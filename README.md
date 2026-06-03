@@ -44,8 +44,13 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **Node ≥ 24** (the core runs TypeScript directly via native type-stripping; no build step).
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
 - **Both `claude` and `codex` CLIs** on PATH.
-- **Codex review needs the `cc` companion** (`claude-companion.mjs`, from the Codex `cc` plugin).
-  Without it, `$pipeline` fails at the review stage. (Override its path with `PIPELINE_CC_COMPANION`.)
+- **The reviewer dependency is asymmetric** (each profile reviews with the *other* harness):
+  - `/pipeline` (Claude profile) reviews by running the **`codex` CLI directly** (`codex exec`).
+    No extra plugin or skill is needed beyond the `codex` CLI — there is no `/codex:review` dependency.
+  - `$pipeline` (Codex profile) reviews by driving Claude Code through the **`cc` companion**
+    (`claude-companion.mjs` → `$cc:review` / `$cc:adversarial-review`). This requires the Codex
+    `cc` plugin installed; without it `$pipeline` fails at the review stage. Override the
+    companion path with `PIPELINE_CC_COMPANION`.
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
 
