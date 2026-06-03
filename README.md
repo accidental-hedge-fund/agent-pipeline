@@ -47,10 +47,12 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **The reviewer dependency is asymmetric** (each profile reviews with the *other* harness):
   - `/pipeline` (Claude profile) reviews by running the **`codex` CLI directly** (`codex exec`).
     No extra plugin or skill is needed beyond the `codex` CLI — there is no `/codex:review` dependency.
-  - `$pipeline` (Codex profile) reviews by driving Claude Code through the **`cc` companion**
-    (`claude-companion.mjs` → `$cc:review` / `$cc:adversarial-review`). This requires the Codex
-    `cc` plugin installed; without it `$pipeline` fails at the review stage. Override the
-    companion path with `PIPELINE_CC_COMPANION`.
+  - `$pipeline` (Codex profile) reviews by driving Claude Code through the **`cc-plugin-codex`
+    companion** (`claude-companion.mjs` → `$cc:review` / `$cc:adversarial-review`). Install it in
+    Codex once: `npx cc-plugin-codex install`. Without it, `$pipeline` fails at the review stage.
+    The companion carries its own review prompt and drives the `claude` CLI directly, so **no
+    Claude-side skill or plugin is required** — only `claude` installed and authenticated. Override
+    the companion path with `PIPELINE_CC_COMPANION`. (The installer warns if it's missing.)
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
 
@@ -81,6 +83,21 @@ The installer copies the shared core + the right host overlay into
 `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher
 shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`
 and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up live.
+
+#### Codex as the primary harness (`$pipeline`)
+
+This is the Codex-primary flow: **Codex implements, Claude Code reviews.** Two installs are needed:
+
+```bash
+npx github:FigID/agent-pipeline install --host codex   # 1. this pipeline skill
+npx cc-plugin-codex install                            # 2. the companion that runs the Claude review
+claude auth login                                      # 3. the companion drives the `claude` CLI
+```
+
+Installing only the pipeline skill is **not enough** for the primary flow — the review stage shells
+out to the `cc-plugin-codex` companion (`claude-companion.mjs`). That companion is a separate plugin
+(it is not bundled here). Nothing extra is needed on the Claude side: the companion carries its own
+review prompt and calls the `claude` CLI directly. Then restart Codex and run `$pipeline N`.
 
 ### Claude Code — plugin marketplace (versioned, auto-updatable)
 

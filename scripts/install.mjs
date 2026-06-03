@@ -132,7 +132,19 @@ function which(bin) {
   return r.status === 0;
 }
 
-function preflight() {
+// The Codex ($pipeline) profile reviews by driving Claude Code through the
+// cc-plugin-codex companion (claude-companion.mjs). It is a SEPARATE plugin,
+// not shipped here. Detect it so a Codex install surfaces the dependency.
+function companionPresent() {
+  if (process.env.PIPELINE_CC_COMPANION) return existsSync(process.env.PIPELINE_CC_COMPANION);
+  const codexHome = process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(HOME, ".codex");
+  return [
+    join(codexHome, "plugins", "cache", "local-plugins", "cc", "local", "scripts", "claude-companion.mjs"),
+    join(codexHome, "plugins", "cc", "scripts", "claude-companion.mjs"),
+  ].some((p) => existsSync(p));
+}
+
+function preflight(hosts) {
   log("\nPrerequisite check (warnings do not block install; the skill needs these at run time):");
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
   if (nodeMajor >= 24) log(`  ✓ node ${process.versions.node} (>= 24)`);
@@ -145,6 +157,15 @@ function preflight() {
     const auth = spawnSync("gh", ["auth", "status"], { stdio: "ignore" });
     if (auth.status === 0) log("  ✓ gh authenticated");
     else warn("gh is not authenticated — run `gh auth login` before using the pipeline.");
+  }
+  if (hosts.includes("codex")) {
+    if (companionPresent()) log("  ✓ cc companion (claude-companion.mjs) — needed for $pipeline review");
+    else
+      warn(
+        "Codex review needs the cc-plugin-codex companion (claude-companion.mjs). " +
+          "Install it with `npx cc-plugin-codex install`, then `claude auth login`. " +
+          "(Override its path with PIPELINE_CC_COMPANION.)",
+      );
   }
   log("");
 }
@@ -239,7 +260,7 @@ function main() {
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
-    preflight();
+    preflight(hosts);
     log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
     for (const h of hosts) installHost(h, dryRun);
     log("\nDone.");
