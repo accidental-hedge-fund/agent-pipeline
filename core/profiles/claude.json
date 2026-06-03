@@ -1,0 +1,10 @@
+{
+  "name": "claude",
+  "displayName": "Claude Code pipeline",
+  "invocation": "/pipeline",
+  "harnesses": { "implementer": "claude", "reviewer": "codex" },
+  "reviewMode": "prompt-harness",
+  "markerFooter": "*Automated by Claude Code Pipeline Skill*",
+  "implementationReadyMessage": "Ready for Codex standard review.",
+  "conventionsDefault": "CLAUDE.md"
+}

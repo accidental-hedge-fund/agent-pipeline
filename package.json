@@ -1,0 +1,33 @@
+{
+  "name": "agent-pipeline",
+  "version": "0.2.0",
+  "description": "Label-driven GitHub issue→ready-to-deploy pipeline skill for Claude Code and Codex, built from a single shared TypeScript core.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "agent-pipeline": "scripts/install.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "core",
+    "hosts",
+    "plugin",
+    "scripts",
+    ".claude-plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:check": "node scripts/build.mjs --check",
+    "install:local": "node scripts/install.mjs install",
+    "test": "cd core && npm install --no-audit --no-fund && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FigID/agent-pipeline.git"
+  },
+  "license": "MIT"
+}

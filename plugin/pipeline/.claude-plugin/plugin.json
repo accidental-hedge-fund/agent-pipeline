@@ -1,0 +1,9 @@
+{
+  "name": "pipeline",
+  "description": "Advance a GitHub issue/PR through a label-driven pipeline to ready-to-deploy.",
+  "author": {
+    "name": "FigID"
+  },
+  "homepage": "https://github.com/FigID/agent-pipeline",
+  "repository": "https://github.com/FigID/agent-pipeline"
+}

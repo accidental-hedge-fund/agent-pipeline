@@ -1,0 +1,11 @@
+{
+  "name": "openclaw",
+  "displayName": "OpenClaw pipeline",
+  "invocation": "OpenClaw cron/scripts",
+  "harnesses": { "implementer": "claude", "reviewer": "codex" },
+  "reviewMode": "prompt-harness",
+  "markerFooter": "*Automated by OpenClaw Pipeline*",
+  "implementationReadyMessage": "Ready for Codex standard review.",
+  "conventionsDefault": "CLAUDE.md",
+  "notifications": "openclaw-notify.py/conventions remain in Python wrappers until explicitly migrated"
+}

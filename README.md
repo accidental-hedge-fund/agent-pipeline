@@ -1,0 +1,158 @@
+# agent-pipeline
+
+A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
+through a 10-stage state machine to `pipeline:ready-to-deploy` — planning →
+plan-review → implementing → review → fix → pre-merge. It does **not** auto-merge;
+you own the merge button.
+
+It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)**
+from a single shared TypeScript core. The two hosts differ only by a small
+JSON **profile** (who implements vs. reviews, naming, review mode) — there is no
+forked pipeline logic.
+
+```
+backlog → ready → planning → plan-review → implementing
+              → review-1 → fix-1 → review-2 → fix-2
+              → pre-merge → ready-to-deploy
+```
+
+## Repository layout
+
+```
+core/                 single source of truth (host-agnostic TypeScript)
+  scripts/            orchestrator, stages/, prompts/, gh/worktree/lock/harness
+  profiles/           claude.json · codex.json · openclaw.json  ← the host seam
+  test/               node --test suite (45 tests)
+hosts/
+  claude/SKILL.md     Claude overlay (/pipeline, Monitor/PushNotification flow)
+  codex/SKILL.md      Codex overlay ($pipeline, PTY exec flow)
+  codex/agents/openai.yaml   Codex UI manifest
+  _shared/entry.template.mjs launcher shim template (__PROFILE__)
+plugin/               GENERATED Claude plugin (committed; built by scripts/build.mjs)
+.claude-plugin/marketplace.json   GENERATED marketplace catalog (repo root)
+scripts/
+  install.mjs         cross-tool installer (zero deps)
+  build.mjs           regenerate plugin/ from core + hosts/claude
+  install.sh          clone-and-install convenience wrapper
+```
+
+## Prerequisites
+
+The pipeline is **cross-harness** — each run uses one CLI to implement and the
+*other* to review. So both are required regardless of which host you install:
+
+- **Node ≥ 24** (the core runs TypeScript directly via native type-stripping; no build step).
+- **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
+- **Both `claude` and `codex` CLIs** on PATH.
+- **Codex review needs the `cc` companion** (`claude-companion.mjs`, from the Codex `cc` plugin).
+  Without it, `$pipeline` fails at the review stage. (Override its path with `PIPELINE_CC_COMPANION`.)
+- `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
+- No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
+
+The installer prints a prerequisite checklist (warnings don't block install).
+
+## Install
+
+> Private repo: every method below needs read access to `FigID/agent-pipeline`
+> (git over SSH/HTTPS, or a `GITHUB_TOKEN`/`GH_TOKEN`).
+
+### One command, both hosts (recommended)
+
+```bash
+npx github:FigID/agent-pipeline install            # detects ~/.claude and ~/.codex; installs to each present host
+# or a specific host:
+npx github:FigID/agent-pipeline install --host claude
+npx github:FigID/agent-pipeline install --host codex
+```
+
+Or clone and run directly:
+
+```bash
+gh repo clone FigID/agent-pipeline
+node agent-pipeline/scripts/install.mjs install        # --host claude|codex|all  (default all)
+```
+
+The installer copies the shared core + the right host overlay into
+`~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher
+shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`
+and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up live.
+
+### Claude Code — plugin marketplace (versioned, auto-updatable)
+
+```
+/plugin marketplace add FigID/agent-pipeline
+/plugin install pipeline@figid-tools
+```
+
+This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`).
+If you also have a personal install at `~/.claude/skills/pipeline`, remove it first
+(`node scripts/install.mjs uninstall --host claude`) to avoid two `/pipeline` entries.
+Update later with `/plugin marketplace update figid-tools`.
+
+## Usage
+
+```
+/pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
+/pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
+/pipeline N --unblock "<answer>"              post answer + clear the blocked label
+/pipeline N --once                            advance one stage and stop
+/pipeline N --dry-run                         log only; no harness calls, no GitHub writes
+```
+
+The number is auto-detected as an issue or PR. PRs resolve to their linked
+closing issue; PRs with no `Closes #N` are refused. Items must carry a
+`pipeline:*` label (opt-in) — add `pipeline:ready` to start.
+
+## Per-repo config (optional)
+
+Commit `.github/pipeline.yml` to override defaults:
+
+```yaml
+base_branch: main
+worktree_root: .worktrees
+review_timeout: 1200
+ci_timeout: 900
+conventions_md_path: CLAUDE.md     # excerpt embedded in prompts
+domain_name: my-service
+domain_description: a payments service
+# `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
+```
+
+## How the two hosts share one core
+
+`core/scripts/profile.ts` loads `core/profiles/<name>.json`; the shim passes
+`--profile claude` or `--profile codex`. The profile sets the only things that
+differ between hosts:
+
+| | Claude | Codex |
+|---|---|---|
+| invocation | `/pipeline` | `$pipeline` |
+| implementer / reviewer | claude / codex | codex / claude |
+| review mode | `prompt-harness` | `claude-companion` |
+| conventions file | `CLAUDE.md` | `AGENTS.md` |
+
+Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one
+shared implementation. Inverting behavior is a JSON edit, not a code change.
+
+## Uninstall
+
+```bash
+node scripts/install.mjs uninstall --host all      # or claude | codex
+# plugin install:
+/plugin uninstall pipeline@figid-tools
+```
+
+## Development
+
+```bash
+cd core && npm ci && npm test     # 45 tests, node --test
+node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
+node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
+```
+
+After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run
+`build.mjs` and commit the regenerated `plugin/` (CI enforces this).
+
+## License
+
+MIT © FigID

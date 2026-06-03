@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "figid-tools",
+  "owner": {
+    "name": "FigID"
+  },
+  "description": "FigID internal Claude Code tools.",
+  "plugins": [
+    {
+      "name": "pipeline",
+      "source": "./plugin/pipeline",
+      "description": "Advance a GitHub issue/PR through a label-driven pipeline to ready-to-deploy (Claude Code).",
+      "category": "development"
+    }
+  ]
+}

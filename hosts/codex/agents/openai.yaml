@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pipeline"
+  short_description: "Advance pipeline issues and PRs"
+  default_prompt: "Use $pipeline 123 --status to inspect a pipeline issue."
