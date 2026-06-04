@@ -41,9 +41,9 @@ scripts/
 The pipeline is **cross-harness** — each run uses one CLI to implement and the
 *other* to review. So both are required regardless of which host you install:
 
-- **Node ≥ 24** (the core runs TypeScript directly via native type-stripping; no build step).
+- **Node ≥ 24** with **`npm`** (npm ships with Node and installs the core's deps — commander, js-yaml, zod). The core runs TypeScript directly via native type-stripping; no build step.
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
-- **Both `claude` and `codex` CLIs** on PATH.
+- **Both `claude` and `codex` CLIs** on PATH and **authenticated** (logged in) — each run uses one to implement and the other to review.
 - **The reviewer dependency is asymmetric** (each profile reviews with the *other* harness):
   - `/pipeline` (Claude profile) reviews by running the **`codex` CLI directly** (`codex exec`).
     No extra plugin or skill is needed beyond the `codex` CLI — there is no `/codex:review` dependency.
