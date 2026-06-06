@@ -34,7 +34,7 @@ function dummyConfig(): PipelineConfig {
     ci_poll_interval: 30,
     harnesses: { implementer: "codex", reviewer: "claude" },
     models: { planning: "sonnet", review: "opus", fix: "sonnet" },
-    openspec: { enabled: "auto" },
+    openspec: { enabled: "auto", bootstrap: false },
     domain_name: "Widget",
     domain_description: "the example widget service",
   };

@@ -48,7 +48,7 @@ export async function advance(
   issueNumber: number,
   opts: AdvanceOpts = {},
 ): Promise<Outcome> {
-  if (openspec.isActive(cfg, cfg.repo_dir)) {
+  if (openspec.shouldPlanWithOpenspec(cfg, cfg.repo_dir)) {
     return advanceOpenspec(cfg, issueNumber, opts);
   }
 
@@ -322,6 +322,42 @@ async function advanceOpenspec(
     const e = err as Error;
     await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, "ready");
     return { advanced: false, status: "blocked", reason: e.message };
+  }
+
+  // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
+  if (!openspec.isInitialized(wt.path)) {
+    if (!cfg.openspec.bootstrap) {
+      await setBlocked(
+        cfg,
+        issueNumber,
+        "OpenSpec is required (openspec.enabled: on) but this repo has no `openspec/` " +
+          "workspace. Set `openspec.bootstrap: true` in .github/pipeline.yml, or run `openspec init`.",
+        "ready",
+      );
+      return { advanced: false, status: "blocked", reason: "openspec not initialized" };
+    }
+    console.log(`[pipeline] #${issueNumber}: bootstrapping OpenSpec (openspec init)`);
+    const initRes = await openspec.init(wt.path);
+    if (initRes.unavailable) {
+      await setBlocked(
+        cfg,
+        issueNumber,
+        "OpenSpec bootstrap requested but the `openspec` CLI is not on PATH " +
+          "(install: `npm i -g @fission-ai/openspec`).",
+        "ready",
+      );
+      return { advanced: false, status: "blocked", reason: "openspec CLI unavailable" };
+    }
+    if (!initRes.success) {
+      await setBlocked(cfg, issueNumber, `openspec init failed:\n${initRes.output}`, "ready");
+      return { advanced: false, status: "blocked", reason: "openspec init failed" };
+    }
+    await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
+    await gitInWorktree(
+      wt.path,
+      ["commit", "-m", `chore: openspec init for #${issueNumber}`],
+      { ignoreFailure: true },
+    );
   }
 
   // ---- Author the OpenSpec change (intent only, no code). ----
