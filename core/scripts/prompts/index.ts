@@ -144,6 +144,8 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
 export interface BuildReviewArgs extends BuildPlanArgs {
   plan: string;
   diff: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
@@ -156,6 +158,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     plan: a.plan,
+    spec_context: specSection(a.specContext),
     diff: truncateDiff(a.diff, 50_000),
   });
 }
@@ -163,6 +166,8 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
 export interface BuildAdversarialArgs extends BuildPlanArgs {
   diff: string;
   review1Summary?: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
@@ -178,6 +183,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     review1_section: review1Section,
+    spec_context: specSection(a.specContext),
     diff: truncateDiff(a.diff, 50_000),
   });
 }
@@ -215,6 +221,15 @@ export function buildDocsUpdatePrompt(a: BuildDocsArgs): string {
     title: a.title,
     diff: truncateDiff(a.diff, 40_000),
   });
+}
+
+function specSection(specContext?: string): string {
+  if (!specContext || !specContext.trim()) return "";
+  return (
+    "## OpenSpec — Intended Behavior (spec deltas)\n\n" +
+    "The diff must satisfy these requirement changes. Flag any divergence from them.\n\n" +
+    specContext.trim()
+  );
 }
 
 function truncateDiff(diff: string, cap: number): string {

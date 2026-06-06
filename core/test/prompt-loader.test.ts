@@ -95,6 +95,46 @@ test("planning_openspec prompt: builds with all keys + OpenSpec guidance", () =>
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("review_standard: injects OpenSpec spec context when provided", () => {
+  const out = buildReviewStandardPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 5,
+    title: "t",
+    body: "b",
+    plan: "p",
+    diff: "d",
+    specContext: "REQ: user must be able to log in",
+  });
+  assert.match(out, /Intended Behavior/);
+  assert.match(out, /must be able to log in/);
+});
+
+test("review_standard: no spec section + no leftover placeholders when specContext absent", () => {
+  const out = buildReviewStandardPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 5,
+    title: "t",
+    body: "b",
+    plan: "p",
+    diff: "d",
+  });
+  assert.doesNotMatch(out, /Intended Behavior/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("review_adversarial: injects OpenSpec spec context when provided", () => {
+  const out = buildReviewAdversarialPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 6,
+    title: "t",
+    body: "b",
+    diff: "d",
+    specContext: "REQ: tokens must expire",
+  });
+  assert.match(out, /Intended Behavior/);
+  assert.match(out, /tokens must expire/);
+});
+
 test("plan_review prompt: includes plan, implementer, and reviewer", () => {
   const out = buildPlanReviewPrompt({
     cfg: dummyConfig(),
