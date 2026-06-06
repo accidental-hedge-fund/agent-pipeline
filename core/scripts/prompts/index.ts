@@ -52,6 +52,8 @@ export interface BuildPlanArgs {
   issueNumber: number;
   title: string;
   body: string;
+  /** Optional carry-forward context (e.g. a last30days brief) for planning prompts. */
+  carryForward?: string;
 }
 
 export function buildPlanningPrompt(a: BuildPlanArgs): string {
@@ -63,6 +65,7 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    carry_forward_context: carryForwardSection(a.carryForward),
   });
 }
 
@@ -77,6 +80,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    carry_forward_context: carryForwardSection(a.carryForward),
   });
 }
 
@@ -221,6 +225,15 @@ export function buildDocsUpdatePrompt(a: BuildDocsArgs): string {
     title: a.title,
     diff: truncateDiff(a.diff, 40_000),
   });
+}
+
+function carryForwardSection(s?: string): string {
+  if (!s || !s.trim()) return "";
+  return (
+    "## Carry-Forward Context (last 30 days of public discourse)\n\n" +
+    "Use this only where it informs the work; ignore irrelevant noise.\n\n" +
+    s.trim()
+  );
 }
 
 function specSection(specContext?: string): string {

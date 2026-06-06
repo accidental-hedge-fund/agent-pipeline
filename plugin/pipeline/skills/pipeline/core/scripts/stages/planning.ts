@@ -35,6 +35,7 @@ import {
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
 import * as openspec from "../openspec.ts";
+import * as last30days from "../last30days.ts";
 import type { Harness, Outcome, PipelineConfig } from "../types.ts";
 
 export interface AdvanceOpts {
@@ -66,8 +67,11 @@ export async function advance(
     return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] planning + plan-review" };
   }
 
+  // ---- Step 0: optional carry-forward context (last30days) ----
+  const carryForward = await gatherCarryForward(cfg, issueNumber, title);
+
   // ---- Step 1: generate plan ----
-  const planPrompt = buildPlanningPrompt({ cfg, issueNumber, title, body });
+  const planPrompt = buildPlanningPrompt({ cfg, issueNumber, title, body, carryForward });
   let planResult: HarnessResult;
   try {
     planResult = await invoke(primary, cfg.repo_dir, planPrompt, {
@@ -312,6 +316,9 @@ async function advanceOpenspec(
     return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] openspec planning" };
   }
 
+  // ---- Step 0: optional carry-forward context (last30days) ----
+  const carryForward = await gatherCarryForward(cfg, issueNumber, title);
+
   // ---- Worktree first: OpenSpec artifacts are files in the change folder. ----
   const slug = slugify(title) || `issue-${issueNumber}`;
   let wt: { path: string; branch: string };
@@ -362,7 +369,7 @@ async function advanceOpenspec(
 
   // ---- Author the OpenSpec change (intent only, no code). ----
   const before = openspec.listChangeDirs(wt.path);
-  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body }), {
+  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward }), {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
   });
@@ -545,6 +552,43 @@ function formatIssues(v: { issues: { item?: string; message: string }[]; raw: st
   return v.issues.length
     ? v.issues.map((i) => `- ${i.item ? `${i.item}: ` : ""}${i.message}`).join("\n")
     : v.raw;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-planning carry-forward context (optional; last30days)
+// ---------------------------------------------------------------------------
+
+/**
+ * When `last30days.enabled`, run the last30days skill against the issue title and
+ * carry the resulting evidence brief forward: post it as an issue comment AND
+ * return it for injection into the planning prompt. Always non-blocking — a
+ * missing skill, failure, or empty/low-signal brief just returns "".
+ */
+async function gatherCarryForward(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  title: string,
+): Promise<string> {
+  if (!last30days.isEnabled(cfg)) return "";
+  console.log(`[pipeline] #${issueNumber}: gathering last30days carry-forward context`);
+  const res = await last30days.run(title, { timeoutSec: cfg.last30days.timeout });
+  if (res.unavailable) {
+    console.log(
+      `[pipeline] #${issueNumber}: last30days enabled but skill/python not found; skipping (non-blocking)`,
+    );
+    return "";
+  }
+  if (!res.success || !last30days.hasSignal(res.brief)) {
+    console.log(`[pipeline] #${issueNumber}: last30days returned no usable brief; skipping`);
+    return "";
+  }
+  await postComment(
+    cfg,
+    issueNumber,
+    `## Pre-Planning Context — last30days\n\n_Topic: "${title}"_${res.stats ? `\n\n${res.stats}` : ""}\n\n${res.brief}${footer(cfg)}`,
+  );
+  console.log(`[pipeline] #${issueNumber}: last30days brief posted + carried into planning`);
+  return res.brief;
 }
 
 function footer(cfg: PipelineConfig): string {

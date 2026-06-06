@@ -39,6 +39,12 @@ const PartialConfigSchema = z.object({
       bootstrap: z.boolean().optional(),
     })
     .optional(),
+  last30days: z
+    .object({
+      enabled: z.boolean().optional(),
+      timeout: z.number().int().positive().optional(),
+    })
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -131,6 +137,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     openspec: {
       enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
       bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
+    },
+    last30days: {
+      enabled: fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled,
+      timeout: fileConfig.last30days?.timeout ?? DEFAULT_CONFIG.last30days.timeout,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,

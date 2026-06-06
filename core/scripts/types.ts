@@ -52,6 +52,9 @@ export interface PipelineConfig {
   // the target repo has an `openspec/` directory; "on"/"off" force it. When
   // `bootstrap` is true, planning runs `openspec init` on repos that lack it.
   openspec: { enabled: OpenspecMode; bootstrap: boolean };
+  // last30days pre-planning brief (opt-in; default off). Adds external public
+  // discourse for the issue topic as carry-forward context for planning.
+  last30days: { enabled: boolean; timeout: number };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -72,6 +75,7 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   harnesses: { implementer: "codex", reviewer: "claude" },
   models: { planning: "sonnet", review: "opus", fix: "sonnet" },
   openspec: { enabled: "auto", bootstrap: false },
+  last30days: { enabled: false, timeout: 600 },
 };
 
 // One transition outcome from a stage advance call.
