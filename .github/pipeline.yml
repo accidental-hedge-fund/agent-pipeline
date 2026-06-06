@@ -1,0 +1,10 @@
+# Pipeline config for agent-pipeline itself.
+#
+# OpenSpec auto-activates because an `openspec/` workspace exists in this repo;
+# this file just makes that explicit and gives the planning prompts some domain
+# context. `harnesses:` is intentionally omitted — the invoking install profile
+# owns the implementer/reviewer split.
+domain_name: agent-pipeline
+domain_description: a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex)
+openspec:
+  enabled: auto
