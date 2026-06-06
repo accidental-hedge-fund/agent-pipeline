@@ -23,6 +23,7 @@ import {
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildDocsUpdatePrompt } from "../prompts/index.ts";
+import * as openspec from "../openspec.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 
 const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
@@ -112,6 +113,33 @@ export async function advance(
   }
   if (mergeStatus === "unknown") {
     return { advanced: false, status: "waiting", reason: "GitHub still computing mergeability" };
+  }
+
+  // ---- Step 3.5: OpenSpec validation gate (opt-in / auto-detected) ----
+  // Only runs when the target repo has an `openspec/` workspace (or it's forced
+  // on via config). Refuses ready-to-deploy if the change's specs/deltas are
+  // structurally invalid. A missing `openspec` CLI is non-blocking (skipped).
+  const specWt = await getForIssue(cfg, issueNumber);
+  if (specWt && openspec.isActive(cfg, specWt.path)) {
+    const spec = await openspec.validate(specWt.path);
+    if (spec.unavailable) {
+      console.log(
+        `[pipeline] #${issueNumber}: openspec active but CLI unavailable; skipping spec validation (non-blocking)`,
+      );
+    } else if (!spec.valid) {
+      const detail = spec.issues.length
+        ? spec.issues.map((i) => `- ${i.item ? `${i.item}: ` : ""}${i.message}`).join("\n")
+        : spec.raw;
+      await setBlocked(
+        cfg,
+        issueNumber,
+        `OpenSpec validation failed (\`openspec validate --all\`):\n${detail}`,
+        "pre-merge",
+      );
+      return { advanced: false, status: "blocked", reason: "openspec validation failed" };
+    } else {
+      console.log(`[pipeline] #${issueNumber}: openspec validation passed`);
+    }
   }
 
   // ---- Step 4: advance ----
