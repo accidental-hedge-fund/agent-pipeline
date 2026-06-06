@@ -27,6 +27,7 @@ import * as openspec from "../openspec.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 
 const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
+const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 export interface AdvancePreMergeOpts {
@@ -48,9 +49,13 @@ export async function advance(
   }
 
   if (opts.dryRun) {
-    console.log(`[pipeline] #${issueNumber}: [dry-run] would docs+CI+merge for PR #${prNumber}`);
+    console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+docs+CI+merge for PR #${prNumber}`);
     return { advanced: true, from: "pre-merge", to: "ready-to-deploy", summary: "[dry-run]" };
   }
+
+  // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
+  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber);
+  if (archiveOutcome) return archiveOutcome;
 
   // ---- Step 1: docs update (once per PR) ----
   if (!(await docsAlreadyUpdated(cfg, issueNumber))) {
@@ -235,6 +240,75 @@ async function updateDocs(
   const branch = branchName(issueNumber, wt.slug);
   await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
   console.log(`[pipeline] #${issueNumber}: docs pushed; CI will re-run`);
+}
+
+// ---------------------------------------------------------------------------
+// OpenSpec archive (once per PR)
+// ---------------------------------------------------------------------------
+
+/**
+ * When OpenSpec is active, archive the change(s) this PR branch introduced so
+ * their spec deltas fold into the living `openspec/specs/`. Idempotent: a change
+ * already archived is no longer an active dir, so it drops out of the candidate
+ * set. Returns a `waiting` Outcome after pushing (CI must re-run), a `blocked`
+ * Outcome on failure, or null when there is nothing to do (continue the gate).
+ */
+async function maybeArchiveOpenspec(
+  cfg: PipelineConfig,
+  issueNumber: number,
+): Promise<Outcome | null> {
+  const wt = await getForIssue(cfg, issueNumber);
+  if (!wt || !openspec.isActive(cfg, wt.path)) return null;
+
+  // Changes this PR branch introduced, still active (not yet archived).
+  const diff = await gitInWorktree(
+    wt.path,
+    ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+    { ignoreFailure: true },
+  );
+  const candidates = openspec
+    .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
+    .filter((id) => openspec.changeDirExists(wt.path, id));
+  if (candidates.length === 0) return null; // already archived, or none
+
+  console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
+  for (const id of candidates) {
+    const res = await openspec.archive(wt.path, id);
+    if (res.unavailable) {
+      console.log(
+        `[pipeline] #${issueNumber}: openspec CLI unavailable; skipping archive (non-blocking)`,
+      );
+      return null;
+    }
+    if (!res.success) {
+      await setBlocked(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge");
+      return { advanced: false, status: "blocked", reason: `openspec archive failed (${id})` };
+    }
+  }
+
+  // Commit + push the archived specs so CI validates the finalized state.
+  await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
+  const status = await gitInWorktree(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
+  await gitInWorktree(
+    wt.path,
+    ["commit", "-m", `${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`],
+    { ignoreFailure: true },
+  );
+  const push = await gitInWorktree(wt.path, ["push", "origin", branchName(issueNumber, wt.slug)], {
+    ignoreFailure: true,
+  });
+  if (push.code !== 0) {
+    await setBlocked(
+      cfg,
+      issueNumber,
+      `Git push failed after OpenSpec archive: ${push.stderr.trim()}`,
+      "pre-merge",
+    );
+    return { advanced: false, status: "blocked", reason: "push failed after archive" };
+  }
+  console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
+  return { advanced: false, status: "waiting", reason: "openspec change archived; CI re-running" };
 }
 
 // ---------------------------------------------------------------------------
