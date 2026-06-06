@@ -275,7 +275,7 @@ function collectIssues(data: unknown, out: ValidationIssue[]): void {
   }
   if (data && typeof data === "object") {
     const o = data as Record<string, unknown>;
-    for (const key of ["issues", "results", "errors", "problems", "changes"]) {
+    for (const key of ["items", "issues", "results", "errors", "problems", "changes"]) {
       if (o[key] && typeof o[key] === "object") collectIssues(o[key], out);
     }
     const message =

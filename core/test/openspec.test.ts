@@ -120,6 +120,22 @@ test("readSpecDeltas: empty string when the change has no specs", () => {
   assert.equal(readSpecDeltas(tmpDir(), "nope"), "");
 });
 
+test("parseValidateResult: real validate --json {items} failure yields clean messages", () => {
+  // Shape confirmed against openspec 1.4.1: { items: [...], summary: { totals }, byType }.
+  const out = JSON.stringify({
+    items: [
+      { id: "add-auth", type: "change", valid: false, issues: ["missing tasks.md", "empty spec delta"] },
+    ],
+    summary: { totals: { items: 1, passed: 0, failed: 1 } },
+    version: "1.0",
+  });
+  const r = parseValidateResult(1, out);
+  assert.equal(r.valid, false);
+  const msgs = r.issues.map((i) => i.message);
+  assert.ok(msgs.includes("missing tasks.md"));
+  assert.ok(msgs.includes("empty spec delta"));
+});
+
 test("changeIdsFromPaths: distinct active change ids, excludes archive + non-change paths", () => {
   const paths = [
     "openspec/changes/add-auth/proposal.md",
