@@ -158,6 +158,10 @@ function preflight(hosts) {
     if (auth.status === 0) log("  ✓ gh authenticated");
     else warn("gh is not authenticated — run `gh auth login` before using the pipeline.");
   }
+  // OpenSpec is optional — only repos that opt in (an `openspec/` dir, or
+  // `openspec.enabled` in .github/pipeline.yml) need the CLI. Info, not a warning.
+  if (which("openspec")) log("  ✓ openspec (optional) — for OpenSpec-enabled repos");
+  else log("  ℹ openspec not found (optional) — only for OpenSpec-enabled repos; install: npm i -g @fission-ai/openspec");
   if (hosts.includes("codex")) {
     if (companionPresent()) log("  ✓ cc companion (claude-companion.mjs) — needed for $pipeline review");
     else
