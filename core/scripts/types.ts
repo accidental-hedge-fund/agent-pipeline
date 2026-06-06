@@ -22,6 +22,8 @@ export const HARNESS_LABEL_PREFIX = "harness:";
 
 export type Harness = "claude" | "codex";
 
+export type OpenspecMode = "auto" | "on" | "off";
+
 export interface PipelineConfig {
   profile_name: string;
   invocation: string;
@@ -46,6 +48,9 @@ export interface PipelineConfig {
   // Harnesses + models
   harnesses: { implementer: Harness; reviewer: Harness };
   models: { planning: string; review: string; fix: string };
+  // OpenSpec (spec-driven development) integration. "auto" activates only when
+  // the target repo has an `openspec/` directory; "on"/"off" force it.
+  openspec: { enabled: OpenspecMode };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -65,6 +70,7 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   ci_poll_interval: 30,
   harnesses: { implementer: "codex", reviewer: "claude" },
   models: { planning: "sonnet", review: "opus", fix: "sonnet" },
+  openspec: { enabled: "auto" },
 };
 
 // One transition outcome from a stage advance call.

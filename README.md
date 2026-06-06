@@ -137,8 +137,20 @@ ci_timeout: 900
 conventions_md_path: CLAUDE.md     # excerpt embedded in prompts
 domain_name: my-service
 domain_description: a payments service
+openspec:
+  enabled: auto                      # auto (default) | on | off — see "OpenSpec integration"
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
+
+## OpenSpec integration (optional)
+
+If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/`
+directory), the pre-merge gate runs `openspec validate --all` in the worktree and
+refuses `pipeline:ready-to-deploy` if the change's specs/deltas are structurally
+invalid. It's **auto-detected** by default (`openspec.enabled: auto`); set it to
+`on` to require OpenSpec everywhere or `off` to disable. The `openspec` CLI must be
+on PATH — if it's missing the gate is skipped (non-blocking). No `openspec/` dir
+means no behavior change, so the pipeline stays usable on any repo.
 
 ## How the two hosts share one core
 
