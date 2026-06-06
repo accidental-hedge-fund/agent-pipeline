@@ -27,7 +27,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/FigID/agent-pipeline.git"
+    "url": "git+https://github.com/accidental-hedge-fund/agent-pipeline.git"
   },
   "license": "MIT"
 }

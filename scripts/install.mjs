@@ -6,7 +6,7 @@
 //   node scripts/install.mjs uninstall [--host …]
 //
 // Zero runtime dependencies (node: builtins only) so it can be run directly
-// from a clone or via `npx github:FigID/agent-pipeline`. It copies the shared
+// from a clone or via `npx github:accidental-hedge-fund/agent-pipeline`. It copies the shared
 // core + the right host overlay into each host's skills directory, writes a
 // portable launcher shim, and pre-installs the core's npm dependencies.
 //

@@ -5,7 +5,7 @@
 //   node scripts/build.mjs           regenerate plugin/ and .claude-plugin/marketplace.json
 //   node scripts/build.mjs --check   verify the committed output is up to date (CI gate)
 //
-// The plugin is committed so `/plugin marketplace add FigID/agent-pipeline`
+// The plugin is committed so `/plugin marketplace add accidental-hedge-fund/agent-pipeline`
 // works directly off the repo with no build step on the user's machine.
 
 import {
@@ -29,9 +29,9 @@ const CORE_ENTRIES = ["scripts", "profiles", "package.json", "package-lock.json"
 
 const MARKETPLACE = {
   $schema: "https://anthropic.com/claude-code/marketplace.schema.json",
-  name: "figid-tools",
-  owner: { name: "FigID" },
-  description: "FigID internal Claude Code tools.",
+  name: "ahf-tools",
+  owner: { name: "AHF" },
+  description: "AHF internal Claude Code tools.",
   plugins: [
     {
       name: "pipeline",
@@ -46,9 +46,9 @@ const MARKETPLACE = {
 const PLUGIN_MANIFEST = {
   name: "pipeline",
   description: "Advance a GitHub issue/PR through a label-driven pipeline to ready-to-deploy.",
-  author: { name: "FigID" },
-  homepage: "https://github.com/FigID/agent-pipeline",
-  repository: "https://github.com/FigID/agent-pipeline",
+  author: { name: "AHF" },
+  homepage: "https://github.com/accidental-hedge-fund/agent-pipeline",
+  repository: "https://github.com/accidental-hedge-fund/agent-pipeline",
 };
 
 function renderShim(profile) {
