@@ -145,12 +145,21 @@ openspec:
 ## OpenSpec integration (optional)
 
 If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/`
-directory), the pre-merge gate runs `openspec validate --all` in the worktree and
-refuses `pipeline:ready-to-deploy` if the change's specs/deltas are structurally
-invalid. It's **auto-detected** by default (`openspec.enabled: auto`); set it to
-`on` to require OpenSpec everywhere or `off` to disable. The `openspec` CLI must be
-on PATH — if it's missing the gate is skipped (non-blocking). No `openspec/` dir
-means no behavior change, so the pipeline stays usable on any repo.
+directory), the pipeline runs a spec-first flow:
+
+- **Planning** — instead of a freeform plan, the implementer authors an OpenSpec
+  change (`proposal.md`, `tasks.md`, spec deltas) under `openspec/changes/<id>/`,
+  which the *other* harness plan-reviews as intent before any code is written. The
+  change is validated structurally (`openspec validate <id>`) at draft and after
+  revision, and implementation works the change's `tasks.md`.
+- **Pre-merge gate** — runs `openspec validate --all` in the worktree and refuses
+  `pipeline:ready-to-deploy` if the change's specs/deltas are structurally invalid.
+
+It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to
+require OpenSpec everywhere or `off` to disable. The `openspec` CLI must be on PATH
+— if it's missing the pre-merge gate is skipped (non-blocking), and planning blocks
+with an install hint. No `openspec/` dir means no behavior change, so the pipeline
+stays usable on any repo.
 
 ## How the two hosts share one core
 

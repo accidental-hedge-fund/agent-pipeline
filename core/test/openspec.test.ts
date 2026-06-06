@@ -5,7 +5,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isActive, isInitialized, parseValidateResult } from "../scripts/openspec.ts";
+import {
+  changeDirExists,
+  isActive,
+  isInitialized,
+  listChangeDirs,
+  parseValidateResult,
+  readChangeFile,
+} from "../scripts/openspec.ts";
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openspec-test-"));
@@ -60,4 +67,38 @@ test("parseValidateResult: object with a message field is captured", () => {
   const r = parseValidateResult(1, JSON.stringify({ message: "validation failed: 2 errors" }));
   assert.equal(r.valid, false);
   assert.ok(r.issues.some((i) => /2 errors/.test(i.message)));
+});
+
+test("parseValidateResult: nested results.changes shape extracts issues", () => {
+  const out = JSON.stringify({
+    results: { changes: [{ name: "add-auth", valid: false, issues: ["delta missing scenario"] }] },
+    summary: { total: 1, valid: 0, invalid: 1 },
+  });
+  const r = parseValidateResult(1, out);
+  assert.equal(r.valid, false);
+  assert.ok(r.issues.some((i) => /delta missing scenario/.test(i.message)));
+});
+
+test("listChangeDirs: lists change folders excluding archive", () => {
+  const dir = tmpDir();
+  const changes = path.join(dir, "openspec", "changes");
+  fs.mkdirSync(path.join(changes, "add-auth"), { recursive: true });
+  fs.mkdirSync(path.join(changes, "fix-bug"), { recursive: true });
+  fs.mkdirSync(path.join(changes, "archive"), { recursive: true });
+  assert.deepEqual(listChangeDirs(dir).sort(), ["add-auth", "fix-bug"]);
+});
+
+test("listChangeDirs: empty when no openspec workspace", () => {
+  assert.deepEqual(listChangeDirs(tmpDir()), []);
+});
+
+test("changeDirExists + readChangeFile", () => {
+  const dir = tmpDir();
+  const c = path.join(dir, "openspec", "changes", "add-auth");
+  fs.mkdirSync(c, { recursive: true });
+  fs.writeFileSync(path.join(c, "proposal.md"), "# Proposal\nbody");
+  assert.equal(changeDirExists(dir, "add-auth"), true);
+  assert.equal(changeDirExists(dir, "nope"), false);
+  assert.match(readChangeFile(dir, "add-auth", "proposal.md") ?? "", /Proposal/);
+  assert.equal(readChangeFile(dir, "add-auth", "missing.md"), null);
 });

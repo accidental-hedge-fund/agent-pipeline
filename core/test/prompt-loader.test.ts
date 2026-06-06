@@ -7,6 +7,7 @@ import {
   buildDocsUpdatePrompt,
   buildFixPrompt,
   buildImplementingPrompt,
+  buildPlanningOpenspecPrompt,
   buildPlanningPrompt,
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
@@ -33,6 +34,7 @@ function dummyConfig(): PipelineConfig {
     ci_poll_interval: 30,
     harnesses: { implementer: "codex", reviewer: "claude" },
     models: { planning: "sonnet", review: "opus", fix: "sonnet" },
+    openspec: { enabled: "auto" },
     domain_name: "Widget",
     domain_description: "the example widget service",
   };
@@ -77,6 +79,20 @@ test("planning prompt: empty body becomes (no description)", () => {
     body: "",
   });
   assert.match(out, /\(no description\)/);
+});
+
+test("planning_openspec prompt: builds with all keys + OpenSpec guidance", () => {
+  const out = buildPlanningOpenspecPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 7,
+    title: "Add feature Y",
+    body: "spec it",
+  });
+  assert.match(out, /#7/);
+  assert.match(out, /Add feature Y/);
+  assert.match(out, /OpenSpec/);
+  assert.match(out, /openspec\/changes/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
 test("plan_review prompt: includes plan, implementer, and reviewer", () => {
