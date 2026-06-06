@@ -35,6 +35,7 @@ function dummyConfig(): PipelineConfig {
     harnesses: { implementer: "codex", reviewer: "claude" },
     models: { planning: "sonnet", review: "opus", fix: "sonnet" },
     openspec: { enabled: "auto", bootstrap: false },
+    last30days: { enabled: false, timeout: 600 },
     domain_name: "Widget",
     domain_description: "the example widget service",
   };
@@ -92,6 +93,24 @@ test("planning_openspec prompt: builds with all keys + OpenSpec guidance", () =>
   assert.match(out, /Add feature Y/);
   assert.match(out, /OpenSpec/);
   assert.match(out, /openspec\/changes/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("planning prompt: injects carry-forward context when provided", () => {
+  const out = buildPlanningPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 9,
+    title: "t",
+    body: "b",
+    carryForward: "### 1. Big cluster (score 9)",
+  });
+  assert.match(out, /Carry-Forward Context/);
+  assert.match(out, /Big cluster/);
+});
+
+test("planning prompt: no carry-forward section + no leftover placeholders when absent", () => {
+  const out = buildPlanningPrompt({ cfg: dummyConfig(), issueNumber: 9, title: "t", body: "b" });
+  assert.doesNotMatch(out, /Carry-Forward Context/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 

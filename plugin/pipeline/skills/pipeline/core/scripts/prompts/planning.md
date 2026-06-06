@@ -6,6 +6,8 @@ You are a senior engineer planning the implementation of a GitHub issue for {{do
 
 {{body}}
 
+{{carry_forward_context}}
+
 ## Task
 
 Generate a detailed implementation plan. Structure your response as:

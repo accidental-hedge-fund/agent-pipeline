@@ -141,6 +141,9 @@ domain_description: a payments service
 openspec:
   enabled: auto                      # auto (default) | on | off — see "OpenSpec integration"
   bootstrap: false                   # if true, run `openspec init` on repos that lack openspec/
+last30days:
+  enabled: false                     # opt-in pre-planning brief — see "last30days context"
+  timeout: 600                       # seconds
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
 
@@ -169,6 +172,23 @@ OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have
 pre-merge gate is skipped (non-blocking) and planning blocks with an install hint.
 No `openspec/` dir (and no bootstrap) means no behavior change, so the pipeline
 stays usable on any repo.
+
+## last30days context (optional)
+
+When `last30days.enabled: true`, a **pre-planning** step runs the
+[last30days skill](https://github.com/mvanhorn/last30days-skill) against the issue
+title and carries the resulting brief forward: it's posted as a
+`## Pre-Planning Context — last30days` issue comment **and** injected into the
+planning prompt, so the plan is written with recent public discourse (Reddit, X,
+YouTube, HN, GitHub, …) in hand.
+
+**Default off**, and best suited to product/strategy/named-topic issues — a typical
+pure-code issue title returns little public signal. It's also **always
+non-blocking**: if the skill isn't installed, the interpreter is missing, the run
+fails, or the brief has no signal, planning proceeds without it. The pipeline reads
+no API keys itself — the skill owns its own env/keys. Requires the `last30days`
+skill installed (resolved from `$LAST30DAYS_SKILL_DIR`, `~/.claude/skills/last30days`,
+or `~/.codex/skills/last30days`) and Python 3.12+.
 
 ## How the two hosts share one core
 

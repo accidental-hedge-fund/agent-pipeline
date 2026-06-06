@@ -6,6 +6,8 @@ You are a senior engineer authoring an OpenSpec change proposal for {{domain_nam
 
 {{body}}
 
+{{carry_forward_context}}
+
 ## Task
 
 This repo uses **OpenSpec** (spec-driven development). Create a new OpenSpec change for this issue and populate its artifacts. **Do NOT write implementation code yet** — this step captures intent only.
