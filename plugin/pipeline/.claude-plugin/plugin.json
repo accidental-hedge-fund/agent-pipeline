@@ -2,8 +2,8 @@
   "name": "pipeline",
   "description": "Advance a GitHub issue/PR through a label-driven pipeline to ready-to-deploy.",
   "author": {
-    "name": "FigID"
+    "name": "AHF"
   },
-  "homepage": "https://github.com/FigID/agent-pipeline",
-  "repository": "https://github.com/FigID/agent-pipeline"
+  "homepage": "https://github.com/accidental-hedge-fund/agent-pipeline",
+  "repository": "https://github.com/accidental-hedge-fund/agent-pipeline"
 }

@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "figid-tools",
+  "name": "ahf-tools",
   "owner": {
-    "name": "FigID"
+    "name": "AHF"
   },
-  "description": "FigID internal Claude Code tools.",
+  "description": "AHF internal Claude Code tools.",
   "plugins": [
     {
       "name": "pipeline",

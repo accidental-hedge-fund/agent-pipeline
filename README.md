@@ -60,22 +60,22 @@ The installer prints a prerequisite checklist (warnings don't block install).
 
 ## Install
 
-> Private repo: every method below needs read access to `FigID/agent-pipeline`
-> (git over SSH/HTTPS, or a `GITHUB_TOKEN`/`GH_TOKEN`).
+> Public repo under the `accidental-hedge-fund` org — the methods below need no
+> special access.
 
 ### One command, both hosts (recommended)
 
 ```bash
-npx github:FigID/agent-pipeline install            # detects ~/.claude and ~/.codex; installs to each present host
+npx github:accidental-hedge-fund/agent-pipeline install            # detects ~/.claude and ~/.codex; installs to each present host
 # or a specific host:
-npx github:FigID/agent-pipeline install --host claude
-npx github:FigID/agent-pipeline install --host codex
+npx github:accidental-hedge-fund/agent-pipeline install --host claude
+npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
 
 Or clone and run directly:
 
 ```bash
-gh repo clone FigID/agent-pipeline
+gh repo clone accidental-hedge-fund/agent-pipeline
 node agent-pipeline/scripts/install.mjs install        # --host claude|codex|all  (default all)
 ```
 
@@ -89,7 +89,7 @@ and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up li
 This is the Codex-primary flow: **Codex implements, Claude Code reviews.** Two installs are needed:
 
 ```bash
-npx github:FigID/agent-pipeline install --host codex   # 1. this pipeline skill
+npx github:accidental-hedge-fund/agent-pipeline install --host codex   # 1. this pipeline skill
 npx cc-plugin-codex install                            # 2. the companion that runs the Claude review
 claude auth login                                      # 3. the companion drives the `claude` CLI
 ```
@@ -102,14 +102,14 @@ review prompt and calls the `claude` CLI directly. Then restart Codex and run `$
 ### Claude Code — plugin marketplace (versioned, auto-updatable)
 
 ```
-/plugin marketplace add FigID/agent-pipeline
-/plugin install pipeline@figid-tools
+/plugin marketplace add accidental-hedge-fund/agent-pipeline
+/plugin install pipeline@ahf-tools
 ```
 
 This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`).
 If you also have a personal install at `~/.claude/skills/pipeline`, remove it first
 (`node scripts/install.mjs uninstall --host claude`) to avoid two `/pipeline` entries.
-Update later with `/plugin marketplace update figid-tools`.
+Update later with `/plugin marketplace update ahf-tools`.
 
 ## Usage
 
@@ -161,7 +161,7 @@ shared implementation. Inverting behavior is a JSON edit, not a code change.
 ```bash
 node scripts/install.mjs uninstall --host all      # or claude | codex
 # plugin install:
-/plugin uninstall pipeline@figid-tools
+/plugin uninstall pipeline@ahf-tools
 ```
 
 ## Development
@@ -177,4 +177,4 @@ After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run
 
 ## License
 
-MIT © FigID
+MIT © AHF

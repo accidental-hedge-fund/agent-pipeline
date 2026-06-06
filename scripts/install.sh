@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Convenience wrapper: clone (or update) the repo to a cache dir and run the
-# installer. For a private repo you must have read access (git over SSH/HTTPS).
+# installer. The repo is public, so no special access is required.
 #
-#   curl -fsSL https://raw.githubusercontent.com/FigID/agent-pipeline/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/accidental-hedge-fund/agent-pipeline/main/scripts/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --host codex
 #
 # Or just clone and run directly:
-#   gh repo clone FigID/agent-pipeline && node agent-pipeline/scripts/install.mjs install
+#   gh repo clone accidental-hedge-fund/agent-pipeline && node agent-pipeline/scripts/install.mjs install
 set -euo pipefail
 
-REPO="${AGENT_PIPELINE_REPO:-FigID/agent-pipeline}"
+REPO="${AGENT_PIPELINE_REPO:-accidental-hedge-fund/agent-pipeline}"
 REF="${AGENT_PIPELINE_REF:-main}"
 CACHE="${AGENT_PIPELINE_CACHE:-$HOME/.cache/agent-pipeline}"
 
