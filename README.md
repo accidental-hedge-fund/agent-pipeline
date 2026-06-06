@@ -54,6 +54,7 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
     Claude-side skill or plugin is required** — only `claude` installed and authenticated. Override
     the companion path with `PIPELINE_CC_COMPANION`. (The installer warns if it's missing.)
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
+- **Optional: the [OpenSpec](https://openspec.dev/) CLI** (`npm i -g @fission-ai/openspec`) — only for repos that opt into the OpenSpec flow (see "OpenSpec integration (optional)"). Not needed otherwise.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
 
 The installer prints a prerequisite checklist (warnings don't block install).
