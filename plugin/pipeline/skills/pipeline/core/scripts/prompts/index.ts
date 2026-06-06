@@ -66,6 +66,20 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
   });
 }
 
+/** OpenSpec-mode planning: the implementer authors a change (proposal/tasks/
+ *  spec deltas) instead of a freeform plan. */
+export function buildPlanningOpenspecPrompt(a: BuildPlanArgs): string {
+  const dc = domainContext(a.cfg);
+  return substitute(loadTemplate("planning_openspec"), {
+    domain_name: dc.name,
+    domain_description: dc.description,
+    conventions: readConventions(a.cfg),
+    issue_number: String(a.issueNumber),
+    title: a.title,
+    body: a.body || "(no description)",
+  });
+}
+
 export interface BuildPlanReviewArgs extends BuildPlanArgs {
   plan: string;
   reviewer: string;

@@ -29,10 +29,12 @@ import {
 } from "../worktree.ts";
 import {
   buildImplementingPrompt,
+  buildPlanningOpenspecPrompt,
   buildPlanningPrompt,
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
+import * as openspec from "../openspec.ts";
 import type { Harness, Outcome, PipelineConfig } from "../types.ts";
 
 export interface AdvanceOpts {
@@ -46,6 +48,10 @@ export async function advance(
   issueNumber: number,
   opts: AdvanceOpts = {},
 ): Promise<Outcome> {
+  if (openspec.isActive(cfg, cfg.repo_dir)) {
+    return advanceOpenspec(cfg, issueNumber, opts);
+  }
+
   const detail = await getIssueDetail(cfg, issueNumber);
   const title = detail.title;
   const body = detail.body;
@@ -274,6 +280,235 @@ export async function advance(
     to: "review-1",
     summary: `PR #${prNumber} opened after plan-review`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// OpenSpec planning flow (active when the target repo uses OpenSpec).
+//
+// Differs from the freeform flow above: the worktree is created FIRST (OpenSpec
+// artifacts are files under `openspec/changes/<id>/`), the implementer authors a
+// change (proposal/tasks/spec deltas) instead of a freeform plan, the change is
+// validated structurally, and its proposal drives the cross-harness plan-review.
+// ---------------------------------------------------------------------------
+
+async function advanceOpenspec(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  opts: AdvanceOpts,
+): Promise<Outcome> {
+  const detail = await getIssueDetail(cfg, issueNumber);
+  const { title, body } = detail;
+  const primary: Harness = cfg.harnesses.implementer;
+  const reviewer: Harness = cfg.harnesses.reviewer;
+
+  console.log(
+    `[pipeline] #${issueNumber}: planning (OpenSpec; impl=${primary}, plan-review=${reviewer})`,
+  );
+
+  if (opts.dryRun) {
+    console.log(
+      `[pipeline] #${issueNumber}: [dry-run] would author + ${reviewer} review + revise an OpenSpec change + implement + open PR`,
+    );
+    return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] openspec planning" };
+  }
+
+  // ---- Worktree first: OpenSpec artifacts are files in the change folder. ----
+  const slug = slugify(title) || `issue-${issueNumber}`;
+  let wt: { path: string; branch: string };
+  try {
+    wt = await createWorktree(cfg, issueNumber, slug);
+    console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
+  } catch (err) {
+    const e = err as Error;
+    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, "ready");
+    return { advanced: false, status: "blocked", reason: e.message };
+  }
+
+  // ---- Author the OpenSpec change (intent only, no code). ----
+  const before = openspec.listChangeDirs(wt.path);
+  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body }), {
+    timeoutSec: cfg.implementation_timeout,
+    model: opts.model ?? cfg.models.planning,
+  });
+  if (!planResult.success) {
+    const reason = planResult.timed_out
+      ? `timed out after ${planResult.duration.toFixed(0)}s`
+      : `exit ${planResult.exit_code}`;
+    await setBlocked(cfg, issueNumber, `OpenSpec proposal authoring (${primary}) failed: ${reason}`, "ready");
+    return { advanced: false, status: "blocked", reason };
+  }
+
+  // ---- Discover the change the implementer created. ----
+  const after = openspec.listChangeDirs(wt.path);
+  const fresh = after.filter((c) => !before.includes(c));
+  const changeId = fresh[0] ?? (after.length === 1 ? after[0] : undefined);
+  if (!changeId) {
+    await setBlocked(
+      cfg,
+      issueNumber,
+      "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
+        "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`).",
+      "ready",
+    );
+    return { advanced: false, status: "blocked", reason: "no openspec change created" };
+  }
+  console.log(`[pipeline] #${issueNumber}: OpenSpec change \`${changeId}\` drafted`);
+
+  // ---- Validate the change structurally. ----
+  const v1 = await openspec.validateItem(wt.path, changeId);
+  if (!v1.unavailable && !v1.valid) {
+    await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` is invalid:\n${formatIssues(v1)}`, "planning");
+    return { advanced: false, status: "blocked", reason: "openspec change invalid" };
+  }
+
+  const proposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || "(proposal.md not found)";
+
+  // ---- ready → planning, post the proposal as the plan. ----
+  await transition(cfg, issueNumber, "ready", "planning", `OpenSpec change \`${changeId}\` drafted by ${primary}.`);
+  await postComment(
+    cfg,
+    issueNumber,
+    `## Implementation Plan\n\n_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}${footer(cfg)}`,
+  );
+  try {
+    await addLabel(cfg, issueNumber, `harness:${primary}`);
+  } catch {
+    /* idempotent */
+  }
+
+  // ---- planning → plan-review (reviewer reviews the proposed intent). ----
+  await transition(
+    cfg,
+    issueNumber,
+    "planning",
+    "plan-review",
+    `OpenSpec proposal by ${primary}. ${reviewer} reviewing intent before implementation.`,
+  );
+  const reviewResult = await invoke(
+    reviewer,
+    wt.path,
+    buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary }),
+    { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
+  );
+  if (!reviewResult.success || !reviewResult.stdout.trim()) {
+    const reason = reviewResult.timed_out
+      ? `timed out after ${reviewResult.duration.toFixed(0)}s`
+      : `exit ${reviewResult.exit_code}`;
+    await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review");
+    return { advanced: false, status: "blocked", reason };
+  }
+  const planReview = reviewResult.stdout.trim();
+  await postComment(
+    cfg,
+    issueNumber,
+    `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`,
+  );
+
+  // ---- Implementer revises the change per feedback. ----
+  const revisionResult = await invoke(
+    primary,
+    wt.path,
+    buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary }),
+    { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
+  );
+  if (!revisionResult.success || !revisionResult.stdout.trim()) {
+    const reason = revisionResult.timed_out
+      ? `timed out after ${revisionResult.duration.toFixed(0)}s`
+      : `exit ${revisionResult.exit_code}`;
+    await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
+    return { advanced: false, status: "blocked", reason };
+  }
+  const v2 = await openspec.validateItem(wt.path, changeId);
+  if (!v2.unavailable && !v2.valid) {
+    await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`, "plan-review");
+    return { advanced: false, status: "blocked", reason: "openspec change invalid after revision" };
+  }
+  const revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || proposal;
+  await postComment(
+    cfg,
+    issueNumber,
+    `## Revised Implementation Plan\n\n**Updated by**: ${primary}\n**Based on review by**: ${reviewer}\n_OpenSpec change \`${changeId}\`_\n\n${revisedProposal}${footer(cfg)}`,
+  );
+
+  // ---- plan-review → implementing (work the change's task checklist). ----
+  await transition(
+    cfg,
+    issueNumber,
+    "plan-review",
+    "implementing",
+    `OpenSpec proposal reviewed by ${reviewer}, revised by ${primary}. Implementation starting with ${primary}.`,
+  );
+  const tasks = openspec.readChangeFile(wt.path, changeId, "tasks.md")?.trim() ?? "";
+  const implPlan =
+    `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
+    `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
+    `${revisedProposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`;
+  const result = await invoke(
+    primary,
+    wt.path,
+    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan }),
+    { timeoutSec: cfg.implementation_timeout, model: opts.model },
+  );
+  if (!result.success) {
+    const reason = result.timed_out ? `timed out after ${result.duration.toFixed(0)}s` : `exit ${result.exit_code}`;
+    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) failed: ${reason}`, "implementing");
+    return { advanced: false, status: "blocked", reason };
+  }
+  console.log(`[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`);
+
+  // ---- Verify commits, push, open PR, implementing → review-1. ----
+  if (!(await hasCommitsAhead(wt.path, cfg.base_branch))) {
+    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing");
+    return { advanced: false, status: "blocked", reason: "no commits produced" };
+  }
+  const branch = branchName(issueNumber, slug);
+  const push = await gitInWorktree(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
+  if (push.code !== 0) {
+    await setBlocked(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing");
+    return { advanced: false, status: "blocked", reason: "push failed" };
+  }
+  const planExcerpt =
+    revisedProposal.length > 2000 ? revisedProposal.slice(0, 2000) + "\n\n[…proposal truncated]" : revisedProposal;
+  const prBody = [
+    `Closes #${issueNumber}`,
+    "",
+    `## Summary`,
+    `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
+    "",
+    `**Implemented by**: ${primary}`,
+    `**Plan reviewed by**: ${reviewer}`,
+    `**OpenSpec change**: \`${changeId}\``,
+    "",
+    `## Proposal`,
+    planExcerpt,
+  ].join("\n") + footer(cfg);
+  let prNumber: number;
+  try {
+    prNumber = await createPr(cfg, { branch, title: `[Pipeline] ${title} (#${issueNumber})`, body: prBody });
+  } catch (err) {
+    const existing = await getPrForIssue(cfg, issueNumber);
+    if (existing) {
+      prNumber = existing;
+    } else {
+      await setBlocked(cfg, issueNumber, `PR creation failed: ${(err as Error).message}`, "implementing");
+      return { advanced: false, status: "blocked", reason: (err as Error).message };
+    }
+  }
+  console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
+  await transition(
+    cfg,
+    issueNumber,
+    "implementing",
+    "review-1",
+    `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
+  );
+  return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
+}
+
+function formatIssues(v: { issues: { item?: string; message: string }[]; raw: string }): string {
+  return v.issues.length
+    ? v.issues.map((i) => `- ${i.item ? `${i.item}: ` : ""}${i.message}`).join("\n")
+    : v.raw;
 }
 
 function footer(cfg: PipelineConfig): string {
