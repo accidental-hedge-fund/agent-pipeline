@@ -3,3 +3,6 @@ node_modules/
 *.log
 .DS_Store
 *.tgz
+
+# Pipeline worktrees (created under .claude/worktrees/ by the worktree policy)
+.claude/worktrees/
