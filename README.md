@@ -152,6 +152,9 @@ directory), the pipeline runs a spec-first flow:
   which the *other* harness plan-reviews as intent before any code is written. The
   change is validated structurally (`openspec validate <id>`) at draft and after
   revision, and implementation works the change's `tasks.md`.
+- **Review** — the change's spec deltas are fed into the standard and adversarial
+  review prompts as the intended behavior, so reviews check whether the diff
+  actually satisfies the spec, not just whether the code looks correct.
 - **Pre-merge gate** — runs `openspec validate --all` in the worktree and refuses
   `pipeline:ready-to-deploy` if the change's specs/deltas are structurally invalid.
 

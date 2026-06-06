@@ -25,6 +25,7 @@ import {
   buildReviewStandardPrompt,
 } from "../prompts/index.ts";
 import { getForIssue } from "../worktree.ts";
+import * as openspec from "../openspec.ts";
 import type {
   Outcome,
   PipelineConfig,
@@ -201,9 +202,12 @@ async function invokeClaudeCodeReview(
   cwd: string,
   opts: AdvanceReviewOpts,
 ): Promise<HarnessResult> {
+  const specHint = openspec.isActive(cfg, cwd)
+    ? " The intended behavior is specified under openspec/changes/<change>/specs/ — verify the diff satisfies those spec deltas."
+    : "";
   const focusText =
     round === 2
-      ? `Pipeline adversarial review for issue #${issueNumber}: challenge whether the PR fully satisfies "${title}" and whether review-1 missed material risk.`
+      ? `Pipeline adversarial review for issue #${issueNumber}: challenge whether the PR fully satisfies "${title}" and whether review-1 missed material risk.${specHint}`
       : undefined;
   const command = buildClaudeCodeReviewCommand(cfg, round, {
     model: opts.model ?? cfg.models.review,
@@ -231,13 +235,21 @@ async function invokePromptHarnessReview(
   cwd: string,
   opts: AdvanceReviewOpts,
 ): Promise<HarnessResult> {
+  const specContext = openspecContext(cfg, cwd);
   const prompt = round === 1
-    ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff })
-    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary });
+    ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
+    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, specContext });
   return invoke(cfg.harnesses.reviewer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
     model: opts.model ?? cfg.models.review,
   });
+}
+
+/** OpenSpec spec deltas for the worktree's change, or "" when not applicable. */
+function openspecContext(cfg: PipelineConfig, cwd: string): string {
+  if (!openspec.isActive(cfg, cwd)) return "";
+  const changes = openspec.listChangeDirs(cwd);
+  return changes.length ? openspec.readSpecDeltas(cwd, changes[0]) : "";
 }
 
 // ---------------------------------------------------------------------------

@@ -115,6 +115,38 @@ export function readChangeFile(dir: string, name: string, file: string): string 
   }
 }
 
+/**
+ * Concatenate a change's spec delta files (`openspec/changes/<name>/specs/**.md`)
+ * into a single markdown block — the "intended behavior" to anchor reviews on.
+ * Empty string when the change has no spec deltas.
+ */
+export function readSpecDeltas(dir: string, name: string): string {
+  const base = path.join(dir, "openspec", "changes", name, "specs");
+  const parts: string[] = [];
+  const walk = (d: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(p);
+      } else if (e.isFile() && e.name.endsWith(".md")) {
+        try {
+          parts.push(`#### ${path.relative(base, p)}\n\n${fs.readFileSync(p, "utf8").trim()}`);
+        } catch {
+          /* skip unreadable file */
+        }
+      }
+    }
+  };
+  walk(base);
+  return parts.join("\n\n");
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------

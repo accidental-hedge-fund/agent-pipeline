@@ -12,6 +12,7 @@ import {
   listChangeDirs,
   parseValidateResult,
   readChangeFile,
+  readSpecDeltas,
 } from "../scripts/openspec.ts";
 
 function tmpDir(): string {
@@ -101,4 +102,18 @@ test("changeDirExists + readChangeFile", () => {
   assert.equal(changeDirExists(dir, "nope"), false);
   assert.match(readChangeFile(dir, "add-auth", "proposal.md") ?? "", /Proposal/);
   assert.equal(readChangeFile(dir, "add-auth", "missing.md"), null);
+});
+
+test("readSpecDeltas: concatenates spec delta markdown under a change", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "add-auth", "specs", "auth");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "## ADDED Requirement: login\nuser can log in");
+  const out = readSpecDeltas(dir, "add-auth");
+  assert.match(out, /Requirement: login/);
+  assert.match(out, /user can log in/);
+});
+
+test("readSpecDeltas: empty string when the change has no specs", () => {
+  assert.equal(readSpecDeltas(tmpDir(), "nope"), "");
 });

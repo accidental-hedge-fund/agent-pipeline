@@ -9,6 +9,8 @@ Your job is to break confidence in the change, not to validate it.
 
 {{review1_section}}
 
+{{spec_context}}
+
 ## Operating Stance
 
 Default to skepticism.

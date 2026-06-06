@@ -10,6 +10,8 @@ You are performing a standard code review for {{domain_name}}, {{domain_descript
 
 {{plan}}
 
+{{spec_context}}
+
 ## Review Checklist
 
 Evaluate the diff against these criteria:
