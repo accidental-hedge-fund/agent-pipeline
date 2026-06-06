@@ -49,8 +49,9 @@ export interface PipelineConfig {
   harnesses: { implementer: Harness; reviewer: Harness };
   models: { planning: string; review: string; fix: string };
   // OpenSpec (spec-driven development) integration. "auto" activates only when
-  // the target repo has an `openspec/` directory; "on"/"off" force it.
-  openspec: { enabled: OpenspecMode };
+  // the target repo has an `openspec/` directory; "on"/"off" force it. When
+  // `bootstrap` is true, planning runs `openspec init` on repos that lack it.
+  openspec: { enabled: OpenspecMode; bootstrap: boolean };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -70,7 +71,7 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   ci_poll_interval: 30,
   harnesses: { implementer: "codex", reviewer: "claude" },
   models: { planning: "sonnet", review: "opus", fix: "sonnet" },
-  openspec: { enabled: "auto" },
+  openspec: { enabled: "auto", bootstrap: false },
 };
 
 // One transition outcome from a stage advance call.

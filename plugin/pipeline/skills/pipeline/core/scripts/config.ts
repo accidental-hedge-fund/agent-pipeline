@@ -34,7 +34,10 @@ const PartialConfigSchema = z.object({
     })
     .optional(),
   openspec: z
-    .object({ enabled: z.enum(["auto", "on", "off"]) })
+    .object({
+      enabled: z.enum(["auto", "on", "off"]).optional(),
+      bootstrap: z.boolean().optional(),
+    })
     .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
@@ -125,7 +128,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     // but do not let repo config invert the invoking harness ownership split.
     harnesses: profile.harnesses,
     models: fileConfig.models ?? DEFAULT_CONFIG.models,
-    openspec: fileConfig.openspec ?? DEFAULT_CONFIG.openspec,
+    openspec: {
+      enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
+      bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
+    },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,

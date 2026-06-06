@@ -73,6 +73,19 @@ export function isInitialized(dir: string): boolean {
   }
 }
 
+/**
+ * Whether the PLANNING stage should use the OpenSpec flow. Unlike isActive
+ * (which gates the worktree-time review/pre-merge steps), this also returns true
+ * for an uninitialized repo when bootstrap is enabled — planning then runs
+ * `openspec init` in the worktree before authoring the change.
+ */
+export function shouldPlanWithOpenspec(cfg: Pick<PipelineConfig, "openspec">, repoDir: string): boolean {
+  const mode = cfg.openspec?.enabled ?? "auto";
+  if (mode === "off") return false;
+  if (mode === "on") return true;
+  return isInitialized(repoDir) || Boolean(cfg.openspec?.bootstrap);
+}
+
 /** Resolve whether the OpenSpec integration is active for this repo. */
 export function isActive(cfg: Pick<PipelineConfig, "openspec">, dir: string): boolean {
   const mode = cfg.openspec?.enabled ?? "auto";
@@ -182,6 +195,22 @@ export interface ArchiveResult {
 /** `openspec archive <name> --yes` — merges delta specs and moves the change to archive/. */
 export async function archive(dir: string, name: string, timeoutMs = 60_000): Promise<ArchiveResult> {
   const r = await runOpenspec(dir, ["archive", name, "--yes"], timeoutMs);
+  return {
+    success: r.code === 0 && !r.unavailable,
+    unavailable: r.unavailable,
+    output: `${r.stdout}${r.stderr}`.trim(),
+  };
+}
+
+export interface InitResult {
+  success: boolean;
+  unavailable: boolean;
+  output: string;
+}
+
+/** `openspec init --tools <tools>` — scaffolds an OpenSpec workspace in `dir`. */
+export async function init(dir: string, tools = "claude,codex", timeoutMs = 120_000): Promise<InitResult> {
+  const r = await runOpenspec(dir, ["init", "--tools", tools], timeoutMs);
   return {
     success: r.code === 0 && !r.unavailable,
     unavailable: r.unavailable,

@@ -14,6 +14,7 @@ import {
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
+  shouldPlanWithOpenspec,
 } from "../scripts/openspec.ts";
 
 function tmpDir(): string {
@@ -128,4 +129,18 @@ test("changeIdsFromPaths: distinct active change ids, excludes archive + non-cha
     "openspec/specs/auth/spec.md",
   ];
   assert.deepEqual(changeIdsFromPaths(paths).sort(), ["add-auth"]);
+});
+
+test("shouldPlanWithOpenspec: off → false, on → true", () => {
+  const d = tmpDir();
+  assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "off", bootstrap: true } }, d), false);
+  assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "on", bootstrap: false } }, d), true);
+});
+
+test("shouldPlanWithOpenspec: auto follows init, or bootstrap when uninitialized", () => {
+  const d = tmpDir();
+  assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: false } }, d), false);
+  assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: true } }, d), true);
+  fs.mkdirSync(path.join(d, "openspec"));
+  assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: false } }, d), true);
 });

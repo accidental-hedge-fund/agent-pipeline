@@ -139,6 +139,7 @@ domain_name: my-service
 domain_description: a payments service
 openspec:
   enabled: auto                      # auto (default) | on | off — see "OpenSpec integration"
+  bootstrap: false                   # if true, run `openspec init` on repos that lack openspec/
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
 
@@ -160,9 +161,12 @@ directory), the pipeline runs a spec-first flow:
   and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
 
 It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to
-require OpenSpec everywhere or `off` to disable. The `openspec` CLI must be on PATH
-— if it's missing the pre-merge gate is skipped (non-blocking), and planning blocks
-with an install hint. No `openspec/` dir means no behavior change, so the pipeline
+require OpenSpec everywhere or `off` to disable. By default the pipeline only uses
+OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have
+**planning run `openspec init`** (committed to the PR) on repos that lack an
+`openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing the
+pre-merge gate is skipped (non-blocking) and planning blocks with an install hint.
+No `openspec/` dir (and no bootstrap) means no behavior change, so the pipeline
 stays usable on any repo.
 
 ## How the two hosts share one core
