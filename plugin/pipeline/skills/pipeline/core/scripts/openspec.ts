@@ -169,6 +169,40 @@ async function runValidate(dir: string, args: string[], timeoutMs: number): Prom
   return parseValidateResult(r.code, `${r.stdout}${r.stderr}`);
 }
 
+// ---------------------------------------------------------------------------
+// Archive (fold a completed change's deltas into the living specs)
+// ---------------------------------------------------------------------------
+
+export interface ArchiveResult {
+  success: boolean;
+  unavailable: boolean;
+  output: string;
+}
+
+/** `openspec archive <name> --yes` — merges delta specs and moves the change to archive/. */
+export async function archive(dir: string, name: string, timeoutMs = 60_000): Promise<ArchiveResult> {
+  const r = await runOpenspec(dir, ["archive", name, "--yes"], timeoutMs);
+  return {
+    success: r.code === 0 && !r.unavailable,
+    unavailable: r.unavailable,
+    output: `${r.stdout}${r.stderr}`.trim(),
+  };
+}
+
+/**
+ * Distinct active change ids referenced by a list of repo-relative paths
+ * (matches `openspec/changes/<id>/…`, excludes the `archive` folder). Pure;
+ * exported for tests. Used to find the change(s) a PR branch introduced.
+ */
+export function changeIdsFromPaths(paths: string[]): string[] {
+  const ids = new Set<string>();
+  for (const p of paths) {
+    const m = p.replace(/\\/g, "/").match(/(?:^|\/)openspec\/changes\/([^/]+)\//);
+    if (m && m[1] !== "archive") ids.add(m[1]);
+  }
+  return [...ids];
+}
+
 /**
  * Pure parser. Exit code is the source of truth for pass/fail (0 = valid). The
  * `--json` payload is parsed best-effort to surface issue messages; if it isn't

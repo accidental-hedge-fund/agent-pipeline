@@ -155,8 +155,9 @@ directory), the pipeline runs a spec-first flow:
 - **Review** — the change's spec deltas are fed into the standard and adversarial
   review prompts as the intended behavior, so reviews check whether the diff
   actually satisfies the spec, not just whether the code looks correct.
-- **Pre-merge gate** — runs `openspec validate --all` in the worktree and refuses
-  `pipeline:ready-to-deploy` if the change's specs/deltas are structurally invalid.
+- **Finalize (pre-merge)** — folds the change into the living specs
+  (`openspec archive`, committed to the PR), then runs `openspec validate --all`
+  and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
 
 It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to
 require OpenSpec everywhere or `off` to disable. The `openspec` CLI must be on PATH

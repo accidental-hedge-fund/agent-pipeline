@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   changeDirExists,
+  changeIdsFromPaths,
   isActive,
   isInitialized,
   listChangeDirs,
@@ -116,4 +117,15 @@ test("readSpecDeltas: concatenates spec delta markdown under a change", () => {
 
 test("readSpecDeltas: empty string when the change has no specs", () => {
   assert.equal(readSpecDeltas(tmpDir(), "nope"), "");
+});
+
+test("changeIdsFromPaths: distinct active change ids, excludes archive + non-change paths", () => {
+  const paths = [
+    "openspec/changes/add-auth/proposal.md",
+    "openspec/changes/add-auth/tasks.md",
+    "openspec/changes/archive/2026-01-01-old/specs/x/spec.md",
+    "src/index.ts",
+    "openspec/specs/auth/spec.md",
+  ];
+  assert.deepEqual(changeIdsFromPaths(paths).sort(), ["add-auth"]);
 });
