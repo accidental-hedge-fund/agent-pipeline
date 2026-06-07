@@ -26,6 +26,7 @@ import {
   isBlocked,
   pickStage,
   postComment,
+  transition,
 } from "./gh.ts";
 import { isKillSwitchActive, withLock } from "./lock.ts";
 import * as planningStage from "./stages/planning.ts";
@@ -34,7 +35,7 @@ import * as fixStage from "./stages/fix.ts";
 import * as preMergeStage from "./stages/pre_merge.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
-import { LABEL_PREFIX, type Outcome, type PipelineConfig, type Stage } from "./types.ts";
+import { LABEL_PREFIX, reviewStageSkipTarget, type Outcome, type PipelineConfig, type Stage } from "./types.ts";
 
 const MAX_ITERATIONS = 12;
 
@@ -273,6 +274,20 @@ async function runAdvance(
           `[pipeline] To unblock: $pipeline ${issueNumber} --unblock "<answer>"`,
         );
         break;
+      }
+
+      // #13: skip disabled review stages, keeping a valid forward path.
+      if (
+        (stage === "review-1" && !cfg.steps.standard_review) ||
+        (stage === "review-2" && !cfg.steps.adversarial_review)
+      ) {
+        const to = reviewStageSkipTarget(cfg, stage);
+        await transition(cfg, issueNumber, stage, to, `${stage} step disabled in this repo's config; skipping.`);
+        console.log(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
+        transitions++;
+        lastStage = to;
+        if (opts.once) break;
+        continue;
       }
 
       const out = await dispatch(cfg, issueNumber, stage, opts);

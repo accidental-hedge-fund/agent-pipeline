@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { STAGES, type Stage } from "../scripts/types.ts";
+import { reviewStageSkipTarget, STAGES, type Stage } from "../scripts/types.ts";
 
 interface ExpectedTransition {
   from: Stage;
@@ -79,4 +79,16 @@ test("state machine: STAGES order is forward", () => {
     "ready-to-deploy",
   ];
   assert.deepEqual([...STAGES], expected);
+});
+
+test("step config (#13): review skip targets keep a valid forward path", () => {
+  const cfg = (s: Partial<{ standard_review: boolean; adversarial_review: boolean }>) => ({
+    steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true, ...s },
+  });
+  // review-1 disabled, adversarial still on → fall through to review-2
+  assert.equal(reviewStageSkipTarget(cfg({ standard_review: false }), "review-1"), "review-2");
+  // review-1 disabled and adversarial also off → straight to pre-merge
+  assert.equal(reviewStageSkipTarget(cfg({ standard_review: false, adversarial_review: false }), "review-1"), "pre-merge");
+  // review-2 disabled → always pre-merge
+  assert.equal(reviewStageSkipTarget(cfg({ adversarial_review: false }), "review-2"), "pre-merge");
 });

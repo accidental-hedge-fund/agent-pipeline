@@ -53,6 +53,7 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
     assert.equal(cfg.auto_merge, false);
     assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude" });
+    assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
     process.env.PATH = oldPath;
   }
@@ -112,6 +113,38 @@ test("resolveConfig: --base override wins over file value", async () => {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
     const cfg = cfgMod.resolveConfig({ repoPath: repo, baseBranch: "develop" });
     assert.equal(cfg.base_branch, "develop");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: a configurable step can be disabled, others stay default-on", async () => {
+  const repo = makeFakeRepo(`steps:\n  adversarial_review: false\n  docs: false\n`);
+  const binDir = makeFakeGh("acme/steps1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.steps.adversarial_review, false);
+    assert.equal(cfg.steps.docs, false);
+    assert.equal(cfg.steps.standard_review, true); // unspecified → default on
+    assert.equal(cfg.steps.plan_review, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: disabling a protected step is rejected (strict schema)", async () => {
+  // CI / mergeability / planning / implementing are not configurable; an unknown
+  // step key is rejected at parse time rather than silently dropping a safety gate.
+  const repo = makeFakeRepo(`steps:\n  mergeability: false\n`);
+  const binDir = makeFakeGh("acme/steps2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
   } finally {
     process.env.PATH = oldPath;
   }

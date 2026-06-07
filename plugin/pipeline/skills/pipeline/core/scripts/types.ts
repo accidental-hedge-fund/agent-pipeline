@@ -55,6 +55,16 @@ export interface PipelineConfig {
   // last30days pre-planning brief (opt-in; default off). Adds external public
   // discourse for the issue topic as carry-forward context for planning.
   last30days: { enabled: boolean; timeout: number };
+  // Configurable pipeline steps (#13). Per-repo on/off for the optional
+  // "thoroughness" steps. Structural/safety steps (planning, implementing, and
+  // the pre-merge CI + mergeability gates) have no toggle and are always on —
+  // attempting to disable them is rejected at config-parse time (strict schema).
+  steps: {
+    plan_review: boolean;
+    standard_review: boolean;
+    adversarial_review: boolean;
+    docs: boolean;
+  };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -76,7 +86,21 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   models: { planning: "sonnet", review: "opus", fix: "sonnet" },
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
+  steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
 };
+
+// ---------------------------------------------------------------------------
+// Step routing (#13): structural/safety steps are always on, so the spine
+// planning → implementing → pre-merge → ready-to-deploy is always intact. Only
+// review rounds are skipped here (centrally, by the orchestrator); plan-review
+// and docs are skipped inside their own stages.
+// ---------------------------------------------------------------------------
+
+/** When a review stage is disabled, the next stage to advance to. */
+export function reviewStageSkipTarget(cfg: Pick<PipelineConfig, "steps">, stage: Stage): Stage {
+  if (stage === "review-1") return cfg.steps.adversarial_review ? "review-2" : "pre-merge";
+  return "pre-merge";
+}
 
 // One transition outcome from a stage advance call.
 export type Outcome =
