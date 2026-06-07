@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -144,6 +145,25 @@ function companionPresent() {
   ].some((p) => existsSync(p));
 }
 
+// The Claude (/pipeline) profile reviews by driving Codex through the
+// codex-plugin-cc companion (codex-companion.mjs). It is a SEPARATE Claude Code
+// plugin, not shipped here. Detect it so a Claude install surfaces the dependency.
+function codexCompanionPresent() {
+  if (process.env.PIPELINE_CODEX_COMPANION) return existsSync(process.env.PIPELINE_CODEX_COMPANION);
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(HOME, ".claude");
+  const candidates = [
+    join(claudeDir, "plugins", "marketplaces", "openai-codex", "plugins", "codex", "scripts", "codex-companion.mjs"),
+  ];
+  // Versioned install cache: plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs
+  const cacheBase = join(claudeDir, "plugins", "cache", "openai-codex", "codex");
+  if (existsSync(cacheBase)) {
+    for (const version of readdirSync(cacheBase)) {
+      candidates.push(join(cacheBase, version, "scripts", "codex-companion.mjs"));
+    }
+  }
+  return candidates.some((p) => existsSync(p));
+}
+
 function preflight(hosts) {
   log("\nPrerequisite check (warnings do not block install; the skill needs these at run time):");
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
@@ -169,6 +189,16 @@ function preflight(hosts) {
         "Codex review needs the cc-plugin-codex companion (claude-companion.mjs). " +
           "Install it with `npx cc-plugin-codex install`, then `claude auth login`. " +
           "(Override its path with PIPELINE_CC_COMPANION.)",
+      );
+  }
+  if (hosts.includes("claude")) {
+    if (codexCompanionPresent()) log("  ✓ codex companion (codex-companion.mjs) — needed for /pipeline review");
+    else
+      warn(
+        "Claude review needs the codex-plugin-cc companion (codex-companion.mjs). " +
+          "Install it in Claude Code with `/plugin marketplace add openai/codex-plugin-cc` then " +
+          "`/plugin install codex@openai-codex`, and ensure the `codex` CLI is authenticated. " +
+          "(Override its path with PIPELINE_CODEX_COMPANION.)",
       );
   }
   log("");

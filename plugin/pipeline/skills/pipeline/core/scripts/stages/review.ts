@@ -3,10 +3,15 @@
 //   review-1 → review-2 (approve) OR fix-1 (needs-attention)
 //   review-2 → pre-merge (approve) OR fix-2 (needs-attention)
 //
-// Review runs through the Codex Claude Code companion, mirroring $cc:review
-// for review-1 and $cc:adversarial-review for review-2. Output is parsed from
-// structured JSON when present; otherwise text verdict detection is
-// conservative and defaults to "needs-attention".
+// When the profile's review_mode is a *companion* mode, review runs through a
+// cross-harness reviewer plugin: "claude-companion" drives Claude Code via
+// cc-plugin-codex ($cc:review / $cc:adversarial-review); "codex-companion"
+// drives Codex via codex-plugin-cc (/codex:review / /codex:adversarial-review).
+// review-1 maps to the plugin's standard review, review-2 to its adversarial
+// review. Output is parsed from structured JSON when present; otherwise text
+// verdict detection is conservative and defaults to "needs-attention".
+// "prompt-harness" mode instead runs the reviewer CLI directly with the
+// pipeline's own review prompt.
 
 import * as os from "node:os";
 import * as path from "node:path";
@@ -36,6 +41,8 @@ import type {
 
 const REVIEW_MARKER_PREFIX_R1 = "## Review 1";
 const REVIEW_MARKER_PREFIX_R2 = "## Review 2";
+// cc-plugin-codex companion (drives Claude Code from Codex). Installed under
+// CODEX_HOME; override with PIPELINE_CC_COMPANION.
 const DEFAULT_CC_COMPANION = path.join(
   os.homedir(),
   ".codex",
@@ -48,35 +55,100 @@ const DEFAULT_CC_COMPANION = path.join(
   "claude-companion.mjs",
 );
 
+// codex-plugin-cc companion (drives Codex from Claude Code). Installed under the
+// Claude plugin marketplace dir; override with PIPELINE_CODEX_COMPANION.
+const DEFAULT_CODEX_COMPANION = path.join(
+  process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"),
+  "plugins",
+  "marketplaces",
+  "openai-codex",
+  "plugins",
+  "codex",
+  "scripts",
+  "codex-companion.mjs",
+);
+
+export type CompanionMode = "claude-companion" | "codex-companion";
+
+interface CompanionSpec {
+  /** Default companion script path when no override env var / arg is set. */
+  defaultPath: string;
+  /** Env var that overrides the companion script path. */
+  envVar: string;
+  /** Reviewer labels for [round 1 (standard), round 2 (adversarial)]. */
+  labels: readonly [string, string];
+  /**
+   * claude-companion's review is a prompt-driven Claude turn that honors
+   * --view-state and --model (a Claude model name). codex-companion's standard
+   * review maps to Codex's *native* reviewer, which honors neither: an unknown
+   * --view-state flag and any extra positional are treated as review focus text
+   * (which native review rejects), and --model expects a Codex model — not the
+   * Claude model name ("opus") the pipeline carries. So both are gated per mode.
+   */
+  viewState: boolean;
+  passModel: boolean;
+}
+
+const COMPANIONS: Record<CompanionMode, CompanionSpec> = {
+  "claude-companion": {
+    defaultPath: DEFAULT_CC_COMPANION,
+    envVar: "PIPELINE_CC_COMPANION",
+    labels: ["$cc:review", "$cc:adversarial-review"],
+    viewState: true,
+    passModel: true,
+  },
+  "codex-companion": {
+    defaultPath: DEFAULT_CODEX_COMPANION,
+    envVar: "PIPELINE_CODEX_COMPANION",
+    labels: ["/codex:review", "/codex:adversarial-review"],
+    viewState: false,
+    passModel: false,
+  },
+};
+
+export function isCompanionMode(mode: string): mode is CompanionMode {
+  return mode === "claude-companion" || mode === "codex-companion";
+}
+
+/** Human-readable reviewer label for summaries, given the configured review mode. */
+export function reviewerLabel(cfg: Pick<PipelineConfig, "review_mode" | "harnesses">): string {
+  if (isCompanionMode(cfg.review_mode)) {
+    const spec = COMPANIONS[cfg.review_mode];
+    const name = cfg.review_mode === "claude-companion" ? "Claude Code" : "Codex";
+    return `${name} (${spec.labels[0]} + ${spec.labels[1]})`;
+  }
+  return cfg.harnesses.reviewer;
+}
+
 export interface AdvanceReviewOpts {
   dryRun?: boolean;
   model?: string;
 }
 
-export interface ClaudeCodeReviewCommand {
+export interface CompanionReviewCommand {
   cmd: string;
   args: string[];
-  label: "$cc:review" | "$cc:adversarial-review";
+  label: string;
 }
 
-export function buildClaudeCodeReviewCommand(
+export function buildCompanionReviewCommand(
+  mode: CompanionMode,
   cfg: Pick<PipelineConfig, "base_branch">,
   round: 1 | 2,
   opts: { model?: string; focusText?: string; companionPath?: string } = {},
-): ClaudeCodeReviewCommand {
+): CompanionReviewCommand {
+  const spec = COMPANIONS[mode];
   const subcommand = round === 1 ? "review" : "adversarial-review";
-  const label = round === 1 ? "$cc:review" : "$cc:adversarial-review";
+  const label = spec.labels[round - 1];
   const args = [
-    opts.companionPath ?? process.env.PIPELINE_CC_COMPANION ?? DEFAULT_CC_COMPANION,
+    opts.companionPath ?? process.env[spec.envVar] ?? spec.defaultPath,
     subcommand,
-    "--view-state",
-    "on-success",
-    "--scope",
-    "branch",
-    "--base",
-    cfg.base_branch,
   ];
-  if (opts.model) args.push("--model", opts.model);
+  if (spec.viewState) args.push("--view-state", "on-success");
+  args.push("--scope", "branch", "--base", cfg.base_branch);
+  if (spec.passModel && opts.model) args.push("--model", opts.model);
+  // Round-2 adversarial review takes free-text focus as a positional. It MUST
+  // be appended last so no flag is misparsed as focus text by the companion.
   if (round === 2 && opts.focusText?.trim()) args.push(opts.focusText.trim());
   return { cmd: "node", args, label };
 }
@@ -88,8 +160,9 @@ export async function advanceReview(
   opts: AdvanceReviewOpts = {},
 ): Promise<Outcome> {
   const stage: Stage = round === 1 ? "review-1" : "review-2";
-  const reviewer = cfg.review_mode === "claude-companion"
-    ? (round === 1 ? "$cc:review" : "$cc:adversarial-review")
+  const companionMode = isCompanionMode(cfg.review_mode) ? cfg.review_mode : null;
+  const reviewer = companionMode
+    ? COMPANIONS[companionMode].labels[round - 1]
     : cfg.harnesses.reviewer;
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${reviewer}`);
@@ -126,8 +199,8 @@ export async function advanceReview(
   const wt = await getForIssue(cfg, issueNumber);
   const cwd = wt?.path ?? cfg.repo_dir;
 
-  const result = cfg.review_mode === "claude-companion"
-    ? await invokeClaudeCodeReview(cfg, issueNumber, detail.title, round, cwd, opts)
+  const result = companionMode
+    ? await invokeCompanionReview(companionMode, cfg, issueNumber, detail.title, round, cwd, opts)
     : await invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, diff, round, cwd, opts);
 
   if (!result.success) {
@@ -194,7 +267,8 @@ export async function advanceReview(
   };
 }
 
-async function invokeClaudeCodeReview(
+async function invokeCompanionReview(
+  mode: CompanionMode,
   cfg: PipelineConfig,
   issueNumber: number,
   title: string,
@@ -209,7 +283,7 @@ async function invokeClaudeCodeReview(
     round === 2
       ? `Pipeline adversarial review for issue #${issueNumber}: challenge whether the PR fully satisfies "${title}" and whether review-1 missed material risk.${specHint}`
       : undefined;
-  const command = buildClaudeCodeReviewCommand(cfg, round, {
+  const command = buildCompanionReviewCommand(mode, cfg, round, {
     model: opts.model ?? cfg.models.review,
     focusText,
   });

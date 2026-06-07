@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Harness } from "./types.ts";
 
-export type ReviewMode = "claude-companion" | "prompt-harness";
+export type ReviewMode = "claude-companion" | "codex-companion" | "prompt-harness";
 
 export interface PipelineProfile {
   name: "codex" | "claude" | "openclaw" | string;
