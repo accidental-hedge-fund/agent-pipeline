@@ -162,13 +162,19 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     harnesses: profile.harnesses,
     models: fileConfig.models ?? DEFAULT_CONFIG.models,
     openspec: {
-      // steps.openspec: false overrides any top-level openspec.enabled value.
-      enabled: fileConfig.steps?.openspec === false ? "off" : (fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled),
+      // steps.openspec: false → "off"; steps.openspec: true → "on"; undefined → top-level or default.
+      enabled:
+        fileConfig.steps?.openspec === false ? "off" :
+        fileConfig.steps?.openspec === true  ? "on"  :
+        (fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled),
       bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
     },
     last30days: {
-      // steps.last30days: false overrides any top-level last30days.enabled value.
-      enabled: fileConfig.steps?.last30days === false ? false : (fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled),
+      // steps.last30days: false → disabled; steps.last30days: true → enabled; undefined → top-level or default.
+      enabled:
+        fileConfig.steps?.last30days === false ? false :
+        fileConfig.steps?.last30days === true  ? true  :
+        (fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled),
       timeout: fileConfig.last30days?.timeout ?? DEFAULT_CONFIG.last30days.timeout,
     },
     steps: {

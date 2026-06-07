@@ -71,6 +71,10 @@ export async function advance(
     };
   }
 
+  // Suffix appended to any blocker posted from this point forward so reviewers
+  // can see the reduced-scrutiny audit trail even on failed/blocked runs.
+  const docsSkipSuffix = docsSkipped ? "\n\n_(Note: docs step was skipped — steps.docs: false)_" : "";
+
   // ---- Step 2: CI ----
   let checks;
   try {
@@ -98,7 +102,7 @@ export async function advance(
     await setBlocked(
       cfg,
       issueNumber,
-      `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
+      `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}${docsSkipSuffix}`,
       "pre-merge",
     );
     return { advanced: false, status: "blocked", reason: "CI failed" };
@@ -115,7 +119,7 @@ export async function advance(
     await setBlocked(
       cfg,
       issueNumber,
-      "PR has merge conflicts that could not be automatically resolved.",
+      `PR has merge conflicts that could not be automatically resolved.${docsSkipSuffix}`,
       "pre-merge",
     );
     return { advanced: false, status: "blocked", reason: "merge conflict" };
@@ -142,7 +146,7 @@ export async function advance(
       await setBlocked(
         cfg,
         issueNumber,
-        `OpenSpec validation failed (\`openspec validate --all\`):\n${detail}`,
+        `OpenSpec validation failed (\`openspec validate --all\`):\n${detail}${docsSkipSuffix}`,
         "pre-merge",
       );
       return { advanced: false, status: "blocked", reason: "openspec validation failed" };

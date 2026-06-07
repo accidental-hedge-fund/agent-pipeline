@@ -278,9 +278,24 @@ async function runAdvance(
 
       // #13: skip disabled stages, keeping a valid forward path.
       if (stage === "plan-review" && !cfg.steps.plan_review) {
-        const to: Stage = "implementing";
-        await transition(cfg, issueNumber, stage, to, "plan-review step disabled in this repo's config; skipping.");
-        console.log(`[pipeline] #${issueNumber}: plan-review → implementing (step disabled)`);
+        // Routing to `implementing` would be a no-op because dispatch returns `waiting`
+        // for that label (it's only an in-flight marker set by planning.ts). Instead:
+        //   - If a PR already exists, implementation completed — advance to the first
+        //     active review stage (or pre-merge if both reviews are also off).
+        //   - Otherwise route back to `ready` so the full planning+implementation
+        //     cycle re-runs with plan_review disabled this time.
+        const existingPr = await getPrForIssue(cfg, issueNumber);
+        let to: Stage;
+        let note: string;
+        if (existingPr) {
+          to = cfg.steps.standard_review ? "review-1" : reviewStageSkipTarget(cfg, "review-1");
+          note = `plan-review step disabled and PR #${existingPr} already exists; resuming at ${to}.`;
+        } else {
+          to = "ready";
+          note = "plan-review step disabled; re-entering planning (plan-review will be skipped this time).";
+        }
+        await transition(cfg, issueNumber, stage, to, note);
+        console.log(`[pipeline] #${issueNumber}: plan-review → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
         if (opts.once) break;

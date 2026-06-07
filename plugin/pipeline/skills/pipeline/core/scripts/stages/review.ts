@@ -147,17 +147,15 @@ export async function advanceReview(
 
   if (verdict.verdict === "approve") {
     if (round === 1) {
-      await transition(
-        cfg,
-        issueNumber,
-        "review-1",
-        "review-2",
-        `Standard review by ${reviewer} — approved (${verdict.findings.length} findings).`,
-      );
+      const approveTarget: Stage = cfg.steps.adversarial_review ? "review-2" : "pre-merge";
+      const approveNote = cfg.steps.adversarial_review
+        ? `Standard review by ${reviewer} — approved (${verdict.findings.length} findings).`
+        : `Standard review by ${reviewer} — approved (${verdict.findings.length} findings). Adversarial review disabled; routing to pre-merge.`;
+      await transition(cfg, issueNumber, "review-1", approveTarget, approveNote);
       return {
         advanced: true,
         from: "review-1",
-        to: "review-2",
+        to: approveTarget,
         summary: `approved (${verdict.findings.length} findings)`,
       };
     } else {

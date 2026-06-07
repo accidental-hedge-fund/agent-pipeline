@@ -36,7 +36,7 @@ import {
 } from "../prompts/index.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
-import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
+import { reviewStageSkipTarget, type Harness, type Outcome, type PipelineConfig, type Stage } from "../types.ts";
 
 export interface AdvanceOpts {
   dryRun?: boolean;
@@ -258,22 +258,24 @@ export async function advance(
 
   console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
 
-  // ---- Step 10: implementing → review-1 ----
+  // ---- Step 10: implementing → next active review stage ----
+  const nextAfterImpl: Stage = cfg.steps.standard_review ? "review-1" : reviewStageSkipTarget(cfg, "review-1");
+  const skipNote = cfg.steps.standard_review ? "" : " standard-review step disabled; routing to next active stage.";
   await transition(
     cfg,
     issueNumber,
     "implementing",
-    "review-1",
+    nextAfterImpl,
     cfg.steps.plan_review
-      ? `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`
-      : `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. (Plan-review step skipped.)`,
+      ? `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.${skipNote}`
+      : `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. (Plan-review step skipped.)${skipNote}`,
   );
 
   return {
     advanced: true,
     from: "ready",
-    to: "review-1",
-    summary: `PR #${prNumber} opened after plan-review`,
+    to: nextAfterImpl,
+    summary: `PR #${prNumber} opened`,
   };
 }
 
@@ -537,16 +539,18 @@ async function advanceOpenspec(
     }
   }
   console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
+  const nextAfterImplOs: Stage = cfg.steps.standard_review ? "review-1" : reviewStageSkipTarget(cfg, "review-1");
+  const skipNoteOs = cfg.steps.standard_review ? "" : " standard-review step disabled; routing to next active stage.";
   await transition(
     cfg,
     issueNumber,
     "implementing",
-    "review-1",
+    nextAfterImplOs,
     cfg.steps.plan_review
-      ? `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`
-      : `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). (Plan-review step skipped.)`,
+      ? `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.${skipNoteOs}`
+      : `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). (Plan-review step skipped.)${skipNoteOs}`,
   );
-  return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
+  return { advanced: true, from: "ready", to: nextAfterImplOs, summary: `PR #${prNumber} opened` };
 }
 
 function formatIssues(v: { issues: { item?: string; message: string }[]; raw: string }): string {

@@ -53,6 +53,12 @@ const PartialConfigSchema = z.object({
       standard_review: z.boolean().optional(),
       adversarial_review: z.boolean().optional(),
       docs: z.boolean().optional(),
+      // Shortcut aliases: `steps.openspec: false` is equivalent to
+      // `openspec.enabled: "off"`; `steps.last30days: false` to
+      // `last30days.enabled: false`. Merged into the canonical top-level
+      // sections during resolution so legacy configs stay compatible.
+      openspec: z.boolean().optional(),
+      last30days: z.boolean().optional(),
     })
     .strict()
     .optional(),
@@ -156,11 +162,19 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     harnesses: profile.harnesses,
     models: fileConfig.models ?? DEFAULT_CONFIG.models,
     openspec: {
-      enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
+      // steps.openspec: false → "off"; steps.openspec: true → "on"; undefined → top-level or default.
+      enabled:
+        fileConfig.steps?.openspec === false ? "off" :
+        fileConfig.steps?.openspec === true  ? "on"  :
+        (fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled),
       bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
     },
     last30days: {
-      enabled: fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled,
+      // steps.last30days: false → disabled; steps.last30days: true → enabled; undefined → top-level or default.
+      enabled:
+        fileConfig.steps?.last30days === false ? false :
+        fileConfig.steps?.last30days === true  ? true  :
+        (fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled),
       timeout: fileConfig.last30days?.timeout ?? DEFAULT_CONFIG.last30days.timeout,
     },
     steps: {

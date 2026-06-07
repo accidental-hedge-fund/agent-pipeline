@@ -196,6 +196,62 @@ test("resolveConfig: steps.openspec: false overrides top-level openspec.enabled:
   }
 });
 
+test("resolveConfig: steps.openspec: true forces openspec.enabled to on", async () => {
+  const repo = makeFakeRepo(`steps:\n  openspec: true\n`);
+  const binDir = makeFakeGh("acme/steps-openspec-true");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.openspec.enabled, "on");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: steps.last30days: true forces last30days.enabled to true", async () => {
+  const repo = makeFakeRepo(`steps:\n  last30days: true\n`);
+  const binDir = makeFakeGh("acme/steps-l30d-true");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.last30days.enabled, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: steps.openspec: true overrides top-level openspec.enabled: off", async () => {
+  const repo = makeFakeRepo(`openspec:\n  enabled: off\nsteps:\n  openspec: true\n`);
+  const binDir = makeFakeGh("acme/steps-openspec-true-override");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.openspec.enabled, "on");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: steps.last30days: true overrides top-level last30days.enabled: false", async () => {
+  const repo = makeFakeRepo(`last30days:\n  enabled: false\nsteps:\n  last30days: true\n`);
+  const binDir = makeFakeGh("acme/steps-l30d-true-override");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.last30days.enabled, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: disabling a protected step is rejected with a clear safety-floor message", async () => {
   // CI / mergeability / planning / implementing are not configurable; an unknown
   // step key is rejected at parse time rather than silently dropping a safety gate.

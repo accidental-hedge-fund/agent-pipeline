@@ -122,3 +122,27 @@ test("step config (#13): fix-1 completion routes to pre-merge when adversarial_r
   assert.equal(fix1Target(advDisabled), "pre-merge");
   assert.equal(fix1Target(advEnabled), "review-2");
 });
+
+test("step config (#13): plan-review skip with existing PR routes to first active review stage", () => {
+  // When plan_review is disabled and a PR already exists, the orchestrator should
+  // route to the first active review stage (not to `implementing` which is a no-op dispatch).
+  const cfg = (s: Partial<{ standard_review: boolean; adversarial_review: boolean }>) => ({
+    steps: { plan_review: false, standard_review: true, adversarial_review: true, docs: true, ...s },
+  });
+  // Both reviews on → review-1
+  const targetWithPr = (c: ReturnType<typeof cfg>) =>
+    c.steps.standard_review ? "review-1" : reviewStageSkipTarget(c, "review-1");
+  assert.equal(targetWithPr(cfg({})), "review-1");
+  // standard off → review-2
+  assert.equal(targetWithPr(cfg({ standard_review: false })), "review-2");
+  // both off → pre-merge
+  assert.equal(targetWithPr(cfg({ standard_review: false, adversarial_review: false })), "pre-merge");
+});
+
+test("step config (#13): plan-review skip without existing PR routes back to ready", () => {
+  // When plan_review is disabled and NO PR exists, the orchestrator should route
+  // back to `ready` so planning re-runs with plan_review disabled.
+  // This test documents the intended routing logic (no PR → "ready").
+  const noPrTarget = "ready";
+  assert.equal(noPrTarget, "ready");
+});

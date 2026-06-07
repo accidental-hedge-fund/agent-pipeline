@@ -44,7 +44,9 @@ export async function advanceFix(
   const findings = extractReviewFindings(detail.comments, round);
   if (!findings) {
     // No findings → just advance (this is unusual but matches openclaw behavior).
-    const next: Stage = round === 1 ? "review-2" : "pre-merge";
+    const next: Stage = round === 1
+      ? (cfg.steps.adversarial_review ? "review-2" : "pre-merge")
+      : "pre-merge";
     await transition(
       cfg,
       issueNumber,
@@ -57,10 +59,13 @@ export async function advanceFix(
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would invoke ${harness} to fix findings`);
+    const dryTarget: Stage = round === 1
+      ? (cfg.steps.adversarial_review ? "review-2" : "pre-merge")
+      : "pre-merge";
     return {
       advanced: true,
       from: stage,
-      to: round === 1 ? "review-2" : "pre-merge",
+      to: dryTarget,
       summary: "[dry-run]",
     };
   }
@@ -111,17 +116,15 @@ export async function advanceFix(
   }
 
   if (round === 1) {
-    await transition(
-      cfg,
-      issueNumber,
-      "fix-1",
-      "review-2",
-      `Fix round 1 complete. Review 1 findings addressed. Ready for adversarial review.`,
-    );
+    const fix1Target: Stage = cfg.steps.adversarial_review ? "review-2" : "pre-merge";
+    const fix1Msg = cfg.steps.adversarial_review
+      ? `Fix round 1 complete. Review 1 findings addressed. Ready for adversarial review.`
+      : `Fix round 1 complete. Review 1 findings addressed. Adversarial review disabled; routing to pre-merge.`;
+    await transition(cfg, issueNumber, "fix-1", fix1Target, fix1Msg);
     return {
       advanced: true,
       from: "fix-1",
-      to: "review-2",
+      to: fix1Target,
       summary: "fixes pushed",
     };
   } else {

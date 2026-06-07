@@ -278,9 +278,24 @@ async function runAdvance(
 
       // #13: skip disabled stages, keeping a valid forward path.
       if (stage === "plan-review" && !cfg.steps.plan_review) {
-        const to: Stage = "implementing";
-        await transition(cfg, issueNumber, stage, to, "plan-review step disabled in this repo's config; skipping.");
-        console.log(`[pipeline] #${issueNumber}: plan-review → implementing (step disabled)`);
+        // Routing to `implementing` would be a no-op because dispatch returns `waiting`
+        // for that label (it's only an in-flight marker set by planning.ts). Instead:
+        //   - If a PR already exists, implementation completed — advance to the first
+        //     active review stage (or pre-merge if both reviews are also off).
+        //   - Otherwise route back to `ready` so the full planning+implementation
+        //     cycle re-runs with plan_review disabled this time.
+        const existingPr = await getPrForIssue(cfg, issueNumber);
+        let to: Stage;
+        let note: string;
+        if (existingPr) {
+          to = cfg.steps.standard_review ? "review-1" : reviewStageSkipTarget(cfg, "review-1");
+          note = `plan-review step disabled and PR #${existingPr} already exists; resuming at ${to}.`;
+        } else {
+          to = "ready";
+          note = "plan-review step disabled; re-entering planning (plan-review will be skipped this time).";
+        }
+        await transition(cfg, issueNumber, stage, to, note);
+        console.log(`[pipeline] #${issueNumber}: plan-review → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
         if (opts.once) break;
@@ -294,6 +309,28 @@ async function runAdvance(
         const to = reviewStageSkipTarget(cfg, stage);
         await transition(cfg, issueNumber, stage, to, `${stage} step disabled in this repo's config; skipping.`);
         console.log(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
+        transitions++;
+        lastStage = to;
+        if (opts.once) break;
+        continue;
+      }
+
+      // fix-1 is only meaningful when standard_review ran; if disabled, skip to
+      // the next active stage (review-2 or pre-merge). fix-2 requires adversarial_review.
+      if (stage === "fix-1" && !cfg.steps.standard_review) {
+        const to = reviewStageSkipTarget(cfg, "review-1");
+        await transition(cfg, issueNumber, stage, to, "fix-1 skipped (standard-review step disabled).");
+        console.log(`[pipeline] #${issueNumber}: fix-1 → ${to} (step disabled)`);
+        transitions++;
+        lastStage = to;
+        if (opts.once) break;
+        continue;
+      }
+
+      if (stage === "fix-2" && !cfg.steps.adversarial_review) {
+        const to: Stage = "pre-merge";
+        await transition(cfg, issueNumber, stage, to, "fix-2 skipped (adversarial-review step disabled).");
+        console.log(`[pipeline] #${issueNumber}: fix-2 → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
         if (opts.once) break;
