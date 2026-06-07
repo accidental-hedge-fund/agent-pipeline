@@ -300,6 +300,28 @@ async function runAdvance(
         continue;
       }
 
+      // fix-1 is only meaningful when standard_review ran; if disabled, skip to
+      // the next active stage (review-2 or pre-merge). fix-2 requires adversarial_review.
+      if (stage === "fix-1" && !cfg.steps.standard_review) {
+        const to = reviewStageSkipTarget(cfg, "review-1");
+        await transition(cfg, issueNumber, stage, to, "fix-1 skipped (standard-review step disabled).");
+        console.log(`[pipeline] #${issueNumber}: fix-1 → ${to} (step disabled)`);
+        transitions++;
+        lastStage = to;
+        if (opts.once) break;
+        continue;
+      }
+
+      if (stage === "fix-2" && !cfg.steps.adversarial_review) {
+        const to: Stage = "pre-merge";
+        await transition(cfg, issueNumber, stage, to, "fix-2 skipped (adversarial-review step disabled).");
+        console.log(`[pipeline] #${issueNumber}: fix-2 → ${to} (step disabled)`);
+        transitions++;
+        lastStage = to;
+        if (opts.once) break;
+        continue;
+      }
+
       const out = await dispatch(cfg, issueNumber, stage, opts);
       printOutcome(issueNumber, stage, out);
 

@@ -135,6 +135,67 @@ test("resolveConfig: a configurable step can be disabled, others stay default-on
   }
 });
 
+test("resolveConfig: steps.openspec: false sets openspec.enabled to off", async () => {
+  const repo = makeFakeRepo(`steps:\n  openspec: false\n`);
+  const binDir = makeFakeGh("acme/steps-openspec1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.openspec.enabled, "off");
+    // Other steps should be unaffected.
+    assert.equal(cfg.steps.plan_review, true);
+    assert.equal(cfg.steps.docs, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: steps.last30days: false sets last30days.enabled to false", async () => {
+  const repo = makeFakeRepo(`steps:\n  last30days: false\n`);
+  const binDir = makeFakeGh("acme/steps-l30d1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.last30days.enabled, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: legacy top-level openspec config still works alongside steps aliases", async () => {
+  // Existing openspec.enabled: on configs must not be broken by the new steps.openspec key.
+  const repo = makeFakeRepo(`openspec:\n  enabled: on\n  bootstrap: true\n`);
+  const binDir = makeFakeGh("acme/steps-openspec2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.openspec.enabled, "on");
+    assert.equal(cfg.openspec.bootstrap, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: steps.openspec: false overrides top-level openspec.enabled: auto", async () => {
+  const repo = makeFakeRepo(`openspec:\n  enabled: auto\nsteps:\n  openspec: false\n`);
+  const binDir = makeFakeGh("acme/steps-openspec3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.openspec.enabled, "off");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: disabling a protected step is rejected with a clear safety-floor message", async () => {
   // CI / mergeability / planning / implementing are not configurable; an unknown
   // step key is rejected at parse time rather than silently dropping a safety gate.

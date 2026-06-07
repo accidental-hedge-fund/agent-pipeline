@@ -58,7 +58,11 @@ export async function advance(
   if (archiveOutcome) return archiveOutcome;
 
   // ---- Step 1: docs update (once per PR; skippable via steps.docs) ----
-  if (cfg.steps.docs && !(await docsAlreadyUpdated(cfg, issueNumber))) {
+  let docsSkipped = false;
+  if (!cfg.steps.docs) {
+    docsSkipped = true;
+    console.log(`[pipeline] #${issueNumber}: docs step disabled (steps.docs: false); skipping`);
+  } else if (!(await docsAlreadyUpdated(cfg, issueNumber))) {
     await updateDocs(cfg, issueNumber, prNumber, opts);
     return {
       advanced: false,
@@ -148,12 +152,13 @@ export async function advance(
   }
 
   // ---- Step 4: advance ----
+  const docsNote = docsSkipped ? "docs skipped (steps.docs: false)" : "docs updated";
   await transition(
     cfg,
     issueNumber,
     "pre-merge",
     "ready-to-deploy",
-    `All pre-merge gates passed (docs updated, CI green, no conflicts). PR #${prNumber} is ready to merge.`,
+    `All pre-merge gates passed (${docsNote}, CI green, no conflicts). PR #${prNumber} is ready to merge.`,
   );
   // Note: cfg.auto_merge intentionally NOT honored here. The user owns the merge button.
   return {
