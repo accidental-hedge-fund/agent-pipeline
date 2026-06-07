@@ -34,6 +34,7 @@ import {
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
+import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -206,6 +207,13 @@ export async function advance(
       "implementing",
     );
     return { advanced: false, status: "blocked", reason: "no commits produced" };
+  }
+
+  // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
+  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  if (!gate.skipped && !gate.passed) {
+    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
+    return { advanced: false, status: "blocked", reason: "test gate failed" };
   }
 
   // ---- Step 9: push + PR ----
@@ -500,6 +508,12 @@ async function advanceOpenspec(
   if (!(await hasCommitsAhead(wt.path, cfg.base_branch))) {
     await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing");
     return { advanced: false, status: "blocked", reason: "no commits produced" };
+  }
+  // ---- test/build gate (#15) — must pass before opening a PR ----
+  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  if (!gate.skipped && !gate.passed) {
+    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
+    return { advanced: false, status: "blocked", reason: "test gate failed" };
   }
   const branch = branchName(issueNumber, slug);
   const push = await gitInWorktree(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });

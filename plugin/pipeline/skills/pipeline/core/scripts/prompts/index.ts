@@ -209,6 +209,26 @@ export function buildFixPrompt(a: BuildFixArgs): string {
   });
 }
 
+export interface BuildTestFixArgs {
+  issueNumber: number;
+  /** Human-readable command string (e.g. "pnpm run test"). */
+  command: string;
+  attempt: number;
+  maxAttempts: number;
+  /** Captured failure output from the test/build run. */
+  output: string;
+}
+
+export function buildTestFixPrompt(a: BuildTestFixArgs): string {
+  return substitute(loadTemplate("test_fix"), {
+    issue_number: String(a.issueNumber),
+    command: a.command,
+    attempt: String(a.attempt),
+    max_attempts: String(a.maxAttempts),
+    test_output: truncateDiff(a.output, 16_000),
+  });
+}
+
 export interface BuildDocsArgs {
   cfg: PipelineConfig;
   issueNumber: number;

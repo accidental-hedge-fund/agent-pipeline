@@ -149,6 +149,11 @@ steps:                               # turn optional steps off for speed/prefere
   standard_review: true              # review-1 (and its fix round)
   adversarial_review: true           # review-2 (and its fix round)
   docs: true                         # docs-update pass in pre-merge
+test_gate:                           # run the repo's own tests/build before opening a PR — see "test/build gate"
+  enabled: true                      # default: true; set false to disable entirely
+  command: "pnpm test"               # optional explicit command; auto-detected when absent
+  max_attempts: 3                    # fix-harness invocations before blocking
+  timeout: 300                       # seconds per test/build run
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
 
@@ -164,6 +169,36 @@ The structural and safety steps — planning, implementing, and the pre-merge **
 and **mergeability** gates — are **not** configurable: they have no toggle, and an
 unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse
 time rather than silently dropping a safety gate.
+
+## Test/build gate (optional, default on)
+
+When `test_gate.enabled` (the default), the target repo's **own** test/build
+command runs inside the worktree during implementation and **after each fix
+round**, before a PR is opened or the item advances. If it fails, the implementer
+harness gets the failure output and retries in a **bounded generate→test→fix
+loop** — up to `max_attempts` fix invocations (default 3), each test run capped at
+`timeout` seconds (default 300). The item never opens a PR or advances while the
+command is failing; persistent failure → `blocked` with the captured output
+surfaced on the issue. This catches broken changes locally instead of waiting for
+CI after review.
+
+The command is **auto-detected** (first match wins):
+
+1. explicit `test_gate.command` override (parsed without a shell)
+2. `package.json` — a real `test` script (npm placeholder/`echo` stubs skipped),
+   else a `build:check` / `typecheck` / `type-check` / `build` script; the package
+   manager follows the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm)
+3. `go.mod` → `go test ./...`
+4. `Cargo.toml` → `cargo test`
+5. pytest — only with a concrete marker (`pytest.ini`, root `conftest.py`, or a
+   `[tool.pytest*]` section in `pyproject.toml`); `pyproject.toml` alone is **not**
+   enough
+6. `Makefile` with a `test:` target → `make test`
+
+**Repos with no detectable command (and no override) are skipped entirely** — zero
+behavior change. For monorepos or custom runners, set `test_gate.command`
+explicitly. **Rollback** is a one-line `test_gate: { enabled: false }` — no labels,
+no state-machine changes.
 
 ## OpenSpec integration (optional)
 

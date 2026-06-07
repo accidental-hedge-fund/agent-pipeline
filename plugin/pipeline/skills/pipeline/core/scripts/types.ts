@@ -65,6 +65,17 @@ export interface PipelineConfig {
     adversarial_review: boolean;
     docs: boolean;
   };
+  // Test/build gate (#15). When enabled, the target repo's own test/build
+  // command runs in the worktree during implementation and after each fix
+  // round; on failure a bounded generate→test→fix loop runs before a PR is
+  // opened or the item advances. `command` is an explicit override; when absent
+  // the command is auto-detected, and repos with none are skipped entirely.
+  test_gate: {
+    enabled: boolean;
+    command?: string;
+    max_attempts: number; // max fix-harness invocations before blocking
+    timeout: number; // seconds per test/build run
+  };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -87,6 +98,7 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
+  test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
 };
 
 // ---------------------------------------------------------------------------

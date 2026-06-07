@@ -13,6 +13,7 @@ import {
   buildPlanRevisionPrompt,
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
+  buildTestFixPrompt,
   substitute,
 } from "../scripts/prompts/index.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
@@ -254,6 +255,32 @@ test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
   assert.match(r2, /adversarial/);
   assert.match(r1, /FINDINGS-X/);
   assert.match(r2, /FINDINGS-X/);
+});
+
+test("test_fix prompt: includes command, attempt counter, and failure output", () => {
+  const out = buildTestFixPrompt({
+    issueNumber: 15,
+    command: "pnpm run test",
+    attempt: 2,
+    maxAttempts: 3,
+    output: "FAIL-OUTPUT-XYZ",
+  });
+  assert.match(out, /#15/);
+  assert.match(out, /pnpm run test/);
+  assert.match(out, /attempt 2 of 3/);
+  assert.match(out, /FAIL-OUTPUT-XYZ/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("test_fix prompt: large failure output is truncated", () => {
+  const out = buildTestFixPrompt({
+    issueNumber: 1,
+    command: "npm test",
+    attempt: 1,
+    maxAttempts: 1,
+    output: "y".repeat(20_000),
+  });
+  assert.match(out, /diff truncated at 16KB/);
 });
 
 test("docs_update prompt: contains diff", () => {

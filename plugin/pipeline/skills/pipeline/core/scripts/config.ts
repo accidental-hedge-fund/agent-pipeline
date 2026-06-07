@@ -54,6 +54,14 @@ const PartialConfigSchema = z.object({
     })
     .strict()
     .optional(),
+  test_gate: z
+    .object({
+      enabled: z.boolean().optional(),
+      command: z.string().optional(),
+      max_attempts: z.number().int().positive().optional(),
+      timeout: z.number().int().positive().optional(),
+    })
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -156,6 +164,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       standard_review: fileConfig.steps?.standard_review ?? DEFAULT_CONFIG.steps.standard_review,
       adversarial_review: fileConfig.steps?.adversarial_review ?? DEFAULT_CONFIG.steps.adversarial_review,
       docs: fileConfig.steps?.docs ?? DEFAULT_CONFIG.steps.docs,
+    },
+    test_gate: {
+      enabled: fileConfig.test_gate?.enabled ?? DEFAULT_CONFIG.test_gate.enabled,
+      command: fileConfig.test_gate?.command,
+      max_attempts: fileConfig.test_gate?.max_attempts ?? DEFAULT_CONFIG.test_gate.max_attempts,
+      timeout: fileConfig.test_gate?.timeout ?? DEFAULT_CONFIG.test_gate.timeout,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
