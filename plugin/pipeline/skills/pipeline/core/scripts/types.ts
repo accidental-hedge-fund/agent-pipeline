@@ -27,7 +27,7 @@ export type OpenspecMode = "auto" | "on" | "off";
 export interface PipelineConfig {
   profile_name: string;
   invocation: string;
-  review_mode: "claude-companion" | "prompt-harness";
+  review_mode: "claude-companion" | "codex-companion" | "prompt-harness";
   marker_footer: string;
   implementation_ready_message: string;
   conventions_default: string;

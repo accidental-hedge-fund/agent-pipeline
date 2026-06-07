@@ -59,8 +59,12 @@ build step). First-ever invocation runs `npm install` automatically.
 
 Required:
 - `gh` CLI authenticated against the target repo
-- `claude` CLI on PATH (for the implementer/reviewer harness when configured to claude)
-- `codex` CLI on PATH (for the harness when configured to codex)
+- `claude` CLI on PATH — the primary harness (planning, implementation, fixes, docs)
+- `codex` CLI on PATH and authenticated — the reviewer harness
+- The **codex-plugin-cc companion** (`codex-companion.mjs`) — review-1/review-2 shell out to it
+  (`/codex:review` / `/codex:adversarial-review`). Install in Claude Code with
+  `/plugin marketplace add openai/codex-plugin-cc` then `/plugin install codex@openai-codex`.
+  Without it the review stage blocks. Override its path with `PIPELINE_CODEX_COMPANION`.
 - Node 24+
 - The user's Claude Code subscription provides the LLM budget — this skill
   never reads `ANTHROPIC_API_KEY`
@@ -188,7 +192,7 @@ Examples that DO push:
 - `[pipeline] #N: implementation done (Xs, harness=Y)`
 - `[pipeline] #N: PR #M created`
 - `[pipeline] #N: ready → review-1: PR #M opened`
-- `[pipeline] #N: review-1 by codex`
+- `[pipeline] #N: review-1 by /codex:review`
 - `[pipeline] #N: verdict=approve findings=0`
 - `[pipeline] #N: review-1 → review-2: standard review approved`
 - … and so on, all the way through `→ ready-to-deploy`
@@ -291,7 +295,9 @@ When the loop ends, the skill prints:
 - `core/scripts/config.ts` — load `.github/pipeline.yml` + defaults
 - `core/scripts/gh.ts` — typed wrappers for the `gh` CLI
 - `core/scripts/worktree.ts` — `pipeline-{N}-{slug}` worktree lifecycle
-- `core/scripts/harness.ts` — `invoke("claude" | "codex", cwd, prompt)`
+- `core/scripts/harness.ts` — `invoke("claude" | "codex", cwd, prompt)` (planning/impl/fix)
+- `core/scripts/stages/review.ts` — review-1/review-2 drive Codex via the codex-plugin-cc
+  companion (`/codex:review` / `/codex:adversarial-review`)
 - `core/scripts/lock.ts` — PID-based lock at `/tmp/pipeline-{domain}.lock`
 - `core/scripts/stages/*.ts` — one file per stage (planning, review, fix, pre_merge, deploy_ready, auto_recover)
 - `core/scripts/prompts/*.md` — prompt templates with `{{placeholders}}`

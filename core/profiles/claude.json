@@ -3,7 +3,7 @@
   "displayName": "Claude Code pipeline",
   "invocation": "/pipeline",
   "harnesses": { "implementer": "claude", "reviewer": "codex" },
-  "reviewMode": "prompt-harness",
+  "reviewMode": "codex-companion",
   "markerFooter": "*Automated by Claude Code Pipeline Skill*",
   "implementationReadyMessage": "Ready for Codex standard review.",
   "conventionsDefault": "CLAUDE.md"
