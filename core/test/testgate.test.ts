@@ -389,6 +389,57 @@ test("gate: fix harness leaves tree dirty without committing → blocked immedia
   assert.match(out.blockReason ?? "", /uncommitted/i);
 });
 
+test("gate (regression / finding #1, post-pass): initial pass that leaves tree dirty → blocked at attempts 0", async () => {
+  // Regression: test command exits 0 but generates uncommitted artifacts
+  // (snapshots, tsbuildinfo, lock-file updates). The gate must block even though
+  // the command itself succeeded, because committed state ≠ tested state.
+  let invoked = 0;
+  let dirtyCall = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult,
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      return dirtyCall > 1; // clean on pre-test check, dirty after the passing run
+    },
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(invoked, 0);
+  assert.match(out.blockReason ?? "", /generated artifacts|committed state/i);
+});
+
+test("gate (regression / finding #1, post-fix-pass): post-fix pass that leaves tree dirty → blocked", async () => {
+  // Regression: test command passes after a fix attempt but leaves uncommitted
+  // artifacts. Must block even though the re-run succeeded.
+  let n = 0;
+  let invoked = 0;
+  let dirtyCall = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => (n++ === 0 ? failResult : passResult),
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      // call 1: pre-test check → clean
+      // call 2: post-fix dirty check → clean (harness committed its changes)
+      // call 3: post-pass dirty check → dirty (re-run generated artifacts)
+      return dirtyCall > 2;
+    },
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 1);
+  assert.equal(invoked, 1);
+  assert.match(out.blockReason ?? "", /generated artifacts|committed state/i);
+});
+
 test("gate (regression / finding #1): dirty state after fix always blocks, regardless of HEAD movement", async () => {
   // Previously only blocked when HEAD did NOT move. Now the dirty check is
   // unconditional — even if the fix harness committed something, leftover

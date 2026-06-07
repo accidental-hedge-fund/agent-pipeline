@@ -110,6 +110,20 @@ export async function runTestGate(
 
   let { passed, output } = await runTestsFn(wtPath, command, cfg.test_gate.timeout);
   if (passed) {
+    // A passing run can still generate uncommitted artifacts (tsbuildinfo,
+    // snapshots, lock-file updates). If it does, the committed state diverges
+    // from what was tested — block so artifacts are committed and the gate reruns.
+    if (await gitDirtyFn(wtPath)) {
+      return {
+        skipped: false,
+        passed: false,
+        attempts: 0,
+        blockReason:
+          "Test/build command left uncommitted changes in the working tree. " +
+          "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
+          "so the gate certifies the exact committed state.",
+      };
+    }
     console.log(`[pipeline] #${issueNumber}: test gate passed`);
     return { skipped: false, passed: true, attempts: 0 };
   }
@@ -154,6 +168,17 @@ export async function runTestGate(
 
     ({ passed, output } = await runTestsFn(wtPath, command, cfg.test_gate.timeout));
     if (passed) {
+      if (await gitDirtyFn(wtPath)) {
+        return {
+          skipped: false,
+          passed: false,
+          attempts: attempt,
+          blockReason:
+            "Test/build command left uncommitted changes in the working tree. " +
+            "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
+            "so the gate certifies the exact committed state.",
+        };
+      }
       console.log(`[pipeline] #${issueNumber}: test gate passed after ${attempt} fix attempt(s)`);
       return { skipped: false, passed: true, attempts: attempt };
     }
