@@ -231,9 +231,9 @@ export async function advance(
     `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
     "",
     `**Implemented by**: ${primary}`,
-    `**Plan reviewed by**: ${reviewer}`,
+    cfg.steps.plan_review ? `**Plan reviewed by**: ${reviewer}` : `**Plan review**: skipped (steps.plan_review: false)`,
     "",
-    `## Revised Implementation Plan`,
+    cfg.steps.plan_review ? `## Revised Implementation Plan` : `## Implementation Plan`,
     planExcerpt,
   ].join("\n") + footer(cfg);
 
@@ -264,7 +264,9 @@ export async function advance(
     issueNumber,
     "implementing",
     "review-1",
-    `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`,
+    cfg.steps.plan_review
+      ? `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`
+      : `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. (Plan-review step skipped.)`,
   );
 
   return {
@@ -516,7 +518,7 @@ async function advanceOpenspec(
     `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
     "",
     `**Implemented by**: ${primary}`,
-    `**Plan reviewed by**: ${reviewer}`,
+    cfg.steps.plan_review ? `**Plan reviewed by**: ${reviewer}` : `**Plan review**: skipped (steps.plan_review: false)`,
     `**OpenSpec change**: \`${changeId}\``,
     "",
     `## Proposal`,
@@ -540,7 +542,9 @@ async function advanceOpenspec(
     issueNumber,
     "implementing",
     "review-1",
-    `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
+    cfg.steps.plan_review
+      ? `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`
+      : `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). (Plan-review step skipped.)`,
   );
   return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
 }

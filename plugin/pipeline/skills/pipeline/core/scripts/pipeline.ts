@@ -276,7 +276,17 @@ async function runAdvance(
         break;
       }
 
-      // #13: skip disabled review stages, keeping a valid forward path.
+      // #13: skip disabled stages, keeping a valid forward path.
+      if (stage === "plan-review" && !cfg.steps.plan_review) {
+        const to: Stage = "implementing";
+        await transition(cfg, issueNumber, stage, to, "plan-review step disabled in this repo's config; skipping.");
+        console.log(`[pipeline] #${issueNumber}: plan-review → implementing (step disabled)`);
+        transitions++;
+        lastStage = to;
+        if (opts.once) break;
+        continue;
+      }
+
       if (
         (stage === "review-1" && !cfg.steps.standard_review) ||
         (stage === "review-2" && !cfg.steps.adversarial_review)

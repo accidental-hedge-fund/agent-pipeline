@@ -135,7 +135,7 @@ test("resolveConfig: a configurable step can be disabled, others stay default-on
   }
 });
 
-test("resolveConfig: disabling a protected step is rejected (strict schema)", async () => {
+test("resolveConfig: disabling a protected step is rejected with a clear safety-floor message", async () => {
   // CI / mergeability / planning / implementing are not configurable; an unknown
   // step key is rejected at parse time rather than silently dropping a safety gate.
   const repo = makeFakeRepo(`steps:\n  mergeability: false\n`);
@@ -144,7 +144,14 @@ test("resolveConfig: disabling a protected step is rejected (strict schema)", as
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
-    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => {
+        assert.ok(err.message.includes("Invalid") && err.message.includes("pipeline.yml"), `expected pipeline.yml parse error, got: ${err.message}`);
+        assert.ok(err.message.includes("cannot be disabled") || err.message.includes("safety-critical"), `expected safety-floor explanation, got: ${err.message}`);
+        return true;
+      },
+    );
   } finally {
     process.env.PATH = oldPath;
   }

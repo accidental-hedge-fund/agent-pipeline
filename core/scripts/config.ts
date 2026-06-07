@@ -8,6 +8,8 @@ import { execFileSync } from "node:child_process";
 import { DEFAULT_CONFIG, type Harness, type PipelineConfig } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 
+const PROTECTED_STEP_NAMES = new Set(["planning", "implementing", "ci", "mergeability", "pre_merge"]);
+
 const PartialConfigSchema = z.object({
   repo: z.string().optional(),
   base_branch: z.string().optional(),
@@ -108,7 +110,17 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       const result = PartialConfigSchema.safeParse(parsed);
       if (!result.success) {
         const errors = result.error.issues
-          .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+          .map((i) => {
+            const pathStr = i.path.join(".") || "<root>";
+            if (i.code === "unrecognized_keys" && i.path.length === 1 && i.path[0] === "steps") {
+              const keys = (i as unknown as { keys: string[] }).keys;
+              const protectedOnes = keys.filter((k) => PROTECTED_STEP_NAMES.has(k));
+              if (protectedOnes.length > 0) {
+                return `steps: "${protectedOnes.join('", "')}" cannot be disabled — these are safety-critical steps (planning, implementing, ci, mergeability) that are always on`;
+              }
+            }
+            return `${pathStr}: ${i.message}`;
+          })
           .join("; ");
         throw new Error(`Invalid ${configPath}: ${errors}`);
       }
