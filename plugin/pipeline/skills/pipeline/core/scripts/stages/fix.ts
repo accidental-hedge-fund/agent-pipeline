@@ -16,6 +16,7 @@ import {
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
+import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
@@ -96,6 +97,13 @@ export async function advanceFix(
       stage,
     );
     return { advanced: false, status: "blocked", reason: "no new commits" };
+  }
+
+  // ---- test/build gate (#15) — must pass before advancing past this fix round ----
+  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  if (!gate.skipped && !gate.passed) {
+    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage);
+    return { advanced: false, status: "blocked", reason: "test gate failed" };
   }
 
   const branch = branchName(issueNumber, wt.slug);

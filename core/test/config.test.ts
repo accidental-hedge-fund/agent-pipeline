@@ -149,3 +149,66 @@ test("resolveConfig: disabling a protected step is rejected (strict schema)", as
     process.env.PATH = oldPath;
   }
 });
+
+test("resolveConfig: test_gate defaults apply when unspecified", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/tg0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.test_gate.enabled, DEFAULT_CONFIG.test_gate.enabled);
+    assert.equal(cfg.test_gate.max_attempts, DEFAULT_CONFIG.test_gate.max_attempts);
+    assert.equal(cfg.test_gate.timeout, DEFAULT_CONFIG.test_gate.timeout);
+    assert.equal(cfg.test_gate.command, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: test_gate can be disabled; other fields keep defaults", async () => {
+  const repo = makeFakeRepo(`test_gate:\n  enabled: false\n`);
+  const binDir = makeFakeGh("acme/tg1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.test_gate.enabled, false);
+    assert.equal(cfg.test_gate.max_attempts, DEFAULT_CONFIG.test_gate.max_attempts);
+    assert.equal(cfg.test_gate.timeout, DEFAULT_CONFIG.test_gate.timeout);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: explicit test_gate command + max_attempts preserved", async () => {
+  const repo = makeFakeRepo(`test_gate:\n  command: make test\n  max_attempts: 5\n`);
+  const binDir = makeFakeGh("acme/tg2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.test_gate.command, "make test");
+    assert.equal(cfg.test_gate.max_attempts, 5);
+    assert.equal(cfg.test_gate.enabled, true); // default
+    assert.equal(cfg.test_gate.timeout, 300); // default
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: invalid test_gate.max_attempts is rejected", async () => {
+  const repo = makeFakeRepo(`test_gate:\n  max_attempts: -1\n`);
+  const binDir = makeFakeGh("acme/tg3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
