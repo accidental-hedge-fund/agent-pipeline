@@ -36,6 +36,7 @@ function dummyConfig(): PipelineConfig {
     models: { planning: "sonnet", review: "opus", fix: "sonnet" },
     openspec: { enabled: "auto", bootstrap: false },
     last30days: { enabled: false, timeout: 600 },
+    steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
     domain_name: "Widget",
     domain_description: "the example widget service",
   };
