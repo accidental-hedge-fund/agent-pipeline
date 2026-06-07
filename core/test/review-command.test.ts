@@ -113,6 +113,29 @@ test("buildCompanionReviewCommand: PIPELINE_CODEX_COMPANION overrides the defaul
   }
 });
 
+test("buildCompanionReviewCommand: codex-companion resolves to a codex-companion.mjs path when nothing is overridden", () => {
+  const prev = process.env.PIPELINE_CODEX_COMPANION;
+  delete process.env.PIPELINE_CODEX_COMPANION;
+  try {
+    const command = buildCompanionReviewCommand("codex-companion", { base_branch: "main" }, 1);
+    // first existing candidate, else the first candidate as a fallback — either ends in the script name
+    assert.match(command.args[0], /codex-companion\.mjs$/);
+  } finally {
+    if (prev !== undefined) process.env.PIPELINE_CODEX_COMPANION = prev;
+  }
+});
+
+test("buildCompanionReviewCommand: claude-companion resolves to a claude-companion.mjs path when nothing is overridden", () => {
+  const prev = process.env.PIPELINE_CC_COMPANION;
+  delete process.env.PIPELINE_CC_COMPANION;
+  try {
+    const command = buildCompanionReviewCommand("claude-companion", { base_branch: "main" }, 1);
+    assert.match(command.args[0], /claude-companion\.mjs$/);
+  } finally {
+    if (prev !== undefined) process.env.PIPELINE_CC_COMPANION = prev;
+  }
+});
+
 test("reviewerLabel: reflects the configured review mode", () => {
   assert.equal(
     reviewerLabel({ review_mode: "codex-companion", harnesses: { implementer: "claude", reviewer: "codex" } }),

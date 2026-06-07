@@ -13,6 +13,7 @@
 // "prompt-harness" mode instead runs the reviewer CLI directly with the
 // pipeline's own review prompt.
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -41,38 +42,44 @@ import type {
 
 const REVIEW_MARKER_PREFIX_R1 = "## Review 1";
 const REVIEW_MARKER_PREFIX_R2 = "## Review 2";
-// cc-plugin-codex companion (drives Claude Code from Codex). Installed under
-// CODEX_HOME; override with PIPELINE_CC_COMPANION.
-const DEFAULT_CC_COMPANION = path.join(
-  os.homedir(),
-  ".codex",
-  "plugins",
-  "cache",
-  "local-plugins",
-  "cc",
-  "local",
-  "scripts",
-  "claude-companion.mjs",
-);
+// Companion plugin script locations. The pipeline shells out to the companion
+// .mjs directly; an explicit PIPELINE_*_COMPANION env var always wins, otherwise
+// we use the first candidate path that EXISTS — installs move between layouts
+// (e.g. cc-plugin-codex's uninstall prunes the legacy local path, and
+// codex-plugin-cc's active copy lives in a versioned cache dir), so a single
+// hardcoded default goes stale. Candidates are listed best-first.
 
-// codex-plugin-cc companion (drives Codex from Claude Code). Installed under the
-// Claude plugin marketplace dir; override with PIPELINE_CODEX_COMPANION.
-const DEFAULT_CODEX_COMPANION = path.join(
-  process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"),
-  "plugins",
-  "marketplaces",
-  "openai-codex",
-  "plugins",
-  "codex",
-  "scripts",
-  "codex-companion.mjs",
-);
+// cc-plugin-codex companion (drives Claude Code from Codex), under CODEX_HOME.
+function ccCompanionCandidates(): string[] {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  return [
+    path.join(codexHome, "plugins", "cache", "local-plugins", "cc", "local", "scripts", "claude-companion.mjs"),
+    path.join(codexHome, "plugins", "cc", "scripts", "claude-companion.mjs"),
+  ];
+}
+
+// codex-plugin-cc companion (drives Codex from Claude Code), under the Claude
+// plugin dir: the stable marketplace clone, then any versioned install cache
+// (newest first).
+function codexCompanionCandidates(): string[] {
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+  const candidates = [
+    path.join(claudeDir, "plugins", "marketplaces", "openai-codex", "plugins", "codex", "scripts", "codex-companion.mjs"),
+  ];
+  const cacheBase = path.join(claudeDir, "plugins", "cache", "openai-codex", "codex");
+  if (fs.existsSync(cacheBase)) {
+    for (const version of fs.readdirSync(cacheBase).sort().reverse()) {
+      candidates.push(path.join(cacheBase, version, "scripts", "codex-companion.mjs"));
+    }
+  }
+  return candidates;
+}
 
 export type CompanionMode = "claude-companion" | "codex-companion";
 
 interface CompanionSpec {
-  /** Default companion script path when no override env var / arg is set. */
-  defaultPath: string;
+  /** Ordered candidate companion script paths (best-first); first existing wins. */
+  candidates: () => string[];
   /** Env var that overrides the companion script path. */
   envVar: string;
   /** Reviewer labels for [round 1 (standard), round 2 (adversarial)]. */
@@ -91,20 +98,29 @@ interface CompanionSpec {
 
 const COMPANIONS: Record<CompanionMode, CompanionSpec> = {
   "claude-companion": {
-    defaultPath: DEFAULT_CC_COMPANION,
+    candidates: ccCompanionCandidates,
     envVar: "PIPELINE_CC_COMPANION",
     labels: ["$cc:review", "$cc:adversarial-review"],
     viewState: true,
     passModel: true,
   },
   "codex-companion": {
-    defaultPath: DEFAULT_CODEX_COMPANION,
+    candidates: codexCompanionCandidates,
     envVar: "PIPELINE_CODEX_COMPANION",
     labels: ["/codex:review", "/codex:adversarial-review"],
     viewState: false,
     passModel: false,
   },
 };
+
+/** Resolve the companion script path: explicit arg → env override → first existing candidate. */
+function resolveCompanionPath(spec: CompanionSpec, companionPath?: string): string {
+  if (companionPath) return companionPath;
+  const override = process.env[spec.envVar];
+  if (override) return override;
+  const candidates = spec.candidates();
+  return candidates.find((p) => fs.existsSync(p)) ?? candidates[0];
+}
 
 export function isCompanionMode(mode: string): mode is CompanionMode {
   return mode === "claude-companion" || mode === "codex-companion";
@@ -140,10 +156,7 @@ export function buildCompanionReviewCommand(
   const spec = COMPANIONS[mode];
   const subcommand = round === 1 ? "review" : "adversarial-review";
   const label = spec.labels[round - 1];
-  const args = [
-    opts.companionPath ?? process.env[spec.envVar] ?? spec.defaultPath,
-    subcommand,
-  ];
+  const args = [resolveCompanionPath(spec, opts.companionPath), subcommand];
   if (spec.viewState) args.push("--view-state", "on-success");
   args.push("--scope", "branch", "--base", cfg.base_branch);
   if (spec.passModel && opts.model) args.push("--model", opts.model);
