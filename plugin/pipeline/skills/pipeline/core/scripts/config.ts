@@ -45,6 +45,15 @@ const PartialConfigSchema = z.object({
       timeout: z.number().int().positive().optional(),
     })
     .optional(),
+  steps: z
+    .object({
+      plan_review: z.boolean().optional(),
+      standard_review: z.boolean().optional(),
+      adversarial_review: z.boolean().optional(),
+      docs: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -141,6 +150,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     last30days: {
       enabled: fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled,
       timeout: fileConfig.last30days?.timeout ?? DEFAULT_CONFIG.last30days.timeout,
+    },
+    steps: {
+      plan_review: fileConfig.steps?.plan_review ?? DEFAULT_CONFIG.steps.plan_review,
+      standard_review: fileConfig.steps?.standard_review ?? DEFAULT_CONFIG.steps.standard_review,
+      adversarial_review: fileConfig.steps?.adversarial_review ?? DEFAULT_CONFIG.steps.adversarial_review,
+      docs: fileConfig.steps?.docs ?? DEFAULT_CONFIG.steps.docs,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,

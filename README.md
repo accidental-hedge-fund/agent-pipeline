@@ -144,8 +144,26 @@ openspec:
 last30days:
   enabled: false                     # opt-in pre-planning brief — see "last30days context"
   timeout: 600                       # seconds
+steps:                               # turn optional steps off for speed/preference (default: all on)
+  plan_review: true                  # cross-harness review of the plan before coding
+  standard_review: true              # review-1 (and its fix round)
+  adversarial_review: true           # review-2 (and its fix round)
+  docs: true                         # docs-update pass in pre-merge
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
+
+## Configurable steps (optional)
+
+The `steps` block turns the optional "thoroughness" steps on or off per repo, to
+trade rigor for speed. Default is everything on (the full pipeline). Configurable:
+`plan_review`, `standard_review` (review-1 + its fix round), `adversarial_review`
+(review-2 + its fix round), and `docs`. Disabling a step still yields a valid path
+to `ready-to-deploy`, and each skip is recorded as a transition comment on the issue.
+
+The structural and safety steps — planning, implementing, and the pre-merge **CI**
+and **mergeability** gates — are **not** configurable: they have no toggle, and an
+unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse
+time rather than silently dropping a safety gate.
 
 ## OpenSpec integration (optional)
 

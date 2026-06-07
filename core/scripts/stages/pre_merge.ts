@@ -57,8 +57,8 @@ export async function advance(
   const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber);
   if (archiveOutcome) return archiveOutcome;
 
-  // ---- Step 1: docs update (once per PR) ----
-  if (!(await docsAlreadyUpdated(cfg, issueNumber))) {
+  // ---- Step 1: docs update (once per PR; skippable via steps.docs) ----
+  if (cfg.steps.docs && !(await docsAlreadyUpdated(cfg, issueNumber))) {
     await updateDocs(cfg, issueNumber, prNumber, opts);
     return {
       advanced: false,
