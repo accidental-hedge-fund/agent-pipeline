@@ -115,6 +115,16 @@ test("detect: npm placeholder/echo stub test script is ignored", () => {
   assert.equal(detectTestCommand(dir), null);
 });
 
+test("detect: echo && real-command is NOT treated as stub", () => {
+  // Regression for finding #2: `echo "..." && vitest` must not be skipped
+  const dir = scaffold({
+    "package.json": JSON.stringify({
+      scripts: { test: 'echo "running tests" && vitest' },
+    }),
+  });
+  assert.deepEqual(detectTestCommand(dir), { cmd: "npm", args: ["run", "test"] });
+});
+
 test("detect: no test script falls back to build:check", () => {
   const dir = scaffold({
     "package.json": JSON.stringify({ scripts: { "build:check": "tsc --noEmit", build: "tsc" } }),
@@ -337,8 +347,30 @@ test("gate (regression / core AC): max_attempts 3, always fail → exactly 3 fix
   assert.equal(out.attempts, 3);
 });
 
-test("gate: fix harness leaves tree dirty without committing → blocked immediately", async () => {
+test("gate: dirty worktree before initial run → blocked at attempts 0 (no fix invoked)", async () => {
+  // Regression for finding #1: gate must check clean state before the first run,
+  // not only after a fix attempt.
   let invoked = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult,
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    gitDirty: async () => true, // dirty from the start
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(invoked, 0);
+  assert.match(out.blockReason ?? "", /uncommitted/i);
+});
+
+test("gate: fix harness leaves tree dirty without committing → blocked immediately", async () => {
+  // gitDirty returns false on the initial check so the first test run proceeds,
+  // then returns true after the fix attempt to simulate uncommitted leftovers.
+  let invoked = 0;
+  let dirtyCall = 0;
   const out = await runTestGate(cfgWith({}), 1, "/wt", {
     detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
     runTests: async () => failResult,
@@ -346,8 +378,34 @@ test("gate: fix harness leaves tree dirty without committing → blocked immedia
       invoked++;
       return okInvoke();
     },
-    gitHead: async () => "same-sha", // HEAD never moves
-    gitDirty: async () => true, // but the tree is dirty
+    gitDirty: async () => {
+      dirtyCall++;
+      return dirtyCall > 1; // clean on initial check, dirty after the fix
+    },
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 1);
+  assert.equal(invoked, 1);
+  assert.match(out.blockReason ?? "", /uncommitted/i);
+});
+
+test("gate (regression / finding #1): dirty state after fix always blocks, regardless of HEAD movement", async () => {
+  // Previously only blocked when HEAD did NOT move. Now the dirty check is
+  // unconditional — even if the fix harness committed something, leftover
+  // uncommitted changes must block the gate.
+  let invoked = 0;
+  let dirtyCall = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => failResult,
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      return dirtyCall > 1; // clean on initial check, dirty after fix
+    },
   });
   assert.equal(out.passed, false);
   assert.equal(out.attempts, 1);

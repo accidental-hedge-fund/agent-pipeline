@@ -94,6 +94,20 @@ export async function runTestGate(
   const label = formatCommand(command);
   console.log(`[pipeline] #${issueNumber}: test gate running \`${label}\``);
 
+  // Require a clean worktree before the first trusted test run. If uncommitted
+  // changes exist, what's tested diverges from what's committed, so the gate
+  // result can't be trusted.
+  if (await gitDirtyFn(wtPath)) {
+    return {
+      skipped: false,
+      passed: false,
+      attempts: 0,
+      blockReason:
+        "Worktree has uncommitted changes before the test gate ran. " +
+        "All changes must be committed so test results can be trusted.",
+    };
+  }
+
   let { passed, output } = await runTestsFn(wtPath, command, cfg.test_gate.timeout);
   if (passed) {
     console.log(`[pipeline] #${issueNumber}: test gate passed`);
@@ -106,7 +120,6 @@ export async function runTestGate(
       `[pipeline] #${issueNumber}: test gate failed; fix attempt ${attempt}/${cfg.test_gate.max_attempts} (${harness})`,
     );
 
-    const headBefore = await gitHeadFn(wtPath);
     const prompt = buildTestFixPrompt({
       issueNumber,
       command: label,
@@ -125,16 +138,16 @@ export async function runTestGate(
       return { skipped: false, passed: false, attempts: attempt, blockReason: reason };
     }
 
-    // If the fix harness produced no commit but left the tree dirty, the test
-    // results would be untrustworthy — block rather than test stale state.
-    const headAfter = await gitHeadFn(wtPath);
-    if (headBefore && headAfter && headBefore === headAfter && (await gitDirtyFn(wtPath))) {
+    // Require a clean worktree after every fix attempt regardless of whether HEAD
+    // advanced. If uncommitted changes remain, the test run would certify state
+    // that can't be pushed as-is, defeating the gate's trust invariant.
+    if (await gitDirtyFn(wtPath)) {
       return {
         skipped: false,
         passed: false,
         attempts: attempt,
         blockReason:
-          "Fix harness left uncommitted changes in the working tree without committing them. " +
+          "Fix harness left uncommitted changes in the working tree. " +
           "Test results can't be trusted — stage and commit the fix before re-running.",
       };
     }
@@ -256,9 +269,12 @@ function detectPackageManager(repoDir: string): string {
   return "npm";
 }
 
-/** True for the npm placeholder and any echo-only stub test script. */
+/** True for the npm placeholder and echo-only stubs (no executable after echo).
+ *  Splits on compound shell operators so `echo "..." && vitest` is NOT a stub,
+ *  while `echo "Error: no test specified" && exit 1` is. */
 function isStubScript(script: string): boolean {
-  return /^\s*echo\b/.test(script);
+  const cmds = script.split(/&&|\|\|?|;/).map((s) => s.trim()).filter(Boolean);
+  return cmds.every((cmd) => /^echo\b|^exit\b/.test(cmd));
 }
 
 /** pytest is only auto-detected with a concrete marker — `pyproject.toml`

@@ -87,12 +87,19 @@ models:
   planning: sonnet
   review: opus
   fix: sonnet
+test_gate:
+  enabled: true                  # default true; set false to skip entirely
+  # command: pnpm run test:ci    # explicit override; auto-detected when absent
+  max_attempts: 3                # max fix-harness invocations before blocking
+  timeout: 300                   # seconds per test/build run
 conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
 
-If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation, fixes, and docs update; Codex is always secondary for review/adversarial review. Legacy `.github/pipeline.yml` `harnesses` keys are accepted for compatibility but ignored so repo config cannot invert a Claude-invoked pipeline run.
+If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply.
+
+The test/build gate runs at the start of the **planning** stage (before a PR is opened) and again at the start of each **fix** stage (before the item advances). Auto-detection checks `package.json` scripts, `go.mod`, `Cargo.toml`, `pytest.ini`/`conftest.py`, and `Makefile` in that order; repos with no detectable command are skipped silently. Set `test_gate.enabled: false` to disable the gate for a repo entirely. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation, fixes, and docs update; Codex is always secondary for review/adversarial review. Legacy `.github/pipeline.yml` `harnesses` keys are accepted for compatibility but ignored so repo config cannot invert a Claude-invoked pipeline run.
 
 ## Run flow
 
