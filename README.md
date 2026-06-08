@@ -219,6 +219,15 @@ and **mergeability** gates — are **not** configurable: they have no toggle, an
 unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse
 time rather than silently dropping a safety gate.
 
+Review verdicts are also pinned to the commit they evaluated. Every review comment
+records the reviewed commit SHA — surfaced in the header (e.g. `— approve (commit
+a1b2c3d)`) and embedded as a machine-readable footer sentinel. Before pre-merge acts
+on a prior approval it re-checks that SHA against current HEAD: if any commit has
+landed since the review, the stale verdict is discarded and the item returns to its
+review round for a fresh review (posting a `## Pipeline: Re-running review` comment)
+rather than advancing. This guards against advancing on a stale approval and is
+always-on — there is no toggle.
+
 ## Test/build gate (optional, default on)
 
 When `test_gate.enabled` (the default), the target repo's **own** test/build
