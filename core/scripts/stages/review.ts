@@ -46,7 +46,11 @@ const REVIEW_MARKER_PREFIX_R2 = "## Review 2";
 // Machine-readable binding of a review verdict to the commit it evaluated (#16).
 // Embedded as a dedicated HTML-comment sentinel on its own line so extraction
 // can anchor to it without matching a SHA that happens to appear in the diff.
-const REVIEWED_SHA_RE = /<!--\s*reviewed-sha:\s*([0-9a-fA-F]{7,40})\s*-->/;
+// Anchored to a full line; requires exactly 40 hex chars so short SHAs that
+// may appear in model-authored prose or diff excerpts do not match. Global flag
+// lets extractReviewedSha pick the LAST occurrence, guarding against injected
+// sentinel content appearing earlier in the comment body.
+const REVIEWED_SHA_RE = /^<!-- reviewed-sha: ([0-9a-fA-F]{40}) -->$/gm;
 // Companion plugin script locations. The pipeline shells out to the companion
 // .mjs directly; an explicit PIPELINE_*_COMPANION env var always wins, otherwise
 // we use the first candidate path that EXISTS — installs move between layouts
@@ -811,8 +815,16 @@ export function extractReviewedSha(
     (b) => reviewRoundOf(b, round) !== null,
   );
   if (!m) return null;
+  // Reset lastIndex before each exec so the global regex is stateless across calls.
+  REVIEWED_SHA_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = REVIEWED_SHA_RE.exec(m.body)) !== null) {
+    lastMatch = cur;
+  }
+  REVIEWED_SHA_RE.lastIndex = 0;
   return {
-    sha: m.body.match(REVIEWED_SHA_RE)?.[1] ?? null,
+    sha: lastMatch?.[1] ?? null,
     round: reviewRoundOf(m.body, round) as 1 | 2,
   };
 }
