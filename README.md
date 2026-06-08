@@ -266,8 +266,17 @@ pure-code issue title returns little public signal. It's also **always
 non-blocking**: if the skill isn't installed, the interpreter is missing, the run
 fails, or the brief has no signal, planning proceeds without it. The pipeline reads
 no API keys itself — the skill owns its own env/keys. Requires the `last30days`
-skill installed (resolved from `$LAST30DAYS_SKILL_DIR`, `~/.claude/skills/last30days`,
-or `~/.codex/skills/last30days`) and Python 3.12+.
+skill installed (`/plugin marketplace add mvanhorn/last30days-skill` in Claude Code,
+or `npx skills add mvanhorn/last30days-skill -g` for Codex/CLI hosts; resolved from
+`$LAST30DAYS_SKILL_DIR`, `~/.claude/skills/last30days`, or `~/.codex/skills/last30days`)
+and Python 3.12+.
+
+**Data-source keys** are configured in the skill, not this pipeline. The two
+highest-lift keys are `BRAVE_SEARCH_API_KEY` (free [Brave Search API](https://brave.com/search/api/))
+and `SCRAPECREATORS_API_KEY` (fuller social/X coverage). Without any keys the
+skill still runs on free public sources, but adding keys improves signal
+significantly. See the [skill's setup guide](https://github.com/mvanhorn/last30days-skill#setup)
+for full instructions.
 
 ## How the two hosts share one core
 

@@ -35,7 +35,7 @@ _Alternatives:_ `console.warn` — rejected because it would mark the output "wa
 
 ### D3 — Hint text content
 
-- **Unavailable branch**: point at `npx -y @last30days/skill` install and note keys live in the skill.
+- **Unavailable branch**: point at the skill's real install (`npx skills add mvanhorn/last30days-skill -g` for Codex/CLI hosts, `/plugin marketplace add mvanhorn/last30days-skill` for Claude Code) and note keys live in the skill.
 - **No-signal branch**: note that the skill ran but found no signal, and suggest adding data-source keys (name `BRAVE_SEARCH_API_KEY` as free; `SCRAPECREATORS_API_KEY` for fuller coverage) configured in the skill itself.
 
 Both messages include a pointer to the skill's README for full setup — a URL the skill's own documentation provides.
