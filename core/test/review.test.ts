@@ -212,6 +212,36 @@ test("advanceReview: zero findings on both attempts blocks with the raw output, 
   });
 });
 
+test("advanceReview: structured zero-findings re-review includes raw stdout in block reason (not _raw fallback)", async (t) => {
+  // Reviewer returns valid structured JSON (no _raw set) on both invocations.
+  // The block comment must still carry the raw stdout so operators can diagnose.
+  const structuredZero =
+    '{"verdict":"needs-attention","summary":"","findings":[],' +
+    '"next_steps":["investigate the auth path thoroughly"]}';
+  const { deps, rec } = makeDeps([structuredZero, structuredZero]);
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 55, 1, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 2, "first attempt + one re-review");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(
+    rec.blocked[0],
+    /investigate the auth path/,
+    "block comment must include the raw stdout even when the structured JSON has no _raw",
+  );
+  assert.ok(
+    !rec.transitions.some((x) => x.to === "fix-1" || x.to === "fix-2"),
+    "must never transition to a fix stage",
+  );
+  assert.deepEqual(outcome, {
+    advanced: false,
+    status: "blocked",
+    reason: "needs-attention with 0 findings on re-review",
+  });
+});
+
 test("advanceReview: needs-attention WITH findings still routes to fix (no re-review)", async (t) => {
   const { deps, rec } = makeDeps([NA_WITH_FINDING]);
   let outcome;
