@@ -329,7 +329,7 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
-    const raw = verdict._raw?.trim() || verdict.summary?.trim() || "(no reviewer output captured)";
+    const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
     await setBlockedFn(
       cfg,
       issueNumber,
