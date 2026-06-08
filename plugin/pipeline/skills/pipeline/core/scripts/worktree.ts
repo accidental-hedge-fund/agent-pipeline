@@ -259,13 +259,20 @@ export function parseDirtyWorkdir(statusOutput: string): boolean {
   return statusOutput.trim().length > 0;
 }
 
+/** Pure — exposed for unit tests. Fail-closed: a non-zero exit code (e.g. index lock,
+ *  permission error) is treated as dirty so the worktree is never silently removed. */
+export function isDirtyResult(code: number, stdout: string): boolean {
+  if (code !== 0) return true;
+  return parseDirtyWorkdir(stdout);
+}
+
 export async function hasDirtyWorkdir(worktreePath: string): Promise<boolean> {
-  const { stdout } = await gitInWorktree(
+  const { stdout, code } = await gitInWorktree(
     worktreePath,
     ["status", "--porcelain"],
     { ignoreFailure: true },
   );
-  return parseDirtyWorkdir(stdout);
+  return isDirtyResult(code, stdout);
 }
 
 async function getWorktreeHeadSha(worktreePath: string): Promise<string> {
@@ -313,15 +320,19 @@ async function sweepRemoveWorktree(
   const branch = branchName(issueNumber, slug);
 
   if (pathOnDisk) {
-    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath, "--force"], { ignoreFailure: true });
+    // Non-forced: if the worktree still has uncommitted changes git will refuse,
+    // giving us a second safety net beyond the dirty-check above.
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath], { ignoreFailure: true });
     if (r.code !== 0) {
       return { ok: false, reason: `git worktree remove failed: ${r.stderr.trim()}` };
     }
   } else {
-    // Directory is already gone — prune the stale registration.
-    const r = await git(cfg, cfg.repo_dir, ["worktree", "prune"], { ignoreFailure: true });
+    // Directory is already gone — deregister the specific stale entry only.
+    // --force is required because the directory is missing; it is scoped to
+    // wtPath and does NOT prune unrelated worktrees (unlike git worktree prune).
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", "--force", wtPath], { ignoreFailure: true });
     if (r.code !== 0) {
-      return { ok: false, reason: `git worktree prune failed: ${r.stderr.trim()}` };
+      return { ok: false, reason: `git worktree remove (stale) failed: ${r.stderr.trim()}` };
     }
   }
 
