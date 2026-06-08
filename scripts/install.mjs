@@ -26,11 +26,16 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOME = homedir();
+
+// Sentinel written into every installer-managed skill dir. Its absence marks a
+// pre-existing personal install that would shadow the plugin's /pipeline skill.
+const MANAGED_MARKER = ".pipeline-installer-managed";
 
 // ---------------------------------------------------------------------------
 // Host definitions
@@ -63,9 +68,7 @@ const HOSTS = {
     overlayDirs: [],
     baseExists: () => existsSync(claudeBase()),
     skillsDir: () => join(claudeBase(), "skills"),
-    postInstall:
-      "Invoke with /pipeline. Live-detected this session (no restart). " +
-      "Tip: removing a duplicate plugin install avoids two /pipeline entries.",
+    postInstall: "Invoke with /pipeline. Live-detected this session (no restart).",
   },
   codex: {
     label: "Codex",
@@ -204,6 +207,94 @@ function preflight(hosts) {
   log("");
 }
 
+// ---------------------------------------------------------------------------
+// Shadow detection + relocation
+// ---------------------------------------------------------------------------
+
+function detectPersonalSkill(host) {
+  const dest = join(HOSTS[host].skillsDir(), "pipeline");
+  if (!existsSync(dest)) return { shadowing: false, dest };
+  if (existsSync(join(dest, MANAGED_MARKER))) return { shadowing: false, dest };
+  return { shadowing: true, dest };
+}
+
+function uniqueBackupPath(base, timestamp) {
+  const stem = join(base, `pipeline.${timestamp}.bak`);
+  if (!existsSync(stem)) return stem;
+  for (let i = 1; i <= 100; i++) {
+    const p = `${stem}.${i}`;
+    if (!existsSync(p)) return p;
+  }
+  throw new Error(`Cannot find a unique backup path under ${base} — remove old backups and retry.`);
+}
+
+function relocatePersonalSkill(dest, backupPath) {
+  renameSync(dest, backupPath);
+}
+
+async function promptLine(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (a) => { rl.close(); resolve(a.trim()); }));
+}
+
+// offerRelocationWith is the testable core; isTTY and promptFn are injectable
+// for unit tests. Returns "proceed" (install this host) or "skip" (preserve the
+// personal install untouched and skip this host).
+async function offerRelocationWith(dest, base, dryRun, isTTY, promptFn = promptLine) {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const backupPath = uniqueBackupPath(base, ts);
+  const relocateCmd = `mv '${dest}' '${backupPath}'`;
+
+  if (dryRun) {
+    warn(
+      `Personal install detected at ${dest} — would shadow the plugin's /pipeline.\n` +
+        `  (dry-run) To relocate manually: ${relocateCmd}`,
+    );
+    return "proceed";
+  }
+
+  if (!isTTY) {
+    // Non-interactive (CI, piped npx): the install target is this exact path, so
+    // proceeding would overwrite the personal install. Auto-relocate to a backup
+    // first so data is preserved rather than silently destroyed.
+    warn(
+      `Personal pipeline skill detected at ${dest} (no ${MANAGED_MARKER} marker).\n` +
+        `  Non-interactive environment — auto-relocating to preserve data.\n` +
+        `  Backed up to: ${backupPath}`,
+    );
+    relocatePersonalSkill(dest, backupPath);
+    return "proceed";
+  }
+
+  // Interactive TTY: prompt the user.
+  warn(
+    `A personal pipeline skill exists at:\n  ${dest}\n` +
+      `  The plugin installs to this same path, so installing here would overwrite it.`,
+  );
+  const answer = await promptFn(`  Relocate it to ${backupPath} first? [y/N] `);
+  if (answer.toLowerCase() === "y") {
+    relocatePersonalSkill(dest, backupPath);
+    log(`  ✓ Relocated to ${backupPath}`);
+    return "proceed";
+  }
+
+  // Declined: leave the personal install untouched and skip this host's install
+  // (proceeding would overwrite it). The duplicate-/pipeline consequence is real
+  // when a personal skill install coexists with the marketplace plugin.
+  warn(
+    `Personal install left in place at ${dest}.\n` +
+      `  Skipped installing here to avoid overwriting it.\n` +
+      `  Note: a personal skill install alongside the marketplace plugin shows up as\n` +
+      `  duplicate /pipeline entries. To migrate, relocate it then re-run install:\n` +
+      `    ${relocateCmd}`,
+  );
+  return "skip";
+}
+
+async function offerRelocation(dest, base, dryRun) {
+  return offerRelocationWith(dest, base, dryRun, Boolean(process.stdin.isTTY));
+}
+
 function renderShim(profile) {
   const tmpl = readFileSync(join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
   return tmpl.replaceAll("__PROFILE__", profile);
@@ -231,6 +322,9 @@ function stageInto(stagingDir, host) {
   const shimPath = join(scriptsDst, "pipeline.mjs");
   writeFileSync(shimPath, renderShim(cfg.profile));
   chmodSync(shimPath, 0o755);
+  // Sentinel: written into staging so it lands atomically with the skill tree.
+  // Future runs use this to distinguish an installer-managed dir from a personal one.
+  writeFileSync(join(stagingDir, MANAGED_MARKER), "");
 }
 
 function installHost(host, dryRun) {
@@ -289,14 +383,26 @@ function uninstallHost(host, dryRun) {
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
   const { verb, host, dryRun } = parseArgs(process.argv);
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
     preflight(hosts);
     log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
-    for (const h of hosts) installHost(h, dryRun);
+    for (const h of hosts) {
+      if (h === "claude") {
+        const { shadowing, dest } = detectPersonalSkill(h);
+        if (shadowing) {
+          const action = await offerRelocation(dest, claudeBase(), dryRun);
+          if (action === "skip") {
+            log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
+            continue;
+          }
+        }
+      }
+      installHost(h, dryRun);
+    }
     log("\nDone.");
   } else if (verb === "uninstall") {
     log(`Uninstalling agent-pipeline ← [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
@@ -307,4 +413,10 @@ function main() {
   }
 }
 
-main();
+// Named exports for unit tests.
+export { MANAGED_MARKER, detectPersonalSkill, uniqueBackupPath, relocatePersonalSkill, offerRelocationWith };
+
+// ESM main guard — prevents main() from running when imported by tests.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => { console.error(err); process.exit(1); });
+}

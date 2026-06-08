@@ -34,7 +34,7 @@ When the installer successfully installs the skill for `--host claude`, it SHALL
 - **THEN** no files are written and no marker is created
 
 ### Requirement: Interactive relocation offer in TTY
-When a personal install is detected AND `process.stdin.isTTY` is true, the installer SHALL prompt the user (Y/N) to relocate the pre-existing `<skillsDir>/pipeline` to `<claudeBase>/pipeline.<unique>.bak`. If the user confirms, the installer SHALL perform the relocation before installing. The relocation SHALL never overwrite an existing backup path (SHALL find a unique name). If the user declines, the installer SHALL proceed with install and print the exact command the user can run later to relocate manually.
+When a personal install is detected AND `process.stdin.isTTY` is true, the installer SHALL prompt the user (Y/N) to relocate the pre-existing `<skillsDir>/pipeline` to `<claudeBase>/pipeline.<unique>.bak`. If the user confirms, the installer SHALL perform the relocation before installing. The relocation SHALL never overwrite an existing backup path (SHALL find a unique name). If the user declines, the installer SHALL leave the personal install untouched and SHALL skip this host's install (because the install target is the same path — proceeding would overwrite the personal install, deleting data). It SHALL print the duplicate-`/pipeline` consequence and the exact command the user can run later to relocate manually, and the installer run SHALL complete without a non-zero exit.
 
 #### Scenario: User accepts relocation
 - **WHEN** personal install is detected in a TTY environment
@@ -46,10 +46,11 @@ When a personal install is detected AND `process.stdin.isTTY` is true, the insta
 #### Scenario: User declines relocation
 - **WHEN** personal install is detected in a TTY environment
 - **AND** the user enters "n" or "N" at the prompt (or presses Enter)
-- **THEN** no relocation occurs
-- **AND** a message is printed stating the duplicate-`/pipeline` consequence
+- **THEN** no relocation occurs and the personal install is left untouched (no data deleted)
+- **AND** this host's install is skipped (proceeding would overwrite the personal install at the same path)
+- **AND** a message is printed stating the duplicate-`/pipeline` consequence (a personal install alongside the marketplace plugin)
 - **AND** the exact shell command to relocate later is printed
-- **AND** the installer proceeds with install (returns exit code 0)
+- **AND** the installer run completes without a non-zero exit
 
 #### Scenario: Backup path already exists, unique name chosen
 - **WHEN** relocation is accepted
@@ -58,15 +59,16 @@ When a personal install is detected AND `process.stdin.isTTY` is true, the insta
 - **AND** the relocation SHALL succeed without overwriting the existing backup
 - **AND** the unique backup path SHALL be printed to the user
 
-### Requirement: Non-interactive relocation skip
-When a personal install is detected AND `process.stdin.isTTY` is false (CI, piped execution), the installer SHALL skip the interactive prompt, emit the warning with the manual-relocation command, and proceed with install without blocking.
+### Requirement: Non-interactive auto-relocation
+When a personal install is detected AND `process.stdin.isTTY` is false (CI, piped execution), the installer SHALL skip the interactive prompt and, because the install target is the same path, SHALL auto-relocate the personal install to a unique `<claudeBase>/pipeline.<unique>.bak` (preserving data rather than overwriting it) before proceeding with the install. It SHALL emit a warning naming the backup path so the move is not silent.
 
 #### Scenario: Non-TTY environment, personal install present
 - **WHEN** personal install is detected
 - **AND** `process.stdin.isTTY` is falsy
 - **THEN** no prompt is shown
-- **AND** a warning is emitted with the manual-relocation shell command
-- **AND** the installer proceeds without user input
+- **AND** the personal install is moved to a unique `<claudeBase>/pipeline.<unique>.bak` (no data deleted, no existing backup overwritten)
+- **AND** a warning is emitted naming the backup path
+- **AND** the installer proceeds with the install without user input
 
 ### Requirement: Paths honor CLAUDE_CONFIG_DIR
 All paths used by detection and relocation SHALL be derived from `claudeBase()` (which already honors `CLAUDE_CONFIG_DIR`). No path SHALL be constructed by hardcoding `~/.claude`.
