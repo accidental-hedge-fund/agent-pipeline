@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseDirtyWorkdir, sweepMergedWorktrees } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -21,6 +21,31 @@ test("parseDirtyWorkdir: empty output → false", () => {
 test("parseDirtyWorkdir: non-empty output → true", () => {
   assert.equal(parseDirtyWorkdir("M  src/foo.ts\n"), true);
   assert.equal(parseDirtyWorkdir("?? untracked.txt"), true);
+});
+
+// ---------------------------------------------------------------------------
+// isDirtyResult — fail-closed dirty detection
+// Regression: previously hasDirtyWorkdir used ignoreFailure but only inspected
+// stdout, so a non-zero git status (lock error, permission error) with empty
+// stdout was treated as "clean" and the worktree could be force-removed.
+// ---------------------------------------------------------------------------
+
+test("isDirtyResult: code=0, empty stdout → false (clean)", () => {
+  assert.equal(isDirtyResult(0, ""), false);
+  assert.equal(isDirtyResult(0, "   \n"), false);
+});
+
+test("isDirtyResult: code=0, non-empty stdout → true (dirty)", () => {
+  assert.equal(isDirtyResult(0, "M  src/foo.ts\n"), true);
+});
+
+test("isDirtyResult: code≠0, empty stdout → true (fail closed)", () => {
+  assert.equal(isDirtyResult(1, ""), true);
+  assert.equal(isDirtyResult(128, ""), true);
+});
+
+test("isDirtyResult: code≠0, non-empty stdout → true", () => {
+  assert.equal(isDirtyResult(1, "some error text"), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -266,6 +291,37 @@ test("sweep: merged + path gone on disk → removal attempted; ok → removed", 
 
   const result = await sweepMergedWorktrees(cfg, deps);
   assert.ok(removeCalled, "removeWorktree should be called for stale registration");
+  assert.equal(result.removed.length, 1);
+  assert.equal(result.skipped.length, 0);
+});
+
+// Regression: previously path-not-on-disk triggered global `git worktree prune`
+// which could deregister unrelated user-created worktrees outside the pipeline
+// root. The sweep must only attempt removal of the specific pipeline worktree.
+test("sweep: stale-reg + unrelated worktree present → only pipeline worktree removal is invoked", async () => {
+  const cfg = makeCfg();
+  const pipelineRec = makeRec(10, "stale-pipeline");
+  // Unrelated worktree that listOnDisk returns (branch does not start with "pipeline/")
+  // — it will be filtered out by the pipeline-root guard, so removeWorktree
+  // should only ever be called once with the pipeline record.
+  const removedIssues: number[] = [];
+
+  const deps: Partial<SweepDeps> = {
+    listOnDisk: async () => [pipelineRec],
+    getPrMergeState: async () => ({ merged: true, prNumber: 100, headSha: "sha-stale" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "",
+    pathExists: () => false,
+    removeWorktree: async (_c, n, _s, pathOnDisk) => {
+      removedIssues.push(n);
+      assert.equal(pathOnDisk, false);
+      return { ok: true as const };
+    },
+  };
+
+  const result = await sweepMergedWorktrees(cfg, deps);
+  assert.equal(removedIssues.length, 1, "removeWorktree must be called exactly once");
+  assert.equal(removedIssues[0], 10);
   assert.equal(result.removed.length, 1);
   assert.equal(result.skipped.length, 0);
 });
