@@ -467,6 +467,13 @@ export function parseStructuredVerdict(output: string): ReviewVerdict & { _raw?:
     }
   }
 
+  // Codex's standard review (`/codex:review`) returns Markdown prose, not JSON.
+  // Parse it so real findings route to a fix instead of being silently dropped
+  // (#50 — observed live on #48: a real [P2] finding was lost → needs-attention/0
+  // → blocked run).
+  const prose = parseProseReview(output);
+  if (prose) return prose;
+
   // Fall back to text-based verdict (conservative). This path produces no
   // structured findings, so log it: a fallback `needs-attention` is
   // indistinguishable from a genuine one at the routing site, and silent
@@ -514,6 +521,123 @@ export function parseTextVerdict(output: string): "approve" | "needs-attention" 
     return "approve";
   }
   return "needs-attention";
+}
+
+const SEVERITY_BY_PRIORITY: Record<string, ReviewFinding["severity"]> = {
+  p0: "critical",
+  p1: "high",
+  p2: "medium",
+  p3: "low",
+};
+const WORD_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
+
+/**
+ * Parse Codex's native review (Markdown prose from `/codex:review`) into a
+ * structured verdict. The standard review is NOT JSON — it emits a
+ * "# Codex Review … Review comment:" block whose findings look like:
+ *
+ *     - [P2] <title> — <file>:<start>-<end>
+ *       <indented body>
+ *
+ * `parseStructuredVerdict` previously only understood JSON, so these findings
+ * were silently dropped (→ needs-attention/0 → blocked run). See #50. Returns
+ * `null` when the output is not a recognizable Codex review, so callers fall
+ * through to the conservative fallback — never a silent approve of unparsed
+ * content (#45).
+ */
+export function parseProseReview(output: string): ReviewVerdict | null {
+  const text = output ?? "";
+  if (!/^#{1,6}\s*Codex Review/im.test(text) && !/^\s*Review comment\s*:/im.test(text)) {
+    return null;
+  }
+
+  const headerRe = /^\s*[-*]\s*\[\s*(P[0-3]|critical|high|medium|low)\s*\]\s*(.+?)\s*$/i;
+  const locRe = /^(.*\S)\s+[—–-]\s+(\S.*?):(\d+)(?:\s*-\s*(\d+))?\s*$/;
+
+  const findings: ReviewFinding[] = [];
+  let current: ReviewFinding | null = null;
+  const flush = (): void => {
+    if (current) {
+      current.body = current.body.trim();
+      findings.push(current);
+      current = null;
+    }
+  };
+
+  for (const line of text.split("\n")) {
+    const h = line.match(headerRe);
+    if (h) {
+      flush();
+      const tag = h[1].toLowerCase();
+      const severity: ReviewFinding["severity"] =
+        SEVERITY_BY_PRIORITY[tag] ??
+        (WORD_SEVERITIES.has(tag) ? (tag as ReviewFinding["severity"]) : "medium");
+      let title = h[2].trim();
+      let file: string | undefined;
+      let lineStart: number | undefined;
+      let lineEnd: number | undefined;
+      const loc = title.match(locRe);
+      if (loc) {
+        title = loc[1].trim();
+        file = loc[2].trim();
+        lineStart = Number(loc[3]);
+        lineEnd = loc[4] ? Number(loc[4]) : lineStart;
+      }
+      current = {
+        severity,
+        title,
+        body: "",
+        file,
+        line_start: lineStart,
+        line_end: lineEnd,
+        confidence: 0.7,
+        recommendation: "",
+      };
+      continue;
+    }
+    if (current) {
+      // A markdown section header ends the current finding's body.
+      if (/^#{1,6}\s/.test(line)) {
+        flush();
+        continue;
+      }
+      const trimmed = line.trim();
+      if (trimmed || current.body) {
+        current.body += (current.body ? "\n" : "") + trimmed;
+      }
+    }
+  }
+  flush();
+
+  const summary = extractProseSummary(text);
+  if (findings.length > 0) {
+    return { verdict: "needs-attention", summary, findings, next_steps: [] };
+  }
+
+  // Recognized as a Codex review but with no parseable findings: only call it an
+  // approve when the text positively says so. Otherwise return null so the
+  // conservative fallback (re-review → block) applies — never silently approve.
+  if (
+    /\bno (?:material )?(?:issues|findings|concerns|blocking)\b/i.test(text) ||
+    /\b(?:looks good|lgtm|approved?|no problems found)\b/i.test(text)
+  ) {
+    return { verdict: "approve", summary, findings: [], next_steps: [] };
+  }
+  return null;
+}
+
+/** Pull a short summary from the prose preceding the findings list. */
+function extractProseSummary(text: string): string {
+  const head = text.split(/^\s*Review comment\s*:/im)[0] ?? text;
+  const cleaned = head
+    .replace(/^#{1,6}\s*Codex Review\s*$/im, "")
+    .replace(/^\s*Target:.*$/im, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  return (cleaned || "Codex review").slice(0, 500);
 }
 
 export function formatReviewComment(
