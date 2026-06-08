@@ -4,7 +4,7 @@ The local test gate (#15) ran only `npm run test` on issue #45, but this repo's 
 
 ## What Changes
 
-- **Apply the fix to this repo:** set `test_gate.command: "npm test && node scripts/build.mjs --check"` in `.github/pipeline.yml` so the gate runs agent-pipeline's full CI command locally.
+- **Apply the fix to this repo:** add a `ci` npm script (covering `npm test`, `node scripts/build.mjs --check`, and the install smoke test), then set `test_gate.command: "npm run ci"` in `.github/pipeline.yml`. A single-token command is required because `test_gate.command` is parsed without a shell — compound operators must live inside the npm script.
 - **Document the pattern:** add a README section (and inline pipeline.yml comment) explaining that if a repo's CI does more than its `test` script, the operator must set `test_gate.command` to cover the additional steps.
 - **Add a regression test:** extend `testgate.test.ts` with a test that verifies a stale generated artifact (simulated via a dirty worktree after the test command runs) is caught by the gate rather than escaping to CI.
 
@@ -20,7 +20,9 @@ The local test gate (#15) ran only `npm run test` on issue #45, but this repo's 
 
 ## Impact
 
-- `.github/pipeline.yml` — adds `test_gate.command` override for this repo.
+- `.github/pipeline.yml` — adds `test_gate.command: "npm run ci"` override for this repo.
+- `package.json` — adds `ci` and `ci:install-smoke` scripts covering the full CI surface.
+- `scripts/ci-install-smoke.mjs` — Node.js script replicating the CI install smoke step.
 - `README.md` — new sub-section under the test/build gate documentation.
 - `core/test/testgate.test.ts` — one new regression test case.
 - No changes to `core/scripts/testgate.ts` logic (the config field already exists; this change wires it up and documents it).

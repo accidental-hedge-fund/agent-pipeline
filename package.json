@@ -24,7 +24,8 @@
     "build:check": "node scripts/build.mjs --check",
     "install:local": "node scripts/install.mjs install",
     "test": "(cd core && npm install --no-audit --no-fund && npm test) && node --test scripts/install.test.mjs",
-    "ci": "npm test && node scripts/build.mjs --check"
+    "ci": "npm test && node scripts/build.mjs --check && npm run ci:install-smoke",
+    "ci:install-smoke": "node scripts/ci-install-smoke.mjs"
   },
   "repository": {
     "type": "git",

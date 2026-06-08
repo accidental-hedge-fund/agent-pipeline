@@ -21,8 +21,8 @@ The incident: #45's implementation passed `npm test` locally, but CI also runs `
 **Decision: Fix via config, not code.**
 The `test_gate.command` field exists precisely for this case. Adding auto-GHA-discovery would be complex and fragile (matrix jobs, conditional steps, `uses:` actions). The operator-configured approach keeps the gate simple and explicit. Rationale: a one-line config change is easier to review, easier to roll back, and immediately verifiable.
 
-**Decision: Use `&&` to chain commands.**
-`shellSplit` already parses `&&`-chained commands as a single command string passed to the shell. The gate spawns this via `sh -c` when the parsed command contains shell operators, preserving short-circuit semantics: if `npm test` fails, `build.mjs --check` is skipped (fast fail). This matches how a developer would run the same check locally.
+**Decision: Wrap all CI steps in a single `npm run ci` script, not a raw `&&` chain.**
+`test_gate.command` is whitespace-tokenized and spawned without a shell (no `sh -c`), so a raw `&&` in the config value would be treated as a literal argument rather than a shell operator. Wrapping the full CI command sequence (`npm test && node scripts/build.mjs --check && npm run ci:install-smoke`) in a single `npm run ci` script keeps the config value a single token and preserves short-circuit semantics via the npm script runner. This is the correct approach for any multi-step CI command.
 
 **Decision: Regression test targets the compound-command failure path.**
 The test should verify that a `test_gate.command` of form `<passing-cmd> && <failing-cmd>` causes the gate to block. This precisely models the stale-mirror scenario: the first command (npm test) passes but the second (build.mjs --check) fails. The existing test harness in `testgate.test.ts` already mocks process spawning, so the new test case is a thin addition.
