@@ -507,12 +507,12 @@ export function parsePrMergeState(
 }
 
 /** Returns the merge state for a specific branch by exact `--head` match.
- *  On any gh failure returns `{ merged: false }` (fail-safe: don't remove
- *  things we aren't sure about). */
+ *  On gh/auth/API failure returns `{ merged: false, error }` so callers can
+ *  distinguish "unmerged PR" from "lookup failed". */
 export async function getPrMergeState(
   cfg: PipelineConfig,
   branch: string,
-): Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false }> {
+): Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false; error?: string }> {
   try {
     const stdout = await ghRun([
       "pr", "list",
@@ -523,8 +523,9 @@ export async function getPrMergeState(
       "-R", cfg.repo,
     ]);
     return parsePrMergeState(stdout);
-  } catch {
-    return { merged: false };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { merged: false, error: msg };
   }
 }
 

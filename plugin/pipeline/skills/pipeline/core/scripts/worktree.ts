@@ -287,11 +287,50 @@ export interface SweepDeps {
   getPrMergeState: (
     cfg: PipelineConfig,
     branch: string,
-  ) => Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false }>;
+  ) => Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false; error?: string }>;
   hasDirtyWorkdir: (worktreePath: string) => Promise<boolean>;
   getWorktreeHeadSha: (worktreePath: string) => Promise<string>;
-  removeWorktree: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
+  /** Attempt to remove a worktree and its branch; returns ok/failure so the
+   *  caller can report partial success rather than silently claiming removal. */
+  removeWorktree: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    pathOnDisk: boolean,
+  ) => Promise<{ ok: true } | { ok: false; reason: string }>;
   pathExists: (p: string) => boolean;
+}
+
+/** Sweep-specific removal that verifies both worktree deregistration and
+ *  branch deletion succeeded before reporting the worktree as removed. */
+async function sweepRemoveWorktree(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  slug: string,
+  pathOnDisk: boolean,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const wtPath = worktreePath(cfg, issueNumber, slug);
+  const branch = branchName(issueNumber, slug);
+
+  if (pathOnDisk) {
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath, "--force"], { ignoreFailure: true });
+    if (r.code !== 0) {
+      return { ok: false, reason: `git worktree remove failed: ${r.stderr.trim()}` };
+    }
+  } else {
+    // Directory is already gone — prune the stale registration.
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "prune"], { ignoreFailure: true });
+    if (r.code !== 0) {
+      return { ok: false, reason: `git worktree prune failed: ${r.stderr.trim()}` };
+    }
+  }
+
+  const br = await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+  if (br.code !== 0) {
+    return { ok: false, reason: `git branch -D failed: ${br.stderr.trim()}` };
+  }
+
+  return { ok: true };
 }
 
 /** Remove pipeline-managed worktrees whose PR has already been merged.
@@ -308,7 +347,7 @@ export async function sweepMergedWorktrees(
     getPrMergeState,
     hasDirtyWorkdir,
     getWorktreeHeadSha,
-    removeWorktree,
+    removeWorktree: sweepRemoveWorktree,
     pathExists: fs.existsSync,
     ...deps,
   };
@@ -327,12 +366,21 @@ export async function sweepMergedWorktrees(
     if (!rec.branch || rec.issueNumber === undefined || !rec.slug) continue;
 
     const mergeState = await d.getPrMergeState(cfg, rec.branch);
-    if (!mergeState.merged) continue;
+    if (!mergeState.merged) {
+      if (mergeState.error !== undefined) {
+        skipped.push({ rec, reason: `could not determine PR merge state: ${mergeState.error}` });
+      }
+      continue;
+    }
 
-    // Path gone on disk but still registered — just deregister.
+    // Path gone on disk but still registered — deregister and clean branch.
     if (!d.pathExists(rec.path)) {
-      await d.removeWorktree(cfg, rec.issueNumber, rec.slug);
-      removed.push(rec);
+      const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, false);
+      if (result.ok) {
+        removed.push(rec);
+      } else {
+        skipped.push({ rec, reason: `removal failed: ${result.reason}` });
+      }
       continue;
     }
 
@@ -351,8 +399,12 @@ export async function sweepMergedWorktrees(
       continue;
     }
 
-    await d.removeWorktree(cfg, rec.issueNumber, rec.slug);
-    removed.push(rec);
+    const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, true);
+    if (result.ok) {
+      removed.push(rec);
+    } else {
+      skipped.push({ rec, reason: `removal failed: ${result.reason}` });
+    }
   }
 
   return { removed, skipped };

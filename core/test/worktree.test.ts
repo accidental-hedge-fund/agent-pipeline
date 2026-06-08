@@ -55,8 +55,8 @@ function makeRec(issueNumber: number, slug: string, rootOverride?: string): Work
   };
 }
 
-function noop(): Promise<void> {
-  return Promise.resolve();
+function okResult(): Promise<{ ok: true }> {
+  return Promise.resolve({ ok: true as const });
 }
 
 test("sweep: merged + clean + same SHA → removed", async () => {
@@ -72,7 +72,7 @@ test("sweep: merged + clean + same SHA → removed", async () => {
     pathExists: () => true,
     removeWorktree: async (_c, n, s) => {
       removeWorktreeCalls.push(makeRec(n, s));
-      return noop();
+      return okResult();
     },
   };
 
@@ -94,7 +94,7 @@ test("sweep: open PR → untouched (not in removed or skipped)", async () => {
     hasDirtyWorkdir: async () => false,
     getWorktreeHeadSha: async () => "def456",
     pathExists: () => true,
-    removeWorktree: async () => { removeWorktreeCalls.push(1); },
+    removeWorktree: async () => { removeWorktreeCalls.push(1); return { ok: true as const }; },
   };
 
   const result = await sweepMergedWorktrees(cfg, deps);
@@ -113,7 +113,7 @@ test("sweep: merged + dirty → skipped with 'uncommitted changes'", async () =>
     hasDirtyWorkdir: async () => true,
     getWorktreeHeadSha: async () => "ghi789",
     pathExists: () => true,
-    removeWorktree: async () => {},
+    removeWorktree: async () => ({ ok: true as const }),
   };
 
   const result = await sweepMergedWorktrees(cfg, deps);
@@ -133,7 +133,7 @@ test("sweep: merged + clean + diverged local HEAD → skipped", async () => {
     hasDirtyWorkdir: async () => false,
     getWorktreeHeadSha: async () => "local-sha-different",
     pathExists: () => true,
-    removeWorktree: async () => {},
+    removeWorktree: async () => ({ ok: true as const }),
   };
 
   const result = await sweepMergedWorktrees(cfg, deps);
@@ -151,7 +151,7 @@ test("sweep: no pipeline worktrees on disk → empty result (no-op)", async () =
     hasDirtyWorkdir: async () => false,
     getWorktreeHeadSha: async () => "",
     pathExists: () => false,
-    removeWorktree: async () => {},
+    removeWorktree: async () => ({ ok: true as const }),
   };
 
   const result = await sweepMergedWorktrees(cfg, deps);
@@ -175,7 +175,7 @@ test("sweep: worktree outside cfg.worktree_root is ignored", async () => {
     hasDirtyWorkdir: async () => false,
     getWorktreeHeadSha: async () => "abc",
     pathExists: () => true,
-    removeWorktree: async () => { removeWorktreeCalls.push(1); },
+    removeWorktree: async () => { removeWorktreeCalls.push(1); return { ok: true as const }; },
   };
 
   const result = await sweepMergedWorktrees(cfg, deps);
@@ -195,7 +195,7 @@ test("sweep: second run is a no-op (idempotent)", async () => {
     hasDirtyWorkdir: async () => false,
     getWorktreeHeadSha: async () => "xyz",
     pathExists: () => true,
-    removeWorktree: async () => {},
+    removeWorktree: async () => ({ ok: true as const }),
   };
 
   const first = await sweepMergedWorktrees(cfg, deps);
@@ -204,4 +204,68 @@ test("sweep: second run is a no-op (idempotent)", async () => {
   const second = await sweepMergedWorktrees(cfg, deps);
   assert.equal(second.removed.length, 0);
   assert.equal(second.skipped.length, 0);
+});
+
+test("sweep: removeWorktree failure → skipped with reason, not added to removed", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(7, "removal-fails");
+
+  const deps: Partial<SweepDeps> = {
+    listOnDisk: async () => [rec],
+    getPrMergeState: async () => ({ merged: true, prNumber: 70, headSha: "sha-ok" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "sha-ok",
+    pathExists: () => true,
+    removeWorktree: async () => ({ ok: false as const, reason: "git worktree remove failed: locked" }),
+  };
+
+  const result = await sweepMergedWorktrees(cfg, deps);
+  assert.equal(result.removed.length, 0);
+  assert.equal(result.skipped.length, 1);
+  assert.match(result.skipped[0].reason, /removal failed/);
+  assert.match(result.skipped[0].reason, /git worktree remove failed: locked/);
+});
+
+test("sweep: getPrMergeState error → skipped with reason, not silently treated as unmerged", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(8, "gh-error");
+
+  const deps: Partial<SweepDeps> = {
+    listOnDisk: async () => [rec],
+    getPrMergeState: async () => ({ merged: false, error: "gh: authentication required" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "",
+    pathExists: () => true,
+    removeWorktree: async () => ({ ok: true as const }),
+  };
+
+  const result = await sweepMergedWorktrees(cfg, deps);
+  assert.equal(result.removed.length, 0);
+  assert.equal(result.skipped.length, 1);
+  assert.match(result.skipped[0].reason, /could not determine PR merge state/);
+  assert.match(result.skipped[0].reason, /gh: authentication required/);
+});
+
+test("sweep: merged + path gone on disk → removal attempted; ok → removed", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(9, "stale-reg");
+  let removeCalled = false;
+
+  const deps: Partial<SweepDeps> = {
+    listOnDisk: async () => [rec],
+    getPrMergeState: async () => ({ merged: true, prNumber: 90, headSha: "stale-sha" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "",
+    pathExists: () => false,
+    removeWorktree: async (_c, _n, _s, pathOnDisk) => {
+      removeCalled = true;
+      assert.equal(pathOnDisk, false, "should signal path is not on disk");
+      return { ok: true as const };
+    },
+  };
+
+  const result = await sweepMergedWorktrees(cfg, deps);
+  assert.ok(removeCalled, "removeWorktree should be called for stale registration");
+  assert.equal(result.removed.length, 1);
+  assert.equal(result.skipped.length, 0);
 });
