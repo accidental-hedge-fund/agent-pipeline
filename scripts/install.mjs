@@ -19,6 +19,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -416,7 +417,14 @@ async function main() {
 // Named exports for unit tests.
 export { MANAGED_MARKER, detectPersonalSkill, uniqueBackupPath, relocatePersonalSkill, offerRelocationWith };
 
-// ESM main guard — prevents main() from running when imported by tests.
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// ESM main guard — tolerates bin symlinks by resolving both paths before comparing.
+function _isMain() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (_isMain()) {
   main().catch((err) => { console.error(err); process.exit(1); });
 }
