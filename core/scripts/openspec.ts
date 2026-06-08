@@ -219,6 +219,16 @@ export async function init(dir: string, tools = "claude,codex", timeoutMs = 120_
 }
 
 /**
+ * Spec deltas for the active change (or "" when OpenSpec is not active or has no changes).
+ * Shared helper called by all pipeline stages that need the current change's requirements.
+ */
+export function openspecContext(cfg: Pick<PipelineConfig, "openspec">, cwd: string): string {
+  if (!isActive(cfg, cwd)) return "";
+  const changes = listChangeDirs(cwd);
+  return changes.length ? readSpecDeltas(cwd, changes[0]) : "";
+}
+
+/**
  * Distinct active change ids referenced by a list of repo-relative paths
  * (matches `openspec/changes/<id>/…`, excludes the `archive` folder). Pure;
  * exported for tests. Used to find the change(s) a PR branch introduced.

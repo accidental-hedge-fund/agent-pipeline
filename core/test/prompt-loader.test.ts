@@ -305,3 +305,115 @@ test("review prompt: large diff is truncated", () => {
   });
   assert.match(out, /diff truncated at 50KB/);
 });
+
+test("plan_review prompt: injects OpenSpec spec context when provided", () => {
+  const out = buildPlanReviewPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 10,
+    title: "t",
+    body: "b",
+    plan: "p",
+    reviewer: "codex",
+    implementer: "claude",
+    specContext: "REQ: plan must include a migration rollback step",
+  });
+  assert.match(out, /Intended Behavior/);
+  assert.match(out, /plan must include a migration rollback step/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("plan_review prompt: no spec section + no leftover placeholders when specContext absent", () => {
+  const out = buildPlanReviewPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 10,
+    title: "t",
+    body: "b",
+    plan: "p",
+    reviewer: "codex",
+    implementer: "claude",
+  });
+  assert.doesNotMatch(out, /Intended Behavior/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("plan_revision prompt: injects OpenSpec spec context when provided", () => {
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 11,
+    title: "t",
+    body: "b",
+    plan: "p",
+    feedback: "needs work",
+    reviewer: "codex",
+    implementer: "claude",
+    specContext: "REQ: revision must address auth timeout scenario",
+  });
+  assert.match(out, /Intended Behavior/);
+  assert.match(out, /revision must address auth timeout scenario/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("plan_revision prompt: no spec section + no leftover placeholders when specContext absent", () => {
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 11,
+    title: "t",
+    body: "b",
+    plan: "p",
+    feedback: "needs work",
+    reviewer: "codex",
+    implementer: "claude",
+  });
+  assert.doesNotMatch(out, /Intended Behavior/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("implementing prompt: injects OpenSpec spec context when provided", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 12,
+    title: "t",
+    body: "b",
+    plan: "p",
+    specContext: "REQ: implementation must handle empty input gracefully",
+  });
+  assert.match(out, /Intended Behavior/);
+  assert.match(out, /handle empty input gracefully/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("implementing prompt: no spec section + no leftover placeholders when specContext absent", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 12,
+    title: "t",
+    body: "b",
+    plan: "p",
+  });
+  assert.doesNotMatch(out, /Intended Behavior/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix prompt: injects OpenSpec spec context when provided", () => {
+  const out = buildFixPrompt({
+    issueNumber: 13,
+    title: "t",
+    reviewFindings: "FINDINGS",
+    fixRound: 1,
+    specContext: "REQ: fix must preserve idempotency guarantee",
+  });
+  assert.match(out, /Intended Behavior/);
+  assert.match(out, /preserve idempotency guarantee/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix prompt: no spec section + no leftover placeholders when specContext absent", () => {
+  const out = buildFixPrompt({
+    issueNumber: 13,
+    title: "t",
+    reviewFindings: "FINDINGS",
+    fixRound: 1,
+  });
+  assert.doesNotMatch(out, /Intended Behavior/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});

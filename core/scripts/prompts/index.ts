@@ -88,6 +88,8 @@ export interface BuildPlanReviewArgs extends BuildPlanArgs {
   plan: string;
   reviewer: string;
   implementer: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildPlanReviewPrompt(a: BuildPlanReviewArgs): string {
@@ -102,6 +104,7 @@ export function buildPlanReviewPrompt(a: BuildPlanReviewArgs): string {
     plan: a.plan,
     reviewer: a.reviewer,
     implementer: a.implementer,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -110,6 +113,8 @@ export interface BuildPlanRevisionArgs extends BuildPlanArgs {
   feedback: string;
   reviewer: string;
   implementer: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
@@ -125,11 +130,14 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
     feedback: a.feedback,
     reviewer: a.reviewer,
     implementer: a.implementer,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
 export interface BuildImplementingArgs extends BuildPlanArgs {
   plan: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildImplementingPrompt(a: BuildImplementingArgs): string {
@@ -142,6 +150,7 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     plan: a.plan,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -197,6 +206,8 @@ export interface BuildFixArgs {
   title: string;
   reviewFindings: string;
   fixRound: 1 | 2;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
@@ -206,6 +217,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     fix_round: String(a.fixRound),
     review_type: a.fixRound === 1 ? "standard" : "adversarial",
     review_findings: a.reviewFindings,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -261,6 +273,15 @@ function specSection(specContext?: string): string {
   return (
     "## OpenSpec — Intended Behavior (spec deltas)\n\n" +
     "The diff must satisfy these requirement changes. Flag any divergence from them.\n\n" +
+    specContext.trim()
+  );
+}
+
+function specContextSection(specContext?: string): string {
+  if (!specContext || !specContext.trim()) return "";
+  return (
+    "## OpenSpec — Intended Behavior (spec deltas)\n\n" +
+    "This work must satisfy these requirement changes.\n\n" +
     specContext.trim()
   );
 }

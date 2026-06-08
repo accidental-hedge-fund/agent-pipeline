@@ -6,6 +6,8 @@ This is fix round {{fix_round}} — addressing findings from the {{review_type}}
 
 {{review_findings}}
 
+{{spec_context}}
+
 ## Instructions
 
 1. Address EACH finding listed above. For each:

@@ -11,6 +11,7 @@ import {
   isActive,
   isInitialized,
   listChangeDirs,
+  openspecContext,
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
@@ -159,4 +160,49 @@ test("shouldPlanWithOpenspec: auto follows init, or bootstrap when uninitialized
   assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: true } }, d), true);
   fs.mkdirSync(path.join(d, "openspec"));
   assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: false } }, d), true);
+});
+
+test("openspecContext: returns spec deltas when OpenSpec is active with a change", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "my-change", "specs", "feature");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "## ADDED Requirement: must support batch mode");
+  const result = openspecContext({ openspec: { enabled: "on" } }, dir);
+  assert.match(result, /must support batch mode/);
+});
+
+test("openspecContext: returns empty string when OpenSpec is inactive (mode off)", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "my-change", "specs");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "## ADDED Requirement");
+  assert.equal(openspecContext({ openspec: { enabled: "off" } }, dir), "");
+});
+
+test("openspecContext: returns empty string when no change dirs exist", () => {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, "openspec", "changes"), { recursive: true });
+  assert.equal(openspecContext({ openspec: { enabled: "on" } }, dir), "");
+});
+
+test("openspecContext: returns empty string when active change has no spec deltas", () => {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, "openspec", "changes", "empty-change"), { recursive: true });
+  assert.equal(openspecContext({ openspec: { enabled: "on" } }, dir), "");
+});
+
+test("openspecContext: uses the first change dir when multiple exist", () => {
+  const dir = tmpDir();
+  const changes = path.join(dir, "openspec", "changes");
+  const s1 = path.join(changes, "aaa-change", "specs");
+  const s2 = path.join(changes, "zzz-change", "specs");
+  fs.mkdirSync(s1, { recursive: true });
+  fs.mkdirSync(s2, { recursive: true });
+  fs.writeFileSync(path.join(s1, "spec.md"), "REQ-AAA");
+  fs.writeFileSync(path.join(s2, "spec.md"), "REQ-ZZZ");
+  const result = openspecContext({ openspec: { enabled: "on" } }, dir);
+  // Should return spec deltas from whichever change listChangeDirs() picks first.
+  assert.ok(result === "REQ-AAA" || result.includes("REQ-AAA") || result === "REQ-ZZZ" || result.includes("REQ-ZZZ"));
+  // Should NOT include both (only the first change is used).
+  assert.ok(!(result.includes("REQ-AAA") && result.includes("REQ-ZZZ")));
 });
