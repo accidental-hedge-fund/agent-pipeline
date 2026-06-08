@@ -19,7 +19,8 @@ const TABLE: ExpectedTransition[] = [
   { from: "review-2",      outcome: "approve",        to: "pre-merge" },
   { from: "review-2",      outcome: "needs-attention", to: "fix-2" },
   { from: "fix-2",         outcome: "advance",        to: "pre-merge" },
-  { from: "pre-merge",     outcome: "advance",        to: "ready-to-deploy" },
+  { from: "pre-merge",     outcome: "advance",        to: "eval-gate" },
+  { from: "eval-gate",     outcome: "advance",        to: "ready-to-deploy" },
 ];
 
 test("state machine: every documented stage exists in STAGES", () => {
@@ -76,9 +77,19 @@ test("state machine: STAGES order is forward", () => {
     "review-2",
     "fix-2",
     "pre-merge",
+    "eval-gate",
     "ready-to-deploy",
   ];
   assert.deepEqual([...STAGES], expected);
+});
+
+test("state machine: eval-gate sits between pre-merge and ready-to-deploy", () => {
+  const stages = [...STAGES];
+  const preMergeIdx = stages.indexOf("pre-merge");
+  const evalGateIdx = stages.indexOf("eval-gate");
+  const readyToDeployIdx = stages.indexOf("ready-to-deploy");
+  assert.ok(evalGateIdx > preMergeIdx, "eval-gate must come after pre-merge");
+  assert.ok(evalGateIdx < readyToDeployIdx, "eval-gate must come before ready-to-deploy");
 });
 
 test("step config (#13): review skip targets keep a valid forward path", () => {

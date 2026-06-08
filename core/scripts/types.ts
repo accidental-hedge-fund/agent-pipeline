@@ -11,6 +11,7 @@ export const STAGES = [
   "review-2",
   "fix-2",
   "pre-merge",
+  "eval-gate",
   "ready-to-deploy",
 ] as const;
 export type Stage = (typeof STAGES)[number];
@@ -76,6 +77,16 @@ export interface PipelineConfig {
     max_attempts: number; // max fix-harness invocations before blocking
     timeout: number; // seconds per test/build run
   };
+  // Eval gate (#12). When enabled, runs the repo's eval harness after pre-merge
+  // and before ready-to-deploy. gate mode (default) blocks on fail; advisory
+  // mode records the result and always advances.
+  eval_gate: {
+    enabled: boolean;
+    command?: string;
+    mode: "gate" | "advisory";
+    timeout: number;   // seconds
+    max_attempts: number; // total attempts (1 = no retry)
+  };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -99,6 +110,7 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   last30days: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
+  eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
 };
 
 // ---------------------------------------------------------------------------

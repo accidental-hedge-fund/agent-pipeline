@@ -212,3 +212,60 @@ test("resolveConfig: invalid test_gate.max_attempts is rejected", async () => {
     process.env.PATH = oldPath;
   }
 });
+
+test("resolveConfig: eval_gate defaults apply when block is absent", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/eg0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.eval_gate.enabled, DEFAULT_CONFIG.eval_gate.enabled);
+    assert.equal(cfg.eval_gate.enabled, false);
+    assert.equal(cfg.eval_gate.mode, DEFAULT_CONFIG.eval_gate.mode);
+    assert.equal(cfg.eval_gate.mode, "gate");
+    assert.equal(cfg.eval_gate.timeout, DEFAULT_CONFIG.eval_gate.timeout);
+    assert.equal(cfg.eval_gate.max_attempts, DEFAULT_CONFIG.eval_gate.max_attempts);
+    assert.equal(cfg.eval_gate.command, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: eval_gate enabled with command and advisory mode", async () => {
+  const repo = makeFakeRepo(
+    `eval_gate:\n  enabled: true\n  command: "pnpm evals"\n  mode: advisory\n  timeout: 120\n  max_attempts: 3\n`,
+  );
+  const binDir = makeFakeGh("acme/eg1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.eval_gate.enabled, true);
+    assert.equal(cfg.eval_gate.command, "pnpm evals");
+    assert.equal(cfg.eval_gate.mode, "advisory");
+    assert.equal(cfg.eval_gate.timeout, 120);
+    assert.equal(cfg.eval_gate.max_attempts, 3);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: eval_gate enabled:false keeps other defaults", async () => {
+  const repo = makeFakeRepo(`eval_gate:\n  enabled: false\n`);
+  const binDir = makeFakeGh("acme/eg2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.eval_gate.enabled, false);
+    assert.equal(cfg.eval_gate.mode, DEFAULT_CONFIG.eval_gate.mode);
+    assert.equal(cfg.eval_gate.timeout, DEFAULT_CONFIG.eval_gate.timeout);
+    assert.equal(cfg.eval_gate.max_attempts, DEFAULT_CONFIG.eval_gate.max_attempts);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

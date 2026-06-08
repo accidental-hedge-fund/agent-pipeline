@@ -50,7 +50,7 @@ export async function advance(
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+docs+CI+merge for PR #${prNumber}`);
-    return { advanced: true, from: "pre-merge", to: "ready-to-deploy", summary: "[dry-run]" };
+    return { advanced: true, from: "pre-merge", to: "eval-gate", summary: "[dry-run]" };
   }
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
@@ -152,15 +152,14 @@ export async function advance(
     cfg,
     issueNumber,
     "pre-merge",
-    "ready-to-deploy",
-    `All pre-merge gates passed (docs updated, CI green, no conflicts). PR #${prNumber} is ready to merge.`,
+    "eval-gate",
+    `All pre-merge gates passed (docs updated, CI green, no conflicts). Advancing to eval-gate for PR #${prNumber}.`,
   );
-  // Note: cfg.auto_merge intentionally NOT honored here. The user owns the merge button.
   return {
     advanced: true,
     from: "pre-merge",
-    to: "ready-to-deploy",
-    summary: `PR #${prNumber} ready to merge`,
+    to: "eval-gate",
+    summary: `PR #${prNumber} pre-merge gates passed`,
   };
 }
 
