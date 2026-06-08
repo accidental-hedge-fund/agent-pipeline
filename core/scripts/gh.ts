@@ -494,6 +494,42 @@ export async function clearBlocked(
 }
 
 // ---------------------------------------------------------------------------
+// Worktree cleanup: merged-PR detection
+// ---------------------------------------------------------------------------
+
+/** Pure parser — exposed for unit tests. */
+export function parsePrMergeState(
+  stdout: string,
+): { merged: true; prNumber: number; headSha: string } | { merged: false } {
+  const prs = JSON.parse(stdout) as { number: number; headRefOid: string }[];
+  if (prs.length === 0) return { merged: false };
+  return { merged: true, prNumber: prs[0].number, headSha: prs[0].headRefOid };
+}
+
+/** Returns the merge state for a specific branch by exact `--head` match.
+ *  On gh/auth/API failure returns `{ merged: false, error }` so callers can
+ *  distinguish "unmerged PR" from "lookup failed". */
+export async function getPrMergeState(
+  cfg: PipelineConfig,
+  branch: string,
+): Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false; error?: string }> {
+  try {
+    const stdout = await ghRun([
+      "pr", "list",
+      "--state", "merged",
+      "--head", branch,
+      "--json", "number,headRefOid",
+      "-L", "10",
+      "-R", cfg.repo,
+    ]);
+    return parsePrMergeState(stdout);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { merged: false, error: msg };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // PR creation + lookup
 // ---------------------------------------------------------------------------
 

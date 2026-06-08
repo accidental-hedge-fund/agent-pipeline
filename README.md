@@ -146,11 +146,19 @@ Update later with `/plugin marketplace update ahf-tools`.
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
+/pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 ```
 
 The number is auto-detected as an issue or PR. PRs resolve to their linked
 closing issue; PRs with no `Closes #N` are refused. Items must carry a
 `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
+
+`--cleanup` takes no number: it sweeps pipeline-managed worktrees under
+`worktree_root` whose PR is already merged, removing the worktree and its local
+branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch,
+and skips (reporting the reason) any worktree with uncommitted changes or a local
+HEAD that differs from the merged PR's commit. It is idempotent — a second run
+finds nothing to do.
 
 ## Per-repo config (optional)
 

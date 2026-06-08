@@ -10,7 +10,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { getIssueStateAndLabels } from "./gh.ts";
+import { getIssueStateAndLabels, getPrMergeState } from "./gh.ts";
 import type { PipelineConfig } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -64,7 +64,7 @@ async function git(
   }
 }
 
-interface WorktreeRecord {
+export interface WorktreeRecord {
   path: string;
   branch?: string;
   issueNumber?: number;
@@ -248,4 +248,175 @@ export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<
     { ignoreFailure: true },
   );
   return stdout.trim().length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Worktree sweep (cleanup of merged-PR worktrees)
+// ---------------------------------------------------------------------------
+
+/** Pure parser — exposed for unit tests. */
+export function parseDirtyWorkdir(statusOutput: string): boolean {
+  return statusOutput.trim().length > 0;
+}
+
+/** Pure — exposed for unit tests. Fail-closed: a non-zero exit code (e.g. index lock,
+ *  permission error) is treated as dirty so the worktree is never silently removed. */
+export function isDirtyResult(code: number, stdout: string): boolean {
+  if (code !== 0) return true;
+  return parseDirtyWorkdir(stdout);
+}
+
+export async function hasDirtyWorkdir(worktreePath: string): Promise<boolean> {
+  const { stdout, code } = await gitInWorktree(
+    worktreePath,
+    ["status", "--porcelain"],
+    { ignoreFailure: true },
+  );
+  return isDirtyResult(code, stdout);
+}
+
+async function getWorktreeHeadSha(worktreePath: string): Promise<string> {
+  const { stdout } = await gitInWorktree(
+    worktreePath,
+    ["rev-parse", "HEAD"],
+    { ignoreFailure: true },
+  );
+  return stdout.trim();
+}
+
+export interface SweepResult {
+  removed: WorktreeRecord[];
+  skipped: Array<{ rec: WorktreeRecord; reason: string }>;
+}
+
+export interface SweepDeps {
+  listOnDisk: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  getPrMergeState: (
+    cfg: PipelineConfig,
+    branch: string,
+  ) => Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false; error?: string }>;
+  hasDirtyWorkdir: (worktreePath: string) => Promise<boolean>;
+  getWorktreeHeadSha: (worktreePath: string) => Promise<string>;
+  /** Attempt to remove a worktree and its branch; returns ok/failure so the
+   *  caller can report partial success rather than silently claiming removal. */
+  removeWorktree: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    pathOnDisk: boolean,
+  ) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  pathExists: (p: string) => boolean;
+}
+
+/** Sweep-specific removal that verifies both worktree deregistration and
+ *  branch deletion succeeded before reporting the worktree as removed. */
+async function sweepRemoveWorktree(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  slug: string,
+  pathOnDisk: boolean,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const wtPath = worktreePath(cfg, issueNumber, slug);
+  const branch = branchName(issueNumber, slug);
+
+  if (pathOnDisk) {
+    // Non-forced: if the worktree still has uncommitted changes git will refuse,
+    // giving us a second safety net beyond the dirty-check above.
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath], { ignoreFailure: true });
+    if (r.code !== 0) {
+      return { ok: false, reason: `git worktree remove failed: ${r.stderr.trim()}` };
+    }
+  } else {
+    // Directory is already gone — deregister the specific stale entry only.
+    // --force is required because the directory is missing; it is scoped to
+    // wtPath and does NOT prune unrelated worktrees (unlike git worktree prune).
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", "--force", wtPath], { ignoreFailure: true });
+    if (r.code !== 0) {
+      return { ok: false, reason: `git worktree remove (stale) failed: ${r.stderr.trim()}` };
+    }
+  }
+
+  const br = await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+  if (br.code !== 0) {
+    return { ok: false, reason: `git branch -D failed: ${br.stderr.trim()}` };
+  }
+
+  return { ok: true };
+}
+
+/** Remove pipeline-managed worktrees whose PR has already been merged.
+ *  Only touches worktrees under cfg.worktree_root with pipeline/<N>-<slug> branches.
+ *  Skips dirty worktrees (uncommitted changes) and worktrees whose local HEAD
+ *  diverges from the merged PR's head SHA (may have unpushed commits).
+ *  Deps are injectable for unit testing; defaults use real implementations. */
+export async function sweepMergedWorktrees(
+  cfg: PipelineConfig,
+  deps?: Partial<SweepDeps>,
+): Promise<SweepResult> {
+  const d: SweepDeps = {
+    listOnDisk,
+    getPrMergeState,
+    hasDirtyWorkdir,
+    getWorktreeHeadSha,
+    removeWorktree: sweepRemoveWorktree,
+    pathExists: fs.existsSync,
+    ...deps,
+  };
+
+  const onDisk = await d.listOnDisk(cfg);
+  const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
+
+  const candidates = onDisk.filter(
+    (rec) => rec.path === root || rec.path.startsWith(root + path.sep),
+  );
+
+  const removed: WorktreeRecord[] = [];
+  const skipped: Array<{ rec: WorktreeRecord; reason: string }> = [];
+
+  for (const rec of candidates) {
+    if (!rec.branch || rec.issueNumber === undefined || !rec.slug) continue;
+
+    const mergeState = await d.getPrMergeState(cfg, rec.branch);
+    if (!mergeState.merged) {
+      if (mergeState.error !== undefined) {
+        skipped.push({ rec, reason: `could not determine PR merge state: ${mergeState.error}` });
+      }
+      continue;
+    }
+
+    // Path gone on disk but still registered — deregister and clean branch.
+    if (!d.pathExists(rec.path)) {
+      const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, false);
+      if (result.ok) {
+        removed.push(rec);
+      } else {
+        skipped.push({ rec, reason: `removal failed: ${result.reason}` });
+      }
+      continue;
+    }
+
+    const dirty = await d.hasDirtyWorkdir(rec.path);
+    if (dirty) {
+      skipped.push({ rec, reason: "uncommitted changes" });
+      continue;
+    }
+
+    const localSha = await d.getWorktreeHeadSha(rec.path);
+    if (localSha && localSha !== mergeState.headSha) {
+      skipped.push({
+        rec,
+        reason: "local HEAD differs from merged PR SHA (may have unpushed commits)",
+      });
+      continue;
+    }
+
+    const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, true);
+    if (result.ok) {
+      removed.push(rec);
+    } else {
+      skipped.push({ rec, reason: `removal failed: ${result.reason}` });
+    }
+  }
+
+  return { removed, skipped };
 }
