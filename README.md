@@ -258,7 +258,9 @@ test_gate:
 ```json
 // package.json
 "scripts": {
-  "ci": "npm test && node scripts/build.mjs --check && npm run ci:install-smoke"
+  "ci:core": "(cd core && npm ci --no-audit --no-fund && npm test)",
+  "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke",
+  "ci:install-smoke": "node scripts/ci-install-smoke.mjs"
 }
 ```
 
