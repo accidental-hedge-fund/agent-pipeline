@@ -12,19 +12,22 @@ import * as path from "node:path";
 import {
   getIssueDetail,
   getPrChecks,
+  getPrCommits,
   getPrDetail,
   getPrDiff,
   getPrForIssue,
   parseChecksAggregate,
   parseMergeable,
+  postComment,
   setBlocked,
   transition,
 } from "../gh.ts";
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildDocsUpdatePrompt } from "../prompts/index.ts";
+import { extractReviewedSha } from "./review.ts";
 import * as openspec from "../openspec.ts";
-import type { Outcome, PipelineConfig } from "../types.ts";
+import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
@@ -53,6 +56,15 @@ export async function advance(
     console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+docs+CI+merge for PR #${prNumber}`);
     return { advanced: true, from: "pre-merge", to: dryNextStage, summary: "[dry-run]" };
   }
+
+  // ---- Review-SHA gate (#16): runs before any pre-merge work ----
+  // pre-merge is the only stage that acts on a prior review verdict without
+  // re-running review, so it is where a stale approval would slip through. If
+  // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
+  // back to the review round before doing any pre-merge work; pipeline-internal
+  // commits (docs / openspec archive) do not invalidate the verdict.
+  const shaGate = await enforceReviewShaGate(cfg, issueNumber, prNumber);
+  if (shaGate) return shaGate;
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
   const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber);
@@ -165,6 +177,123 @@ export async function advance(
     to: nextStage,
     summary: `PR #${prNumber} pre-merge gates passed`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Review-SHA gate (#16): never advance on a stale approval
+// ---------------------------------------------------------------------------
+
+/**
+ * External seams for {@link enforceReviewShaGate}, overridable in tests.
+ * Mirrors the DI pattern used elsewhere (testgate.ts, review.ts).
+ */
+export interface ShaGateDeps {
+  getIssueDetail?: typeof getIssueDetail;
+  getPrDetail?: typeof getPrDetail;
+  getPrCommits?: typeof getPrCommits;
+  postComment?: typeof postComment;
+  transition?: typeof transition;
+}
+
+/**
+ * Before pre-merge acts on the prior review verdict, verify the most recent
+ * review comment still covers HEAD. Returns `null` to proceed (verdict fresh,
+ * or nothing to validate), or an `advanced` Outcome that bounces the item back
+ * to its review round when the verdict is stale (HEAD moved past the reviewed
+ * commit) or unverifiable (no SHA sentinel). The orchestrator loop then re-runs
+ * that review stage, which records the new SHA.
+ */
+export async function enforceReviewShaGate(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  prNumber: number,
+  deps: ShaGateDeps = {},
+): Promise<Outcome | null> {
+  const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
+  const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
+  const getPrCommitsFn = deps.getPrCommits ?? getPrCommits;
+  const postCommentFn = deps.postComment ?? postComment;
+  const transitionFn = deps.transition ?? transition;
+
+  const detail = await getIssueDetailFn(cfg, issueNumber);
+  const reviewed = extractReviewedSha(detail.comments);
+  // No prior review comment (e.g. review steps disabled, or first run) → nothing
+  // to validate; let pre-merge proceed as normal.
+  if (!reviewed) return null;
+
+  const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
+
+  // Fast path / no-movement transparency: an exact match needs no commit lookup
+  // and no further work — pre-merge behaves exactly as before this change.
+  if (reviewed.sha && reviewed.sha === head) return null;
+
+  // HEAD differs (or the comment has no sentinel). A missing sentinel is
+  // unverifiable → stale. Otherwise the verdict survives only if every commit
+  // since the reviewed SHA is pipeline-internal (docs / openspec archive).
+  if (reviewed.sha) {
+    const commits = await getPrCommitsFn(cfg, prNumber);
+    if (classifyReviewGate(reviewed.sha, head, commits) === "fresh") return null;
+  }
+
+  const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
+  await postCommentFn(cfg, issueNumber, staleReviewNotice(reviewed.sha, head));
+  await transitionFn(
+    cfg,
+    issueNumber,
+    "pre-merge",
+    reviewStage,
+    `Re-running review ${reviewed.round}: HEAD moved past the reviewed commit ` +
+      `${reviewed.sha ? `\`${reviewed.sha.slice(0, 7)}\`` : "(unrecorded)"} → \`${head.slice(0, 7)}\`.`,
+  );
+  return {
+    advanced: true,
+    from: "pre-merge",
+    to: reviewStage,
+    summary: `re-review: HEAD moved to ${head.slice(0, 7)}`,
+  };
+}
+
+const PIPELINE_INTERNAL_COMMIT_PREFIXES = [DOCS_COMMIT_PREFIX, OPENSPEC_ARCHIVE_PREFIX];
+
+function isPipelineInternalCommit(messageHeadline: string): boolean {
+  const h = messageHeadline.trim();
+  return PIPELINE_INTERNAL_COMMIT_PREFIXES.some((p) => h.startsWith(p));
+}
+
+/**
+ * Decide whether a review verdict still covers HEAD given the PR's commits
+ * (oldest-first). "fresh" only when the reviewed commit is on the PR and every
+ * commit after it is pipeline-internal; any developer/fix commit, a rewritten
+ * history (reviewed SHA absent), or an inconsistent list yields "stale" — the
+ * safe default is to re-review. Pure; exported for unit tests.
+ */
+export function classifyReviewGate(
+  reviewedSha: string,
+  headSha: string,
+  prCommits: { oid: string; messageHeadline: string }[],
+): "fresh" | "stale" {
+  if (reviewedSha === headSha) return "fresh";
+  const idx = prCommits.findIndex((c) => c.oid === reviewedSha);
+  if (idx === -1) return "stale"; // reviewed commit no longer on the PR (rebased/force-pushed)
+  const since = prCommits.slice(idx + 1);
+  if (since.length === 0) return "stale"; // head differs but nothing follows the reviewed commit
+  return since.every((c) => isPipelineInternalCommit(c.messageHeadline)) ? "fresh" : "stale";
+}
+
+/** The notice posted before a SHA-mismatch re-review. Pure; exported for tests. */
+export function staleReviewNotice(reviewedSha: string | null, headSha: string): string {
+  const newShort = headSha.slice(0, 7);
+  const body = reviewedSha
+    ? `Re-running review: HEAD has moved from \`${reviewedSha.slice(0, 7)}\` to \`${newShort}\` since the last review.`
+    : `Re-running review: the last review did not record the commit it evaluated, ` +
+      `so its verdict cannot be verified against current HEAD (\`${newShort}\`).`;
+  return [
+    "## Pipeline: Re-running review",
+    "",
+    body,
+    "",
+    "The prior review verdict is discarded; review re-runs against the current commit before this item can advance.",
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -209,6 +209,7 @@ test("formatReviewComment: includes findings", () => {
         },
       ],
       next_steps: ["follow up"],
+      commitSha: "a".repeat(40),
     },
     1,
     "codex",
@@ -217,6 +218,9 @@ test("formatReviewComment: includes findings", () => {
   assert.match(md, /\[HIGH\] Bad/);
   assert.match(md, /do better/);
   assert.match(md, /follow up/);
+  // #16: the short SHA is visible in the header and the full SHA sentinel last.
+  assert.match(md, /\(commit aaaaaaa\)/);
+  assert.match(md, new RegExp(`<!-- reviewed-sha: ${"a".repeat(40)} -->\\s*$`));
 });
 
 test("extractReviewFindings: matches Review N with needs-attention", () => {

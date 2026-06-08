@@ -188,4 +188,9 @@ export interface ReviewVerdict {
   summary: string;
   findings: ReviewFinding[];
   next_steps: string[];
+  // Full 40-char HEAD SHA the verdict evaluated (#16). Populated by the review
+  // stage from the PR head at review time, not parsed from reviewer output.
+  // Binds the verdict to a commit so a later gate can detect a stale approval
+  // (HEAD moved) and re-review instead of trusting it.
+  commitSha: string;
 }

@@ -19,6 +19,7 @@ import * as path from "node:path";
 import {
   findLatestCommentMatching,
   getIssueDetail,
+  getPrDetail,
   getPrDiff,
   getPrForIssue,
   postComment,
@@ -42,6 +43,10 @@ import type {
 
 const REVIEW_MARKER_PREFIX_R1 = "## Review 1";
 const REVIEW_MARKER_PREFIX_R2 = "## Review 2";
+// Machine-readable binding of a review verdict to the commit it evaluated (#16).
+// Embedded as a dedicated HTML-comment sentinel on its own line so extraction
+// can anchor to it without matching a SHA that happens to appear in the diff.
+const REVIEWED_SHA_RE = /<!--\s*reviewed-sha:\s*([0-9a-fA-F]{7,40})\s*-->/;
 // Companion plugin script locations. The pipeline shells out to the companion
 // .mjs directly; an explicit PIPELINE_*_COMPANION env var always wins, otherwise
 // we use the first candidate path that EXISTS — installs move between layouts
@@ -150,6 +155,7 @@ export interface AdvanceReviewOpts {
 export interface AdvanceReviewDeps {
   getPrForIssue?: typeof getPrForIssue;
   getPrDiff?: typeof getPrDiff;
+  getPrDetail?: typeof getPrDetail;
   getIssueDetail?: typeof getIssueDetail;
   getForIssue?: typeof getForIssue;
   postComment?: typeof postComment;
@@ -207,6 +213,7 @@ export async function advanceReview(
 ): Promise<Outcome> {
   const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
+  const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getForIssueFn = deps.getForIssue ?? getForIssue;
   const postCommentFn = deps.postComment ?? postComment;
@@ -239,6 +246,18 @@ export async function advanceReview(
   if (!diff.trim()) {
     await setBlockedFn(cfg, issueNumber, "PR has an empty diff.", stage);
     return { advanced: false, status: "blocked", reason: "empty diff" };
+  }
+
+  // Bind this verdict to the commit it evaluates (#16): the PR head is the SHA of
+  // the diff we just fetched. A non-fatal failure leaves commitSha empty, which a
+  // later gate treats as unverifiable (re-review) rather than trusting blindly.
+  let commitSha = "";
+  try {
+    commitSha = (await getPrDetailFn(cfg, prNumber)).head_sha ?? "";
+  } catch (err) {
+    console.warn(
+      `[pipeline] #${issueNumber}: could not resolve HEAD SHA to bind the review verdict: ${(err as Error).message}`,
+    );
   }
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
@@ -275,7 +294,7 @@ export async function advanceReview(
     return { advanced: false, status: "blocked", reason };
   }
 
-  const verdict = parseStructuredVerdict(result.stdout);
+  const verdict = parseStructuredVerdict(result.stdout, commitSha);
   console.log(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );
@@ -442,7 +461,10 @@ function openspecContext(cfg: PipelineConfig, cwd: string): string {
 // Pure parsers — exported for testability
 // ---------------------------------------------------------------------------
 
-export function parseStructuredVerdict(output: string): ReviewVerdict & { _raw?: string } {
+export function parseStructuredVerdict(
+  output: string,
+  commitSha = "",
+): ReviewVerdict & { _raw?: string } {
   // Try fenced JSON first.
   const fenceMatch = output.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
   const candidates: string[] = [];
@@ -460,6 +482,7 @@ export function parseStructuredVerdict(output: string): ReviewVerdict & { _raw?:
           summary: data.summary ?? "",
           findings: Array.isArray(data.findings) ? (data.findings as ReviewFinding[]) : [],
           next_steps: Array.isArray(data.next_steps) ? data.next_steps as string[] : [],
+          commitSha,
         };
       }
     } catch {
@@ -470,9 +493,9 @@ export function parseStructuredVerdict(output: string): ReviewVerdict & { _raw?:
   // Codex's standard review (`/codex:review`) returns Markdown prose, not JSON.
   // Parse it so real findings route to a fix instead of being silently dropped
   // (#50 — observed live on #48: a real [P2] finding was lost → needs-attention/0
-  // → blocked run).
+  // → blocked run). The commit SHA is stamped here, not parsed from prose (#16).
   const prose = parseProseReview(output);
-  if (prose) return prose;
+  if (prose) return { ...prose, commitSha };
 
   // Fall back to text-based verdict (conservative). This path produces no
   // structured findings, so log it: a fallback `needs-attention` is
@@ -487,6 +510,7 @@ export function parseStructuredVerdict(output: string): ReviewVerdict & { _raw?:
     summary: output.slice(0, 500),
     findings: [],
     next_steps: [],
+    commitSha,
     _raw: output.slice(0, 4000),
   };
 }
@@ -545,8 +569,10 @@ const WORD_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
  * dropped (→ needs-attention/0 → blocked run). See #50. Returns `null` when the
  * output is not a recognizable Codex review, so callers fall through to the
  * conservative fallback — never a silent approve of unparsed content (#45).
+ *
+ * Returns a verdict without `commitSha`; the caller stamps it (#16).
  */
-export function parseProseReview(output: string): ReviewVerdict | null {
+export function parseProseReview(output: string): Omit<ReviewVerdict, "commitSha"> | null {
   const text = output ?? "";
   if (
     !/^#{1,6}\s*Codex\b.*\bReview\b/im.test(text) &&
@@ -664,8 +690,14 @@ export function formatReviewComment(
   const round = maybeReviewer === undefined ? verdictOrRound as 1 | 2 : roundOrReviewer as 1 | 2;
   const reviewer = maybeReviewer === undefined ? roundOrReviewer as string : maybeReviewer;
   const reviewType = round === 1 ? "Standard" : "Adversarial";
+  // Surface the reviewed commit in the header so it is visible which commit this
+  // verdict covers (#16); the machine-readable sentinel is appended last.
+  const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
+  const heading = shortSha
+    ? `## Review ${round} (${reviewType}) — ${verdict.verdict} (commit ${shortSha})`
+    : `## Review ${round} (${reviewType}) — ${verdict.verdict}`;
   const lines = [
-    `## Review ${round} (${reviewType}) — ${verdict.verdict}`,
+    heading,
     `**Reviewer**: ${reviewer}`,
     "",
     verdict.summary,
@@ -692,6 +724,11 @@ export function formatReviewComment(
     for (const step of verdict.next_steps) lines.push(`- ${step}`);
   }
   lines.push(cfgFooter(cfg));
+  // Sentinel last (#16): a dedicated, anchorable line the gate reads back to
+  // verify the verdict still covers HEAD. Omitted when no SHA was resolved.
+  if (verdict.commitSha) {
+    lines.push("", `<!-- reviewed-sha: ${verdict.commitSha} -->`);
+  }
   return lines.join("\n");
 }
 
@@ -713,6 +750,42 @@ function extractReview1Summary(comments: { body: string }[]): string {
     (b) => b.startsWith(REVIEW_MARKER_PREFIX_R1),
   );
   return (m?.body ?? "").slice(0, 2000);
+}
+
+/** Which review round a comment body belongs to, or null if it isn't one. */
+function reviewRoundOf(body: string, only?: 1 | 2): 1 | 2 | null {
+  const isR1 = body.startsWith(REVIEW_MARKER_PREFIX_R1);
+  const isR2 = body.startsWith(REVIEW_MARKER_PREFIX_R2);
+  if (only === 1) return isR1 ? 1 : null;
+  if (only === 2) return isR2 ? 2 : null;
+  if (isR2) return 2;
+  if (isR1) return 1;
+  return null;
+}
+
+/**
+ * Read the commit a prior review verdict evaluated (#16) from the most recent
+ * review comment. With `round`, only that round's comments are considered;
+ * without it, the latest review comment of either round is used and its round
+ * reported (so a gate can re-run the right review stage).
+ *
+ * Returns `null` when no review comment exists at all. Returns `{ sha: null }`
+ * when a review comment exists but carries no `reviewed-sha` sentinel (a legacy
+ * comment predating this change) — the gate treats that as unverifiable.
+ */
+export function extractReviewedSha(
+  comments: { body: string }[],
+  round?: 1 | 2,
+): { sha: string | null; round: 1 | 2 } | null {
+  const m = findLatestCommentMatching(
+    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+    (b) => reviewRoundOf(b, round) !== null,
+  );
+  if (!m) return null;
+  return {
+    sha: m.body.match(REVIEWED_SHA_RE)?.[1] ?? null,
+    round: reviewRoundOf(m.body, round) as 1 | 2,
+  };
 }
 
 // Internal export for tests, so review.test isn't needed.

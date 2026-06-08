@@ -15,6 +15,8 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
   advanceReview,
+  extractReviewedSha,
+  formatReviewComment,
   parseStructuredVerdict,
   type AdvanceReviewDeps,
 } from "../scripts/stages/review.ts";
@@ -158,6 +160,90 @@ test("parseStructuredVerdict: Codex adversarial review with `Verdict: approve` a
 });
 
 // ---------------------------------------------------------------------------
+// commitSha binding + reviewed-SHA sentinel (#16)
+// ---------------------------------------------------------------------------
+
+const SHA_A = "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334";
+
+test("parseStructuredVerdict: stamps the supplied commitSha onto a JSON verdict (#16)", () => {
+  const out = '```json\n{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}\n```';
+  const v = parseStructuredVerdict(out, SHA_A);
+  assert.equal(v.commitSha, SHA_A);
+});
+
+test("parseStructuredVerdict: stamps commitSha onto a prose verdict (#16)", () => {
+  const v = parseStructuredVerdict(CODEX_PROSE_FINDING, SHA_A);
+  assert.equal(v.verdict, "needs-attention");
+  assert.equal(v.commitSha, SHA_A, "the prose path must carry the supplied SHA");
+});
+
+test("parseStructuredVerdict: stamps commitSha onto the text-fallback verdict (#16)", (t) => {
+  t.mock.method(console, "warn", () => {});
+  const v = parseStructuredVerdict("freeform prose with no verdict json", SHA_A);
+  assert.equal(v.commitSha, SHA_A);
+});
+
+test("formatReviewComment: embeds the short SHA in the header and full SHA sentinel last (#16)", () => {
+  const md = formatReviewComment(
+    { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: SHA_A },
+    1,
+    "codex",
+  );
+  assert.match(md, new RegExp(`\\(commit ${SHA_A.slice(0, 7)}\\)`));
+  assert.match(md, new RegExp(`<!-- reviewed-sha: ${SHA_A} -->\\s*$`), "sentinel must be the last line");
+});
+
+test("formatReviewComment: omits the sentinel when no SHA was resolved (#16)", () => {
+  const md = formatReviewComment(
+    { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: "" },
+    1,
+    "codex",
+  );
+  assert.ok(!md.includes("reviewed-sha:"), "no sentinel when commitSha is empty");
+  assert.ok(!md.includes("(commit "), "no short SHA in header when commitSha is empty");
+});
+
+test("extractReviewedSha: reads the sentinel from the most recent review comment (#16)", () => {
+  const comments = [
+    { body: `## Review 1 (Standard) — approve (commit ${SHA_A.slice(0, 7)})\n\nok\n\n<!-- reviewed-sha: ${SHA_A} -->` },
+  ];
+  const r = extractReviewedSha(comments);
+  assert.deepEqual(r, { sha: SHA_A, round: 1 });
+});
+
+test("extractReviewedSha: reports round 2 and the latest comment wins (#16)", () => {
+  const older = "b".repeat(40);
+  const comments = [
+    { body: `## Review 1 (Standard) — approve\n\n<!-- reviewed-sha: ${older} -->` },
+    { body: `## Review 2 (Adversarial) — approve\n\n<!-- reviewed-sha: ${SHA_A} -->` },
+  ];
+  assert.deepEqual(extractReviewedSha(comments), { sha: SHA_A, round: 2 });
+  // Scoping to round 1 returns the round-1 SHA, not the latest.
+  assert.deepEqual(extractReviewedSha(comments, 1), { sha: older, round: 1 });
+});
+
+test("extractReviewedSha: legacy review comment with no sentinel → sha null (#16)", () => {
+  const comments = [{ body: "## Review 2 (Adversarial) — approve\n\nLGTM, no sentinel here." }];
+  assert.deepEqual(extractReviewedSha(comments), { sha: null, round: 2 });
+});
+
+test("extractReviewedSha: no review comment at all → null (#16)", () => {
+  assert.equal(extractReviewedSha([{ body: "## Pipeline: review-2\n\nunrelated" }]), null);
+});
+
+test("advanceReview: posted review comment carries the bound SHA sentinel (#16)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  await quiet(t, async () => {
+    await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  // makeDeps' getPrDetail returns head_sha = 40 'f's.
+  assert.ok(
+    rec.comments.some((c) => c.includes(`<!-- reviewed-sha: ${"f".repeat(40)} -->`)),
+    "the review comment must embed the reviewed-sha sentinel",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // advanceReview — verdict normalization gate
 // ---------------------------------------------------------------------------
 
@@ -193,6 +279,10 @@ function makeDeps(stdouts: string[]): { deps: AdvanceReviewDeps; rec: Recorder }
   const deps: AdvanceReviewDeps = {
     getPrForIssue: async () => 123,
     getPrDiff: async () => "diff --git a/x.ts b/x.ts\n+const a = 1;",
+    getPrDetail: async () =>
+      ({ head_sha: "f".repeat(40) }) as Awaited<
+        ReturnType<NonNullable<AdvanceReviewDeps["getPrDetail"]>>
+      >,
     getIssueDetail: async () =>
       ({
         number: 1,

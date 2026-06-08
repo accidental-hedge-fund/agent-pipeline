@@ -255,6 +255,34 @@ export async function getPrDiff(cfg: PipelineConfig, prNumber: number): Promise<
   return stdout;
 }
 
+/**
+ * The PR's commits, oldest-first (base → head). Used by the pre-merge review-SHA
+ * gate (#16) to classify the commits that landed since a review verdict: a
+ * developer commit invalidates the verdict, pipeline-internal commits (docs /
+ * openspec archive) do not.
+ */
+export async function getPrCommits(
+  cfg: PipelineConfig,
+  prNumber: number,
+): Promise<{ oid: string; messageHeadline: string }[]> {
+  const stdout = await ghRun([
+    "pr",
+    "view",
+    String(prNumber),
+    "--json",
+    "commits",
+    "-R",
+    cfg.repo,
+  ]);
+  const data = JSON.parse(stdout) as {
+    commits?: { oid: string; messageHeadline?: string }[];
+  };
+  return (data.commits ?? []).map((c) => ({
+    oid: c.oid,
+    messageHeadline: c.messageHeadline ?? "",
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // Stage / label helpers
 // ---------------------------------------------------------------------------
