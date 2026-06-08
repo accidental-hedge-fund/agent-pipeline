@@ -10,7 +10,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { getIssueStateAndLabels } from "./gh.ts";
+import { getIssueStateAndLabels, getPrMergeState } from "./gh.ts";
 import type { PipelineConfig } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -64,7 +64,7 @@ async function git(
   }
 }
 
-interface WorktreeRecord {
+export interface WorktreeRecord {
   path: string;
   branch?: string;
   issueNumber?: number;
@@ -248,4 +248,112 @@ export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<
     { ignoreFailure: true },
   );
   return stdout.trim().length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Worktree sweep (cleanup of merged-PR worktrees)
+// ---------------------------------------------------------------------------
+
+/** Pure parser — exposed for unit tests. */
+export function parseDirtyWorkdir(statusOutput: string): boolean {
+  return statusOutput.trim().length > 0;
+}
+
+export async function hasDirtyWorkdir(worktreePath: string): Promise<boolean> {
+  const { stdout } = await gitInWorktree(
+    worktreePath,
+    ["status", "--porcelain"],
+    { ignoreFailure: true },
+  );
+  return parseDirtyWorkdir(stdout);
+}
+
+async function getWorktreeHeadSha(worktreePath: string): Promise<string> {
+  const { stdout } = await gitInWorktree(
+    worktreePath,
+    ["rev-parse", "HEAD"],
+    { ignoreFailure: true },
+  );
+  return stdout.trim();
+}
+
+export interface SweepResult {
+  removed: WorktreeRecord[];
+  skipped: Array<{ rec: WorktreeRecord; reason: string }>;
+}
+
+export interface SweepDeps {
+  listOnDisk: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  getPrMergeState: (
+    cfg: PipelineConfig,
+    branch: string,
+  ) => Promise<{ merged: true; prNumber: number; headSha: string } | { merged: false }>;
+  hasDirtyWorkdir: (worktreePath: string) => Promise<boolean>;
+  getWorktreeHeadSha: (worktreePath: string) => Promise<string>;
+  removeWorktree: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
+  pathExists: (p: string) => boolean;
+}
+
+/** Remove pipeline-managed worktrees whose PR has already been merged.
+ *  Only touches worktrees under cfg.worktree_root with pipeline/<N>-<slug> branches.
+ *  Skips dirty worktrees (uncommitted changes) and worktrees whose local HEAD
+ *  diverges from the merged PR's head SHA (may have unpushed commits).
+ *  Deps are injectable for unit testing; defaults use real implementations. */
+export async function sweepMergedWorktrees(
+  cfg: PipelineConfig,
+  deps?: Partial<SweepDeps>,
+): Promise<SweepResult> {
+  const d: SweepDeps = {
+    listOnDisk,
+    getPrMergeState,
+    hasDirtyWorkdir,
+    getWorktreeHeadSha,
+    removeWorktree,
+    pathExists: fs.existsSync,
+    ...deps,
+  };
+
+  const onDisk = await d.listOnDisk(cfg);
+  const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
+
+  const candidates = onDisk.filter(
+    (rec) => rec.path === root || rec.path.startsWith(root + path.sep),
+  );
+
+  const removed: WorktreeRecord[] = [];
+  const skipped: Array<{ rec: WorktreeRecord; reason: string }> = [];
+
+  for (const rec of candidates) {
+    if (!rec.branch || rec.issueNumber === undefined || !rec.slug) continue;
+
+    const mergeState = await d.getPrMergeState(cfg, rec.branch);
+    if (!mergeState.merged) continue;
+
+    // Path gone on disk but still registered — just deregister.
+    if (!d.pathExists(rec.path)) {
+      await d.removeWorktree(cfg, rec.issueNumber, rec.slug);
+      removed.push(rec);
+      continue;
+    }
+
+    const dirty = await d.hasDirtyWorkdir(rec.path);
+    if (dirty) {
+      skipped.push({ rec, reason: "uncommitted changes" });
+      continue;
+    }
+
+    const localSha = await d.getWorktreeHeadSha(rec.path);
+    if (localSha && localSha !== mergeState.headSha) {
+      skipped.push({
+        rec,
+        reason: "local HEAD differs from merged PR SHA (may have unpushed commits)",
+      });
+      continue;
+    }
+
+    await d.removeWorktree(cfg, rec.issueNumber, rec.slug);
+    removed.push(rec);
+  }
+
+  return { removed, skipped };
 }

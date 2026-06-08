@@ -29,6 +29,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, withLock } from "./lock.ts";
+import { sweepMergedWorktrees } from "./worktree.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -49,6 +50,7 @@ interface CliOpts {
   base?: string;
   model?: string;
   profile?: string;
+  cleanup?: boolean;
 }
 
 async function main(): Promise<void> {
@@ -56,7 +58,8 @@ async function main(): Promise<void> {
   cmd
     .name("pipeline")
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
-    .argument("<number>", "issue or PR number")
+    .argument("[number]", "issue or PR number (required unless --cleanup)")
+    .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--status", "read-only status; print stage and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option("--once", "advance one stage and stop")
@@ -70,11 +73,6 @@ async function main(): Promise<void> {
 
   const opts = cmd.opts<CliOpts>();
   const numArg = cmd.args[0];
-  const number = Number.parseInt(numArg, 10);
-  if (!Number.isFinite(number) || number <= 0) {
-    console.error(`pipeline: invalid number "${numArg}"`);
-    process.exit(2);
-  }
 
   let cfg: PipelineConfig;
   try {
@@ -87,6 +85,17 @@ async function main(): Promise<void> {
   } catch (err) {
     const e = err as Error;
     console.error(`pipeline: ${e.message}`);
+    process.exit(2);
+  }
+
+  if (opts.cleanup) {
+    await runCleanup(cfg);
+    return;
+  }
+
+  const number = Number.parseInt(numArg ?? "", 10);
+  if (!Number.isFinite(number) || number <= 0) {
+    console.error(`pipeline: argument <number> is required (or use --cleanup)`);
     process.exit(2);
   }
 
@@ -120,6 +129,31 @@ async function main(): Promise<void> {
     return;
   }
   await runAdvance(cfg, issueNumber, opts);
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup mode
+// ---------------------------------------------------------------------------
+
+async function runCleanup(cfg: PipelineConfig): Promise<void> {
+  console.log("[pipeline] cleanup: scanning for merged-PR worktrees...");
+  const result = await sweepMergedWorktrees(cfg);
+  if (result.removed.length === 0 && result.skipped.length === 0) {
+    console.log("Nothing to clean up.");
+    return;
+  }
+  if (result.removed.length > 0) {
+    console.log(`Removed ${result.removed.length} worktree(s):`);
+    for (const rec of result.removed) {
+      console.log(`  - ${rec.branch}`);
+    }
+  }
+  if (result.skipped.length > 0) {
+    console.log(`Skipped ${result.skipped.length} worktree(s):`);
+    for (const { rec, reason } of result.skipped) {
+      console.log(`  - ${rec.branch}: ${reason}`);
+    }
+  }
 }
 
 async function resolveIssueNumber(cfg: PipelineConfig, number: number): Promise<number> {
