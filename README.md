@@ -328,11 +328,22 @@ stays usable on any repo.
 ## last30days context (optional)
 
 When `last30days.enabled: true`, a **pre-planning** step runs the
-[last30days skill](https://github.com/mvanhorn/last30days-skill) against the issue
-title and carries the resulting brief forward: it's posted as a
+[last30days skill](https://github.com/mvanhorn/last30days-skill) against the issue's
+full content (title + description, excerpted for long descriptions) and carries the
+resulting brief forward: it's posted as a
 `## Pre-Planning Context — last30days` issue comment **and** injected into the
 planning prompt, so the plan is written with recent public discourse (Reddit, X,
-YouTube, HN, GitHub, …) in hand.
+YouTube, HN, GitHub, …) in hand. When an issue's description is absent, the title
+alone is used (no change from prior behaviour).
+
+> **Data boundary**: the research topic (title + excerpt of the description) is
+> forwarded to the last30days skill and its configured external data sources.
+> Before sending, the pipeline automatically redacts URLs, email addresses, Bearer
+> tokens, long hex strings, and common `key=value` / `token=value` assignments from
+> the description. Despite this redaction, **do not enable this feature for issues
+> that contain sensitive customer data, unreleased roadmap details, or
+> proprietary stack traces** — redaction catches common patterns, not every
+> possible form of sensitive content.
 
 **Default off**, and best suited to product/strategy/named-topic issues — a typical
 pure-code issue title returns little public signal. It's also **always
