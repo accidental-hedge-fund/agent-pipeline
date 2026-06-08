@@ -442,6 +442,26 @@ export async function transition(
   await postComment(cfg, issueNumber, comment);
 }
 
+/** Swap pipeline labels without posting a comment. Used for silent skip paths. */
+export async function silentTransition(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  fromStage: Stage,
+  toStage: Stage,
+): Promise<void> {
+  await ghRun([
+    "issue",
+    "edit",
+    String(issueNumber),
+    "--remove-label",
+    `${LABEL_PREFIX}${fromStage}`,
+    "--add-label",
+    `${LABEL_PREFIX}${toStage}`,
+    "-R",
+    cfg.repo,
+  ]);
+}
+
 export async function setBlocked(
   cfg: PipelineConfig,
   issueNumber: number,

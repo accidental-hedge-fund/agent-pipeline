@@ -13,7 +13,7 @@ description: |
 # pipeline
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 10-stage label-driven state machine, ending at
+issue) through an 11-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
 the merge button.
 
@@ -22,7 +22,7 @@ the merge button.
 ```
 backlog → ready → planning → implementing
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → ready-to-deploy
+              → pre-merge → eval-gate → ready-to-deploy
 ```
 
 Each item carries one `pipeline:<stage>` label and at most one `blocked`
@@ -309,7 +309,7 @@ When the loop ends, the skill prints:
 - `core/scripts/stages/review.ts` — review-1/review-2 drive Codex via the codex-plugin-cc
   companion (`/codex:review` / `/codex:adversarial-review`)
 - `core/scripts/lock.ts` — PID-based lock at `/tmp/pipeline-{domain}.lock`
-- `core/scripts/stages/*.ts` — one file per stage (planning, review, fix, pre_merge, deploy_ready, auto_recover)
+- `core/scripts/stages/*.ts` — one file per stage (planning, review, fix, pre_merge, eval, deploy_ready, auto_recover)
 - `core/scripts/prompts/*.md` — prompt templates with `{{placeholders}}`
 - `core/scripts/pipeline.ts` — top-level orchestrator + CLI
 - `README.md` — human-facing docs

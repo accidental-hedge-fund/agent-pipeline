@@ -34,6 +34,7 @@ import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
 import * as preMergeStage from "./stages/pre_merge.ts";
+import * as evalStage from "./stages/eval.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import { LABEL_PREFIX, reviewStageSkipTarget, type Outcome, type PipelineConfig, type Stage } from "./types.ts";
@@ -374,6 +375,8 @@ async function dispatch(
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
       return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model });
+    case "eval-gate":
+      return evalStage.advanceEval(cfg, issueNumber, { dryRun });
     case "ready-to-deploy":
       return deployReady.finalize(cfg, issueNumber);
     case "backlog":

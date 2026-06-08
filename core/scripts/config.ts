@@ -62,6 +62,15 @@ const PartialConfigSchema = z.object({
       timeout: z.number().int().positive().optional(),
     })
     .optional(),
+  eval_gate: z
+    .object({
+      enabled: z.boolean().optional(),
+      command: z.string().optional(),
+      mode: z.enum(["gate", "advisory"]).optional(),
+      timeout: z.number().int().positive().optional(),
+      max_attempts: z.number().int().positive().optional(),
+    })
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -170,6 +179,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       command: fileConfig.test_gate?.command,
       max_attempts: fileConfig.test_gate?.max_attempts ?? DEFAULT_CONFIG.test_gate.max_attempts,
       timeout: fileConfig.test_gate?.timeout ?? DEFAULT_CONFIG.test_gate.timeout,
+    },
+    eval_gate: {
+      enabled: fileConfig.eval_gate?.enabled ?? DEFAULT_CONFIG.eval_gate.enabled,
+      command: fileConfig.eval_gate?.command,
+      mode: fileConfig.eval_gate?.mode ?? DEFAULT_CONFIG.eval_gate.mode,
+      timeout: fileConfig.eval_gate?.timeout ?? DEFAULT_CONFIG.eval_gate.timeout,
+      max_attempts: fileConfig.eval_gate?.max_attempts ?? DEFAULT_CONFIG.eval_gate.max_attempts,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,

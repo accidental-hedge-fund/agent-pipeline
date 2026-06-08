@@ -49,8 +49,9 @@ export async function advance(
   }
 
   if (opts.dryRun) {
+    const dryNextStage = cfg.eval_gate.enabled ? "eval-gate" : "ready-to-deploy";
     console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+docs+CI+merge for PR #${prNumber}`);
-    return { advanced: true, from: "pre-merge", to: "ready-to-deploy", summary: "[dry-run]" };
+    return { advanced: true, from: "pre-merge", to: dryNextStage, summary: "[dry-run]" };
   }
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
@@ -148,19 +149,21 @@ export async function advance(
   }
 
   // ---- Step 4: advance ----
+  // Skip the eval-gate label entirely when evals are disabled to avoid spurious
+  // label churn and pipeline comments on repos that did not opt in.
+  const nextStage = cfg.eval_gate.enabled ? "eval-gate" : "ready-to-deploy";
   await transition(
     cfg,
     issueNumber,
     "pre-merge",
-    "ready-to-deploy",
-    `All pre-merge gates passed (docs updated, CI green, no conflicts). PR #${prNumber} is ready to merge.`,
+    nextStage,
+    `All pre-merge gates passed (docs updated, CI green, no conflicts). Advancing to ${nextStage} for PR #${prNumber}.`,
   );
-  // Note: cfg.auto_merge intentionally NOT honored here. The user owns the merge button.
   return {
     advanced: true,
     from: "pre-merge",
-    to: "ready-to-deploy",
-    summary: `PR #${prNumber} ready to merge`,
+    to: nextStage,
+    summary: `PR #${prNumber} pre-merge gates passed`,
   };
 }
 

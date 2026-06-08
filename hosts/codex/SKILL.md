@@ -15,7 +15,7 @@ This skill keeps the old `/pipeline` workflow as Codex skill `$pipeline`.
 Treat the text after `$pipeline`, `/pipeline`, or the natural-language request as the argument string.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 10-stage label-driven state machine, ending at
+issue) through an 11-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
 the merge button.
 
@@ -24,7 +24,7 @@ the merge button.
 ```
 backlog → ready → planning → implementing
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → ready-to-deploy
+              → pre-merge → eval-gate → ready-to-deploy
 ```
 
 Each item carries one `pipeline:<stage>` label and at most one `blocked`
@@ -295,7 +295,7 @@ When the loop ends, the skill prints:
 - `core/scripts/harness.ts` — invokes Codex for implementation and provides shared process helpers
 - `core/scripts/stages/review.ts` — invokes Claude Code via the `$cc:review` and `$cc:adversarial-review` companion commands
 - `core/scripts/lock.ts` — PID-based lock at `/tmp/pipeline-{domain}.lock`
-- `core/scripts/stages/*.ts` — one file per stage (planning, review, fix, pre_merge, deploy_ready, auto_recover)
+- `core/scripts/stages/*.ts` — one file per stage (planning, review, fix, pre_merge, eval, deploy_ready, auto_recover)
 - `core/scripts/prompts/*.md` — prompt templates with `{{placeholders}}`
 - `core/scripts/pipeline.ts` — top-level orchestrator + CLI
 - `README.md` — human-facing docs
