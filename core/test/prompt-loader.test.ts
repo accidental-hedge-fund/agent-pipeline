@@ -417,3 +417,53 @@ test("fix prompt: no spec section + no leftover placeholders when specContext ab
   assert.doesNotMatch(out, /Intended Behavior/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
+
+// Regression: empty specContext must not introduce extra blank lines (non-OpenSpec
+// runs must produce byte-for-byte the same prompt as before spec_context was added).
+test("plan_review prompt: no extra blank lines when specContext absent", () => {
+  const out = buildPlanReviewPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 10,
+    title: "t",
+    body: "b",
+    plan: "p",
+    reviewer: "codex",
+    implementer: "claude",
+  });
+  assert.doesNotMatch(out, /\n\n\n/);
+});
+
+test("plan_revision prompt: no extra blank lines when specContext absent", () => {
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 11,
+    title: "t",
+    body: "b",
+    plan: "p",
+    feedback: "fb",
+    reviewer: "codex",
+    implementer: "claude",
+  });
+  assert.doesNotMatch(out, /\n\n\n/);
+});
+
+test("implementing prompt: no extra blank lines when specContext absent", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 12,
+    title: "t",
+    body: "b",
+    plan: "p",
+  });
+  assert.doesNotMatch(out, /\n\n\n/);
+});
+
+test("fix prompt: no extra blank lines when specContext absent", () => {
+  const out = buildFixPrompt({
+    issueNumber: 13,
+    title: "t",
+    reviewFindings: "FINDINGS",
+    fixRound: 1,
+  });
+  assert.doesNotMatch(out, /\n\n\n/);
+});

@@ -9,9 +9,7 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 ## Implementation Plan
 
 {{plan}}
-
 {{spec_context}}
-
 ## Instructions
 
 1. Read CLAUDE.md in this repo for full conventions.

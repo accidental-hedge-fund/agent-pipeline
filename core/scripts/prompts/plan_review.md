@@ -13,9 +13,7 @@ Issue body:
 
 Proposed implementation plan:
 {{plan}}
-
 {{spec_context}}
-
 Review the plan before implementation starts. Focus on correctness, repo conventions, missing edge cases, testing strategy, blast radius, rollback safety, and whether the plan is too broad or too vague.
 
 Return concise Markdown with:

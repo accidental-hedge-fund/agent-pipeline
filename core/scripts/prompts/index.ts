@@ -280,9 +280,10 @@ function specSection(specContext?: string): string {
 function specContextSection(specContext?: string): string {
   if (!specContext || !specContext.trim()) return "";
   return (
-    "## OpenSpec — Intended Behavior (spec deltas)\n\n" +
+    "\n## OpenSpec — Intended Behavior (spec deltas)\n\n" +
     "This work must satisfy these requirement changes.\n\n" +
-    specContext.trim()
+    specContext.trim() +
+    "\n"
   );
 }
 
