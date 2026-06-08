@@ -89,7 +89,7 @@ The installer copies the shared core + the right host overlay into
 shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`
 and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up live.
 
-After the core install, the installer detects which optional companion plugins and feature tools are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install. To skip all prompts and auto-accept in non-interactive environments:
+After the core install, the installer detects which optional companion plugins and feature tools are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install. One exception: `codex-plugin-cc` (the Codex companion for the Claude-primary flow) installs through Claude Code's own plugin marketplace, so the installer prints its `/plugin` command for you to run inside Claude Code rather than installing it directly — including under `--yes-deps`. To skip all prompts and auto-accept in non-interactive environments:
 
 ```bash
 npx github:accidental-hedge-fund/agent-pipeline install --yes-deps   # auto-accept all optional deps
