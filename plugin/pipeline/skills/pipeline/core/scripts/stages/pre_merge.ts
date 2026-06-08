@@ -12,7 +12,6 @@ import * as path from "node:path";
 import {
   getIssueDetail,
   getPrChecks,
-  getPrCommits,
   getPrDetail,
   getPrDiff,
   getPrForIssue,
@@ -190,7 +189,6 @@ export async function advance(
 export interface ShaGateDeps {
   getIssueDetail?: typeof getIssueDetail;
   getPrDetail?: typeof getPrDetail;
-  getPrCommits?: typeof getPrCommits;
   postComment?: typeof postComment;
   transition?: typeof transition;
 }
@@ -211,7 +209,6 @@ export async function enforceReviewShaGate(
 ): Promise<Outcome | null> {
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
-  const getPrCommitsFn = deps.getPrCommits ?? getPrCommits;
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
 
@@ -223,17 +220,9 @@ export async function enforceReviewShaGate(
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 
-  // Fast path / no-movement transparency: an exact match needs no commit lookup
-  // and no further work — pre-merge behaves exactly as before this change.
+  // Any SHA mismatch — including pipeline-internal commits — is treated as stale.
+  // The only safe path forward is an exact match with the verified SHA.
   if (reviewed.sha && reviewed.sha === head) return null;
-
-  // HEAD differs (or the comment has no sentinel). A missing sentinel is
-  // unverifiable → stale. Otherwise the verdict survives only if every commit
-  // since the reviewed SHA is pipeline-internal (docs / openspec archive).
-  if (reviewed.sha) {
-    const commits = await getPrCommitsFn(cfg, prNumber);
-    if (classifyReviewGate(reviewed.sha, head, commits) === "fresh") return null;
-  }
 
   const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
   await postCommentFn(cfg, issueNumber, staleReviewNotice(reviewed.sha, head));
@@ -251,33 +240,6 @@ export async function enforceReviewShaGate(
     to: reviewStage,
     summary: `re-review: HEAD moved to ${head.slice(0, 7)}`,
   };
-}
-
-const PIPELINE_INTERNAL_COMMIT_PREFIXES = [DOCS_COMMIT_PREFIX, OPENSPEC_ARCHIVE_PREFIX];
-
-function isPipelineInternalCommit(messageHeadline: string): boolean {
-  const h = messageHeadline.trim();
-  return PIPELINE_INTERNAL_COMMIT_PREFIXES.some((p) => h.startsWith(p));
-}
-
-/**
- * Decide whether a review verdict still covers HEAD given the PR's commits
- * (oldest-first). "fresh" only when the reviewed commit is on the PR and every
- * commit after it is pipeline-internal; any developer/fix commit, a rewritten
- * history (reviewed SHA absent), or an inconsistent list yields "stale" — the
- * safe default is to re-review. Pure; exported for unit tests.
- */
-export function classifyReviewGate(
-  reviewedSha: string,
-  headSha: string,
-  prCommits: { oid: string; messageHeadline: string }[],
-): "fresh" | "stale" {
-  if (reviewedSha === headSha) return "fresh";
-  const idx = prCommits.findIndex((c) => c.oid === reviewedSha);
-  if (idx === -1) return "stale"; // reviewed commit no longer on the PR (rebased/force-pushed)
-  const since = prCommits.slice(idx + 1);
-  if (since.length === 0) return "stale"; // head differs but nothing follows the reviewed commit
-  return since.every((c) => isPipelineInternalCommit(c.messageHeadline)) ? "fresh" : "stale";
 }
 
 /** The notice posted before a SHA-mismatch re-review. Pure; exported for tests. */

@@ -235,6 +235,28 @@ export async function advanceReview(
     return { advanced: false, status: "blocked", reason: "no PR found" };
   }
 
+  // (#16) Capture HEAD SHA before fetching the diff so the stamped SHA matches
+  // the diff being reviewed. SHA resolution is mandatory — a missing or invalid
+  // SHA would produce an unverifiable verdict that the pre-merge gate can never
+  // clear.
+  let commitSha: string;
+  try {
+    const sha = (await getPrDetailFn(cfg, prNumber)).head_sha ?? "";
+    if (!/^[0-9a-f]{40}$/i.test(sha)) {
+      await setBlockedFn(cfg, issueNumber, `PR head SHA is missing or invalid: "${sha}"`, stage);
+      return { advanced: false, status: "blocked", reason: "invalid SHA" };
+    }
+    commitSha = sha;
+  } catch (err) {
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Could not resolve PR head SHA: ${(err as Error).message}`,
+      stage,
+    );
+    return { advanced: false, status: "blocked", reason: "SHA resolution failed" };
+  }
+
   let diff: string;
   try {
     diff = await getPrDiffFn(cfg, prNumber);
@@ -248,16 +270,23 @@ export async function advanceReview(
     return { advanced: false, status: "blocked", reason: "empty diff" };
   }
 
-  // Bind this verdict to the commit it evaluates (#16): the PR head is the SHA of
-  // the diff we just fetched. A non-fatal failure leaves commitSha empty, which a
-  // later gate treats as unverifiable (re-review) rather than trusting blindly.
-  let commitSha = "";
+  // Verify HEAD didn't move between SHA capture and diff fetch. If it did,
+  // the diff and the stamped SHA describe different states (#16).
   try {
-    commitSha = (await getPrDetailFn(cfg, prNumber)).head_sha ?? "";
-  } catch (err) {
-    console.warn(
-      `[pipeline] #${issueNumber}: could not resolve HEAD SHA to bind the review verdict: ${(err as Error).message}`,
-    );
+    const postDiffSha = (await getPrDetailFn(cfg, prNumber)).head_sha ?? "";
+    if (postDiffSha !== commitSha) {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} → ${postDiffSha.slice(0, 7)}). ` +
+          `Re-run the review stage to evaluate a stable HEAD.`,
+        stage,
+      );
+      return { advanced: false, status: "blocked", reason: "HEAD moved during diff fetch" };
+    }
+  } catch {
+    // If the post-diff check fails, continue: the pre-merge gate will detect
+    // staleness when it compares the stamped SHA against HEAD.
   }
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
