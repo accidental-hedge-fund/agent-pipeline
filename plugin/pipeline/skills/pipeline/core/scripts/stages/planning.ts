@@ -577,16 +577,50 @@ const LAST30DAYS_SETUP_URL = "https://github.com/mvanhorn/last30days-skill#setup
 // avoids passing unbounded, noisy markdown to the skill's query builder.
 const BODY_TOPIC_CAP = 400;
 
+// Patterns that commonly indicate secrets or private data in issue bodies.
+// Replacements use `[REDACTED]` to preserve prose structure while removing
+// content that should not cross the pipeline→external-skill boundary.
+const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
+  // URLs — can embed tokens, internal hostnames, or auth parameters
+  /(?:https?|ftp):\/\/[^\s]+/gi,
+  // Email addresses
+  /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g,
+  // Bearer / Authorization header values
+  /\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
+  // JWT-shaped strings: three base64url segments joined by dots
+  /[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+  // Long hex strings (32+ chars) — API keys, session tokens, hashes
+  /\b[0-9a-f]{32,}\b/gi,
+  // key/token/secret/password assignments, e.g. `api_key=abc123` or `token: xyz`
+  /(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*\S+/gi,
+];
+
+/**
+ * Redact URLs, email addresses, and common secret patterns from `text` before
+ * the content is forwarded to the last30days skill's external research runtime.
+ * Replacements use the literal `[REDACTED]` so prose structure is preserved.
+ */
+export function sanitizeBodyForResearch(text: string): string {
+  let out = text;
+  for (const pattern of REDACT_PATTERNS) {
+    out = out.replace(pattern, "[REDACTED]");
+  }
+  return out;
+}
+
 /**
  * Build the research topic string for the last30days skill from the issue's
  * full content (title + description).
  * - body absent/empty/whitespace-only → returns `title` unchanged (no regression).
- * - body ≤ BODY_TOPIC_CAP → appends it verbatim after the title.
- * - body > BODY_TOPIC_CAP → appends an excerpt capped at BODY_TOPIC_CAP, trimmed
- *   at the last word boundary, with a trailing `…` marking the truncation.
+ * - body ≤ BODY_TOPIC_CAP → appends sanitized body after the title.
+ * - body > BODY_TOPIC_CAP → appends a sanitized excerpt capped at BODY_TOPIC_CAP,
+ *   trimmed at the last word boundary, with a trailing `…` marking the truncation.
+ *
+ * The body is passed through `sanitizeBodyForResearch` before use to redact URLs,
+ * emails, and common secret patterns before the topic crosses the pipeline boundary.
  */
 export function buildResearchTopic(title: string, body?: string): string {
-  const b = (body ?? "").trim();
+  const b = sanitizeBodyForResearch((body ?? "").trim());
   if (!b) return title;
   if (b.length <= BODY_TOPIC_CAP) return `${title}\n\n${b}`;
   let excerpt = b.slice(0, BODY_TOPIC_CAP).trimEnd();
