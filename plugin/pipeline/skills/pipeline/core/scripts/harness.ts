@@ -18,6 +18,7 @@ export interface HarnessResult {
   exit_code: number;
   duration: number; // seconds
   timed_out: boolean;
+  spawn_error?: boolean; // true when the process could not be spawned at all
 }
 
 export interface InvokeOptions {
@@ -62,32 +63,42 @@ export async function runCapped(
   timeoutSec: number,
   stream: boolean,
   label: string,
+  opts: { killProcessGroup?: boolean } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
   return new Promise<HarnessResult>((resolve) => {
+    const killProcessGroup = opts.killProcessGroup ?? false;
     const child = spawn(cmd, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
+      // detached creates a new process group so we can kill all descendants on timeout
+      ...(killProcessGroup ? { detached: true } : {}),
     });
     let stdoutBuf = "";
     let stderrBuf = "";
     let timedOut = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // best effort
-      }
-      // Hard kill if still alive after 5s.
-      setTimeout(() => {
+    const killGroup = (signal: NodeJS.Signals) => {
+      if (killProcessGroup && child.pid != null) {
         try {
-          child.kill("SIGKILL");
+          process.kill(-child.pid, signal);
+        } catch {
+          // best effort — group may already be dead
+        }
+      } else {
+        try {
+          child.kill(signal);
         } catch {
           // best effort
         }
-      }, 5000);
+      }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup("SIGTERM");
+      // Hard kill the process group if still alive after 5s.
+      setTimeout(() => killGroup("SIGKILL"), 5000);
     }, timeoutSec * 1000);
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -117,6 +128,7 @@ export async function runCapped(
         exit_code: -1,
         duration,
         timed_out: false,
+        spawn_error: true,
       });
     });
 

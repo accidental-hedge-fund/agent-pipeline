@@ -1,7 +1,7 @@
 # agent-pipeline
 
 A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
-through a 11-stage state machine to `pipeline:ready-to-deploy` — planning →
+through an 11-stage state machine to `pipeline:ready-to-deploy` — planning →
 plan-review → implementing → review → fix → pre-merge → eval-gate. It does **not**
 auto-merge; you own the merge button.
 
@@ -22,7 +22,7 @@ backlog → ready → planning → plan-review → implementing
 core/                 single source of truth (host-agnostic TypeScript)
   scripts/            orchestrator, stages/, prompts/, gh/worktree/lock/harness
   profiles/           claude.json · codex.json · openclaw.json  ← the host seam
-  test/               node --test suite (144 tests)
+  test/               node --test suite (169 tests)
 hosts/
   claude/SKILL.md     Claude overlay (/pipeline, Monitor/PushNotification flow)
   codex/SKILL.md      Codex overlay ($pipeline, PTY exec flow)
@@ -232,6 +232,30 @@ behavior change. For monorepos or custom runners, set `test_gate.command`
 explicitly. **Rollback** is a one-line `test_gate: { enabled: false }` — no labels,
 no state-machine changes.
 
+## Eval gate (optional, default off)
+
+When `eval_gate.enabled` (default **off**), the target repo's eval harness runs
+**after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a
+one-time opt-in per repo: set `enabled: true` and a `command`. The command runs
+through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone**
+decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode,
+elapsed, output excerpt) is always recorded as an issue comment.
+
+- **`mode: gate`** (default) — a non-zero exit **blocks** the item.
+- **`mode: advisory`** — the result is recorded and the item **always advances**,
+  even after retries are exhausted.
+- A failing run is retried up to `max_attempts` (default 2; `1` = no retry),
+  short-circuiting on the first pass.
+- `timeout` (default 300) is a **hard stage-level budget in seconds, shared across
+  all attempts**, so total wall-time never exceeds it.
+- **Tooling failures always block, regardless of mode** — if the command times out
+  or can't be spawned (missing binary, etc.) the harness itself couldn't run, so the
+  item is blocked even in advisory mode.
+
+When disabled (the default), pre-merge advances straight to `ready-to-deploy` and
+the `eval-gate` label is never applied — zero behavior change and no extra comment.
+**Rollback** is `eval_gate: { enabled: false }` (the default).
+
 ## OpenSpec integration (optional)
 
 If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/`
@@ -312,7 +336,7 @@ node scripts/install.mjs uninstall --host all      # or claude | codex
 ## Development
 
 ```bash
-cd core && npm ci && npm test     # 144 tests, node --test
+cd core && npm ci && npm test     # 169 tests, node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
 ```
