@@ -221,11 +221,35 @@ export async function init(dir: string, tools = "claude,codex", timeoutMs = 120_
 /**
  * Spec deltas for the active change (or "" when OpenSpec is not active or has no changes).
  * Shared helper called by all pipeline stages that need the current change's requirements.
+ *
+ * NOTE: In worktrees that may contain pre-existing changes (fix rounds, review rounds),
+ * prefer openspecContextFromDiff() which targets the branch-introduced change instead of
+ * picking changes[0] — that can be an unrelated pre-existing change.
  */
 export function openspecContext(cfg: Pick<PipelineConfig, "openspec">, cwd: string): string {
   if (!isActive(cfg, cwd)) return "";
   const changes = listChangeDirs(cwd);
   return changes.length ? readSpecDeltas(cwd, changes[0]) : "";
+}
+
+/**
+ * Spec deltas for the change(s) this PR branch introduced, identified via a git
+ * diff path list (e.g. from `git diff --name-only origin/<base>...HEAD`).
+ *
+ * Uses changeIdsFromPaths to find the branch-specific change IDs, then reads
+ * their spec deltas. Returns "" when the branch introduced no OpenSpec changes —
+ * unlike openspecContext which picks changes[0] and may return an unrelated
+ * pre-existing change's deltas.
+ */
+export function openspecContextFromDiff(
+  cfg: Pick<PipelineConfig, "openspec">,
+  cwd: string,
+  diffPaths: string[],
+): string {
+  if (!isActive(cfg, cwd)) return "";
+  const ids = changeIdsFromPaths(diffPaths).filter((id) => changeDirExists(cwd, id));
+  if (!ids.length) return "";
+  return ids.map((id) => readSpecDeltas(cwd, id)).filter(Boolean).join("\n\n");
 }
 
 /**
