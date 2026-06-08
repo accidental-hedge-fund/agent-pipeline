@@ -569,28 +569,53 @@ function formatIssues(v: { issues: { item?: string; message: string }[]; raw: st
 // Pre-planning carry-forward context (optional; last30days)
 // ---------------------------------------------------------------------------
 
+const LAST30DAYS_SETUP_URL = "https://github.com/mvanhorn/last30days-skill#setup";
+
+/** Returns a non-blocking hint for the two empty-brief cases in gatherCarryForward. Exported for unit tests. */
+export function buildSetupHint(issueNumber: number, mode: "unavailable" | "no-signal"): string {
+  const p = `[pipeline] #${issueNumber}: last30days:`;
+  if (mode === "unavailable") {
+    return (
+      `${p} skill or Python not found; skipping (non-blocking). ` +
+      `To install: \`npx skills add mvanhorn/last30days-skill -g\` (Codex/CLI hosts) or ` +
+      `\`/plugin marketplace add mvanhorn/last30days-skill\` (Claude Code). ` +
+      `Data-source keys (BRAVE_SEARCH_API_KEY, SCRAPECREATORS_API_KEY) are configured in the skill — see ${LAST30DAYS_SETUP_URL}`
+    );
+  }
+  return (
+    `${p} skill ran but returned no usable signal; skipping (non-blocking). ` +
+    `Add data-source keys in the skill for better coverage: ` +
+    `BRAVE_SEARCH_API_KEY (free Brave Search) and SCRAPECREATORS_API_KEY (fuller social/X). ` +
+    `See ${LAST30DAYS_SETUP_URL}`
+  );
+}
+
+/** Seam for unit-testing the two empty-brief branches without the skill installed. */
+export interface CarryForwardDeps {
+  run: typeof last30days.run;
+}
+
 /**
  * When `last30days.enabled`, run the last30days skill against the issue title and
  * carry the resulting evidence brief forward: post it as an issue comment AND
  * return it for injection into the planning prompt. Always non-blocking — a
  * missing skill, failure, or empty/low-signal brief just returns "".
  */
-async function gatherCarryForward(
+export async function gatherCarryForward(
   cfg: PipelineConfig,
   issueNumber: number,
   title: string,
+  deps: CarryForwardDeps = { run: last30days.run },
 ): Promise<string> {
   if (!last30days.isEnabled(cfg)) return "";
   console.log(`[pipeline] #${issueNumber}: gathering last30days carry-forward context`);
-  const res = await last30days.run(title, { timeoutSec: cfg.last30days.timeout });
+  const res = await deps.run(title, { timeoutSec: cfg.last30days.timeout });
   if (res.unavailable) {
-    console.log(
-      `[pipeline] #${issueNumber}: last30days enabled but skill/python not found; skipping (non-blocking)`,
-    );
+    console.log(buildSetupHint(issueNumber, "unavailable"));
     return "";
   }
   if (!res.success || !last30days.hasSignal(res.brief)) {
-    console.log(`[pipeline] #${issueNumber}: last30days returned no usable brief; skipping`);
+    console.log(buildSetupHint(issueNumber, "no-signal"));
     return "";
   }
   await postComment(
