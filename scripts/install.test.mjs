@@ -804,7 +804,7 @@ test("promptDeps: failed dep does not abort subsequent deps", async () => {
 // Integration scenarios (8.1 – 8.3)
 // ==========================================================================
 
-test("integration 8.1: fresh install — all deps missing, all prompted and installed", async () => {
+test("integration 8.1: fresh install — installable deps installed, manual-only deps show instructions", async () => {
   const tmp = makeTmp();
   process.env.PIPELINE_CC_COMPANION = join(tmp, "none-cc");
   process.env.PIPELINE_CODEX_COMPANION = join(tmp, "none-codex");
@@ -818,8 +818,9 @@ test("integration 8.1: fresh install — all deps missing, all prompted and inst
       runCmd: (cmd, args) => { installOrder.push(`${cmd} ${args.join(" ")}`); return { status: 0 }; },
     });
     assert.equal(results["cc-plugin-codex"]?.status, "installed");
-    assert.equal(results["codex-plugin-cc"]?.status, "installed");
-    assert.equal(installOrder.length, 2);
+    // codex-plugin-cc is manual-only (marketplace install only) — never calls installCmd
+    assert.equal(results["codex-plugin-cc"]?.status, "manual-only");
+    assert.equal(installOrder.length, 1, "only cc-plugin-codex has an automated install");
   } finally {
     delete process.env.PIPELINE_CC_COMPANION;
     delete process.env.PIPELINE_CODEX_COMPANION;
@@ -848,7 +849,7 @@ test("integration 8.2: non-interactive mode — all deps skipped, hint present",
   }
 });
 
-test("integration 8.3: --yes-deps in non-TTY — all deps auto-installed without prompts", async () => {
+test("integration 8.3: --yes-deps in non-TTY — installable deps auto-installed, manual-only shows instructions without prompting", async () => {
   let promptCalled = false;
   const results = await promptDeps(["cc-plugin-codex", "codex-plugin-cc"], {
     isTTY: false,
@@ -860,5 +861,152 @@ test("integration 8.3: --yes-deps in non-TTY — all deps auto-installed without
   });
   assert.equal(promptCalled, false);
   assert.equal(results["cc-plugin-codex"]?.status, "installed");
-  assert.equal(results["codex-plugin-cc"]?.status, "installed");
+  // codex-plugin-cc is manual-only — yesDeps shows instructions, does not call installCmd
+  assert.equal(results["codex-plugin-cc"]?.status, "manual-only");
+});
+
+// ==========================================================================
+// Regression: codex-plugin-cc is manual-only (Finding 1)
+// ==========================================================================
+
+test("DEPS codex-plugin-cc: installCmd and updateCmd are null", () => {
+  assert.equal(DEPS["codex-plugin-cc"].installCmd, null, "installCmd must be null — Claude marketplace only");
+  assert.equal(DEPS["codex-plugin-cc"].updateCmd, null, "updateCmd must be null — Claude marketplace only");
+  assert.ok(DEPS["codex-plugin-cc"].manualInstall.length > 0, "manualInstall must be a non-empty string");
+});
+
+test("promptDeps: codex-plugin-cc manual-only — TTY accept → status manual-only, no installCmd called", async () => {
+  let installCalled = false;
+  const results = await promptDeps(["codex-plugin-cc"], {
+    isTTY: true,
+    yesDeps: false,
+    promptFn: async () => "y",
+    runCmd: () => { installCalled = true; return { status: 0 }; },
+    detectFn: () => ({ present: false, version: null }),
+    fetchLatestFn: () => null,
+  });
+  assert.equal(installCalled, false, "no shell command should be run for manual-only dep");
+  assert.equal(results["codex-plugin-cc"]?.status, "manual-only");
+  assert.ok(results["codex-plugin-cc"]?.manualCmd, "manualCmd should be set");
+});
+
+test("promptDeps: codex-plugin-cc manual-only — TTY decline → status declined, no installCmd called", async () => {
+  let installCalled = false;
+  const results = await promptDeps(["codex-plugin-cc"], {
+    isTTY: true,
+    yesDeps: false,
+    promptFn: async () => "n",
+    runCmd: () => { installCalled = true; return { status: 0 }; },
+    detectFn: () => ({ present: false, version: null }),
+    fetchLatestFn: () => null,
+  });
+  assert.equal(installCalled, false);
+  assert.equal(results["codex-plugin-cc"]?.status, "declined");
+});
+
+test("promptDeps: codex-plugin-cc manual-only — already present → status already current", async () => {
+  const results = await promptDeps(["codex-plugin-cc"], {
+    isTTY: true,
+    yesDeps: false,
+    promptFn: async () => "y",
+    detectFn: () => ({ present: true, version: "1.2.0" }),
+    fetchLatestFn: () => null,
+  });
+  assert.equal(results["codex-plugin-cc"]?.status, "already current");
+  assert.equal(results["codex-plugin-cc"]?.version, "1.2.0");
+});
+
+test("printDepSummary: manual-only status renders install instructions", () => {
+  const lines = [];
+  const origLog = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    printDepSummary({
+      "codex-plugin-cc": {
+        status: "manual-only",
+        manualCmd: DEPS["codex-plugin-cc"].manualInstall,
+      },
+    });
+  } finally {
+    console.log = origLog;
+  }
+  const out = lines.join("\n");
+  assert.ok(out.includes("install manually"), "should mention manual install");
+  assert.ok(out.includes(DEPS["codex-plugin-cc"].manualInstall), "should include the manualInstall command");
+});
+
+// ==========================================================================
+// Regression: last30days detection covers Codex and env-override (Finding 2)
+// ==========================================================================
+
+test("last30daysPresent: returns non-null when skill exists under Codex (CODEX_HOME)", () => {
+  const tmp = makeTmp();
+  mkdirSync(join(tmp, "skills", "last30days"), { recursive: true });
+  process.env.CODEX_HOME = tmp;
+  // Ensure CLAUDE_CONFIG_DIR points somewhere without the skill
+  const claudeTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  try {
+    const result = last30daysPresent();
+    assert.notEqual(result, null, "skill under CODEX_HOME should be detected");
+  } finally {
+    delete process.env.CODEX_HOME;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(tmp);
+    cleanup(claudeTmp);
+  }
+});
+
+test("last30daysPresent: returns version from plugin.json under Codex skill dir", () => {
+  const tmp = makeTmp();
+  const pluginDir = join(tmp, "skills", "last30days", ".claude-plugin");
+  mkdirSync(pluginDir, { recursive: true });
+  writeFileSync(join(pluginDir, "plugin.json"), JSON.stringify({ version: "4.0.0" }));
+  process.env.CODEX_HOME = tmp;
+  const claudeTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  try {
+    const result = last30daysPresent();
+    assert.equal(result, "4.0.0");
+  } finally {
+    delete process.env.CODEX_HOME;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(tmp);
+    cleanup(claudeTmp);
+  }
+});
+
+test("last30daysPresent: LAST30DAYS_SKILL_DIR env override takes precedence", () => {
+  const tmp = makeTmp();
+  mkdirSync(join(tmp, "skills", "last30days"), { recursive: true });
+  const skillOverride = makeTmp();
+  mkdirSync(join(skillOverride, ".claude-plugin"), { recursive: true });
+  writeFileSync(join(skillOverride, ".claude-plugin", "plugin.json"), JSON.stringify({ version: "9.9.9" }));
+  process.env.LAST30DAYS_SKILL_DIR = skillOverride;
+  process.env.CLAUDE_CONFIG_DIR = tmp; // this one also has the skill
+  try {
+    const result = last30daysPresent();
+    assert.equal(result, "9.9.9", "LAST30DAYS_SKILL_DIR override must take precedence");
+  } finally {
+    delete process.env.LAST30DAYS_SKILL_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(tmp);
+    cleanup(skillOverride);
+  }
+});
+
+test("last30daysPresent: returns null when skill missing from all locations", () => {
+  const claudeTmp = makeTmp();
+  const codexTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  process.env.CODEX_HOME = codexTmp;
+  try {
+    const result = last30daysPresent();
+    assert.equal(result, null);
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CODEX_HOME;
+    cleanup(claudeTmp);
+    cleanup(codexTmp);
+  }
 });

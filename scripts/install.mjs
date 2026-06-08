@@ -441,9 +441,10 @@ const DEPS = {
     description: "Codex companion for Claude Code cross-review (optional — for reviewMode: codex-companion)",
     hosts: ["claude"],
     featureGate: null,
-    installCmd: ["npx", "--yes", "codex-plugin-cc", "install"],
-    updateCmd: ["npx", "--yes", "codex-plugin-cc", "install"],
-    manualInstall: "npx codex-plugin-cc install",
+    // Installed via Claude Code plugin marketplace — cannot be automated from a shell installer.
+    installCmd: null,
+    updateCmd: null,
+    manualInstall: "In Claude Code: /plugin marketplace add openai/codex-plugin-cc  →  /plugin install codex@openai-codex",
   },
   openspec: {
     label: "openspec CLI (@fission-ai/openspec)",
@@ -538,18 +539,28 @@ function openspecPresent() {
 }
 
 // Returns version string (or "unknown") if last30days skill is installed, null if not.
+// Mirrors the runtime resolver candidates: $LAST30DAYS_SKILL_DIR, ~/.claude/skills/last30days,
+// ~/.codex/skills/last30days.
 function last30daysPresent() {
   const claudeDir = process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(HOME, ".claude");
-  const skillDir = join(claudeDir, "skills", "last30days");
-  if (!existsSync(skillDir)) return null;
-  const pluginJson = join(skillDir, ".claude-plugin", "plugin.json");
-  if (existsSync(pluginJson)) {
-    try {
-      const plugin = JSON.parse(readFileSync(pluginJson, "utf8"));
-      if (plugin.version) return plugin.version;
-    } catch {}
+  const codexHome = process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(HOME, ".codex");
+  const candidates = [
+    process.env.LAST30DAYS_SKILL_DIR ? resolve(process.env.LAST30DAYS_SKILL_DIR) : null,
+    join(claudeDir, "skills", "last30days"),
+    join(codexHome, "skills", "last30days"),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    const pluginJson = join(candidate, ".claude-plugin", "plugin.json");
+    if (existsSync(pluginJson)) {
+      try {
+        const plugin = JSON.parse(readFileSync(pluginJson, "utf8"));
+        if (plugin.version) return plugin.version;
+      } catch {}
+    }
+    return "unknown";
   }
-  return "unknown";
+  return null;
 }
 
 // Returns { present, version } for a dependency key.
@@ -695,6 +706,32 @@ async function promptDeps(depKeys, {
       continue;
     }
 
+    // Manual-only deps have no automated install command — show instructions instead.
+    if (!dep.installCmd) {
+      const detection = detectFn(key);
+      if (detection.present) {
+        results[key] = { status: "already current", version: detection.version };
+        log(`  ✓ ${dep.label}: present${detection.version ? ` (${detection.version})` : ""}`);
+      } else {
+        let accepted;
+        if (yesDeps) {
+          accepted = true;
+          log(`  → ${dep.label}: showing install instructions (--yes-deps)`);
+        } else {
+          const answer = await promptFn(`  ${dep.label}: requires manual install.\n    ${dep.description}\n    Show instructions? [y/N] `);
+          accepted = answer.toLowerCase() === "y";
+        }
+        if (accepted) {
+          results[key] = { status: "manual-only", manualCmd: dep.manualInstall };
+          if (dep.manualInstall) log(`  ℹ  ${dep.label}: install manually:\n      ${dep.manualInstall}`);
+        } else {
+          results[key] = { status: "declined" };
+          log(`  ↷ ${dep.label}: declined`);
+        }
+      }
+      continue;
+    }
+
     const detection = detectFn(key);
     let action, promptText;
 
@@ -759,6 +796,10 @@ function printDepSummary(results) {
         log(`  ✓ ${label}: updated`); break;
       case "already current":
         log(`  ✓ ${label}: already current${result.version ? ` (${result.version})` : ""}`); break;
+      case "manual-only":
+        log(`  ℹ  ${label}: install manually`);
+        if (result.manualCmd) log(`      ${result.manualCmd}`);
+        break;
       case "declined":
         log(`  ↷ ${label}: declined`); break;
       case "skipped":
