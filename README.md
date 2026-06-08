@@ -146,11 +146,19 @@ Update later with `/plugin marketplace update ahf-tools`.
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
+/pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 ```
 
 The number is auto-detected as an issue or PR. PRs resolve to their linked
 closing issue; PRs with no `Closes #N` are refused. Items must carry a
 `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
+
+`--cleanup` takes no number: it sweeps pipeline-managed worktrees under
+`worktree_root` whose PR is already merged, removing the worktree and its local
+branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch,
+and skips (reporting the reason) any worktree with uncommitted changes or a local
+HEAD that differs from the merged PR's commit. It is idempotent — a second run
+finds nothing to do.
 
 ## Per-repo config (optional)
 
@@ -231,6 +239,32 @@ The command is **auto-detected** (first match wins):
 behavior change. For monorepos or custom runners, set `test_gate.command`
 explicitly. **Rollback** is a one-line `test_gate: { enabled: false }` — no labels,
 no state-machine changes.
+
+### Matching CI: set `test_gate.command` when CI does more than `npm test`
+
+Auto-detection picks the package `test` script (or equivalent). If your CI also
+runs additional steps — a generated-artifact sync check, a typecheck pass, an
+install smoke-test — the gate will miss those steps and a CI-only failure can
+escape to pre-merge.
+
+**Fix:** add a script that chains all CI steps and point the gate at it:
+
+```yaml
+# .github/pipeline.yml
+test_gate:
+  command: "npm run ci"   # wraps the full CI command sequence (see package.json)
+```
+
+```json
+// package.json
+"scripts": {
+  "ci": "npm test && node scripts/build.mjs --check && npm run ci:install-smoke"
+}
+```
+
+`test_gate.command` is parsed **without a shell** (whitespace-tokenized, then
+spawned directly). Compound operators like `&&` must live inside the script body
+(where npm/shell handles them), not raw in the config value.
 
 ## Eval gate (optional, default off)
 
@@ -336,9 +370,10 @@ node scripts/install.mjs uninstall --host all      # or claude | codex
 ## Development
 
 ```bash
-cd core && npm ci && npm test     # 169 tests, node --test
+cd core && npm ci && npm test     # 189 tests, node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
+npm run ci                        # run the full CI command (tests + build check + install smoke)
 ```
 
 After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run

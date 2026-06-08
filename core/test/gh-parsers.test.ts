@@ -7,6 +7,7 @@ import {
   isBlocked,
   parseChecksAggregate,
   parseMergeable,
+  parsePrMergeState,
   pickStage,
 } from "../scripts/gh.ts";
 import {
@@ -233,4 +234,21 @@ test("extractReviewFindings: matches Review N with needs-attention", () => {
 test("extractReviewFindings: returns empty when no review found", () => {
   const f = extractReviewFindings([{ body: "random comment" }], 1);
   assert.equal(f, "");
+});
+
+// ---------- parsePrMergeState ----------
+
+test("parsePrMergeState: single merged PR → merged=true with prNumber and headSha", () => {
+  const stdout = JSON.stringify([{ number: 42, headRefOid: "abc123def456" }]);
+  const result = parsePrMergeState(stdout);
+  assert.equal(result.merged, true);
+  if (result.merged) {
+    assert.equal(result.prNumber, 42);
+    assert.equal(result.headSha, "abc123def456");
+  }
+});
+
+test("parsePrMergeState: empty array → merged=false", () => {
+  const result = parsePrMergeState("[]");
+  assert.equal(result.merged, false);
 });

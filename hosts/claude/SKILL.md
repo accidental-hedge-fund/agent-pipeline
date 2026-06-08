@@ -45,11 +45,19 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline N --domain <d>                 override domain name in lock/log paths
 /pipeline N --base <branch>              override base branch
 /pipeline N --repo-path <path>           target a different repo working tree
+/pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
 resolved to their linked closing issue (the pipeline is issue-centric). PRs
 without a `Closes #N` reference are refused with an explanation.
+
+`--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
+worktrees under `worktree_root` whose PR is already merged, removing the worktree
+and deleting its local branch (the remote branch is never touched). It only
+considers `pipeline/<N>-<slug>` worktrees, and skips — reporting the reason — any
+that have uncommitted changes or a local HEAD that differs from the merged PR's
+commit. It is idempotent and prints a removed/skipped summary before exiting.
 
 ## Setup (zero install after first run)
 
@@ -235,6 +243,7 @@ PushNotification with the terminal state.
 - `--status` — read-only, completes in seconds
 - `--unblock "<answer>"` — one comment + label clear, completes in seconds
 - `--dry-run` — logs what would happen, no harness calls
+- `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
 
 Run those synchronously, no Monitor, no background, no Push.
 
