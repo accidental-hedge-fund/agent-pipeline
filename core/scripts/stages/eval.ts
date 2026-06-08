@@ -14,6 +14,7 @@ import {
 import {
   postComment as defaultPostComment,
   setBlocked as defaultSetBlocked,
+  silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
 import { runCapped } from "../harness.ts";
@@ -25,13 +26,23 @@ export interface AdvanceEvalOpts {
   dryRun?: boolean;
 }
 
+export interface EvalRunResult {
+  passed: boolean;
+  output: string;
+  durationSec: number;
+  /** True when the command hit the timeout budget (distinct from an ordinary harness failure). */
+  timedOut: boolean;
+  /** True when the process could not be spawned at all (missing binary, permission error, etc.). */
+  spawnError: boolean;
+}
+
 // Injectable seams — default to real implementations in prod; replaced in unit tests.
 export interface EvalDeps {
   runEval?: (
     shellCmd: string,
     cwd: string,
     timeoutSec: number,
-  ) => Promise<{ passed: boolean; output: string; durationSec: number }>;
+  ) => Promise<EvalRunResult>;
   getForIssue?: (
     cfg: PipelineConfig,
     issueNumber: number,
@@ -42,6 +53,13 @@ export interface EvalDeps {
     from: Stage,
     to: Stage,
     reason: string,
+  ) => Promise<void>;
+  /** Swap labels without posting a comment. Used for the disabled/skip path. */
+  silentTransition?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    from: Stage,
+    to: Stage,
   ) => Promise<void>;
   setBlocked?: (
     cfg: PipelineConfig,
@@ -65,6 +83,7 @@ export async function advanceEval(
   console.log(`[pipeline] #${issueNumber}: eval-gate`);
 
   const transitionFn = deps.transition ?? defaultTransition;
+  const silentTransitionFn = deps.silentTransition ?? defaultSilentTransition;
   const setBlockedFn = deps.setBlocked ?? defaultSetBlocked;
   const postCommentFn = deps.postComment ?? defaultPostComment;
   const getForIssueFn = deps.getForIssue ?? defaultGetForIssue;
@@ -80,10 +99,12 @@ export async function advanceEval(
     return { advanced: true, from: "eval-gate", to: "ready-to-deploy", summary: "[dry-run]" };
   }
 
-  // Skip path — enabled=false → transition forward immediately.
+  // Skip path — enabled=false → swap labels silently, no comment posted.
+  // In normal flow, pre-merge already skips eval-gate when disabled; this is a
+  // safety net for issues that somehow arrive here with an eval-gate label.
   if (!cfg.eval_gate.enabled) {
     console.log(`[pipeline] #${issueNumber}: eval-gate step disabled; skipping.`);
-    await transitionFn(cfg, issueNumber, "eval-gate", "ready-to-deploy", "eval-gate step disabled; skipping.");
+    await silentTransitionFn(cfg, issueNumber, "eval-gate", "ready-to-deploy");
     return { advanced: true, from: "eval-gate", to: "ready-to-deploy", summary: "eval-gate disabled" };
   }
 
@@ -114,13 +135,15 @@ export async function advanceEval(
   // Hard stage-level deadline — each attempt gets only the remaining budget.
   const stageDeadlineMs = Date.now() + timeoutSec * 1000;
 
-  let lastResult: { passed: boolean; output: string; durationSec: number } | null = null;
+  let lastResult: EvalRunResult | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remainingSec = Math.max(0, (stageDeadlineMs - Date.now()) / 1000);
     if (remainingSec <= 0) {
       lastResult = {
         passed: false,
+        timedOut: true,
+        spawnError: false,
         output: `[eval-gate stage timeout (${timeoutSec}s) exceeded before attempt ${attempt}]`,
         durationSec: timeoutSec,
       };
@@ -160,15 +183,39 @@ export async function advanceEval(
     };
   }
 
-  // All attempts failed. Route by mode — advisory always advances; gate always blocks.
+  const attempts = maxAttempts > 1 ? ` after ${maxAttempts} attempts` : "";
+
+  // Tooling failures (timeout or spawn error) are always blocking regardless of mode.
+  // They indicate the eval harness itself could not run, not that the code failed evals.
+  if (result.timedOut) {
+    console.log(`[pipeline] #${issueNumber}: eval-gate timed out${attempts}; blocking`);
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Eval gate timed out${attempts} (${timeoutSec}s limit).\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
+      "eval-gate",
+    );
+    return { advanced: false, status: "blocked", reason: `eval gate timed out${attempts}` };
+  }
+
+  if (result.spawnError) {
+    console.log(`[pipeline] #${issueNumber}: eval-gate runner error${attempts}; blocking`);
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Eval gate runner/tooling error${attempts} — the eval command could not be executed.\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
+      "eval-gate",
+    );
+    return { advanced: false, status: "blocked", reason: `eval gate runner error${attempts}` };
+  }
+
+  // Ordinary harness-owned failure (non-zero exit). Advisory mode records and advances.
   if (cfg.eval_gate.mode === "advisory") {
-    const attempts = maxAttempts > 1 ? ` after ${maxAttempts} attempts` : "";
     console.log(`[pipeline] #${issueNumber}: eval-gate failed${attempts} (advisory mode); advancing`);
     await transitionFn(cfg, issueNumber, "eval-gate", "ready-to-deploy", `Eval gate failed${attempts} (advisory mode); advancing.`);
     return { advanced: true, from: "eval-gate", to: "ready-to-deploy", summary: `eval failed (advisory)` };
   }
 
-  const attempts = maxAttempts > 1 ? ` after ${maxAttempts} attempts` : "";
   console.log(`[pipeline] #${issueNumber}: eval-gate failed${attempts} (gate mode); blocking`);
   await setBlockedFn(
     cfg,
@@ -214,13 +261,21 @@ async function defaultRunEval(
   shellCmd: string,
   cwd: string,
   timeoutSec: number,
-): Promise<{ passed: boolean; output: string; durationSec: number }> {
-  const res = await runCapped("sh", ["-c", shellCmd], cwd, timeoutSec, false, `eval-gate`);
+): Promise<EvalRunResult> {
+  const res = await runCapped("sh", ["-c", shellCmd], cwd, timeoutSec, false, `eval-gate`, {
+    killProcessGroup: true,
+  });
   let output = combineOutput(res);
   if (res.timed_out) {
     output += `\n\n[eval-gate timed out after ${timeoutSec}s]`;
   }
-  return { passed: res.success, output, durationSec: res.duration };
+  return {
+    passed: res.success,
+    timedOut: res.timed_out,
+    spawnError: res.spawn_error ?? false,
+    output,
+    durationSec: res.duration,
+  };
 }
 
 // ---------------------------------------------------------------------------

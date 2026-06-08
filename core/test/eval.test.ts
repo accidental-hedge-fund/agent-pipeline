@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { advanceEval, type EvalDeps } from "../scripts/stages/eval.ts";
+import { advanceEval, type EvalDeps, type EvalRunResult } from "../scripts/stages/eval.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -14,12 +14,13 @@ import type { PipelineConfig } from "../scripts/types.ts";
 
 interface CallLog {
   transitions: Array<{ from: string; to: string }>;
+  silentTransitions: Array<{ from: string; to: string }>;
   blocked: Array<{ reason: string }>;
   comments: string[];
 }
 
 function makeCallLog(): CallLog {
-  return { transitions: [], blocked: [], comments: [] };
+  return { transitions: [], silentTransitions: [], blocked: [], comments: [] };
 }
 
 function baseCfg(overrides: Partial<PipelineConfig["eval_gate"]> = {}): PipelineConfig {
@@ -53,16 +54,19 @@ function baseCfg(overrides: Partial<PipelineConfig["eval_gate"]> = {}): Pipeline
   };
 }
 
-type RunResult = { passed: boolean; output: string; durationSec: number };
+type RunResult = EvalRunResult;
 
 function passResult(output = "All evals passed"): RunResult {
-  return { passed: true, output, durationSec: 1.2 };
+  return { passed: true, timedOut: false, spawnError: false, output, durationSec: 1.2 };
 }
 function failResult(output = "2 evals failed"): RunResult {
-  return { passed: false, output, durationSec: 1.5 };
+  return { passed: false, timedOut: false, spawnError: false, output, durationSec: 1.5 };
 }
 function timeoutResult(): RunResult {
-  return { passed: false, output: "[eval-gate timed out after 300s]", durationSec: 300 };
+  return { passed: false, timedOut: true, spawnError: false, output: "[eval-gate timed out after 300s]", durationSec: 300 };
+}
+function spawnErrorResult(output = "[harness eval-gate] spawn error: command not found"): RunResult {
+  return { passed: false, timedOut: false, spawnError: true, output, durationSec: 0 };
 }
 
 function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; slug: string } | null = { path: "/tmp/wt", slug: "42-slug" }): EvalDeps {
@@ -71,6 +75,7 @@ function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; 
     runEval: async () => results[Math.min(call++, results.length - 1)],
     getForIssue: async () => worktree,
     transition: async (_c, _n, from, to) => { log.transitions.push({ from, to }); },
+    silentTransition: async (_c, _n, from, to) => { log.silentTransitions.push({ from, to }); },
     setBlocked: async (_c, _n, reason) => { log.blocked.push({ reason }); },
     postComment: async (_c, _n, body) => { log.comments.push(body); },
   };
@@ -80,7 +85,7 @@ function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; 
 // Tests
 // ---------------------------------------------------------------------------
 
-test("eval-gate: skip path — disabled config → transitions to ready-to-deploy, no runEval", async () => {
+test("eval-gate: skip path — disabled config → silent label swap to ready-to-deploy, no comment, no runEval", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: false });
   let runCalled = 0;
@@ -93,9 +98,10 @@ test("eval-gate: skip path — disabled config → transitions to ready-to-deplo
   assert.equal(runCalled, 0, "runEval must not be called when disabled");
   assert.equal(out.advanced, true);
   assert.equal((out as { to: string }).to, "ready-to-deploy");
-  assert.equal(log.transitions.length, 1);
-  assert.equal(log.transitions[0].from, "eval-gate");
-  assert.equal(log.transitions[0].to, "ready-to-deploy");
+  assert.equal(log.transitions.length, 0, "disabled path must not call transition (which posts a comment)");
+  assert.equal(log.silentTransitions.length, 1, "disabled path must call silentTransition for label-only swap");
+  assert.equal(log.silentTransitions[0].from, "eval-gate");
+  assert.equal(log.silentTransitions[0].to, "ready-to-deploy");
   assert.equal(log.blocked.length, 0);
   assert.equal(log.comments.length, 0);
 });
@@ -211,7 +217,7 @@ test("eval-gate: retries exhausted + gate mode → setBlocked", async () => {
   assert.equal(log.blocked.length, 1);
 });
 
-test("eval-gate: timeout → treated as fail", async () => {
+test("eval-gate: timeout in gate mode → blocked", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
   const deps = makeDeps(log, [timeoutResult()]);
@@ -221,6 +227,47 @@ test("eval-gate: timeout → treated as fail", async () => {
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1, "timeout must block in gate mode");
   assert.ok(log.comments[0].includes("FAIL"), "timeout comment must say FAIL");
+});
+
+// Regression test for Finding 1: timeouts must ALWAYS block, even in advisory mode.
+test("eval-gate: timeout in advisory mode → always blocks (tooling failure, not harness failure)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const deps = makeDeps(log, [timeoutResult()]);
+
+  const out = await advanceEval(cfg, 491, {}, deps);
+
+  assert.equal(out.advanced, false, "timeout must block even in advisory mode");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.transitions.length, 0, "must not advance on timeout");
+});
+
+// Regression test for Finding 1: spawn/runner errors must ALWAYS block, even in advisory mode.
+test("eval-gate: spawn error in advisory mode → always blocks (tooling failure)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const deps = makeDeps(log, [spawnErrorResult()]);
+
+  const out = await advanceEval(cfg, 492, {}, deps);
+
+  assert.equal(out.advanced, false, "spawn error must block even in advisory mode");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.transitions.length, 0, "must not advance on spawn error");
+});
+
+// Regression test for Finding 1: ordinary eval failure in advisory mode still advances.
+test("eval-gate: ordinary harness failure in advisory mode → still advances", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const deps = makeDeps(log, [failResult("2 evals failed")]);
+
+  const out = await advanceEval(cfg, 493, {}, deps);
+
+  assert.equal(out.advanced, true, "ordinary eval failure in advisory mode must advance");
+  assert.equal(log.blocked.length, 0);
+  assert.equal(log.transitions.length, 1);
 });
 
 test("eval-gate: no worktree → blocked", async () => {
