@@ -90,11 +90,25 @@ test("planning_openspec prompt: builds with all keys + OpenSpec guidance", () =>
     issueNumber: 7,
     title: "Add feature Y",
     body: "spec it",
+    pipelineRunId: "7/2026-06-08T14:32:00Z",
   });
   assert.match(out, /#7/);
   assert.match(out, /Add feature Y/);
   assert.match(out, /OpenSpec/);
   assert.match(out, /openspec\/changes/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("planning_openspec prompt: instructs the trailers with substituted issue + run id (#20)", () => {
+  const out = buildPlanningOpenspecPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 42,
+    title: "Some feature",
+    body: "body",
+    pipelineRunId: "42/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #42/);
+  assert.match(out, /Pipeline-Run: 42\/2026-06-08T14:32:00Z/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
@@ -337,6 +351,17 @@ test("docs_update prompt: contains diff", () => {
     diff: "DIFF-CONTENT",
   });
   assert.match(out, /DIFF-CONTENT/);
+});
+
+test("docs_update prompt: does not instruct harness to commit (#20)", () => {
+  const out = buildDocsUpdatePrompt({
+    cfg: dummyConfig(),
+    issueNumber: 99,
+    title: "T",
+    diff: "some diff",
+  });
+  assert.doesNotMatch(out, /commit with message/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
 test("review prompt: large diff is truncated", () => {

@@ -371,7 +371,7 @@ async function advanceOpenspec(
 
   // ---- Author the OpenSpec change (intent only, no code). ----
   const before = openspec.listChangeDirs(wt.path);
-  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward }), {
+  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward, pipelineRunId }), {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
   });
