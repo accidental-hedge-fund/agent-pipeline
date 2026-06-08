@@ -69,7 +69,7 @@ export async function advance(
   }
 
   // ---- Step 0: optional carry-forward context (last30days) ----
-  const carryForward = await gatherCarryForward(cfg, issueNumber, title);
+  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
 
   // ---- Step 1: generate plan ----
   const planPrompt = buildPlanningPrompt({ cfg, issueNumber, title, body, carryForward });
@@ -314,7 +314,7 @@ async function advanceOpenspec(
   }
 
   // ---- Step 0: optional carry-forward context (last30days) ----
-  const carryForward = await gatherCarryForward(cfg, issueNumber, title);
+  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
 
   // ---- Worktree first: OpenSpec artifacts are files in the change folder. ----
   const slug = slugify(title) || `issue-${issueNumber}`;
@@ -571,6 +571,30 @@ function formatIssues(v: { issues: { item?: string; message: string }[]; raw: st
 
 const LAST30DAYS_SETUP_URL = "https://github.com/mvanhorn/last30days-skill#setup";
 
+// Character cap for the body portion of the research topic. Bodies at or under
+// the cap are appended verbatim; longer bodies are excerpted to the cap, trimmed
+// at the last word boundary, and marked with `…`. Keeping the topic bounded
+// avoids passing unbounded, noisy markdown to the skill's query builder.
+const BODY_TOPIC_CAP = 400;
+
+/**
+ * Build the research topic string for the last30days skill from the issue's
+ * full content (title + description).
+ * - body absent/empty/whitespace-only → returns `title` unchanged (no regression).
+ * - body ≤ BODY_TOPIC_CAP → appends it verbatim after the title.
+ * - body > BODY_TOPIC_CAP → appends an excerpt capped at BODY_TOPIC_CAP, trimmed
+ *   at the last word boundary, with a trailing `…` marking the truncation.
+ */
+export function buildResearchTopic(title: string, body?: string): string {
+  const b = (body ?? "").trim();
+  if (!b) return title;
+  if (b.length <= BODY_TOPIC_CAP) return `${title}\n\n${b}`;
+  let excerpt = b.slice(0, BODY_TOPIC_CAP).trimEnd();
+  const lastSpace = excerpt.lastIndexOf(" ");
+  if (lastSpace > 0) excerpt = excerpt.slice(0, lastSpace);
+  return `${title}\n\n${excerpt}…`;
+}
+
 /** Returns a non-blocking hint for the two empty-brief cases in gatherCarryForward. Exported for unit tests. */
 export function buildSetupHint(issueNumber: number, mode: "unavailable" | "no-signal"): string {
   const p = `[pipeline] #${issueNumber}: last30days:`;
@@ -596,20 +620,26 @@ export interface CarryForwardDeps {
 }
 
 /**
- * When `last30days.enabled`, run the last30days skill against the issue title and
- * carry the resulting evidence brief forward: post it as an issue comment AND
- * return it for injection into the planning prompt. Always non-blocking — a
- * missing skill, failure, or empty/low-signal brief just returns "".
+ * When `last30days.enabled`, run the last30days skill against the issue's full
+ * content (title + description, bounded for long bodies) and carry the resulting
+ * evidence brief forward: post it as an issue comment AND return it for injection
+ * into the planning prompt. Always non-blocking — a missing skill, failure, or
+ * empty/low-signal brief just returns "".
+ *
+ * `body` is optional: when absent, empty, or whitespace-only the research topic
+ * is the title alone (identical to the pre-change baseline).
  */
 export async function gatherCarryForward(
   cfg: PipelineConfig,
   issueNumber: number,
   title: string,
+  body?: string,
   deps: CarryForwardDeps = { run: last30days.run },
 ): Promise<string> {
   if (!last30days.isEnabled(cfg)) return "";
+  const researchTopic = buildResearchTopic(title, body);
   console.log(`[pipeline] #${issueNumber}: gathering last30days carry-forward context`);
-  const res = await deps.run(title, { timeoutSec: cfg.last30days.timeout });
+  const res = await deps.run(researchTopic, { timeoutSec: cfg.last30days.timeout });
   if (res.unavailable) {
     console.log(buildSetupHint(issueNumber, "unavailable"));
     return "";
