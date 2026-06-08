@@ -62,7 +62,8 @@ build step). First-ever invocation runs `npm install` automatically.
 Required:
 - `gh` CLI authenticated against the target repo
 - `codex` CLI on PATH for planning, implementation, fix, and docs_update
-- Claude Code plugin/CLI available for `$cc:review` and `$cc:adversarial-review`
+- `claude` CLI on PATH and authenticated — the reviewer harness (default `prompt-harness` mode
+  invokes it directly; the `cc-plugin-codex` companion is optional, only for `reviewMode: claude-companion`)
 - Node 24+
 - The skill never reads `ANTHROPIC_API_KEY`
 

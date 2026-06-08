@@ -61,10 +61,11 @@ Required:
 - `gh` CLI authenticated against the target repo
 - `claude` CLI on PATH — the primary harness (planning, implementation, fixes, docs)
 - `codex` CLI on PATH and authenticated — the reviewer harness
-- The **codex-plugin-cc companion** (`codex-companion.mjs`) — review-1/review-2 shell out to it
-  (`/codex:review` / `/codex:adversarial-review`). Install in Claude Code with
-  `/plugin marketplace add openai/codex-plugin-cc` then `/plugin install codex@openai-codex`.
-  Without it the review stage blocks. Override its path with `PIPELINE_CODEX_COMPANION`.
+- *(Optional)* the **codex-plugin-cc companion** (`codex-companion.mjs`) — only needed if you
+  set `reviewMode: codex-companion`. The default `prompt-harness` mode reviews by invoking the
+  `codex` CLI directly with a JSON-returning prompt, so **no review plugin is required**. To opt
+  in: `/plugin marketplace add openai/codex-plugin-cc` then `/plugin install codex@openai-codex`
+  (override its path with `PIPELINE_CODEX_COMPANION`).
 - Node 24+
 - The user's Claude Code subscription provides the LLM budget — this skill
   never reads `ANTHROPIC_API_KEY`

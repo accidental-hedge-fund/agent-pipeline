@@ -44,24 +44,19 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **Node ≥ 24** with **`npm`** (npm ships with Node and installs the core's deps — commander, js-yaml, zod). The core runs TypeScript directly via native type-stripping; no build step.
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
 - **Both `claude` and `codex` CLIs** on PATH and **authenticated** (logged in) — each run uses one to implement and the other to review.
-- **The reviewer is the *other* harness's review plugin** (symmetric — each profile reviews
-  through the companion plugin that wraps the opposite harness):
-  - `/pipeline` (Claude profile) reviews by driving Codex through the **`codex-plugin-cc`
-    companion** (`codex-companion.mjs` → `/codex:review` / `/codex:adversarial-review`). Install it
-    in Claude Code once: `/plugin marketplace add openai/codex-plugin-cc` then
-    `/plugin install codex@openai-codex`. Without it, `/pipeline` fails at the review stage. The
-    companion carries its own review prompt and drives the `codex` CLI directly, so **no extra
-    Codex-side skill is required** — only `codex` installed and authenticated. Override the
-    companion path with `PIPELINE_CODEX_COMPANION`. (The installer warns if it's missing.)
-  - `$pipeline` (Codex profile) reviews by driving Claude Code through the **`cc-plugin-codex`
-    companion** (`claude-companion.mjs` → `$cc:review` / `$cc:adversarial-review`). Install it in
-    Codex once: `npx cc-plugin-codex install`. Without it, `$pipeline` fails at the review stage.
-    The companion carries its own review prompt and drives the `claude` CLI directly, so **no
-    Claude-side skill is required** — only `claude` installed and authenticated. Override
-    the companion path with `PIPELINE_CC_COMPANION`. (The installer warns if it's missing.)
-  - Both companions run the reviewer **read-only** (sandboxed / isolated review worktree) and
-    emit a structured verdict against a shared `review-output.schema.json`. review-1 maps to the
-    plugin's standard review, review-2 to its adversarial review.
+- **Review runs on the *other* harness, invoked directly** (symmetric — `/pipeline`
+  reviews with `codex`, `$pipeline` reviews with `claude`). The default
+  `reviewMode: prompt-harness` calls the reviewer CLI with the pipeline's own
+  review prompt, which returns a structured JSON verdict against
+  `review-output.schema.json` (review-1 = standard, review-2 = adversarial). **No
+  review plugin is required** — you just need the other harness's CLI installed and
+  authenticated (listed above).
+  - *Optional companion review modes* (`codex-companion` / `claude-companion`) drive
+    the reviewer through a 3rd-party plugin instead — `codex-plugin-cc`
+    (`/codex:review`) for Codex, `cc-plugin-codex` (`$cc:review`) for Claude — using
+    each harness's native review feature, run read-only/sandboxed. They are **not**
+    the default and **not** required; set `reviewMode` in the profile to opt in.
+    Override companion paths with `PIPELINE_CODEX_COMPANION` / `PIPELINE_CC_COMPANION`.
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
 - **Optional: the [OpenSpec](https://openspec.dev/) CLI** (`npm i -g @fission-ai/openspec`) — only for repos that opt into the OpenSpec flow (see "OpenSpec integration (optional)"). Not needed otherwise.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
@@ -96,35 +91,32 @@ and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up li
 
 #### Claude as the primary harness (`/pipeline`)
 
-This is the Claude-primary flow: **Claude Code implements, Codex reviews.** Two installs are needed:
+This is the Claude-primary flow: **Claude Code implements, Codex reviews.**
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline install --host claude   # 1. this pipeline skill
-# 2. the companion that runs the Codex review (inside Claude Code):
-#    /plugin marketplace add openai/codex-plugin-cc
-#    /plugin install codex@openai-codex
-codex login                                            # 3. the companion drives the `codex` CLI
+npx github:accidental-hedge-fund/agent-pipeline install --host claude   # this pipeline skill
+codex login                                            # the reviewer — review invokes `codex` directly
 ```
 
-Installing only the pipeline skill is **not enough** for this flow — the review stage shells out to
-the `codex-plugin-cc` companion (`codex-companion.mjs`). That companion is a separate Claude Code
-plugin (it is not bundled here). Nothing extra is needed on the Codex side: the companion carries its
-own review prompt and calls the `codex` CLI directly.
+By default (`reviewMode: prompt-harness`) review invokes the `codex` CLI directly with a
+JSON-returning prompt — **no review plugin needed**, just the authenticated `codex` CLI.
+*(Optional: to use Codex's native review via the `codex-plugin-cc` companion instead, set
+`reviewMode: codex-companion` and run `/plugin marketplace add openai/codex-plugin-cc` then
+`/plugin install codex@openai-codex`.)*
 
 #### Codex as the primary harness (`$pipeline`)
 
-This is the Codex-primary flow: **Codex implements, Claude Code reviews.** Two installs are needed:
+This is the Codex-primary flow: **Codex implements, Claude Code reviews.**
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline install --host codex   # 1. this pipeline skill
-npx cc-plugin-codex install                            # 2. the companion that runs the Claude review
-claude auth login                                      # 3. the companion drives the `claude` CLI
+npx github:accidental-hedge-fund/agent-pipeline install --host codex   # this pipeline skill
+claude auth login                                      # the reviewer — review invokes `claude` directly
 ```
 
-Installing only the pipeline skill is **not enough** for the primary flow — the review stage shells
-out to the `cc-plugin-codex` companion (`claude-companion.mjs`). That companion is a separate plugin
-(it is not bundled here). Nothing extra is needed on the Claude side: the companion carries its own
-review prompt and calls the `claude` CLI directly. Then restart Codex and run `$pipeline N`.
+By default (`reviewMode: prompt-harness`) review invokes the `claude` CLI directly with a
+JSON-returning prompt — **no review plugin needed**, just the authenticated `claude` CLI. Then
+restart Codex and run `$pipeline N`. *(Optional: to use Claude Code's native review via the
+`cc-plugin-codex` companion instead, set `reviewMode: claude-companion` and run `npx cc-plugin-codex install`.)*
 
 ### Claude Code — plugin marketplace (versioned, auto-updatable)
 
@@ -296,8 +288,8 @@ differ between hosts:
 |---|---|---|
 | invocation | `/pipeline` | `$pipeline` |
 | implementer / reviewer | claude / codex | codex / claude |
-| review mode | `codex-companion` | `claude-companion` |
-| review companion | codex-plugin-cc (`/codex:review`) | cc-plugin-codex (`$cc:review`) |
+| review mode | `prompt-harness` (default) | `prompt-harness` (default) |
+| reviewer (direct, JSON prompt) | `codex` CLI | `claude` CLI |
 | conventions file | `CLAUDE.md` | `AGENTS.md` |
 
 Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one

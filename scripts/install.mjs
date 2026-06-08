@@ -186,24 +186,16 @@ function preflight(hosts) {
   // `openspec.enabled` in .github/pipeline.yml) need the CLI. Info, not a warning.
   if (which("openspec")) log("  ✓ openspec (optional) — for OpenSpec-enabled repos");
   else log("  ℹ openspec not found (optional) — only for OpenSpec-enabled repos; install: npm i -g @fission-ai/openspec");
+  // Review companions are OPTIONAL — only the legacy `*-companion` reviewMode uses
+  // them. The default `prompt-harness` mode reviews via the reviewer CLI directly,
+  // so no plugin is required. Info, not a warning.
   if (hosts.includes("codex")) {
-    if (companionPresent()) log("  ✓ cc companion (claude-companion.mjs) — needed for $pipeline review");
-    else
-      warn(
-        "Codex review needs the cc-plugin-codex companion (claude-companion.mjs). " +
-          "Install it with `npx cc-plugin-codex install`, then `claude auth login`. " +
-          "(Override its path with PIPELINE_CC_COMPANION.)",
-      );
+    if (companionPresent()) log("  ✓ cc companion (claude-companion.mjs) — optional, for reviewMode: claude-companion");
+    else log("  ℹ cc-plugin-codex companion not found (optional) — only needed if you set reviewMode: claude-companion");
   }
   if (hosts.includes("claude")) {
-    if (codexCompanionPresent()) log("  ✓ codex companion (codex-companion.mjs) — needed for /pipeline review");
-    else
-      warn(
-        "Claude review needs the codex-plugin-cc companion (codex-companion.mjs). " +
-          "Install it in Claude Code with `/plugin marketplace add openai/codex-plugin-cc` then " +
-          "`/plugin install codex@openai-codex`, and ensure the `codex` CLI is authenticated. " +
-          "(Override its path with PIPELINE_CODEX_COMPANION.)",
-      );
+    if (codexCompanionPresent()) log("  ✓ codex companion (codex-companion.mjs) — optional, for reviewMode: codex-companion");
+    else log("  ℹ codex-plugin-cc companion not found (optional) — only needed if you set reviewMode: codex-companion");
   }
   log("");
 }
