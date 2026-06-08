@@ -243,6 +243,55 @@ test("advanceReview: posted review comment carries the bound SHA sentinel (#16)"
   );
 });
 
+test("advanceReview: SHA resolution failure → blocked, no review posted (#16)", async (t) => {
+  // Regression for review finding #2: SHA resolution must be mandatory.
+  const { deps, rec } = makeDeps([APPROVE]);
+  const throwingDeps: AdvanceReviewDeps = {
+    ...deps,
+    getPrDetail: async () => {
+      throw new Error("GitHub API unavailable");
+    },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 1, 1, {}, 0, throwingDeps);
+  });
+  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "SHA resolution failed" });
+  assert.ok(
+    rec.blocked.some((b) => b.includes("Could not resolve PR head SHA")),
+    "must post a blocked comment when SHA resolution throws",
+  );
+  assert.equal(rec.comments.length, 0, "no review comment may be posted without a valid SHA");
+});
+
+test("advanceReview: HEAD moves between SHA capture and diff fetch → blocked (#16)", async (t) => {
+  // Regression for review finding #3: diff/SHA race — stamped SHA must match
+  // the diff that was reviewed.
+  let callCount = 0;
+  const sha1 = "a".repeat(40);
+  const sha2 = "b".repeat(40);
+  const { deps, rec } = makeDeps([APPROVE]);
+  const racingDeps: AdvanceReviewDeps = {
+    ...deps,
+    getPrDetail: async () => {
+      callCount += 1;
+      // First call (pre-diff): return sha1; second call (post-diff): return sha2.
+      const sha = callCount === 1 ? sha1 : sha2;
+      return { head_sha: sha } as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getPrDetail"]>>>;
+    },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 1, 1, {}, 0, racingDeps);
+  });
+  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "HEAD moved during diff fetch" });
+  assert.ok(
+    rec.blocked.some((b) => b.includes("PR HEAD moved while fetching diff")),
+    "must block with a clear message when HEAD moves between SHA capture and diff fetch",
+  );
+  assert.equal(rec.comments.length, 0, "no review comment may be posted when the diff/SHA race is detected");
+});
+
 // ---------------------------------------------------------------------------
 // advanceReview — verdict normalization gate
 // ---------------------------------------------------------------------------
