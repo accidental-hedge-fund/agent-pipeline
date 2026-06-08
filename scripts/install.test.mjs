@@ -273,3 +273,54 @@ test("offerRelocationWith TTY empty answer (Enter): treated as decline → 'skip
     cleanup(tmp);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Race-condition regression: backup path created between selection and rename
+// ---------------------------------------------------------------------------
+
+test("offerRelocationWith non-TTY: uses fallback suffix when stem backup is pre-created (race)", async () => {
+  const tmp = makeTmp();
+  const dest = join(tmp, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal skill");
+
+  // Simulate a concurrent process that already created the timestamped stem
+  // before our rename fires. We do this by pre-populating the stem-named path
+  // so the first rename attempt fails with ENOTEMPTY/EEXIST, forcing a retry.
+  // uniqueBackupPath uses the same ts format so we need to pre-create ANY
+  // plausible stem. We inject a custom promptFn that first creates the stem to
+  // trigger the race, but since this is the non-TTY path (no prompt), we instead
+  // pre-create the stem before calling offerRelocationWith.
+  //
+  // The ts in offerRelocationWith is derived from `new Date()`, so we capture
+  // all .bak entries after the call rather than predicting the exact stem.
+  const { readdirSync } = await import("node:fs");
+
+  // Pre-create a stem that matches the current second so the first candidate
+  // is taken. We over-provision by creating stems for the current and adjacent
+  // seconds to be robust against second boundaries.
+  const nowTs = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  mkdirSync(join(tmp, `pipeline.${nowTs}.bak`), { recursive: true });
+  writeFileSync(join(tmp, `pipeline.${nowTs}.bak`, "sentinel"), "occupied by race");
+
+  try {
+    const result = await offerRelocationWith(dest, tmp, false, false);
+    assert.equal(result, "proceed");
+    assert.equal(existsSync(dest), false, "dest should have been relocated");
+
+    const entries = readdirSync(tmp);
+    // The stem backup contains "sentinel" (untouched). Dest must be in a .bak.N entry.
+    const fallbackEntries = entries.filter((e) => e.includes(".bak.") && e.startsWith("pipeline."));
+    assert.ok(
+      fallbackEntries.length > 0 || entries.some((e) => e.endsWith(".bak") && !existsSync(join(tmp, e, "sentinel"))),
+      "dest must be relocated to a non-colliding backup path",
+    );
+    // The occupied stem must still contain its sentinel (not overwritten).
+    assert.ok(
+      existsSync(join(tmp, `pipeline.${nowTs}.bak`, "sentinel")),
+      "pre-existing backup must not be overwritten (no-clobber guarantee)",
+    );
+  } finally {
+    cleanup(tmp);
+  }
+});

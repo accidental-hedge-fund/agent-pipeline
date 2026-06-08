@@ -229,8 +229,27 @@ function uniqueBackupPath(base, timestamp) {
   throw new Error(`Cannot find a unique backup path under ${base} — remove old backups and retry.`);
 }
 
-function relocatePersonalSkill(dest, backupPath) {
-  renameSync(dest, backupPath);
+// Atomically renames dest to a unique backup path under base/ts, retrying on
+// EEXIST/ENOTEMPTY so a concurrent process creating the same timestamped path
+// cannot violate the no-overwrite guarantee. Returns the actual path used.
+function relocatePersonalSkill(dest, base, ts) {
+  const stem = join(base, `pipeline.${ts}.bak`);
+  const tryRename = (p) => {
+    try {
+      renameSync(dest, p);
+      return p;
+    } catch (err) {
+      if (err.code === "EEXIST" || err.code === "ENOTEMPTY" || err.code === "EISDIR") return null;
+      throw err;
+    }
+  };
+  const first = tryRename(stem);
+  if (first) return first;
+  for (let i = 1; i <= 100; i++) {
+    const r = tryRename(`${stem}.${i}`);
+    if (r) return r;
+  }
+  throw new Error(`Cannot find a unique backup path under ${base} — remove old backups and retry.`);
 }
 
 async function promptLine(question) {
@@ -260,10 +279,10 @@ async function offerRelocationWith(dest, base, dryRun, isTTY, promptFn = promptL
     // first so data is preserved rather than silently destroyed.
     warn(
       `Personal pipeline skill detected at ${dest} (no ${MANAGED_MARKER} marker).\n` +
-        `  Non-interactive environment — auto-relocating to preserve data.\n` +
-        `  Backed up to: ${backupPath}`,
+        `  Non-interactive environment — auto-relocating to preserve data.`,
     );
-    relocatePersonalSkill(dest, backupPath);
+    const actualNonTTYBackup = relocatePersonalSkill(dest, base, ts);
+    warn(`  Backed up to: ${actualNonTTYBackup}`);
     return "proceed";
   }
 
@@ -274,8 +293,8 @@ async function offerRelocationWith(dest, base, dryRun, isTTY, promptFn = promptL
   );
   const answer = await promptFn(`  Relocate it to ${backupPath} first? [y/N] `);
   if (answer.toLowerCase() === "y") {
-    relocatePersonalSkill(dest, backupPath);
-    log(`  ✓ Relocated to ${backupPath}`);
+    const actualTTYBackup = relocatePersonalSkill(dest, base, ts);
+    log(`  ✓ Relocated to ${actualTTYBackup}`);
     return "proceed";
   }
 
