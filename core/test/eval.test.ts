@@ -164,7 +164,9 @@ test("eval-gate: retry on transient fail — first attempt fails, second passes 
   assert.ok(log.comments[0].includes("PASS"));
 });
 
-test("eval-gate: retries exhausted → setBlocked regardless of mode (advisory)", async () => {
+// Regression test for Finding 1: advisory mode must advance even when retries are exhausted.
+// Previously the code blocked unconditionally when maxAttempts > 1, violating the advisory contract.
+test("eval-gate: retries exhausted + advisory mode → advances to ready-to-deploy (never blocks)", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 2 });
   let runCalled = 0;
@@ -175,13 +177,26 @@ test("eval-gate: retries exhausted → setBlocked regardless of mode (advisory)"
   const out = await advanceEval(cfg, 47, {}, deps);
 
   assert.equal(runCalled, 2, "must attempt max_attempts times");
-  assert.equal(out.advanced, false);
-  assert.equal((out as { status: string }).status, "blocked");
-  assert.equal(log.blocked.length, 1, "must block when retries exhausted");
-  assert.equal(log.transitions.length, 0);
+  assert.equal(out.advanced, true, "advisory must advance even after retries exhausted");
+  assert.equal((out as { to: string }).to, "ready-to-deploy");
+  assert.equal(log.blocked.length, 0, "advisory must never block");
+  assert.equal(log.transitions.length, 1);
 });
 
-test("eval-gate: retries exhausted → setBlocked regardless of mode (gate)", async () => {
+// Also verify advisory advances with the default max_attempts (2) configuration.
+test("eval-gate: retries exhausted + advisory mode + default max_attempts → advances", async () => {
+  const log = makeCallLog();
+  // Default max_attempts is 2 per DEFAULT_CONFIG — this was the failing scenario.
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 2 });
+  const deps = makeDeps(log, [failResult(), failResult()]);
+
+  const out = await advanceEval(cfg, 471, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(log.blocked.length, 0);
+});
+
+test("eval-gate: retries exhausted + gate mode → setBlocked", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 3 });
   let runCalled = 0;
@@ -218,4 +233,48 @@ test("eval-gate: no worktree → blocked", async () => {
   assert.equal(out.advanced, false);
   assert.equal((out as { reason: string }).reason, "no worktree");
   assert.equal(log.blocked.length, 1);
+});
+
+// Regression tests for Finding 2: dry-run must not mutate GitHub state even
+// for disabled eval or missing command.
+test("eval-gate: dry-run + disabled eval → no GitHub writes", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: false });
+  const deps = makeDeps(log, []);
+
+  const out = await advanceEval(cfg, 51, { dryRun: true }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(log.transitions.length, 0, "dry-run must not call transition");
+  assert.equal(log.blocked.length, 0, "dry-run must not call setBlocked");
+  assert.equal(log.comments.length, 0, "dry-run must not post comments");
+});
+
+test("eval-gate: dry-run + no command configured → no GitHub writes", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, command: undefined });
+  const deps = makeDeps(log, []);
+
+  const out = await advanceEval(cfg, 52, { dryRun: true }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(log.transitions.length, 0, "dry-run must not call transition");
+  assert.equal(log.blocked.length, 0, "dry-run must not call setBlocked");
+  assert.equal(log.comments.length, 0, "dry-run must not post comments");
+});
+
+test("eval-gate: dry-run + enabled + command → no GitHub writes, no runEval", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, command: "pnpm evals" });
+  let runCalled = 0;
+  const deps = makeDeps(log, []);
+  deps.runEval = async () => { runCalled++; return passResult(); };
+
+  const out = await advanceEval(cfg, 53, { dryRun: true }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(runCalled, 0, "dry-run must not invoke runEval");
+  assert.equal(log.transitions.length, 0);
+  assert.equal(log.blocked.length, 0);
+  assert.equal(log.comments.length, 0);
 });

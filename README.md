@@ -1,9 +1,9 @@
 # agent-pipeline
 
 A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
-through a 10-stage state machine to `pipeline:ready-to-deploy` — planning →
-plan-review → implementing → review → fix → pre-merge. It does **not** auto-merge;
-you own the merge button.
+through a 11-stage state machine to `pipeline:ready-to-deploy` — planning →
+plan-review → implementing → review → fix → pre-merge → eval-gate. It does **not**
+auto-merge; you own the merge button.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)**
 from a single shared TypeScript core. The two hosts differ only by a small
@@ -13,7 +13,7 @@ forked pipeline logic.
 ```
 backlog → ready → planning → plan-review → implementing
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → ready-to-deploy
+              → pre-merge → eval-gate → ready-to-deploy
 ```
 
 ## Repository layout
@@ -180,6 +180,12 @@ test_gate:                           # run the repo's own tests/build before ope
   command: "pnpm test"               # optional explicit command; auto-detected when absent
   max_attempts: 3                    # fix-harness invocations before blocking
   timeout: 300                       # seconds per test/build run
+eval_gate:                           # run the repo's eval harness after pre-merge, before ready-to-deploy
+  enabled: false                     # default: false; set true to enable (one-time declaration per repo)
+  command: "pnpm evals"              # shell command to run; supports pipes, env vars, &&, etc.
+  mode: gate                         # gate (default): block on fail | advisory: record result and always advance
+  timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
+  max_attempts: 2                    # total attempts before giving up (1 = no retry)
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
 
