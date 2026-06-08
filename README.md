@@ -234,6 +234,32 @@ behavior change. For monorepos or custom runners, set `test_gate.command`
 explicitly. **Rollback** is a one-line `test_gate: { enabled: false }` — no labels,
 no state-machine changes.
 
+### Matching CI: set `test_gate.command` when CI does more than `npm test`
+
+Auto-detection picks the package `test` script (or equivalent). If your CI also
+runs additional steps — a generated-artifact sync check, a typecheck pass, an
+install smoke-test — the gate will miss those steps and a CI-only failure can
+escape to pre-merge.
+
+**Fix:** add a script that chains all CI steps and point the gate at it:
+
+```yaml
+# .github/pipeline.yml
+test_gate:
+  command: "npm run ci"   # wraps: npm test && node scripts/build.mjs --check
+```
+
+```json
+// package.json
+"scripts": {
+  "ci": "npm test && node scripts/build.mjs --check"
+}
+```
+
+`test_gate.command` is parsed **without a shell** (whitespace-tokenized, then
+spawned directly). Compound operators like `&&` must live inside the script body
+(where npm/shell handles them), not raw in the config value.
+
 ## OpenSpec integration (optional)
 
 If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/`

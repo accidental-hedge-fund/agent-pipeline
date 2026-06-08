@@ -8,3 +8,12 @@ domain_name: agent-pipeline
 domain_description: a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex)
 openspec:
   enabled: auto
+test_gate:
+  # Run the repo's full CI surface, not just `npm test`.
+  # Auto-detection only finds the `test` script; this repo's CI also runs
+  # `node scripts/build.mjs --check` (plugin-mirror sync). Wrapping both in
+  # `npm run ci` keeps the command a single token — test_gate.command is parsed
+  # without a shell, so compound operators like `&&` must live inside the script.
+  # If your repo's CI does more than the auto-detected test script, set this field
+  # to a single command (or script) that covers all CI steps.
+  command: "npm run ci"
