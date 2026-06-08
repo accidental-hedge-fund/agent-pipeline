@@ -141,6 +141,37 @@ export interface AdvanceReviewOpts {
   model?: string;
 }
 
+/**
+ * External seams used by {@link advanceReview}, overridable in tests so the
+ * verdict-normalization routing can be exercised without a real reviewer,
+ * GitHub, or worktree. Defaults are the real implementations. Mirrors the
+ * dependency-injection pattern used by `testgate.ts`'s `TestGateDeps`.
+ */
+export interface AdvanceReviewDeps {
+  getPrForIssue?: typeof getPrForIssue;
+  getPrDiff?: typeof getPrDiff;
+  getIssueDetail?: typeof getIssueDetail;
+  getForIssue?: typeof getForIssue;
+  postComment?: typeof postComment;
+  transition?: typeof transition;
+  setBlocked?: typeof setBlocked;
+  /** Runs one review round and returns the raw harness result. */
+  runReview?: RunReviewFn;
+}
+
+type RunReviewFn = (
+  companionMode: CompanionMode | null,
+  cfg: PipelineConfig,
+  issueNumber: number,
+  detail: { title: string; body: string },
+  plan: string,
+  review1Summary: string | undefined,
+  diff: string,
+  round: 1 | 2,
+  cwd: string,
+  opts: AdvanceReviewOpts,
+) => Promise<HarnessResult>;
+
 export interface CompanionReviewCommand {
   cmd: string;
   args: string[];
@@ -171,7 +202,18 @@ export async function advanceReview(
   issueNumber: number,
   round: 1 | 2,
   opts: AdvanceReviewOpts = {},
+  retryCount = 0,
+  deps: AdvanceReviewDeps = {},
 ): Promise<Outcome> {
+  const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
+  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
+  const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const postCommentFn = deps.postComment ?? postComment;
+  const transitionFn = deps.transition ?? transition;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const runReviewFn = deps.runReview ?? defaultRunReview;
+
   const stage: Stage = round === 1 ? "review-1" : "review-2";
   const companionMode = isCompanionMode(cfg.review_mode) ? cfg.review_mode : null;
   const reviewer = companionMode
@@ -180,26 +222,26 @@ export async function advanceReview(
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${reviewer}`);
 
-  const prNumber = await getPrForIssue(cfg, issueNumber);
+  const prNumber = await getPrForIssueFn(cfg, issueNumber);
   if (!prNumber) {
-    await setBlocked(cfg, issueNumber, "No pull request found for this issue.", stage);
+    await setBlockedFn(cfg, issueNumber, "No pull request found for this issue.", stage);
     return { advanced: false, status: "blocked", reason: "no PR found" };
   }
 
   let diff: string;
   try {
-    diff = await getPrDiff(cfg, prNumber);
+    diff = await getPrDiffFn(cfg, prNumber);
   } catch (err) {
     const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Could not retrieve PR diff: ${e.message}`, stage);
+    await setBlockedFn(cfg, issueNumber, `Could not retrieve PR diff: ${e.message}`, stage);
     return { advanced: false, status: "blocked", reason: e.message };
   }
   if (!diff.trim()) {
-    await setBlocked(cfg, issueNumber, "PR has an empty diff.", stage);
+    await setBlockedFn(cfg, issueNumber, "PR has an empty diff.", stage);
     return { advanced: false, status: "blocked", reason: "empty diff" };
   }
 
-  const detail = await getIssueDetail(cfg, issueNumber);
+  const detail = await getIssueDetailFn(cfg, issueNumber);
   const plan = extractPlan(detail.comments);
   const review1Summary = round === 2 ? extractReview1Summary(detail.comments) : undefined;
 
@@ -209,18 +251,27 @@ export async function advanceReview(
   }
 
   // Run in worktree if available, otherwise repo root.
-  const wt = await getForIssue(cfg, issueNumber);
+  const wt = await getForIssueFn(cfg, issueNumber);
   const cwd = wt?.path ?? cfg.repo_dir;
 
-  const result = companionMode
-    ? await invokeCompanionReview(companionMode, cfg, issueNumber, detail.title, round, cwd, opts)
-    : await invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, diff, round, cwd, opts);
+  const result = await runReviewFn(
+    companionMode,
+    cfg,
+    issueNumber,
+    detail,
+    plan,
+    review1Summary,
+    diff,
+    round,
+    cwd,
+    opts,
+  );
 
   if (!result.success) {
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    await setBlocked(cfg, issueNumber, `Review harness (${reviewer}) failed: ${reason}`, stage);
+    await setBlockedFn(cfg, issueNumber, `Review harness (${reviewer}) failed: ${reason}`, stage);
     return { advanced: false, status: "blocked", reason };
   }
 
@@ -229,11 +280,11 @@ export async function advanceReview(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );
 
-  await postComment(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
+  await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
 
   if (verdict.verdict === "approve") {
     if (round === 1) {
-      await transition(
+      await transitionFn(
         cfg,
         issueNumber,
         "review-1",
@@ -247,7 +298,7 @@ export async function advanceReview(
         summary: `approved (${verdict.findings.length} findings)`,
       };
     } else {
-      await transition(
+      await transitionFn(
         cfg,
         issueNumber,
         "review-2",
@@ -263,9 +314,40 @@ export async function advanceReview(
     }
   }
 
-  // needs-attention → fix
+  // Verdict normalization (#45): a `needs-attention` verdict carrying zero
+  // enumerated findings has nothing concrete for a fix round to act on. Routing
+  // it to fix burns a harness invocation on nothing and produces a misleading
+  // "fixes pushed" comment (observed live in #34 → PR #44). It almost always
+  // means the reviewer output couldn't be parsed into a structured verdict and
+  // degraded to the conservative text default. Re-review once; if it still can't
+  // produce findings, BLOCK and surface the raw output — do not auto-approve
+  // (the text fallback can silently drop prose findings) and do not fix nothing.
+  if (verdict.verdict === "needs-attention" && verdict.findings.length === 0) {
+    if (retryCount === 0) {
+      console.log(
+        `[pipeline] #${issueNumber}: needs-attention+0-findings — triggering re-review (attempt ${retryCount + 1})`,
+      );
+      return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
+    }
+    const raw = verdict._raw?.trim() || verdict.summary?.trim() || "(no reviewer output captured)";
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Review ${round} returned \`needs-attention\` with zero enumerated findings on re-review, ` +
+        `so there is nothing concrete to fix. The reviewer output likely could not be parsed into ` +
+        `a structured verdict. Raw reviewer output:\n\n${raw}`,
+      stage,
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: "needs-attention with 0 findings on re-review",
+    };
+  }
+
+  // needs-attention with findings → fix
   const fixStage: Stage = round === 1 ? "fix-1" : "fix-2";
-  await transition(
+  await transitionFn(
     cfg,
     issueNumber,
     stage,
@@ -279,6 +361,23 @@ export async function advanceReview(
     summary: `${verdict.findings.length} findings`,
   };
 }
+
+/** Default {@link RunReviewFn}: dispatches to the companion or prompt-harness reviewer. */
+const defaultRunReview: RunReviewFn = (
+  companionMode,
+  cfg,
+  issueNumber,
+  detail,
+  plan,
+  review1Summary,
+  diff,
+  round,
+  cwd,
+  opts,
+) =>
+  companionMode
+    ? invokeCompanionReview(companionMode, cfg, issueNumber, detail.title, round, cwd, opts)
+    : invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, diff, round, cwd, opts);
 
 async function invokeCompanionReview(
   mode: CompanionMode,
@@ -368,7 +467,14 @@ export function parseStructuredVerdict(output: string): ReviewVerdict & { _raw?:
     }
   }
 
-  // Fall back to text-based verdict (conservative).
+  // Fall back to text-based verdict (conservative). This path produces no
+  // structured findings, so log it: a fallback `needs-attention` is
+  // indistinguishable from a genuine one at the routing site, and silent
+  // degradation is exactly what burned a fix round on nothing in #45. `_raw`
+  // carries the unparsed output forward so the routing layer can surface it.
+  console.warn(
+    "[pipeline] warning: verdict fallback — no structured JSON found in reviewer output; raw attached",
+  );
   return {
     verdict: parseTextVerdict(output),
     summary: output.slice(0, 500),
