@@ -61,7 +61,7 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **Optional: the [OpenSpec](https://openspec.dev/) CLI** (`npm i -g @fission-ai/openspec`) — only for repos that opt into the OpenSpec flow (see "OpenSpec integration (optional)"). Not needed otherwise.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
 
-The installer prints a prerequisite checklist (warnings don't block install).
+The installer prints a prerequisite checklist (warnings don't block install). After installing the core skill, it also **detects and offers to install optional companion plugins and feature tools** relevant to your setup — you're prompted for each one and can accept or decline without affecting the core install.
 
 ## Install
 
@@ -88,6 +88,15 @@ The installer copies the shared core + the right host overlay into
 `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher
 shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`
 and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up live.
+
+After the core install, the installer detects which optional companion plugins and feature tools are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install. To skip all prompts and auto-accept in non-interactive environments:
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline install --yes-deps   # auto-accept all optional deps
+PIPELINE_INSTALL_DEPS=1 npx github:accidental-hedge-fund/agent-pipeline install  # same via env var
+```
+
+In non-interactive environments (CI, piped `npx`) without `--yes-deps`, dependency prompts are skipped automatically and a summary is printed with instructions to re-run with `--yes-deps`.
 
 #### Claude as the primary harness (`/pipeline`)
 

@@ -96,11 +96,13 @@ function parseArgs(argv) {
   const verb = args[0] && !args[0].startsWith("-") ? args[0] : "install";
   let host = "all";
   let dryRun = false;
+  let yesDeps = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--host") host = args[++i];
     else if (args[i] === "--dry-run") dryRun = true;
+    else if (args[i] === "--yes-deps") yesDeps = true;
   }
-  return { verb, host, dryRun };
+  return { verb, host, dryRun, yesDeps };
 }
 
 function selectedHosts(hostArg) {
@@ -392,11 +394,396 @@ function uninstallHost(host, dryRun) {
 }
 
 // ---------------------------------------------------------------------------
+// Dependency-prompting phase
+// ---------------------------------------------------------------------------
+//
+// Confirmed install commands — re-verify against upstream READMEs on each
+// installer release:
+//
+//   cc-plugin-codex (sendbird/cc-plugin-codex) — Codex host companion:
+//     Install:  npx --yes cc-plugin-codex install
+//     Update:   npx --yes cc-plugin-codex update
+//     Detect:   companionPresent() — claude-companion.mjs in ~/.codex/plugins
+//     Host:     codex (the $pipeline flow drives Claude Code through this companion)
+//     Note:     Optional — only needed for reviewMode: claude-companion
+//
+//   codex-plugin-cc (openai/codex-plugin-cc) — Claude host companion:
+//     Install:  npx --yes codex-plugin-cc install
+//     Update:   npx --yes codex-plugin-cc install (re-install is idempotent)
+//     Detect:   codexCompanionPresent() — codex-companion.mjs in ~/.claude/plugins
+//     Host:     claude (the /pipeline flow drives Codex through this companion)
+//     Note:     Optional — only needed for reviewMode: codex-companion
+//
+//   openspec (@fission-ai/openspec) — OpenSpec CLI:
+//     Install:  npm install -g @fission-ai/openspec@latest
+//     Update:   npm install -g @fission-ai/openspec@latest (idempotent)
+//     Detect:   which openspec + npm list -g @fission-ai/openspec
+//     Gate:     openspec.enabled in .github/pipeline.yml (auto|on|off)
+//
+//   last30days (mvanhorn/last30days-skill) — last30days Claude skill:
+//     Install:  npx --yes skills add mvanhorn/last30days-skill -g
+//     Update:   npx --yes skills update last30days -g
+//     Detect:   ~/.claude/skills/last30days/ + .claude-plugin/plugin.json
+//     Gate:     last30days.enabled: true in .github/pipeline.yml
+
+const DEPS = {
+  "cc-plugin-codex": {
+    label: "cc-plugin-codex",
+    description: "Claude Code companion for Codex cross-review (optional — for reviewMode: claude-companion)",
+    hosts: ["codex"],
+    featureGate: null,
+    installCmd: ["npx", "--yes", "cc-plugin-codex", "install"],
+    updateCmd: ["npx", "--yes", "cc-plugin-codex", "update"],
+    manualInstall: "npx cc-plugin-codex install",
+  },
+  "codex-plugin-cc": {
+    label: "codex-plugin-cc",
+    description: "Codex companion for Claude Code cross-review (optional — for reviewMode: codex-companion)",
+    hosts: ["claude"],
+    featureGate: null,
+    installCmd: ["npx", "--yes", "codex-plugin-cc", "install"],
+    updateCmd: ["npx", "--yes", "codex-plugin-cc", "install"],
+    manualInstall: "npx codex-plugin-cc install",
+  },
+  openspec: {
+    label: "openspec CLI (@fission-ai/openspec)",
+    description: "OpenSpec planning CLI — required for openspec-enabled repos",
+    hosts: null,
+    featureGate: "openspec",
+    installCmd: ["npm", "install", "-g", "@fission-ai/openspec@latest"],
+    updateCmd: ["npm", "install", "-g", "@fission-ai/openspec@latest"],
+    manualInstall: "npm install -g @fission-ai/openspec@latest",
+  },
+  last30days: {
+    label: "last30days skill",
+    description: "last30days Claude skill — required for last30days-enabled repos",
+    hosts: null,
+    featureGate: "last30days",
+    installCmd: ["npx", "--yes", "skills", "add", "mvanhorn/last30days-skill", "-g"],
+    updateCmd: ["npx", "--yes", "skills", "update", "last30days", "-g"],
+    manualInstall: "npx skills add mvanhorn/last30days-skill -g",
+  },
+};
+
+// Returns { present, version } for cc-plugin-codex.
+function companionPresentWithVersion() {
+  if (process.env.PIPELINE_CC_COMPANION) {
+    const present = existsSync(process.env.PIPELINE_CC_COMPANION);
+    return { present, version: null };
+  }
+  if (!companionPresent()) return { present: false, version: null };
+  const codexHome = process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(HOME, ".codex");
+  // Try to read version from the cached package.json
+  const candidates = [
+    join(codexHome, "plugins", "cache", "local-plugins", "cc", "local", "package.json"),
+    join(codexHome, "plugins", "cc", "package.json"),
+  ];
+  for (const pkgPath of candidates) {
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+        if (pkg.version) return { present: true, version: pkg.version };
+      } catch {}
+    }
+  }
+  return { present: true, version: null };
+}
+
+// Returns { present, version } for codex-plugin-cc.
+function codexCompanionPresentWithVersion() {
+  if (process.env.PIPELINE_CODEX_COMPANION) {
+    const present = existsSync(process.env.PIPELINE_CODEX_COMPANION);
+    return { present, version: null };
+  }
+  if (!codexCompanionPresent()) return { present: false, version: null };
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(HOME, ".claude");
+  // Versioned cache: plugins/cache/openai-codex/codex/<version>/package.json
+  const cacheBase = join(claudeDir, "plugins", "cache", "openai-codex", "codex");
+  if (existsSync(cacheBase)) {
+    const versions = readdirSync(cacheBase).sort();
+    for (const v of versions.reverse()) {
+      const pkgPath = join(cacheBase, v, "package.json");
+      if (existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+          return { present: true, version: pkg.version || v };
+        } catch {}
+      }
+    }
+    if (versions.length > 0) return { present: true, version: versions[0] };
+  }
+  return { present: true, version: null };
+}
+
+// Returns version string (or "unknown") if openspec is installed, null if not.
+function openspecPresent() {
+  if (!which("openspec")) return null;
+  // Try npm list -g for authoritative version
+  const r = spawnSync("npm", ["list", "-g", "@fission-ai/openspec", "--depth=0", "--json"], {
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 8000,
+  });
+  if (r.status === 0 && r.stdout) {
+    try {
+      const parsed = JSON.parse(r.stdout);
+      const v = parsed?.dependencies?.["@fission-ai/openspec"]?.version;
+      if (v) return v;
+    } catch {}
+  }
+  // Fallback: openspec --version
+  const vr = spawnSync("openspec", ["--version"], { encoding: "utf8", stdio: "pipe", timeout: 5000 });
+  if (vr.status === 0 && vr.stdout) return vr.stdout.trim();
+  return "unknown";
+}
+
+// Returns version string (or "unknown") if last30days skill is installed, null if not.
+function last30daysPresent() {
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(HOME, ".claude");
+  const skillDir = join(claudeDir, "skills", "last30days");
+  if (!existsSync(skillDir)) return null;
+  const pluginJson = join(skillDir, ".claude-plugin", "plugin.json");
+  if (existsSync(pluginJson)) {
+    try {
+      const plugin = JSON.parse(readFileSync(pluginJson, "utf8"));
+      if (plugin.version) return plugin.version;
+    } catch {}
+  }
+  return "unknown";
+}
+
+// Returns { present, version } for a dependency key.
+function detectDep(key) {
+  switch (key) {
+    case "cc-plugin-codex": return companionPresentWithVersion();
+    case "codex-plugin-cc": return codexCompanionPresentWithVersion();
+    case "openspec": { const v = openspecPresent(); return { present: v !== null, version: v }; }
+    case "last30days": { const v = last30daysPresent(); return { present: v !== null, version: v }; }
+    default: return { present: false, version: null };
+  }
+}
+
+// Fetches the latest published version for a dep. Returns version string or null on failure.
+function fetchLatestVersion(key) {
+  if (key === "openspec") {
+    const r = spawnSync("npm", ["view", "@fission-ai/openspec", "version"], {
+      encoding: "utf8",
+      stdio: "pipe",
+      timeout: 10000,
+    });
+    if (r.status === 0 && r.stdout) return r.stdout.trim();
+    return null;
+  }
+  // GitHub releases via gh CLI for other deps
+  const repos = {
+    "cc-plugin-codex": "sendbird/cc-plugin-codex",
+    "codex-plugin-cc": "openai/codex-plugin-cc",
+    last30days: "mvanhorn/last30days-skill",
+  };
+  const repo = repos[key];
+  if (!repo || !which("gh")) return null;
+  const r = spawnSync("gh", ["api", `/repos/${repo}/releases/latest`, "--jq", ".tag_name"], {
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 10000,
+  });
+  if (r.status === 0 && r.stdout) return r.stdout.trim().replace(/^v/, "");
+  return null;
+}
+
+// Minimal YAML parser for .github/pipeline.yml (builtins only, no external deps).
+// Handles flat and one-level-deep key: value pairs; ignores comments.
+function readPipelineConfig(repoPath) {
+  const configPath = join(repoPath, ".github", "pipeline.yml");
+  if (!existsSync(configPath)) return {};
+  const lines = readFileSync(configPath, "utf8").split("\n");
+  const config = {};
+  let section = null;
+  for (const raw of lines) {
+    const line = raw.replace(/#.*$/, "").trimEnd();
+    if (!line.trim()) continue;
+    const topMatch = line.match(/^([A-Za-z][\w-]*):\s*(.*)/);
+    if (topMatch) {
+      section = topMatch[1];
+      const val = topMatch[2].trim();
+      config[section] = val || {};
+      continue;
+    }
+    const subMatch = line.match(/^[ \t]+([A-Za-z][\w-]*):\s*(.*)/);
+    if (subMatch && section) {
+      if (typeof config[section] !== "object" || config[section] === null) config[section] = {};
+      config[section][subMatch[1]] = subMatch[2].trim();
+    }
+  }
+  return config;
+}
+
+// Returns the ordered list of dep keys relevant to the current install.
+// repoPath is process.cwd() — where the user ran the installer from.
+function getRelevantDeps(hosts, pipelineConfig, repoPath) {
+  const relevant = [];
+
+  // Companion plugins gated by host.
+  // cc-plugin-codex: Codex host — the $pipeline flow drives Claude through this companion.
+  if (hosts.includes("codex")) relevant.push("cc-plugin-codex");
+  // codex-plugin-cc: Claude host — the /pipeline flow drives Codex through this companion.
+  if (hosts.includes("claude")) relevant.push("codex-plugin-cc");
+
+  // OpenSpec — gated by feature flag (supports auto|on|off and boolean equivalents).
+  const openspecVal = pipelineConfig?.openspec?.enabled;
+  if (openspecVal === "on" || openspecVal === "true" || openspecVal === true) {
+    relevant.push("openspec");
+  } else if (openspecVal === "auto" || openspecVal === undefined || openspecVal === null) {
+    // Auto: offer only when the target repo has an openspec/ directory.
+    if (repoPath && existsSync(join(repoPath, "openspec"))) relevant.push("openspec");
+  }
+  // "off" | "false" | false → do not add
+
+  // last30days — gated by feature flag.
+  const last30daysVal = pipelineConfig?.last30days?.enabled;
+  if (last30daysVal === "true" || last30daysVal === true || last30daysVal === "on") {
+    relevant.push("last30days");
+  }
+
+  return relevant;
+}
+
+// Runs the install/update command for a dep. Returns a result object.
+// runCmd is injectable for tests.
+async function installDep(key, action, runCmd) {
+  const dep = DEPS[key];
+  const cmd = action === "update" && dep.updateCmd ? dep.updateCmd : dep.installCmd;
+  const exec = runCmd || ((c, a) => spawnSync(c, a, { stdio: "inherit" }));
+  try {
+    const r = exec(cmd[0], cmd.slice(1));
+    if ((r.status ?? 1) !== 0) {
+      return {
+        status: "failed",
+        error: (r.stderr || `exit code ${r.status}`).toString().trim().split("\n")[0],
+        manualCmd: dep.manualInstall,
+      };
+    }
+    return { status: action === "update" ? "updated" : "installed" };
+  } catch (err) {
+    return { status: "failed", error: err.message, manualCmd: dep.manualInstall };
+  }
+}
+
+// Iterates relevant deps, detects each, prompts (TTY) or skips (non-TTY), and installs.
+// All injectable: isTTY, yesDeps, promptFn, runCmd, detectFn, fetchLatestFn.
+async function promptDeps(depKeys, {
+  dryRun = false,
+  yesDeps = false,
+  isTTY = false,
+  promptFn = promptLine,
+  runCmd = null,
+  detectFn = detectDep,
+  fetchLatestFn = fetchLatestVersion,
+} = {}) {
+  if (dryRun || !depKeys.length) return {};
+  const results = {};
+  log("\nOptional dependency check:");
+
+  for (const key of depKeys) {
+    const dep = DEPS[key];
+    if (!dep) continue;
+
+    if (!isTTY && !yesDeps) {
+      // Non-interactive, no opt-in → skip without prompting.
+      results[key] = { status: "skipped" };
+      log(`  ℹ  ${dep.label}: skipped (non-interactive)`);
+      continue;
+    }
+
+    const detection = detectFn(key);
+    let action, promptText;
+
+    if (!detection.present) {
+      action = "install";
+      promptText = `  Install ${dep.label}?\n    ${dep.description}\n    [y/N] `;
+    } else {
+      // Present — check against latest to decide install vs update vs already current.
+      const latest = fetchLatestFn(key);
+      const installed = detection.version;
+      if (latest && installed && installed !== "unknown" && installed === latest) {
+        results[key] = { status: "already current", version: installed };
+        log(`  ✓ ${dep.label}: already current (${installed})`);
+        continue;
+      }
+      action = "update";
+      const vInfo = installed && installed !== "unknown"
+        ? ` (installed: ${installed}${latest ? `, latest: ${latest}` : ""})`
+        : " (version unknown)";
+      promptText = `  Update ${dep.label} to latest${vInfo}?\n    ${dep.description}\n    [y/N] `;
+    }
+
+    let accepted;
+    if (yesDeps) {
+      accepted = true;
+      log(`  → ${dep.label}: auto-accepted (--yes-deps)`);
+    } else {
+      const answer = await promptFn(promptText);
+      accepted = answer.toLowerCase() === "y";
+    }
+
+    if (!accepted) {
+      results[key] = { status: "declined" };
+      log(`  ↷ ${dep.label}: declined`);
+      continue;
+    }
+
+    const result = await installDep(key, action, runCmd);
+    results[key] = result;
+    if (result.status === "installed" || result.status === "updated") {
+      log(`  ✓ ${dep.label}: ${result.status}`);
+    } else if (result.status === "failed") {
+      warn(`${dep.label}: install failed — ${result.error || "unknown error"}`);
+    }
+  }
+
+  return results;
+}
+
+// Prints a per-dependency status summary after the core install.
+function printDepSummary(results) {
+  const entries = Object.entries(results);
+  if (!entries.length) return;
+  log("\nDependency status:");
+  let anySkipped = false;
+  for (const [key, result] of entries) {
+    const label = DEPS[key]?.label || key;
+    switch (result.status) {
+      case "installed":
+        log(`  ✓ ${label}: installed`); break;
+      case "updated":
+        log(`  ✓ ${label}: updated`); break;
+      case "already current":
+        log(`  ✓ ${label}: already current${result.version ? ` (${result.version})` : ""}`); break;
+      case "declined":
+        log(`  ↷ ${label}: declined`); break;
+      case "skipped":
+        log(`  ℹ  ${label}: skipped`);
+        anySkipped = true;
+        break;
+      case "failed":
+        warn(`${label}: failed — ${result.error || "unknown error"}`);
+        if (result.manualCmd) log(`      Manual install: ${result.manualCmd}`);
+        break;
+      default:
+        log(`  ? ${label}: ${result.status}`);
+    }
+  }
+  if (anySkipped) {
+    log("\n  Re-run with --yes-deps or PIPELINE_INSTALL_DEPS=1 to auto-install skipped dependencies.");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { verb, host, dryRun } = parseArgs(process.argv);
+  const { verb, host, dryRun, yesDeps } = parseArgs(process.argv);
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
@@ -415,6 +802,19 @@ async function main() {
       }
       installHost(h, dryRun);
     }
+
+    // Dependency-prompting phase: run after core install, never blocks completion.
+    const repoPath = process.cwd();
+    const pipelineConfig = readPipelineConfig(repoPath);
+    const relevantDeps = getRelevantDeps(hosts, pipelineConfig, repoPath);
+    const autoAccept = yesDeps || process.env.PIPELINE_INSTALL_DEPS === "1";
+    const depResults = await promptDeps(relevantDeps, {
+      dryRun,
+      yesDeps: autoAccept,
+      isTTY: Boolean(process.stdin.isTTY),
+    });
+    printDepSummary(depResults);
+
     log("\nDone.");
   } else if (verb === "uninstall") {
     log(`Uninstalling agent-pipeline ← [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
@@ -426,7 +826,25 @@ async function main() {
 }
 
 // Named exports for unit tests.
-export { MANAGED_MARKER, detectPersonalSkill, uniqueBackupPath, relocatePersonalSkill, offerRelocationWith };
+export {
+  MANAGED_MARKER,
+  DEPS,
+  detectPersonalSkill,
+  uniqueBackupPath,
+  relocatePersonalSkill,
+  offerRelocationWith,
+  companionPresentWithVersion,
+  codexCompanionPresentWithVersion,
+  openspecPresent,
+  last30daysPresent,
+  detectDep,
+  fetchLatestVersion,
+  readPipelineConfig,
+  getRelevantDeps,
+  promptDeps,
+  installDep,
+  printDepSummary,
+};
 
 // ESM main guard — tolerates bin symlinks by resolving both paths before comparing.
 function _isMain() {

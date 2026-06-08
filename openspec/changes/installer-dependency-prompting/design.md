@@ -3,8 +3,8 @@
 The installer (`scripts/install.mjs`) is a zero-dependency Node script that uses only builtins. It already detects companion plugins (`companionPresent`, `codexCompanionPresent`) and the openspec CLI but only emits info-level warnings — it has no install/update logic for these. The preflight function (lines 171–201) is the natural seam to extend. Shadow detection (lines 207–244) established the pattern for interactive prompts with non-TTY fallback — the same pattern applies here.
 
 Four external dependencies are in scope:
-1. **`cc-plugin-codex`** (`sendbird/cc-plugin-codex`) — adds `codex-companion.mjs` to Claude Code's plugin cache; required for the cross-tool review flow from Claude's side.
-2. **`codex-plugin-cc`** (`openai/codex-plugin-cc`) — adds `claude-companion.mjs` to Codex's plugin cache; required for the cross-tool review flow from Codex's side.
+1. **`cc-plugin-codex`** (`sendbird/cc-plugin-codex`) — adds `claude-companion.mjs` to Codex's plugin cache; the `$pipeline` (Codex) flow drives Claude Code through it for review.
+2. **`codex-plugin-cc`** (`openai/codex-plugin-cc`) — adds `codex-companion.mjs` to Claude Code's plugin cache; the `/pipeline` (Claude) flow drives Codex through it for review.
 3. **`openspec`** CLI (`Fission-AI/OpenSpec`) — required only when `openspec.enabled: true` in `.github/pipeline.yml`.
 4. **`last30days`** skill (`mvanhorn/last30days-skill`) — required only when `last30days.enabled: true` in `.github/pipeline.yml`.
 
@@ -37,9 +37,9 @@ The installer already uses Node's `readline` (via the shadow-detection relocatio
 ### 2. Relevance gating via host selection + feature flags
 
 Each dependency maps to a gate:
-- `cc-plugin-codex` — only offered when Claude Code host is being installed.
-- `codex-plugin-cc` — only offered when Codex host is being installed.
-- `openspec` — only offered when `openspec.enabled: true` in `.github/pipeline.yml` (or file absent, since openspec is a workflow tool not a runtime dep, gate it to "when openspec is in use").
+- `cc-plugin-codex` — only offered when the Codex host is being installed.
+- `codex-plugin-cc` — only offered when the Claude Code host is being installed.
+- `openspec` — only offered when `openspec.enabled` is `on`/`true` in `.github/pipeline.yml`, or when it is `auto`/absent and the target repo has an `openspec/` directory ("when openspec is in use").
 - `last30days` — only offered when `last30days.enabled: true` in `.github/pipeline.yml`.
 
 **Rationale:** avoids prompting Claude-only users about Codex plugins and vice versa; aligns with issue scope ("relevance-gated by host/feature").
@@ -48,10 +48,10 @@ Each dependency maps to a gate:
 
 | Dependency | Detection | Install/Update command |
 |---|---|---|
-| `cc-plugin-codex` | `codexCompanionPresent()` + version comparison | `claude mcp add sendbird/cc-plugin-codex` or its documented `npx` installer |
-| `codex-plugin-cc` | `companionPresent()` + version comparison | Codex plugin install command from openai/codex-plugin-cc docs |
-| `openspec` | `which openspec` | `npm install -g @fission-ai/openspec@latest` (or documented install command) |
-| `last30days` | skill dir presence + version file | `claude skills install mvanhorn/last30days-skill@latest` or equivalent |
+| `cc-plugin-codex` | `companionPresent()` (claude-companion.mjs in `~/.codex/plugins`) + version comparison | `npx --yes cc-plugin-codex install` / `npx --yes cc-plugin-codex update` |
+| `codex-plugin-cc` | `codexCompanionPresent()` (codex-companion.mjs in `~/.claude/plugins`) + version comparison | `npx --yes codex-plugin-cc install` |
+| `openspec` | `which openspec` + `npm list -g @fission-ai/openspec` | `npm install -g @fission-ai/openspec@latest` |
+| `last30days` | skill dir presence + `.claude-plugin/plugin.json` version | `npx --yes skills add mvanhorn/last30days-skill -g` / `npx --yes skills update last30days -g` |
 
 **Note:** exact install commands must be confirmed against each dependency's published README during implementation — the table shows intent, not literal commands. Implementation tasks include a research step for each.
 

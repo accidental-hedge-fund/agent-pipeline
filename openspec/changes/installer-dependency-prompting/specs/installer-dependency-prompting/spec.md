@@ -4,18 +4,18 @@
 The installer SHALL determine which external dependencies are relevant for the current install based on (a) which hosts are being installed and (b) feature flags in `.github/pipeline.yml`. It SHALL NOT prompt for dependencies that are not relevant to the chosen configuration.
 
 Relevance rules:
-- `cc-plugin-codex` (sendbird): relevant when the Claude Code host is being installed.
-- `codex-plugin-cc` (openai): relevant when the Codex host is being installed.
-- `openspec` CLI: relevant when `openspec.enabled: true` in `.github/pipeline.yml`, or when the file is absent and the user is setting up a new repo.
+- `cc-plugin-codex` (sendbird): relevant when the Codex host is being installed — it provides the `claude-companion.mjs` the `$pipeline` flow uses to drive Claude Code for review.
+- `codex-plugin-cc` (openai): relevant when the Claude Code host is being installed — it provides the `codex-companion.mjs` the `/pipeline` flow uses to drive Codex for review.
+- `openspec` CLI: relevant when `openspec.enabled` is `on`/`true` in `.github/pipeline.yml`, or when it is `auto`/absent and the target repo has an `openspec/` directory.
 - `last30days` skill: relevant when `last30days.enabled: true` in `.github/pipeline.yml`.
 
 #### Scenario: Claude-only install omits Codex companion
 - **WHEN** the installer is run targeting only the Claude Code host
-- **THEN** `codex-plugin-cc` is not included in the dependency prompt list
+- **THEN** `cc-plugin-codex` (the Codex-host companion) is not included in the dependency prompt list
 
 #### Scenario: Codex-only install omits Claude companion
 - **WHEN** the installer is run targeting only the Codex host
-- **THEN** `cc-plugin-codex` is not included in the dependency prompt list
+- **THEN** `codex-plugin-cc` (the Claude-host companion) is not included in the dependency prompt list
 
 #### Scenario: Feature flag gates last30days prompt
 - **WHEN** `.github/pipeline.yml` exists and `last30days.enabled` is absent or false
