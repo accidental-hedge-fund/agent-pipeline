@@ -64,6 +64,52 @@ test("parseStructuredVerdict: fallback path emits a warning naming the fallback"
   );
 });
 
+// parseProseReview — Codex Markdown review (#50). Codex's standard `/codex:review`
+// returns prose, not JSON; these assert real findings route to a fix instead of
+// being dropped (the live failure on #48 → PR #49).
+
+const CODEX_PROSE_FINDING = [
+  "# Codex Review",
+  "",
+  "Target: branch diff against main",
+  "",
+  "The configured gate does not cover the full CI workflow.",
+  "",
+  "Review comment:",
+  "",
+  "- [P2] Include the install smoke step in the gate command — /repo/package.json:27-27",
+  "  When the install path breaks, `npm run ci` can still pass because it only runs root tests and the build check.",
+].join("\n");
+
+test("parseStructuredVerdict: Codex prose review with a [P2] finding → needs-attention WITH findings (#50)", () => {
+  const v = parseStructuredVerdict(CODEX_PROSE_FINDING);
+  assert.equal(v.verdict, "needs-attention");
+  assert.equal(v.findings.length, 1, "the prose finding must be parsed, not dropped");
+  assert.equal(v.findings[0].severity, "medium");
+  assert.match(v.findings[0].title, /install smoke/i);
+  assert.match(v.findings[0].file ?? "", /package\.json/);
+  assert.equal(v.findings[0].line_start, 27);
+  assert.equal(v.findings[0].line_end, 27);
+  assert.equal(v._raw, undefined, "a parsed prose verdict must not carry _raw");
+});
+
+test("parseStructuredVerdict: clean Codex review with no findings approves (#50)", () => {
+  const out = "# Codex Review\n\nTarget: branch diff against main\n\nNo issues found; the change looks good.";
+  const v = parseStructuredVerdict(out);
+  assert.equal(v.verdict, "approve");
+  assert.equal(v.findings.length, 0);
+  assert.equal(v._raw, undefined);
+});
+
+test("parseStructuredVerdict: Codex review recognized but unparseable still falls back, never silent-approves (#50)", (t) => {
+  t.mock.method(console, "warn", () => {});
+  const out = "# Codex Review\n\nReview comment:\n\nFreeform remarks without a structured finding line.";
+  const v = parseStructuredVerdict(out);
+  assert.equal(v.verdict, "needs-attention");
+  assert.equal(v.findings.length, 0);
+  assert.ok(v._raw, "ambiguous Codex review must fall back with _raw, not silent-approve");
+});
+
 // ---------------------------------------------------------------------------
 // advanceReview — verdict normalization gate
 // ---------------------------------------------------------------------------
