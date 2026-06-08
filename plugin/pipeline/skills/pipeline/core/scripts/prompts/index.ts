@@ -69,9 +69,13 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
   });
 }
 
+export interface BuildPlanningOpenspecArgs extends BuildPlanArgs {
+  pipelineRunId: string;
+}
+
 /** OpenSpec-mode planning: the implementer authors a change (proposal/tasks/
  *  spec deltas) instead of a freeform plan. */
-export function buildPlanningOpenspecPrompt(a: BuildPlanArgs): string {
+export function buildPlanningOpenspecPrompt(a: BuildPlanningOpenspecArgs): string {
   const dc = domainContext(a.cfg);
   return substitute(loadTemplate("planning_openspec"), {
     domain_name: dc.name,
@@ -81,6 +85,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     carry_forward_context: carryForwardSection(a.carryForward),
+    pipeline_run_id: a.pipelineRunId,
   });
 }
 
