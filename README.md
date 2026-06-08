@@ -246,13 +246,13 @@ escape to pre-merge.
 ```yaml
 # .github/pipeline.yml
 test_gate:
-  command: "npm run ci"   # wraps: npm test && node scripts/build.mjs --check
+  command: "npm run ci"   # wraps the full CI command sequence (see package.json)
 ```
 
 ```json
 // package.json
 "scripts": {
-  "ci": "npm test && node scripts/build.mjs --check"
+  "ci": "npm test && node scripts/build.mjs --check && npm run ci:install-smoke"
 }
 ```
 
@@ -340,9 +340,10 @@ node scripts/install.mjs uninstall --host all      # or claude | codex
 ## Development
 
 ```bash
-cd core && npm ci && npm test     # 144 tests, node --test
+cd core && npm ci && npm test     # 145 tests, node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
+npm run ci                        # run the full CI command (tests + build check + install smoke)
 ```
 
 After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run
