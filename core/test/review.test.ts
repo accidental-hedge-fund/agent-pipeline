@@ -110,6 +110,53 @@ test("parseStructuredVerdict: Codex review recognized but unparseable still fall
   assert.ok(v._raw, "ambiguous Codex review must fall back with _raw, not silent-approve");
 });
 
+// Adversarial review format (#50 follow-up): "# Codex Adversarial Review" /
+// "Verdict:" / "Findings:" with parenthesized locations — distinct from the
+// standard review's "Review comment:" / em-dash form. Both must parse.
+
+const CODEX_ADVERSARIAL = [
+  "# Codex Adversarial Review",
+  "",
+  "Target: branch diff against main",
+  "Verdict: needs-attention",
+  "",
+  "No-ship: the change still lets CI-only failures escape.",
+  "",
+  "Findings:",
+  "- [high] Configured gate omits an actual CI workflow step (package.json:27)",
+  "  The branch points the test gate at `npm run ci`, but that script only runs tests and the build check.",
+  "  Recommendation: Make the configured CI script execute every step from the workflow.",
+  "- [medium] OpenSpec requires raw compound commands, but the gate runs without shell semantics (core/scripts/testgate.ts:211-228)",
+  "  The OpenSpec delta says a compound command must run both steps.",
+  "",
+  "Next steps:",
+  "- Update `npm run ci` to match the real workflow.",
+].join("\n");
+
+test("parseStructuredVerdict: Codex adversarial review (Findings: / parens loc) parses BOTH findings (#50 follow-up)", () => {
+  const v = parseStructuredVerdict(CODEX_ADVERSARIAL);
+  assert.equal(v.verdict, "needs-attention");
+  assert.equal(v.findings.length, 2, "both adversarial findings must be parsed, not dropped");
+  assert.equal(v.findings[0].severity, "high");
+  assert.match(v.findings[0].title, /omits an actual CI workflow step/i);
+  assert.equal(v.findings[0].file, "package.json");
+  assert.equal(v.findings[0].line_start, 27);
+  assert.equal(v.findings[1].severity, "medium");
+  assert.equal(v.findings[1].file, "core/scripts/testgate.ts");
+  assert.equal(v.findings[1].line_start, 211);
+  assert.equal(v.findings[1].line_end, 228);
+  assert.ok(!v.findings[1].body.includes("Next steps"), "trailing sections must not bleed into a finding body");
+  assert.equal(v._raw, undefined);
+});
+
+test("parseStructuredVerdict: Codex adversarial review with `Verdict: approve` and no findings approves (#50 follow-up)", () => {
+  const out = "# Codex Adversarial Review\n\nTarget: branch diff against main\nVerdict: approve\n\nFindings:\n\n(none)";
+  const v = parseStructuredVerdict(out);
+  assert.equal(v.verdict, "approve");
+  assert.equal(v.findings.length, 0);
+  assert.equal(v._raw, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // advanceReview — verdict normalization gate
 // ---------------------------------------------------------------------------

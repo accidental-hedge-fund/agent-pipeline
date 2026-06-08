@@ -532,27 +532,35 @@ const SEVERITY_BY_PRIORITY: Record<string, ReviewFinding["severity"]> = {
 const WORD_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
 
 /**
- * Parse Codex's native review (Markdown prose from `/codex:review`) into a
- * structured verdict. The standard review is NOT JSON — it emits a
- * "# Codex Review … Review comment:" block whose findings look like:
+ * Parse Codex's native review (Markdown prose) into a structured verdict.
+ * Codex reviews are NOT JSON, and the two review types use different shapes:
  *
- *     - [P2] <title> — <file>:<start>-<end>
- *       <indented body>
+ *   Standard (`/codex:review`):    "# Codex Review" … "Review comment:"
+ *     - [P2] <title> — <file>:<start>-<end>       (em-dash location)
+ *   Adversarial (`/codex:adversarial-review`):   "# Codex Adversarial Review" …
+ *     "Verdict: …" … "Findings:"
+ *     - [high] <title> (<file>:<start>-<end>)      (parenthesized location)
  *
- * `parseStructuredVerdict` previously only understood JSON, so these findings
- * were silently dropped (→ needs-attention/0 → blocked run). See #50. Returns
- * `null` when the output is not a recognizable Codex review, so callers fall
- * through to the conservative fallback — never a silent approve of unparsed
- * content (#45).
+ * `parseStructuredVerdict` only understood JSON, so these findings were silently
+ * dropped (→ needs-attention/0 → blocked run). See #50. Returns `null` when the
+ * output is not a recognizable Codex review, so callers fall through to the
+ * conservative fallback — never a silent approve of unparsed content (#45).
  */
 export function parseProseReview(output: string): ReviewVerdict | null {
   const text = output ?? "";
-  if (!/^#{1,6}\s*Codex Review/im.test(text) && !/^\s*Review comment\s*:/im.test(text)) {
+  if (
+    !/^#{1,6}\s*Codex\b.*\bReview\b/im.test(text) &&
+    !/^\s*(?:Review comment|Findings)\s*:/im.test(text) &&
+    !/^\s*Verdict\s*:/im.test(text)
+  ) {
     return null;
   }
 
   const headerRe = /^\s*[-*]\s*\[\s*(P[0-3]|critical|high|medium|low)\s*\]\s*(.+?)\s*$/i;
-  const locRe = /^(.*\S)\s+[—–-]\s+(\S.*?):(\d+)(?:\s*-\s*(\d+))?\s*$/;
+  // Two Codex location styles: "title — file:line" (standard, em-dash) and
+  // "title (file:line)" (adversarial, parens); both may carry a line range.
+  const locDash = /^(.*\S)\s+[—–-]\s+(\S.*?):(\d+)(?:\s*-\s*(\d+))?\s*$/;
+  const locParen = /^(.*\S)\s+\((\S.*?):(\d+)(?:\s*-\s*(\d+))?\)\s*$/;
 
   const findings: ReviewFinding[] = [];
   let current: ReviewFinding | null = null;
@@ -576,7 +584,7 @@ export function parseProseReview(output: string): ReviewVerdict | null {
       let file: string | undefined;
       let lineStart: number | undefined;
       let lineEnd: number | undefined;
-      const loc = title.match(locRe);
+      const loc = title.match(locDash) ?? title.match(locParen);
       if (loc) {
         title = loc[1].trim();
         file = loc[2].trim();
@@ -596,14 +604,15 @@ export function parseProseReview(output: string): ReviewVerdict | null {
       continue;
     }
     if (current) {
-      // A markdown section header ends the current finding's body.
-      if (/^#{1,6}\s/.test(line)) {
-        flush();
-        continue;
-      }
       const trimmed = line.trim();
-      if (trimmed || current.body) {
+      // Blank lines don't end a finding; indented lines continue its body; a
+      // non-indented non-blank line ("Findings:", "Verdict:", "Next steps:", a
+      // markdown header, or the next finding) ends it.
+      if (trimmed === "") continue;
+      if (/^\s/.test(line)) {
         current.body += (current.body ? "\n" : "") + trimmed;
+      } else {
+        flush();
       }
     }
   }
@@ -618,6 +627,7 @@ export function parseProseReview(output: string): ReviewVerdict | null {
   // approve when the text positively says so. Otherwise return null so the
   // conservative fallback (re-review → block) applies — never silently approve.
   if (
+    /^\s*Verdict\s*:\s*approve\b/im.test(text) ||
     /\bno (?:material )?(?:issues|findings|concerns|blocking)\b/i.test(text) ||
     /\b(?:looks good|lgtm|approved?|no problems found)\b/i.test(text)
   ) {
@@ -628,10 +638,11 @@ export function parseProseReview(output: string): ReviewVerdict | null {
 
 /** Pull a short summary from the prose preceding the findings list. */
 function extractProseSummary(text: string): string {
-  const head = text.split(/^\s*Review comment\s*:/im)[0] ?? text;
+  const head = text.split(/^\s*(?:Review comment|Findings)\s*:/im)[0] ?? text;
   const cleaned = head
-    .replace(/^#{1,6}\s*Codex Review\s*$/im, "")
+    .replace(/^#{1,6}\s*Codex\b.*Review\s*$/im, "")
     .replace(/^\s*Target:.*$/im, "")
+    .replace(/^\s*Verdict\s*:.*$/im, "")
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
