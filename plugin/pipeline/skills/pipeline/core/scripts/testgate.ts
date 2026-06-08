@@ -15,6 +15,7 @@ import {
 } from "./harness.ts";
 import { gitInWorktree } from "./worktree.ts";
 import { buildTestFixPrompt } from "./prompts/index.ts";
+import { makePipelineRunId } from "./traceability.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -79,6 +80,11 @@ export async function runTestGate(
   issueNumber: number,
   wtPath: string,
   deps: TestGateDeps = {},
+  // Run identifier for the commit traceability trailers (#20) the fix harness is
+  // instructed to add. Defaults to a fresh id so test/build-gate callers that
+  // don't thread it still produce valid trailers; production callers
+  // (planning/fix) pass the dispatch-wide id so all commits in a run match.
+  pipelineRunId: string = makePipelineRunId(issueNumber),
 ): Promise<TestGateResult> {
   if (!cfg.test_gate.enabled) return { skipped: true };
 
@@ -140,6 +146,7 @@ export async function runTestGate(
       attempt,
       maxAttempts: cfg.test_gate.max_attempts,
       output,
+      pipelineRunId,
     });
     const fixRes = await invokeFn(harness, wtPath, prompt, {
       timeoutSec: cfg.fix_timeout,

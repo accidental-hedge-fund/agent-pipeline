@@ -24,6 +24,7 @@ import {
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildDocsUpdatePrompt } from "../prompts/index.ts";
+import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { extractReviewedSha } from "./review.ts";
 import * as openspec from "../openspec.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -35,6 +36,8 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 export interface AdvancePreMergeOpts {
   dryRun?: boolean;
   model?: string;
+  /** Dispatch-wide run id for the commit traceability trailers (#20). */
+  pipelineRunId?: string;
 }
 
 export async function advance(
@@ -43,6 +46,8 @@ export async function advance(
   opts: AdvancePreMergeOpts = {},
 ): Promise<Outcome> {
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
+
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   const prNumber = await getPrForIssue(cfg, issueNumber);
   if (!prNumber) {
@@ -66,12 +71,12 @@ export async function advance(
   if (shaGate) return shaGate;
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber);
+  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId);
   if (archiveOutcome) return archiveOutcome;
 
   // ---- Step 1: docs update (once per PR; skippable via steps.docs) ----
   if (cfg.steps.docs && !(await docsAlreadyUpdated(cfg, issueNumber))) {
-    await updateDocs(cfg, issueNumber, prNumber, opts);
+    await updateDocs(cfg, issueNumber, prNumber, pipelineRunId, opts);
     return {
       advanced: false,
       status: "waiting",
@@ -280,6 +285,7 @@ async function updateDocs(
   cfg: PipelineConfig,
   issueNumber: number,
   prNumber: number,
+  pipelineRunId: string,
   opts: AdvancePreMergeOpts,
 ): Promise<void> {
   const wt = await getForIssue(cfg, issueNumber);
@@ -319,14 +325,14 @@ async function updateDocs(
     // Empty marker commit so we don't re-run docs next cycle.
     await gitInWorktree(
       wt.path,
-      ["commit", "--allow-empty", "-m", `${DOCS_COMMIT_PREFIX}${issueNumber}`],
+      ["commit", "--allow-empty", "-m", withTrailers(`${DOCS_COMMIT_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
       { ignoreFailure: true },
     );
   } else {
     await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
     await gitInWorktree(
       wt.path,
-      ["commit", "-m", `${DOCS_COMMIT_PREFIX}${issueNumber}`],
+      ["commit", "-m", withTrailers(`${DOCS_COMMIT_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
       { ignoreFailure: true },
     );
   }
@@ -350,6 +356,7 @@ async function updateDocs(
 async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
   issueNumber: number,
+  pipelineRunId: string,
 ): Promise<Outcome | null> {
   const wt = await getForIssue(cfg, issueNumber);
   if (!wt || !openspec.isActive(cfg, wt.path)) return null;
@@ -386,7 +393,7 @@ async function maybeArchiveOpenspec(
   if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
   await gitInWorktree(
     wt.path,
-    ["commit", "-m", `${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`],
+    ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
     { ignoreFailure: true },
   );
   const push = await gitInWorktree(wt.path, ["push", "origin", branchName(issueNumber, wt.slug)], {

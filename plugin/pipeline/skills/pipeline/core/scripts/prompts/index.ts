@@ -130,6 +130,8 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
 
 export interface BuildImplementingArgs extends BuildPlanArgs {
   plan: string;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
 }
 
 export function buildImplementingPrompt(a: BuildImplementingArgs): string {
@@ -142,6 +144,7 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     plan: a.plan,
+    pipeline_run_id: a.pipelineRunId,
   });
 }
 
@@ -197,6 +200,8 @@ export interface BuildFixArgs {
   title: string;
   reviewFindings: string;
   fixRound: 1 | 2;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
@@ -206,6 +211,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     fix_round: String(a.fixRound),
     review_type: a.fixRound === 1 ? "standard" : "adversarial",
     review_findings: a.reviewFindings,
+    pipeline_run_id: a.pipelineRunId,
   });
 }
 
@@ -217,6 +223,8 @@ export interface BuildTestFixArgs {
   maxAttempts: number;
   /** Captured failure output from the test/build run. */
   output: string;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
 }
 
 export function buildTestFixPrompt(a: BuildTestFixArgs): string {
@@ -226,6 +234,7 @@ export function buildTestFixPrompt(a: BuildTestFixArgs): string {
     attempt: String(a.attempt),
     max_attempts: String(a.maxAttempts),
     test_output: truncateDiff(a.output, 16_000),
+    pipeline_run_id: a.pipelineRunId,
   });
 }
 

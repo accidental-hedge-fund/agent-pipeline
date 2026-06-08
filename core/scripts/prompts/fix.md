@@ -16,6 +16,11 @@ This is fix round {{fix_round}} — addressing findings from the {{review_type}}
 2. After all fixes:
    - Run the repo's standard formatter and tests for the touched files (e.g., `pnpm test`, `pytest test/`, `black .` — whatever applies).
    - Commit all fixes with message: `fix: address review {{fix_round}} findings (#{{issue_number}})`
+   - Append these two git trailers to the bottom of every commit message, after a
+     blank line (standard git trailer format):
+
+         Issue: #{{issue_number}}
+         Pipeline-Run: {{pipeline_run_id}}
 
 3. Do NOT change anything unrelated to the review findings.
 

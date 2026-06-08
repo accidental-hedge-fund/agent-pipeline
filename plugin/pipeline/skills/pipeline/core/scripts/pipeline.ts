@@ -29,6 +29,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, withLock } from "./lock.ts";
+import { makePipelineRunId } from "./traceability.ts";
 import { sweepMergedWorktrees } from "./worktree.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
@@ -272,6 +273,12 @@ async function runAdvance(
     let transitions = 0;
     const t0 = Date.now();
 
+    // One run id per dispatch (#20): generated before any stage runs and threaded
+    // into every commit operation, so all commits this invocation produces — across
+    // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
+    const pipelineRunId = makePipelineRunId(issueNumber);
+    console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
+
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       const detail = await getIssueDetail(cfg, issueNumber);
       const stage = pickStage(detail.labels);
@@ -325,7 +332,7 @@ async function runAdvance(
         continue;
       }
 
-      const out = await dispatch(cfg, issueNumber, stage, opts);
+      const out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId);
       printOutcome(issueNumber, stage, out);
 
       if (out.advanced) {
@@ -353,20 +360,21 @@ async function dispatch(
   issueNumber: number,
   stage: Stage,
   opts: CliOpts,
+  pipelineRunId: string,
 ): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
     case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model });
+      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId });
     case "review-1":
       return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model });
     case "review-2":
       return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model });
     case "fix-1":
-      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model });
+      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId });
     case "fix-2":
-      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model });
+      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId });
     case "pre-merge":
       // Use the polling wrapper, not bare advance(). Bare advance returns
       // "waiting" after docs push / on pending CI / after rebase — that
@@ -374,7 +382,7 @@ async function dispatch(
       // exit the loop, requiring the user to re-invoke. Our skill is
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
-      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model });
+      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId });
     case "eval-gate":
       return evalStage.advanceEval(cfg, issueNumber, { dryRun });
     case "ready-to-deploy":
