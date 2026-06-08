@@ -629,8 +629,20 @@ function readPipelineConfig(repoPath) {
   return config;
 }
 
+// Walks up from startDir to find the git root. Falls back to startDir if not in a git repo.
+function findGitRoot(startDir) {
+  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd: startDir,
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+  if (r.status === 0 && r.stdout) return r.stdout.trim();
+  return startDir;
+}
+
 // Returns the ordered list of dep keys relevant to the current install.
-// repoPath is process.cwd() — where the user ran the installer from.
+// repoPath should be the git root so feature flags and openspec/ detection are
+// repo-relative regardless of what subdirectory the installer was invoked from.
 function getRelevantDeps(hosts, pipelineConfig, repoPath) {
   const relevant = [];
 
@@ -710,8 +722,17 @@ async function promptDeps(depKeys, {
     if (!dep.installCmd) {
       const detection = detectFn(key);
       if (detection.present) {
-        results[key] = { status: "already current", version: detection.version };
-        log(`  ✓ ${dep.label}: present${detection.version ? ` (${detection.version})` : ""}`);
+        // Check against latest even for manual deps — flag stale installs for manual update.
+        const latest = fetchLatestFn(key);
+        const installed = detection.version;
+        if (latest && installed && installed !== "unknown" && installed !== latest) {
+          results[key] = { status: "manual-update-needed", version: installed, latest, manualCmd: dep.manualInstall };
+          log(`  ⚠  ${dep.label}: update available (${installed} → ${latest}) — update manually`);
+          if (dep.manualInstall) log(`      ${dep.manualInstall}`);
+        } else {
+          results[key] = { status: "already current", version: installed };
+          log(`  ✓ ${dep.label}: present${installed ? ` (${installed})` : ""}`);
+        }
       } else {
         let accepted;
         if (yesDeps) {
@@ -800,6 +821,10 @@ function printDepSummary(results) {
         log(`  ℹ  ${label}: install manually`);
         if (result.manualCmd) log(`      ${result.manualCmd}`);
         break;
+      case "manual-update-needed":
+        warn(`${label}: update available (${result.version} → ${result.latest}) — update manually`);
+        if (result.manualCmd) log(`      ${result.manualCmd}`);
+        break;
       case "declined":
         log(`  ↷ ${label}: declined`); break;
       case "skipped":
@@ -845,7 +870,7 @@ async function main() {
     }
 
     // Dependency-prompting phase: run after core install, never blocks completion.
-    const repoPath = process.cwd();
+    const repoPath = findGitRoot(process.cwd());
     const pipelineConfig = readPipelineConfig(repoPath);
     const relevantDeps = getRelevantDeps(hosts, pipelineConfig, repoPath);
     const autoAccept = yesDeps || process.env.PIPELINE_INSTALL_DEPS === "1";
@@ -881,6 +906,7 @@ export {
   detectDep,
   fetchLatestVersion,
   readPipelineConfig,
+  findGitRoot,
   getRelevantDeps,
   promptDeps,
   installDep,

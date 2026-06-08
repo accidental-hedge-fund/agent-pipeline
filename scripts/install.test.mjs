@@ -8,11 +8,13 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 
 import {
   MANAGED_MARKER,
@@ -27,6 +29,7 @@ import {
   detectDep,
   fetchLatestVersion,
   readPipelineConfig,
+  findGitRoot,
   getRelevantDeps,
   promptDeps,
   installDep,
@@ -973,6 +976,107 @@ test("last30daysPresent: returns version from plugin.json under Codex skill dir"
     delete process.env.CLAUDE_CONFIG_DIR;
     cleanup(tmp);
     cleanup(claudeTmp);
+  }
+});
+
+// ==========================================================================
+// Regression: codex-plugin-cc version comparison for present installs
+// ==========================================================================
+
+test("promptDeps: codex-plugin-cc present + stale version → manual-update-needed", async () => {
+  const results = await promptDeps(["codex-plugin-cc"], {
+    isTTY: true,
+    yesDeps: false,
+    promptFn: async () => "y",
+    detectFn: () => ({ present: true, version: "1.0.0" }),
+    fetchLatestFn: () => "2.0.0",
+  });
+  assert.equal(results["codex-plugin-cc"]?.status, "manual-update-needed");
+  assert.equal(results["codex-plugin-cc"]?.version, "1.0.0");
+  assert.equal(results["codex-plugin-cc"]?.latest, "2.0.0");
+  assert.ok(results["codex-plugin-cc"]?.manualCmd, "should carry manualCmd for update instructions");
+});
+
+test("promptDeps: codex-plugin-cc present + current version → already current", async () => {
+  const results = await promptDeps(["codex-plugin-cc"], {
+    isTTY: true,
+    yesDeps: false,
+    promptFn: async () => "y",
+    detectFn: () => ({ present: true, version: "2.0.0" }),
+    fetchLatestFn: () => "2.0.0",
+  });
+  assert.equal(results["codex-plugin-cc"]?.status, "already current");
+});
+
+test("printDepSummary: manual-update-needed renders version diff and manual cmd", () => {
+  const lines = [];
+  const warns = [];
+  const origLog = console.log;
+  const origWarn = console.warn;
+  console.log = (...a) => lines.push(a.join(" "));
+  console.warn = (...a) => warns.push(a.join(" "));
+  try {
+    printDepSummary({
+      "codex-plugin-cc": {
+        status: "manual-update-needed",
+        version: "1.0.0",
+        latest: "2.0.0",
+        manualCmd: DEPS["codex-plugin-cc"].manualInstall,
+      },
+    });
+  } finally {
+    console.log = origLog;
+    console.warn = origWarn;
+  }
+  const out = [...lines, ...warns].join("\n");
+  assert.ok(out.includes("1.0.0"), "should show installed version");
+  assert.ok(out.includes("2.0.0"), "should show latest version");
+  assert.ok(out.includes(DEPS["codex-plugin-cc"].manualInstall), "should include manual update command");
+});
+
+// ==========================================================================
+// Regression: findGitRoot resolves to repo root from subdirectory
+// ==========================================================================
+
+test("findGitRoot: returns startDir when not in a git repo", () => {
+  const tmp = makeTmp();
+  try {
+    const result = findGitRoot(tmp);
+    assert.equal(result, tmp, "non-git dir should be returned as-is");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("findGitRoot: resolves to root from a nested subdir", () => {
+  const tmp = makeTmp();
+  spawnSync("git", ["init"], { cwd: tmp, stdio: "pipe" });
+  const subdir = join(tmp, "nested", "subdir");
+  mkdirSync(subdir, { recursive: true });
+  try {
+    const root = findGitRoot(subdir);
+    assert.equal(root, realpathSync(tmp), "should resolve to git root from nested subdir");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("getRelevantDeps: reads openspec from git root, not invocation subdir", () => {
+  const tmp = makeTmp();
+  mkdirSync(join(tmp, ".github"), { recursive: true });
+  writeFileSync(join(tmp, ".github", "pipeline.yml"), "openspec:\n  enabled: auto\n");
+  mkdirSync(join(tmp, "openspec"), { recursive: true });
+  const subdir = join(tmp, "nested");
+  mkdirSync(subdir);
+  try {
+    // With git root as repoPath: openspec/ is found → openspec included.
+    const depsFromRoot = getRelevantDeps(["claude"], readPipelineConfig(tmp), tmp);
+    assert.ok(depsFromRoot.includes("openspec"), "openspec detected when repoPath is git root");
+    // Without git root fix (using subdir as repoPath): openspec/ not found → omitted.
+    const depsFromSubdir = getRelevantDeps(["claude"], readPipelineConfig(subdir), subdir);
+    assert.ok(!depsFromSubdir.includes("openspec"), "openspec omitted when repoPath is a subdir (demonstrates the bug)");
+  } finally {
+    cleanup(tmp);
   }
 });
 
