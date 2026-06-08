@@ -23,7 +23,7 @@
     "build": "node scripts/build.mjs",
     "build:check": "node scripts/build.mjs --check",
     "install:local": "node scripts/install.mjs install",
-    "test": "cd core && npm install --no-audit --no-fund && npm test"
+    "test": "(cd core && npm install --no-audit --no-fund && npm test) && node --test scripts/install.test.mjs"
   },
   "repository": {
     "type": "git",

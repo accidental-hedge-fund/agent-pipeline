@@ -134,8 +134,16 @@ review prompt and calls the `claude` CLI directly. Then restart Codex and run `$
 ```
 
 This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`).
-If you also have a personal install at `~/.claude/skills/pipeline`, remove it first
-(`node scripts/install.mjs uninstall --host claude`) to avoid two `/pipeline` entries.
+If you have a personal install at `~/.claude/skills/pipeline`, the installer detects
+it automatically and offers to relocate it to a timestamped backup — no data is lost.
+In interactive terminals you will be prompted; in non-interactive environments (CI,
+piped `npx`) the relocation happens automatically. If you declined the prompt or need
+to re-run, use the installer directly:
+
+```
+node scripts/install.mjs install --host claude
+```
+
 Update later with `/plugin marketplace update ahf-tools`.
 
 ## Usage
