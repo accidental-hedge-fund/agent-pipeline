@@ -69,12 +69,13 @@ function okInvoke(): HarnessResult {
 }
 
 /** Deps where every fix invocation looks like a clean commit (HEAD advances,
- *  tree clean) so the loop keeps iterating. */
-function cleanGitDeps(): Pick<TestGateDeps, "gitHead" | "gitDirty"> {
+ *  tree clean, commit format passes) so the loop keeps iterating. */
+function cleanGitDeps(): Pick<TestGateDeps, "gitHead" | "gitDirty" | "verifyTestFix"> {
   let n = 0;
   return {
     gitHead: async () => `head-${n++}`,
     gitDirty: async () => false,
+    verifyTestFix: async () => ({ ok: true }),
   };
 }
 
@@ -559,6 +560,7 @@ test("gate (regression / #20, trailer enforcement): fix harness creates commit w
       },
       gitHead: async () => "head-before",
       gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => ["fix: correct the test\n\nNo trailers here."],
     },
     FIXED_RUN_ID,
@@ -581,6 +583,7 @@ test("gate (regression / #20, trailer enforcement): fix harness creates commit w
       invoke: async () => okInvoke(),
       gitHead: async () => "head-before",
       gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [
         `fix: correct the test\n\nIssue: #1\nPipeline-Run: ${FIXED_RUN_ID}`,
       ],
@@ -605,6 +608,7 @@ test("gate (regression / #20, trailer enforcement): no new commits after fix →
       invoke: async () => okInvoke(),
       gitHead: async () => "head-before",
       gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [],
     },
     FIXED_RUN_ID,
@@ -629,6 +633,7 @@ test("gate (regression / #20, trailer enforcement): multiple fix commits, one mi
       },
       gitHead: async () => "head-before",
       gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [
         `fix: first\n\nIssue: #1\nPipeline-Run: ${FIXED_RUN_ID}`,
         "fix: second\n\nNo trailers.",

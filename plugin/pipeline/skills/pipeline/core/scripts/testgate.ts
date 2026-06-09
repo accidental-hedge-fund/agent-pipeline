@@ -15,6 +15,11 @@ import {
 } from "./harness.ts";
 import { gitInWorktree } from "./worktree.ts";
 import { buildTestFixPrompt } from "./prompts/index.ts";
+import {
+  verifyHarnessCommits,
+  type VerifyDeps,
+  type VerifyResult,
+} from "./verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
@@ -56,11 +61,48 @@ export interface TestGateDeps {
   detectTestCommand?: (repoDir: string) => ParsedCommand | null;
   gitHead?: (cwd: string) => Promise<string>;
   gitDirty?: (cwd: string) => Promise<boolean>;
+  /** Verify commit message format after each test-fix attempt (#68). Injectable for tests. */
+  verifyTestFix?: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
   /** Return the full commit messages for every commit reachable from HEAD but
    *  not from `baseRef`. Used to validate traceability trailers on commits the
    *  fix harness creates. Returns [] when `baseRef` equals HEAD (no new commits)
    *  or when the git command fails (non-git directory). */
   gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Test-fix commit format gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that at least one commit in `headBefore..HEAD` matches the expected
+ * test-fix commit message format. Exported so tests can exercise the gate
+ * without mocking the full `runTestGate` call chain.
+ */
+export async function enforceTestFixCommitFormat(
+  issueNumber: number,
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(
+    wtPath,
+    headBefore,
+    {
+      messagePattern: {
+        pattern: new RegExp(
+          `fix:\\s+resolve test/build failures \\(#${issueNumber}\\)`,
+          "i",
+        ),
+        description: "Test-fix commit message does not match prescribed format",
+      },
+      // requireTrailers is intentionally absent here: trailer enforcement on
+      // test-fix commits is handled separately by validateCommitTrailers in the
+      // loop below (test_fix.md prescribes the Issue:/Pipeline-Run: trailers via
+      // #20). This gate only asserts the prescribed commit-message format.
+    },
+    deps,
+  );
 }
 
 const MAX_BLOCK_OUTPUT = 8000;
@@ -98,6 +140,9 @@ export async function runTestGate(
   const detectFn = deps.detectTestCommand ?? detectTestCommand;
   const gitHeadFn = deps.gitHead ?? defaultGitHead;
   const gitDirtyFn = deps.gitDirty ?? defaultGitDirty;
+  const verifyTestFixFn =
+    deps.verifyTestFix ??
+    ((wt: string, hb: string) => enforceTestFixCommitFormat(issueNumber, wt, hb));
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
 
   const command = cfg.test_gate.command ? shellSplit(cfg.test_gate.command) : detectFn(wtPath);
@@ -146,6 +191,8 @@ export async function runTestGate(
       `[pipeline] #${issueNumber}: test gate failed; fix attempt ${attempt}/${cfg.test_gate.max_attempts} (${harness})`,
     );
 
+    const fixHeadBefore = await gitHeadFn(wtPath);
+
     const prompt = buildTestFixPrompt({
       issueNumber,
       command: label,
@@ -179,6 +226,14 @@ export async function runTestGate(
           "Fix harness left uncommitted changes in the working tree. " +
           "Test results can't be trusted — stage and commit the fix before re-running.",
       };
+    }
+
+    // Verify the test-fix commit message format (#68).
+    if (fixHeadBefore) {
+      const commitCheck = await verifyTestFixFn(wtPath, fixHeadBefore);
+      if (!commitCheck.ok) {
+        return { skipped: false, passed: false, attempts: attempt, blockReason: commitCheck.reason };
+      }
     }
 
     // Validate that every commit the fix harness just created carries the
