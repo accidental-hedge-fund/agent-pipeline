@@ -1,78 +1,95 @@
 # agent-pipeline
 
-A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
-through an 11-stage state machine to `pipeline:ready-to-deploy` — planning →
-plan-review → implementing → review → fix → pre-merge → eval-gate. It does **not**
-auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 12-stage state machine — planning → plan-review → implementing → review → fix → pre-merge → eval-gate. It does **not** auto-merge; you own the merge button.
 
-It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)**
-from a single shared TypeScript core. The two hosts differ only by a small
-JSON **profile** (who implements vs. reviews, naming, review mode) — there is no
-forked pipeline logic.
+It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
-```
+```text
 backlog → ready → planning → plan-review → implementing
               → review-1 → fix-1 → review-2 → fix-2
               → pre-merge → eval-gate → ready-to-deploy
 ```
 
-## Repository layout
+## Contents
 
-```
-core/                 single source of truth (host-agnostic TypeScript)
-  scripts/            orchestrator, stages/, prompts/, gh/worktree/lock/harness
-  profiles/           claude.json · codex.json · openclaw.json  ← the host seam
-  test/               node --test suite (169 tests)
-hosts/
-  claude/SKILL.md     Claude overlay (/pipeline, Monitor/PushNotification flow)
-  codex/SKILL.md      Codex overlay ($pipeline, PTY exec flow)
-  codex/agents/openai.yaml   Codex UI manifest
-  _shared/entry.template.mjs launcher shim template (__PROFILE__)
-plugin/               GENERATED Claude plugin (committed; built by scripts/build.mjs)
-.claude-plugin/marketplace.json   GENERATED marketplace catalog (repo root)
-scripts/
-  install.mjs         cross-tool installer (zero deps)
-  build.mjs           regenerate plugin/ from core + hosts/claude
-  install.sh          clone-and-install convenience wrapper
-```
+- [Prerequisites](#prerequisites)
+- [Quickstart](#quickstart)
+- [Install](#install)
+- [Usage](#usage)
+- [Per-repo config](#per-repo-config-optional)
+- [Test/build gate](#testbuild-gate-optional-default-on)
+- [Troubleshooting](#troubleshooting)
+- [Advanced topics](#advanced-topics)
+  - [Configurable steps](#configurable-steps)
+  - [Eval gate](#eval-gate)
+  - [OpenSpec integration](#openspec-integration)
+  - [last30days context](#last30days-context)
+- [How the two hosts share one core](#how-the-two-hosts-share-one-core)
+- [Repository layout](#repository-layout)
+- [Uninstall](#uninstall)
+- [Development](#development)
+- [License](#license)
 
 ## Prerequisites
 
-The pipeline is **cross-harness** — each run uses one CLI to implement and the
-*other* to review. So both are required regardless of which host you install:
+The pipeline is **cross-harness** — each run uses one CLI to implement and the *other* to review. **Both CLIs are required regardless of which host you install.**
 
-- **Node ≥ 24** with **`npm`** (npm ships with Node and installs the core's deps — commander, js-yaml, zod). The core runs TypeScript directly via native type-stripping; no build step.
+- **Node ≥ 24** with **`npm`** (npm ships with Node and installs the core's dependencies — commander, js-yaml, zod). The core runs TypeScript directly via native type-stripping; no build step.
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
-- **Both `claude` and `codex` CLIs** on PATH and **authenticated** (logged in) — each run uses one to implement and the other to review.
-- **Review runs on the *other* harness, invoked directly** (symmetric — `/pipeline`
-  reviews with `codex`, `$pipeline` reviews with `claude`). The default
-  `reviewMode: prompt-harness` calls the reviewer CLI with the pipeline's own
-  review prompt, which returns a structured JSON verdict against
-  `review-output.schema.json` (review-1 = standard, review-2 = adversarial). **No
-  review plugin is required** — you just need the other harness's CLI installed and
-  authenticated (listed above).
-  - *Optional companion review modes* (`codex-companion` / `claude-companion`) drive
-    the reviewer through a 3rd-party plugin instead — `codex-plugin-cc`
-    (`/codex:review`) for Codex, `cc-plugin-codex` (`$cc:review`) for Claude — using
-    each harness's native review feature, run read-only/sandboxed. They are **not**
-    the default and **not** required; set `reviewMode` in the profile to opt in.
-    Override companion paths with `PIPELINE_CODEX_COMPANION` / `PIPELINE_CC_COMPANION`.
+- **Both `claude` and `codex` CLIs** on PATH and **authenticated** — each run uses one to implement and the other to review.
+- **Review runs on the *other* harness, invoked directly** (default `reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the other harness's CLI installed and authenticated.
+  - *Optional companion modes* (`codex-companion` / `claude-companion`) drive the reviewer through a third-party plugin instead. See [Advanced topics](#advanced-topics).
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
-- **Optional: the [OpenSpec](https://openspec.dev/) CLI** (`npm i -g @fission-ai/openspec`) — only for repos that opt into the OpenSpec flow (see "OpenSpec integration (optional)"). Not needed otherwise.
+- **Optional:** the [OpenSpec](https://openspec.dev/) CLI (`npm i -g @fission-ai/openspec`) — only needed for repos that opt into the OpenSpec planning flow.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
 
-The installer prints a prerequisite checklist (warnings don't block install). After installing the core skill, it also **detects and offers to install optional companion plugins and feature tools** relevant to your setup — you're prompted for each one and can accept or decline without affecting the core install.
+The installer prints a prerequisite checklist during install (warnings do not block the install).
+
+## Quickstart
+
+**Step 1 — Install**
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline install
+```
+
+This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill.
+
+**Step 2 — Label an issue and run**
+
+```bash
+# Create the pipeline:ready label if it doesn't exist yet
+gh label create "pipeline:ready" --color 0075ca --description "Start the pipeline" 2>/dev/null || true
+
+# Label any open issue to opt it in
+gh issue edit N --add-label "pipeline:ready"
+```
+
+Then invoke from Claude Code:
+
+```text
+/pipeline N
+```
+
+Or from Codex (after restarting it):
+
+```text
+$pipeline N
+```
+
+The pipeline advances the issue up to 12 transitions per invocation — creating a worktree, opening a PR, requesting cross-harness review, fixing review findings, and running pre-merge checks — all without further manual input.
 
 ## Install
 
-> Public repo under the `accidental-hedge-fund` org — the methods below need no
-> special access.
+> Public repo under the `accidental-hedge-fund` org — no special access needed.
 
-### One command, both hosts (recommended)
+### Recommended: one command, both hosts
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline install            # detects ~/.claude and ~/.codex; installs to each present host
-# or a specific host:
+# Detects ~/.claude and ~/.codex; installs to each present host
+npx github:accidental-hedge-fund/agent-pipeline install
+
+# Or a specific host:
 npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
@@ -81,93 +98,72 @@ Or clone and run directly:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-node agent-pipeline/scripts/install.mjs install        # --host claude|codex|all  (default all)
+node agent-pipeline/scripts/install.mjs install        # --host claude|codex|all  (default: all)
 ```
 
-The installer copies the shared core + the right host overlay into
-`~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher
-shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`
-and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks it up live.
+The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks the skill up live.
 
-After the core install, the installer detects which optional companion plugins and feature tools are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install. One exception: `codex-plugin-cc` (the Codex companion for the Claude-primary flow) installs through Claude Code's own plugin marketplace, so the installer prints its `/plugin` command for you to run inside Claude Code rather than installing it directly — including under `--yes-deps`. To skip all prompts and auto-accept in non-interactive environments:
+After the core install, the installer detects which optional companion plugins and feature tools are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install. One exception: `codex-plugin-cc` (the Codex companion for the Claude-primary flow) requires a manual step inside Claude Code — the installer prints the command to run rather than installing it directly.
+
+To skip all prompts and auto-accept in non-interactive environments:
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline install --yes-deps   # auto-accept all optional deps
+npx github:accidental-hedge-fund/agent-pipeline install --yes-deps
 PIPELINE_INSTALL_DEPS=1 npx github:accidental-hedge-fund/agent-pipeline install  # same via env var
 ```
 
-In non-interactive environments (CI, piped `npx`) without `--yes-deps`, dependency prompts are skipped automatically and a summary is printed with instructions to re-run with `--yes-deps`.
+In non-interactive environments without `--yes-deps`, dependency prompts are skipped automatically and a summary is printed with instructions to re-run with `--yes-deps`.
 
 #### Claude as the primary harness (`/pipeline`)
 
-This is the Claude-primary flow: **Claude Code implements, Codex reviews.**
+Claude Code implements, Codex reviews.
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline install --host claude   # this pipeline skill
+npx github:accidental-hedge-fund/agent-pipeline install --host claude
 codex login                                            # the reviewer — review invokes `codex` directly
 ```
 
-By default (`reviewMode: prompt-harness`) review invokes the `codex` CLI directly with a
-JSON-returning prompt — **no review plugin needed**, just the authenticated `codex` CLI.
-*(Optional: to use Codex's native review via the `codex-plugin-cc` companion instead, set
-`reviewMode: codex-companion` and run `/plugin marketplace add openai/codex-plugin-cc` then
-`/plugin install codex@openai-codex`.)*
+By default (`reviewMode: prompt-harness`) review invokes the `codex` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `codex` CLI.
+
+*(Optional: to use Codex's native review via the `codex-plugin-cc` companion instead, set `reviewMode: codex-companion` and run the companion's install steps.)*
 
 #### Codex as the primary harness (`$pipeline`)
 
-This is the Codex-primary flow: **Codex implements, Claude Code reviews.**
+Codex implements, Claude Code reviews.
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline install --host codex   # this pipeline skill
+npx github:accidental-hedge-fund/agent-pipeline install --host codex
 claude auth login                                      # the reviewer — review invokes `claude` directly
 ```
 
-By default (`reviewMode: prompt-harness`) review invokes the `claude` CLI directly with a
-JSON-returning prompt — **no review plugin needed**, just the authenticated `claude` CLI. Then
-restart Codex and run `$pipeline N`. *(Optional: to use Claude Code's native review via the
-`cc-plugin-codex` companion instead, set `reviewMode: claude-companion` and run `npx cc-plugin-codex install`.)*
+By default (`reviewMode: prompt-harness`) review invokes the `claude` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `claude` CLI. Then restart Codex and run `$pipeline N`.
 
-### Claude Code — plugin marketplace (versioned, auto-updatable)
+*(Optional: to use Claude Code's native review via the `cc-plugin-codex` companion instead, set `reviewMode: claude-companion` and run `npx cc-plugin-codex install`.)*
 
-```
+### Claude Code plugin marketplace (versioned, auto-updatable)
+
+```text
 /plugin marketplace add accidental-hedge-fund/agent-pipeline
 /plugin install pipeline@ahf-tools
 ```
 
-This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`).
-If you have a personal install at `~/.claude/skills/pipeline`, the installer detects
-it automatically and offers to relocate it to a timestamped backup — no data is lost.
-In interactive terminals you will be prompted; in non-interactive environments (CI,
-piped `npx`) the relocation happens automatically. If you declined the prompt or need
-to re-run, use the installer directly:
-
-```
-node scripts/install.mjs install --host claude
-```
-
-Update later with `/plugin marketplace update ahf-tools`.
+This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`). If you have a personal install at `~/.claude/skills/pipeline`, the installer detects it automatically and offers to relocate it to a timestamped backup — no data is lost. Update later with `/plugin marketplace update ahf-tools`.
 
 ## Usage
 
-```
+```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
 /pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
+$pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 ```
 
-The number is auto-detected as an issue or PR. PRs resolve to their linked
-closing issue; PRs with no `Closes #N` are refused. Items must carry a
-`pipeline:*` label (opt-in) — add `pipeline:ready` to start.
+The number is auto-detected as an issue or PR. PRs resolve to their linked closing issue; PRs with no `Closes #N` are refused. Items must carry a `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
 
-`--cleanup` takes no number: it sweeps pipeline-managed worktrees under
-`worktree_root` whose PR is already merged, removing the worktree and its local
-branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch,
-and skips (reporting the reason) any worktree with uncommitted changes or a local
-HEAD that differs from the merged PR's commit. It is idempotent — a second run
-finds nothing to do.
+`--cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
 
 ## Per-repo config (optional)
 
@@ -192,7 +188,7 @@ steps:                               # turn optional steps off for speed/prefere
   standard_review: true              # review-1 (and its fix round)
   adversarial_review: true           # review-2 (and its fix round)
   docs: true                         # docs-update pass in pre-merge
-test_gate:                           # run the repo's own tests/build before opening a PR — see "test/build gate"
+test_gate:                           # run the repo's own tests/build before opening a PR
   enabled: true                      # default: true; set false to disable entirely
   command: "pnpm test"               # optional explicit command; auto-detected when absent
   max_attempts: 3                    # fix-harness invocations before blocking
@@ -206,64 +202,24 @@ eval_gate:                           # run the repo's eval harness after pre-mer
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
 
-## Configurable steps (optional)
-
-The `steps` block turns the optional "thoroughness" steps on or off per repo, to
-trade rigor for speed. Default is everything on (the full pipeline). Configurable:
-`plan_review`, `standard_review` (review-1 + its fix round), `adversarial_review`
-(review-2 + its fix round), and `docs`. Disabling a step still yields a valid path
-to `ready-to-deploy`, and each skip is recorded as a transition comment on the issue.
-
-The structural and safety steps — planning, implementing, and the pre-merge **CI**
-and **mergeability** gates — are **not** configurable: they have no toggle, and an
-unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse
-time rather than silently dropping a safety gate.
-
-Review verdicts are also pinned to the commit they evaluated. Every review comment
-records the reviewed commit SHA — surfaced in the header (e.g. `— approve (commit
-a1b2c3d)`) and embedded as a machine-readable footer sentinel. Before pre-merge acts
-on a prior approval it re-checks that SHA against current HEAD: if any commit has
-landed since the review, the stale verdict is discarded and the item returns to its
-review round for a fresh review (posting a `## Pipeline: Re-running review` comment)
-rather than advancing. This guards against advancing on a stale approval and is
-always-on — there is no toggle.
-
 ## Test/build gate (optional, default on)
 
-When `test_gate.enabled` (the default), the target repo's **own** test/build
-command runs inside the worktree during implementation and **after each fix
-round**, before a PR is opened or the item advances. If it fails, the implementer
-harness gets the failure output and retries in a **bounded generate→test→fix
-loop** — up to `max_attempts` fix invocations (default 3), each test run capped at
-`timeout` seconds (default 300). The item never opens a PR or advances while the
-command is failing; persistent failure → `blocked` with the captured output
-surfaced on the issue. This catches broken changes locally instead of waiting for
-CI after review.
+When `test_gate.enabled` (the default), the target repo's **own** test/build command runs inside the worktree during implementation and **after each fix round**, before a PR is opened or the item advances. If it fails, the implementer harness gets the failure output and retries in a **bounded generate→test→fix loop** — up to `max_attempts` fix invocations (default 3), each test run capped at `timeout` seconds (default 300). The item never opens a PR or advances while the command is failing; persistent failure → `blocked` with the captured output surfaced on the issue.
 
 The command is **auto-detected** (first match wins):
 
-1. explicit `test_gate.command` override (parsed without a shell)
-2. `package.json` — a real `test` script (npm placeholder/`echo` stubs skipped),
-   else a `build:check` / `typecheck` / `type-check` / `build` script; the package
-   manager follows the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm)
+1. Explicit `test_gate.command` override (parsed without a shell)
+2. `package.json` — a real `test` script (npm placeholder/`echo` stubs skipped), else a `build:check` / `typecheck` / `type-check` / `build` script; the package manager follows the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm)
 3. `go.mod` → `go test ./...`
 4. `Cargo.toml` → `cargo test`
-5. pytest — only with a concrete marker (`pytest.ini`, root `conftest.py`, or a
-   `[tool.pytest*]` section in `pyproject.toml`); `pyproject.toml` alone is **not**
-   enough
+5. pytest — only with a concrete marker (`pytest.ini`, root `conftest.py`, or a `[tool.pytest*]` section in `pyproject.toml`); `pyproject.toml` alone is **not** enough
 6. `Makefile` with a `test:` target → `make test`
 
-**Repos with no detectable command (and no override) are skipped entirely** — zero
-behavior change. For monorepos or custom runners, set `test_gate.command`
-explicitly. **Rollback** is a one-line `test_gate: { enabled: false }` — no labels,
-no state-machine changes.
+**Repos with no detectable command (and no override) are skipped entirely** — zero behavior change. For monorepos or custom runners, set `test_gate.command` explicitly. **Rollback** is a one-line `test_gate: { enabled: false }`.
 
 ### Matching CI: set `test_gate.command` when CI does more than `npm test`
 
-Auto-detection picks the package `test` script (or equivalent). If your CI also
-runs additional steps — a generated-artifact sync check, a typecheck pass, an
-install smoke-test — the gate will miss those steps and a CI-only failure can
-escape to pre-merge.
+Auto-detection picks the package `test` script (or equivalent). If your CI also runs additional steps — a generated-artifact sync check, a typecheck pass, an install smoke-test — the gate will miss those steps and a CI-only failure can escape to pre-merge.
 
 **Fix:** add a script that chains all CI steps and point the gate at it:
 
@@ -274,110 +230,118 @@ test_gate:
 ```
 
 ```json
-// package.json
-"scripts": {
-  "ci:core": "(cd core && npm ci --no-audit --no-fund && npm test)",
-  "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke",
-  "ci:install-smoke": "node scripts/ci-install-smoke.mjs"
+{
+  "scripts": {
+    "ci:core": "(cd core && npm ci --no-audit --no-fund && npm test)",
+    "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke",
+    "ci:install-smoke": "node scripts/ci-install-smoke.mjs"
+  }
 }
 ```
 
-`test_gate.command` is parsed **without a shell** (whitespace-tokenized, then
-spawned directly). Compound operators like `&&` must live inside the script body
-(where npm/shell handles them), not raw in the config value.
+`test_gate.command` is parsed **without a shell** (whitespace-tokenized, then spawned directly). Compound operators like `&&` must live inside the script body (where npm/shell handles them), not raw in the config value.
 
-## Eval gate (optional, default off)
+## Troubleshooting
 
-When `eval_gate.enabled` (default **off**), the target repo's eval harness runs
-**after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a
-one-time opt-in per repo: set `enabled: true` and a `command`. The command runs
-through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone**
-decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode,
-elapsed, output excerpt) is always recorded as an issue comment.
+### Pipeline is blocked
+
+When the pipeline cannot advance on its own, it applies a `pipeline:blocked` label to the issue and posts a comment explaining why. To unblock:
+
+1. Read the blocker comment on the issue.
+2. Address the root cause (fix failing tests, answer a question, supply missing context, etc.).
+3. Clear the label and re-invoke using `--unblock`:
+
+```bash
+/pipeline N --unblock "your answer or context here"
+# or for Codex:
+$pipeline N --unblock "your answer or context here"
+```
+
+Or clear the label manually and re-run normally:
+
+```bash
+gh issue edit N --remove-label "pipeline:blocked"
+/pipeline N   # or: $pipeline N
+```
+
+### Common blockers
+
+- **Test gate failure** — the repo's test/build command is failing. Fix the tests, or set `test_gate.command` in `.github/pipeline.yml` if the wrong command is being detected.
+- **Reviewer CLI not found or not authenticated** — install and authenticate both `claude` and `codex` CLIs (see [Prerequisites](#prerequisites)).
+- **`gh` not authenticated** — run `gh auth login` and try again.
+- **Missing `pipeline:ready` label** — create it with `gh label create "pipeline:ready"` before labeling an issue.
+- **PR has no `Closes #N` link** — the pipeline cannot resolve a PR to an issue without a closing reference. Add `Closes #N` to the PR body.
+- **Review verdict is stale** — if commits land after a review approval, the pipeline detects the stale SHA and re-reviews automatically before advancing.
+
+### Dry-run and status inspection
+
+To observe what the pipeline would do without making any writes:
+
+```bash
+/pipeline N --dry-run
+$pipeline N --dry-run
+```
+
+To print the current stage, any blocker, the linked PR, and the last review verdict without advancing:
+
+```bash
+/pipeline N --status
+$pipeline N --status
+```
+
+---
+
+## Advanced topics
+
+The following features are all **default off** (or are clearly optional). A reader who completes Prerequisites, Quickstart, and Usage has a fully working setup without needing any of these sections.
+
+### Configurable steps
+
+The `steps` block turns the optional "thoroughness" steps on or off per repo, to trade rigor for speed. Default is everything on (the full pipeline). Configurable: `plan_review`, `standard_review` (review-1 + its fix round), `adversarial_review` (review-2 + its fix round), and `docs`. Disabling a step still yields a valid path to `ready-to-deploy`, and each skip is recorded as a transition comment on the issue.
+
+The structural and safety steps — planning, implementing, and the pre-merge **CI** and **mergeability** gates — are **not** configurable: they have no toggle, and an unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse time rather than silently dropping a safety gate.
+
+Review verdicts are also pinned to the commit they evaluated. Every review comment records the reviewed commit SHA — surfaced in the header (e.g. `— approve (commit a1b2c3d)`) and embedded as a machine-readable footer sentinel. Before pre-merge acts on a prior approval it re-checks that SHA against current HEAD: if any commit has landed since the review, the stale verdict is discarded and the item returns to its review round for a fresh review (posting a `## Pipeline: Re-running review` comment) rather than advancing. This is always-on — there is no toggle.
+
+### Eval gate
+
+When `eval_gate.enabled` (default **off**), the target repo's eval harness runs **after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode, elapsed, output excerpt) is always recorded as an issue comment.
 
 - **`mode: gate`** (default) — a non-zero exit **blocks** the item.
-- **`mode: advisory`** — the result is recorded and the item **always advances**,
-  even after retries are exhausted.
-- A failing run is retried up to `max_attempts` (default 2; `1` = no retry),
-  short-circuiting on the first pass.
-- `timeout` (default 300) is a **hard stage-level budget in seconds, shared across
-  all attempts**, so total wall-time never exceeds it.
-- **Tooling failures always block, regardless of mode** — if the command times out
-  or can't be spawned (missing binary, etc.) the harness itself couldn't run, so the
-  item is blocked even in advisory mode.
+- **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted.
+- A failing run is retried up to `max_attempts` (default 2; `1` = no retry), short-circuiting on the first pass.
+- `timeout` (default 300) is a **hard stage-level budget in seconds, shared across all attempts**, so total wall-time never exceeds it.
+- **Tooling failures always block, regardless of mode** — if the command times out or can't be spawned the item is blocked even in advisory mode.
 
-When disabled (the default), pre-merge advances straight to `ready-to-deploy` and
-the `eval-gate` label is never applied — zero behavior change and no extra comment.
-**Rollback** is `eval_gate: { enabled: false }` (the default).
+When disabled (the default), pre-merge advances straight to `ready-to-deploy` and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
 
-## OpenSpec integration (optional)
+### OpenSpec integration
 
-If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/`
-directory), the pipeline runs a spec-first flow:
+If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/` directory), the pipeline runs a spec-first flow:
 
-- **Planning** — instead of a freeform plan, the implementer authors an OpenSpec
-  change (`proposal.md`, `tasks.md`, spec deltas) under `openspec/changes/<id>/`,
-  which the *other* harness plan-reviews as intent before any code is written. The
-  change is validated structurally (`openspec validate <id>`) at draft and after
-  revision, and implementation works the change's `tasks.md`.
-- **Review** — the change's spec deltas are fed into the standard and adversarial
-  review prompts as the intended behavior, so reviews check whether the diff
-  actually satisfies the spec, not just whether the code looks correct.
-- **Finalize (pre-merge)** — folds the change into the living specs
-  (`openspec archive`, committed to the PR), then runs `openspec validate --all`
-  and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
+- **Planning** — instead of a freeform plan, the implementer authors an OpenSpec change (`proposal.md`, `tasks.md`, spec deltas) under `openspec/changes/<id>/`, which the *other* harness plan-reviews as intent before any code is written. The change is validated structurally (`openspec validate <id>`) at draft and after revision, and implementation works the change's `tasks.md`.
+- **Review** — the change's spec deltas are fed into the standard and adversarial review prompts as the intended behavior, so reviews check whether the diff actually satisfies the spec, not just whether the code looks correct.
+- **Finalize (pre-merge)** — folds the change into the living specs (`openspec archive`, committed to the PR), then runs `openspec validate --all` and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
 
-It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to
-require OpenSpec everywhere or `off` to disable. By default the pipeline only uses
-OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have
-**planning run `openspec init`** (committed to the PR) on repos that lack an
-`openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing the
-pre-merge gate is skipped (non-blocking) and planning blocks with an install hint.
-No `openspec/` dir (and no bootstrap) means no behavior change, so the pipeline
-stays usable on any repo.
+It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to require OpenSpec everywhere or `off` to disable. By default the pipeline only uses OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have **planning run `openspec init`** on repos that lack an `openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing the pre-merge gate is skipped (non-blocking) and planning blocks with an install hint. No `openspec/` dir (and no bootstrap) means no behavior change.
 
-## last30days context (optional)
+### last30days context
 
-When `last30days.enabled: true`, a **pre-planning** step runs the
-[last30days skill](https://github.com/mvanhorn/last30days-skill) against the issue's
-full content (title + description, excerpted for long descriptions) and carries the
-resulting brief forward: it's posted as a
-`## Pre-Planning Context — last30days` issue comment **and** injected into the
-planning prompt, so the plan is written with recent public discourse (Reddit, X,
-YouTube, HN, GitHub, …) in hand. When an issue's description is absent, the title
-alone is used (no change from prior behaviour).
+When `last30days.enabled: true`, a **pre-planning** step runs the [last30days skill](https://github.com/mvanhorn/last30days-skill) against the issue's full content (title + description, excerpted for long descriptions) and carries the resulting brief forward: it's posted as a `## Pre-Planning Context — last30days` issue comment **and** injected into the planning prompt, so the plan is written with recent public discourse (Reddit, X, YouTube, HN, GitHub, …) in hand. When an issue's description is absent, the title alone is used.
 
-> **Data boundary**: the research topic (title + excerpt of the description) is
-> forwarded to the last30days skill and its configured external data sources.
-> Before sending, the pipeline automatically redacts URLs, email addresses, Bearer
-> tokens, long hex strings, and common `key=value` / `token=value` assignments from
-> the description. Despite this redaction, **do not enable this feature for issues
-> that contain sensitive customer data, unreleased roadmap details, or
-> proprietary stack traces** — redaction catches common patterns, not every
-> possible form of sensitive content.
+> **Data boundary**: the research topic (title + excerpt of the description) is forwarded to the last30days skill and its configured external data sources. Before sending, the pipeline automatically redacts URLs, email addresses, Bearer tokens, long hex strings, and common `key=value` / `token=value` assignments from the description. Despite this redaction, **do not enable this feature for issues that contain sensitive customer data, unreleased roadmap details, or proprietary stack traces**.
 
-**Default off**, and best suited to product/strategy/named-topic issues — a typical
-pure-code issue title returns little public signal. It's also **always
-non-blocking**: if the skill isn't installed, the interpreter is missing, the run
-fails, or the brief has no signal, planning proceeds without it. The pipeline reads
-no API keys itself — the skill owns its own env/keys. Requires the `last30days`
-skill installed (`/plugin marketplace add mvanhorn/last30days-skill` in Claude Code,
-or `npx skills add mvanhorn/last30days-skill -g` for Codex/CLI hosts; resolved from
-`$LAST30DAYS_SKILL_DIR`, `~/.claude/skills/last30days`, or `~/.codex/skills/last30days`)
-and Python 3.12+.
+**Default off**, and best suited to product/strategy/named-topic issues. It's also **always non-blocking**: if the skill isn't installed, the interpreter is missing, the run fails, or the brief has no signal, planning proceeds without it.
 
-**Data-source keys** are configured in the skill, not this pipeline. The two
-highest-lift keys are `BRAVE_SEARCH_API_KEY` (free [Brave Search API](https://brave.com/search/api/))
-and `SCRAPECREATORS_API_KEY` (fuller social/X coverage). Without any keys the
-skill still runs on free public sources, but adding keys improves signal
-significantly. See the [skill's setup guide](https://github.com/mvanhorn/last30days-skill#setup)
-for full instructions.
+Requires the `last30days` skill installed (`/plugin marketplace add mvanhorn/last30days-skill` in Claude Code, or `npx skills add mvanhorn/last30days-skill -g` for Codex/CLI hosts; resolved from `$LAST30DAYS_SKILL_DIR`, `~/.claude/skills/last30days`, or `~/.codex/skills/last30days`) and Python 3.12+.
+
+**Data-source keys** are configured in the skill, not this pipeline. The two highest-lift keys are `BRAVE_SEARCH_API_KEY` (free [Brave Search API](https://brave.com/search/api/)) and `SCRAPECREATORS_API_KEY` (fuller social/X coverage). Without any keys the skill still runs on free public sources. See the [skill's setup guide](https://github.com/mvanhorn/last30days-skill#setup) for full instructions.
+
+---
 
 ## How the two hosts share one core
 
-`core/scripts/profile.ts` loads `core/profiles/<name>.json`; the shim passes
-`--profile claude` or `--profile codex`. The profile sets the only things that
-differ between hosts:
+`core/scripts/profile.ts` loads `core/profiles/<name>.json`; the shim passes `--profile claude` or `--profile codex`. The profile sets the only things that differ between hosts:
 
 | | Claude | Codex |
 |---|---|---|
@@ -387,13 +351,35 @@ differ between hosts:
 | reviewer (direct, JSON prompt) | `codex` CLI | `claude` CLI |
 | conventions file | `CLAUDE.md` | `AGENTS.md` |
 
-Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one
-shared implementation. Inverting behavior is a JSON edit, not a code change.
+Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one shared implementation. Inverting behavior is a JSON edit, not a code change.
+
+## Repository layout
+
+```text
+core/                 single source of truth (host-agnostic TypeScript)
+  scripts/            orchestrator, stages/, prompts/, gh/worktree/lock/harness
+  profiles/           claude.json · codex.json · openclaw.json  ← the host seam
+  test/               node --test suite
+hosts/
+  claude/SKILL.md     Claude overlay (/pipeline, Monitor/PushNotification flow)
+  codex/SKILL.md      Codex overlay ($pipeline, PTY exec flow)
+  codex/agents/openai.yaml   Codex UI manifest
+  _shared/entry.template.mjs launcher shim template (__PROFILE__)
+plugin/               GENERATED Claude plugin (committed; built by scripts/build.mjs)
+.claude-plugin/marketplace.json   GENERATED marketplace catalog (repo root)
+scripts/
+  install.mjs         cross-tool installer (zero deps)
+  build.mjs           regenerate plugin/ from core + hosts/claude
+  install.sh          clone-and-install convenience wrapper
+```
 
 ## Uninstall
 
 ```bash
-node scripts/install.mjs uninstall --host all      # or claude | codex
+# npx form:
+npx github:accidental-hedge-fund/agent-pipeline uninstall --host all   # or claude | codex
+# or from a clone:
+node scripts/install.mjs uninstall --host all
 # plugin install:
 /plugin uninstall pipeline@ahf-tools
 ```
@@ -401,14 +387,13 @@ node scripts/install.mjs uninstall --host all      # or claude | codex
 ## Development
 
 ```bash
-cd core && npm ci && npm test     # 189 tests, node --test
+cd core && npm ci && npm test     # node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
 npm run ci                        # run the full CI command (tests + build check + install smoke)
 ```
 
-After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run
-`build.mjs` and commit the regenerated `plugin/` (CI enforces this).
+After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this).
 
 ## License
 
