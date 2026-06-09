@@ -16,7 +16,7 @@ Original implementation plan:
 
 Secondary harness plan-review feedback:
 {{feedback}}
-
-Revise the implementation plan before coding. Incorporate valid feedback, resolve conflicts explicitly, and keep the plan surgical.
+{{human_feedback}}
+Revise the implementation plan before coding. Incorporate valid feedback from the reviewer harness and any human comments above, resolve conflicts explicitly (note which human feedback you addressed, or why you declined it), and keep the plan surgical.
 
 Return only the final revised implementation plan in Markdown. Do not implement code yet.

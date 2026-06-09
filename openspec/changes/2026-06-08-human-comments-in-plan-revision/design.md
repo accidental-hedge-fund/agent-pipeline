@@ -33,7 +33,9 @@ The reviewer harness invocation is not instant (typically 30 s – 3 min). Durin
 
 Content-based filtering works without config: a comment posted after the plan comment whose body does not begin with a known pipeline header is treated as human.
 
-Known pipeline headers to exclude: `## Implementation Plan`, `## Plan Review`, `## Revised Implementation Plan`, `## Review 1`, `## Review 2`, `## Fix 1`, `## Fix 2`.
+Known pipeline headers to exclude: `## Implementation Plan`, `## Plan Review`, `## Revised Implementation Plan`, `## Review 1`, `## Review 2`, `## Fix 1`, `## Fix 2`, `## Pipeline:`, `## Pre-Planning Context`.
+
+The `## Pipeline:` prefix is required, not optional: `transition()` posts a `## Pipeline: <stage>` comment, and the `planning → plan-review` transition lands between the plan comment and the reviewer feedback. Without excluding it, that transition comment would be read as human input on every run, breaking the "no human comments → behavior unchanged" guarantee. `## Pre-Planning Context` (the last30days brief) is excluded defensively; it is posted before the plan and so normally precedes the anchor.
 
 **Alternatives considered:**
 - Filter by author against a configured `bot_user` — rejected: adds required config, bot identity may change.

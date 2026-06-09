@@ -5,8 +5,10 @@
 When the pipeline is about to build the plan-revision prompt and `steps.plan_review` is enabled, it SHALL fetch the current issue comments and identify any human comments posted after the `## Implementation Plan` comment.
 
 A comment is considered **human** if:
-1. Its `createdAt` timestamp is later than the `## Implementation Plan` comment's `createdAt`, AND
-2. Its body does NOT begin with one of the known pipeline comment headers: `## Implementation Plan`, `## Plan Review`, `## Revised Implementation Plan`, `## Review 1`, `## Review 2`, `## Fix 1`, `## Fix 2`.
+1. It is posted after the `## Implementation Plan` comment (comments are returned in chronological order, so position after the plan-comment anchor establishes this), AND
+2. Its body does NOT begin with one of the known pipeline comment headers: `## Implementation Plan`, `## Plan Review`, `## Revised Implementation Plan`, `## Review 1`, `## Review 2`, `## Fix 1`, `## Fix 2`, `## Pipeline:`, `## Pre-Planning Context`.
+
+The `## Pipeline:` prefix (stage-transition and blocked comments) is essential: the pipeline posts `## Pipeline: plan review` between the plan comment and the reviewer feedback, so omitting it would misclassify that transition comment as human input on every run.
 
 #### Scenario: No comments follow the plan comment
 

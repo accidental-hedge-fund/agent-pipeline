@@ -9,7 +9,9 @@ import assert from "node:assert/strict";
 import {
   buildResearchTopic,
   buildSetupHint,
+  formatHumanFeedback,
   gatherCarryForward,
+  revisedPlanHeader,
   sanitizeBodyForResearch,
   type CarryForwardDeps,
 } from "../scripts/stages/planning.ts";
@@ -302,4 +304,39 @@ test("buildResearchTopic: body containing a hex API key has key redacted in outp
   const result = buildResearchTopic("Setup issue", body);
   assert.ok(!result.includes(hexKey), "hex key must not appear in the research topic");
   assert.ok(result.includes("[REDACTED]"));
+});
+
+// ---------------------------------------------------------------------------
+// Human plan feedback (#26) — formatHumanFeedback / revisedPlanHeader
+// ---------------------------------------------------------------------------
+
+test("formatHumanFeedback: undefined when there are no human comments", () => {
+  assert.equal(formatHumanFeedback([]), undefined);
+});
+
+test("formatHumanFeedback: renders @login: body blocks separated by blank lines", () => {
+  const out = formatHumanFeedback([
+    { author: "alice", body: "use the existing helper" },
+    { author: "bob", body: "handle the empty case too" },
+  ]);
+  assert.equal(out, "@alice: use the existing helper\n\n@bob: handle the empty case too");
+});
+
+test("revisedPlanHeader: includes **Human feedback from** line when humans commented", () => {
+  const lines = revisedPlanHeader("claude", "codex", [{ author: "alice" }, { author: "bob" }]);
+  assert.deepEqual(lines, [
+    "**Updated by**: claude",
+    "**Based on review by**: codex",
+    "**Human feedback from**: @alice, @bob",
+  ]);
+});
+
+test("revisedPlanHeader: dedupes repeat commenters", () => {
+  const lines = revisedPlanHeader("claude", "codex", [{ author: "alice" }, { author: "alice" }]);
+  assert.equal(lines[2], "**Human feedback from**: @alice");
+});
+
+test("revisedPlanHeader: header unchanged when no human comments", () => {
+  const lines = revisedPlanHeader("claude", "codex", []);
+  assert.deepEqual(lines, ["**Updated by**: claude", "**Based on review by**: codex"]);
 });

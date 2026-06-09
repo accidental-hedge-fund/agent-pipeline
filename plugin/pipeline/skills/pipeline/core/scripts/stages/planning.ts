@@ -13,6 +13,7 @@
 import {
   addLabel,
   createPr,
+  extractHumanPlanComments,
   getIssueDetail,
   getPrForIssue,
   postComment,
@@ -95,7 +96,8 @@ export async function advance(
 
   // ---- Step 2: post plan, transition ready → planning ----
   await transition(cfg, issueNumber, "ready", "planning", "Implementation plan generated.");
-  await postComment(cfg, issueNumber, `## Implementation Plan\n\n${plan}${footer(cfg)}`);
+  const planComment = `## Implementation Plan\n\n${plan}${footer(cfg)}`;
+  await postComment(cfg, issueNumber, planComment);
 
   // Tag the primary harness early for visibility in transition/blocker comments.
   try {
@@ -132,7 +134,14 @@ export async function advance(
     const planReview = reviewResult.stdout.trim();
     await postComment(cfg, issueNumber, `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
 
-    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary });
+    // #26: re-fetch comments so any human feedback left on the posted plan
+    // during the reviewer run flows into the revision alongside the reviewer's.
+    const humanComments = extractHumanPlanComments(
+      (await getIssueDetail(cfg, issueNumber)).comments,
+      planComment,
+    );
+
+    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments) });
     const revisionResult = await invoke(primary, cfg.repo_dir, revisionPrompt, {
       timeoutSec: cfg.implementation_timeout,
       model: opts.model ?? cfg.models.planning,
@@ -145,7 +154,11 @@ export async function advance(
       return { advanced: false, status: "blocked", reason };
     }
     revisedPlan = revisionResult.stdout.trim();
-    await postComment(cfg, issueNumber, `## Revised Implementation Plan\n\n**Updated by**: ${primary}\n**Based on review by**: ${reviewer}\n\n${revisedPlan}${footer(cfg)}`);
+    await postComment(
+      cfg,
+      issueNumber,
+      `## Revised Implementation Plan\n\n${revisedPlanHeader(primary, reviewer, humanComments).join("\n")}\n\n${revisedPlan}${footer(cfg)}`,
+    );
   } else {
     console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the original plan`);
   }
@@ -405,11 +418,8 @@ async function advanceOpenspec(
 
   // ---- ready → planning, post the proposal as the plan. ----
   await transition(cfg, issueNumber, "ready", "planning", `OpenSpec change \`${changeId}\` drafted by ${primary}.`);
-  await postComment(
-    cfg,
-    issueNumber,
-    `## Implementation Plan\n\n_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}${footer(cfg)}`,
-  );
+  const planComment = `## Implementation Plan\n\n_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}${footer(cfg)}`;
+  await postComment(cfg, issueNumber, planComment);
   try {
     await addLabel(cfg, issueNumber, `harness:${primary}`);
   } catch {
@@ -448,10 +458,15 @@ async function advanceOpenspec(
       `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`,
     );
 
+    // #26: pull in human comments left on the posted plan during the reviewer run.
+    const humanComments = extractHumanPlanComments(
+      (await getIssueDetail(cfg, issueNumber)).comments,
+      planComment,
+    );
     const revisionResult = await invoke(
       primary,
       wt.path,
-      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary }),
+      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments) }),
       { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
     );
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
@@ -470,7 +485,7 @@ async function advanceOpenspec(
     await postComment(
       cfg,
       issueNumber,
-      `## Revised Implementation Plan\n\n**Updated by**: ${primary}\n**Based on review by**: ${reviewer}\n_OpenSpec change \`${changeId}\`_\n\n${revisedProposal}${footer(cfg)}`,
+      `## Revised Implementation Plan\n\n${[...revisedPlanHeader(primary, reviewer, humanComments), `_OpenSpec change \`${changeId}\`_`].join("\n")}\n\n${revisedProposal}${footer(cfg)}`,
     );
   } else {
     console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the drafted change`);
@@ -693,4 +708,40 @@ export async function gatherCarryForward(
 
 function footer(cfg: PipelineConfig): string {
   return `\n\n---\n${cfg.marker_footer}`;
+}
+
+// ---------------------------------------------------------------------------
+// Human plan feedback (#26)
+// ---------------------------------------------------------------------------
+
+/**
+ * Render human comments left on the posted plan as `@login: body` blocks for the
+ * revision prompt's human-feedback section, or `undefined` when there are none
+ * (so `buildPlanRevisionPrompt` omits the section entirely). Exported for tests.
+ */
+export function formatHumanFeedback(
+  humanComments: { author: string; body: string }[],
+): string | undefined {
+  if (humanComments.length === 0) return undefined;
+  return humanComments.map((c) => `@${c.author}: ${c.body}`).join("\n\n");
+}
+
+/**
+ * Attribution lines for the `## Revised Implementation Plan` comment. Appends a
+ * `**Human feedback from**: @login, …` line (deduped) when human comments were
+ * incorporated; returns the base attribution unchanged when there were none, so
+ * the comment is byte-for-byte identical to today's on the no-feedback path.
+ * Exported for tests.
+ */
+export function revisedPlanHeader(
+  implementer: string,
+  reviewer: string,
+  humanComments: { author: string }[],
+): string[] {
+  const lines = [`**Updated by**: ${implementer}`, `**Based on review by**: ${reviewer}`];
+  if (humanComments.length > 0) {
+    const logins = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+    lines.push(`**Human feedback from**: ${logins}`);
+  }
+  return lines;
 }

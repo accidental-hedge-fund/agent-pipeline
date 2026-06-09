@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  extractHumanPlanComments,
   getHarnessLabel,
   isBlocked,
   parseChecksAggregate,
@@ -255,4 +256,49 @@ test("parsePrMergeState: single merged PR → merged=true with prNumber and head
 test("parsePrMergeState: empty array → merged=false", () => {
   const result = parsePrMergeState("[]");
   assert.equal(result.merged, false);
+});
+
+// ---------- extractHumanPlanComments (#26) ----------
+
+const PLAN_BODY = "## Implementation Plan\n\nDo the thing.";
+
+test("extractHumanPlanComments: empty when all comments precede the plan comment", () => {
+  const comments = [
+    { author: "alice", body: "early thought", createdAt: "2026-06-01T00:00:00Z" },
+    { author: "pipeline", body: PLAN_BODY, createdAt: "2026-06-02T00:00:00Z" },
+  ];
+  assert.deepEqual(extractHumanPlanComments(comments, PLAN_BODY), []);
+});
+
+test("extractHumanPlanComments: empty when only pipeline comments follow the plan", () => {
+  // Includes the `## Pipeline: plan review` transition comment posted between
+  // the plan and the reviewer feedback — it must not be read as human input.
+  const comments = [
+    { author: "bot", body: PLAN_BODY, createdAt: "2026-06-02T00:00:00Z" },
+    { author: "bot", body: "## Pipeline: plan review\n\n...", createdAt: "2026-06-02T00:01:00Z" },
+    { author: "bot", body: "## Plan Review\n\nlooks ok", createdAt: "2026-06-02T00:02:00Z" },
+  ];
+  assert.deepEqual(extractHumanPlanComments(comments, PLAN_BODY), []);
+});
+
+test("extractHumanPlanComments: returns human comments that follow the plan", () => {
+  const comments = [
+    { author: "bot", body: PLAN_BODY, createdAt: "2026-06-02T00:00:00Z" },
+    { author: "bot", body: "## Pipeline: plan review", createdAt: "2026-06-02T00:01:00Z" },
+    { author: "carol", body: "Please also handle the empty case.", createdAt: "2026-06-02T00:03:00Z" },
+    { author: "bot", body: "## Plan Review\n\nok", createdAt: "2026-06-02T00:04:00Z" },
+    { author: "dave", body: "Use the existing util instead.", createdAt: "2026-06-02T00:05:00Z" },
+  ];
+  assert.deepEqual(extractHumanPlanComments(comments, PLAN_BODY), [
+    { author: "carol", body: "Please also handle the empty case." },
+    { author: "dave", body: "Use the existing util instead." },
+  ]);
+});
+
+test("extractHumanPlanComments: empty when no plan comment exists at all", () => {
+  const comments = [
+    { author: "alice", body: "random comment", createdAt: "2026-06-01T00:00:00Z" },
+    { author: "bob", body: "another one", createdAt: "2026-06-02T00:00:00Z" },
+  ];
+  assert.deepEqual(extractHumanPlanComments(comments, PLAN_BODY), []);
 });
