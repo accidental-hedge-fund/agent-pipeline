@@ -536,3 +536,112 @@ test("gate: explicit command override bypasses detection", async () => {
   assert.deepEqual(seen, { cmd: "pnpm", args: ["run", "test:ci"] });
   assert.equal(out.passed, true);
 });
+
+// ---------------------------------------------------------------------------
+// Traceability trailer enforcement on fix-harness commits (#20)
+// ---------------------------------------------------------------------------
+
+const FIXED_RUN_ID = "1/2026-06-08T14:32:00Z";
+
+test("gate (regression / #20, trailer enforcement): fix harness creates commit without trailers → blocked", async () => {
+  // The harness "succeeds" and leaves a clean tree, but the commit it produced
+  // has no Issue: or Pipeline-Run: trailers. The gate must block.
+  let invoked = 0;
+  const out = await runTestGate(
+    cfgWith({}),
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => {
+        invoked++;
+        return okInvoke();
+      },
+      gitHead: async () => "head-before",
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => ["fix: correct the test\n\nNo trailers here."],
+    },
+    FIXED_RUN_ID,
+  );
+  assert.equal(out.passed, false);
+  assert.equal(invoked, 1);
+  assert.match(out.blockReason ?? "", /trailers/i);
+});
+
+test("gate (regression / #20, trailer enforcement): fix harness creates commit with correct trailers → allowed", async () => {
+  // Harness succeeds, commit has both required trailers → gate continues.
+  let n = 0;
+  const out = await runTestGate(
+    cfgWith({}),
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => (n++ === 0 ? failResult : passResult),
+      invoke: async () => okInvoke(),
+      gitHead: async () => "head-before",
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [
+        `fix: correct the test\n\nIssue: #1\nPipeline-Run: ${FIXED_RUN_ID}`,
+      ],
+    },
+    FIXED_RUN_ID,
+  );
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 1);
+});
+
+test("gate (regression / #20, trailer enforcement): no new commits after fix → not blocked on trailers", async () => {
+  // Harness succeeds, tree clean, but made no commits (messages []) → trailer
+  // validation passes since there are no commits to validate.
+  let n = 0;
+  const out = await runTestGate(
+    cfgWith({}),
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => (n++ === 0 ? failResult : passResult),
+      invoke: async () => okInvoke(),
+      gitHead: async () => "head-before",
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    FIXED_RUN_ID,
+  );
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 1);
+});
+
+test("gate (regression / #20, trailer enforcement): multiple fix commits, one missing trailers → blocked", async () => {
+  // Two commits: the first compliant, the second not. Gate must block.
+  let invoked = 0;
+  const out = await runTestGate(
+    cfgWith({}),
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => {
+        invoked++;
+        return okInvoke();
+      },
+      gitHead: async () => "head-before",
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [
+        `fix: first\n\nIssue: #1\nPipeline-Run: ${FIXED_RUN_ID}`,
+        "fix: second\n\nNo trailers.",
+      ],
+    },
+    FIXED_RUN_ID,
+  );
+  assert.equal(out.passed, false);
+  assert.equal(invoked, 1);
+  assert.match(out.blockReason ?? "", /trailers/i);
+});

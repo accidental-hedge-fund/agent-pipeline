@@ -11,6 +11,8 @@ import {
   isActive,
   isInitialized,
   listChangeDirs,
+  openspecContext,
+  openspecContextFromDiff,
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
@@ -159,4 +161,123 @@ test("shouldPlanWithOpenspec: auto follows init, or bootstrap when uninitialized
   assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: true } }, d), true);
   fs.mkdirSync(path.join(d, "openspec"));
   assert.equal(shouldPlanWithOpenspec({ openspec: { enabled: "auto", bootstrap: false } }, d), true);
+});
+
+test("openspecContext: returns spec deltas when OpenSpec is active with a change", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "my-change", "specs", "feature");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "## ADDED Requirement: must support batch mode");
+  const result = openspecContext({ openspec: { enabled: "on" } }, dir);
+  assert.match(result, /must support batch mode/);
+});
+
+test("openspecContext: returns empty string when OpenSpec is inactive (mode off)", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "my-change", "specs");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "## ADDED Requirement");
+  assert.equal(openspecContext({ openspec: { enabled: "off" } }, dir), "");
+});
+
+test("openspecContext: returns empty string when no change dirs exist", () => {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, "openspec", "changes"), { recursive: true });
+  assert.equal(openspecContext({ openspec: { enabled: "on" } }, dir), "");
+});
+
+test("openspecContext: returns empty string when active change has no spec deltas", () => {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, "openspec", "changes", "empty-change"), { recursive: true });
+  assert.equal(openspecContext({ openspec: { enabled: "on" } }, dir), "");
+});
+
+test("openspecContext: uses the first change dir when multiple exist", () => {
+  const dir = tmpDir();
+  const changes = path.join(dir, "openspec", "changes");
+  const s1 = path.join(changes, "aaa-change", "specs");
+  const s2 = path.join(changes, "zzz-change", "specs");
+  fs.mkdirSync(s1, { recursive: true });
+  fs.mkdirSync(s2, { recursive: true });
+  fs.writeFileSync(path.join(s1, "spec.md"), "REQ-AAA");
+  fs.writeFileSync(path.join(s2, "spec.md"), "REQ-ZZZ");
+  const result = openspecContext({ openspec: { enabled: "on" } }, dir);
+  // Should return spec deltas from whichever change listChangeDirs() picks first.
+  assert.ok(result === "REQ-AAA" || result.includes("REQ-AAA") || result === "REQ-ZZZ" || result.includes("REQ-ZZZ"));
+  // Should NOT include both (only the first change is used).
+  assert.ok(!(result.includes("REQ-AAA") && result.includes("REQ-ZZZ")));
+});
+
+// ---------------------------------------------------------------------------
+// openspecContextFromDiff — regression for multi-change worktrees in fix rounds
+// ---------------------------------------------------------------------------
+
+test("openspecContextFromDiff: returns inactive string when OpenSpec is off", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "my-change", "specs");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "REQ-X");
+  const result = openspecContextFromDiff({ openspec: { enabled: "off" } }, dir, [
+    "openspec/changes/my-change/proposal.md",
+  ]);
+  assert.equal(result, "");
+});
+
+test("openspecContextFromDiff: returns the matching change's spec deltas", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "new-change", "specs");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "REQ-NEW");
+  const result = openspecContextFromDiff({ openspec: { enabled: "on" } }, dir, [
+    "src/index.ts",
+    "openspec/changes/new-change/proposal.md",
+    "openspec/changes/new-change/tasks.md",
+  ]);
+  assert.match(result, /REQ-NEW/);
+});
+
+test("openspecContextFromDiff: returns empty string when diff has no OpenSpec change paths", () => {
+  const dir = tmpDir();
+  const specs = path.join(dir, "openspec", "changes", "my-change", "specs");
+  fs.mkdirSync(specs, { recursive: true });
+  fs.writeFileSync(path.join(specs, "spec.md"), "REQ-X");
+  const result = openspecContextFromDiff({ openspec: { enabled: "on" } }, dir, [
+    "src/index.ts",
+    "README.md",
+  ]);
+  assert.equal(result, "");
+});
+
+test("openspecContextFromDiff: multi-change worktree — selects only the branch-introduced change", () => {
+  // Regression: worktree has a pre-existing 'old-change' AND this branch's 'new-change'.
+  // openspecContext() would pick changes[0] (alphabetically 'new-change' here, but
+  // ordering is filesystem-dependent). openspecContextFromDiff must pick only 'new-change'
+  // regardless of ordering, because only 'new-change' appears in the branch diff paths.
+  const dir = tmpDir();
+  const oldSpecs = path.join(dir, "openspec", "changes", "old-change", "specs");
+  const newSpecs = path.join(dir, "openspec", "changes", "new-change", "specs");
+  fs.mkdirSync(oldSpecs, { recursive: true });
+  fs.mkdirSync(newSpecs, { recursive: true });
+  fs.writeFileSync(path.join(oldSpecs, "spec.md"), "REQ-OLD-UNRELATED");
+  fs.writeFileSync(path.join(newSpecs, "spec.md"), "REQ-NEW-CORRECT");
+
+  // Branch diff only references new-change (old-change was already on base branch).
+  const diffPaths = [
+    "src/feature.ts",
+    "openspec/changes/new-change/proposal.md",
+    "openspec/changes/new-change/specs/spec.md",
+  ];
+  const result = openspecContextFromDiff({ openspec: { enabled: "on" } }, dir, diffPaths);
+  assert.match(result, /REQ-NEW-CORRECT/);
+  assert.ok(!result.includes("REQ-OLD-UNRELATED"), "must not include the pre-existing change's spec deltas");
+});
+
+test("openspecContextFromDiff: returns empty string when diff references a change not on disk", () => {
+  // e.g. the diff references openspec/changes/gone-change/ but it was archived/deleted.
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, "openspec", "changes"), { recursive: true });
+  const result = openspecContextFromDiff({ openspec: { enabled: "on" } }, dir, [
+    "openspec/changes/gone-change/proposal.md",
+  ]);
+  assert.equal(result, "");
 });

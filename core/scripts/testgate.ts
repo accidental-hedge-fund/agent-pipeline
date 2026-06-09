@@ -20,6 +20,7 @@ import {
   type VerifyDeps,
   type VerifyResult,
 } from "./verify-harness-commits.ts";
+import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -62,6 +63,11 @@ export interface TestGateDeps {
   gitDirty?: (cwd: string) => Promise<boolean>;
   /** Verify commit message format after each test-fix attempt (#68). Injectable for tests. */
   verifyTestFix?: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
+  /** Return the full commit messages for every commit reachable from HEAD but
+   *  not from `baseRef`. Used to validate traceability trailers on commits the
+   *  fix harness creates. Returns [] when `baseRef` equals HEAD (no new commits)
+   *  or when the git command fails (non-git directory). */
+  gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,8 +96,10 @@ export async function enforceTestFixCommitFormat(
         ),
         description: "Test-fix commit message does not match prescribed format",
       },
-      // requireTrailers is intentionally absent: test_fix.md does not prescribe
-      // trailers, so the gate must not enforce them (#68 review-2 finding 1).
+      // requireTrailers is intentionally absent here: trailer enforcement on
+      // test-fix commits is handled separately by validateCommitTrailers in the
+      // loop below (test_fix.md prescribes the Issue:/Pipeline-Run: trailers via
+      // #20). This gate only asserts the prescribed commit-message format.
     },
     deps,
   );
@@ -119,6 +127,11 @@ export async function runTestGate(
   issueNumber: number,
   wtPath: string,
   deps: TestGateDeps = {},
+  // Run identifier for the commit traceability trailers (#20) the fix harness is
+  // instructed to add. Defaults to a fresh id so test/build-gate callers that
+  // don't thread it still produce valid trailers; production callers
+  // (planning/fix) pass the dispatch-wide id so all commits in a run match.
+  pipelineRunId: string = makePipelineRunId(issueNumber),
 ): Promise<TestGateResult> {
   if (!cfg.test_gate.enabled) return { skipped: true };
 
@@ -130,6 +143,7 @@ export async function runTestGate(
   const verifyTestFixFn =
     deps.verifyTestFix ??
     ((wt: string, hb: string) => enforceTestFixCommitFormat(issueNumber, wt, hb));
+  const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
 
   const command = cfg.test_gate.command ? shellSplit(cfg.test_gate.command) : detectFn(wtPath);
   if (!command) return { skipped: true };
@@ -185,7 +199,10 @@ export async function runTestGate(
       attempt,
       maxAttempts: cfg.test_gate.max_attempts,
       output,
+      pipelineRunId,
     });
+    // Capture HEAD before the harness runs so we can inspect only its commits.
+    const headBefore = await gitHeadFn(wtPath);
     const fixRes = await invokeFn(harness, wtPath, prompt, {
       timeoutSec: cfg.fix_timeout,
       model: cfg.models.fix,
@@ -216,6 +233,18 @@ export async function runTestGate(
       const commitCheck = await verifyTestFixFn(wtPath, fixHeadBefore);
       if (!commitCheck.ok) {
         return { skipped: false, passed: false, attempts: attempt, blockReason: commitCheck.reason };
+      }
+    }
+
+    // Validate that every commit the fix harness just created carries the
+    // required Issue: and Pipeline-Run: traceability trailers. Skipped when
+    // headBefore is empty (git unavailable in this environment) or when the
+    // harness produced no new commits (messages list is empty).
+    if (headBefore) {
+      const newMessages = await gitCommitMessagesFn(wtPath, headBefore);
+      const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
+      if (trailerErr) {
+        return { skipped: false, passed: false, attempts: attempt, blockReason: trailerErr };
       }
     }
 
@@ -465,4 +494,17 @@ async function defaultGitHead(cwd: string): Promise<string> {
 async function defaultGitDirty(cwd: string): Promise<boolean> {
   const res = await gitInWorktree(cwd, ["status", "--porcelain"], { ignoreFailure: true });
   return res.stdout.trim().length > 0;
+}
+
+/** Return the full commit messages for commits reachable from HEAD but not from
+ *  `baseRef`. Uses NUL-delimited output to safely handle multi-line messages.
+ *  Returns [] when there are no new commits or when git is unavailable. */
+async function defaultGitCommitMessages(cwd: string, baseRef: string): Promise<string[]> {
+  const res = await gitInWorktree(
+    cwd,
+    ["log", "--format=%x00%B", `${baseRef}..HEAD`],
+    { ignoreFailure: true },
+  );
+  if (!res.stdout.trim()) return [];
+  return res.stdout.split("\x00").map((s) => s.trim()).filter(Boolean);
 }

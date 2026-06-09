@@ -18,7 +18,7 @@ Review the diff below and update any documentation that is now stale or incomple
 - Do NOT modify application code, tests, or configs unless the file is itself documentation/config-example text.
 - Do NOT add unnecessary boilerplate docs.
 - Keep updates minimal and accurate.
-- If you edit documentation files, commit with message: `docs: update documentation for #{{issue_number}}`
+- Do not commit — the pipeline commits documentation changes with the required traceability trailers.
 
 ## Diff to Review
 
