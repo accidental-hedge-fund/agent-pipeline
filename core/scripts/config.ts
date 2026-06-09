@@ -227,3 +227,76 @@ export function domainContext(cfg: PipelineConfig): { name: string; description:
     description: cfg.domain_description ?? "this repository",
   };
 }
+
+/**
+ * Write a commented starter `.github/pipeline.yml` to the repo if absent.
+ * Uses exclusive-create (`flag: "wx"`) so a concurrent second call never
+ * clobbers an existing file — EEXIST → { created: false }.
+ */
+export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created: boolean }> {
+  const configDir = path.join(repoDir, ".github");
+  const configPath = path.join(configDir, "pipeline.yml");
+
+  fs.mkdirSync(configDir, { recursive: true });
+
+  try {
+    fs.writeFileSync(configPath, buildConfigTemplate(), { flag: "wx" });
+    return { created: true };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "EEXIST") return { created: false };
+    throw e;
+  }
+}
+
+function buildConfigTemplate(): string {
+  const d = DEFAULT_CONFIG;
+  return `# Pipeline configuration for this repo — created by \`pipeline init\`.
+# Every key is shown at its current default value; edit any line to override.
+# Delete a key to fall back to the built-in default. Lines that are commented
+# out (e.g. the \`command:\` entries) are optional overrides — uncomment to set.
+
+base_branch: ${d.base_branch} # branch PRs target and worktrees branch from
+worktree_root: ${d.worktree_root} # dir (relative to repo) holding pipeline worktrees
+max_concurrent_worktrees: ${d.max_concurrent_worktrees} # cap on simultaneous in-flight worktrees
+auto_merge: ${d.auto_merge} # accepted for back-compat; the pipeline stops at ready-to-deploy
+auto_recovery_max_retries: ${d.auto_recovery_max_retries} # auto-recovery attempts when implementation blocks
+implementation_timeout: ${d.implementation_timeout} # seconds for the implementation harness
+review_timeout: ${d.review_timeout} # seconds per review stage
+fix_timeout: ${d.fix_timeout} # seconds per fix stage
+ci_timeout: ${d.ci_timeout} # seconds to wait for CI at pre-merge
+ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
+
+models: # model alias per phase (resolved by the active harness)
+  planning: ${d.models.planning}
+  review: ${d.models.review}
+  fix: ${d.models.fix}
+
+openspec:
+  enabled: ${d.openspec.enabled} # auto | on | off
+  bootstrap: ${d.openspec.bootstrap} # if true, run \`openspec init\` on repos lacking openspec/
+
+last30days:
+  enabled: ${d.last30days.enabled} # opt-in pre-planning activity brief
+  timeout: ${d.last30days.timeout} # seconds
+
+steps: # turn optional steps off for speed/preference (default: all on)
+  plan_review: ${d.steps.plan_review} # cross-harness review of the plan before coding
+  standard_review: ${d.steps.standard_review} # review-1 (and its fix round)
+  adversarial_review: ${d.steps.adversarial_review} # review-2 (and its fix round)
+  docs: ${d.steps.docs} # docs-update pass in pre-merge
+
+test_gate: # run the repo's tests/build before opening a PR
+  enabled: ${d.test_gate.enabled} # set false to disable entirely
+  # command: pnpm test # explicit command; auto-detected when absent
+  max_attempts: ${d.test_gate.max_attempts} # fix-harness invocations before blocking
+  timeout: ${d.test_gate.timeout} # seconds per test/build run
+
+eval_gate: # run the repo's eval harness after pre-merge
+  enabled: ${d.eval_gate.enabled} # set true to enable (one-time declaration per repo)
+  # command: pnpm evals # shell command to run; required when enabled
+  mode: ${d.eval_gate.mode} # gate: block on fail | advisory: record and advance
+  timeout: ${d.eval_gate.timeout} # stage-level budget in seconds (shared across attempts)
+  max_attempts: ${d.eval_gate.max_attempts} # total attempts before giving up (1 = no retry)
+`;
+}
