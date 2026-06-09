@@ -287,6 +287,33 @@ export async function enforceDocsOnlyGate(
   return verifyHarnessCommits(wtPath, headBefore, { docsOnly: true }, deps);
 }
 
+/**
+ * Verifies that every harness-produced commit (in `headBefore..HEAD`) carries
+ * the expected docs commit message prefix. Uses `allowEmpty: true` so runs
+ * where the harness made no commits (dirty-only) are not blocked — the stage
+ * will auto-commit those with the correct message. Exported for direct testing.
+ * (#68 review-2 finding 3)
+ */
+export async function enforceDocsCommitMessageGate(
+  wtPath: string,
+  headBefore: string,
+  issueNumber: number,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(
+    wtPath,
+    headBefore,
+    {
+      messagePattern: {
+        pattern: new RegExp(`docs: update documentation for #${issueNumber}`, "i"),
+        description: `Docs harness committed with wrong message — expected prefix: "${DOCS_COMMIT_PREFIX}${issueNumber}"`,
+      },
+      allowEmpty: true,
+    },
+    deps,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Docs update
 // ---------------------------------------------------------------------------
@@ -352,6 +379,11 @@ async function updateDocs(
     const docsCheck = await enforceDocsOnlyGate(wt.path, headBefore);
     if (!docsCheck.ok) {
       return { advanced: false, status: "blocked", reason: docsCheck.reason };
+    }
+    // Verify harness-produced commit messages match the expected docs prefix (#68 review-2 finding 3).
+    const msgCheck = await enforceDocsCommitMessageGate(wt.path, headBefore, issueNumber);
+    if (!msgCheck.ok) {
+      return { advanced: false, status: "blocked", reason: msgCheck.reason };
     }
   }
 

@@ -201,10 +201,16 @@ export async function verifyHarnessCommits(
     }
   }
 
-  // Path constraint: every committed file must match the allow-pattern.
+  // Path constraint: every committed or dirty file must match the allow-pattern
+  // (#68 review-2 finding 2: dirty files must also be checked so an authoring
+  // harness cannot bypass the constraint by leaving application code uncommitted).
   if (config.pathConstraint) {
-    const diffFiles = await getDiffFiles(wtPath, headBefore);
-    const denied = diffFiles.filter((f) => !config.pathConstraint!.allowPattern.test(f));
+    const [diffFiles, dirtyFiles] = await Promise.all([
+      getDiffFiles(wtPath, headBefore),
+      getDirtyFiles(wtPath),
+    ]);
+    const allFiles = [...new Set([...diffFiles, ...dirtyFiles])];
+    const denied = allFiles.filter((f) => !config.pathConstraint!.allowPattern.test(f));
     if (denied.length > 0) {
       return { ok: false, reason: config.pathConstraint.description };
     }
