@@ -245,7 +245,7 @@ test_gate:
 
 ### Pipeline is blocked
 
-When the pipeline cannot advance on its own, it applies a `pipeline:blocked` label to the issue and posts a comment explaining why. To unblock:
+When the pipeline cannot advance on its own, it applies a `blocked` label to the issue and posts a comment explaining why. To unblock:
 
 1. Read the blocker comment on the issue.
 2. Address the root cause (fix failing tests, answer a question, supply missing context, etc.).
@@ -260,7 +260,7 @@ $pipeline N --unblock "your answer or context here"
 Or clear the label manually and re-run normally:
 
 ```bash
-gh issue edit N --remove-label "pipeline:blocked"
+gh issue edit N --remove-label "blocked"
 /pipeline N   # or: $pipeline N
 ```
 
@@ -336,6 +336,47 @@ When `last30days.enabled: true`, a **pre-planning** step runs the [last30days sk
 Requires the `last30days` skill installed (`/plugin marketplace add mvanhorn/last30days-skill` in Claude Code, or `npx skills add mvanhorn/last30days-skill -g` for Codex/CLI hosts; resolved from `$LAST30DAYS_SKILL_DIR`, `~/.claude/skills/last30days`, or `~/.codex/skills/last30days`) and Python 3.12+.
 
 **Data-source keys** are configured in the skill, not this pipeline. The two highest-lift keys are `BRAVE_SEARCH_API_KEY` (free [Brave Search API](https://brave.com/search/api/)) and `SCRAPECREATORS_API_KEY` (fuller social/X coverage). Without any keys the skill still runs on free public sources. See the [skill's setup guide](https://github.com/mvanhorn/last30days-skill#setup) for full instructions.
+
+### Optional companion review modes
+
+By default the reviewer harness is called directly with the pipeline's own JSON-returning review prompt (`reviewMode: prompt-harness`). This requires no extra plugins and is the recommended starting point.
+
+If you prefer the reviewer to run through a third-party plugin — so it sees a richer plugin context rather than a raw CLI invocation — two companion modes are available:
+
+| `reviewMode` | When the implementer is Claude | When the implementer is Codex |
+|---|---|---|
+| `prompt-harness` (default) | Codex CLI called directly | Claude CLI called directly |
+| `codex-companion` | Codex drives review via the **codex-plugin-cc** plugin | *(same harness, uses codex-plugin-cc)* |
+| `claude-companion` | Claude Code drives review via the **cc-plugin-codex** plugin | *(same harness, uses cc-plugin-codex)* |
+
+**Install the companion plugin** for your desired mode:
+
+```bash
+# codex-companion — install codex-plugin-cc into Claude Code
+/plugin marketplace add openai/codex-plugin-cc
+
+# claude-companion — install cc-plugin-codex into Codex
+npx skills add anthropics/cc-plugin-codex -g
+```
+
+**Set the mode** in `.github/pipeline.yml`:
+
+```yaml
+# .github/pipeline.yml
+review_mode: codex-companion   # or: claude-companion
+```
+
+**Override the companion script path** (optional, for custom plugin installs):
+
+```bash
+# codex-companion path override
+PIPELINE_CODEX_COMPANION=/path/to/codex-companion.mjs /pipeline N
+
+# claude-companion path override
+PIPELINE_CC_COMPANION=/path/to/claude-companion.mjs /pipeline N
+```
+
+If the companion script cannot be found at any of the default locations and no env-var override is set, the pipeline blocks with an install hint rather than silently falling back.
 
 ---
 
