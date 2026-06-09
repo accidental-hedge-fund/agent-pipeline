@@ -154,6 +154,12 @@ export async function advance(
       return { advanced: false, status: "blocked", reason };
     }
     revisedPlan = revisionResult.stdout.trim();
+    if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
+      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
+      await setBlocked(cfg, issueNumber, reason, "plan-review");
+      return { advanced: false, status: "blocked", reason };
+    }
     await postComment(
       cfg,
       issueNumber,
@@ -482,6 +488,12 @@ async function advanceOpenspec(
       return { advanced: false, status: "blocked", reason: "openspec change invalid after revision" };
     }
     revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || proposal;
+    if (!validateHumanFeedbackAck(revisedProposal, humanComments)) {
+      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
+      await setBlocked(cfg, issueNumber, reason, "plan-review");
+      return { advanced: false, status: "blocked", reason };
+    }
     await postComment(
       cfg,
       issueNumber,
@@ -713,6 +725,23 @@ function footer(cfg: PipelineConfig): string {
 // ---------------------------------------------------------------------------
 // Human plan feedback (#26)
 // ---------------------------------------------------------------------------
+
+/** Exact section heading the revised plan must contain when human comments are present. */
+export const HUMAN_FEEDBACK_ACK_HEADER = "## Human Feedback Acknowledgement";
+
+/**
+ * Returns `true` when no acknowledgement is required (no human comments) or when
+ * the revised plan contains the required acknowledgement section header.
+ * Returns `false` when human comments were present but the section is missing —
+ * the caller must block or reject the revision. Exported for tests.
+ */
+export function validateHumanFeedbackAck(
+  revisedPlan: string,
+  humanComments: { author: string }[],
+): boolean {
+  if (humanComments.length === 0) return true;
+  return revisedPlan.includes(HUMAN_FEEDBACK_ACK_HEADER);
+}
 
 /**
  * Render human comments left on the posted plan as `@login: body` blocks for the

@@ -122,7 +122,7 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
   const dc = domainContext(a.cfg);
   const humanFeedback =
     a.humanFeedback && a.humanFeedback.trim()
-      ? `\nHuman comments on the plan:\n\n${a.humanFeedback.trim()}\n\nIncorporate the human comments above. Note which feedback you addressed or why you declined it.\n`
+      ? `\nHuman comments on the plan:\n\n${a.humanFeedback.trim()}\n\nIncorporate the human comments above. End your revised plan with a section headed exactly "## Human Feedback Acknowledgement" that lists each commenter as "- @login: addressed — <reason>" or "- @login: declined — <reason>". This section is required when human comments are present.\n`
       : "";
   return substitute(loadTemplate("plan_revision"), {
     domain_name: dc.name,
