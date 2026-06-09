@@ -17,6 +17,11 @@ import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import {
+  verifyHarnessCommits,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
@@ -99,6 +104,15 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: "no new commits" };
   }
 
+  // ---- Verify fix-round commit message format (#68) ----
+  if (headBefore) {
+    const commitCheck = await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
+    if (!commitCheck.ok) {
+      await setBlocked(cfg, issueNumber, commitCheck.reason, stage);
+      return { advanced: false, status: "blocked", reason: commitCheck.reason };
+    }
+  }
+
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
   const gate = await runTestGate(cfg, issueNumber, wt.path);
   if (!gate.skipped && !gate.passed) {
@@ -147,6 +161,38 @@ export async function advanceFix(
       summary: "fixes pushed",
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Fix-commit format gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the `VerifyDeps`-compatible config for a fix-round commit check and
+ * exposes the gate as a standalone injectable function so tests can exercise
+ * it without mocking the entire `advanceFix` call chain.
+ */
+export async function enforceFixCommitGate(
+  round: 1 | 2,
+  issueNumber: number,
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(
+    wtPath,
+    headBefore,
+    {
+      messagePattern: {
+        pattern: new RegExp(
+          `fix:\\s+address review ${round} findings \\(#${issueNumber}\\)`,
+          "i",
+        ),
+        description: `Fix round ${round} commit message does not match prescribed format`,
+      },
+    },
+    deps,
+  );
 }
 
 // ---- pure helpers ----

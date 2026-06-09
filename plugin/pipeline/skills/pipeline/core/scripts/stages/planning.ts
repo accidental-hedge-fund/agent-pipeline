@@ -37,6 +37,12 @@ import {
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
+import {
+  verifyHarnessCommits,
+  verifyPlanRevisionOutput,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceOpts {
@@ -144,6 +150,12 @@ export async function advance(
       await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
       return { advanced: false, status: "blocked", reason };
     }
+    // Verify the plan-revision output includes the required acknowledgement section (#68).
+    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout);
+    if (!ackCheck.ok) {
+      await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review");
+      return { advanced: false, status: "blocked", reason: ackCheck.reason };
+    }
     revisedPlan = revisionResult.stdout.trim();
     await postComment(cfg, issueNumber, `## Revised Implementation Plan\n\n**Updated by**: ${primary}\n**Based on review by**: ${reviewer}\n\n${revisedPlan}${footer(cfg)}`);
   } else {
@@ -175,6 +187,9 @@ export async function advance(
 
   // ---- Step 7: primary implementer harness ----
   const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan });
+  const implHeadBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
   const result = await invoke(primary, wt.path, implPrompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model,
@@ -207,6 +222,15 @@ export async function advance(
       "implementing",
     );
     return { advanced: false, status: "blocked", reason: "no commits produced" };
+  }
+
+  // ---- Verify implementation commit references the issue (#68) ----
+  if (implHeadBefore) {
+    const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
+    if (!implCheck.ok) {
+      await setBlocked(cfg, issueNumber, implCheck.reason, "implementing");
+      return { advanced: false, status: "blocked", reason: implCheck.reason };
+    }
   }
 
   // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
@@ -461,6 +485,12 @@ async function advanceOpenspec(
       await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
       return { advanced: false, status: "blocked", reason };
     }
+    // Verify the plan-revision output includes the required acknowledgement section (#68).
+    const osAckCheck = verifyPlanRevisionOutput(revisionResult.stdout);
+    if (!osAckCheck.ok) {
+      await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review");
+      return { advanced: false, status: "blocked", reason: osAckCheck.reason };
+    }
     const v2 = await openspec.validateItem(wt.path, changeId);
     if (!v2.unavailable && !v2.valid) {
       await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`, "plan-review");
@@ -491,6 +521,9 @@ async function advanceOpenspec(
     `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
     `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
     `${revisedProposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`;
+  const osImplHeadBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
   const result = await invoke(
     primary,
     wt.path,
@@ -508,6 +541,15 @@ async function advanceOpenspec(
   if (!(await hasCommitsAhead(wt.path, cfg.base_branch))) {
     await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing");
     return { advanced: false, status: "blocked", reason: "no commits produced" };
+  }
+
+  // ---- Verify implementation commit references the issue (#68) ----
+  if (osImplHeadBefore) {
+    const osImplCheck = await enforceImplCommitRef(issueNumber, wt.path, osImplHeadBefore);
+    if (!osImplCheck.ok) {
+      await setBlocked(cfg, issueNumber, osImplCheck.reason, "implementing");
+      return { advanced: false, status: "blocked", reason: osImplCheck.reason };
+    }
   }
   // ---- test/build gate (#15) — must pass before opening a PR ----
   const gate = await runTestGate(cfg, issueNumber, wt.path);
@@ -557,6 +599,24 @@ async function advanceOpenspec(
     `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
   );
   return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
+}
+
+// ---------------------------------------------------------------------------
+// Implementation-commit reference gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that at least one commit in `headBefore..HEAD` references the issue
+ * number. Exported so tests can exercise the gate without mocking the full
+ * `advance` call chain.
+ */
+export async function enforceImplCommitRef(
+  issueNumber: number,
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(wtPath, headBefore, { issueNumber }, deps);
 }
 
 function formatIssues(v: { issues: { item?: string; message: string }[]; raw: string }): string {

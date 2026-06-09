@@ -26,6 +26,11 @@ import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildDocsUpdatePrompt } from "../prompts/index.ts";
 import { extractReviewedSha } from "./review.ts";
 import * as openspec from "../openspec.ts";
+import {
+  verifyHarnessCommits,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
@@ -71,7 +76,11 @@ export async function advance(
 
   // ---- Step 1: docs update (once per PR; skippable via steps.docs) ----
   if (cfg.steps.docs && !(await docsAlreadyUpdated(cfg, issueNumber))) {
-    await updateDocs(cfg, issueNumber, prNumber, opts);
+    const docsViolation = await updateDocs(cfg, issueNumber, prNumber, opts);
+    if (docsViolation) {
+      await setBlocked(cfg, issueNumber, docsViolation.reason, "pre-merge");
+      return docsViolation;
+    }
     return {
       advanced: false,
       status: "waiting",
@@ -259,6 +268,26 @@ export function staleReviewNotice(reviewedSha: string | null, headSha: string): 
 }
 
 // ---------------------------------------------------------------------------
+// Docs-only file-constraint gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that a docs-update harness only modified documentation files —
+ * no application code or test files. Checks both committed changes
+ * (`headBefore..HEAD`) and uncommitted dirty paths (which the stage will
+ * auto-commit). Returns `null` to proceed, or a blocked `VerifyResult` on
+ * violation. Exported so tests can exercise the gate without mocking the
+ * full `updateDocs` call chain.
+ */
+export async function enforceDocsOnlyGate(
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(wtPath, headBefore, { docsOnly: true }, deps);
+}
+
+// ---------------------------------------------------------------------------
 // Docs update
 // ---------------------------------------------------------------------------
 
@@ -281,9 +310,9 @@ async function updateDocs(
   issueNumber: number,
   prNumber: number,
   opts: AdvancePreMergeOpts,
-): Promise<void> {
+): Promise<{ advanced: false; status: "blocked"; reason: string } | null> {
   const wt = await getForIssue(cfg, issueNumber);
-  if (!wt) return;
+  if (!wt) return null;
 
   const detail = await getIssueDetail(cfg, issueNumber);
   const harness = cfg.harnesses.implementer;
@@ -291,11 +320,15 @@ async function updateDocs(
   try {
     diff = await getPrDiff(cfg, prNumber);
   } catch {
-    return;
+    return null;
   }
-  if (!diff.trim()) return;
+  if (!diff.trim()) return null;
 
   console.log(`[pipeline] #${issueNumber}: updating docs (${harness})`);
+
+  const headBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
 
   const prompt = buildDocsUpdatePrompt({
     cfg,
@@ -311,7 +344,15 @@ async function updateDocs(
     console.log(
       `[pipeline] #${issueNumber}: docs update failed (${result.timed_out ? "timeout" : `exit ${result.exit_code}`}); skipping (non-blocking)`,
     );
-    return;
+    return null;
+  }
+
+  // Verify the harness only modified documentation files (#68).
+  if (headBefore) {
+    const docsCheck = await enforceDocsOnlyGate(wt.path, headBefore);
+    if (!docsCheck.ok) {
+      return { advanced: false, status: "blocked", reason: docsCheck.reason };
+    }
   }
 
   const status = await gitInWorktree(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
@@ -334,6 +375,7 @@ async function updateDocs(
   const branch = branchName(issueNumber, wt.slug);
   await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
   console.log(`[pipeline] #${issueNumber}: docs pushed; CI will re-run`);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
