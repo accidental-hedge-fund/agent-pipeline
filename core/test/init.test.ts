@@ -6,9 +6,13 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import { scaffoldDefaultConfig } from "../scripts/config.ts";
 import { runInit } from "../scripts/pipeline.ts";
+
+const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-init-test-"));
 
@@ -173,4 +177,30 @@ test("scaffoldDefaultConfig: scaffolded file round-trips through resolveConfig w
   } finally {
     process.env.PATH = oldPath;
   }
+});
+
+// ---------------------------------------------------------------------------
+// 3.5 CLI-level: `pipeline init` positional arg routes to init, not numeric error
+// ---------------------------------------------------------------------------
+
+test("CLI: `pipeline init` (positional arg) runs init and does not emit the numeric-arg error", () => {
+  const repo = makeTempRepo();
+  const binDir = makeFakeGhBin({ repoSlug: "acme/cli-init-test" });
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "init", "--repo-path", repo],
+    {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      encoding: "utf8",
+    },
+  );
+
+  // Must not emit the "argument <number> is required" fallback message.
+  assert.ok(
+    !result.stderr.includes("argument <number> is required"),
+    `CLI emitted numeric-arg error when given 'init'; stderr:\n${result.stderr}`,
+  );
+  // Process must not exit with code 2 (the parse-error exit).
+  assert.notEqual(result.status, 2, `CLI exited with code 2; stderr:\n${result.stderr}`);
 });
