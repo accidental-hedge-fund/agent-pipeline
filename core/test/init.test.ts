@@ -9,7 +9,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import { scaffoldDefaultConfig } from "../scripts/config.ts";
+import { resolveConfig, scaffoldDefaultConfig } from "../scripts/config.ts";
 import { runInit } from "../scripts/pipeline.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
@@ -203,4 +203,61 @@ test("CLI: `pipeline init` (positional arg) runs init and does not emit the nume
   );
   // Process must not exit with code 2 (the parse-error exit).
   assert.notEqual(result.status, 2, `CLI exited with code 2; stderr:\n${result.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// 3.6 init tolerates an invalid existing .github/pipeline.yml (regression)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: tolerateInvalidConfig=true warns and falls back to defaults instead of throwing", async () => {
+  const repo = makeTempRepo();
+  fs.mkdirSync(path.join(repo, ".github"), { recursive: true });
+  // Write a config that fails strict schema validation (unknown key).
+  fs.writeFileSync(path.join(repo, ".github", "pipeline.yml"), "unknown_key: bad-value\n", "utf8");
+
+  const binDir = makeFakeGhBin({ repoSlug: "acme/tolerate-invalid" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // Must not throw; must return a valid config using defaults.
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, tolerateInvalidConfig: true });
+    assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
+    assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
+    // Invalid file is preserved on disk.
+    const onDisk = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+    assert.equal(onDisk, "unknown_key: bad-value\n", "invalid config file must not be overwritten");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("CLI: `pipeline init` with invalid pre-existing .github/pipeline.yml ensures labels, preserves file, exits 0", () => {
+  const repo = makeTempRepo();
+  fs.mkdirSync(path.join(repo, ".github"), { recursive: true });
+  const invalidContent = "unknown_key: bad-value\n";
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  fs.writeFileSync(configPath, invalidContent, "utf8");
+
+  const logFile = path.join(tmpRoot, `gh-log-invalid-cfg-${Date.now()}.txt`);
+  const binDir = makeFakeGhBin({ repoSlug: "acme/invalid-cfg-init", logFile });
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "init", "--repo-path", repo],
+    {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      encoding: "utf8",
+    },
+  );
+
+  // Must succeed despite the invalid config.
+  assert.equal(result.status, 0, `CLI exited non-zero with invalid config; stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  // Must have called label list + create (ensurePipelineLabels ran).
+  const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+  assert.ok(log.includes("label list"), `expected label list in gh log; got:\n${log}`);
+  assert.ok(log.includes("label create"), `expected label create in gh log; got:\n${log}`);
+  // Invalid file must be preserved (not overwritten by scaffold).
+  assert.equal(fs.readFileSync(configPath, "utf8"), invalidContent, "invalid config file must be preserved");
 });
