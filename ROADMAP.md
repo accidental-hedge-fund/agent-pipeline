@@ -40,12 +40,12 @@ Single source of truth for the execution order of the open backlog. Last updated
 2. **#74** — Stamp test-fix-loop commits with `Issue:`/`Pipeline-Run:` trailers. *Closes the one commit path #20's audit invariant misses (surfaced by #68).*
 3. **#75** — Harness regenerates the `plugin/` mirror after editing `core/`. *Root-cause for the recurring first-attempt test-gate retry; the #61 follow-up.*
 4. **#76** — `--status` resolves an issue's PR by closing-reference/branch, not loose body-text match. *Cosmetic but misleading.*
-5. **#57** — Upgrade `review_standard`/`review_adversarial` prompts to world-class (severity rubric, confidence calibration, few-shot, diff-scoping). *Quality is a taste call — confirm direction or accept the pipeline's take.*
+5. **#70** — Per-step model configuration. *Decision-complete (2026-06-09): adds `implementing` + `docs` slots → final list `planning`/`implementing`/`review`/`fix`/`docs`, with startup validation of model identifiers.*
+6. **#57** — Upgrade `review_standard`/`review_adversarial` prompts to world-class (severity rubric, confidence calibration, few-shot, diff-scoping). *Quality is a taste call — confirm direction or accept the pipeline's take.*
 
-### Tier 2 — one decision away, then runnable
+### Special — decision-complete, NOT a standard `/pipeline` run
 
-- **#70** — Per-step model configuration. *Decide: is the `docs` step a 5th model slot, or does it inherit `fix`?*
-- **#38** — Back-populate OpenSpec baseline capability specs from existing code. *Decide authoring shape: write directly into `openspec/specs/` vs. model as an OpenSpec change.*
+- **#38** — Back-populate OpenSpec baseline capability specs from existing code. *Resolved (2026-06-09): author the baseline **directly into `openspec/specs/`** via a **reviewed agent pass** (per-spec fidelity check against the code), not the change→archive flow. Execute as a dedicated branch → PR → fidelity review; **do not add `pipeline:ready`**.*
 
 ### Tier 3 — architecture / research (need direction first)
 
