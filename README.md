@@ -228,6 +228,24 @@ review round for a fresh review (posting a `## Pipeline: Re-running review` comm
 rather than advancing. This guards against advancing on a stale approval and is
 always-on — there is no toggle.
 
+## Human plan feedback (during plan-review)
+
+When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan`
+issue comment and runs the reviewer harness against it. **Comments you leave on that
+plan before the revision step are folded into the revision** alongside the reviewer's
+feedback — so a human reading the plan can steer it without waiting for a separate
+approval gate. Any comment posted after the plan that doesn't start with a pipeline
+header (`## Implementation Plan`, `## Plan Review`, `## Pipeline:`, …) is treated as
+human input; the practical window is the reviewer-harness run (comments that land
+after the revision starts are picked up on the next trigger).
+
+The revised plan comment attributes contributors with a `**Human feedback from**:
+@login, …` line, and the revision **must** end with a `## Human Feedback
+Acknowledgement` section listing each commenter as `addressed — <reason>` or
+`declined — <reason>` — a revision missing it is **blocked**. With no human comments
+present, behavior is byte-for-byte identical to before (no extra section, no
+attribution line). The feature is a no-op when `plan_review` is disabled.
+
 ## Test/build gate (optional, default on)
 
 When `test_gate.enabled` (the default), the target repo's **own** test/build
