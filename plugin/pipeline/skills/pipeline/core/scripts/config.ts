@@ -81,6 +81,7 @@ export interface ResolveOptions {
   domainOverride?: string;  // --domain X (used as the "domain" name in logs)
   baseBranch?: string;      // --base
   profile?: string;         // shared-core profile name
+  tolerateInvalidConfig?: boolean; // warn + fall back to defaults instead of throwing on invalid config (used by init)
 }
 
 /**
@@ -127,9 +128,15 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         const errors = result.error.issues
           .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
           .join("; ");
-        throw new Error(`Invalid ${configPath}: ${errors}`);
+        if (opts.tolerateInvalidConfig) {
+          console.warn(`[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${errors}`);
+          // fileConfig stays as {} — all defaults apply
+        } else {
+          throw new Error(`Invalid ${configPath}: ${errors}`);
+        }
+      } else {
+        fileConfig = result.data;
       }
-      fileConfig = result.data;
     }
   }
 

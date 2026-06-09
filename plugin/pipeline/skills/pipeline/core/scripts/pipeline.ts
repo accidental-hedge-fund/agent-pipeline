@@ -77,6 +77,7 @@ async function main(): Promise<void> {
 
   const opts = cmd.opts<CliOpts>();
   const numArg = cmd.args[0];
+  const isInit = opts.init || numArg === "init";
 
   let cfg: PipelineConfig;
   try {
@@ -85,6 +86,9 @@ async function main(): Promise<void> {
       domainOverride: opts.domain,
       baseBranch: opts.base,
       profile: opts.profile,
+      // init must tolerate an invalid existing config: warn + fall back to defaults
+      // so label-ensure still runs and the file is preserved rather than blocked.
+      tolerateInvalidConfig: isInit,
     });
   } catch (err) {
     const e = err as Error;
@@ -97,7 +101,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (opts.init || numArg === "init") {
+  if (isInit) {
     await runInit(cfg);
     return;
   }
