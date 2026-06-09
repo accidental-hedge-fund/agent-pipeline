@@ -90,6 +90,7 @@ export async function enforceTestFixCommitFormat(
         ),
         description: "Test-fix commit message does not match prescribed format",
       },
+      requireTrailers: ["Issue", "Pipeline-Run"],
     },
     deps,
   );

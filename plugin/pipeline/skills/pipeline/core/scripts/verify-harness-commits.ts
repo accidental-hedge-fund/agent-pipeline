@@ -30,6 +30,17 @@ export interface VerifyConfig {
    * paths) are documentation-only — none may match the application-code deny-list.
    */
   docsOnly?: boolean;
+  /**
+   * When true, an empty commit range is not an error even when commit-based checks
+   * (issueNumber, messagePattern, requireTrailers) are configured. Use ONLY for
+   * steps whose spec explicitly allows no commits. Default: false (empty range blocks).
+   */
+  allowEmpty?: boolean;
+  /**
+   * Assert every file changed in `headBefore..HEAD` matches this allow-pattern.
+   * Files that do not match cause a block with the provided description.
+   */
+  pathConstraint?: { allowPattern: RegExp; description: string };
 }
 
 export interface VerifyDeps {
@@ -82,17 +93,27 @@ export function parseDirtyFiles(statusOutput: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Application-code deny-list (docs-only check)
+// Documentation allow-list (docs-only check)
 // ---------------------------------------------------------------------------
 
-const APP_CODE_DENY_PATTERNS: RegExp[] = [
-  /\.(ts|tsx|js|jsx|mts|mjs|cjs)$/,
-  /^(src|core|plugin)\//,
+const DOCS_ALLOW_PATTERNS: RegExp[] = [
+  /\.md$/i,
+  /\.txt$/i,
+  /\.rst$/i,
+  /\.adoc$/i,
+  /^docs\//i,
+  /^doc\//i,
+  // Common named documentation files without extension
+  /^(README|CHANGELOG|LICENSE|CONTRIBUTING|AUTHORS|NOTICE|CODEOWNERS|SECURITY)$/i,
 ];
 
-/** Returns true when the file path looks like application code (not documentation). Exported for tests. */
-export function isApplicationCodeFile(filePath: string): boolean {
-  return APP_CODE_DENY_PATTERNS.some((re) => re.test(filePath));
+/**
+ * Returns true when the file path looks like a documentation file.
+ * Used in docsOnly mode: any file NOT matching the allow-list is denied.
+ * Exported for tests.
+ */
+export function isDocumentationFile(filePath: string): boolean {
+  return DOCS_ALLOW_PATTERNS.some((re) => re.test(filePath));
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +138,19 @@ export async function verifyHarnessCommits(
   const getDirtyFiles = deps.gitDirtyFiles ?? defaultGitDirtyFiles;
 
   // Commit-based checks
-  if (config.issueNumber !== undefined || config.messagePattern || config.requireTrailers?.length) {
+  const requiresCommits =
+    config.issueNumber !== undefined || config.messagePattern || config.requireTrailers?.length;
+  if (requiresCommits) {
     const messages = await getMessages(wtPath, headBefore);
-    if (messages.length > 0) {
+    if (messages.length === 0) {
+      if (!config.allowEmpty) {
+        return {
+          ok: false,
+          reason:
+            "No commits found in the range; the harness was expected to produce at least one commit",
+        };
+      }
+    } else {
       if (config.issueNumber !== undefined) {
         const ref = `#${config.issueNumber}`;
         if (!messages.some((m) => m.includes(ref))) {
@@ -153,19 +184,29 @@ export async function verifyHarnessCommits(
     }
   }
 
-  // Docs-only file constraint
+  // Docs-only file constraint: allow-list approach — any file not matching
+  // a documentation pattern is denied (finding 4).
   if (config.docsOnly) {
     const [diffFiles, dirtyFiles] = await Promise.all([
       getDiffFiles(wtPath, headBefore),
       getDirtyFiles(wtPath),
     ]);
     const allFiles = [...new Set([...diffFiles, ...dirtyFiles])];
-    const denied = allFiles.filter(isApplicationCodeFile);
+    const denied = allFiles.filter((f) => !isDocumentationFile(f));
     if (denied.length > 0) {
       return {
         ok: false,
         reason: `Docs-update commit modified non-documentation files: ${denied.join(", ")}`,
       };
+    }
+  }
+
+  // Path constraint: every committed file must match the allow-pattern.
+  if (config.pathConstraint) {
+    const diffFiles = await getDiffFiles(wtPath, headBefore);
+    const denied = diffFiles.filter((f) => !config.pathConstraint!.allowPattern.test(f));
+    if (denied.length > 0) {
+      return { ok: false, reason: config.pathConstraint.description };
     }
   }
 
@@ -178,24 +219,58 @@ export async function verifyHarnessCommits(
 
 /**
  * Verify that the plan-revision harness output includes a machine-readable
- * `## Feedback Incorporated` section with at least one `[ADDRESSED]` or
- * `[DEFERRED]` item. Exported for direct unit testing.
+ * `## Feedback Incorporated` section with tagged bullet items, and optionally
+ * that the number of tagged items covers the count of feedback items given.
+ *
+ * @param stdout - Full stdout from the plan-revision harness.
+ * @param feedback - Optional: the reviewer feedback text. When provided, the
+ *   number of `[ADDRESSED]`/`[DEFERRED]` tags must be ≥ the number of
+ *   top-level items (numbered or bulleted) detected in the feedback.
  */
-export function verifyPlanRevisionOutput(stdout: string): VerifyResult {
-  if (!/^##\s+Feedback\s+Incorporated/im.test(stdout)) {
+export function verifyPlanRevisionOutput(stdout: string, feedback?: string): VerifyResult {
+  // 1. Locate the ## Feedback Incorporated section header.
+  const headerMatch = /^##\s+Feedback\s+Incorporated\b/im.exec(stdout);
+  if (!headerMatch) {
     return {
       ok: false,
       reason: "Plan revision output is missing required ## Feedback Incorporated section",
     };
   }
-  if (!/\[(ADDRESSED|DEFERRED)\]/i.test(stdout)) {
+
+  // 2. Extract section content: from after the header to the next level-2 section or end.
+  const afterHeader = stdout.slice(headerMatch.index + headerMatch[0].length);
+  const nextSection = afterHeader.search(/^##\s/m);
+  const sectionContent = nextSection >= 0 ? afterHeader.slice(0, nextSection) : afterHeader;
+
+  // 3. Require tagged bullet lines within the section (not just anywhere in stdout).
+  const taggedItems = sectionContent.match(/^\s*[-*]?\s*\[(ADDRESSED|DEFERRED)\]/gim) ?? [];
+  if (taggedItems.length === 0) {
     return {
       ok: false,
       reason:
         "Plan revision ## Feedback Incorporated section has no [ADDRESSED] or [DEFERRED] items",
     };
   }
+
+  // 4. When feedback is provided, require coverage proportional to feedback items.
+  if (feedback) {
+    const feedbackCount = countTopLevelItems(feedback);
+    if (feedbackCount > 0 && taggedItems.length < feedbackCount) {
+      return {
+        ok: false,
+        reason:
+          `Plan revision acknowledges only ${taggedItems.length} of ${feedbackCount} feedback items — each item must be tagged [ADDRESSED] or [DEFERRED]`,
+      };
+    }
+  }
+
   return { ok: true };
+}
+
+/** Count top-level numbered or bulleted items in reviewer feedback text. */
+function countTopLevelItems(text: string): number {
+  const lines = text.match(/^\s*(?:\*{0,2}\d+\.?\*{0,2}|[-*•])\s+\S/gm) ?? [];
+  return lines.length;
 }
 
 // ---------------------------------------------------------------------------
