@@ -166,18 +166,27 @@ immediately; the pipeline runs detached.
 
 #### c. Stream stage transitions via Monitor
 
-Arm a persistent Monitor anchored to the **resolved issue number** `<N>`.
-If you passed a PR number to `/pipeline`, the log will contain a line like
-`[pipeline] #<PR> is a PR → resolved to issue #<N>` — use that `<N>`:
+Arm a persistent Monitor. The **log path** always uses the original argument
+`<N>` from section b (the same file that was opened for writing). The
+**grep filter** uses the **resolved issue number** `<resolved-N>` — identical
+to `<N>` when you passed an issue directly; look for the line
+`[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` near the top of
+the log when you passed a PR:
 
 ```bash
 tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
-  "^\[pipeline\] #<N>: "
+  "^\[pipeline\] #<resolved-N>: "
 ```
 
-For example, monitoring issue 64:
+For example, `/pipeline 64` (issue passed directly, `<N>` = `<resolved-N>` = 64):
 ```bash
 tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
+  "^\[pipeline\] #64: "
+```
+
+`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100, `<resolved-N>` = 64):
+```bash
+tail -f /tmp/pipeline-<domain>-100.log | grep -E --line-buffered \
   "^\[pipeline\] #64: "
 ```
 
@@ -242,10 +251,10 @@ final summary inline by reading the tail of the log.
 
 #### f. Final summary
 
-Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` and surface
-inline: starting stage → ending stage, transitions made, wall-clock
-elapsed, PR URL if one was opened. Also send one final
-PushNotification with the terminal state.
+Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` (same path as
+section b — the original argument) and surface inline: starting stage →
+ending stage, transitions made, wall-clock elapsed, PR URL if one was
+opened. Also send one final PushNotification with the terminal state.
 
 ### 5. Modes that DON'T need this orchestration
 
