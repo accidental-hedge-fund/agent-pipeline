@@ -80,7 +80,7 @@ After each test-fix harness invocation within the test gate, the pipeline SHALL 
 
 ### Requirement: Docs-update step verifies docs-only file constraint
 
-After the docs-update harness completes and before pushing, the pipeline SHALL verify that no application code or test files appear in the set of changed files in `headBefore..HEAD`. The constraint is: every modified file path must match a documentation-file pattern and must NOT match the application-code deny-list (`src/`, `core/`, `plugin/`, `*.ts`, `*.js`, `*.json` outside of declared doc-example directories).
+After the docs-update harness completes and before pushing, the pipeline SHALL verify that no application code or test files appear in the set of changed files in `headBefore..HEAD` (or in the uncommitted dirty tree). The constraint is an allow-list: every modified file path must match a documentation-file pattern (`*.md`, `*.txt`, `*.rst`, `*.adoc`, paths under `docs/` or `doc/`, and extensionless named docs files such as `README`, `CHANGELOG`, `LICENSE`). Any path that does not match — application code, config such as `package.json`, or CI workflows — is denied.
 
 #### Scenario: Docs-update only touches documentation files
 
@@ -91,7 +91,7 @@ After the docs-update harness completes and before pushing, the pipeline SHALL v
 #### Scenario: Docs-update modifies application code — step blocks
 
 - **WHEN** the docs-update harness exits 0 and new commits exist on `headBefore..HEAD`
-- **AND** one or more modified file paths match the application-code deny-list
+- **AND** one or more modified file paths do not match any documentation-file pattern
 - **THEN** the step SHALL block with reason: `"Docs-update commit modified non-documentation files: <list>"`
 - **AND** SHALL NOT push the commits
 

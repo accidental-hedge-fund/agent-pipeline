@@ -14,7 +14,7 @@ records the enforcement status.
 | Step | Prompt Template | Machine-Checkable Invariants | Enforcement Added |
 |------|----------------|------------------------------|-------------------|
 | Planning (freeform) | `planning.md` | — | — |
-| Planning (OpenSpec) | `planning_openspec.md` | OpenSpec change created; structural validity | Pre-existing (`openspec validate`) |
+| Planning (OpenSpec) | `planning_openspec.md` | Exactly one OpenSpec change created; structural validity; authoring commits touch only `openspec/` | Pre-existing (`openspec validate`) + **Added (#68)** (singularity block + `openspec/`-only path constraint) |
 | Plan review | `plan_review.md` | Verdict structure | Pre-existing (structured output parse) |
 | Plan revision | `plan_revision.md` | `## Feedback Incorporated` section with `[ADDRESSED]`/`[DEFERRED]` items | **Added (#68)** |
 | Implementation | `implementing.md` | At least one commit references `#<issue_number>` | **Added (#68)** |
@@ -49,14 +49,15 @@ records the enforcement status.
 - Author exactly one OpenSpec change under `openspec/changes/<id>/`
 - Intent-only (no application code); commit the change artifacts
 
-**Machine-checkable invariants (pre-existing enforcement):**
-- Exactly one new change directory was created (`before`/`after` scan)
-- `openspec validate` passes on the new change
+**Machine-checkable invariants:**
+- Exactly one new change directory was created (`before`/`after` scan). Multiple new changes are a hard block (`enforceOpenspecChangeSingular`) rather than silently selecting the first (**#68, finding 3**)
+- The authoring harness committed (and left dirty) only files under `openspec/` — application code at the intent stage is blocked via a `pathConstraint` (**#68**)
+- `openspec validate` passes on the new change (pre-existing)
 
 **Judgmental properties (out of scope):**
 - Quality of the proposal intent, design choices, scope
 
-**Enforcement:** Pre-existing structural validation via `openspec.validateItem`.
+**Enforcement:** Pre-existing structural validation via `openspec.validateItem`, hardened by #68 with the singularity block (`enforceOpenspecChangeSingular`) and the `openspec/`-only path constraint (`verifyHarnessCommits` with `pathConstraint`).
 
 ---
 
@@ -163,10 +164,10 @@ Same structure as Fix Round 1, with pattern `fix: address review 2 findings (#<N
 - If docs changed: commit with message `docs: update documentation for #<issue_number>`
 
 **Machine-checkable invariants:**
-- No file in `headBefore..HEAD` or in the uncommitted dirty tree matches the application-code deny-list (`*.ts`, `*.tsx`, `*.js`, `*.jsx`, `*.mts`, `*.mjs`, `*.cjs`, paths under `src/`, `core/`, `plugin/`)
+- Every changed file in `headBefore..HEAD` **and** in the uncommitted dirty tree matches the documentation **allow-list**: `*.md`, `*.txt`, `*.rst`, `*.adoc`, paths under `docs/` or `doc/`, and extensionless named docs files (`README`, `CHANGELOG`, `LICENSE`, `CONTRIBUTING`, `AUTHORS`, `NOTICE`, `CODEOWNERS`, `SECURITY`). Any path that does not match is denied — application code, config (`package.json`, `tsconfig.json`), and CI workflows (`*.yml`) all block (#68 review-2 finding 4)
 - Every harness-produced commit (non-empty `headBefore..HEAD`) carries the message prefix `docs: update documentation for #<N>`
 
-**Enforcement added by #68:** `enforceDocsOnlyGate` blocks on application-code files in committed or uncommitted changes; `enforceDocsCommitMessageGate` blocks when harness-produced commits carry a wrong message prefix (#68 review-2 finding 3).
+**Enforcement added by #68:** `enforceDocsOnlyGate` blocks on any file outside the documentation allow-list in committed or uncommitted changes; `enforceDocsCommitMessageGate` blocks when harness-produced commits carry a wrong message prefix (#68 review-2 finding 3).
 
 **Judgmental properties (out of scope):**
 - Accuracy and completeness of the documentation updates
@@ -195,16 +196,18 @@ because they require reviewer judgment:
 
 All mechanical checks are implemented through `core/scripts/verify-harness-commits.ts`:
 
-- `verifyHarnessCommits(wtPath, headBefore, config, deps)` — shared git-log-based checker
-- `verifyPlanRevisionOutput(stdout)` — pure regex checker for stdout acknowledgement section
-- `isApplicationCodeFile(path)` — deny-list for docs-only constraint
+- `verifyHarnessCommits(wtPath, headBefore, config, deps)` — shared git-log-based checker (config supports `issueNumber`, `messagePattern`, `requireTrailers`, `docsOnly`, `pathConstraint`, and `allowEmpty`)
+- `verifyPlanRevisionOutput(stdout, feedback?)` — pure regex checker for the stdout acknowledgement section
+- `isDocumentationFile(path)` — allow-list predicate for the docs-only constraint (any non-matching file is denied)
 - `parseDirtyFiles(statusOutput)` — git porcelain parser
 
 Per-step gate functions delegate to the shared helper and are exported for direct unit testing:
-- `enforceImplCommitRef` (planning.ts)
+- `enforceImplCommitRef` (planning.ts) — implementation commit references the issue (used by both the freeform and OpenSpec paths)
+- `enforceOpenspecChangeSingular` (planning.ts) — exactly one new OpenSpec change directory
 - `enforceFixCommitGate` (fix.ts)
 - `enforceTestFixCommitFormat` (testgate.ts)
 - `enforceDocsOnlyGate` (pre_merge.ts)
+- `enforceDocsCommitMessageGate` (pre_merge.ts)
 
 ## Prior Pointwise Fixes Consistency
 
