@@ -93,6 +93,8 @@ export interface BuildPlanReviewArgs extends BuildPlanArgs {
   plan: string;
   reviewer: string;
   implementer: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildPlanReviewPrompt(a: BuildPlanReviewArgs): string {
@@ -107,6 +109,7 @@ export function buildPlanReviewPrompt(a: BuildPlanReviewArgs): string {
     plan: a.plan,
     reviewer: a.reviewer,
     implementer: a.implementer,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -115,6 +118,8 @@ export interface BuildPlanRevisionArgs extends BuildPlanArgs {
   feedback: string;
   reviewer: string;
   implementer: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
@@ -130,6 +135,7 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
     feedback: a.feedback,
     reviewer: a.reviewer,
     implementer: a.implementer,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -137,6 +143,8 @@ export interface BuildImplementingArgs extends BuildPlanArgs {
   plan: string;
   /** Pipeline run identifier for the commit traceability trailers (#20). */
   pipelineRunId: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildImplementingPrompt(a: BuildImplementingArgs): string {
@@ -150,6 +158,7 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     body: a.body || "(no description)",
     plan: a.plan,
     pipeline_run_id: a.pipelineRunId,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -207,6 +216,8 @@ export interface BuildFixArgs {
   fixRound: 1 | 2;
   /** Pipeline run identifier for the commit traceability trailers (#20). */
   pipelineRunId: string;
+  /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
+  specContext?: string;
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
@@ -217,6 +228,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     review_type: a.fixRound === 1 ? "standard" : "adversarial",
     review_findings: a.reviewFindings,
     pipeline_run_id: a.pipelineRunId,
+    spec_context: specContextSection(a.specContext),
   });
 }
 
@@ -276,6 +288,16 @@ function specSection(specContext?: string): string {
     "## OpenSpec — Intended Behavior (spec deltas)\n\n" +
     "The diff must satisfy these requirement changes. Flag any divergence from them.\n\n" +
     specContext.trim()
+  );
+}
+
+function specContextSection(specContext?: string): string {
+  if (!specContext || !specContext.trim()) return "";
+  return (
+    "\n## OpenSpec — Intended Behavior (spec deltas)\n\n" +
+    "This work must satisfy these requirement changes.\n\n" +
+    specContext.trim() +
+    "\n"
   );
 }
 

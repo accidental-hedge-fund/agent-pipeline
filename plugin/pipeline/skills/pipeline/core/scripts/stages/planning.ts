@@ -109,6 +109,7 @@ export async function advance(
   }
 
   // ---- Steps 3+4: secondary plan review + revision (skippable via steps.plan_review) ----
+  const specContext = openspec.openspecContext(cfg, cfg.repo_dir);
   let revisedPlan = plan;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
@@ -121,7 +122,7 @@ export async function advance(
     );
     preImplStage = "plan-review";
 
-    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary });
+    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary, specContext });
     const reviewResult = await invoke(reviewer, cfg.repo_dir, reviewPrompt, {
       timeoutSec: cfg.review_timeout,
       model: opts.model ?? cfg.models.review,
@@ -136,7 +137,7 @@ export async function advance(
     const planReview = reviewResult.stdout.trim();
     await postComment(cfg, issueNumber, `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
 
-    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary });
+    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, specContext });
     const revisionResult = await invoke(primary, cfg.repo_dir, revisionPrompt, {
       timeoutSec: cfg.implementation_timeout,
       model: opts.model ?? cfg.models.planning,
@@ -178,7 +179,7 @@ export async function advance(
   );
 
   // ---- Step 7: primary implementer harness ----
-  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId });
+  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, specContext });
   const result = await invoke(primary, wt.path, implPrompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model,
@@ -422,6 +423,7 @@ async function advanceOpenspec(
   }
 
   // ---- plan review + revision (skippable via steps.plan_review) ----
+  let specContext = openspec.readSpecDeltas(wt.path, changeId);
   let revisedProposal = proposal;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
@@ -436,7 +438,7 @@ async function advanceOpenspec(
     const reviewResult = await invoke(
       reviewer,
       wt.path,
-      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary }),
+      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary, specContext }),
       { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
     );
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
@@ -456,7 +458,7 @@ async function advanceOpenspec(
     const revisionResult = await invoke(
       primary,
       wt.path,
-      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary }),
+      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, specContext }),
       { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
     );
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
@@ -472,6 +474,8 @@ async function advanceOpenspec(
       return { advanced: false, status: "blocked", reason: "openspec change invalid after revision" };
     }
     revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || proposal;
+    // Recompute spec deltas: revision may have updated the spec files.
+    specContext = openspec.readSpecDeltas(wt.path, changeId);
     await postComment(
       cfg,
       issueNumber,
@@ -499,7 +503,7 @@ async function advanceOpenspec(
   const result = await invoke(
     primary,
     wt.path,
-    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId }),
+    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, specContext }),
     { timeoutSec: cfg.implementation_timeout, model: opts.model },
   );
   if (!result.success) {

@@ -18,6 +18,7 @@ import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import { makePipelineRunId } from "../traceability.ts";
+import { openspecContextFromDiff } from "../openspec.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
@@ -73,12 +74,22 @@ export async function advanceFix(
   // Capture HEAD before so we can detect non-commits.
   const headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
 
+  // Use branch-diff to identify the OpenSpec change this branch introduced rather
+  // than changes[0], which may be an unrelated pre-existing change in the worktree.
+  const branchDiff = await gitInWorktree(
+    wt.path,
+    ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+    { ignoreFailure: true },
+  );
+  const diffPaths = branchDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  const specContext = openspecContextFromDiff(cfg, wt.path, diffPaths);
   const prompt = buildFixPrompt({
     issueNumber,
     title: detail.title,
     reviewFindings: findings,
     fixRound: round,
     pipelineRunId,
+    specContext,
   });
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,

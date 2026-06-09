@@ -338,9 +338,11 @@ directory), the pipeline runs a spec-first flow:
   which the *other* harness plan-reviews as intent before any code is written. The
   change is validated structurally (`openspec validate <id>`) at draft and after
   revision, and implementation works the change's `tasks.md`.
-- **Review** — the change's spec deltas are fed into the standard and adversarial
-  review prompts as the intended behavior, so reviews check whether the diff
-  actually satisfies the spec, not just whether the code looks correct.
+- **Spec deltas as intended behavior** — once authored, the change's spec deltas
+  are injected into every harness step that acts on the change — plan-review,
+  plan-revision, implementing, the standard and adversarial review rounds, and the
+  fix rounds — so each step checks its work against the spec, not just whether the
+  code looks correct.
 - **Finalize (pre-merge)** — folds the change into the living specs
   (`openspec archive`, committed to the PR), then runs `openspec validate --all`
   and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
