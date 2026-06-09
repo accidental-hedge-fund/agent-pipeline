@@ -9,8 +9,12 @@ import assert from "node:assert/strict";
 import {
   buildResearchTopic,
   buildSetupHint,
+  formatHumanFeedback,
   gatherCarryForward,
+  HUMAN_FEEDBACK_ACK_HEADER,
+  revisedPlanHeader,
   sanitizeBodyForResearch,
+  validateHumanFeedbackAck,
   type CarryForwardDeps,
 } from "../scripts/stages/planning.ts";
 import type { BriefResult } from "../scripts/last30days.ts";
@@ -302,4 +306,72 @@ test("buildResearchTopic: body containing a hex API key has key redacted in outp
   const result = buildResearchTopic("Setup issue", body);
   assert.ok(!result.includes(hexKey), "hex key must not appear in the research topic");
   assert.ok(result.includes("[REDACTED]"));
+});
+
+// ---------------------------------------------------------------------------
+// Human plan feedback (#26) — formatHumanFeedback / revisedPlanHeader
+// ---------------------------------------------------------------------------
+
+test("formatHumanFeedback: undefined when there are no human comments", () => {
+  assert.equal(formatHumanFeedback([]), undefined);
+});
+
+test("formatHumanFeedback: renders @login: body blocks separated by blank lines", () => {
+  const out = formatHumanFeedback([
+    { author: "alice", body: "use the existing helper" },
+    { author: "bob", body: "handle the empty case too" },
+  ]);
+  assert.equal(out, "@alice: use the existing helper\n\n@bob: handle the empty case too");
+});
+
+test("revisedPlanHeader: includes **Human feedback from** line when humans commented", () => {
+  const lines = revisedPlanHeader("claude", "codex", [{ author: "alice" }, { author: "bob" }]);
+  assert.deepEqual(lines, [
+    "**Updated by**: claude",
+    "**Based on review by**: codex",
+    "**Human feedback from**: @alice, @bob",
+  ]);
+});
+
+test("revisedPlanHeader: dedupes repeat commenters", () => {
+  const lines = revisedPlanHeader("claude", "codex", [{ author: "alice" }, { author: "alice" }]);
+  assert.equal(lines[2], "**Human feedback from**: @alice");
+});
+
+test("revisedPlanHeader: header unchanged when no human comments", () => {
+  const lines = revisedPlanHeader("claude", "codex", []);
+  assert.deepEqual(lines, ["**Updated by**: claude", "**Based on review by**: codex"]);
+});
+
+// ---------------------------------------------------------------------------
+// validateHumanFeedbackAck (#26) — acknowledgement guard
+// ---------------------------------------------------------------------------
+
+test("validateHumanFeedbackAck: passes when there are no human comments (no ack required)", () => {
+  assert.equal(validateHumanFeedbackAck("Any revised plan content", []), true);
+});
+
+test("validateHumanFeedbackAck: passes when ack section is present and human comments exist", () => {
+  const plan = `## My Plan\n\nDo the thing.\n\n${HUMAN_FEEDBACK_ACK_HEADER}\n\n- @alice: addressed — implemented as suggested`;
+  assert.equal(validateHumanFeedbackAck(plan, [{ author: "alice" }]), true);
+});
+
+test("validateHumanFeedbackAck: fails when human comments exist but ack section is absent", () => {
+  const plan = "## My Plan\n\nDo the thing.";
+  assert.equal(validateHumanFeedbackAck(plan, [{ author: "alice" }]), false);
+});
+
+test("validateHumanFeedbackAck: fails when human comments exist and plan is empty", () => {
+  assert.equal(validateHumanFeedbackAck("", [{ author: "alice" }]), false);
+});
+
+test("validateHumanFeedbackAck: fails when ack text is present but heading is not an exact match", () => {
+  // Partial matches or alternate headings must not satisfy the guard.
+  const plan = "## My Plan\n\nHuman Feedback Acknowledgement (inline, not a heading)";
+  assert.equal(validateHumanFeedbackAck(plan, [{ author: "alice" }]), false);
+});
+
+test("validateHumanFeedbackAck: passes when there are multiple commenters and ack section is present", () => {
+  const plan = `## Steps\n\n1. thing\n\n${HUMAN_FEEDBACK_ACK_HEADER}\n\n- @alice: addressed\n- @bob: declined — out of scope`;
+  assert.equal(validateHumanFeedbackAck(plan, [{ author: "alice" }, { author: "bob" }]), true);
 });

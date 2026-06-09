@@ -13,6 +13,7 @@
 import {
   addLabel,
   createPr,
+  extractHumanPlanComments,
   getIssueDetail,
   getPrForIssue,
   postComment,
@@ -35,14 +36,23 @@ import {
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
+import {
+  verifyHarnessCommits,
+  verifyPlanRevisionOutput,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceOpts {
   dryRun?: boolean;
   /** Optional model override forwarded to harnesses that support it. */
   model?: string;
+  /** Dispatch-wide run id for the commit traceability trailers (#20). */
+  pipelineRunId?: string;
 }
 
 export async function advance(
@@ -60,6 +70,7 @@ export async function advance(
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: Harness = cfg.harnesses.reviewer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(`[pipeline] #${issueNumber}: planning (impl=${primary}, plan-review=${reviewer})`);
 
@@ -95,7 +106,8 @@ export async function advance(
 
   // ---- Step 2: post plan, transition ready → planning ----
   await transition(cfg, issueNumber, "ready", "planning", "Implementation plan generated.");
-  await postComment(cfg, issueNumber, `## Implementation Plan\n\n${plan}${footer(cfg)}`);
+  const planComment = `## Implementation Plan\n\n${plan}${footer(cfg)}`;
+  await postComment(cfg, issueNumber, planComment);
 
   // Tag the primary harness early for visibility in transition/blocker comments.
   try {
@@ -105,6 +117,7 @@ export async function advance(
   }
 
   // ---- Steps 3+4: secondary plan review + revision (skippable via steps.plan_review) ----
+  const specContext = openspec.openspecContext(cfg, cfg.repo_dir);
   let revisedPlan = plan;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
@@ -117,7 +130,7 @@ export async function advance(
     );
     preImplStage = "plan-review";
 
-    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary });
+    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary, specContext });
     const reviewResult = await invoke(reviewer, cfg.repo_dir, reviewPrompt, {
       timeoutSec: cfg.review_timeout,
       model: opts.model ?? cfg.models.review,
@@ -132,7 +145,14 @@ export async function advance(
     const planReview = reviewResult.stdout.trim();
     await postComment(cfg, issueNumber, `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
 
-    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary });
+    // #26: re-fetch comments so any human feedback left on the posted plan
+    // during the reviewer run flows into the revision alongside the reviewer's.
+    const humanComments = extractHumanPlanComments(
+      (await getIssueDetail(cfg, issueNumber)).comments,
+      planComment,
+    );
+
+    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
     const revisionResult = await invoke(primary, cfg.repo_dir, revisionPrompt, {
       timeoutSec: cfg.implementation_timeout,
       model: opts.model ?? cfg.models.planning,
@@ -144,8 +164,24 @@ export async function advance(
       await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
       return { advanced: false, status: "blocked", reason };
     }
+    // Verify the plan-revision output includes the required acknowledgement section (#68).
+    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
+    if (!ackCheck.ok) {
+      await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review");
+      return { advanced: false, status: "blocked", reason: ackCheck.reason };
+    }
     revisedPlan = revisionResult.stdout.trim();
-    await postComment(cfg, issueNumber, `## Revised Implementation Plan\n\n**Updated by**: ${primary}\n**Based on review by**: ${reviewer}\n\n${revisedPlan}${footer(cfg)}`);
+    if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
+      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
+      await setBlocked(cfg, issueNumber, reason, "plan-review");
+      return { advanced: false, status: "blocked", reason };
+    }
+    await postComment(
+      cfg,
+      issueNumber,
+      `## Revised Implementation Plan\n\n${revisedPlanHeader(primary, reviewer, humanComments).join("\n")}\n\n${revisedPlan}${footer(cfg)}`,
+    );
   } else {
     console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the original plan`);
   }
@@ -174,7 +210,10 @@ export async function advance(
   );
 
   // ---- Step 7: primary implementer harness ----
-  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan });
+  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, specContext });
+  const implHeadBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
   const result = await invoke(primary, wt.path, implPrompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model,
@@ -209,8 +248,17 @@ export async function advance(
     return { advanced: false, status: "blocked", reason: "no commits produced" };
   }
 
+  // ---- Verify implementation commit references the issue (#68) ----
+  if (implHeadBefore) {
+    const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
+    if (!implCheck.ok) {
+      await setBlocked(cfg, issueNumber, implCheck.reason, "implementing");
+      return { advanced: false, status: "blocked", reason: implCheck.reason };
+    }
+  }
+
   // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
@@ -301,6 +349,7 @@ async function advanceOpenspec(
   const { title, body } = detail;
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: Harness = cfg.harnesses.reviewer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(
     `[pipeline] #${issueNumber}: planning (OpenSpec; impl=${primary}, plan-review=${reviewer})`,
@@ -359,14 +408,19 @@ async function advanceOpenspec(
     await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
     await gitInWorktree(
       wt.path,
-      ["commit", "-m", `chore: openspec init for #${issueNumber}`],
+      ["commit", "-m", withTrailers(`chore: openspec init for #${issueNumber}`, issueNumber, pipelineRunId)],
       { ignoreFailure: true },
     );
   }
 
   // ---- Author the OpenSpec change (intent only, no code). ----
   const before = openspec.listChangeDirs(wt.path);
-  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward }), {
+  // Capture HEAD before authoring so we can verify committed artifacts afterward (#68).
+  const osAuthorHeadBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward, pipelineRunId }), {
+
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
   });
@@ -381,17 +435,36 @@ async function advanceOpenspec(
   // ---- Discover the change the implementer created. ----
   const after = openspec.listChangeDirs(wt.path);
   const fresh = after.filter((c) => !before.includes(c));
-  const changeId = fresh[0] ?? (after.length === 1 ? after[0] : undefined);
-  if (!changeId) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
-        "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`).",
-      "ready",
-    );
-    return { advanced: false, status: "blocked", reason: "no openspec change created" };
+  // Block on multiple new changes — silently selecting the first would hide a
+  // non-compliant authoring run (#68, finding 3).
+  const changeResult = enforceOpenspecChangeSingular(fresh, after);
+  if (!changeResult.ok) {
+    const blockMsg =
+      changeResult.reason === "no openspec change created"
+        ? "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
+          "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`)."
+        : changeResult.reason;
+    await setBlocked(cfg, issueNumber, blockMsg, "ready");
+    return { advanced: false, status: "blocked", reason: changeResult.reason };
   }
+  const changeId = changeResult.changeId;
+
+  // ---- Verify the authoring harness committed only openspec/ artifacts (#68). ----
+  if (osAuthorHeadBefore) {
+    const authorCheck = await verifyHarnessCommits(wt.path, osAuthorHeadBefore, {
+      issueNumber,
+      pathConstraint: {
+        allowPattern: /^openspec\//,
+        description:
+          "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+      },
+    });
+    if (!authorCheck.ok) {
+      await setBlocked(cfg, issueNumber, authorCheck.reason, "ready");
+      return { advanced: false, status: "blocked", reason: authorCheck.reason };
+    }
+  }
+
   console.log(`[pipeline] #${issueNumber}: OpenSpec change \`${changeId}\` drafted`);
 
   // ---- Validate the change structurally. ----
@@ -405,11 +478,8 @@ async function advanceOpenspec(
 
   // ---- ready → planning, post the proposal as the plan. ----
   await transition(cfg, issueNumber, "ready", "planning", `OpenSpec change \`${changeId}\` drafted by ${primary}.`);
-  await postComment(
-    cfg,
-    issueNumber,
-    `## Implementation Plan\n\n_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}${footer(cfg)}`,
-  );
+  const planComment = `## Implementation Plan\n\n_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}${footer(cfg)}`;
+  await postComment(cfg, issueNumber, planComment);
   try {
     await addLabel(cfg, issueNumber, `harness:${primary}`);
   } catch {
@@ -417,6 +487,7 @@ async function advanceOpenspec(
   }
 
   // ---- plan review + revision (skippable via steps.plan_review) ----
+  let specContext = openspec.readSpecDeltas(wt.path, changeId);
   let revisedProposal = proposal;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
@@ -431,7 +502,7 @@ async function advanceOpenspec(
     const reviewResult = await invoke(
       reviewer,
       wt.path,
-      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary }),
+      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary, specContext }),
       { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
     );
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
@@ -448,10 +519,15 @@ async function advanceOpenspec(
       `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`,
     );
 
+    // #26: pull in human comments left on the posted plan during the reviewer run.
+    const humanComments = extractHumanPlanComments(
+      (await getIssueDetail(cfg, issueNumber)).comments,
+      planComment,
+    );
     const revisionResult = await invoke(
       primary,
       wt.path,
-      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary }),
+      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext }),
       { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
     );
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
@@ -461,16 +537,30 @@ async function advanceOpenspec(
       await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
       return { advanced: false, status: "blocked", reason };
     }
+    // Verify the plan-revision output includes the required acknowledgement section (#68).
+    const osAckCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
+    if (!osAckCheck.ok) {
+      await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review");
+      return { advanced: false, status: "blocked", reason: osAckCheck.reason };
+    }
     const v2 = await openspec.validateItem(wt.path, changeId);
     if (!v2.unavailable && !v2.valid) {
       await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`, "plan-review");
       return { advanced: false, status: "blocked", reason: "openspec change invalid after revision" };
     }
     revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || proposal;
+    if (!validateHumanFeedbackAck(revisedProposal, humanComments)) {
+      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
+      await setBlocked(cfg, issueNumber, reason, "plan-review");
+      return { advanced: false, status: "blocked", reason };
+    }
+    // Recompute spec deltas: revision may have updated the spec files.
+    specContext = openspec.readSpecDeltas(wt.path, changeId);
     await postComment(
       cfg,
       issueNumber,
-      `## Revised Implementation Plan\n\n**Updated by**: ${primary}\n**Based on review by**: ${reviewer}\n_OpenSpec change \`${changeId}\`_\n\n${revisedProposal}${footer(cfg)}`,
+      `## Revised Implementation Plan\n\n${[...revisedPlanHeader(primary, reviewer, humanComments), `_OpenSpec change \`${changeId}\`_`].join("\n")}\n\n${revisedProposal}${footer(cfg)}`,
     );
   } else {
     console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the drafted change`);
@@ -491,10 +581,13 @@ async function advanceOpenspec(
     `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
     `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
     `${revisedProposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`;
+  const osImplHeadBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
   const result = await invoke(
     primary,
     wt.path,
-    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan }),
+    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, specContext }),
     { timeoutSec: cfg.implementation_timeout, model: opts.model },
   );
   if (!result.success) {
@@ -509,8 +602,17 @@ async function advanceOpenspec(
     await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing");
     return { advanced: false, status: "blocked", reason: "no commits produced" };
   }
+
+  // ---- Verify implementation commit references the issue (#68) ----
+  if (osImplHeadBefore) {
+    const osImplCheck = await enforceImplCommitRef(issueNumber, wt.path, osImplHeadBefore);
+    if (!osImplCheck.ok) {
+      await setBlocked(cfg, issueNumber, osImplCheck.reason, "implementing");
+      return { advanced: false, status: "blocked", reason: osImplCheck.reason };
+    }
+  }
   // ---- test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
@@ -557,6 +659,54 @@ async function advanceOpenspec(
     `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
   );
   return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
+}
+
+// ---------------------------------------------------------------------------
+// OpenSpec change-directory singularity gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates that the OpenSpec authoring harness produced exactly one new change
+ * directory. When `fresh` is empty (no new change) the `all` list is checked for
+ * a single pre-existing change (fallback for harnesses that modify rather than
+ * create). Multiple new changes are always a hard block.
+ *
+ * Returns `{ ok: true, changeId }` or `{ ok: false, reason }`. Exported for
+ * unit testing without mocking the full `advanceOpenspec` chain.
+ */
+export function enforceOpenspecChangeSingular(
+  fresh: string[],
+  all: string[],
+): { ok: true; changeId: string } | { ok: false; reason: string } {
+  if (fresh.length > 1) {
+    return {
+      ok: false,
+      reason: `OpenSpec authoring produced ${fresh.length} new changes (${fresh.join(", ")}) — expected exactly one`,
+    };
+  }
+  const changeId = fresh[0] ?? (all.length === 1 ? all[0] : undefined);
+  if (!changeId) {
+    return { ok: false, reason: "no openspec change created" };
+  }
+  return { ok: true, changeId };
+}
+
+// ---------------------------------------------------------------------------
+// Implementation-commit reference gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that at least one commit in `headBefore..HEAD` references the issue
+ * number. Exported so tests can exercise the gate without mocking the full
+ * `advance` call chain.
+ */
+export async function enforceImplCommitRef(
+  issueNumber: number,
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(wtPath, headBefore, { issueNumber }, deps);
 }
 
 function formatIssues(v: { issues: { item?: string; message: string }[]; raw: string }): string {
@@ -693,4 +843,57 @@ export async function gatherCarryForward(
 
 function footer(cfg: PipelineConfig): string {
   return `\n\n---\n${cfg.marker_footer}`;
+}
+
+// ---------------------------------------------------------------------------
+// Human plan feedback (#26)
+// ---------------------------------------------------------------------------
+
+/** Exact section heading the revised plan must contain when human comments are present. */
+export const HUMAN_FEEDBACK_ACK_HEADER = "## Human Feedback Acknowledgement";
+
+/**
+ * Returns `true` when no acknowledgement is required (no human comments) or when
+ * the revised plan contains the required acknowledgement section header.
+ * Returns `false` when human comments were present but the section is missing —
+ * the caller must block or reject the revision. Exported for tests.
+ */
+export function validateHumanFeedbackAck(
+  revisedPlan: string,
+  humanComments: { author: string }[],
+): boolean {
+  if (humanComments.length === 0) return true;
+  return revisedPlan.includes(HUMAN_FEEDBACK_ACK_HEADER);
+}
+
+/**
+ * Render human comments left on the posted plan as `@login: body` blocks for the
+ * revision prompt's human-feedback section, or `undefined` when there are none
+ * (so `buildPlanRevisionPrompt` omits the section entirely). Exported for tests.
+ */
+export function formatHumanFeedback(
+  humanComments: { author: string; body: string }[],
+): string | undefined {
+  if (humanComments.length === 0) return undefined;
+  return humanComments.map((c) => `@${c.author}: ${c.body}`).join("\n\n");
+}
+
+/**
+ * Attribution lines for the `## Revised Implementation Plan` comment. Appends a
+ * `**Human feedback from**: @login, …` line (deduped) when human comments were
+ * incorporated; returns the base attribution unchanged when there were none, so
+ * the comment is byte-for-byte identical to today's on the no-feedback path.
+ * Exported for tests.
+ */
+export function revisedPlanHeader(
+  implementer: string,
+  reviewer: string,
+  humanComments: { author: string }[],
+): string[] {
+  const lines = [`**Updated by**: ${implementer}`, `**Based on review by**: ${reviewer}`];
+  if (humanComments.length > 0) {
+    const logins = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+    lines.push(`**Human feedback from**: ${logins}`);
+  }
+  return lines;
 }

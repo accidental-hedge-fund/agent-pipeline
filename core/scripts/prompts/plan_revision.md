@@ -16,7 +16,17 @@ Original implementation plan:
 
 Secondary harness plan-review feedback:
 {{feedback}}
-
+{{human_feedback}}{{spec_context}}
 Revise the implementation plan before coding. Incorporate valid feedback, resolve conflicts explicitly, and keep the plan surgical.
 
-Return only the final revised implementation plan in Markdown. Do not implement code yet.
+Before the revised plan, output a `## Feedback Incorporated` section that lists every piece of reviewer feedback and its disposition:
+
+```
+## Feedback Incorporated
+- [ADDRESSED] <brief description of what was changed>
+- [DEFERRED] <brief description> — reason: <why it was not incorporated>
+```
+
+Every reviewer feedback item MUST appear as either `[ADDRESSED]` or `[DEFERRED]`. Do not omit items.
+
+Then return the final revised implementation plan in Markdown. Do not implement code yet.

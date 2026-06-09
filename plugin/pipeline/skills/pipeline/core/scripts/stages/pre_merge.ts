@@ -24,8 +24,14 @@ import {
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildDocsUpdatePrompt } from "../prompts/index.ts";
+import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { extractReviewedSha } from "./review.ts";
 import * as openspec from "../openspec.ts";
+import {
+  verifyHarnessCommits,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
@@ -35,6 +41,8 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 export interface AdvancePreMergeOpts {
   dryRun?: boolean;
   model?: string;
+  /** Dispatch-wide run id for the commit traceability trailers (#20). */
+  pipelineRunId?: string;
 }
 
 export async function advance(
@@ -43,6 +51,8 @@ export async function advance(
   opts: AdvancePreMergeOpts = {},
 ): Promise<Outcome> {
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
+
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   const prNumber = await getPrForIssue(cfg, issueNumber);
   if (!prNumber) {
@@ -66,12 +76,16 @@ export async function advance(
   if (shaGate) return shaGate;
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber);
+  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId);
   if (archiveOutcome) return archiveOutcome;
 
   // ---- Step 1: docs update (once per PR; skippable via steps.docs) ----
   if (cfg.steps.docs && !(await docsAlreadyUpdated(cfg, issueNumber))) {
-    await updateDocs(cfg, issueNumber, prNumber, opts);
+    const docsViolation = await updateDocs(cfg, issueNumber, prNumber, pipelineRunId, opts);
+    if (docsViolation) {
+      await setBlocked(cfg, issueNumber, docsViolation.reason, "pre-merge");
+      return docsViolation;
+    }
     return {
       advanced: false,
       status: "waiting",
@@ -259,6 +273,53 @@ export function staleReviewNotice(reviewedSha: string | null, headSha: string): 
 }
 
 // ---------------------------------------------------------------------------
+// Docs-only file-constraint gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies that a docs-update harness only modified documentation files —
+ * no application code or test files. Checks both committed changes
+ * (`headBefore..HEAD`) and uncommitted dirty paths (which the stage will
+ * auto-commit). Returns `null` to proceed, or a blocked `VerifyResult` on
+ * violation. Exported so tests can exercise the gate without mocking the
+ * full `updateDocs` call chain.
+ */
+export async function enforceDocsOnlyGate(
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(wtPath, headBefore, { docsOnly: true }, deps);
+}
+
+/**
+ * Verifies that every harness-produced commit (in `headBefore..HEAD`) carries
+ * the expected docs commit message prefix. Uses `allowEmpty: true` so runs
+ * where the harness made no commits (dirty-only) are not blocked — the stage
+ * will auto-commit those with the correct message. Exported for direct testing.
+ * (#68 review-2 finding 3)
+ */
+export async function enforceDocsCommitMessageGate(
+  wtPath: string,
+  headBefore: string,
+  issueNumber: number,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(
+    wtPath,
+    headBefore,
+    {
+      messagePattern: {
+        pattern: new RegExp(`docs: update documentation for #${issueNumber}`, "i"),
+        description: `Docs harness committed with wrong message — expected prefix: "${DOCS_COMMIT_PREFIX}${issueNumber}"`,
+      },
+      allowEmpty: true,
+    },
+    deps,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Docs update
 // ---------------------------------------------------------------------------
 
@@ -280,10 +341,11 @@ async function updateDocs(
   cfg: PipelineConfig,
   issueNumber: number,
   prNumber: number,
+  pipelineRunId: string,
   opts: AdvancePreMergeOpts,
-): Promise<void> {
+): Promise<{ advanced: false; status: "blocked"; reason: string } | null> {
   const wt = await getForIssue(cfg, issueNumber);
-  if (!wt) return;
+  if (!wt) return null;
 
   const detail = await getIssueDetail(cfg, issueNumber);
   const harness = cfg.harnesses.implementer;
@@ -291,11 +353,15 @@ async function updateDocs(
   try {
     diff = await getPrDiff(cfg, prNumber);
   } catch {
-    return;
+    return null;
   }
-  if (!diff.trim()) return;
+  if (!diff.trim()) return null;
 
   console.log(`[pipeline] #${issueNumber}: updating docs (${harness})`);
+
+  const headBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
 
   const prompt = buildDocsUpdatePrompt({
     cfg,
@@ -311,7 +377,20 @@ async function updateDocs(
     console.log(
       `[pipeline] #${issueNumber}: docs update failed (${result.timed_out ? "timeout" : `exit ${result.exit_code}`}); skipping (non-blocking)`,
     );
-    return;
+    return null;
+  }
+
+  // Verify the harness only modified documentation files (#68).
+  if (headBefore) {
+    const docsCheck = await enforceDocsOnlyGate(wt.path, headBefore);
+    if (!docsCheck.ok) {
+      return { advanced: false, status: "blocked", reason: docsCheck.reason };
+    }
+    // Verify harness-produced commit messages match the expected docs prefix (#68 review-2 finding 3).
+    const msgCheck = await enforceDocsCommitMessageGate(wt.path, headBefore, issueNumber);
+    if (!msgCheck.ok) {
+      return { advanced: false, status: "blocked", reason: msgCheck.reason };
+    }
   }
 
   const status = await gitInWorktree(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
@@ -319,14 +398,14 @@ async function updateDocs(
     // Empty marker commit so we don't re-run docs next cycle.
     await gitInWorktree(
       wt.path,
-      ["commit", "--allow-empty", "-m", `${DOCS_COMMIT_PREFIX}${issueNumber}`],
+      ["commit", "--allow-empty", "-m", withTrailers(`${DOCS_COMMIT_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
       { ignoreFailure: true },
     );
   } else {
     await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
     await gitInWorktree(
       wt.path,
-      ["commit", "-m", `${DOCS_COMMIT_PREFIX}${issueNumber}`],
+      ["commit", "-m", withTrailers(`${DOCS_COMMIT_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
       { ignoreFailure: true },
     );
   }
@@ -334,6 +413,7 @@ async function updateDocs(
   const branch = branchName(issueNumber, wt.slug);
   await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
   console.log(`[pipeline] #${issueNumber}: docs pushed; CI will re-run`);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +430,7 @@ async function updateDocs(
 async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
   issueNumber: number,
+  pipelineRunId: string,
 ): Promise<Outcome | null> {
   const wt = await getForIssue(cfg, issueNumber);
   if (!wt || !openspec.isActive(cfg, wt.path)) return null;
@@ -386,7 +467,7 @@ async function maybeArchiveOpenspec(
   if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
   await gitInWorktree(
     wt.path,
-    ["commit", "-m", `${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`],
+    ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
     { ignoreFailure: true },
   );
   const push = await gitInWorktree(wt.path, ["push", "origin", branchName(issueNumber, wt.slug)], {
