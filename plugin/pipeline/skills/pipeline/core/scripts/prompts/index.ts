@@ -122,7 +122,7 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
   const dc = domainContext(a.cfg);
   const humanFeedback =
     a.humanFeedback && a.humanFeedback.trim()
-      ? `\nHuman comments on the plan:\n\n${a.humanFeedback.trim()}\n`
+      ? `\nHuman comments on the plan:\n\n${a.humanFeedback.trim()}\n\nIncorporate the human comments above. Note which feedback you addressed or why you declined it.\n`
       : "";
   return substitute(loadTemplate("plan_revision"), {
     domain_name: dc.name,
