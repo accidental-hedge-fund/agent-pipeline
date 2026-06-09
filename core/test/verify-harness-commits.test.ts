@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  isApplicationCodeFile,
+  isDocumentationFile,
   parseDirtyFiles,
   verifyHarnessCommits,
   verifyPlanRevisionOutput,
@@ -37,47 +37,51 @@ test("parseDirtyFiles: multiple lines", () => {
 });
 
 // ---------------------------------------------------------------------------
-// isApplicationCodeFile — pure
+// isDocumentationFile — pure (allow-list approach for docsOnly, finding 4)
 // ---------------------------------------------------------------------------
 
-test("isApplicationCodeFile: .ts file is application code", () => {
-  assert.equal(isApplicationCodeFile("core/scripts/foo.ts"), true);
+test("isDocumentationFile: .md file is documentation", () => {
+  assert.equal(isDocumentationFile("README.md"), true);
 });
 
-test("isApplicationCodeFile: .js file is application code", () => {
-  assert.equal(isApplicationCodeFile("src/index.js"), true);
+test("isDocumentationFile: CLAUDE.md is documentation", () => {
+  assert.equal(isDocumentationFile("CLAUDE.md"), true);
 });
 
-test("isApplicationCodeFile: .tsx file is application code", () => {
-  assert.equal(isApplicationCodeFile("src/App.tsx"), true);
+test("isDocumentationFile: docs/guide.md is documentation", () => {
+  assert.equal(isDocumentationFile("docs/guide.md"), true);
 });
 
-test("isApplicationCodeFile: file under src/ is application code", () => {
-  assert.equal(isApplicationCodeFile("src/utils/helpers.md"), true);
+test("isDocumentationFile: file under docs/ is documentation", () => {
+  assert.equal(isDocumentationFile("docs/api-reference.txt"), true);
 });
 
-test("isApplicationCodeFile: file under core/ is application code", () => {
-  assert.equal(isApplicationCodeFile("core/README.md"), true);
+test("isDocumentationFile: named LICENSE file (no extension) is documentation", () => {
+  assert.equal(isDocumentationFile("LICENSE"), true);
 });
 
-test("isApplicationCodeFile: file under plugin/ is application code", () => {
-  assert.equal(isApplicationCodeFile("plugin/pipeline/skills/pipeline/foo.ts"), true);
+test("isDocumentationFile: named CHANGELOG file is documentation", () => {
+  assert.equal(isDocumentationFile("CHANGELOG"), true);
 });
 
-test("isApplicationCodeFile: .md file is NOT application code", () => {
-  assert.equal(isApplicationCodeFile("README.md"), false);
+test("isDocumentationFile: .ts file is NOT documentation → denied in docs-only mode", () => {
+  assert.equal(isDocumentationFile("core/scripts/foo.ts"), false);
 });
 
-test("isApplicationCodeFile: CLAUDE.md is NOT application code", () => {
-  assert.equal(isApplicationCodeFile("CLAUDE.md"), false);
+test("isDocumentationFile: .js file is NOT documentation", () => {
+  assert.equal(isDocumentationFile("src/index.js"), false);
 });
 
-test("isApplicationCodeFile: docs/guide.md is NOT application code", () => {
-  assert.equal(isApplicationCodeFile("docs/guide.md"), false);
+test("isDocumentationFile: .yaml workflow file is NOT documentation → denied (finding 4)", () => {
+  assert.equal(isDocumentationFile(".github/workflows/ci.yml"), false);
 });
 
-test("isApplicationCodeFile: .yaml file is NOT application code", () => {
-  assert.equal(isApplicationCodeFile(".github/pipeline.yml"), false);
+test("isDocumentationFile: package.json is NOT documentation → denied (finding 4)", () => {
+  assert.equal(isDocumentationFile("package.json"), false);
+});
+
+test("isDocumentationFile: config JSON outside doc-examples is NOT documentation (finding 4)", () => {
+  assert.equal(isDocumentationFile("tsconfig.json"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -115,8 +119,14 @@ test("issueNumber: no commit contains the reference → blocked", async () => {
   assert.ok("reason" in result && result.reason.includes("#42"), `reason: ${JSON.stringify(result)}`);
 });
 
-test("issueNumber: empty range (no commits) → ok (empty range is not a violation)", async () => {
+test("issueNumber: empty range (no commits) → blocked (harness produced nothing, finding 1)", async () => {
   const result = await verifyHarnessCommits("/wt", "abc", { issueNumber: 42 }, msgsDeps([]));
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("at least one commit"));
+});
+
+test("issueNumber: empty range with allowEmpty → ok (explicit opt-out, finding 1)", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", { issueNumber: 42, allowEmpty: true }, msgsDeps([]));
   assert.equal(result.ok, true);
 });
 
@@ -164,14 +174,15 @@ test("messagePattern: case-insensitive match → ok", async () => {
   assert.equal(result.ok, true);
 });
 
-test("messagePattern: empty range → ok (no violation)", async () => {
+test("messagePattern: empty range → blocked (harness produced nothing, finding 1)", async () => {
   const result = await verifyHarnessCommits("/wt", "abc", {
     messagePattern: {
       pattern: /fix: address review 1 findings \(#1\)/i,
       description: "mismatch",
     },
   }, msgsDeps([]));
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("at least one commit"));
 });
 
 // ---------------------------------------------------------------------------
@@ -198,11 +209,12 @@ test("requireTrailers: commit missing a trailer → blocked", async () => {
   assert.ok("reason" in result && result.reason.includes('"Issue:"'));
 });
 
-test("requireTrailers: empty range → ok", async () => {
+test("requireTrailers: empty range → blocked (harness produced nothing, finding 1)", async () => {
   const result = await verifyHarnessCommits("/wt", "abc", {
     requireTrailers: ["Issue"],
   }, msgsDeps([]));
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("at least one commit"));
 });
 
 // ---------------------------------------------------------------------------
@@ -256,6 +268,63 @@ test("docsOnly: combination of doc and app code → blocked, lists denied file",
   assert.ok("reason" in result && result.reason.includes("src/main.ts") && !result.reason.includes("README.md"));
 });
 
+test("docsOnly: package.json in committed files → blocked (finding 4)", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", { docsOnly: true },
+    filesDeps(["README.md", "package.json"], []));
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("package.json"));
+});
+
+test("docsOnly: workflow config file → blocked (finding 4)", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", { docsOnly: true },
+    filesDeps([".github/workflows/ci.yml"], []));
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("ci.yml"));
+});
+
+// ---------------------------------------------------------------------------
+// verifyHarnessCommits — pathConstraint check (finding 3)
+// ---------------------------------------------------------------------------
+
+function diffFilesDeps(diffFiles: string[]): VerifyDeps {
+  return {
+    gitMessages: async () => [],
+    gitDiffFiles: async () => diffFiles,
+    gitDirtyFiles: async () => [],
+  };
+}
+
+test("pathConstraint: all committed files under allowed prefix → ok", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", {
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "committed files outside openspec/",
+    },
+  }, diffFilesDeps(["openspec/changes/abc/proposal.md", "openspec/changes/abc/tasks.md"]));
+  assert.equal(result.ok, true);
+});
+
+test("pathConstraint: file outside allowed prefix → blocked (finding 3)", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", {
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring committed non-openspec files",
+    },
+  }, diffFilesDeps(["openspec/changes/abc/proposal.md", "src/index.ts"]));
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("non-openspec files"));
+});
+
+test("pathConstraint: no committed files → ok (no violation)", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", {
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "committed files outside openspec/",
+    },
+  }, diffFilesDeps([]));
+  assert.equal(result.ok, true);
+});
+
 // ---------------------------------------------------------------------------
 // verifyPlanRevisionOutput — pure
 // ---------------------------------------------------------------------------
@@ -304,4 +373,71 @@ test("verifyPlanRevisionOutput: both ADDRESSED and DEFERRED items → ok", () =>
     "...",
   ].join("\n");
   assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
+test("verifyPlanRevisionOutput: tagged items only in plan body, not in section → blocked (finding 5)", () => {
+  const stdout = [
+    "## Summary",
+    "I [ADDRESSED] everything in the summary.",
+    "",
+    "## Feedback Incorporated",
+    "Considered all feedback carefully.",
+    "",
+    "## Plan",
+    "- [ADDRESSED] Implementation step",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("[ADDRESSED]"));
+});
+
+test("verifyPlanRevisionOutput: with feedback — fewer ack items than feedback items → blocked (finding 5)", () => {
+  const feedback = [
+    "**1.** Add commit format check",
+    "**2.** Add trailer validation",
+    "**3.** Tighten docs path check",
+  ].join("\n");
+  const stdout = [
+    "## Feedback Incorporated",
+    "- [ADDRESSED] commit format (#1)",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout, feedback);
+  assert.equal(result.ok, false);
+  assert.ok(
+    "reason" in result && result.reason.includes("acknowledges only 1 of 3"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
+test("verifyPlanRevisionOutput: with feedback — all items acknowledged → ok (finding 5)", () => {
+  const feedback = [
+    "**1.** Add commit format check",
+    "**2.** Add trailer validation",
+    "**3.** Tighten docs path check",
+  ].join("\n");
+  const stdout = [
+    "## Feedback Incorporated",
+    "- [ADDRESSED] commit format (#1)",
+    "- [ADDRESSED] trailer validation (#2)",
+    "- [DEFERRED] docs path check (#3) — reason: separate PR",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout, feedback), { ok: true });
+});
+
+test("verifyPlanRevisionOutput: with feedback — no detectable items in feedback → ok (no count enforcement)", () => {
+  const feedback = "The plan looks mostly fine. Consider tightening the docs check.";
+  const stdout = [
+    "## Feedback Incorporated",
+    "- [ADDRESSED] tightened docs check",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout, feedback), { ok: true });
 });

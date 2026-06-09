@@ -151,7 +151,7 @@ export async function advance(
       return { advanced: false, status: "blocked", reason };
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
-    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout);
+    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
     if (!ackCheck.ok) {
       await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review");
       return { advanced: false, status: "blocked", reason: ackCheck.reason };
@@ -390,6 +390,10 @@ async function advanceOpenspec(
 
   // ---- Author the OpenSpec change (intent only, no code). ----
   const before = openspec.listChangeDirs(wt.path);
+  // Capture HEAD before authoring so we can verify committed artifacts afterward (#68).
+  const osAuthorHeadBefore = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
   const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward }), {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
@@ -405,17 +409,36 @@ async function advanceOpenspec(
   // ---- Discover the change the implementer created. ----
   const after = openspec.listChangeDirs(wt.path);
   const fresh = after.filter((c) => !before.includes(c));
-  const changeId = fresh[0] ?? (after.length === 1 ? after[0] : undefined);
-  if (!changeId) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
-        "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`).",
-      "ready",
-    );
-    return { advanced: false, status: "blocked", reason: "no openspec change created" };
+  // Block on multiple new changes — silently selecting the first would hide a
+  // non-compliant authoring run (#68, finding 3).
+  const changeResult = enforceOpenspecChangeSingular(fresh, after);
+  if (!changeResult.ok) {
+    const blockMsg =
+      changeResult.reason === "no openspec change created"
+        ? "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
+          "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`)."
+        : changeResult.reason;
+    await setBlocked(cfg, issueNumber, blockMsg, "ready");
+    return { advanced: false, status: "blocked", reason: changeResult.reason };
   }
+  const changeId = changeResult.changeId;
+
+  // ---- Verify the authoring harness committed only openspec/ artifacts (#68). ----
+  if (osAuthorHeadBefore) {
+    const authorCheck = await verifyHarnessCommits(wt.path, osAuthorHeadBefore, {
+      issueNumber,
+      pathConstraint: {
+        allowPattern: /^openspec\//,
+        description:
+          "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+      },
+    });
+    if (!authorCheck.ok) {
+      await setBlocked(cfg, issueNumber, authorCheck.reason, "ready");
+      return { advanced: false, status: "blocked", reason: authorCheck.reason };
+    }
+  }
+
   console.log(`[pipeline] #${issueNumber}: OpenSpec change \`${changeId}\` drafted`);
 
   // ---- Validate the change structurally. ----
@@ -486,7 +509,7 @@ async function advanceOpenspec(
       return { advanced: false, status: "blocked", reason };
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
-    const osAckCheck = verifyPlanRevisionOutput(revisionResult.stdout);
+    const osAckCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
     if (!osAckCheck.ok) {
       await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review");
       return { advanced: false, status: "blocked", reason: osAckCheck.reason };
@@ -599,6 +622,36 @@ async function advanceOpenspec(
     `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
   );
   return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
+}
+
+// ---------------------------------------------------------------------------
+// OpenSpec change-directory singularity gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates that the OpenSpec authoring harness produced exactly one new change
+ * directory. When `fresh` is empty (no new change) the `all` list is checked for
+ * a single pre-existing change (fallback for harnesses that modify rather than
+ * create). Multiple new changes are always a hard block.
+ *
+ * Returns `{ ok: true, changeId }` or `{ ok: false, reason }`. Exported for
+ * unit testing without mocking the full `advanceOpenspec` chain.
+ */
+export function enforceOpenspecChangeSingular(
+  fresh: string[],
+  all: string[],
+): { ok: true; changeId: string } | { ok: false; reason: string } {
+  if (fresh.length > 1) {
+    return {
+      ok: false,
+      reason: `OpenSpec authoring produced ${fresh.length} new changes (${fresh.join(", ")}) — expected exactly one`,
+    };
+  }
+  const changeId = fresh[0] ?? (all.length === 1 ? all[0] : undefined);
+  if (!changeId) {
+    return { ok: false, reason: "no openspec change created" };
+  }
+  return { ok: true, changeId };
 }
 
 // ---------------------------------------------------------------------------

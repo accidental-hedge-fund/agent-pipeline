@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { enforceImplCommitRef } from "../scripts/stages/planning.ts";
+import { enforceImplCommitRef, enforceOpenspecChangeSingular } from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 
@@ -47,9 +47,10 @@ test("impl: no commit references the issue → blocked (4.1)", async () => {
   );
 });
 
-test("impl: empty commit range → ok (no commits = no violation)", async () => {
+test("impl: empty commit range → blocked (harness produced nothing, finding 1)", async () => {
   const result = await enforceImplCommitRef(68, "/wt", "abc", msgsDeps([]));
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("at least one commit"));
 });
 
 test("impl: wrong issue number in commits → blocked", async () => {
@@ -136,4 +137,44 @@ test("plan-revision ack: lowercase section header accepted (case-insensitive)", 
 test("plan-revision ack: item with lowercase tag accepted (case-insensitive)", () => {
   const stdout = "## Feedback Incorporated\n- [addressed] done\n## Plan\n...";
   assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// OpenSpec change singularity gate (finding 3)
+// ---------------------------------------------------------------------------
+
+test("openspec singularity: exactly one fresh change → ok (finding 3)", () => {
+  const result = enforceOpenspecChangeSingular(["change-abc"], ["change-abc"]);
+  assert.ok(result.ok);
+  if (result.ok) assert.equal(result.changeId, "change-abc");
+});
+
+test("openspec singularity: multiple fresh changes → blocked (finding 3)", () => {
+  const result = enforceOpenspecChangeSingular(
+    ["change-abc", "change-def"],
+    ["change-abc", "change-def"],
+  );
+  assert.equal(result.ok, false);
+  assert.ok(
+    !result.ok && result.reason.includes("2 new changes"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
+test("openspec singularity: no fresh, single pre-existing change → ok (fallback)", () => {
+  const result = enforceOpenspecChangeSingular([], ["change-abc"]);
+  assert.ok(result.ok);
+  if (result.ok) assert.equal(result.changeId, "change-abc");
+});
+
+test("openspec singularity: no fresh, no pre-existing → blocked", () => {
+  const result = enforceOpenspecChangeSingular([], []);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.reason.includes("no openspec change"));
+});
+
+test("openspec singularity: no fresh, multiple pre-existing → blocked (ambiguous)", () => {
+  const result = enforceOpenspecChangeSingular([], ["change-abc", "change-def"]);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.reason.includes("no openspec change"));
 });

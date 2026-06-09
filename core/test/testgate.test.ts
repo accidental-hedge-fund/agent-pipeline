@@ -69,12 +69,13 @@ function okInvoke(): HarnessResult {
 }
 
 /** Deps where every fix invocation looks like a clean commit (HEAD advances,
- *  tree clean) so the loop keeps iterating. */
-function cleanGitDeps(): Pick<TestGateDeps, "gitHead" | "gitDirty"> {
+ *  tree clean, commit format passes) so the loop keeps iterating. */
+function cleanGitDeps(): Pick<TestGateDeps, "gitHead" | "gitDirty" | "verifyTestFix"> {
   let n = 0;
   return {
     gitHead: async () => `head-${n++}`,
     gitDirty: async () => false,
+    verifyTestFix: async () => ({ ok: true }),
   };
 }
 

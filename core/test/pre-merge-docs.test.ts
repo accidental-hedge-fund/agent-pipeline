@@ -73,12 +73,13 @@ test("docs-only: only .md files modified → proceeds (4.8)", async () => {
   assert.equal(result.ok, true);
 });
 
-test("docs-only: .yaml config file modified → proceeds", async () => {
+test("docs-only: .yaml config file modified → blocked (finding 4: not a documentation file)", async () => {
   const result = await enforceDocsOnlyGate("/wt", "abc", filesDeps(
     [".github/pipeline.yml"],
     [],
   ));
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("pipeline.yml"));
 });
 
 test("docs-only: mix of doc files in committed and dirty → proceeds if none are app code", async () => {

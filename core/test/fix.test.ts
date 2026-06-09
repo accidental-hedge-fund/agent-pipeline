@@ -55,9 +55,10 @@ test("fix round 1: completely unrelated commit message → blocked", async () =>
   assert.equal(result.ok, false);
 });
 
-test("fix round 1: empty commit range → ok (no commits to validate)", async () => {
+test("fix round 1: empty commit range → blocked (harness produced nothing, finding 1)", async () => {
   const result = await enforceFixCommitGate(1, 42, "/wt", "abc", msgsDeps([]));
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("at least one commit"));
 });
 
 test("fix round 1: correct format for wrong round number → blocked", async () => {
