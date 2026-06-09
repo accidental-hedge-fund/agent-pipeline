@@ -21,5 +21,5 @@
 ## 5. Validate and commit
 
 - [x] 5.1 Run `openspec validate tighten-skillmd-monitor-filter` and fix any structural errors
-- [ ] 5.2 Commit all OpenSpec change artifacts (`openspec/changes/tighten-skillmd-monitor-filter/`) with a message referencing #64
-- [ ] 5.3 Commit the three SKILL.md edits referencing #64
+- [x] 5.2 Commit all OpenSpec change artifacts (`openspec/changes/tighten-skillmd-monitor-filter/`) with a message referencing #64
+- [x] 5.3 Commit the three SKILL.md edits referencing #64
