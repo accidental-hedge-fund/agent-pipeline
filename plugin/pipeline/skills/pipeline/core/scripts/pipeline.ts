@@ -97,14 +97,14 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (opts.init) {
+  if (opts.init || numArg === "init") {
     await runInit(cfg);
     return;
   }
 
   const number = Number.parseInt(numArg ?? "", 10);
   if (!Number.isFinite(number) || number <= 0) {
-    console.error(`pipeline: argument <number> is required (or use --cleanup or --init)`);
+    console.error(`pipeline: argument <number> is required (or use --cleanup, --init, or 'pipeline init')`);
     process.exit(2);
   }
 
