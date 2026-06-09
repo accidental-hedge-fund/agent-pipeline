@@ -200,7 +200,10 @@ test("plan_revision prompt: omits human feedback section when humanFeedback abse
     reviewer: "codex",
   });
   assert.doesNotMatch(out, /Human comments on the plan/);
+  assert.doesNotMatch(out, /human comments above/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  // Regression: no-feedback path must match the original revision instruction baseline
+  assert.match(out, /Incorporate valid feedback, resolve conflicts explicitly, and keep the plan surgical\./);
 });
 
 test("plan_revision prompt: includes formatted human comments when provided (#26)", () => {
@@ -218,6 +221,7 @@ test("plan_revision prompt: includes formatted human comments when provided (#26
   assert.match(out, /Human comments on the plan/);
   assert.match(out, /@alice: please use the existing helper/);
   assert.match(out, /REVIEW-FEEDBACK/);
+  assert.match(out, /Incorporate the human comments above/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
