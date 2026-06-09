@@ -21,6 +21,10 @@ This repo uses **OpenSpec** (spec-driven development). Create a new OpenSpec cha
 3. If you need the exact format for an artifact, run `openspec instructions proposal --change <name>` (and `specs`, `design`, `tasks`).
 4. Self-check with `openspec validate <name>` and fix every structural error until it passes.
 5. Commit everything under `openspec/changes/<name>/` with a message referencing #{{issue_number}}.
+   Append these two git trailers to the bottom of the commit message, after a blank line:
+
+       Issue: #{{issue_number}}
+       Pipeline-Run: {{pipeline_run_id}}
 
 ## Important
 - Capture INTENT (requirements / behavior), not code. No application code changes in this step.

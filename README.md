@@ -21,6 +21,8 @@ backlog → ready → planning → plan-review → implementing
 - [Troubleshooting](#troubleshooting)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
+  - [Human plan feedback](#human-plan-feedback)
+  - [Commit traceability trailers](#commit-traceability-trailers-always-on)
   - [Eval gate](#eval-gate)
   - [OpenSpec integration](#openspec-integration)
   - [last30days context](#last30days-context)
@@ -303,6 +305,23 @@ The structural and safety steps — planning, implementing, and the pre-merge **
 
 Review verdicts are also pinned to the commit they evaluated. Every review comment records the reviewed commit SHA — surfaced in the header (e.g. `— approve (commit a1b2c3d)`) and embedded as a machine-readable footer sentinel. Before pre-merge acts on a prior approval it re-checks that SHA against current HEAD: if any commit has landed since the review, the stale verdict is discarded and the item returns to its review round for a fresh review (posting a `## Pipeline: Re-running review` comment) rather than advancing. This is always-on — there is no toggle.
 
+### Human plan feedback
+
+When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs the reviewer harness against it. **Comments you leave on that plan before the revision step are folded into the revision** alongside the reviewer's feedback — so a human reading the plan can steer it without waiting for a separate approval gate. Any comment posted after the plan that doesn't start with a pipeline header (`## Implementation Plan`, `## Plan Review`, `## Pipeline:`, …) is treated as human input; the practical window is the reviewer-harness run (comments that land after the revision starts are picked up on the next trigger).
+
+The revised plan comment attributes contributors with a `**Human feedback from**: @login, …` line, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>` — a revision missing it is **blocked**. With no human comments present, behavior is byte-for-byte identical to before (no extra section, no attribution line). The feature is a no-op when `plan_review` is disabled.
+
+### Commit traceability trailers (always on)
+
+Every commit the pipeline produces is stamped with two git trailers tying it back to its origin — both the commits the pipeline writes directly (docs-update, OpenSpec init/archive) and the ones the implement/fix harnesses author:
+
+```
+Issue: #<n>
+Pipeline-Run: <n>/<UTC-ISO-datetime>
+```
+
+The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused for every commit in that run, so `git log --grep="Pipeline-Run: 42/"` surfaces all commits from every run on issue #42, and `git log --format="%(trailers:key=Issue)"` reads the issue link back via `git interpret-trailers`. The test/build gate enforces it: if a fix-harness commit lands without both trailers, the gate blocks rather than advancing. There is no toggle.
+
 ### Eval gate
 
 When `eval_gate.enabled` (default **off**), the target repo's eval harness runs **after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode, elapsed, output excerpt) is always recorded as an issue comment.
@@ -320,7 +339,7 @@ When disabled (the default), pre-merge advances straight to `ready-to-deploy` an
 If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/` directory), the pipeline runs a spec-first flow:
 
 - **Planning** — instead of a freeform plan, the implementer authors an OpenSpec change (`proposal.md`, `tasks.md`, spec deltas) under `openspec/changes/<id>/`, which the *other* harness plan-reviews as intent before any code is written. The change is validated structurally (`openspec validate <id>`) at draft and after revision, and implementation works the change's `tasks.md`.
-- **Review** — the change's spec deltas are fed into the standard and adversarial review prompts as the intended behavior, so reviews check whether the diff actually satisfies the spec, not just whether the code looks correct.
+- **Spec deltas as intended behavior** — once authored, the change's spec deltas are injected into every harness step that acts on the change — plan-review, plan-revision, implementing, the standard and adversarial review rounds, and the fix rounds — so each step checks its work against the spec, not just whether the code looks correct.
 - **Finalize (pre-merge)** — folds the change into the living specs (`openspec archive`, committed to the PR), then runs `openspec validate --all` and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
 
 It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to require OpenSpec everywhere or `off` to disable. By default the pipeline only uses OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have **planning run `openspec init`** on repos that lack an `openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing the pre-merge gate is skipped (non-blocking) and planning blocks with an install hint. No `openspec/` dir (and no bootstrap) means no behavior change.

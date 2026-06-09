@@ -17,11 +17,20 @@ import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import {
+  verifyHarnessCommits,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
+import { makePipelineRunId } from "../traceability.ts";
+import { openspecContextFromDiff } from "../openspec.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
   model?: string;
+  /** Dispatch-wide run id for the commit traceability trailers (#20). */
+  pipelineRunId?: string;
 }
 
 export async function advanceFix(
@@ -32,6 +41,7 @@ export async function advanceFix(
 ): Promise<Outcome> {
   const stage: Stage = round === 1 ? "fix-1" : "fix-2";
   const harness = cfg.harnesses.implementer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${harness}`);
 
@@ -69,11 +79,22 @@ export async function advanceFix(
   // Capture HEAD before so we can detect non-commits.
   const headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
 
+  // Use branch-diff to identify the OpenSpec change this branch introduced rather
+  // than changes[0], which may be an unrelated pre-existing change in the worktree.
+  const branchDiff = await gitInWorktree(
+    wt.path,
+    ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+    { ignoreFailure: true },
+  );
+  const diffPaths = branchDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  const specContext = openspecContextFromDiff(cfg, wt.path, diffPaths);
   const prompt = buildFixPrompt({
     issueNumber,
     title: detail.title,
     reviewFindings: findings,
     fixRound: round,
+    pipelineRunId,
+    specContext,
   });
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
@@ -99,8 +120,17 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: "no new commits" };
   }
 
+  // ---- Verify fix-round commit message format (#68) ----
+  if (headBefore) {
+    const commitCheck = await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
+    if (!commitCheck.ok) {
+      await setBlocked(cfg, issueNumber, commitCheck.reason, stage);
+      return { advanced: false, status: "blocked", reason: commitCheck.reason };
+    }
+  }
+
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage);
     return { advanced: false, status: "blocked", reason: "test gate failed" };
@@ -147,6 +177,38 @@ export async function advanceFix(
       summary: "fixes pushed",
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Fix-commit format gate — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the `VerifyDeps`-compatible config for a fix-round commit check and
+ * exposes the gate as a standalone injectable function so tests can exercise
+ * it without mocking the entire `advanceFix` call chain.
+ */
+export async function enforceFixCommitGate(
+  round: 1 | 2,
+  issueNumber: number,
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(
+    wtPath,
+    headBefore,
+    {
+      messagePattern: {
+        pattern: new RegExp(
+          `fix:\\s+address review ${round} findings \\(#${issueNumber}\\)`,
+          "i",
+        ),
+        description: `Fix round ${round} commit message does not match prescribed format`,
+      },
+    },
+    deps,
+  );
 }
 
 // ---- pure helpers ----

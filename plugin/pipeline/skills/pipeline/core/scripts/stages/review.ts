@@ -473,7 +473,7 @@ async function invokePromptHarnessReview(
   cwd: string,
   opts: AdvanceReviewOpts,
 ): Promise<HarnessResult> {
-  const specContext = openspecContext(cfg, cwd);
+  const specContext = openspec.openspecContext(cfg, cwd);
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
     : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, specContext });
@@ -481,13 +481,6 @@ async function invokePromptHarnessReview(
     timeoutSec: cfg.review_timeout,
     model: opts.model ?? cfg.models.review,
   });
-}
-
-/** OpenSpec spec deltas for the worktree's change, or "" when not applicable. */
-function openspecContext(cfg: PipelineConfig, cwd: string): string {
-  if (!openspec.isActive(cfg, cwd)) return "";
-  const changes = openspec.listChangeDirs(cwd);
-  return changes.length ? openspec.readSpecDeltas(cwd, changes[0]) : "";
 }
 
 // ---------------------------------------------------------------------------
