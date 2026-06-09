@@ -16,6 +16,7 @@ backlog → ready → planning → plan-review → implementing
 - [Quickstart](#quickstart)
 - [Install](#install)
 - [Usage](#usage)
+- [Onboarding a new repo](#onboarding-a-new-repo)
 - [Per-repo config](#per-repo-config-optional)
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Troubleshooting](#troubleshooting)
@@ -161,11 +162,30 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
+/pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
 ```
 
 The number is auto-detected as an issue or PR. PRs resolve to their linked closing issue; PRs with no `Closes #N` are refused. Items must carry a `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
 
 `--cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
+
+## Onboarding a new repo
+
+Before running the pipeline for the first time on a fresh repo, run `init` to create all pipeline labels and scaffold a starter config in one step:
+
+```bash
+/pipeline --init    # Claude Code primary
+$pipeline --init    # Codex primary
+```
+
+`init` does two things, idempotently:
+
+1. **Creates all pipeline labels** (`pipeline:<stage>`, `blocked`, `harness:claude`, `harness:codex`) in the target repo via `gh label create`. Labels that already exist are left untouched.
+2. **Writes `.github/pipeline.yml`** with all configurable keys at their default values. If the file already exists it is preserved and a notice is printed — `init` never clobbers an existing config.
+
+Safe to re-run: a second `init` on the same repo finds all labels present and the config file already there, and exits cleanly. A normal `/pipeline N` run still creates any missing labels as a side-effect even if you never ran `init` — `init` is additive, not a new precondition.
+
+After running `init`, commit `.github/pipeline.yml` (edit as needed), add `pipeline:ready` to an issue, and start the pipeline.
 
 ## Per-repo config (optional)
 

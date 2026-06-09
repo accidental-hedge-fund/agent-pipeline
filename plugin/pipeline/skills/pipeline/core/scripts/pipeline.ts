@@ -13,8 +13,9 @@
 // /tmp/pipeline-{domain}-{N}.lock) so multiple pipeline runs on different
 // issues coexist.
 
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { resolveConfig } from "./config.ts";
+import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
 import {
   addLabel,
   clearBlocked,
@@ -53,6 +54,7 @@ interface CliOpts {
   model?: string;
   profile?: string;
   cleanup?: boolean;
+  init?: boolean;
 }
 
 async function main(): Promise<void> {
@@ -62,6 +64,7 @@ async function main(): Promise<void> {
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
     .argument("[number]", "issue or PR number (required unless --cleanup)")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
+    .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--status", "read-only status; print stage and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option("--once", "advance one stage and stop")
@@ -75,6 +78,7 @@ async function main(): Promise<void> {
 
   const opts = cmd.opts<CliOpts>();
   const numArg = cmd.args[0];
+  const isInit = opts.init || numArg === "init";
 
   let cfg: PipelineConfig;
   try {
@@ -83,6 +87,9 @@ async function main(): Promise<void> {
       domainOverride: opts.domain,
       baseBranch: opts.base,
       profile: opts.profile,
+      // init must tolerate an invalid existing config: warn + fall back to defaults
+      // so label-ensure still runs and the file is preserved rather than blocked.
+      tolerateInvalidConfig: isInit,
     });
   } catch (err) {
     const e = err as Error;
@@ -95,9 +102,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (isInit) {
+    await runInit(cfg);
+    return;
+  }
+
   const number = Number.parseInt(numArg ?? "", 10);
   if (!Number.isFinite(number) || number <= 0) {
-    console.error(`pipeline: argument <number> is required (or use --cleanup)`);
+    console.error(`pipeline: argument <number> is required (or use --cleanup, --init, or 'pipeline init')`);
     process.exit(2);
   }
 
@@ -156,6 +168,21 @@ async function runCleanup(cfg: PipelineConfig): Promise<void> {
       console.log(`  - ${rec.branch}: ${reason}`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Init mode
+// ---------------------------------------------------------------------------
+
+export async function runInit(cfg: PipelineConfig): Promise<void> {
+  await ensurePipelineLabels(cfg);
+  const { created } = await scaffoldDefaultConfig(cfg.repo_dir);
+  if (created) {
+    console.log(`[pipeline] init: created .github/pipeline.yml with default configuration.`);
+  } else {
+    console.log(`[pipeline] init: .github/pipeline.yml already exists — skipping scaffold.`);
+  }
+  console.log(`[pipeline] init: pipeline labels ensured in ${cfg.repo}.`);
 }
 
 async function resolveIssueNumber(cfg: PipelineConfig, number: number): Promise<number> {
@@ -416,16 +443,18 @@ function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome): void
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Internal exports for tests (state-transition table tests).
 // ---------------------------------------------------------------------------
 
-export const _internals = { dispatch };
+export const _internals = { dispatch, runInit };
 
 // Suppress unused import warnings for test-only helpers.
 void addLabel;

@@ -46,6 +46,7 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline N --base <branch>              override base branch
 /pipeline N --repo-path <path>           target a different repo working tree
 /pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
+/pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
@@ -58,6 +59,13 @@ and deleting its local branch (the remote branch is never touched). It only
 considers `pipeline/<N>-<slug>` worktrees, and skips — reporting the reason — any
 that have uncommitted changes or a local HEAD that differs from the merged PR's
 commit. It is idempotent and prints a removed/skipped summary before exiting.
+
+`--init` also takes no number. It onboards a fresh repo in one step: ensures all
+pipeline labels via `ensurePipelineLabels` and scaffolds a commented
+`.github/pipeline.yml` with every key at its default (skipping the write, with a
+notice, if the file already exists). It is idempotent and additive — a normal
+`/pipeline N` run still self-creates any missing labels, so `init` is a
+convenience, not a precondition.
 
 ## Setup (zero install after first run)
 
@@ -262,6 +270,7 @@ opened. Also send one final PushNotification with the terminal state.
 - `--unblock "<answer>"` — one comment + label clear, completes in seconds
 - `--dry-run` — logs what would happen, no harness calls
 - `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
+- `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
 
 Run those synchronously, no Monitor, no background, no Push.
 
