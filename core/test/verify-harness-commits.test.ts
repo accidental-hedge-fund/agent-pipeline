@@ -420,7 +420,10 @@ test("verifyPlanRevisionOutput: tagged items only in plan body, not in section �
   assert.ok("reason" in result && result.reason.includes("[ADDRESSED]"));
 });
 
-test("verifyPlanRevisionOutput: with feedback — fewer ack items than feedback items → blocked (finding 5)", () => {
+test("verifyPlanRevisionOutput: fewer ack items than feedback bullets → ok with advisory warning, not blocked (#56 follow-up)", () => {
+  // The per-item coverage count is heuristic (it counts every bullet, including
+  // non-actionable notes), so a shortfall is surfaced as a warning rather than a
+  // hard block — the hard gate is the section + at least one tagged item.
   const feedback = [
     "**1.** Add commit format check",
     "**2.** Add trailer validation",
@@ -434,11 +437,42 @@ test("verifyPlanRevisionOutput: with feedback — fewer ack items than feedback 
     "...",
   ].join("\n");
   const result = verifyPlanRevisionOutput(stdout, feedback);
-  assert.equal(result.ok, false);
+  assert.equal(result.ok, true);
   assert.ok(
-    "reason" in result && result.reason.includes("acknowledges only 1 of 3"),
-    `unexpected reason: ${JSON.stringify(result)}`,
+    "warning" in result && (result.warning ?? "").includes("1 of 3"),
+    `expected an advisory coverage warning, got: ${JSON.stringify(result)}`,
   );
+});
+
+test("verifyPlanRevisionOutput: Risks/Checks bullets don't block when Required Changes are tagged (#56 regression)", () => {
+  // Live #56: plan-review had 4 Required Changes + 5 advisory Risks/Checks (9
+  // bullets total); the revision tagged the 4 actionable items. countTopLevelItems
+  // counts all 9, so coverage is "short" — but that must be advisory, not a block.
+  const feedback = [
+    "## Required Changes",
+    "- Resolve the type boundary",
+    "- Strengthen the drift guard",
+    "- Add a raw-template test",
+    "- Fix the verification commands",
+    "## Risks / Checks",
+    "- Check review.ts",
+    "- Verify rendered prompts",
+    "- Keep schema byte-equivalent",
+    "- No leftover placeholder",
+    "- Companion schema untouched",
+  ].join("\n");
+  const stdout = [
+    "## Feedback Incorporated",
+    "- **[ADDRESSED]** Resolve the type boundary",
+    "- **[ADDRESSED]** Strengthen the drift guard",
+    "- **[ADDRESSED]** Add a raw-template test",
+    "- **[ADDRESSED]** Fix the verification commands",
+    "",
+    "## Revised Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout, feedback);
+  assert.equal(result.ok, true);
 });
 
 test("verifyPlanRevisionOutput: with feedback — all items acknowledged → ok (finding 5)", () => {

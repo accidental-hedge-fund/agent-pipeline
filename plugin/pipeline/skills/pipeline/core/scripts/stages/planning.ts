@@ -170,6 +170,9 @@ export async function advance(
       await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review");
       return { advanced: false, status: "blocked", reason: ackCheck.reason };
     }
+    if (ackCheck.warning) {
+      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackCheck.warning}`);
+    }
     revisedPlan = revisionResult.stdout.trim();
     if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
@@ -542,6 +545,9 @@ async function advanceOpenspec(
     if (!osAckCheck.ok) {
       await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review");
       return { advanced: false, status: "blocked", reason: osAckCheck.reason };
+    }
+    if (osAckCheck.warning) {
+      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${osAckCheck.warning}`);
     }
     const v2 = await openspec.validateItem(wt.path, changeId);
     if (!v2.unavailable && !v2.valid) {
