@@ -13,7 +13,7 @@
 
 import { gitInWorktree } from "./worktree.ts";
 
-export type VerifyResult = { ok: true } | { ok: false; reason: string };
+export type VerifyResult = { ok: true; warning?: string } | { ok: false; reason: string };
 
 export interface VerifyConfig {
   /** Assert at least one new commit message (subject+body) contains `#<issueNumber>` */
@@ -261,14 +261,20 @@ export function verifyPlanRevisionOutput(stdout: string, feedback?: string): Ver
     };
   }
 
-  // 4. When feedback is provided, require coverage proportional to feedback items.
+  // 4. When feedback is provided, a coverage shortfall is ADVISORY (not a block).
+  //    `countTopLevelItems` is heuristic — it counts every bullet in the reviewer
+  //    feedback, including non-actionable "Risks / Checks" lines — so hard-blocking
+  //    on it false-blocks revisions that legitimately acknowledge only the
+  //    actionable "Required Changes". The hard gate is the presence of the section
+  //    plus at least one tagged item (checked above); coverage is surfaced as a
+  //    warning for the operator, not a blocker.
   if (feedback) {
     const feedbackCount = countTopLevelItems(feedback);
     if (feedbackCount > 0 && taggedItems.length < feedbackCount) {
       return {
-        ok: false,
-        reason:
-          `Plan revision acknowledges only ${taggedItems.length} of ${feedbackCount} feedback items — each item must be tagged [ADDRESSED] or [DEFERRED]`,
+        ok: true,
+        warning:
+          `Plan revision tags ${taggedItems.length} of ${feedbackCount} detected feedback bullets — confirm each required change was addressed (advisory; some bullets may be non-actionable notes)`,
       };
     }
   }
