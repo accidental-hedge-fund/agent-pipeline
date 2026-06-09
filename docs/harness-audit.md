@@ -21,7 +21,7 @@ records the enforcement status.
 | Fix round 1 | `fix.md` (round=1) | At least one commit matches `fix: address review 1 findings (#<N>)` | **Added (#68)** |
 | Fix round 2 | `fix.md` (round=2) | At least one commit matches `fix: address review 2 findings (#<N>)` | **Added (#68)** |
 | Test-fix loop | `test_fix.md` | At least one commit matches `fix: resolve test/build failures (#<N>)` | **Added (#68)** |
-| Docs update | `docs_update.md` | No application code files in committed/dirty changes; commit message `docs: update documentation for #<N>` | **Added (#68)** (file check); pre-existing (commit prefix via `docsAlreadyUpdated`) |
+| Docs update | `docs_update.md` | No application code files in committed/dirty changes; harness-produced commit message matches `docs: update documentation for #<N>` | **Added (#68)** (file check + commit message check) |
 | Review SHA gate | — | HEAD matches the reviewed commit SHA | Pre-existing (#16 / PR #63) |
 
 ---
@@ -148,6 +148,8 @@ Same structure as Fix Round 1, with pattern `fix: address review 2 findings (#<N
 
 **Enforcement added by #68:** `enforceTestFixCommitFormat` blocks on format mismatch; wired via `TestGateDeps.verifyTestFix`.
 
+**Note:** Trailers (`Issue:`, `Pipeline-Run:`) are not enforced here — the prompt does not prescribe them. The `verifyHarnessCommits` helper supports `requireTrailers` but this step does not use it (#68 review-2 finding 1).
+
 **Judgmental properties (out of scope):**
 - Whether the root cause was correctly identified
 - Fix quality and minimal scope
@@ -162,9 +164,9 @@ Same structure as Fix Round 1, with pattern `fix: address review 2 findings (#<N
 
 **Machine-checkable invariants:**
 - No file in `headBefore..HEAD` or in the uncommitted dirty tree matches the application-code deny-list (`*.ts`, `*.tsx`, `*.js`, `*.jsx`, `*.mts`, `*.mjs`, `*.cjs`, paths under `src/`, `core/`, `plugin/`)
-- Docs commit message prefix `docs: update documentation for #<N>` (pre-existing via `docsAlreadyUpdated` idempotency check)
+- Every harness-produced commit (non-empty `headBefore..HEAD`) carries the message prefix `docs: update documentation for #<N>`
 
-**Enforcement added by #68:** `enforceDocsOnlyGate` blocks on application-code files in committed or uncommitted changes.
+**Enforcement added by #68:** `enforceDocsOnlyGate` blocks on application-code files in committed or uncommitted changes; `enforceDocsCommitMessageGate` blocks when harness-produced commits carry a wrong message prefix (#68 review-2 finding 3).
 
 **Judgmental properties (out of scope):**
 - Accuracy and completeness of the documentation updates
@@ -209,5 +211,5 @@ Per-step gate functions delegate to the shared helper and are exported for direc
 | Prior fix | Invariant | Status in this PR |
 |-----------|-----------|-------------------|
 | #16 / PR #63 (review SHA gate) | HEAD matches reviewed commit | Unchanged; `enforceReviewShaGate` is a separate gate with its own DI, consistent with the general pattern |
-| #20 / PR #66 (test-fix trailers) | `Issue:` and `Pipeline-Run:` trailers | Not present in this branch prior to #68; `verifyHarnessCommits` supports `requireTrailers` config; no current prompt asks for trailers so it is not wired up — deferred until a prompt prescribes trailers |
+| #20 / PR #66 (test-fix trailers) | `Issue:` and `Pipeline-Run:` trailers | Deferred: `test_fix.md` does not prescribe trailers; `requireTrailers` removed from `enforceTestFixCommitFormat` to avoid blocking compliant output (#68 review-2 finding 1) |
 | #26 / PR #67 (plan-revision ack) | `## Feedback Incorporated` section | Implemented here via `verifyPlanRevisionOutput`; consistent with the general pattern |

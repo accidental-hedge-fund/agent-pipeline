@@ -90,7 +90,8 @@ export async function enforceTestFixCommitFormat(
         ),
         description: "Test-fix commit message does not match prescribed format",
       },
-      requireTrailers: ["Issue", "Pipeline-Run"],
+      // requireTrailers is intentionally absent: test_fix.md does not prescribe
+      // trailers, so the gate must not enforce them (#68 review-2 finding 1).
     },
     deps,
   );

@@ -25,18 +25,18 @@ function msgsDeps(messages: string[]): VerifyDeps {
 // enforceTestFixCommitFormat — gate isolation (4.5 / 4.6)
 // ---------------------------------------------------------------------------
 
-test("test-fix format: matching commit with trailers → proceeds (4.6)", async () => {
+test("test-fix format: matching commit → proceeds (4.6)", async () => {
   const result = await enforceTestFixCommitFormat(
     42, "/wt", "abc",
-    msgsDeps(["fix: resolve test/build failures (#42)\n\nIssue: #42\nPipeline-Run: run-123\n"]),
+    msgsDeps(["fix: resolve test/build failures (#42)\n"]),
   );
   assert.equal(result.ok, true);
 });
 
-test("test-fix format: case-insensitive match with trailers → proceeds", async () => {
+test("test-fix format: case-insensitive match → proceeds", async () => {
   const result = await enforceTestFixCommitFormat(
     42, "/wt", "abc",
-    msgsDeps(["Fix: Resolve Test/Build Failures (#42)\n\nIssue: #42\nPipeline-Run: run-456\n"]),
+    msgsDeps(["Fix: Resolve Test/Build Failures (#42)\n"]),
   );
   assert.equal(result.ok, true);
 });
@@ -73,48 +73,6 @@ test("test-fix format: wrong issue number → blocked", async () => {
     msgsDeps(["fix: resolve test/build failures (#99)\n"]),
   );
   assert.equal(result.ok, false);
-});
-
-// ---------------------------------------------------------------------------
-// enforceTestFixCommitFormat — trailer verification (finding 2)
-// ---------------------------------------------------------------------------
-
-test("test-fix trailers: matching subject + both trailers → ok (finding 2)", async () => {
-  const result = await enforceTestFixCommitFormat(
-    42, "/wt", "abc",
-    msgsDeps([
-      "fix: resolve test/build failures (#42)\n\nIssue: #42\nPipeline-Run: run-456\n",
-    ]),
-  );
-  assert.equal(result.ok, true);
-});
-
-test("test-fix trailers: matching subject but missing Issue trailer → blocked (finding 2)", async () => {
-  const result = await enforceTestFixCommitFormat(
-    42, "/wt", "abc",
-    msgsDeps([
-      "fix: resolve test/build failures (#42)\n\nPipeline-Run: run-456\n",
-    ]),
-  );
-  assert.equal(result.ok, false);
-  assert.ok(
-    "reason" in result && result.reason.includes('"Issue:"'),
-    `unexpected reason: ${JSON.stringify(result)}`,
-  );
-});
-
-test("test-fix trailers: matching subject but missing Pipeline-Run trailer → blocked (finding 2)", async () => {
-  const result = await enforceTestFixCommitFormat(
-    42, "/wt", "abc",
-    msgsDeps([
-      "fix: resolve test/build failures (#42)\n\nIssue: #42\n",
-    ]),
-  );
-  assert.equal(result.ok, false);
-  assert.ok(
-    "reason" in result && result.reason.includes('"Pipeline-Run:"'),
-    `unexpected reason: ${JSON.stringify(result)}`,
-  );
 });
 
 // ---------------------------------------------------------------------------

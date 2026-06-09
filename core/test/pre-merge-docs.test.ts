@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { enforceDocsOnlyGate } from "../scripts/stages/pre_merge.ts";
+import { enforceDocsCommitMessageGate, enforceDocsOnlyGate } from "../scripts/stages/pre_merge.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 
 function filesDeps(diffFiles: string[], dirtyFiles: string[]): VerifyDeps {
@@ -96,5 +96,51 @@ test("docs-only: mix of doc files in committed and dirty → proceeds if none ar
 
 test("docs-only: no committed changes, no dirty files → proceeds (4.9)", async () => {
   const result = await enforceDocsOnlyGate("/wt", "abc", filesDeps([], []));
+  assert.equal(result.ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// enforceDocsCommitMessageGate (#68 review-2 finding 3)
+// ---------------------------------------------------------------------------
+
+function msgsDeps(messages: string[]): VerifyDeps {
+  return {
+    gitMessages: async () => messages,
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+  };
+}
+
+test("docs commit message: correct prefix → ok", async () => {
+  const result = await enforceDocsCommitMessageGate("/wt", "abc", 42,
+    msgsDeps(["docs: update documentation for #42\n"]));
+  assert.equal(result.ok, true);
+});
+
+test("docs commit message: case-insensitive match → ok", async () => {
+  const result = await enforceDocsCommitMessageGate("/wt", "abc", 42,
+    msgsDeps(["Docs: Update Documentation For #42\n"]));
+  assert.equal(result.ok, true);
+});
+
+test("docs commit message: wrong prefix → blocked", async () => {
+  const result = await enforceDocsCommitMessageGate("/wt", "abc", 42,
+    msgsDeps(["chore: update docs (#42)\n"]));
+  assert.equal(result.ok, false);
+  assert.ok(
+    "reason" in result && result.reason.includes("docs: update documentation for #42"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
+test("docs commit message: wrong issue number → blocked", async () => {
+  const result = await enforceDocsCommitMessageGate("/wt", "abc", 42,
+    msgsDeps(["docs: update documentation for #99\n"]));
+  assert.equal(result.ok, false);
+});
+
+test("docs commit message: no harness commits (allowEmpty) → ok", async () => {
+  // Harness left dirty files; pipeline will commit. allowEmpty means no commits = ok.
+  const result = await enforceDocsCommitMessageGate("/wt", "abc", 42, msgsDeps([]));
   assert.equal(result.ok, true);
 });

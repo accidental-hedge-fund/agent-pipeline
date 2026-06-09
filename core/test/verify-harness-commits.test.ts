@@ -325,6 +325,35 @@ test("pathConstraint: no committed files → ok (no violation)", async () => {
   assert.equal(result.ok, true);
 });
 
+test("pathConstraint: dirty file outside allowed prefix → blocked (#68 review-2 finding 2)", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", {
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring committed non-openspec files",
+    },
+  }, {
+    gitMessages: async () => [],
+    gitDiffFiles: async () => ["openspec/changes/abc/proposal.md"],
+    gitDirtyFiles: async () => ["src/index.ts"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("non-openspec files"));
+});
+
+test("pathConstraint: dirty file within allowed prefix → ok", async () => {
+  const result = await verifyHarnessCommits("/wt", "abc", {
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "committed files outside openspec/",
+    },
+  }, {
+    gitMessages: async () => [],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => ["openspec/changes/abc/tasks.md"],
+  });
+  assert.equal(result.ok, true);
+});
+
 // ---------------------------------------------------------------------------
 // verifyPlanRevisionOutput — pure
 // ---------------------------------------------------------------------------
