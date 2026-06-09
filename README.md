@@ -352,19 +352,21 @@ If you prefer the reviewer to run through a third-party plugin — so it sees a 
 **Install the companion plugin** for your desired mode:
 
 ```bash
-# codex-companion — install codex-plugin-cc into Claude Code
+# codex-companion — install codex-plugin-cc into Claude Code (two steps)
 /plugin marketplace add openai/codex-plugin-cc
+/plugin install codex@openai-codex
 
 # claude-companion — install cc-plugin-codex into Codex
-npx skills add anthropics/cc-plugin-codex -g
+npx cc-plugin-codex install
 ```
 
-**Set the mode** in `.github/pipeline.yml`:
+**Set the mode** by editing the profile JSON for your host (`core/profiles/claude.json` or `core/profiles/codex.json`):
 
-```yaml
-# .github/pipeline.yml
-review_mode: codex-companion   # or: claude-companion
+```json
+{ "reviewMode": "codex-companion" }
 ```
+
+The `reviewMode` field is profile-level and is not configurable via `.github/pipeline.yml`.
 
 **Override the companion script path** (optional, for custom plugin installs):
 
