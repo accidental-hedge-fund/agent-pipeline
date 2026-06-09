@@ -44,3 +44,29 @@ export function makePipelineRunId(issueNumber: number, now: Date = new Date()): 
 export function withTrailers(message: string, issueNumber: number, pipelineRunId: string): string {
   return `${message}\n\n${ISSUE_TRAILER_KEY}: #${issueNumber}\n${RUN_TRAILER_KEY}: ${pipelineRunId}`;
 }
+
+/**
+ * Validate that every commit message in `messages` carries the required
+ * `Issue: #<issueNumber>` and `Pipeline-Run: <pipelineRunId>` trailers.
+ *
+ * Returns a blockReason string when any commit is missing either trailer, or
+ * `null` when all commits are compliant (or the list is empty — if the harness
+ * made no new commits there is nothing to validate).
+ */
+export function validateCommitTrailers(
+  messages: string[],
+  issueNumber: number,
+  pipelineRunId: string,
+): string | null {
+  const issueTrailer = `${ISSUE_TRAILER_KEY}: #${issueNumber}`;
+  const runTrailer = `${RUN_TRAILER_KEY}: ${pipelineRunId}`;
+  const missingCount = messages.filter(
+    (m) => !m.includes(issueTrailer) || !m.includes(runTrailer),
+  ).length;
+  if (missingCount === 0) return null;
+  return (
+    `${missingCount} commit(s) produced by the fix harness are missing required traceability ` +
+    `trailers (${ISSUE_TRAILER_KEY}: #${issueNumber} and/or ${RUN_TRAILER_KEY}: ${pipelineRunId}). ` +
+    "Every pipeline commit must carry both trailers for audit compliance."
+  );
+}
