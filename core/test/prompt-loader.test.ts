@@ -90,11 +90,25 @@ test("planning_openspec prompt: builds with all keys + OpenSpec guidance", () =>
     issueNumber: 7,
     title: "Add feature Y",
     body: "spec it",
+    pipelineRunId: "7/2026-06-08T14:32:00Z",
   });
   assert.match(out, /#7/);
   assert.match(out, /Add feature Y/);
   assert.match(out, /OpenSpec/);
   assert.match(out, /openspec\/changes/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("planning_openspec prompt: instructs the trailers with substituted issue + run id (#20)", () => {
+  const out = buildPlanningOpenspecPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 42,
+    title: "Some feature",
+    body: "body",
+    pipelineRunId: "42/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #42/);
+  assert.match(out, /Pipeline-Run: 42\/2026-06-08T14:32:00Z/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
@@ -195,8 +209,23 @@ test("implementing prompt: includes plan", () => {
     title: "Title",
     body: "Body",
     plan: "PLAN-CONTENT-XYZ",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
   });
   assert.match(out, /PLAN-CONTENT-XYZ/);
+});
+
+test("implementing prompt: instructs the trailers with substituted issue + run id (#20)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "p",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #100/);
+  assert.match(out, /Pipeline-Run: 100\/2026-06-08T14:32:00Z/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
 test("review_standard: includes plan + diff and the JSON schema", () => {
@@ -244,17 +273,32 @@ test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
     title: "t",
     reviewFindings: "FINDINGS-X",
     fixRound: 1,
+    pipelineRunId: "5/2026-06-08T14:32:00Z",
   });
   const r2 = buildFixPrompt({
     issueNumber: 5,
     title: "t",
     reviewFindings: "FINDINGS-X",
     fixRound: 2,
+    pipelineRunId: "5/2026-06-08T14:32:00Z",
   });
   assert.match(r1, /standard/);
   assert.match(r2, /adversarial/);
   assert.match(r1, /FINDINGS-X/);
   assert.match(r2, /FINDINGS-X/);
+});
+
+test("fix prompt: instructs the trailers with substituted issue + run id (#20)", () => {
+  const out = buildFixPrompt({
+    issueNumber: 5,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "5/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #5/);
+  assert.match(out, /Pipeline-Run: 5\/2026-06-08T14:32:00Z/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
 test("test_fix prompt: includes command, attempt counter, and failure output", () => {
@@ -264,11 +308,26 @@ test("test_fix prompt: includes command, attempt counter, and failure output", (
     attempt: 2,
     maxAttempts: 3,
     output: "FAIL-OUTPUT-XYZ",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
   });
   assert.match(out, /#15/);
   assert.match(out, /pnpm run test/);
   assert.match(out, /attempt 2 of 3/);
   assert.match(out, /FAIL-OUTPUT-XYZ/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("test_fix prompt: instructs the trailers with substituted issue + run id (#20)", () => {
+  const out = buildTestFixPrompt({
+    issueNumber: 15,
+    command: "npm test",
+    attempt: 1,
+    maxAttempts: 1,
+    output: "fail",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #15/);
+  assert.match(out, /Pipeline-Run: 15\/2026-06-08T14:32:00Z/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
@@ -279,6 +338,7 @@ test("test_fix prompt: large failure output is truncated", () => {
     attempt: 1,
     maxAttempts: 1,
     output: "y".repeat(20_000),
+    pipelineRunId: "1/2026-06-08T14:32:00Z",
   });
   assert.match(out, /diff truncated at 16KB/);
 });
@@ -291,6 +351,17 @@ test("docs_update prompt: contains diff", () => {
     diff: "DIFF-CONTENT",
   });
   assert.match(out, /DIFF-CONTENT/);
+});
+
+test("docs_update prompt: does not instruct harness to commit (#20)", () => {
+  const out = buildDocsUpdatePrompt({
+    cfg: dummyConfig(),
+    issueNumber: 99,
+    title: "T",
+    diff: "some diff",
+  });
+  assert.doesNotMatch(out, /commit with message/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
 test("review prompt: large diff is truncated", () => {

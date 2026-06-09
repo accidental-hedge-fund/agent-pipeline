@@ -228,6 +228,24 @@ review round for a fresh review (posting a `## Pipeline: Re-running review` comm
 rather than advancing. This guards against advancing on a stale approval and is
 always-on — there is no toggle.
 
+## Commit traceability trailers (always on)
+
+Every commit the pipeline produces is stamped with two git trailers tying it back
+to its origin — both the commits the pipeline writes directly (docs-update,
+OpenSpec init/archive) and the ones the implement/fix harnesses author:
+
+```
+Issue: #<n>
+Pipeline-Run: <n>/<UTC-ISO-datetime>
+```
+
+The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused for
+every commit in that run, so `git log --grep="Pipeline-Run: 42/"` surfaces all
+commits from every run on issue #42, and `git log --format="%(trailers:key=Issue)"`
+reads the issue link back via `git interpret-trailers`. The test/build gate
+enforces it: if a fix-harness commit lands without both trailers, the gate blocks
+rather than advancing. There is no toggle.
+
 ## Test/build gate (optional, default on)
 
 When `test_gate.enabled` (the default), the target repo's **own** test/build

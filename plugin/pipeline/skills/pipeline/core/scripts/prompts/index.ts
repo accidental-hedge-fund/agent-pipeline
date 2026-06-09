@@ -69,9 +69,13 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
   });
 }
 
+export interface BuildPlanningOpenspecArgs extends BuildPlanArgs {
+  pipelineRunId: string;
+}
+
 /** OpenSpec-mode planning: the implementer authors a change (proposal/tasks/
  *  spec deltas) instead of a freeform plan. */
-export function buildPlanningOpenspecPrompt(a: BuildPlanArgs): string {
+export function buildPlanningOpenspecPrompt(a: BuildPlanningOpenspecArgs): string {
   const dc = domainContext(a.cfg);
   return substitute(loadTemplate("planning_openspec"), {
     domain_name: dc.name,
@@ -81,6 +85,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     carry_forward_context: carryForwardSection(a.carryForward),
+    pipeline_run_id: a.pipelineRunId,
   });
 }
 
@@ -136,6 +141,8 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
 
 export interface BuildImplementingArgs extends BuildPlanArgs {
   plan: string;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
 }
@@ -150,6 +157,7 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     plan: a.plan,
+    pipeline_run_id: a.pipelineRunId,
     spec_context: specContextSection(a.specContext),
   });
 }
@@ -206,6 +214,8 @@ export interface BuildFixArgs {
   title: string;
   reviewFindings: string;
   fixRound: 1 | 2;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
 }
@@ -217,6 +227,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     fix_round: String(a.fixRound),
     review_type: a.fixRound === 1 ? "standard" : "adversarial",
     review_findings: a.reviewFindings,
+    pipeline_run_id: a.pipelineRunId,
     spec_context: specContextSection(a.specContext),
   });
 }
@@ -229,6 +240,8 @@ export interface BuildTestFixArgs {
   maxAttempts: number;
   /** Captured failure output from the test/build run. */
   output: string;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
 }
 
 export function buildTestFixPrompt(a: BuildTestFixArgs): string {
@@ -238,6 +251,7 @@ export function buildTestFixPrompt(a: BuildTestFixArgs): string {
     attempt: String(a.attempt),
     max_attempts: String(a.maxAttempts),
     test_output: truncateDiff(a.output, 16_000),
+    pipeline_run_id: a.pipelineRunId,
   });
 }
 

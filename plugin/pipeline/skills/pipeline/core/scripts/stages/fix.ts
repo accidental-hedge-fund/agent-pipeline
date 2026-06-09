@@ -17,12 +17,15 @@ import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { makePipelineRunId } from "../traceability.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
   model?: string;
+  /** Dispatch-wide run id for the commit traceability trailers (#20). */
+  pipelineRunId?: string;
 }
 
 export async function advanceFix(
@@ -33,6 +36,7 @@ export async function advanceFix(
 ): Promise<Outcome> {
   const stage: Stage = round === 1 ? "fix-1" : "fix-2";
   const harness = cfg.harnesses.implementer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${harness}`);
 
@@ -84,6 +88,7 @@ export async function advanceFix(
     title: detail.title,
     reviewFindings: findings,
     fixRound: round,
+    pipelineRunId,
     specContext,
   });
   const result = await invoke(harness, wt.path, prompt, {
@@ -111,7 +116,7 @@ export async function advanceFix(
   }
 
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage);
     return { advanced: false, status: "blocked", reason: "test gate failed" };
