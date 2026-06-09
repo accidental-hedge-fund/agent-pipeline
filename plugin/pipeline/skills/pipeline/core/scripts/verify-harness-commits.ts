@@ -249,7 +249,10 @@ export function verifyPlanRevisionOutput(stdout: string, feedback?: string): Ver
   const sectionContent = nextSection >= 0 ? afterHeader.slice(0, nextSection) : afterHeader;
 
   // 3. Require tagged bullet lines within the section (not just anywhere in stdout).
-  const taggedItems = sectionContent.match(/^\s*[-*]?\s*\[(ADDRESSED|DEFERRED)\]/gim) ?? [];
+  //    Tolerate a leading bullet and markdown emphasis around the tag — models
+  //    routinely render it as "- **[ADDRESSED]**" or "* _[DEFERRED]_". The match
+  //    stays anchored to line-start so prose mentions of "[ADDRESSED]" don't count.
+  const taggedItems = sectionContent.match(/^[\s>*_-]*\[(ADDRESSED|DEFERRED)\]/gim) ?? [];
   if (taggedItems.length === 0) {
     return {
       ok: false,

@@ -107,6 +107,36 @@ test("plan-revision ack: section present with both items → proceeds", () => {
   assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
 });
 
+test("plan-revision ack: bolded tags (- **[ADDRESSED]**) → proceeds (#56 regression)", () => {
+  // Models routinely bold the tag. The live #56 run emitted exactly this format
+  // and was wrongly blocked by an over-strict regex that didn't tolerate the **
+  // (or other markdown emphasis) between the bullet and the tag.
+  const stdout = [
+    "## Feedback Incorporated",
+    "",
+    "- **[ADDRESSED]** Resolve the commitSha type boundary",
+    "- **[ADDRESSED]** Strengthen the drift guard",
+    "- *[DEFERRED]* Refactor — reason: separate issue",
+    "",
+    "## Revised Implementation Plan",
+    "...",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
+test("plan-revision ack: bolded tags satisfy the feedback-coverage count (#56 regression)", () => {
+  const feedback = "1. First change\n2. Second change\n3. Third change";
+  const stdout = [
+    "## Feedback Incorporated",
+    "- **[ADDRESSED]** one",
+    "- **[ADDRESSED]** two",
+    "- **[DEFERRED]** three — reason: out of scope",
+    "",
+    "## Plan",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout, feedback), { ok: true });
+});
+
 test("plan-revision ack: section entirely absent → blocked (4.10)", () => {
   const result = verifyPlanRevisionOutput("## Revised Plan\n\nHere is the plan.");
   assert.equal(result.ok, false);
