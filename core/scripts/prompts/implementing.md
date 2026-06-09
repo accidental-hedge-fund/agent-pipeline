@@ -9,7 +9,7 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 ## Implementation Plan
 
 {{plan}}
-
+{{spec_context}}
 ## Instructions
 
 1. Read CLAUDE.md in this repo for full conventions.
@@ -18,6 +18,11 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 4. Write or update tests that cover the new or changed behavior, focusing on the smallest relevant suites for the touched surfaces.
 5. Run the relevant formatter, typecheck, and test commands already used by this repo's CI for the files you changed.
 6. Commit all changes with a descriptive message referencing #{{issue_number}}.
+   Append these two git trailers to the bottom of every commit message, after a
+   blank line (standard git trailer format):
+
+       Issue: #{{issue_number}}
+       Pipeline-Run: {{pipeline_run_id}}
 7. Do NOT push — the pipeline handles pushing after review.
 
 ## Important

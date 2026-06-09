@@ -15,6 +15,7 @@ import {
 } from "./harness.ts";
 import { gitInWorktree } from "./worktree.ts";
 import { buildTestFixPrompt } from "./prompts/index.ts";
+import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -55,6 +56,11 @@ export interface TestGateDeps {
   detectTestCommand?: (repoDir: string) => ParsedCommand | null;
   gitHead?: (cwd: string) => Promise<string>;
   gitDirty?: (cwd: string) => Promise<boolean>;
+  /** Return the full commit messages for every commit reachable from HEAD but
+   *  not from `baseRef`. Used to validate traceability trailers on commits the
+   *  fix harness creates. Returns [] when `baseRef` equals HEAD (no new commits)
+   *  or when the git command fails (non-git directory). */
+  gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
 }
 
 const MAX_BLOCK_OUTPUT = 8000;
@@ -79,6 +85,11 @@ export async function runTestGate(
   issueNumber: number,
   wtPath: string,
   deps: TestGateDeps = {},
+  // Run identifier for the commit traceability trailers (#20) the fix harness is
+  // instructed to add. Defaults to a fresh id so test/build-gate callers that
+  // don't thread it still produce valid trailers; production callers
+  // (planning/fix) pass the dispatch-wide id so all commits in a run match.
+  pipelineRunId: string = makePipelineRunId(issueNumber),
 ): Promise<TestGateResult> {
   if (!cfg.test_gate.enabled) return { skipped: true };
 
@@ -87,6 +98,7 @@ export async function runTestGate(
   const detectFn = deps.detectTestCommand ?? detectTestCommand;
   const gitHeadFn = deps.gitHead ?? defaultGitHead;
   const gitDirtyFn = deps.gitDirty ?? defaultGitDirty;
+  const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
 
   const command = cfg.test_gate.command ? shellSplit(cfg.test_gate.command) : detectFn(wtPath);
   if (!command) return { skipped: true };
@@ -140,7 +152,10 @@ export async function runTestGate(
       attempt,
       maxAttempts: cfg.test_gate.max_attempts,
       output,
+      pipelineRunId,
     });
+    // Capture HEAD before the harness runs so we can inspect only its commits.
+    const headBefore = await gitHeadFn(wtPath);
     const fixRes = await invokeFn(harness, wtPath, prompt, {
       timeoutSec: cfg.fix_timeout,
       model: cfg.models.fix,
@@ -164,6 +179,18 @@ export async function runTestGate(
           "Fix harness left uncommitted changes in the working tree. " +
           "Test results can't be trusted — stage and commit the fix before re-running.",
       };
+    }
+
+    // Validate that every commit the fix harness just created carries the
+    // required Issue: and Pipeline-Run: traceability trailers. Skipped when
+    // headBefore is empty (git unavailable in this environment) or when the
+    // harness produced no new commits (messages list is empty).
+    if (headBefore) {
+      const newMessages = await gitCommitMessagesFn(wtPath, headBefore);
+      const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
+      if (trailerErr) {
+        return { skipped: false, passed: false, attempts: attempt, blockReason: trailerErr };
+      }
     }
 
     ({ passed, output } = await runTestsFn(wtPath, command, cfg.test_gate.timeout));
@@ -412,4 +439,17 @@ async function defaultGitHead(cwd: string): Promise<string> {
 async function defaultGitDirty(cwd: string): Promise<boolean> {
   const res = await gitInWorktree(cwd, ["status", "--porcelain"], { ignoreFailure: true });
   return res.stdout.trim().length > 0;
+}
+
+/** Return the full commit messages for commits reachable from HEAD but not from
+ *  `baseRef`. Uses NUL-delimited output to safely handle multi-line messages.
+ *  Returns [] when there are no new commits or when git is unavailable. */
+async function defaultGitCommitMessages(cwd: string, baseRef: string): Promise<string[]> {
+  const res = await gitInWorktree(
+    cwd,
+    ["log", "--format=%x00%B", `${baseRef}..HEAD`],
+    { ignoreFailure: true },
+  );
+  if (!res.stdout.trim()) return [];
+  return res.stdout.split("\x00").map((s) => s.trim()).filter(Boolean);
 }

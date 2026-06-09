@@ -246,6 +246,24 @@ Acknowledgement` section listing each commenter as `addressed — <reason>` or
 present, behavior is byte-for-byte identical to before (no extra section, no
 attribution line). The feature is a no-op when `plan_review` is disabled.
 
+## Commit traceability trailers (always on)
+
+Every commit the pipeline produces is stamped with two git trailers tying it back
+to its origin — both the commits the pipeline writes directly (docs-update,
+OpenSpec init/archive) and the ones the implement/fix harnesses author:
+
+```
+Issue: #<n>
+Pipeline-Run: <n>/<UTC-ISO-datetime>
+```
+
+The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused for
+every commit in that run, so `git log --grep="Pipeline-Run: 42/"` surfaces all
+commits from every run on issue #42, and `git log --format="%(trailers:key=Issue)"`
+reads the issue link back via `git interpret-trailers`. The test/build gate
+enforces it: if a fix-harness commit lands without both trailers, the gate blocks
+rather than advancing. There is no toggle.
+
 ## Test/build gate (optional, default on)
 
 When `test_gate.enabled` (the default), the target repo's **own** test/build
@@ -338,9 +356,11 @@ directory), the pipeline runs a spec-first flow:
   which the *other* harness plan-reviews as intent before any code is written. The
   change is validated structurally (`openspec validate <id>`) at draft and after
   revision, and implementation works the change's `tasks.md`.
-- **Review** — the change's spec deltas are fed into the standard and adversarial
-  review prompts as the intended behavior, so reviews check whether the diff
-  actually satisfies the spec, not just whether the code looks correct.
+- **Spec deltas as intended behavior** — once authored, the change's spec deltas
+  are injected into every harness step that acts on the change — plan-review,
+  plan-revision, implementing, the standard and adversarial review rounds, and the
+  fix rounds — so each step checks its work against the spec, not just whether the
+  code looks correct.
 - **Finalize (pre-merge)** — folds the change into the living specs
   (`openspec archive`, committed to the PR), then runs `openspec validate --all`
   and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.

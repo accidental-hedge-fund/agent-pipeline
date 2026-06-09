@@ -36,6 +36,7 @@ import {
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -44,6 +45,8 @@ export interface AdvanceOpts {
   dryRun?: boolean;
   /** Optional model override forwarded to harnesses that support it. */
   model?: string;
+  /** Dispatch-wide run id for the commit traceability trailers (#20). */
+  pipelineRunId?: string;
 }
 
 export async function advance(
@@ -61,6 +64,7 @@ export async function advance(
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: Harness = cfg.harnesses.reviewer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(`[pipeline] #${issueNumber}: planning (impl=${primary}, plan-review=${reviewer})`);
 
@@ -107,6 +111,7 @@ export async function advance(
   }
 
   // ---- Steps 3+4: secondary plan review + revision (skippable via steps.plan_review) ----
+  const specContext = openspec.openspecContext(cfg, cfg.repo_dir);
   let revisedPlan = plan;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
@@ -119,7 +124,7 @@ export async function advance(
     );
     preImplStage = "plan-review";
 
-    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary });
+    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary, specContext });
     const reviewResult = await invoke(reviewer, cfg.repo_dir, reviewPrompt, {
       timeoutSec: cfg.review_timeout,
       model: opts.model ?? cfg.models.review,
@@ -141,7 +146,7 @@ export async function advance(
       planComment,
     );
 
-    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments) });
+    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
     const revisionResult = await invoke(primary, cfg.repo_dir, revisionPrompt, {
       timeoutSec: cfg.implementation_timeout,
       model: opts.model ?? cfg.models.planning,
@@ -193,7 +198,7 @@ export async function advance(
   );
 
   // ---- Step 7: primary implementer harness ----
-  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan });
+  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, specContext });
   const result = await invoke(primary, wt.path, implPrompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model,
@@ -229,7 +234,7 @@ export async function advance(
   }
 
   // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
@@ -320,6 +325,7 @@ async function advanceOpenspec(
   const { title, body } = detail;
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: Harness = cfg.harnesses.reviewer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(
     `[pipeline] #${issueNumber}: planning (OpenSpec; impl=${primary}, plan-review=${reviewer})`,
@@ -378,14 +384,14 @@ async function advanceOpenspec(
     await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
     await gitInWorktree(
       wt.path,
-      ["commit", "-m", `chore: openspec init for #${issueNumber}`],
+      ["commit", "-m", withTrailers(`chore: openspec init for #${issueNumber}`, issueNumber, pipelineRunId)],
       { ignoreFailure: true },
     );
   }
 
   // ---- Author the OpenSpec change (intent only, no code). ----
   const before = openspec.listChangeDirs(wt.path);
-  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward }), {
+  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward, pipelineRunId }), {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
   });
@@ -433,6 +439,7 @@ async function advanceOpenspec(
   }
 
   // ---- plan review + revision (skippable via steps.plan_review) ----
+  let specContext = openspec.readSpecDeltas(wt.path, changeId);
   let revisedProposal = proposal;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
@@ -447,7 +454,7 @@ async function advanceOpenspec(
     const reviewResult = await invoke(
       reviewer,
       wt.path,
-      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary }),
+      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary, specContext }),
       { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
     );
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
@@ -472,7 +479,7 @@ async function advanceOpenspec(
     const revisionResult = await invoke(
       primary,
       wt.path,
-      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments) }),
+      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext }),
       { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
     );
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
@@ -494,6 +501,8 @@ async function advanceOpenspec(
       await setBlocked(cfg, issueNumber, reason, "plan-review");
       return { advanced: false, status: "blocked", reason };
     }
+    // Recompute spec deltas: revision may have updated the spec files.
+    specContext = openspec.readSpecDeltas(wt.path, changeId);
     await postComment(
       cfg,
       issueNumber,
@@ -521,7 +530,7 @@ async function advanceOpenspec(
   const result = await invoke(
     primary,
     wt.path,
-    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan }),
+    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, specContext }),
     { timeoutSec: cfg.implementation_timeout, model: opts.model },
   );
   if (!result.success) {
@@ -537,7 +546,7 @@ async function advanceOpenspec(
     return { advanced: false, status: "blocked", reason: "no commits produced" };
   }
   // ---- test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
