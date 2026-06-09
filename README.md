@@ -22,7 +22,7 @@ backlog → ready → planning → plan-review → implementing
 core/                 single source of truth (host-agnostic TypeScript)
   scripts/            orchestrator, stages/, prompts/, gh/worktree/lock/harness
   profiles/           claude.json · codex.json · openclaw.json  ← the host seam
-  test/               node --test suite (169 tests)
+  test/               node --test suite (238 tests)
 hosts/
   claude/SKILL.md     Claude overlay (/pipeline, Monitor/PushNotification flow)
   codex/SKILL.md      Codex overlay ($pipeline, PTY exec flow)
@@ -420,7 +420,7 @@ node scripts/install.mjs uninstall --host all      # or claude | codex
 ## Development
 
 ```bash
-cd core && npm ci && npm test     # 189 tests, node --test
+cd core && npm ci && npm test     # 238 tests, node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
 npm run ci                        # run the full CI command (tests + build check + install smoke)
