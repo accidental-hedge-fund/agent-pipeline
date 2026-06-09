@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { domainContext, readConventions } from "../config.ts";
+import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
 import type { PipelineConfig } from "../types.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -191,6 +192,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     body: a.body || "(no description)",
     plan: a.plan,
     spec_context: specSection(a.specContext),
+    schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
 }
@@ -216,6 +218,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     body: a.body || "(no description)",
     review1_section: review1Section,
     spec_context: specSection(a.specContext),
+    schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
 }
