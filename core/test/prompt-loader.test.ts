@@ -202,6 +202,43 @@ test("plan_revision prompt: includes review feedback", () => {
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("plan_revision prompt: omits human feedback section when humanFeedback absent (#26)", () => {
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 102,
+    title: "Revise me",
+    body: "Body",
+    plan: "ORIGINAL-PLAN",
+    feedback: "REVIEW-FEEDBACK",
+    implementer: "claude",
+    reviewer: "codex",
+  });
+  assert.doesNotMatch(out, /Human comments on the plan/);
+  assert.doesNotMatch(out, /human comments above/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  // Regression: no-feedback path must match the original revision instruction baseline
+  assert.match(out, /Incorporate valid feedback, resolve conflicts explicitly, and keep the plan surgical\./);
+});
+
+test("plan_revision prompt: includes formatted human comments when provided (#26)", () => {
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 102,
+    title: "Revise me",
+    body: "Body",
+    plan: "ORIGINAL-PLAN",
+    feedback: "REVIEW-FEEDBACK",
+    implementer: "claude",
+    reviewer: "codex",
+    humanFeedback: "@alice: please use the existing helper",
+  });
+  assert.match(out, /Human comments on the plan/);
+  assert.match(out, /@alice: please use the existing helper/);
+  assert.match(out, /REVIEW-FEEDBACK/);
+  assert.match(out, /Incorporate the human comments above/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("implementing prompt: includes plan", () => {
   const out = buildImplementingPrompt({
     cfg: dummyConfig(),

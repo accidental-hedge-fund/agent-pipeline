@@ -118,12 +118,22 @@ export interface BuildPlanRevisionArgs extends BuildPlanArgs {
   feedback: string;
   reviewer: string;
   implementer: string;
+  /**
+   * Human comments left on the posted plan, pre-formatted as `@login: body`
+   * blocks (#26). When absent/blank the human-feedback section is omitted and
+   * the rendered prompt is identical to one built without this parameter.
+   */
+  humanFeedback?: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
 }
 
 export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
   const dc = domainContext(a.cfg);
+  const humanFeedback =
+    a.humanFeedback && a.humanFeedback.trim()
+      ? `\nHuman comments on the plan:\n\n${a.humanFeedback.trim()}\n\nIncorporate the human comments above. End your revised plan with a section headed exactly "## Human Feedback Acknowledgement" that lists each commenter as "- @login: addressed — <reason>" or "- @login: declined — <reason>". This section is required when human comments are present.\n`
+      : "";
   return substitute(loadTemplate("plan_revision"), {
     domain_name: dc.name,
     domain_description: dc.description,
@@ -135,6 +145,7 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
     feedback: a.feedback,
     reviewer: a.reviewer,
     implementer: a.implementer,
+    human_feedback: humanFeedback,
     spec_context: specContextSection(a.specContext),
   });
 }
