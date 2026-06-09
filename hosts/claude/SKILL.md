@@ -200,11 +200,12 @@ task completing, not by log content.
 
 #### d. Push notification on every `[pipeline]` event
 
-For every Monitor event, call `PushNotification` with a short one-line
-message. The state machine has only 9 transitions max and each emits ≤2
-visible `[pipeline]` lines, so this caps at ~12–18 pushes per full run —
-coarse enough to not be spammy, fine enough that the user never wonders
-"is anything happening?" between major arrows.
+For every material Monitor event (see suppression list below), call
+`PushNotification` with a short one-line message. The state machine has
+only 9 transitions max and each emits ≤2 visible `[pipeline]` lines, so
+this caps at ~12–18 pushes per full run — coarse enough to not be spammy,
+fine enough that the user never wonders "is anything happening?" between
+major arrows.
 
 Examples that DO push:
 - `[pipeline] #N: starting at stage=<x>`

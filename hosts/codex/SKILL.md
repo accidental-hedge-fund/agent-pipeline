@@ -188,7 +188,8 @@ dumps the full unit-test suite output to the same log. The eval-gate and
 state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
 `→ ready-to-deploy` substrings (they assert on the pipeline's own log
 format). The broad alternation matched hundreds of these fixture lines in
-rapid succession.
+rapid succession, triggering the Monitor tool's auto-stop threshold and
+silencing the rest of the run.
 
 **No real signal is lost:** every stage transition — including
 `[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
