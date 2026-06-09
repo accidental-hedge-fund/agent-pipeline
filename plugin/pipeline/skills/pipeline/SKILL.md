@@ -166,33 +166,55 @@ immediately; the pipeline runs detached.
 
 #### c. Stream stage transitions via Monitor
 
-Arm a persistent Monitor on the log file with this filter (matches the
-pipeline.ts transition lines + structured failure markers):
+Arm a persistent Monitor. The **log path** always uses the original argument
+`<N>` from section b (the same file that was opened for writing). The
+**grep filter** uses the **resolved issue number** `<resolved-N>` — identical
+to `<N>` when you passed an issue directly; look for the line
+`[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` near the top of
+the log when you passed a PR:
 
 ```bash
 tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
-  "^\[pipeline\]|^\[exit code|FAILED|timed out|blocked label|approved|needs-attention|→ "
+  "^\[pipeline\] #<resolved-N>: "
+```
+
+For example, `/pipeline 64` (issue passed directly, `<N>` = `<resolved-N>` = 64):
+```bash
+tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
+  "^\[pipeline\] #64: "
+```
+
+`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100, `<resolved-N>` = 64):
+```bash
+tail -f /tmp/pipeline-<domain>-100.log | grep -E --line-buffered \
+  "^\[pipeline\] #64: "
 ```
 
 Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if
 needed). Each emitted line lands in Claude's notification stream.
 
-**Known false-positives to ignore:**
-- `Traceback:` and `verdict` and other prompt content echoed verbatim
-  through the harness's stdout. These are NOT real stage events —
-  they're the prompt being read back by claude/codex during streaming.
-  The grep matches them anyway because we deliberately broaden the
-  filter to catch real failures (`FAILED`, `timed out`, etc.). The
-  real stage signal is always a line starting with `[pipeline]`.
+**Why the tight filter?** The test-gate stage (`npm test` / `npm run ci`)
+dumps the full unit-test suite output to the same log. The eval-gate and
+state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
+`→ ready-to-deploy` substrings (they assert on the pipeline's own log
+format). The broad alternation matched hundreds of these fixture lines in
+rapid succession, triggering the Monitor tool's auto-stop threshold and
+silencing the rest of the run.
+
+**No real signal is lost:** every stage transition — including
+`[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
+`[pipeline] #N: → ready-to-deploy` — begins with `[pipeline] #N:`.
+Process exit (run-end) is independently signalled by the background bash
+task completing, not by log content.
 
 #### d. Push notification on every `[pipeline]` event
 
-For every Monitor event that is a real `[pipeline]` line (i.e., not the
-known prompt-echo false-positives), call `PushNotification` with a short
-one-line message. The state machine has only 9 transitions max and each
-emits ≤2 visible `[pipeline]` lines, so this caps at ~12–18 pushes per
-full run — coarse enough to not be spammy, fine enough that the user
-never wonders "is anything happening?" between major arrows.
+For every material Monitor event (see suppression list below), call
+`PushNotification` with a short one-line message. The state machine has
+only 9 transitions max and each emits ≤2 visible `[pipeline]` lines, so
+this caps at ~12–18 pushes per full run — coarse enough to not be spammy,
+fine enough that the user never wonders "is anything happening?" between
+major arrows.
 
 Examples that DO push:
 - `[pipeline] #N: starting at stage=<x>`
@@ -206,11 +228,7 @@ Examples that DO push:
 - `[pipeline] #N: review-1 → review-2: standard review approved`
 - … and so on, all the way through `→ ready-to-deploy`
 
-Examples that do NOT push (false-positives the grep filter still catches):
-- `Traceback:` and `verdict` and other prompt content echoed verbatim
-  through the harness's stdout. Real stage signals always start with
-  `[pipeline]`. If a Monitor event line doesn't start with `[pipeline]`,
-  surface in chat for context but skip the push.
+Examples that do NOT push:
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
   re-enters the gate check every `ci_poll_interval` seconds (default 30s)
   and emits `[pipeline] #N: pre-merge gate` each time. Push the FIRST
@@ -233,10 +251,10 @@ final summary inline by reading the tail of the log.
 
 #### f. Final summary
 
-Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` and surface
-inline: starting stage → ending stage, transitions made, wall-clock
-elapsed, PR URL if one was opened. Also send one final
-PushNotification with the terminal state.
+Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` (same path as
+section b — the original argument) and surface inline: starting stage →
+ending stage, transitions made, wall-clock elapsed, PR URL if one was
+opened. Also send one final PushNotification with the terminal state.
 
 ### 5. Modes that DON'T need this orchestration
 
