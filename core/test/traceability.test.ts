@@ -10,6 +10,7 @@ import {
   ISSUE_TRAILER_KEY,
   RUN_TRAILER_KEY,
   makePipelineRunId,
+  validateCommitTrailers,
   withTrailers,
 } from "../scripts/traceability.ts";
 
@@ -74,4 +75,73 @@ test("withTrailers: uses the exported trailer key constants", () => {
   const msg = withTrailers("subject", 5, "5/2026-06-08T14:32:00Z");
   assert.ok(msg.includes(`${ISSUE_TRAILER_KEY}: #5`));
   assert.ok(msg.includes(`${RUN_TRAILER_KEY}: 5/2026-06-08T14:32:00Z`));
+});
+
+// ---------------------------------------------------------------------------
+// validateCommitTrailers — harness-commit trailer enforcement (task for #20)
+// ---------------------------------------------------------------------------
+
+const RUN_ID = "20/2026-06-08T14:32:00Z";
+
+function compliantMessage(extra = ""): string {
+  return `fix: correct the test${extra}\n\nIssue: #20\nPipeline-Run: ${RUN_ID}`;
+}
+
+test("validateCommitTrailers: empty list → null (no commits to validate)", () => {
+  assert.equal(validateCommitTrailers([], 20, RUN_ID), null);
+});
+
+test("validateCommitTrailers: single compliant commit → null", () => {
+  assert.equal(validateCommitTrailers([compliantMessage()], 20, RUN_ID), null);
+});
+
+test("validateCommitTrailers: multiple compliant commits → null", () => {
+  assert.equal(
+    validateCommitTrailers([compliantMessage(" A"), compliantMessage(" B")], 20, RUN_ID),
+    null,
+  );
+});
+
+test("validateCommitTrailers: missing Issue trailer → returns blockReason", () => {
+  const msg = `fix: correct the test\n\nPipeline-Run: ${RUN_ID}`;
+  const result = validateCommitTrailers([msg], 20, RUN_ID);
+  assert.ok(result !== null, "expected a blockReason");
+  assert.match(result, /Issue/i);
+  assert.match(result, /trailers/i);
+});
+
+test("validateCommitTrailers: missing Pipeline-Run trailer → returns blockReason", () => {
+  const msg = "fix: correct the test\n\nIssue: #20";
+  const result = validateCommitTrailers([msg], 20, RUN_ID);
+  assert.ok(result !== null, "expected a blockReason");
+  assert.match(result, /Pipeline-Run/i);
+});
+
+test("validateCommitTrailers: both trailers absent → returns blockReason", () => {
+  const msg = "fix: correct the test\n\nNo trailers here.";
+  const result = validateCommitTrailers([msg], 20, RUN_ID);
+  assert.ok(result !== null, "expected a blockReason");
+  assert.match(result, /trailers/i);
+});
+
+test("validateCommitTrailers: mixed — one compliant, one non-compliant → blockReason with count 1", () => {
+  const result = validateCommitTrailers(
+    [compliantMessage(), "fix: another\n\nNo trailers."],
+    20,
+    RUN_ID,
+  );
+  assert.ok(result !== null, "expected a blockReason");
+  assert.match(result, /1 commit/);
+});
+
+test("validateCommitTrailers: wrong issue number → returns blockReason", () => {
+  const msg = `fix: correct\n\nIssue: #99\nPipeline-Run: ${RUN_ID}`;
+  const result = validateCommitTrailers([msg], 20, RUN_ID);
+  assert.ok(result !== null, "expected a blockReason for wrong issue number");
+});
+
+test("validateCommitTrailers: wrong run id → returns blockReason", () => {
+  const msg = "fix: correct\n\nIssue: #20\nPipeline-Run: 20/2020-01-01T00:00:00Z";
+  const result = validateCommitTrailers([msg], 20, RUN_ID);
+  assert.ok(result !== null, "expected a blockReason for wrong run id");
 });
