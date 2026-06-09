@@ -167,21 +167,33 @@ leave a live pipeline session running when the Codex turn ends.
 #### c. Poll stage transitions from the session or log
 
 Poll the PTY session with `write_stdin` and summarize material `[pipeline]`
-lines to the user. If the session output is too noisy, read the log with this
-filter:
+lines to the user. If the session output is too noisy, filter the log to
+the **resolved issue number** `<N>` (if you passed a PR number to
+`/pipeline`, check the log for `[pipeline] #<PR> is a PR → resolved to
+issue #<N>` — use that `<N>`):
 
 ```bash
 tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
-  "^\[pipeline\]|^\[exit code|FAILED|timed out|blocked label|approved|needs-attention|→ "
+  "^\[pipeline\] #<N>: "
 ```
 
-**Known false-positives to ignore:**
-- `Traceback:` and `verdict` and other prompt content echoed verbatim
-  through the harness's stdout. These are NOT real stage events —
-  they're the prompt being read back by claude/codex during streaming.
-  The grep matches them anyway because we deliberately broaden the
-  filter to catch real failures (`FAILED`, `timed out`, etc.). The
-  real stage signal is always a line starting with `[pipeline]`.
+For example, monitoring issue 64:
+```bash
+tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
+  "^\[pipeline\] #64: "
+```
+
+**Why the tight filter?** The test-gate stage (`npm test` / `npm run ci`)
+dumps the full unit-test suite output to the same log. The eval-gate and
+state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
+`→ ready-to-deploy` substrings (they assert on the pipeline's own log
+format). The broad alternation matched hundreds of these fixture lines in
+rapid succession.
+
+**No real signal is lost:** every stage transition — including
+`[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
+`[pipeline] #N: → ready-to-deploy` — begins with `[pipeline] #N:`.
+The PTY session finishing signals run-end independently.
 
 #### d. User-visible progress updates
 
@@ -202,10 +214,6 @@ Examples that should be surfaced:
 - … and so on, all the way through `→ ready-to-deploy`
 
 Examples to suppress or summarize:
-- `Traceback:` and `verdict` and other prompt content echoed verbatim
-  through the harness's stdout. Real stage signals always start with
-  `[pipeline]`. If a line doesn't start with `[pipeline]`, surface it only if
-  it is an actual error the user needs to see.
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
   re-enters the gate check every `ci_poll_interval` seconds (default 30s)
   and emits `[pipeline] #N: pre-merge gate` each time. Surface the FIRST
