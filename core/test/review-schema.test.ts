@@ -9,6 +9,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   REVIEW_SCHEMA_FIELDS,
   REVIEW_VERDICT_SCHEMA_BLOCK,
@@ -19,6 +22,32 @@ import {
   substitute,
 } from "../scripts/prompts/index.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+
+// Extract field names from a named `interface Foo { ... }` block in TypeScript
+// source text. Handles optional fields (`name?:`) and ignores comment lines.
+function parseInterfaceFields(src: string, interfaceName: string): string[] {
+  const marker = `interface ${interfaceName} {`;
+  const start = src.indexOf(marker);
+  if (start === -1) throw new Error(`Interface ${interfaceName} not found in types.ts`);
+  const bodyStart = src.indexOf("{", start) + 1;
+  let depth = 1;
+  let i = bodyStart;
+  while (i < src.length && depth > 0) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") depth--;
+    i++;
+  }
+  const body = src.slice(bodyStart, i - 1);
+  const fields: string[] = [];
+  for (const line of body.split("\n")) {
+    const m = line.match(/^\s+(\w+)\??:/);
+    if (m) fields.push(m[1]);
+  }
+  return fields;
+}
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const typesSrc = readFileSync(join(__dirname, "../scripts/types.ts"), "utf-8");
 
 // Walk the schema block tracking brace/bracket depth, recording the order of
 // keys at the verdict level (depth 1) and the finding level (depth 3). The block
@@ -71,6 +100,36 @@ test("drift guard: schema block fields match the ReviewFinding/ReviewVerdict man
     extraInBlock,
     [],
     `fields present in REVIEW_VERDICT_SCHEMA_BLOCK but not declared in ReviewFinding/ReviewVerdict: ${extraInBlock.join(", ")}`,
+  );
+});
+
+// This test is the critical link that makes the drift guard non-bypassable:
+// it reads the *actual* TypeScript source and compares interface field names
+// against REVIEW_SCHEMA_FIELDS. Without it, adding a field to ReviewFinding
+// while forgetting FINDING_FIELD_GUARD passes silently under --experimental-strip-types
+// (which strips types but never type-checks).
+test("drift guard: REVIEW_SCHEMA_FIELDS tracks the actual interface declarations in types.ts", () => {
+  const findingFromSrc = parseInterfaceFields(typesSrc, "ReviewFinding");
+  // commitSha is excluded from the verdict side: it is stamped by the pipeline
+  // from the PR head, not emitted by the reviewer, and must NOT appear in the
+  // schema block sent to the reviewer (see VERDICT_FIELD_GUARD in review-schema.ts).
+  const verdictFromSrc = parseInterfaceFields(typesSrc, "ReviewVerdict").filter(
+    (f) => f !== "commitSha",
+  );
+
+  assert.deepEqual(
+    findingFromSrc,
+    REVIEW_SCHEMA_FIELDS.finding,
+    `ReviewFinding fields in types.ts (${findingFromSrc.join(", ")}) ` +
+      `don't match REVIEW_SCHEMA_FIELDS.finding (${REVIEW_SCHEMA_FIELDS.finding.join(", ")}). ` +
+      `Update FINDING_FIELD_GUARD in review-schema.ts to match.`,
+  );
+  assert.deepEqual(
+    verdictFromSrc,
+    REVIEW_SCHEMA_FIELDS.verdict,
+    `ReviewVerdict fields in types.ts (${verdictFromSrc.join(", ")}) ` +
+      `don't match REVIEW_SCHEMA_FIELDS.verdict (${REVIEW_SCHEMA_FIELDS.verdict.join(", ")}). ` +
+      `Update VERDICT_FIELD_GUARD in review-schema.ts to match.`,
   );
 });
 
