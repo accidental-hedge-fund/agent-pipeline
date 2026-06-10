@@ -49,7 +49,7 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 
 ## Release plan (sem-ver)
 
-Post-1.0 the open backlog is **entirely additive or internal hardening — no breaking changes.** This was verified 2026-06-10 by a per-issue classification with an adversarial breaking-change check; the verifier agreed on all 14 issues. Every `adds_key` change is optional and **default-off**, so it is safe under the strict (`.strict()`) config schema — an omitted key still validates. A 2.0 would require removing/renaming a key, changing a default, making a dead key live, or breaking the verdict output schema; nothing open does that.
+Post-1.0 the open backlog is **entirely additive or internal hardening — no breaking changes.** This was verified 2026-06-10 by a per-issue classification with an adversarial breaking-change check; the verifier agreed on all 14 issues. Each new key (#40, #70, #23, #21) is optional and its **default reproduces current behavior**, so existing configs and runs are unchanged — that, not schema mechanics, is what keeps these MINOR rather than MAJOR. (Top-level config is `.strict()`, so an old config that omits the new key still validates; the new key is always added *optional*, never required. Note `models.*` is itself non-`.strict()` with required inner fields, so #70's `models.implementing` must land as an added **optional** field, not a new required one.) A 2.0 would instead require removing/renaming a key, changing a default, making a dead key live, or breaking the verdict output schema — nothing open does that.
 
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
@@ -65,11 +65,11 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 |---|--------|--------|-------|-----------|------------|
 | #95 | patch | none | dev-loop convergence | v1.0.1 | — |
 | #75 | patch | none | dev-loop convergence | v1.0.1 | #61 ✓ |
-| #19 | minor | none | review quality | v1.1.0 | #25 |
-| #25 | minor | none | review quality | v1.1.0 | #19 |
+| #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
+| #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
 | #84 | minor | none | review quality | v1.1.0 | #57 |
-| #85 | patch | none | drift-guard hardening | v1.1.0 | #83 ✓ |
+| #85 | patch | none | review quality | v1.1.0 | #83 ✓ |
 | #39 | minor | none | reviewer pluggability | v1.2.0 | — |
 | #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
 | #70 | minor | adds key | per-step models | v1.2.0 | #91 ✓ |
