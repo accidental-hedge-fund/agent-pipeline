@@ -618,6 +618,10 @@ export async function createPr(
 export interface PrCandidate {
   number: number;
   headRefName: string;
+  /** True when the head branch lives in a fork, not cfg.repo. A fork PR's
+   *  headRefName is only the branch name and can spoof `pipeline/<N>-`, so the
+   *  branch fast path must not trust it (#76). */
+  isCrossRepository: boolean;
 }
 
 /** Structured closing-issue reference returned by the GH API (includes repo). */
@@ -627,7 +631,8 @@ export interface ClosingIssueRef {
 }
 
 /** Resolve the PR for an issue using exactly two strategies, in order:
- *    1. Head branch starts with `pipeline/<N>-` (fast path, no extra API calls).
+ *    1. Head branch starts with `pipeline/<N>-` AND the PR is not from a fork
+ *       (fast path, no extra API calls; a fork PR can spoof the branch name).
  *    2. The PR's closingIssuesReferences contains the issue in targetRepo (authoritative link).
  *  Returns null when neither matches. Deliberately NO body/title text search —
  *  a PR that merely mentions `#N` must not resolve as issue N's PR (#76).
@@ -640,7 +645,9 @@ export async function resolvePrForIssue(
 ): Promise<number | null> {
   const branchPrefix = `pipeline/${issueNumber}-`;
   for (const pr of prs) {
-    if (pr.headRefName.startsWith(branchPrefix)) return pr.number;
+    // A fork PR's headRefName is only the branch name and can spoof the prefix,
+    // so the fast path trusts it only for same-repo (non-fork) PRs (#76).
+    if (!pr.isCrossRepository && pr.headRefName.startsWith(branchPrefix)) return pr.number;
   }
 
   for (const pr of prs) {
@@ -691,7 +698,7 @@ export async function getPrForIssue(
     "pr",
     "list",
     "--json",
-    "number,headRefName",
+    "number,headRefName,isCrossRepository",
     "--state",
     "open",
     "-L",

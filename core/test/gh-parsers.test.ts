@@ -307,8 +307,8 @@ function refs(...nums: number[]): ClosingIssueRef[] {
 test("resolvePrForIssue: branch-prefix match returns the PR without fetching closing refs", async () => {
   let fetches = 0;
   const prs = [
-    { number: 7, headRefName: "feat/unrelated" },
-    { number: 9, headRefName: "pipeline/42-my-feature" },
+    { number: 7, headRefName: "feat/unrelated", isCrossRepository: false },
+    { number: 9, headRefName: "pipeline/42-my-feature", isCrossRepository: false },
   ];
   const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => {
     fetches++;
@@ -316,6 +316,30 @@ test("resolvePrForIssue: branch-prefix match returns the PR without fetching clo
   });
   assert.equal(result, 9);
   assert.equal(fetches, 0);
+});
+
+test("resolvePrForIssue: a FORK PR cannot spoof the branch fast path (#76 adversarial regression)", async () => {
+  // A fork PR's headRefName is just the branch name and can be `pipeline/42-*`
+  // without belonging to cfg.repo or closing #42. It must NOT win the fast path;
+  // it falls through to closing references, which here do not link #42 → null.
+  const prs = [
+    { number: 13, headRefName: "pipeline/42-spoofed", isCrossRepository: true },
+  ];
+  let fetches = 0;
+  const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => {
+    fetches++;
+    return []; // fork PR does not actually close #42
+  });
+  assert.equal(result, null, "a fork branch must not be trusted by the fast path");
+  assert.equal(fetches, 1, "the fork PR must fall through to the closing-ref check");
+});
+
+test("resolvePrForIssue: a same-repo branch match still wins even with a fork PR present (#76)", async () => {
+  const prs = [
+    { number: 13, headRefName: "pipeline/42-spoofed", isCrossRepository: true },
+    { number: 9, headRefName: "pipeline/42-real", isCrossRepository: false },
+  ];
+  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), 9);
 });
 
 test("resolvePrForIssue: branch prefix requires the trailing dash (no pipeline/420-* match for #42)", async () => {
