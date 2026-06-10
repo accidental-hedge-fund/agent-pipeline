@@ -209,7 +209,7 @@ steps:                               # turn optional steps off for speed/prefere
   plan_review: true                  # cross-harness review of the plan before coding
   standard_review: true              # review-1 (and its fix round)
   adversarial_review: true           # review-2 (and its fix round)
-  docs: true                         # docs-update pass in pre-merge
+  docs: true                         # include the docs-update instruction in the implementing prompt
 test_gate:                           # run the repo's own tests/build before opening a PR
   enabled: true                      # default: true; set false to disable entirely
   command: "pnpm test"               # optional explicit command; auto-detected when absent
@@ -322,7 +322,7 @@ The following features are all **default off** (or are clearly optional). A read
 
 ### Configurable steps
 
-The `steps` block turns the optional "thoroughness" steps on or off per repo, to trade rigor for speed. Default is everything on (the full pipeline). Configurable: `plan_review`, `standard_review` (review-1 + its fix round), `adversarial_review` (review-2 + its fix round), and `docs`. Disabling a step still yields a valid path to `ready-to-deploy`, and each skip is recorded as a transition comment on the issue.
+The `steps` block turns the optional "thoroughness" steps on or off per repo, to trade rigor for speed. Default is everything on (the full pipeline). Configurable: `plan_review`, `standard_review` (review-1 + its fix round), `adversarial_review` (review-2 + its fix round), and `docs` (when on, the implementing prompt instructs the implementer to update affected documentation — README, CLAUDE.md, config docs — as part of the same change, so docs land inside the reviewed diff; when off, no docs ask is made). Disabling a step still yields a valid path to `ready-to-deploy`, and each skip is recorded as a transition comment on the issue.
 
 The structural and safety steps — planning, implementing, and the pre-merge **CI** and **mergeability** gates — are **not** configurable: they have no toggle, and an unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse time rather than silently dropping a safety gate.
 
@@ -336,7 +336,7 @@ The revised plan comment attributes contributors with a `**Human feedback from**
 
 ### Commit traceability trailers (always on)
 
-Every commit the pipeline produces is stamped with two git trailers tying it back to its origin — both the commits the pipeline writes directly (docs-update, OpenSpec init/archive) and the ones the implement/fix harnesses author:
+Every commit the pipeline produces is stamped with two git trailers tying it back to its origin — both the commits the pipeline writes directly (OpenSpec init/archive) and the ones the implement/fix harnesses author:
 
 ```
 Issue: #<n>

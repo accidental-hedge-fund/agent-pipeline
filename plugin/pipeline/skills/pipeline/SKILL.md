@@ -113,7 +113,7 @@ domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
 
-If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation, fixes, and docs update; Codex is always secondary for review/adversarial review. Legacy `.github/pipeline.yml` `harnesses` keys are accepted for compatibility but ignored so repo config cannot invert a Claude-invoked pipeline run.
+If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation (documentation updates included, when `steps.docs` is on), and fixes; Codex is always secondary for review/adversarial review. Legacy `.github/pipeline.yml` `harnesses` keys are accepted for compatibility but ignored so repo config cannot invert a Claude-invoked pipeline run.
 
 ## Run flow
 

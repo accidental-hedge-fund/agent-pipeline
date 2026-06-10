@@ -213,7 +213,7 @@ export async function advance(
   );
 
   // ---- Step 7: primary implementer harness ----
-  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, specContext });
+  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext });
   const implHeadBefore = (
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
@@ -593,7 +593,7 @@ async function advanceOpenspec(
   const result = await invoke(
     primary,
     wt.path,
-    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, specContext }),
+    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext }),
     { timeoutSec: cfg.implementation_timeout, model: opts.model },
   );
   if (!result.success) {

@@ -77,13 +77,13 @@ build step). First-ever invocation runs `npm install` automatically.
 
 Required:
 - `gh` CLI authenticated against the target repo
-- `codex` CLI on PATH for planning, implementation, fix, and docs_update
+- `codex` CLI on PATH for planning, implementation, and fix
 - `claude` CLI on PATH and authenticated — the reviewer harness (default `prompt-harness` mode
   invokes it directly; the `cc-plugin-codex` companion is optional, only for `reviewMode: claude-companion`)
 - Node 24+
 - The skill never reads `ANTHROPIC_API_KEY`
 
-Harness ownership is relative to the tool that invoked the pipeline. In the Codex skill, Codex is primary and Claude Code is secondary: Codex owns planning, implementation, fixes, and docs update; Claude Code owns review/adversarial review.
+Harness ownership is relative to the tool that invoked the pipeline. In the Codex skill, Codex is primary and Claude Code is secondary: Codex owns planning, implementation (documentation updates included, when `steps.docs` is on), and fixes; Claude Code owns review/adversarial review.
 
 ## Per-repo config
 
@@ -302,8 +302,7 @@ When the loop ends, the skill prints:
 - **No `pipeline:*` label** → refuse with opt-in instructions.
 - **Stage handler error** → posts a `blocked` label + structured comment
   with reason; loop terminates and shows the latest blocker.
-- **Codex implementation fails (planning/implementation/fix/docs)** → blocked
-  for blocking stages, skipped for non-blocking docs_update.
+- **Codex implementation fails (planning/implementation/fix)** → blocked.
 
 ## What this skill never does
 

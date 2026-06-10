@@ -1,8 +1,8 @@
-// Pre-merge gate: docs update (once) → CI gate → mergeability gate → ready-to-deploy.
+// Pre-merge gate: OpenSpec archive (once) → CI gate → mergeability gate → ready-to-deploy.
 //
-// Returns { advanced: false, status: "waiting" } when CI is still running or
-// docs were just pushed (CI needs to re-run). The caller (pipeline.ts loop)
-// breaks on waiting so the user can re-invoke later.
+// Returns { advanced: false, status: "waiting" } when CI is still running.
+// The caller (pipeline.ts loop) breaks on waiting so the user can re-invoke
+// later.
 //
 // We deliberately do NOT auto-merge. The terminal stage is just the
 // `pipeline:ready-to-deploy` label.
@@ -14,7 +14,6 @@ import {
   getPrChecks,
   getPrCommits,
   getPrDetail,
-  getPrDiff,
   getPrForIssue,
   parseChecksAggregate,
   parseMergeable,
@@ -22,36 +21,28 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
-import { buildDocsUpdatePrompt } from "../prompts/index.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { extractReviewedSha } from "./review.ts";
 import * as openspec from "../openspec.ts";
-import {
-  verifyHarnessCommits,
-  type VerifyDeps,
-  type VerifyResult,
-} from "../verify-harness-commits.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
-const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
- * True when a commit was authored by the pipeline itself in pre-merge (a docs
- * update or an OpenSpec archive) rather than by a developer/fix step. These
- * commits do not change the code the reviewer evaluated, so they must not
- * invalidate the review verdict (#98). Matched on the exact pre-merge commit
- * prefixes — a developer's own `docs:`/`chore:` commit with different wording
- * does NOT match and still triggers a re-review. Exported for tests.
+ * True when a commit was authored by the pipeline itself in pre-merge (an
+ * OpenSpec archive) rather than by a developer/fix step. These commits do not
+ * change the code the reviewer evaluated, so they must not invalidate the
+ * review verdict (#98). Matched on the exact pre-merge commit prefix — a
+ * developer's own `chore:` commit with different wording does NOT match and
+ * still triggers a re-review. A `docs: update documentation for #N` commit is
+ * NOT pipeline-internal: the pre-merge docs harness was removed (#91, docs now
+ * land inside the reviewed implementation diff), so any such commit can only
+ * come from a developer. Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return (
-    messageHeadline.startsWith(DOCS_COMMIT_PREFIX) ||
-    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX)
-  );
+  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
 }
 
 export interface AdvancePreMergeOpts {
@@ -61,24 +52,46 @@ export interface AdvancePreMergeOpts {
   pipelineRunId?: string;
 }
 
+/**
+ * External seams for {@link advance}, overridable in tests so the gate
+ * sequence (SHA gate → archive → CI → mergeability → advance) can be
+ * exercised without GitHub or a worktree. Extends {@link ShaGateDeps} so one
+ * bag also feeds the review-SHA gate. Mirrors the DI pattern used elsewhere
+ * (review.ts, testgate.ts).
+ */
+export interface AdvancePreMergeDeps extends ShaGateDeps {
+  getPrForIssue?: typeof getPrForIssue;
+  getPrChecks?: typeof getPrChecks;
+  getForIssue?: typeof getForIssue;
+  setBlocked?: typeof setBlocked;
+}
+
 export async function advance(
   cfg: PipelineConfig,
   issueNumber: number,
   opts: AdvancePreMergeOpts = {},
+  deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome> {
+  const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
+  const getPrChecksFn = deps.getPrChecks ?? getPrChecks;
+  const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const transitionFn = deps.transition ?? transition;
+
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
 
   const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
-  const prNumber = await getPrForIssue(cfg, issueNumber);
+  const prNumber = await getPrForIssueFn(cfg, issueNumber);
   if (!prNumber) {
-    await setBlocked(cfg, issueNumber, "No pull request found for pre-merge gate.", "pre-merge");
+    await setBlockedFn(cfg, issueNumber, "No pull request found for pre-merge gate.", "pre-merge");
     return { advanced: false, status: "blocked", reason: "no PR" };
   }
 
   if (opts.dryRun) {
     const dryNextStage = cfg.eval_gate.enabled ? "eval-gate" : "ready-to-deploy";
-    console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+docs+CI+merge for PR #${prNumber}`);
+    console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+CI+merge for PR #${prNumber}`);
     return { advanced: true, from: "pre-merge", to: dryNextStage, summary: "[dry-run]" };
   }
 
@@ -87,32 +100,18 @@ export async function advance(
   // re-running review, so it is where a stale approval would slip through. If
   // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
   // back to the review round before doing any pre-merge work; pipeline-internal
-  // commits (docs / openspec archive) do not invalidate the verdict.
-  const shaGate = await enforceReviewShaGate(cfg, issueNumber, prNumber);
+  // commits (openspec archive) do not invalidate the verdict.
+  const shaGate = await enforceReviewShaGate(cfg, issueNumber, prNumber, deps);
   if (shaGate) return shaGate;
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId);
+  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, getForIssueFn);
   if (archiveOutcome) return archiveOutcome;
 
-  // ---- Step 1: docs update (once per PR; skippable via steps.docs) ----
-  if (cfg.steps.docs && !(await docsAlreadyUpdated(cfg, issueNumber))) {
-    const docsViolation = await updateDocs(cfg, issueNumber, prNumber, pipelineRunId, opts);
-    if (docsViolation) {
-      await setBlocked(cfg, issueNumber, docsViolation.reason, "pre-merge");
-      return docsViolation;
-    }
-    return {
-      advanced: false,
-      status: "waiting",
-      reason: "docs pushed; CI needs to re-run",
-    };
-  }
-
-  // ---- Step 2: CI ----
+  // ---- Step 1: CI ----
   let checks;
   try {
-    checks = await getPrChecks(cfg, prNumber);
+    checks = await getPrChecksFn(cfg, prNumber);
   } catch (err) {
     const e = err as Error;
     return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
@@ -124,7 +123,7 @@ export async function advance(
   }
 
   if (agg.failed.length > 0) {
-    const wt = await getForIssue(cfg, issueNumber);
+    const wt = await getForIssueFn(cfg, issueNumber);
     const alreadyRebased = wt ? rebaseAlreadyAttempted(wt.path) : true;
     if (!alreadyRebased && wt) {
       const ok = await tryRebaseAndPush(cfg, issueNumber);
@@ -133,7 +132,7 @@ export async function advance(
         return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
       }
     }
-    await setBlocked(
+    await setBlockedFn(
       cfg,
       issueNumber,
       `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
@@ -142,15 +141,15 @@ export async function advance(
     return { advanced: false, status: "blocked", reason: "CI failed" };
   }
 
-  // ---- Step 3: mergeability ----
-  const detail = await getPrDetail(cfg, prNumber);
+  // ---- Step 2: mergeability ----
+  const detail = await getPrDetailFn(cfg, prNumber);
   const mergeStatus = parseMergeable(detail);
   if (mergeStatus === "conflict") {
     const ok = await tryRebaseAndPush(cfg, issueNumber);
     if (ok) {
       return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
     }
-    await setBlocked(
+    await setBlockedFn(
       cfg,
       issueNumber,
       "PR has merge conflicts that could not be automatically resolved.",
@@ -162,11 +161,11 @@ export async function advance(
     return { advanced: false, status: "waiting", reason: "GitHub still computing mergeability" };
   }
 
-  // ---- Step 3.5: OpenSpec validation gate (opt-in / auto-detected) ----
+  // ---- Step 2.5: OpenSpec validation gate (opt-in / auto-detected) ----
   // Only runs when the target repo has an `openspec/` workspace (or it's forced
   // on via config). Refuses ready-to-deploy if the change's specs/deltas are
   // structurally invalid. A missing `openspec` CLI is non-blocking (skipped).
-  const specWt = await getForIssue(cfg, issueNumber);
+  const specWt = await getForIssueFn(cfg, issueNumber);
   if (specWt && openspec.isActive(cfg, specWt.path)) {
     const spec = await openspec.validate(specWt.path);
     if (spec.unavailable) {
@@ -177,7 +176,7 @@ export async function advance(
       const detail = spec.issues.length
         ? spec.issues.map((i) => `- ${i.item ? `${i.item}: ` : ""}${i.message}`).join("\n")
         : spec.raw;
-      await setBlocked(
+      await setBlockedFn(
         cfg,
         issueNumber,
         `OpenSpec validation failed (\`openspec validate --all\`):\n${detail}`,
@@ -189,16 +188,16 @@ export async function advance(
     }
   }
 
-  // ---- Step 4: advance ----
+  // ---- Step 3: advance ----
   // Skip the eval-gate label entirely when evals are disabled to avoid spurious
   // label churn and pipeline comments on repos that did not opt in.
   const nextStage = cfg.eval_gate.enabled ? "eval-gate" : "ready-to-deploy";
-  await transition(
+  await transitionFn(
     cfg,
     issueNumber,
     "pre-merge",
     nextStage,
-    `All pre-merge gates passed (docs updated, CI green, no conflicts). Advancing to ${nextStage} for PR #${prNumber}.`,
+    `All pre-merge gates passed (CI green, no conflicts). Advancing to ${nextStage} for PR #${prNumber}.`,
   );
   return {
     advanced: true,
@@ -257,8 +256,8 @@ export async function enforceReviewShaGate(
 
   // HEAD moved past the reviewed commit. Re-review ONLY when a developer/fix
   // commit landed since the verdict — the pipeline's own pre-merge commits
-  // (docs update, OpenSpec archive) do not change the reviewed code and must
-  // not invalidate the verdict. Re-reviewing them re-ran the adversarial
+  // (OpenSpec archive) do not change the reviewed code and must not
+  // invalidate the verdict. Re-reviewing them re-ran the adversarial
   // reviewer on the pipeline's own commits every run, which (with a thorough
   // reviewer) turned each run into a non-converging cascade (#98). #16's value
   // is preserved: any non-internal commit in the range still bounces.
@@ -272,7 +271,7 @@ export async function enforceReviewShaGate(
           landedSince.length > 0 &&
           landedSince.every((c) => isPipelineInternalCommit(c.messageHeadline))
         ) {
-          // Only docs/archive commits landed since the review → verdict valid.
+          // Only archive commits landed since the review → verdict valid.
           return null;
         }
       }
@@ -318,150 +317,6 @@ export function staleReviewNotice(reviewedSha: string | null, headSha: string): 
 }
 
 // ---------------------------------------------------------------------------
-// Docs-only file-constraint gate — exported for direct unit testing
-// ---------------------------------------------------------------------------
-
-/**
- * Verifies that a docs-update harness only modified documentation files —
- * no application code or test files. Checks both committed changes
- * (`headBefore..HEAD`) and uncommitted dirty paths (which the stage will
- * auto-commit). Returns `null` to proceed, or a blocked `VerifyResult` on
- * violation. Exported so tests can exercise the gate without mocking the
- * full `updateDocs` call chain.
- */
-export async function enforceDocsOnlyGate(
-  wtPath: string,
-  headBefore: string,
-  deps: VerifyDeps = {},
-): Promise<VerifyResult> {
-  return verifyHarnessCommits(wtPath, headBefore, { docsOnly: true }, deps);
-}
-
-/**
- * Verifies that every harness-produced commit (in `headBefore..HEAD`) carries
- * the expected docs commit message prefix. Uses `allowEmpty: true` so runs
- * where the harness made no commits (dirty-only) are not blocked — the stage
- * will auto-commit those with the correct message. Exported for direct testing.
- * (#68 review-2 finding 3)
- */
-export async function enforceDocsCommitMessageGate(
-  wtPath: string,
-  headBefore: string,
-  issueNumber: number,
-  deps: VerifyDeps = {},
-): Promise<VerifyResult> {
-  return verifyHarnessCommits(
-    wtPath,
-    headBefore,
-    {
-      messagePattern: {
-        pattern: new RegExp(`docs: update documentation for #${issueNumber}`, "i"),
-        description: `Docs harness committed with wrong message — expected prefix: "${DOCS_COMMIT_PREFIX}${issueNumber}"`,
-      },
-      allowEmpty: true,
-    },
-    deps,
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Docs update
-// ---------------------------------------------------------------------------
-
-async function docsAlreadyUpdated(
-  cfg: PipelineConfig,
-  issueNumber: number,
-): Promise<boolean> {
-  const wt = await getForIssue(cfg, issueNumber);
-  if (!wt) return true; // No worktree → skip docs (manually-recovered case).
-  const log = await gitInWorktree(
-    wt.path,
-    ["log", "--oneline", `origin/${cfg.base_branch}..HEAD`],
-    { ignoreFailure: true },
-  );
-  return log.stdout.includes(`${DOCS_COMMIT_PREFIX}${issueNumber}`);
-}
-
-async function updateDocs(
-  cfg: PipelineConfig,
-  issueNumber: number,
-  prNumber: number,
-  pipelineRunId: string,
-  opts: AdvancePreMergeOpts,
-): Promise<{ advanced: false; status: "blocked"; reason: string } | null> {
-  const wt = await getForIssue(cfg, issueNumber);
-  if (!wt) return null;
-
-  const detail = await getIssueDetail(cfg, issueNumber);
-  const harness = cfg.harnesses.implementer;
-  let diff: string;
-  try {
-    diff = await getPrDiff(cfg, prNumber);
-  } catch {
-    return null;
-  }
-  if (!diff.trim()) return null;
-
-  console.log(`[pipeline] #${issueNumber}: updating docs (${harness})`);
-
-  const headBefore = (
-    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-
-  const prompt = buildDocsUpdatePrompt({
-    cfg,
-    issueNumber,
-    title: detail.title,
-    diff,
-  });
-  const result = await invoke(harness, wt.path, prompt, {
-    timeoutSec: cfg.implementation_timeout,
-    model: opts.model,
-  });
-  if (!result.success) {
-    console.log(
-      `[pipeline] #${issueNumber}: docs update failed (${result.timed_out ? "timeout" : `exit ${result.exit_code}`}); skipping (non-blocking)`,
-    );
-    return null;
-  }
-
-  // Verify the harness only modified documentation files (#68).
-  if (headBefore) {
-    const docsCheck = await enforceDocsOnlyGate(wt.path, headBefore);
-    if (!docsCheck.ok) {
-      return { advanced: false, status: "blocked", reason: docsCheck.reason };
-    }
-    // Verify harness-produced commit messages match the expected docs prefix (#68 review-2 finding 3).
-    const msgCheck = await enforceDocsCommitMessageGate(wt.path, headBefore, issueNumber);
-    if (!msgCheck.ok) {
-      return { advanced: false, status: "blocked", reason: msgCheck.reason };
-    }
-  }
-
-  const status = await gitInWorktree(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (!status.stdout.trim()) {
-    // Empty marker commit so we don't re-run docs next cycle.
-    await gitInWorktree(
-      wt.path,
-      ["commit", "--allow-empty", "-m", withTrailers(`${DOCS_COMMIT_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
-      { ignoreFailure: true },
-    );
-  } else {
-    await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
-    await gitInWorktree(
-      wt.path,
-      ["commit", "-m", withTrailers(`${DOCS_COMMIT_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
-      { ignoreFailure: true },
-    );
-  }
-
-  const branch = branchName(issueNumber, wt.slug);
-  await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
-  console.log(`[pipeline] #${issueNumber}: docs pushed; CI will re-run`);
-  return null;
-}
-
-// ---------------------------------------------------------------------------
 // OpenSpec archive (once per PR)
 // ---------------------------------------------------------------------------
 
@@ -476,8 +331,9 @@ async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
   issueNumber: number,
   pipelineRunId: string,
+  getForIssueFn: typeof getForIssue = getForIssue,
 ): Promise<Outcome | null> {
-  const wt = await getForIssue(cfg, issueNumber);
+  const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt || !openspec.isActive(cfg, wt.path)) return null;
 
   // Changes this PR branch introduced, still active (not yet archived).

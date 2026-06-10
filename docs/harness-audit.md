@@ -21,7 +21,7 @@ records the enforcement status.
 | Fix round 1 | `fix.md` (round=1) | At least one commit matches `fix: address review 1 findings (#<N>)` | **Added (#68)** |
 | Fix round 2 | `fix.md` (round=2) | At least one commit matches `fix: address review 2 findings (#<N>)` | **Added (#68)** |
 | Test-fix loop | `test_fix.md` | At least one commit matches `fix: resolve test/build failures (#<N>)` | **Added (#68)** |
-| Docs update | `docs_update.md` | No application code files in committed/dirty changes; harness-produced commit message matches `docs: update documentation for #<N>` | **Added (#68)** (file check + commit message check) |
+| Docs update | `docs_update.md` | _Step removed in #91 — docs are now part of the implementation diff_ | **Removed (#91)** |
 | Review SHA gate | — | HEAD matches the reviewed commit SHA | Pre-existing (#16 / PR #63) |
 
 ---
@@ -159,19 +159,12 @@ Same structure as Fix Round 1, with pattern `fix: address review 2 findings (#<N
 
 ### 9. Docs Update — `docs_update.md`
 
-**What the prompt asks for:**
-- Update stale documentation only — no application code
-- If docs changed: commit with message `docs: update documentation for #<issue_number>`
-
-**Machine-checkable invariants:**
-- Every changed file in `headBefore..HEAD` **and** in the uncommitted dirty tree matches the documentation **allow-list**: `*.md`, `*.txt`, `*.rst`, `*.adoc`, paths under `docs/` or `doc/`, and extensionless named docs files (`README`, `CHANGELOG`, `LICENSE`, `CONTRIBUTING`, `AUTHORS`, `NOTICE`, `CODEOWNERS`, `SECURITY`). Any path that does not match is denied — application code, config (`package.json`, `tsconfig.json`), and CI workflows (`*.yml`) all block (#68 review-2 finding 4)
-- Every harness-produced commit (non-empty `headBefore..HEAD`) carries the message prefix `docs: update documentation for #<N>`
-
-**Enforcement added by #68:** `enforceDocsOnlyGate` blocks on any file outside the documentation allow-list in committed or uncommitted changes; `enforceDocsCommitMessageGate` blocks when harness-produced commits carry a wrong message prefix (#68 review-2 finding 3).
-
-**Judgmental properties (out of scope):**
-- Accuracy and completeness of the documentation updates
-- Whether all relevant docs were found and updated
+**Removed in #91.** The pre-merge docs harness call committed documentation the
+reviewers never saw and forced a second CI cycle. The docs ask is now folded
+into the implementing prompt (gated on `steps.docs`), so documentation lands
+inside the reviewed implementation diff and is covered by the review rounds
+like any other change. The #68 gates that guarded this step
+(`enforceDocsOnlyGate`, `enforceDocsCommitMessageGate`) were deleted with it.
 
 ---
 
@@ -184,8 +177,9 @@ because they require reviewer judgment:
   understanding the code — this is what review-1 (standard) and review-2 (adversarial) are for.
 - **Plan quality and soundness** (planning, plan revision): whether a plan is good is a design judgment
   left to the plan-review step.
-- **Documentation accuracy** (docs update): whether the docs reflect the code truthfully requires
-  understanding both; checked by reviewers.
+- **Documentation accuracy** (implementing, with `steps.docs` on): whether the docs reflect the code
+  truthfully requires understanding both; docs are part of the implementation diff (#91), so the
+  review rounds check them.
 - **Test adequacy** (implementing): whether tests provide sufficient coverage is a reviewer judgment.
 - **Finding correctness in review** (plan review): whether the reviewer's findings are correct is
   assessed by the implementer and ultimately the merge decision.
@@ -206,8 +200,6 @@ Per-step gate functions delegate to the shared helper and are exported for direc
 - `enforceOpenspecChangeSingular` (planning.ts) — exactly one new OpenSpec change directory
 - `enforceFixCommitGate` (fix.ts)
 - `enforceTestFixCommitFormat` (testgate.ts)
-- `enforceDocsOnlyGate` (pre_merge.ts)
-- `enforceDocsCommitMessageGate` (pre_merge.ts)
 
 ## Prior Pointwise Fixes Consistency
 
