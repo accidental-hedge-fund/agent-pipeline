@@ -123,7 +123,14 @@ export async function advance(
   // still computing mergeability) is NOT a conflict and falls through to the
   // CI poll.
   const prDetail = await getPrDetailFn(cfg, prNumber);
-  if (parseMergeable(prDetail) === "conflict") {
+  // Narrow predicate: only CONFLICTING (mergeable === false) or an explicit DIRTY
+  // merge state bypasses the CI poll. BEHIND/BLOCKED map to "conflict" in the
+  // broader parseMergeable() but represent out-of-date branch or branch protection —
+  // not a real merge conflict — so they must fall through to the CI poll.
+  const isEarlyConflict =
+    prDetail.mergeable === false ||
+    (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY";
+  if (isEarlyConflict) {
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
     return recoverFromMergeConflict(cfg, issueNumber, deps);
   }

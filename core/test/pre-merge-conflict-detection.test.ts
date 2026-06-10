@@ -142,6 +142,34 @@ test("UNKNOWN mergeability does not enter the early-conflict path; CI poll proce
   assert.deepEqual(rec.blocked, []);
 });
 
+test("BLOCKED mergeable_state does not trigger early-conflict path; CI poll proceeds (#95)", async (t) => {
+  // mergeable: null + mergeable_state: BLOCKED → branch protection or required reviews,
+  // not a merge conflict. The EARLY conflict check must not bypass CI for this state.
+  // (parseMergeable maps BLOCKED to "conflict" for the post-CI mergeability gate — that
+  // is intentional and separate from this test's concern.)
+  const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BLOCKED" });
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.equal(rec.ciPolls, 1, "BLOCKED state must still poll CI — not bypassed by the early-conflict check");
+  // The post-CI mergeability gate sees parseMergeable → "conflict" and attempts a rebase;
+  // that is expected. The critical invariant is that ciPolls === 1.
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("BEHIND mergeable_state does not trigger early-conflict path; CI poll proceeds (#95)", async (t) => {
+  // mergeable: null + mergeable_state: BEHIND → branch is out of date with base,
+  // not a merge conflict. The EARLY conflict check must not bypass CI for this state.
+  const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.equal(rec.ciPolls, 1, "BEHIND state must still poll CI — not bypassed by the early-conflict check");
+  assert.deepEqual(rec.blocked, []);
+});
+
 test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)", async (t) => {
   const { deps, rec } = makeDeps({ mergeable: true, mergeable_state: "CLEAN" });
   deps.getPrChecks = async () => {
