@@ -652,6 +652,21 @@ export async function resolvePrForIssue(
   return null;
 }
 
+/** Parse the raw JSON from `gh pr view --json closingIssuesReferences`.
+ *  gh CLI emits `repository { id, name, owner { id, login } }`, NOT `nameWithOwner`. */
+export function parseClosingIssueRefs(stdout: string): ClosingIssueRef[] {
+  const data = JSON.parse(stdout) as {
+    closingIssuesReferences?: {
+      number: number;
+      repository: { name: string; owner: { login: string } };
+    }[];
+  };
+  return (data.closingIssuesReferences ?? []).map((r) => ({
+    number: r.number,
+    nameWithOwner: `${r.repository.owner.login}/${r.repository.name}`,
+  }));
+}
+
 async function getPrClosingIssueRefs(
   cfg: PipelineConfig,
   prNumber: number,
@@ -665,13 +680,7 @@ async function getPrClosingIssueRefs(
     "-R",
     cfg.repo,
   ]);
-  const data = JSON.parse(stdout) as {
-    closingIssuesReferences?: { number: number; repository: { nameWithOwner: string } }[];
-  };
-  return (data.closingIssuesReferences ?? []).map((r) => ({
-    number: r.number,
-    nameWithOwner: r.repository.nameWithOwner,
-  }));
+  return parseClosingIssueRefs(stdout);
 }
 
 export async function getPrForIssue(
