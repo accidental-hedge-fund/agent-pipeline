@@ -614,6 +614,53 @@ export async function createPr(
   return Number.parseInt(match[1], 10);
 }
 
+/** Minimal open-PR shape needed by resolvePrForIssue. */
+export interface PrCandidate {
+  number: number;
+  headRefName: string;
+}
+
+/** Resolve the PR for an issue using exactly two strategies, in order:
+ *    1. Head branch starts with `pipeline/<N>-` (fast path, no extra API calls).
+ *    2. The PR's closingIssuesReferences contains the issue (authoritative link).
+ *  Returns null when neither matches. Deliberately NO body/title text search —
+ *  a PR that merely mentions `#N` must not resolve as issue N's PR (#76). */
+export async function resolvePrForIssue(
+  prs: PrCandidate[],
+  issueNumber: number,
+  getClosingIssueNumbers: (prNumber: number) => Promise<number[]>,
+): Promise<number | null> {
+  const branchPrefix = `pipeline/${issueNumber}-`;
+  for (const pr of prs) {
+    if (pr.headRefName.startsWith(branchPrefix)) return pr.number;
+  }
+
+  for (const pr of prs) {
+    const closing = await getClosingIssueNumbers(pr.number);
+    if (closing.includes(issueNumber)) return pr.number;
+  }
+  return null;
+}
+
+async function getPrClosingIssueNumbers(
+  cfg: PipelineConfig,
+  prNumber: number,
+): Promise<number[]> {
+  const stdout = await ghRun([
+    "pr",
+    "view",
+    String(prNumber),
+    "--json",
+    "closingIssuesReferences",
+    "-R",
+    cfg.repo,
+  ]);
+  const data = JSON.parse(stdout) as {
+    closingIssuesReferences?: { number: number }[];
+  };
+  return (data.closingIssuesReferences ?? []).map((r) => r.number);
+}
+
 export async function getPrForIssue(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -622,7 +669,7 @@ export async function getPrForIssue(
     "pr",
     "list",
     "--json",
-    "number,headRefName,title,body",
+    "number,headRefName",
     "--state",
     "open",
     "-L",
@@ -630,34 +677,8 @@ export async function getPrForIssue(
     "-R",
     cfg.repo,
   ]);
-  const prs = JSON.parse(stdout) as {
-    number: number;
-    headRefName: string;
-    title: string;
-    body: string;
-  }[];
-
-  const branchPrefix = `pipeline/${issueNumber}-`;
-  for (const pr of prs) {
-    if (pr.headRefName.startsWith(branchPrefix)) return pr.number;
-  }
-
-  const refs = [
-    `Closes #${issueNumber}`,
-    `Closes: #${issueNumber}`,
-    `Fixes #${issueNumber}`,
-    `Fixes: #${issueNumber}`,
-    `Resolves #${issueNumber}`,
-    `Resolves: #${issueNumber}`,
-    `Refs #${issueNumber}`,
-    `Refs: #${issueNumber}`,
-    `#${issueNumber}`,
-  ];
-  for (const pr of prs) {
-    const haystack = `${pr.title}\n${pr.body ?? ""}`;
-    if (refs.some((r) => haystack.includes(r))) return pr.number;
-  }
-  return null;
+  const prs = JSON.parse(stdout) as PrCandidate[];
+  return resolvePrForIssue(prs, issueNumber, (n) => getPrClosingIssueNumbers(cfg, n));
 }
 
 // ---------------------------------------------------------------------------

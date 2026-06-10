@@ -10,6 +10,7 @@ import {
   parseMergeable,
   parsePrMergeState,
   pickStage,
+  resolvePrForIssue,
 } from "../scripts/gh.ts";
 import {
   formatReviewComment,
@@ -256,6 +257,55 @@ test("parsePrMergeState: single merged PR → merged=true with prNumber and head
 test("parsePrMergeState: empty array → merged=false", () => {
   const result = parsePrMergeState("[]");
   assert.equal(result.merged, false);
+});
+
+// ---------- resolvePrForIssue (#76) ----------
+
+test("resolvePrForIssue: branch-prefix match returns the PR without fetching closing refs", async () => {
+  let fetches = 0;
+  const prs = [
+    { number: 7, headRefName: "feat/unrelated" },
+    { number: 9, headRefName: "pipeline/42-my-feature" },
+  ];
+  const result = await resolvePrForIssue(prs, 42, async () => {
+    fetches++;
+    return [];
+  });
+  assert.equal(result, 9);
+  assert.equal(fetches, 0);
+});
+
+test("resolvePrForIssue: branch prefix requires the trailing dash (no pipeline/420-* match for #42)", async () => {
+  const prs = [{ number: 9, headRefName: "pipeline/420-other-issue" }];
+  assert.equal(await resolvePrForIssue(prs, 42, async () => []), null);
+});
+
+test("resolvePrForIssue: falls back to closingIssuesReferences when no pipeline branch", async () => {
+  const prs = [
+    { number: 7, headRefName: "feat/unrelated" },
+    { number: 9, headRefName: "fix/other-work" },
+  ];
+  const closing: Record<number, number[]> = { 7: [13], 9: [42, 50] };
+  assert.equal(await resolvePrForIssue(prs, 42, async (n) => closing[n] ?? []), 9);
+});
+
+test("resolvePrForIssue: PR that merely mentions the issue number is NOT matched (#76 regression)", async () => {
+  // The original bug: PR #66 closed #20 but hard-coded "issue 42" / "Fixes #42"
+  // in its body (a unit-test fixture), and --status resolved it as #42's PR.
+  // Body text plays no part in resolution — only closing references count.
+  const prs = [
+    {
+      number: 66,
+      headRefName: "fix/testgate-fixture",
+      body: "Adds a unit-test fixture that hard-codes issue 42.\n\nFixes #42 appears here only as fixture text.",
+    },
+  ];
+  assert.equal(await resolvePrForIssue(prs, 42, async () => [20]), null);
+});
+
+test("resolvePrForIssue: returns null when no PR matches either strategy", async () => {
+  const prs = [{ number: 7, headRefName: "feat/unrelated" }];
+  assert.equal(await resolvePrForIssue(prs, 42, async () => []), null);
 });
 
 // ---------- extractHumanPlanComments (#26) ----------
