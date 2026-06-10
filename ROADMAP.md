@@ -1,8 +1,8 @@
 # Roadmap
 
-Single source of truth for the execution order of the open backlog. Last updated 2026-06-10.
+Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-10.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready; everything below is the post-1.0 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -36,35 +36,75 @@ Single source of truth for the execution order of the open backlog. Last updated
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
 
-## Execution order (remaining)
+**v1.0.0 — external-ready (tagged 2026-06-10, commit `450b537`):**
 
-### Tier 0 — in flight, finish first
+| # | What | PR |
+|---|------|-----|
+| #56 | single-source the review verdict JSON schema (prompts ↔ `ReviewFinding`) + drift-guard test | #83 |
+| #98 | pre-merge #16 gate must not re-review pipeline-internal commits (the autonomous-convergence fix) | #99 |
+| #76 | `--status` resolves a PR by `closingIssuesReferences`/branch, not loose body-text (folds #97) | #96 |
+| #91 | fold docs into the implementation step; remove the pre-merge docs stage (one CI cycle) | #100 |
+| #93 | delete dead surface: ignored `harnesses` key, `auto_merge`, `openclaw` profile, companion runtime | #102 |
+| — | repo `CLAUDE.md` — conventions contract for the self-dev pipeline | #101 |
 
-1. **#56** — Single-source the review verdict JSON schema (prompts ↔ `ReviewFinding`) + drift-guard test. **Blocked at `fix-2`** on adversarial churn; now unblockable via the merged #17 policy — set `review_policy.block_threshold: high` in `.github/pipeline.yml` or run the audited `--override`. *Implemented by PR #83.*
-2. **PR #83** — finalize and merge once #56 is unblocked. Carries the single-sourced `{{schema_block}}` constant the #57 prompt work builds on.
+## Release plan (sem-ver)
 
-### Tier 1 — runnable now (decision-complete, no blocker)
+Post-1.0 the open backlog is **entirely additive or internal hardening — no breaking changes.** This was verified 2026-06-10 by a per-issue classification with an adversarial breaking-change check; the verifier agreed on all 14 issues. Every `adds_key` change is optional and **default-off**, so it is safe under the strict (`.strict()`) config schema — an omitted key still validates. A 2.0 would require removing/renaming a key, changing a default, making a dead key live, or breaking the verdict output schema; nothing open does that.
 
-3. **#76** — `--status` (and the shared `getPrForIssue`) resolve a PR by branch-prefix + `closingIssuesReferences`, not loose body-text match. *Bug; fixes all five call sites at once. Implemented by PR #96 (also folds #97: single `pr list` query, no per-PR fan-out; fork PRs can't spoof the branch fast path).*
-4. **#91** — Fold docs into the implementation step; remove the pre-merge docs stage. *Docs become part of the **reviewed** diff and the happy path drops from two CI cycles to one. A rigor gain, not a cut. Implemented by PR #100.*
-5. **#57 + #84** — Upgrade the review prompts (**both kept**): severity rubric, confidence calibration (aligned to #17's `min_confidence`), diff-scoping, **strip the deterministic asks** (`review_standard.md:20-21` — the test gate + CI already prove them), **differentiate round-1 vs round-2** to cut overlap, and **enumerate every instance per finding class** (#84) so a defect class converges in one round. *Sequence after PR #83 (shared schema block).*
-6. **#93** — Delete dead surface: the accepted-but-ignored `harnesses` key, dead `auto_merge`, the near-duplicate `openclaw` profile, and decide the fate of the unreachable companion review runtime (keep `parseProseReview` — it serves prompt-harness codex output).
-7. **#75** — Zero-machinery `plugin/` mirror regen: repo-local conventions instruction + commit the mirror after editing `core/`; #61 gate stays the backstop. *No generator-detection/config in the generic core.*
-8. **#70** — Per-step model config: add `models.implementing` only; drop `models.docs` (folds into impl under #91) and the identifier allowlist; warn when `models.*` is set on a codex step.
+| Release | Bump | Theme | Issues | Why this bump |
+|---|---|---|---|---|
+| **v1.0.1** | patch | Dev-loop convergence | #95, #75 | Pure self-heal bug fixes; no public surface or config. Lowest-risk, no in-set deps, and it hardens the loop that ships everything after it. |
+| **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
+| **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
+| **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
+| *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
-### Tier 2 — reviewer pluggability (after #93's companion decision)
+Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 
-- **#39** No-review-harness fallback — degrade to a clearly-labeled same-harness self-review when the reviewer CLI is unavailable (failure-triggered, at the invoke seam, no new config key).
-- **#40** Configurable review harness — generalize `invoke()` and make the reviewer selection key actually honored (turns the #93 dead key into real behavior).
+| # | Impact | Config | Theme | → Release | Depends on |
+|---|--------|--------|-------|-----------|------------|
+| #95 | patch | none | dev-loop convergence | v1.0.1 | — |
+| #75 | patch | none | dev-loop convergence | v1.0.1 | #61 ✓ |
+| #19 | minor | none | review quality | v1.1.0 | #25 |
+| #25 | minor | none | review quality | v1.1.0 | #19 |
+| #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
+| #84 | minor | none | review quality | v1.1.0 | #57 |
+| #85 | patch | none | drift-guard hardening | v1.1.0 | #83 ✓ |
+| #39 | minor | none | reviewer pluggability | v1.2.0 | — |
+| #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
+| #70 | minor | adds key | per-step models | v1.2.0 | #91 ✓ |
+| #23 | minor | adds key | graduated autonomy | v1.3.0 | — |
+| #21 | minor | adds key | execution isolation | v1.3.0 | #93 ✓ |
+| #14 | none | — | research | *(none)* | — |
+| #27 | none | — | research | *(none)* | — |
 
-### Tier 3 — compounding context / graduated autonomy (rescoped; need direction)
+**How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
-- **#19 + #25** — Closed-loop learning + research-grounded planning. **Rescoped:** human-curated lessons file via the existing `readConventions` injection (no pipeline-written store); strengthen the single planning prompt in-call (no fan-out calls). Build together.
-- **#23** — Optional human approval checkpoints. **Rescoped:** labels+comments-only (SHA-bound checkpoint comment + `waiting` + re-invoke); no durable approval-record store.
+## Remaining work — detail (grouped by release)
+
+### v1.0.1 — dev-loop convergence (patch)
+
+- **#95** — pre-merge polling hangs when a PR is **CONFLICTING**: no `pull_request` CI runs ever start, so the gate polls to its timeout. Detect CONFLICTING + auto-rebase. *Real run-loop hang; zero config; no in-set deps.*
+- **#75** — Zero-machinery `plugin/` mirror regen: repo-local conventions instruction + commit the mirror after editing `core/`; the #61 test gate stays the backstop. *No generator-detection/config in the generic core. Kills the recurring one-attempt fix-round waste.*
+
+### v1.1.0 — review quality (minor)
+
+- **#19 + #25** — Closed-loop learning + research-grounded planning. **Rescoped:** human-curated lessons file via the existing `readConventions` injection (no pipeline-written store); strengthen the single planning prompt in-call (no fan-out calls). Mutual pair — build together.
+- **#57 + #84** — Upgrade the review prompts (**both kept**): severity rubric, confidence calibration (aligned to #17's `min_confidence`), diff-scoping, **strip the deterministic asks** (`review_standard.md:20-21` — the test gate + CI already prove them), **differentiate round-1 vs round-2** to cut overlap, and **enumerate every instance per finding class** (#84) so a defect class converges in one round. *Builds on the single-sourced `{{schema_block}}` shipped in #83.*
+- **#85** — Extend the verdict drift guard to value-type/nesting (lightweight type-token comparison only). *Unblocked now that #83 has shipped; same review-gate theme.*
+
+### v1.2.0 — reviewer pluggability & per-step models (minor)
+
+- **#39** — No-review-harness fallback: degrade to a clearly-labeled same-harness self-review when the reviewer CLI is unavailable (failure-triggered, at the invoke seam, **no new config key**).
+- **#40** — Configurable review harness: generalize `invoke()` and add a real, honored reviewer-selection key. *Note: #93 deleted the old ignored `harnesses` key, so this **adds a fresh key** (purely additive), not a revival of a dead one.* Sequence after #39.
+- **#70** — Per-step model config: add `models.implementing` only; drop `models.docs` (folds into impl under #91) and the identifier allowlist; warn when `models.*` is set on a codex step.
+
+### v1.3.0 — graduated autonomy & isolation (minor)
+
+- **#23** — Optional human approval checkpoints. **Rescoped:** labels+comments-only (SHA-bound checkpoint comment + `waiting` + re-invoke); one config key, default empty; no durable approval-record store.
 - **#21** — Optional sandboxed execution. **Rescoped:** one opt-in key swapping to each harness's native sandbox mode (no container/E2B/Modal runtime). *Largest; last.*
-- **#85** — Extend the verdict drift guard to value-type/nesting. **Deferred** until PR #83 lands; then a lightweight type-token comparison only.
 
-### Trackers
+### Trackers (no release)
 
 - **#14, #27** — dark-factory research epics; children filed and individually dispositioned — keep as provenance.
 
@@ -79,7 +119,8 @@ Single source of truth for the execution order of the open backlog. Last updated
 
 ## Notes
 
-- The **review layer** runs `reviewMode: prompt-harness` (reviewer CLI invoked directly with a JSON-returning prompt; companion plugins optional) — standard + adversarial passes, both carrying real weight. #56/#57/#84 harden it; #17 (merged) gives it an audited convergence escape hatch.
+- The **review layer** runs `reviewMode: prompt-harness` (reviewer CLI invoked directly with a JSON-returning prompt; companion plugins optional) — standard + adversarial passes, both carrying real weight. #56 (shipped in 1.0) single-sourced the verdict schema; #57/#84/#85 harden the prompts and drift guard; #17 (merged) gives it an audited convergence escape hatch.
 - The **mirror-staleness dogfooding** (#61) is active: every run's test gate runs `npm run ci` (includes `build.mjs --check`). #75 removes the remaining manual-regen friction.
-- Execution within a tier is value-ranked; tiers are ordered by decision-readiness.
+- Within a release, issues are value-ranked; releases are ordered by dependency + theme cohesion (v1.0.1 first — lowest-risk, no deps, hardens the self-dev loop).
+- Every open issue carries a `release:v*` label mirroring this plan (applied 2026-06-10); research trackers #14/#27 are intentionally unlabeled.
 - Withdrawn 2026-06-10: the umbrella tracker and the review-default-off proposals (no longer in the backlog).
