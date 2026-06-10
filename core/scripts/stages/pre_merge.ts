@@ -1,4 +1,5 @@
-// Pre-merge gate: OpenSpec archive (once) → CI gate → mergeability gate → ready-to-deploy.
+// Pre-merge gate: OpenSpec archive (once) → conflict pre-check → CI gate →
+// mergeability gate → ready-to-deploy.
 //
 // Returns { advanced: false, status: "waiting" } when CI is still running.
 // The caller (pipeline.ts loop) breaks on waiting so the user can re-invoke
@@ -16,7 +17,6 @@ import {
   getPrDetail,
   getPrForIssue,
   parseChecksAggregate,
-  parseMergeable,
   postComment,
   setBlocked,
   transition,
@@ -54,16 +54,19 @@ export interface AdvancePreMergeOpts {
 
 /**
  * External seams for {@link advance}, overridable in tests so the gate
- * sequence (SHA gate → archive → CI → mergeability → advance) can be
- * exercised without GitHub or a worktree. Extends {@link ShaGateDeps} so one
- * bag also feeds the review-SHA gate. Mirrors the DI pattern used elsewhere
- * (review.ts, testgate.ts).
+ * sequence (SHA gate → archive → conflict pre-check → CI → mergeability →
+ * advance) can be exercised without GitHub or a worktree. Extends
+ * {@link ShaGateDeps} so one bag also feeds the review-SHA gate. Mirrors the
+ * DI pattern used elsewhere (review.ts, testgate.ts).
  */
 export interface AdvancePreMergeDeps extends ShaGateDeps {
   getPrForIssue?: typeof getPrForIssue;
   getPrChecks?: typeof getPrChecks;
   getForIssue?: typeof getForIssue;
   setBlocked?: typeof setBlocked;
+  tryRebaseAndPush?: typeof tryRebaseAndPush;
+  rebaseAlreadyAttempted?: typeof rebaseAlreadyAttempted;
+  markRebaseAttempted?: typeof markRebaseAttempted;
 }
 
 export async function advance(
@@ -78,6 +81,9 @@ export async function advance(
   const getForIssueFn = deps.getForIssue ?? getForIssue;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const transitionFn = deps.transition ?? transition;
+  const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
+  const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
+  const markRebaseAttemptedFn = deps.markRebaseAttempted ?? markRebaseAttempted;
 
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
 
@@ -108,6 +114,26 @@ export async function advance(
   const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, getForIssueFn);
   if (archiveOutcome) return archiveOutcome;
 
+  // ---- Step 0.5: early conflict detection (#95) ----
+  // GitHub cannot build the pull_request merge ref for a CONFLICTING PR, so
+  // no pull_request-triggered check runs are ever created — polling for
+  // checks would wait out ci_timeout for runs that cannot appear. Fetch PR
+  // detail and route a conflict straight to the rebase path. UNKNOWN (GitHub
+  // still computing mergeability) is NOT a conflict and falls through to the
+  // CI poll.
+  const prDetail = await getPrDetailFn(cfg, prNumber);
+  // Narrow predicate: only CONFLICTING (mergeable === false) or an explicit DIRTY
+  // merge state bypasses the CI poll. BEHIND/BLOCKED map to "conflict" in the
+  // broader parseMergeable() but represent out-of-date branch or branch protection —
+  // not a real merge conflict — so they must fall through to the CI poll.
+  const isEarlyConflict =
+    prDetail.mergeable === false ||
+    (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY";
+  if (isEarlyConflict) {
+    console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
+    return recoverFromMergeConflict(cfg, issueNumber, deps);
+  }
+
   // ---- Step 1: CI ----
   let checks;
   try {
@@ -124,11 +150,11 @@ export async function advance(
 
   if (agg.failed.length > 0) {
     const wt = await getForIssueFn(cfg, issueNumber);
-    const alreadyRebased = wt ? rebaseAlreadyAttempted(wt.path) : true;
+    const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
     if (!alreadyRebased && wt) {
-      const ok = await tryRebaseAndPush(cfg, issueNumber);
+      const ok = await tryRebaseAndPushFn(cfg, issueNumber);
       if (ok) {
-        markRebaseAttempted(wt.path);
+        markRebaseAttemptedFn(wt.path);
         return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
       }
     }
@@ -142,22 +168,49 @@ export async function advance(
   }
 
   // ---- Step 2: mergeability ----
-  const detail = await getPrDetailFn(cfg, prNumber);
-  const mergeStatus = parseMergeable(detail);
-  if (mergeStatus === "conflict") {
-    const ok = await tryRebaseAndPush(cfg, issueNumber);
-    if (ok) {
-      return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
+  // Re-fetch after CI passes to catch conflicts that developed while CI was
+  // running. Reusing the pre-CI snapshot could let a PR that became
+  // CONFLICTING after the early check slip through to ready-to-deploy.
+  // Use a narrow true-conflict predicate (same as Step 0.5) rather than
+  // parseMergeable(), which also maps BEHIND/BLOCKED to "conflict". BEHIND
+  // is an out-of-date branch (code is compatible, not conflicting); BLOCKED
+  // is branch-protection preventing the merge. Routing those states to
+  // recoverFromMergeConflict consumes the rebase marker and then blocks on
+  // the next poll with a misleading "merge conflict — manual rebase needed"
+  // reason for a PR that never had a real code conflict.
+  const freshPrDetail = await getPrDetailFn(cfg, prNumber);
+  const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
+  const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
+  if (isFreshConflict) {
+    return recoverFromMergeConflict(cfg, issueNumber, deps);
+  }
+  if (freshState === "BEHIND") {
+    // BEHIND means the branch is out-of-date but has no code conflict.
+    // Attempt one auto-rebase (same marker guard as the CONFLICTING path).
+    // A second poll with the marker set blocks with a behind-specific reason,
+    // not a conflict reason. BLOCKED (branch protection) is not updatable
+    // by a rebase and stays as passive waiting.
+    const behindWt = await getForIssueFn(cfg, issueNumber);
+    const behindAlreadyRebased = behindWt ? rebaseAlreadyAttemptedFn(behindWt.path) : true;
+    if (!behindAlreadyRebased && behindWt) {
+      const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+      if (ok) {
+        markRebaseAttemptedFn(behindWt.path);
+        return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+      }
     }
     await setBlockedFn(
       cfg,
       issueNumber,
-      "PR has merge conflicts that could not be automatically resolved.",
+      "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.",
       "pre-merge",
     );
-    return { advanced: false, status: "blocked", reason: "merge conflict" };
+    return { advanced: false, status: "blocked", reason: "branch behind base" };
   }
-  if (mergeStatus === "unknown") {
+  if (freshState === "BLOCKED") {
+    return { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" };
+  }
+  if (freshPrDetail.mergeable === null && freshState !== "CLEAN" && freshState !== "HAS_HOOKS") {
     return { advanced: false, status: "waiting", reason: "GitHub still computing mergeability" };
   }
 
@@ -390,6 +443,43 @@ async function maybeArchiveOpenspec(
 // ---------------------------------------------------------------------------
 // Rebase tracking
 // ---------------------------------------------------------------------------
+
+/**
+ * Conflict recovery shared by the early-conflict check (#95) and the Step 2
+ * mergeability gate: attempt one auto-rebase, bounded by the per-worktree
+ * rebase marker so an unresolvable conflict cannot retry a rebase on every
+ * poll iteration. When the rebase cannot resolve the conflict (or was already
+ * attempted), blocks with a conflict-specific reason rather than a generic
+ * CI-timeout or CI-failure message.
+ */
+async function recoverFromMergeConflict(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: AdvancePreMergeDeps = {},
+): Promise<Outcome> {
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
+  const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
+  const markRebaseAttemptedFn = deps.markRebaseAttempted ?? markRebaseAttempted;
+
+  const wt = await getForIssueFn(cfg, issueNumber);
+  const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
+  if (!alreadyRebased && wt) {
+    const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+    if (ok) {
+      markRebaseAttemptedFn(wt.path);
+      return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
+    }
+  }
+  await setBlockedFn(
+    cfg,
+    issueNumber,
+    "PR has a merge conflict with the base branch that could not be automatically rebased — manual rebase needed.",
+    "pre-merge",
+  );
+  return { advanced: false, status: "blocked", reason: "merge conflict" };
+}
 
 function rebaseAlreadyAttempted(wtPath: string): boolean {
   return fs.existsSync(path.join(wtPath, REBASE_MARKER_FILE));
