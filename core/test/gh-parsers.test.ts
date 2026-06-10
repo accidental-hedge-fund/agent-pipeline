@@ -11,6 +11,7 @@ import {
   parsePrMergeState,
   pickStage,
   resolvePrForIssue,
+  type ClosingIssueRef,
 } from "../scripts/gh.ts";
 import {
   formatReviewComment,
@@ -261,13 +262,19 @@ test("parsePrMergeState: empty array → merged=false", () => {
 
 // ---------- resolvePrForIssue (#76) ----------
 
+const TARGET_REPO = "owner/repo";
+
+function refs(...nums: number[]): ClosingIssueRef[] {
+  return nums.map((n) => ({ number: n, nameWithOwner: TARGET_REPO }));
+}
+
 test("resolvePrForIssue: branch-prefix match returns the PR without fetching closing refs", async () => {
   let fetches = 0;
   const prs = [
     { number: 7, headRefName: "feat/unrelated" },
     { number: 9, headRefName: "pipeline/42-my-feature" },
   ];
-  const result = await resolvePrForIssue(prs, 42, async () => {
+  const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => {
     fetches++;
     return [];
   });
@@ -277,7 +284,7 @@ test("resolvePrForIssue: branch-prefix match returns the PR without fetching clo
 
 test("resolvePrForIssue: branch prefix requires the trailing dash (no pipeline/420-* match for #42)", async () => {
   const prs = [{ number: 9, headRefName: "pipeline/420-other-issue" }];
-  assert.equal(await resolvePrForIssue(prs, 42, async () => []), null);
+  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), null);
 });
 
 test("resolvePrForIssue: falls back to closingIssuesReferences when no pipeline branch", async () => {
@@ -285,8 +292,11 @@ test("resolvePrForIssue: falls back to closingIssuesReferences when no pipeline 
     { number: 7, headRefName: "feat/unrelated" },
     { number: 9, headRefName: "fix/other-work" },
   ];
-  const closing: Record<number, number[]> = { 7: [13], 9: [42, 50] };
-  assert.equal(await resolvePrForIssue(prs, 42, async (n) => closing[n] ?? []), 9);
+  const closing: Record<number, ClosingIssueRef[]> = { 7: refs(13), 9: refs(42, 50) };
+  assert.equal(
+    await resolvePrForIssue(prs, 42, TARGET_REPO, async (n) => closing[n] ?? []),
+    9,
+  );
 });
 
 test("resolvePrForIssue: PR that merely mentions the issue number is NOT matched (#76 regression)", async () => {
@@ -300,12 +310,22 @@ test("resolvePrForIssue: PR that merely mentions the issue number is NOT matched
       body: "Adds a unit-test fixture that hard-codes issue 42.\n\nFixes #42 appears here only as fixture text.",
     },
   ];
-  assert.equal(await resolvePrForIssue(prs, 42, async () => [20]), null);
+  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => refs(20)), null);
+});
+
+test("resolvePrForIssue: cross-repo closing ref is not matched (#76 adversarial regression)", async () => {
+  // A PR in cfg.repo closes other/repo#42 — the same number as our target issue
+  // but in a different repository. Must not resolve as cfg.repo#42's PR.
+  const prs = [{ number: 11, headRefName: "feat/something" }];
+  const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => [
+    { number: 42, nameWithOwner: "other/repo" },
+  ]);
+  assert.equal(result, null);
 });
 
 test("resolvePrForIssue: returns null when no PR matches either strategy", async () => {
   const prs = [{ number: 7, headRefName: "feat/unrelated" }];
-  assert.equal(await resolvePrForIssue(prs, 42, async () => []), null);
+  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), null);
 });
 
 // ---------- extractHumanPlanComments (#26) ----------

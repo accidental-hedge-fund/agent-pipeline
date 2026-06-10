@@ -620,15 +620,23 @@ export interface PrCandidate {
   headRefName: string;
 }
 
+/** Structured closing-issue reference returned by the GH API (includes repo). */
+export interface ClosingIssueRef {
+  number: number;
+  nameWithOwner: string;
+}
+
 /** Resolve the PR for an issue using exactly two strategies, in order:
  *    1. Head branch starts with `pipeline/<N>-` (fast path, no extra API calls).
- *    2. The PR's closingIssuesReferences contains the issue (authoritative link).
+ *    2. The PR's closingIssuesReferences contains the issue in targetRepo (authoritative link).
  *  Returns null when neither matches. Deliberately NO body/title text search —
- *  a PR that merely mentions `#N` must not resolve as issue N's PR (#76). */
+ *  a PR that merely mentions `#N` must not resolve as issue N's PR (#76).
+ *  Cross-repo closing refs (OWNER/REPO#N targeting a different repo) are ignored. */
 export async function resolvePrForIssue(
   prs: PrCandidate[],
   issueNumber: number,
-  getClosingIssueNumbers: (prNumber: number) => Promise<number[]>,
+  targetRepo: string,
+  getClosingIssueRefs: (prNumber: number) => Promise<ClosingIssueRef[]>,
 ): Promise<number | null> {
   const branchPrefix = `pipeline/${issueNumber}-`;
   for (const pr of prs) {
@@ -636,16 +644,18 @@ export async function resolvePrForIssue(
   }
 
   for (const pr of prs) {
-    const closing = await getClosingIssueNumbers(pr.number);
-    if (closing.includes(issueNumber)) return pr.number;
+    const refs = await getClosingIssueRefs(pr.number);
+    if (refs.some((r) => r.nameWithOwner === targetRepo && r.number === issueNumber)) {
+      return pr.number;
+    }
   }
   return null;
 }
 
-async function getPrClosingIssueNumbers(
+async function getPrClosingIssueRefs(
   cfg: PipelineConfig,
   prNumber: number,
-): Promise<number[]> {
+): Promise<ClosingIssueRef[]> {
   const stdout = await ghRun([
     "pr",
     "view",
@@ -656,9 +666,12 @@ async function getPrClosingIssueNumbers(
     cfg.repo,
   ]);
   const data = JSON.parse(stdout) as {
-    closingIssuesReferences?: { number: number }[];
+    closingIssuesReferences?: { number: number; repository: { nameWithOwner: string } }[];
   };
-  return (data.closingIssuesReferences ?? []).map((r) => r.number);
+  return (data.closingIssuesReferences ?? []).map((r) => ({
+    number: r.number,
+    nameWithOwner: r.repository.nameWithOwner,
+  }));
 }
 
 export async function getPrForIssue(
@@ -678,7 +691,7 @@ export async function getPrForIssue(
     cfg.repo,
   ]);
   const prs = JSON.parse(stdout) as PrCandidate[];
-  return resolvePrForIssue(prs, issueNumber, (n) => getPrClosingIssueNumbers(cfg, n));
+  return resolvePrForIssue(prs, issueNumber, cfg.repo, (n) => getPrClosingIssueRefs(cfg, n));
 }
 
 // ---------------------------------------------------------------------------
