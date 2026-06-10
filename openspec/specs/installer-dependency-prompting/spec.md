@@ -4,21 +4,15 @@
 TBD - created by archiving change installer-dependency-prompting. Update Purpose after archive.
 ## Requirements
 ### Requirement: Dependency relevance filtering
-The installer SHALL determine which external dependencies are relevant for the current install based on (a) which hosts are being installed and (b) feature flags in `.github/pipeline.yml`. It SHALL NOT prompt for dependencies that are not relevant to the chosen configuration.
+The installer SHALL determine which external dependencies are relevant for the current install based on feature flags in `.github/pipeline.yml`. It SHALL NOT prompt for companion plugins (`cc-plugin-codex`, `codex-plugin-cc`) — review runs via `prompt-harness` (direct CLI invocation) and requires no companion plugin. It SHALL NOT prompt for dependencies that are not relevant to the chosen configuration.
 
 Relevance rules:
-- `cc-plugin-codex` (sendbird): relevant when the Codex host is being installed — it provides the `claude-companion.mjs` the `$pipeline` flow uses to drive Claude Code for review.
-- `codex-plugin-cc` (openai): relevant when the Claude Code host is being installed — it provides the `codex-companion.mjs` the `/pipeline` flow uses to drive Codex for review.
 - `openspec` CLI: relevant when `openspec.enabled` is `on`/`true` in `.github/pipeline.yml`, or when it is `auto`/absent and the target repo has an `openspec/` directory.
 - `last30days` skill: relevant when `last30days.enabled: true` in `.github/pipeline.yml`.
 
-#### Scenario: Claude-only install omits Codex companion
-- **WHEN** the installer is run targeting only the Claude Code host
-- **THEN** `cc-plugin-codex` (the Codex-host companion) is not included in the dependency prompt list
-
-#### Scenario: Codex-only install omits Claude companion
-- **WHEN** the installer is run targeting only the Codex host
-- **THEN** `codex-plugin-cc` (the Claude-host companion) is not included in the dependency prompt list
+#### Scenario: Companion plugins are never prompted
+- **WHEN** the installer runs for any host configuration
+- **THEN** `cc-plugin-codex` and `codex-plugin-cc` SHALL NOT appear in the dependency prompt list
 
 #### Scenario: Feature flag gates last30days prompt
 - **WHEN** `.github/pipeline.yml` exists and `last30days.enabled` is absent or false
