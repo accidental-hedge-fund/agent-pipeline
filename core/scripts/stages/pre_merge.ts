@@ -184,8 +184,31 @@ export async function advance(
   if (isFreshConflict) {
     return recoverFromMergeConflict(cfg, issueNumber, deps);
   }
-  if (freshState === "BEHIND" || freshState === "BLOCKED") {
-    return { advanced: false, status: "waiting", reason: `GitHub mergeability: ${freshState.toLowerCase()}` };
+  if (freshState === "BEHIND") {
+    // BEHIND means the branch is out-of-date but has no code conflict.
+    // Attempt one auto-rebase (same marker guard as the CONFLICTING path).
+    // A second poll with the marker set blocks with a behind-specific reason,
+    // not a conflict reason. BLOCKED (branch protection) is not updatable
+    // by a rebase and stays as passive waiting.
+    const behindWt = await getForIssueFn(cfg, issueNumber);
+    const behindAlreadyRebased = behindWt ? rebaseAlreadyAttemptedFn(behindWt.path) : true;
+    if (!behindAlreadyRebased && behindWt) {
+      const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+      if (ok) {
+        markRebaseAttemptedFn(behindWt.path);
+        return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+      }
+    }
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.",
+      "pre-merge",
+    );
+    return { advanced: false, status: "blocked", reason: "branch behind base" };
+  }
+  if (freshState === "BLOCKED") {
+    return { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" };
   }
   if (freshPrDetail.mergeable === null && freshState !== "CLEAN" && freshState !== "HAS_HOOKS") {
     return { advanced: false, status: "waiting", reason: "GitHub still computing mergeability" };

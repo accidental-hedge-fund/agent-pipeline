@@ -161,9 +161,10 @@ test("BLOCKED mergeable_state does not trigger early-conflict path; post-CI gate
   assert.deepEqual(rec.blocked, []);
 });
 
-test("BEHIND mergeable_state does not trigger early-conflict path; post-CI gate returns waiting (#95)", async (t) => {
+test("BEHIND mergeable_state does not trigger early-conflict path; post-CI gate attempts auto-update (#95)", async (t) => {
   // mergeable: null + mergeable_state: BEHIND → branch is out of date with base,
-  // not a merge conflict. Must not bypass CI and must not consume the rebase marker.
+  // not a merge conflict. Must not bypass CI (early-conflict path) but post-CI
+  // Step 2 must attempt one auto-rebase to converge, not return waiting indefinitely.
   const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
   let out;
   await quiet(t, async () => {
@@ -172,11 +173,11 @@ test("BEHIND mergeable_state does not trigger early-conflict path; post-CI gate 
   assert.equal(rec.ciPolls, 1, "BEHIND state must still poll CI — not bypassed by the early-conflict check");
   assert.deepEqual(
     out,
-    { advanced: false, status: "waiting", reason: "GitHub mergeability: behind" },
-    "post-CI gate must return waiting for BEHIND, not trigger conflict recovery",
+    { advanced: false, status: "waiting", reason: "rebased; CI re-running" },
+    "post-CI BEHIND must attempt auto-rebase and return waiting while CI re-runs",
   );
-  assert.equal(rec.rebaseCalls, 0, "BEHIND must not consume the rebase slot");
-  assert.deepEqual(rec.marked, [], "BEHIND must not set the rebase-attempted marker");
+  assert.equal(rec.rebaseCalls, 1, "BEHIND must invoke tryRebaseAndPush once");
+  assert.deepEqual(rec.marked, [WT_PATH], "BEHIND rebase success must set the attempted marker");
   assert.deepEqual(rec.blocked, []);
 });
 
@@ -200,10 +201,11 @@ test("BLOCKED with rebase marker present does not set merge-conflict block reaso
   assert.equal(rec.rebaseCalls, 0, "must not attempt a second rebase");
 });
 
-test("BEHIND with rebase marker present does not set merge-conflict block reason (#95)", async (t) => {
+test("BEHIND with rebase marker present blocks with a behind-specific reason, not merge-conflict reason (#95)", async (t) => {
   // Regression for Review 2 finding: BEHIND was mapped to "conflict" by parseMergeable(),
   // which on a second poll (marker present) would block with "merge conflict — manual rebase
   // needed" — wrong message for a PR that is just behind the base branch.
+  // After the fix: BEHIND+marker blocks with "branch behind base", not "merge conflict".
   const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
   deps.rebaseAlreadyAttempted = () => true;
   let out;
@@ -212,11 +214,36 @@ test("BEHIND with rebase marker present does not set merge-conflict block reason
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "waiting", reason: "GitHub mergeability: behind" },
-    "marker-present BEHIND must still return waiting, not a conflict block",
+    { advanced: false, status: "blocked", reason: "branch behind base" },
+    "marker-present BEHIND must block with behind-specific reason, not merge-conflict reason",
   );
-  assert.deepEqual(rec.blocked, [], "must not call setBlocked for a BEHIND-state PR");
+  assert.equal(rec.blocked.length, 1, "must call setBlocked exactly once");
+  assert.match(rec.blocked[0], /behind/, "block reason must mention 'behind'");
+  assert.doesNotMatch(rec.blocked[0], /merge conflict/, "block reason must NOT mention 'merge conflict'");
   assert.equal(rec.rebaseCalls, 0, "must not attempt a second rebase");
+});
+
+test("post-CI BEHIND invokes tryRebaseAndPush instead of returning waiting indefinitely (#95 review-2 regression)", async (t) => {
+  // Regression: Review 2 found that Step 2 passively returned "waiting" for
+  // BEHIND PRs, leaving repos that require branches to be up-to-date stuck in
+  // pre-merge until ci_timeout. BEHIND must attempt one auto-rebase, not stall.
+  const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
+  // Rebase fails (e.g. network issue) — confirm we don't return a waiting outcome.
+  deps.tryRebaseAndPush = async () => {
+    rec.rebaseCalls++;
+    return false;
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.equal(rec.ciPolls, 1, "must still poll CI — BEHIND does not bypass early-conflict check");
+  assert.equal(rec.rebaseCalls, 1, "BEHIND must invoke tryRebaseAndPush");
+  assert.deepEqual(rec.marked, [], "failed rebase must not mark as attempted");
+  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "branch behind base" });
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /behind/, "block message must name the root cause");
+  assert.doesNotMatch(rec.blocked[0], /merge conflict/, "must not use merge-conflict wording for an out-of-date branch");
 });
 
 test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)", async (t) => {
