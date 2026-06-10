@@ -645,7 +645,7 @@ export async function resolvePrForIssue(
 
   for (const pr of prs) {
     const refs = await getClosingIssueRefs(pr.number);
-    if (refs.some((r) => r.nameWithOwner === targetRepo && r.number === issueNumber)) {
+    if (refs.some((r) => r.nameWithOwner.toLowerCase() === targetRepo.toLowerCase() && r.number === issueNumber)) {
       return pr.number;
     }
   }

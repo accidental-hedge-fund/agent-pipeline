@@ -364,6 +364,17 @@ test("resolvePrForIssue: returns null when no PR matches either strategy", async
   assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), null);
 });
 
+test("resolvePrForIssue: closing ref matches despite mixed casing in owner/repo (#76 review-2 regression)", async () => {
+  // GitHub owner/repo identifiers are case-insensitive; cfg.repo may have different
+  // casing than what closingIssuesReferences returns (canonical GitHub casing).
+  // e.g. cfg uses "Owner/Repo" but GitHub returns "owner/repo" in the API response.
+  const prs = [{ number: 11, headRefName: "feat/something" }];
+  const result = await resolvePrForIssue(prs, 42, "Owner/Repo", async () => [
+    { number: 42, nameWithOwner: "owner/repo" },
+  ]);
+  assert.equal(result, 11);
+});
+
 // ---------- extractHumanPlanComments (#26) ----------
 
 const PLAN_BODY = "## Implementation Plan\n\nDo the thing.";
