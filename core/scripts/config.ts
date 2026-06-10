@@ -71,6 +71,13 @@ const PartialConfigSchema = z.object({
       max_attempts: z.number().int().positive().optional(),
     })
     .optional(),
+  review_policy: z
+    .object({
+      block_threshold: z.enum(["critical", "high", "medium", "low"]).optional(),
+      min_confidence: z.number().min(0).max(1).optional(),
+    })
+    .strict()
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -194,6 +201,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       timeout: fileConfig.eval_gate?.timeout ?? DEFAULT_CONFIG.eval_gate.timeout,
       max_attempts: fileConfig.eval_gate?.max_attempts ?? DEFAULT_CONFIG.eval_gate.max_attempts,
     },
+    review_policy: {
+      block_threshold:
+        fileConfig.review_policy?.block_threshold ?? DEFAULT_CONFIG.review_policy.block_threshold,
+      min_confidence:
+        fileConfig.review_policy?.min_confidence ?? DEFAULT_CONFIG.review_policy.min_confidence,
+    },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
@@ -305,5 +318,9 @@ eval_gate: # run the repo's eval harness after pre-merge
   mode: ${d.eval_gate.mode} # gate: block on fail | advisory: record and advance
   timeout: ${d.eval_gate.timeout} # stage-level budget in seconds (shared across attempts)
   max_attempts: ${d.eval_gate.max_attempts} # total attempts before giving up (1 = no retry)
+
+review_policy: # which review findings block progression vs. merely advise (#17)
+  block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block
+  min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
 `;
 }

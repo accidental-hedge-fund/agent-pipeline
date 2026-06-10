@@ -33,6 +33,12 @@ import {
 } from "../prompts/index.ts";
 import { getForIssue } from "../worktree.ts";
 import * as openspec from "../openspec.ts";
+import {
+  extractOverrides,
+  findingKey,
+  partitionFindings,
+  type PartitionResult,
+} from "../review-policy.ts";
 import type {
   Outcome,
   PipelineConfig,
@@ -397,21 +403,87 @@ export async function advanceReview(
     };
   }
 
-  // needs-attention with findings → fix
+  // needs-attention with findings → apply the severity policy (#17). Partition
+  // findings into blocking (at/above threshold + confidence, not overridden),
+  // advisory (below threshold/confidence), and operator-overridden. Only
+  // blocking findings route to a fix round. When none remain, the review still
+  // ran and its findings are on the record — the item advances as if approved.
+  const overrides = extractOverrides(detail.comments);
+  const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides);
+
+  if (partition.blocking.length === 0) {
+    await postCommentFn(cfg, issueNumber, advisoryAdvanceComment(cfg, round, reviewer, partition));
+    const toStage: Stage = round === 1 ? "review-2" : "pre-merge";
+    await transitionFn(
+      cfg,
+      issueNumber,
+      stage,
+      toStage,
+      `Review ${round} by ${reviewer}: ${verdict.findings.length} finding(s), none above policy ` +
+        `(${partition.advisory.length} advisory, ${partition.overridden.length} overridden) — advancing.`,
+    );
+    return {
+      advanced: true,
+      from: stage,
+      to: toStage,
+      summary: `${verdict.findings.length} findings below policy — advanced`,
+    };
+  }
+
   const fixStage: Stage = round === 1 ? "fix-1" : "fix-2";
+  const advisoryNote =
+    partition.advisory.length || partition.overridden.length
+      ? ` (${partition.advisory.length} advisory + ${partition.overridden.length} overridden not blocking)`
+      : "";
   await transitionFn(
     cfg,
     issueNumber,
     stage,
     fixStage,
-    `Review ${round} by ${reviewer} requested changes (${verdict.findings.length} findings).`,
+    `Review ${round} by ${reviewer} requested changes (${partition.blocking.length} blocking ` +
+      `of ${verdict.findings.length} findings${advisoryNote}).`,
   );
   return {
     advanced: true,
     from: stage,
     to: fixStage,
-    summary: `${verdict.findings.length} findings`,
+    summary: `${partition.blocking.length} blocking findings`,
   };
+}
+
+/**
+ * Audited comment posted when a review produced findings but none block under
+ * the active policy — the item advances, with the advisory/overridden findings
+ * recorded so the decision is visible later (#17).
+ */
+function advisoryAdvanceComment(
+  cfg: PipelineConfig,
+  round: 1 | 2,
+  reviewer: string,
+  partition: PartitionResult,
+): string {
+  const lines = [
+    `## Pipeline: Review ${round} advanced under severity policy`,
+    "",
+    `**Reviewer**: ${reviewer}`,
+    `Findings were produced but none meet the repo's \`review_policy.block_threshold\` ` +
+      `(\`${cfg.review_policy.block_threshold}\`, min_confidence ${cfg.review_policy.min_confidence}), ` +
+      `so this item advances instead of routing to a fix round.`,
+  ];
+  if (partition.advisory.length) {
+    lines.push("", "### Advisory (below policy — not blocking)");
+    for (const { finding, reason } of partition.advisory) {
+      lines.push(`- \`${findingKey(finding)}\` **[${(finding.severity ?? "medium").toUpperCase()}]** ${finding.title} — ${reason}`);
+    }
+  }
+  if (partition.overridden.length) {
+    lines.push("", "### Overridden (operator-dispositioned — not blocking)");
+    for (const { finding, key, disposition } of partition.overridden) {
+      lines.push(`- \`${key}\` **[${(finding.severity ?? "medium").toUpperCase()}]** ${finding.title} — ${disposition}`);
+    }
+  }
+  lines.push("", (cfg.marker_footer ?? "*Automated by Claude Code Pipeline Skill*").trim());
+  return lines.join("\n");
 }
 
 /** Default {@link RunReviewFn}: dispatches to the companion or prompt-harness reviewer. */
@@ -736,7 +808,7 @@ export function formatReviewComment(
         ? `${f.file ?? ""}:${f.line_start}-${f.line_end ?? f.line_start}`
         : f.file ?? "";
       const conf = f.confidence !== undefined ? ` (confidence: ${f.confidence})` : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf}`);
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\``);
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);

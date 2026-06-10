@@ -221,6 +221,9 @@ eval_gate:                           # run the repo's eval harness after pre-mer
   mode: gate                         # gate (default): block on fail | advisory: record result and always advance
   timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
   max_attempts: 2                    # total attempts before giving up (1 = no retry)
+review_policy:                       # which review findings block progression vs. merely advise
+  block_threshold: low               # critical|high|medium|low — findings below this advise, not block (default: low = block on every finding)
+  min_confidence: 0                  # 0..1 — findings below this confidence advise, not block (default: 0 = no confidence gate)
 # `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
 ```
 
@@ -353,6 +356,24 @@ When `eval_gate.enabled` (default **off**), the target repo's eval harness runs 
 - **Tooling failures always block, regardless of mode** — if the command times out or can't be spawned the item is blocked even in advisory mode.
 
 When disabled (the default), pre-merge advances straight to `ready-to-deploy` and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
+
+### Review severity policy & audited overrides
+
+By default **every** review finding blocks: a `needs-attention` verdict routes to a fix round regardless of how severe or confident the finding is. `review_policy` lets a repo declare which findings actually block:
+
+- **`block_threshold`** (`critical`|`high`|`medium`|`low`, default `low`) — findings whose severity is **below** the threshold are recorded as **advisory** and do not route to a fix round. The default `low` blocks on everything (pre-policy behavior); set `high` to let medium/low findings advise without blocking.
+- **`min_confidence`** (`0`..`1`, default `0`) — findings whose reported confidence is below this floor advise rather than block, even if high-severity.
+
+When a review produces findings but **none block** under the policy, the item advances as if approved, and an audited *"advanced under severity policy"* comment records the advisory findings (each with its key, severity, and why it didn't block). The pipeline still stops at `ready-to-deploy` — you still own the merge.
+
+**Audited overrides.** Every finding is shown with a stable `override-key` in the review comment. To disposition one specific blocking finding (e.g. a false positive or out-of-scope ask) so it stops blocking:
+
+```
+/pipeline N --override "<override-key>: rejected — <why>"
+/pipeline N --override "<override-key>: deferred #123 — tracked separately"
+```
+
+This posts an audited `## Pipeline: Finding override` comment (the recording account is the *who*, your reason the *why*) and clears the `blocked` label; re-run `/pipeline N` to advance with the override applied. The key is content-addressed, so a finding the reviewer re-emits on a later commit keeps the same key and the override keeps applying. **Rollback** is `review_policy: { block_threshold: low, min_confidence: 0 }` (the default).
 
 ### OpenSpec integration
 
