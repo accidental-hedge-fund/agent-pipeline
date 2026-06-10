@@ -1,7 +1,7 @@
 # verdict-schema-single-source Specification
 
 ## Purpose
-TBD - created by archiving change review-verdict-single-source. Update Purpose after archive.
+A single source of truth for the review verdict JSON schema: the `REVIEW_VERDICT_SCHEMA_BLOCK` constant in `core/scripts/review-schema.ts` is the only authored copy of the schema text, substituted into both review prompts (`review_standard.md`, `review_adversarial.md`) via a `{{schema_block}}` placeholder, with a field-name drift guard test that keeps the block, the `ReviewFinding`/`ReviewVerdict` types, and `parseStructuredVerdict` in agreement — so prompt↔parser drift can no longer silently drop reviewer findings (the `needs-attention/0` → blocked-run class from #45/#50/#52/#54). Value-type and nesting-level drift detection is deferred to #85.
 ## Requirements
 ### Requirement: Single source of truth for the review verdict JSON schema
 The review verdict JSON schema (fields, types, and nesting) SHALL be defined once as a TypeScript constant or structured metadata object (`REVIEW_VERDICT_SCHEMA_BLOCK` or equivalent) exported from `core/scripts/types.ts` or a co-located `review-schema.ts`. No other file in the codebase SHALL contain a hand-copied duplicate of this schema block.
