@@ -304,7 +304,7 @@ steps: # turn optional steps off for speed/preference (default: all on)
   plan_review: ${d.steps.plan_review} # cross-harness review of the plan before coding
   standard_review: ${d.steps.standard_review} # review-1 (and its fix round)
   adversarial_review: ${d.steps.adversarial_review} # review-2 (and its fix round)
-  docs: ${d.steps.docs} # docs-update pass in pre-merge
+  docs: ${d.steps.docs} # include the docs-update instruction in the implementing prompt
 
 test_gate: # run the repo's tests/build before opening a PR
   enabled: ${d.test_gate.enabled} # set false to disable entirely

@@ -25,9 +25,11 @@ const SHA_HEAD = "2222222222222222222222222222222222222222";
 // isPipelineInternalCommit — pure (#98)
 // ---------------------------------------------------------------------------
 
-test("isPipelineInternalCommit: recognizes pre-merge docs + archive commits, not developer commits", () => {
-  assert.equal(isPipelineInternalCommit("docs: update documentation for #16"), true);
+test("isPipelineInternalCommit: recognizes archive commits only, not developer commits", () => {
   assert.equal(isPipelineInternalCommit("chore: archive OpenSpec change(s) for #16"), true);
+  // The pre-merge docs harness was removed (#91): a docs commit can only come
+  // from a developer, so it must NOT be treated as pipeline-internal.
+  assert.equal(isPipelineInternalCommit("docs: update documentation for #16"), false);
   // A developer's own docs/chore commit with different wording must NOT match.
   assert.equal(isPipelineInternalCommit("docs: rewrite the README intro"), false);
   assert.equal(isPipelineInternalCommit("chore: bump deps"), false);
@@ -85,13 +87,19 @@ function makeDeps(opts: {
   return { deps, rec };
 }
 
-// A docs/archive commit the pipeline authors in pre-merge (matches the exact
-// prefixes isPipelineInternalCommit recognizes).
-const DOCS_COMMIT = { oid: SHA_HEAD, messageHeadline: "docs: update documentation for #16" };
+// An archive commit the pipeline authors in pre-merge (matches the exact
+// prefix isPipelineInternalCommit recognizes).
 const ARCHIVE_COMMIT = {
   oid: "3333333333333333333333333333333333333333",
   messageHeadline: "chore: archive OpenSpec change(s) for #16",
 };
+const ARCHIVE_COMMIT_AT_HEAD = {
+  oid: SHA_HEAD,
+  messageHeadline: "chore: archive OpenSpec change(s) for #16",
+};
+// The old pre-merge docs harness prefix — no longer pipeline-internal (#91),
+// so the gate must classify it as a developer commit.
+const DOCS_COMMIT = { oid: SHA_HEAD, messageHeadline: "docs: update documentation for #16" };
 const DEV_COMMIT = { oid: SHA_HEAD, messageHeadline: "fix: address review 2 findings (#16)" };
 
 function reviewComment(round: 1 | 2, sha: string | null): string {
@@ -140,7 +148,7 @@ test("enforceReviewShaGate: SHA mismatch (developer commit) → bounces to revie
 });
 
 test("enforceReviewShaGate: ONLY pipeline-internal commits after review SHA → proceeds, no re-review (#98)", async (t) => {
-  // The pipeline's own docs/archive commits do not change the reviewed code, so
+  // The pipeline's own archive commits do not change the reviewed code, so
   // they must not invalidate the verdict. Re-reviewing them re-ran the reviewer
   // on the pipeline's own commits every run, causing a non-converging cascade.
   const { deps, rec } = makeDeps({
@@ -149,16 +157,34 @@ test("enforceReviewShaGate: ONLY pipeline-internal commits after review SHA → 
     commits: [
       { oid: SHA_REVIEWED, messageHeadline: "feat: implement the thing" },
       ARCHIVE_COMMIT,
-      DOCS_COMMIT, // oid === SHA_HEAD
+      ARCHIVE_COMMIT_AT_HEAD, // oid === SHA_HEAD
     ],
   });
   let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 16, 99, deps);
   });
-  assert.equal(out, null, "only docs/archive landed since review → verdict is still valid");
+  assert.equal(out, null, "only archive commits landed since review → verdict is still valid");
   assert.deepEqual(rec.transitions, [], "no re-review for pipeline-internal commits");
   assert.deepEqual(rec.comments, [], "no stale notice");
+});
+
+test("enforceReviewShaGate: a docs-prefix commit since review → treated as developer commit, re-review (#91)", async (t) => {
+  // The pre-merge docs step no longer exists, so a `docs: update documentation
+  // for #N` commit is unreviewed developer work and must bounce to re-review.
+  const { deps, rec } = makeDeps({
+    commentBody: reviewComment(2, SHA_REVIEWED),
+    headSha: SHA_HEAD,
+    commits: [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement the thing" },
+      DOCS_COMMIT, // oid === SHA_HEAD
+    ],
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "review-2" }]);
+  assert.equal(rec.comments.length, 1, "the stale-verdict notice must be posted");
 });
 
 test("enforceReviewShaGate: internal commits + a developer commit → re-review (#98)", async (t) => {
@@ -186,7 +212,7 @@ test("enforceReviewShaGate: reviewed SHA absent from history (rebased) → re-re
   const { deps, rec } = makeDeps({
     commentBody: reviewComment(2, SHA_REVIEWED),
     headSha: SHA_HEAD,
-    commits: [DOCS_COMMIT], // reviewed SHA not present
+    commits: [ARCHIVE_COMMIT_AT_HEAD], // reviewed SHA not present
   });
   let out;
   await quiet(t, async () => {

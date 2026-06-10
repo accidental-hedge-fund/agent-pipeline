@@ -155,6 +155,12 @@ export interface BuildImplementingArgs extends BuildPlanArgs {
   plan: string;
   /** Pipeline run identifier for the commit traceability trailers (#20). */
   pipelineRunId: string;
+  /**
+   * When true (`cfg.steps.docs`), the prompt instructs the implementer to
+   * update affected documentation as part of the same change, so docs land
+   * inside the reviewed diff (#91). When false, no docs ask is included.
+   */
+  docsEnabled?: boolean;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
 }
@@ -170,9 +176,30 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     body: a.body || "(no description)",
     plan: a.plan,
     pipeline_run_id: a.pipelineRunId,
+    docs_instruction: a.docsEnabled ? DOCS_INSTRUCTION_SECTION : "",
     spec_context: specContextSection(a.specContext),
   });
 }
+
+/**
+ * Documentation ask folded into the implementing prompt when `steps.docs` is
+ * on (#91): the implementer updates docs in the same change, so they are part
+ * of the reviewed diff and the happy path needs no second CI cycle. Leading
+ * newline + trailing newline keep the rendered prompt free of double blank
+ * lines whether or not the section is present (same shape as spec_context).
+ */
+const DOCS_INSTRUCTION_SECTION = `
+## Documentation Updates
+
+Documentation is part of this change — update it in the same commit(s) so reviewers see code and docs together. Check and update where affected:
+- **README.md** — if user-visible setup, workflows, features, or operations changed
+- **CLAUDE.md** — if the change affects conventions agents need to know
+- **Config docs and examples** — if config keys, flags, env vars, or setup steps were added or changed
+- **Docstrings/comments in the files you changed** — if they are now inaccurate
+- **Repo-local ops docs or runbooks** — if the change touches what they describe
+
+If no documentation is affected, change nothing — do not add boilerplate docs.
+`;
 
 export interface BuildReviewArgs extends BuildPlanArgs {
   plan: string;
@@ -266,24 +293,6 @@ export function buildTestFixPrompt(a: BuildTestFixArgs): string {
     max_attempts: String(a.maxAttempts),
     test_output: truncateDiff(a.output, 16_000),
     pipeline_run_id: a.pipelineRunId,
-  });
-}
-
-export interface BuildDocsArgs {
-  cfg: PipelineConfig;
-  issueNumber: number;
-  title: string;
-  diff: string;
-}
-
-export function buildDocsUpdatePrompt(a: BuildDocsArgs): string {
-  const dc = domainContext(a.cfg);
-  return substitute(loadTemplate("docs_update"), {
-    domain_name: dc.name,
-    domain_description: dc.description,
-    issue_number: String(a.issueNumber),
-    title: a.title,
-    diff: truncateDiff(a.diff, 40_000),
   });
 }
 

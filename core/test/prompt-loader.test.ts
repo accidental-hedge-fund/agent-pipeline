@@ -4,7 +4,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildDocsUpdatePrompt,
   buildFixPrompt,
   buildImplementingPrompt,
   buildPlanningOpenspecPrompt,
@@ -265,6 +264,39 @@ test("implementing prompt: instructs the trailers with substituted issue + run i
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("implementing prompt: docsEnabled adds the documentation-update instruction (#91)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "p",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+    docsEnabled: true,
+  });
+  assert.match(out, /## Documentation Updates/);
+  assert.match(out, /README\.md/);
+  assert.match(out, /CLAUDE\.md/);
+  assert.match(out, /do not add boilerplate docs/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  assert.doesNotMatch(out, /\n\n\n/);
+});
+
+test("implementing prompt: docsEnabled false omits any docs ask (#91)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "p",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+    docsEnabled: false,
+  });
+  assert.doesNotMatch(out, /Documentation Updates/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  assert.doesNotMatch(out, /\n\n\n/);
+});
+
 test("review_standard: includes plan + diff and the JSON schema", () => {
   const out = buildReviewStandardPrompt({
     cfg: dummyConfig(),
@@ -378,27 +410,6 @@ test("test_fix prompt: large failure output is truncated", () => {
     pipelineRunId: "1/2026-06-08T14:32:00Z",
   });
   assert.match(out, /diff truncated at 16KB/);
-});
-
-test("docs_update prompt: contains diff", () => {
-  const out = buildDocsUpdatePrompt({
-    cfg: dummyConfig(),
-    issueNumber: 99,
-    title: "T",
-    diff: "DIFF-CONTENT",
-  });
-  assert.match(out, /DIFF-CONTENT/);
-});
-
-test("docs_update prompt: does not instruct harness to commit (#20)", () => {
-  const out = buildDocsUpdatePrompt({
-    cfg: dummyConfig(),
-    issueNumber: 99,
-    title: "T",
-    diff: "some diff",
-  });
-  assert.doesNotMatch(out, /commit with message/);
-  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
 test("review prompt: large diff is truncated", () => {
