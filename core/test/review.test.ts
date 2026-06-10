@@ -21,6 +21,7 @@ import {
   type AdvanceReviewDeps,
 } from "../scripts/stages/review.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
+import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import { findingKey } from "../scripts/review-policy.ts";
 import type { PipelineConfig, Stage } from "../scripts/types.ts";
 
@@ -65,6 +66,45 @@ test("parseStructuredVerdict: fallback path emits a warning naming the fallback"
     warnings.some((w) => /fallback/i.test(w) && /no structured json/i.test(w)),
     `expected a fallback warning, saw: ${warnings.join(" | ")}`,
   );
+});
+
+// Parser drift guard (#56): `parseStructuredVerdict` reconstructs the verdict by
+// hand (it does not blind-spread untrusted reviewer JSON). The schema-block drift
+// guard keeps the prompts and the types in sync, but the *parser* is a third
+// surface — if a top-level `ReviewVerdict` field is added to the schema/types and
+// the hand-written reconstruction is not updated, the field would be silently
+// dropped at runtime (the same data-loss class #56 exists to prevent), while the
+// `--experimental-strip-types` test runner never type-checks the gap. This test
+// fails in exactly that case, keeping the parser in the single-source guarantee.
+test("parser drift guard: parseStructuredVerdict carries every REVIEW_SCHEMA_FIELDS.verdict field (#56)", () => {
+  // Build a verdict JSON exercising every declared top-level field, derived from
+  // the manifest so a newly-added field is automatically exercised here.
+  const sample: Record<string, unknown> = {};
+  for (const field of REVIEW_SCHEMA_FIELDS.verdict) {
+    if (field === "verdict") sample[field] = "needs-attention";
+    else if (field === "findings")
+      sample[field] = [
+        { severity: "low", title: "t", body: "b", confidence: 0.5, recommendation: "r" },
+      ];
+    else if (field === "next_steps") sample[field] = ["step"];
+    else sample[field] = `__sentinel_${field}__`;
+  }
+
+  const parsed = parseStructuredVerdict(JSON.stringify(sample), "a".repeat(40)) as Record<
+    string,
+    unknown
+  >;
+
+  for (const field of REVIEW_SCHEMA_FIELDS.verdict) {
+    assert.ok(
+      field in parsed && parsed[field] !== undefined,
+      `parseStructuredVerdict dropped verdict field "${field}". It reconstructs the verdict by ` +
+        `hand, so when you add "${field}" to REVIEW_SCHEMA_FIELDS/ReviewVerdict you must also copy ` +
+        `it in parseStructuredVerdict — otherwise the reviewer-emitted field is silently lost.`,
+    );
+  }
+  // The findings array must survive as structured objects, not be flattened away.
+  assert.ok(Array.isArray(parsed.findings) && (parsed.findings as unknown[]).length === 1);
 });
 
 // parseProseReview — Codex Markdown review (#50). Codex's standard `/codex:review`

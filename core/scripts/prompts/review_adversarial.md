@@ -53,23 +53,7 @@ If the change looks safe, say so directly and return no findings.
 Return ONLY valid JSON matching this schema (no markdown fences, no commentary outside the JSON):
 
 ```
-{
-    "verdict": "approve" or "needs-attention",
-    "summary": "<terse ship/no-ship assessment>",
-    "findings": [
-        {
-            "severity": "critical" | "high" | "medium" | "low",
-            "title": "<short title>",
-            "body": "<what's wrong and why it matters>",
-            "file": "<relative file path>",
-            "line_start": <int>,
-            "line_end": <int>,
-            "confidence": <0.0-1.0>,
-            "recommendation": "<concrete fix>"
-        }
-    ],
-    "next_steps": ["<action item>"]
-}
+{{schema_block}}
 ```
 
 ## Diff to Review

@@ -1,5 +1,8 @@
-## ADDED Requirements
+# review-severity-policy Specification
 
+## Purpose
+TBD - created by archiving change review-severity-policy. Update Purpose after archive.
+## Requirements
 ### Requirement: Severity threshold gates blocking vs. advisory
 A repo SHALL be able to declare `review_policy.block_threshold` (`critical` | `high` | `medium` |
 `low`). A review finding whose severity rank is below the threshold SHALL be treated as **advisory**:
@@ -24,10 +27,9 @@ is below `min_confidence` SHALL be treated as advisory even if its severity is a
 - **THEN** that finding SHALL be advisory and SHALL NOT route the item to a fix round
 
 ### Requirement: All-advisory verdict advances with an audit record
-When a `needs-attention` verdict carries findings but none block under the active policy (all advisory
-or overridden), the pipeline SHALL advance the item to the next stage as if approved, and SHALL post a
-machine-and-human readable comment recording the advisory and overridden findings and the policy that
-applied.
+The pipeline SHALL advance an item as if approved when a `needs-attention` verdict carries findings but
+none block under the active policy (all advisory or overridden), and SHALL post a machine-and-human
+readable comment recording the advisory and overridden findings and the policy that applied.
 
 #### Scenario: Advance comment records the advisory findings
 - **WHEN** a review advances because all findings were sub-threshold
@@ -70,3 +72,4 @@ later commit keeps the same key and the override keeps applying.
 #### Scenario: Invalid override key rejected
 - **WHEN** an operator supplies an override whose key is not 8 hex characters or whose reason is empty
 - **THEN** the invocation SHALL fail with a usage error and post nothing
+
