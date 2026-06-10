@@ -12,6 +12,7 @@ import * as path from "node:path";
 import {
   getIssueDetail,
   getPrChecks,
+  getPrCommits,
   getPrDetail,
   getPrDiff,
   getPrForIssue,
@@ -37,6 +38,21 @@ import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 const DOCS_COMMIT_PREFIX = "docs: update documentation for #";
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
+
+/**
+ * True when a commit was authored by the pipeline itself in pre-merge (a docs
+ * update or an OpenSpec archive) rather than by a developer/fix step. These
+ * commits do not change the code the reviewer evaluated, so they must not
+ * invalidate the review verdict (#98). Matched on the exact pre-merge commit
+ * prefixes — a developer's own `docs:`/`chore:` commit with different wording
+ * does NOT match and still triggers a re-review. Exported for tests.
+ */
+export function isPipelineInternalCommit(messageHeadline: string): boolean {
+  return (
+    messageHeadline.startsWith(DOCS_COMMIT_PREFIX) ||
+    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX)
+  );
+}
 
 export interface AdvancePreMergeOpts {
   dryRun?: boolean;
@@ -203,6 +219,7 @@ export async function advance(
 export interface ShaGateDeps {
   getIssueDetail?: typeof getIssueDetail;
   getPrDetail?: typeof getPrDetail;
+  getPrCommits?: typeof getPrCommits;
   postComment?: typeof postComment;
   transition?: typeof transition;
 }
@@ -223,6 +240,7 @@ export async function enforceReviewShaGate(
 ): Promise<Outcome | null> {
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
+  const getPrCommitsFn = deps.getPrCommits ?? getPrCommits;
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
 
@@ -234,9 +252,36 @@ export async function enforceReviewShaGate(
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 
-  // Any SHA mismatch — including pipeline-internal commits — is treated as stale.
-  // The only safe path forward is an exact match with the verified SHA.
+  // Exact match → the verdict still covers HEAD; proceed.
   if (reviewed.sha && reviewed.sha === head) return null;
+
+  // HEAD moved past the reviewed commit. Re-review ONLY when a developer/fix
+  // commit landed since the verdict — the pipeline's own pre-merge commits
+  // (docs update, OpenSpec archive) do not change the reviewed code and must
+  // not invalidate the verdict. Re-reviewing them re-ran the adversarial
+  // reviewer on the pipeline's own commits every run, which (with a thorough
+  // reviewer) turned each run into a non-converging cascade (#98). #16's value
+  // is preserved: any non-internal commit in the range still bounces.
+  if (reviewed.sha) {
+    try {
+      const commits = await getPrCommitsFn(cfg, prNumber);
+      const reviewedIdx = commits.findIndex((c) => c.oid === reviewed.sha);
+      if (reviewedIdx !== -1) {
+        const landedSince = commits.slice(reviewedIdx + 1);
+        if (
+          landedSince.length > 0 &&
+          landedSince.every((c) => isPipelineInternalCommit(c.messageHeadline))
+        ) {
+          // Only docs/archive commits landed since the review → verdict valid.
+          return null;
+        }
+      }
+      // reviewed.sha absent from history (rebased/squashed) or a developer
+      // commit landed → fall through to a re-review (the safe default).
+    } catch {
+      // If commit classification fails, fall through to re-review (conservative).
+    }
+  }
 
   const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
   await postCommentFn(cfg, issueNumber, staleReviewNotice(reviewed.sha, head));
