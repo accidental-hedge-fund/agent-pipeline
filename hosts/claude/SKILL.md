@@ -17,6 +17,15 @@ issue) through an 11-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
 the merge button.
 
+## Developing this skill itself (core/ → plugin/ mirror)
+
+When the work target is the agent-pipeline repo — any implementation, fix, or
+test-fix step that edits a file under `core/` — `plugin/` is a generated mirror
+of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
+`node scripts/build.mjs` from the repo root and include the regenerated
+`plugin/` in the same commit. A core-only commit fails CI's
+`build.mjs --check` gate and burns a fix-loop attempt on the stale mirror.
+
 ## State machine
 
 ```
