@@ -48,7 +48,6 @@ function cfgWith(testGate: Partial<PipelineConfig["test_gate"]>): PipelineConfig
     base_branch: "main",
     worktree_root: ".worktrees",
     max_concurrent_worktrees: 5,
-    auto_merge: false,
     auto_recovery_max_retries: 2,
     implementation_timeout: 1200,
     review_timeout: 1200,

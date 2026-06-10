@@ -4,7 +4,6 @@
 import { addLabelToPr, getIssueDetail, getPrForIssue, postComment } from "../gh.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import { getForIssue, removeWorktree } from "../worktree.ts";
-import { reviewerLabel } from "./review.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
@@ -27,7 +26,7 @@ export async function finalize(
       `- **Issue**: #${issueNumber} — ${detail.title}`,
       `- **${prRef}**: ready to merge`,
       `- **Implementer**: ${cfg.harnesses.implementer}`,
-      `- **Reviewer**: ${reviewerLabel(cfg)}`,
+      `- **Reviewer**: ${cfg.harnesses.reviewer}`,
       `- **CI**: passing`,
       `- **Conflicts**: none`,
       "",

@@ -13,19 +13,12 @@ const PartialConfigSchema = z.object({
   base_branch: z.string().optional(),
   worktree_root: z.string().optional(),
   max_concurrent_worktrees: z.number().int().positive().optional(),
-  auto_merge: z.boolean().optional(),
   auto_recovery_max_retries: z.number().int().min(0).optional(),
   implementation_timeout: z.number().int().positive().optional(),
   review_timeout: z.number().int().positive().optional(),
   fix_timeout: z.number().int().positive().optional(),
   ci_timeout: z.number().int().positive().optional(),
   ci_poll_interval: z.number().int().positive().optional(),
-  harnesses: z
-    .object({
-      implementer: z.enum(["claude", "codex"]),
-      reviewer: z.enum(["claude", "codex"]),
-    })
-    .optional(),
   models: z
     .object({
       planning: z.string(),
@@ -161,7 +154,6 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     worktree_root: fileConfig.worktree_root ?? DEFAULT_CONFIG.worktree_root,
     max_concurrent_worktrees:
       fileConfig.max_concurrent_worktrees ?? DEFAULT_CONFIG.max_concurrent_worktrees,
-    auto_merge: fileConfig.auto_merge ?? DEFAULT_CONFIG.auto_merge,
     auto_recovery_max_retries:
       fileConfig.auto_recovery_max_retries ?? DEFAULT_CONFIG.auto_recovery_max_retries,
     implementation_timeout:
@@ -170,8 +162,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     fix_timeout: fileConfig.fix_timeout ?? DEFAULT_CONFIG.fix_timeout,
     ci_timeout: fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout,
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
-    // Harness ownership is profile-relative. Keep the legacy config key accepted,
-    // but do not let repo config invert the invoking harness ownership split.
+    // Harness roles are profile-relative; repo config cannot set them (the
+    // strict schema rejects a `harnesses:` key outright).
     harnesses: profile.harnesses,
     models: fileConfig.models ?? DEFAULT_CONFIG.models,
     openspec: {
@@ -279,7 +271,6 @@ function buildConfigTemplate(): string {
 base_branch: ${d.base_branch} # branch PRs target and worktrees branch from
 worktree_root: ${d.worktree_root} # dir (relative to repo) holding pipeline worktrees
 max_concurrent_worktrees: ${d.max_concurrent_worktrees} # cap on simultaneous in-flight worktrees
-auto_merge: ${d.auto_merge} # accepted for back-compat; the pipeline stops at ready-to-deploy
 auto_recovery_max_retries: ${d.auto_recovery_max_retries} # auto-recovery attempts when implementation blocks
 implementation_timeout: ${d.implementation_timeout} # seconds for the implementation harness
 review_timeout: ${d.review_timeout} # seconds per review stage

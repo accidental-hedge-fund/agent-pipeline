@@ -54,7 +54,7 @@ export async function advanceFix(
   const detail = await getIssueDetail(cfg, issueNumber);
   const findings = extractReviewFindings(detail.comments, round);
   if (!findings) {
-    // No findings → just advance (this is unusual but matches openclaw behavior).
+    // No findings → just advance.
     const next: Stage = round === 1 ? "review-2" : "pre-merge";
     await transition(
       cfg,

@@ -22,8 +22,6 @@ import {
   detectPersonalSkill,
   uniqueBackupPath,
   offerRelocationWith,
-  companionPresentWithVersion,
-  codexCompanionPresentWithVersion,
   openspecPresent,
   last30daysPresent,
   detectDep,
@@ -47,6 +45,19 @@ function makeTmp() {
 function cleanup(dir) {
   rmSync(dir, { recursive: true, force: true });
 }
+
+// Synthetic registry entry exercising the manual-only path of the generic
+// dep-prompt machinery (installCmd: null), which no shipped dep uses today.
+// Registered into DEPS for this test process only.
+DEPS["test-manual-dep"] = {
+  label: "test-manual-dep",
+  description: "synthetic manual-only dependency (test fixture)",
+  hosts: null,
+  featureGate: null,
+  installCmd: null,
+  updateCmd: null,
+  manualInstall: "manually install test-manual-dep",
+};
 
 // ---------------------------------------------------------------------------
 // 4.2 — no marker → detectPersonalSkill returns { shadowing: true }
@@ -345,72 +356,6 @@ test("offerRelocationWith non-TTY: uses fallback suffix when stem backup is pre-
 // ==========================================================================
 
 // ---------------------------------------------------------------------------
-// 2.1 companionPresentWithVersion — cc-plugin-codex (Codex host)
-// ---------------------------------------------------------------------------
-
-test("companionPresentWithVersion: absent when PIPELINE_CC_COMPANION points to non-existent file", () => {
-  const tmp = makeTmp();
-  const fakePath = join(tmp, "claude-companion.mjs");
-  process.env.PIPELINE_CC_COMPANION = fakePath;
-  try {
-    const result = companionPresentWithVersion();
-    assert.equal(result.present, false);
-    assert.equal(result.version, null);
-  } finally {
-    delete process.env.PIPELINE_CC_COMPANION;
-    cleanup(tmp);
-  }
-});
-
-test("companionPresentWithVersion: present when PIPELINE_CC_COMPANION points to existing file", () => {
-  const tmp = makeTmp();
-  const fakePath = join(tmp, "claude-companion.mjs");
-  writeFileSync(fakePath, "// companion");
-  process.env.PIPELINE_CC_COMPANION = fakePath;
-  try {
-    const result = companionPresentWithVersion();
-    assert.equal(result.present, true);
-    assert.equal(result.version, null);
-  } finally {
-    delete process.env.PIPELINE_CC_COMPANION;
-    cleanup(tmp);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// 2.2 codexCompanionPresentWithVersion — codex-plugin-cc (Claude host)
-// ---------------------------------------------------------------------------
-
-test("codexCompanionPresentWithVersion: absent when PIPELINE_CODEX_COMPANION points to non-existent file", () => {
-  const tmp = makeTmp();
-  const fakePath = join(tmp, "codex-companion.mjs");
-  process.env.PIPELINE_CODEX_COMPANION = fakePath;
-  try {
-    const result = codexCompanionPresentWithVersion();
-    assert.equal(result.present, false);
-    assert.equal(result.version, null);
-  } finally {
-    delete process.env.PIPELINE_CODEX_COMPANION;
-    cleanup(tmp);
-  }
-});
-
-test("codexCompanionPresentWithVersion: present when PIPELINE_CODEX_COMPANION points to existing file", () => {
-  const tmp = makeTmp();
-  const fakePath = join(tmp, "codex-companion.mjs");
-  writeFileSync(fakePath, "// companion");
-  process.env.PIPELINE_CODEX_COMPANION = fakePath;
-  try {
-    const result = codexCompanionPresentWithVersion();
-    assert.equal(result.present, true);
-    assert.equal(result.version, null);
-  } finally {
-    delete process.env.PIPELINE_CODEX_COMPANION;
-    cleanup(tmp);
-  }
-});
-
-// ---------------------------------------------------------------------------
 // 2.3 openspecPresent — smoke-tests the return type contract
 // ---------------------------------------------------------------------------
 
@@ -504,30 +449,17 @@ test("readPipelineConfig: ignores comment lines", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3.2 / 3.3 getRelevantDeps — host + feature flag gating
+// 3.2 / 3.3 getRelevantDeps — feature flag gating
 // ---------------------------------------------------------------------------
 
-test("getRelevantDeps: claude-only → includes codex-plugin-cc, omits cc-plugin-codex", () => {
-  const deps = getRelevantDeps(["claude"], {}, null);
-  assert.ok(deps.includes("codex-plugin-cc"), "claude host should include codex-plugin-cc");
-  assert.ok(!deps.includes("cc-plugin-codex"), "claude host should omit cc-plugin-codex");
-});
-
-test("getRelevantDeps: codex-only → includes cc-plugin-codex, omits codex-plugin-cc", () => {
-  const deps = getRelevantDeps(["codex"], {}, null);
-  assert.ok(deps.includes("cc-plugin-codex"), "codex host should include cc-plugin-codex");
-  assert.ok(!deps.includes("codex-plugin-cc"), "codex host should omit codex-plugin-cc");
-});
-
-test("getRelevantDeps: both hosts → includes both companion deps", () => {
-  const deps = getRelevantDeps(["claude", "codex"], {}, null);
-  assert.ok(deps.includes("codex-plugin-cc"));
-  assert.ok(deps.includes("cc-plugin-codex"));
+test("getRelevantDeps: empty config and no repo → no deps offered", () => {
+  const deps = getRelevantDeps({}, null);
+  assert.deepEqual(deps, [], "no feature flags set → nothing to offer");
 });
 
 test("getRelevantDeps: openspec.enabled=auto with no openspec/ dir → omits openspec", () => {
   const tmp = makeTmp();
-  const deps = getRelevantDeps(["claude"], { openspec: { enabled: "auto" } }, tmp);
+  const deps = getRelevantDeps({ openspec: { enabled: "auto" } }, tmp);
   assert.ok(!deps.includes("openspec"), "auto without openspec/ dir should omit openspec");
   cleanup(tmp);
 });
@@ -535,33 +467,33 @@ test("getRelevantDeps: openspec.enabled=auto with no openspec/ dir → omits ope
 test("getRelevantDeps: openspec.enabled=auto with openspec/ dir → includes openspec", () => {
   const tmp = makeTmp();
   mkdirSync(join(tmp, "openspec"), { recursive: true });
-  const deps = getRelevantDeps(["claude"], { openspec: { enabled: "auto" } }, tmp);
+  const deps = getRelevantDeps({ openspec: { enabled: "auto" } }, tmp);
   assert.ok(deps.includes("openspec"), "auto with openspec/ dir should include openspec");
   cleanup(tmp);
 });
 
 test("getRelevantDeps: openspec.enabled=on → includes openspec", () => {
-  const deps = getRelevantDeps(["claude"], { openspec: { enabled: "on" } }, null);
+  const deps = getRelevantDeps({ openspec: { enabled: "on" } }, null);
   assert.ok(deps.includes("openspec"));
 });
 
 test("getRelevantDeps: openspec.enabled=off → omits openspec", () => {
-  const deps = getRelevantDeps(["claude"], { openspec: { enabled: "off" } }, null);
+  const deps = getRelevantDeps({ openspec: { enabled: "off" } }, null);
   assert.ok(!deps.includes("openspec"));
 });
 
 test("getRelevantDeps: missing last30days flag → omits last30days", () => {
-  const deps = getRelevantDeps(["claude"], {}, null);
+  const deps = getRelevantDeps({}, null);
   assert.ok(!deps.includes("last30days"));
 });
 
 test("getRelevantDeps: last30days.enabled=true → includes last30days", () => {
-  const deps = getRelevantDeps(["claude"], { last30days: { enabled: "true" } }, null);
+  const deps = getRelevantDeps({ last30days: { enabled: "true" } }, null);
   assert.ok(deps.includes("last30days"));
 });
 
 test("getRelevantDeps: last30days.enabled=false → omits last30days", () => {
-  const deps = getRelevantDeps(["claude"], { last30days: { enabled: "false" } }, null);
+  const deps = getRelevantDeps({ last30days: { enabled: "false" } }, null);
   assert.ok(!deps.includes("last30days"));
 });
 
@@ -575,15 +507,15 @@ test("getRelevantDeps: last30days.enabled=false → omits last30days", () => {
 
 test("promptDeps: non-TTY without yesDeps → all deps skipped, no prompt called", async () => {
   let promptCalled = false;
-  const results = await promptDeps(["cc-plugin-codex", "codex-plugin-cc"], {
+  const results = await promptDeps(["openspec", "last30days"], {
     isTTY: false,
     yesDeps: false,
     promptFn: async () => { promptCalled = true; return "y"; },
     runCmd: () => ({ status: 0 }),
   });
   assert.equal(promptCalled, false, "prompt must not be called in non-TTY without opt-in");
-  assert.equal(results["cc-plugin-codex"]?.status, "skipped");
-  assert.equal(results["codex-plugin-cc"]?.status, "skipped");
+  assert.equal(results["openspec"]?.status, "skipped");
+  assert.equal(results["last30days"]?.status, "skipped");
 });
 
 // ---------------------------------------------------------------------------
@@ -593,7 +525,7 @@ test("promptDeps: non-TTY without yesDeps → all deps skipped, no prompt called
 test("promptDeps: non-TTY with yesDeps=true → auto-installs without prompting", async () => {
   let promptCalled = false;
   let installCalled = false;
-  const results = await promptDeps(["cc-plugin-codex"], {
+  const results = await promptDeps(["last30days"], {
     isTTY: false,
     yesDeps: true,
     promptFn: async () => { promptCalled = true; return "n"; },
@@ -603,7 +535,7 @@ test("promptDeps: non-TTY with yesDeps=true → auto-installs without prompting"
   });
   assert.equal(promptCalled, false, "prompt must not be called when yesDeps is set");
   assert.equal(installCalled, true, "install must be called when yesDeps is set");
-  assert.equal(results["cc-plugin-codex"]?.status, "installed");
+  assert.equal(results["last30days"]?.status, "installed");
 });
 
 // ---------------------------------------------------------------------------
@@ -612,7 +544,7 @@ test("promptDeps: non-TTY with yesDeps=true → auto-installs without prompting"
 
 test("promptDeps: TTY + user answers Y → installs dep", async () => {
   let installCalled = false;
-  const results = await promptDeps(["cc-plugin-codex"], {
+  const results = await promptDeps(["last30days"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "y",
@@ -621,19 +553,19 @@ test("promptDeps: TTY + user answers Y → installs dep", async () => {
     fetchLatestFn: () => null,
   });
   assert.equal(installCalled, true);
-  assert.equal(results["cc-plugin-codex"]?.status, "installed");
+  assert.equal(results["last30days"]?.status, "installed");
 });
 
 test("promptDeps: TTY + user answers N → declined, no install", async () => {
   let installCalled = false;
-  const results = await promptDeps(["cc-plugin-codex"], {
+  const results = await promptDeps(["last30days"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "n",
     runCmd: () => { installCalled = true; return { status: 0 }; },
   });
   assert.equal(installCalled, false);
-  assert.equal(results["cc-plugin-codex"]?.status, "declined");
+  assert.equal(results["last30days"]?.status, "declined");
 });
 
 test("promptDeps: returns empty object when depKeys is empty", async () => {
@@ -644,7 +576,7 @@ test("promptDeps: returns empty object when depKeys is empty", async () => {
 test("promptDeps: dryRun=true → returns empty object without prompting or installing", async () => {
   let promptCalled = false;
   let installCalled = false;
-  const results = await promptDeps(["cc-plugin-codex"], {
+  const results = await promptDeps(["last30days"], {
     dryRun: true,
     isTTY: true,
     promptFn: async () => { promptCalled = true; return "y"; },
@@ -664,7 +596,7 @@ test("promptDeps: dryRun=true → returns empty object without prompting or inst
 // ---------------------------------------------------------------------------
 
 test("installDep: successful install returns { status: 'installed' }", async () => {
-  const result = await installDep("cc-plugin-codex", "install", () => ({ status: 0 }));
+  const result = await installDep("last30days", "install", () => ({ status: 0 }));
   assert.equal(result.status, "installed");
 });
 
@@ -674,7 +606,7 @@ test("installDep: successful update returns { status: 'updated' }", async () => 
 });
 
 test("installDep: non-zero exit returns { status: 'failed' } with manualCmd", async () => {
-  const result = await installDep("cc-plugin-codex", "install", () => ({ status: 1, stderr: "ENOENT" }));
+  const result = await installDep("last30days", "install", () => ({ status: 1, stderr: "ENOENT" }));
   assert.equal(result.status, "failed");
   assert.ok(result.error, "error field should be set");
   assert.ok(result.manualCmd, "manualCmd should be set for failed dep");
@@ -702,10 +634,10 @@ test("printDepSummary: renders installed/updated/already-current/declined lines"
   console.warn = (...a) => lines.push(a.join(" "));
   try {
     printDepSummary({
-      "cc-plugin-codex": { status: "installed" },
-      "codex-plugin-cc": { status: "updated" },
+      "test-manual-dep": { status: "installed" },
       openspec: { status: "already current", version: "1.4.1" },
       last30days: { status: "declined" },
+      "some-other-dep": { status: "updated" },
     });
   } finally {
     console.log = origLog;
@@ -724,7 +656,7 @@ test("printDepSummary: skipped deps include re-run hint", () => {
   const origLog = console.log;
   console.log = (...a) => lines.push(a.join(" "));
   try {
-    printDepSummary({ "cc-plugin-codex": { status: "skipped" } });
+    printDepSummary({ openspec: { status: "skipped" } });
   } finally {
     console.log = origLog;
   }
@@ -741,10 +673,10 @@ test("printDepSummary: failed dep includes manual install command", () => {
   console.warn = (...a) => lines.push(a.join(" "));
   try {
     printDepSummary({
-      "cc-plugin-codex": {
+      openspec: {
         status: "failed",
         error: "exec failed",
-        manualCmd: DEPS["cc-plugin-codex"].manualInstall,
+        manualCmd: DEPS.openspec.manualInstall,
       },
     });
   } finally {
@@ -753,7 +685,7 @@ test("printDepSummary: failed dep includes manual install command", () => {
   }
   const out = lines.join("\n");
   assert.ok(out.includes("failed"), "should mention failed");
-  assert.ok(out.includes(DEPS["cc-plugin-codex"].manualInstall), "should include manual install command");
+  assert.ok(out.includes(DEPS.openspec.manualInstall), "should include manual install command");
 });
 
 test("printDepSummary: no re-run hint when nothing is skipped", () => {
@@ -761,7 +693,7 @@ test("printDepSummary: no re-run hint when nothing is skipped", () => {
   const origLog = console.log;
   console.log = (...a) => lines.push(a.join(" "));
   try {
-    printDepSummary({ "cc-plugin-codex": { status: "installed" } });
+    printDepSummary({ openspec: { status: "installed" } });
   } finally {
     console.log = origLog;
   }
@@ -787,18 +719,19 @@ test("printDepSummary: no output when results is empty", () => {
 
 test("promptDeps: failed dep does not abort subsequent deps", async () => {
   const installOrder = [];
-  const results = await promptDeps(["cc-plugin-codex", "openspec"], {
+  const results = await promptDeps(["last30days", "openspec"], {
     isTTY: false,
     yesDeps: true,
     detectFn: () => ({ present: false, version: null }),
     fetchLatestFn: () => null,
     runCmd: (cmd) => {
       installOrder.push(cmd);
+      // last30days installs via npx, openspec via npm — fail only the first.
       if (cmd === "npx") return { status: 1, stderr: "error" };
       return { status: 0 };
     },
   });
-  assert.equal(results["cc-plugin-codex"]?.status, "failed", "first dep failed");
+  assert.equal(results["last30days"]?.status, "failed", "first dep failed");
   assert.equal(results["openspec"]?.status, "installed", "second dep still installed");
   assert.equal(installOrder.length, 2, "both install commands were attempted");
 });
@@ -807,29 +740,19 @@ test("promptDeps: failed dep does not abort subsequent deps", async () => {
 // Integration scenarios (8.1 – 8.3)
 // ==========================================================================
 
-test("integration 8.1: fresh install — installable deps installed, manual-only deps show instructions", async () => {
-  const tmp = makeTmp();
-  process.env.PIPELINE_CC_COMPANION = join(tmp, "none-cc");
-  process.env.PIPELINE_CODEX_COMPANION = join(tmp, "none-codex");
-  process.env.CLAUDE_CONFIG_DIR = tmp;
+test("integration 8.1: fresh install — TTY accept installs every offered dep", async () => {
   const installOrder = [];
-  try {
-    const results = await promptDeps(["cc-plugin-codex", "codex-plugin-cc"], {
-      isTTY: true,
-      yesDeps: false,
-      promptFn: async () => "y",
-      runCmd: (cmd, args) => { installOrder.push(`${cmd} ${args.join(" ")}`); return { status: 0 }; },
-    });
-    assert.equal(results["cc-plugin-codex"]?.status, "installed");
-    // codex-plugin-cc is manual-only (marketplace install only) — never calls installCmd
-    assert.equal(results["codex-plugin-cc"]?.status, "manual-only");
-    assert.equal(installOrder.length, 1, "only cc-plugin-codex has an automated install");
-  } finally {
-    delete process.env.PIPELINE_CC_COMPANION;
-    delete process.env.PIPELINE_CODEX_COMPANION;
-    delete process.env.CLAUDE_CONFIG_DIR;
-    cleanup(tmp);
-  }
+  const results = await promptDeps(["openspec", "last30days"], {
+    isTTY: true,
+    yesDeps: false,
+    promptFn: async () => "y",
+    detectFn: () => ({ present: false, version: null }),
+    fetchLatestFn: () => null,
+    runCmd: (cmd, args) => { installOrder.push(`${cmd} ${args.join(" ")}`); return { status: 0 }; },
+  });
+  assert.equal(results["openspec"]?.status, "installed");
+  assert.equal(results["last30days"]?.status, "installed");
+  assert.equal(installOrder.length, 2, "both deps have automated installs");
 });
 
 test("integration 8.2: non-interactive mode — all deps skipped, hint present", async () => {
@@ -837,14 +760,14 @@ test("integration 8.2: non-interactive mode — all deps skipped, hint present",
   const origLog = console.log;
   console.log = (...a) => lines.push(a.join(" "));
   try {
-    const results = await promptDeps(["cc-plugin-codex", "codex-plugin-cc"], {
+    const results = await promptDeps(["openspec", "last30days"], {
       isTTY: false,
       yesDeps: false,
     });
     printDepSummary(results);
     const out = lines.join("\n");
-    assert.equal(results["cc-plugin-codex"]?.status, "skipped");
-    assert.equal(results["codex-plugin-cc"]?.status, "skipped");
+    assert.equal(results["openspec"]?.status, "skipped");
+    assert.equal(results["last30days"]?.status, "skipped");
     assert.ok(out.includes("--yes-deps"), "hint must be present");
     assert.ok(out.includes("PIPELINE_INSTALL_DEPS=1"), "env var hint must be present");
   } finally {
@@ -854,7 +777,7 @@ test("integration 8.2: non-interactive mode — all deps skipped, hint present",
 
 test("integration 8.3: --yes-deps in non-TTY — installable deps auto-installed, manual-only shows instructions without prompting", async () => {
   let promptCalled = false;
-  const results = await promptDeps(["cc-plugin-codex", "codex-plugin-cc"], {
+  const results = await promptDeps(["openspec", "test-manual-dep"], {
     isTTY: false,
     yesDeps: true,
     promptFn: async () => { promptCalled = true; return "n"; },
@@ -863,24 +786,18 @@ test("integration 8.3: --yes-deps in non-TTY — installable deps auto-installed
     fetchLatestFn: () => null,
   });
   assert.equal(promptCalled, false);
-  assert.equal(results["cc-plugin-codex"]?.status, "installed");
-  // codex-plugin-cc is manual-only — yesDeps shows instructions, does not call installCmd
-  assert.equal(results["codex-plugin-cc"]?.status, "manual-only");
+  assert.equal(results["openspec"]?.status, "installed");
+  // test-manual-dep is manual-only — yesDeps shows instructions, does not call installCmd
+  assert.equal(results["test-manual-dep"]?.status, "manual-only");
 });
 
 // ==========================================================================
-// Regression: codex-plugin-cc is manual-only (Finding 1)
+// Manual-only dep handling (installCmd: null) — exercised via test-manual-dep
 // ==========================================================================
 
-test("DEPS codex-plugin-cc: installCmd and updateCmd are null", () => {
-  assert.equal(DEPS["codex-plugin-cc"].installCmd, null, "installCmd must be null — Claude marketplace only");
-  assert.equal(DEPS["codex-plugin-cc"].updateCmd, null, "updateCmd must be null — Claude marketplace only");
-  assert.ok(DEPS["codex-plugin-cc"].manualInstall.length > 0, "manualInstall must be a non-empty string");
-});
-
-test("promptDeps: codex-plugin-cc manual-only — TTY accept → status manual-only, no installCmd called", async () => {
+test("promptDeps: manual-only — TTY accept → status manual-only, no installCmd called", async () => {
   let installCalled = false;
-  const results = await promptDeps(["codex-plugin-cc"], {
+  const results = await promptDeps(["test-manual-dep"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "y",
@@ -889,13 +806,13 @@ test("promptDeps: codex-plugin-cc manual-only — TTY accept → status manual-o
     fetchLatestFn: () => null,
   });
   assert.equal(installCalled, false, "no shell command should be run for manual-only dep");
-  assert.equal(results["codex-plugin-cc"]?.status, "manual-only");
-  assert.ok(results["codex-plugin-cc"]?.manualCmd, "manualCmd should be set");
+  assert.equal(results["test-manual-dep"]?.status, "manual-only");
+  assert.ok(results["test-manual-dep"]?.manualCmd, "manualCmd should be set");
 });
 
-test("promptDeps: codex-plugin-cc manual-only — TTY decline → status declined, no installCmd called", async () => {
+test("promptDeps: manual-only — TTY decline → status declined, no installCmd called", async () => {
   let installCalled = false;
-  const results = await promptDeps(["codex-plugin-cc"], {
+  const results = await promptDeps(["test-manual-dep"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "n",
@@ -904,19 +821,19 @@ test("promptDeps: codex-plugin-cc manual-only — TTY decline → status decline
     fetchLatestFn: () => null,
   });
   assert.equal(installCalled, false);
-  assert.equal(results["codex-plugin-cc"]?.status, "declined");
+  assert.equal(results["test-manual-dep"]?.status, "declined");
 });
 
-test("promptDeps: codex-plugin-cc manual-only — already present → status already current", async () => {
-  const results = await promptDeps(["codex-plugin-cc"], {
+test("promptDeps: manual-only — already present → status already current", async () => {
+  const results = await promptDeps(["test-manual-dep"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "y",
     detectFn: () => ({ present: true, version: "1.2.0" }),
     fetchLatestFn: () => null,
   });
-  assert.equal(results["codex-plugin-cc"]?.status, "already current");
-  assert.equal(results["codex-plugin-cc"]?.version, "1.2.0");
+  assert.equal(results["test-manual-dep"]?.status, "already current");
+  assert.equal(results["test-manual-dep"]?.version, "1.2.0");
 });
 
 test("printDepSummary: manual-only status renders install instructions", () => {
@@ -925,9 +842,9 @@ test("printDepSummary: manual-only status renders install instructions", () => {
   console.log = (...a) => lines.push(a.join(" "));
   try {
     printDepSummary({
-      "codex-plugin-cc": {
+      "test-manual-dep": {
         status: "manual-only",
-        manualCmd: DEPS["codex-plugin-cc"].manualInstall,
+        manualCmd: DEPS["test-manual-dep"].manualInstall,
       },
     });
   } finally {
@@ -935,7 +852,7 @@ test("printDepSummary: manual-only status renders install instructions", () => {
   }
   const out = lines.join("\n");
   assert.ok(out.includes("install manually"), "should mention manual install");
-  assert.ok(out.includes(DEPS["codex-plugin-cc"].manualInstall), "should include the manualInstall command");
+  assert.ok(out.includes(DEPS["test-manual-dep"].manualInstall), "should include the manualInstall command");
 });
 
 // ==========================================================================
@@ -980,32 +897,32 @@ test("last30daysPresent: returns version from plugin.json under Codex skill dir"
 });
 
 // ==========================================================================
-// Regression: codex-plugin-cc version comparison for present installs
+// Regression: manual-only version comparison for present installs
 // ==========================================================================
 
-test("promptDeps: codex-plugin-cc present + stale version → manual-update-needed", async () => {
-  const results = await promptDeps(["codex-plugin-cc"], {
+test("promptDeps: manual-only present + stale version → manual-update-needed", async () => {
+  const results = await promptDeps(["test-manual-dep"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "y",
     detectFn: () => ({ present: true, version: "1.0.0" }),
     fetchLatestFn: () => "2.0.0",
   });
-  assert.equal(results["codex-plugin-cc"]?.status, "manual-update-needed");
-  assert.equal(results["codex-plugin-cc"]?.version, "1.0.0");
-  assert.equal(results["codex-plugin-cc"]?.latest, "2.0.0");
-  assert.ok(results["codex-plugin-cc"]?.manualCmd, "should carry manualCmd for update instructions");
+  assert.equal(results["test-manual-dep"]?.status, "manual-update-needed");
+  assert.equal(results["test-manual-dep"]?.version, "1.0.0");
+  assert.equal(results["test-manual-dep"]?.latest, "2.0.0");
+  assert.ok(results["test-manual-dep"]?.manualCmd, "should carry manualCmd for update instructions");
 });
 
-test("promptDeps: codex-plugin-cc present + current version → already current", async () => {
-  const results = await promptDeps(["codex-plugin-cc"], {
+test("promptDeps: manual-only present + current version → already current", async () => {
+  const results = await promptDeps(["test-manual-dep"], {
     isTTY: true,
     yesDeps: false,
     promptFn: async () => "y",
     detectFn: () => ({ present: true, version: "2.0.0" }),
     fetchLatestFn: () => "2.0.0",
   });
-  assert.equal(results["codex-plugin-cc"]?.status, "already current");
+  assert.equal(results["test-manual-dep"]?.status, "already current");
 });
 
 test("printDepSummary: manual-update-needed renders version diff and manual cmd", () => {
@@ -1017,11 +934,11 @@ test("printDepSummary: manual-update-needed renders version diff and manual cmd"
   console.warn = (...a) => warns.push(a.join(" "));
   try {
     printDepSummary({
-      "codex-plugin-cc": {
+      "test-manual-dep": {
         status: "manual-update-needed",
         version: "1.0.0",
         latest: "2.0.0",
-        manualCmd: DEPS["codex-plugin-cc"].manualInstall,
+        manualCmd: DEPS["test-manual-dep"].manualInstall,
       },
     });
   } finally {
@@ -1031,7 +948,7 @@ test("printDepSummary: manual-update-needed renders version diff and manual cmd"
   const out = [...lines, ...warns].join("\n");
   assert.ok(out.includes("1.0.0"), "should show installed version");
   assert.ok(out.includes("2.0.0"), "should show latest version");
-  assert.ok(out.includes(DEPS["codex-plugin-cc"].manualInstall), "should include manual update command");
+  assert.ok(out.includes(DEPS["test-manual-dep"].manualInstall), "should include manual update command");
 });
 
 // ==========================================================================
@@ -1070,10 +987,10 @@ test("getRelevantDeps: reads openspec from git root, not invocation subdir", () 
   mkdirSync(subdir);
   try {
     // With git root as repoPath: openspec/ is found → openspec included.
-    const depsFromRoot = getRelevantDeps(["claude"], readPipelineConfig(tmp), tmp);
+    const depsFromRoot = getRelevantDeps(readPipelineConfig(tmp), tmp);
     assert.ok(depsFromRoot.includes("openspec"), "openspec detected when repoPath is git root");
     // Without git root fix (using subdir as repoPath): openspec/ not found → omitted.
-    const depsFromSubdir = getRelevantDeps(["claude"], readPipelineConfig(subdir), subdir);
+    const depsFromSubdir = getRelevantDeps(readPipelineConfig(subdir), subdir);
     assert.ok(!depsFromSubdir.includes("openspec"), "openspec omitted when repoPath is a subdir (demonstrates the bug)");
   } finally {
     cleanup(tmp);
