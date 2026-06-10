@@ -222,7 +222,7 @@ Examples that should be surfaced:
 - `[pipeline] #N: implementation done (Xs, harness=Y)`
 - `[pipeline] #N: PR #M created`
 - `[pipeline] #N: ready → review-1: PR #M opened`
-- `[pipeline] #N: review-1 by $cc:review`
+- `[pipeline] #N: review-1 by claude`
 - `[pipeline] #N: verdict=approve findings=0`
 - `[pipeline] #N: review-1 → review-2: standard review approved`
 - … and so on, all the way through `→ ready-to-deploy`
