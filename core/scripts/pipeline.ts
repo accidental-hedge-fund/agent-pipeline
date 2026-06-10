@@ -30,6 +30,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, withLock } from "./lock.ts";
+import { overrideComment, parseOverrideArg } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { sweepMergedWorktrees } from "./worktree.ts";
 import * as planningStage from "./stages/planning.ts";
@@ -46,6 +47,7 @@ const MAX_ITERATIONS = 12;
 interface CliOpts {
   status?: boolean;
   unblock?: string;
+  override?: string;
   once?: boolean;
   dryRun?: boolean;
   domain?: string;
@@ -67,6 +69,10 @@ async function main(): Promise<void> {
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--status", "read-only status; print stage and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
+    .option(
+      "--override <spec>",
+      'disposition a review finding so it no longer blocks: "<override-key>: <reason>" (key from the review comment; reason may lead with "rejected" or "deferred #N")',
+    )
     .option("--once", "advance one stage and stop")
     .option("--dry-run", "log what would happen without invoking harnesses or modifying GitHub")
     .option("--domain <name>", "override domain name (default: repo dir basename)")
@@ -135,11 +141,15 @@ async function main(): Promise<void> {
     await runStatus(cfg, issueNumber);
     return;
   }
-  if (!opts.dryRun && opts.unblock === undefined) {
+  if (!opts.dryRun && opts.unblock === undefined && opts.override === undefined) {
     await ensurePipelineLabels(cfg);
   }
   if (opts.unblock !== undefined) {
     await runUnblock(cfg, issueNumber, opts.unblock);
+    return;
+  }
+  if (opts.override !== undefined) {
+    await runOverride(cfg, issueNumber, opts.override);
     return;
   }
   await runAdvance(cfg, issueNumber, opts);
@@ -266,6 +276,39 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
   console.log(`[pipeline] #${issueNumber}: unblocked at ${stage}`);
+}
+
+// ---------------------------------------------------------------------------
+// Override mode (#17): disposition a review finding so it no longer blocks
+// ---------------------------------------------------------------------------
+
+async function runOverride(cfg: PipelineConfig, issueNumber: number, spec: string): Promise<void> {
+  const parsed = parseOverrideArg(spec);
+  if ("error" in parsed) {
+    console.error(`pipeline: ${parsed.error}`);
+    process.exit(2);
+  }
+  const detail = await getIssueDetail(cfg, issueNumber);
+  const stage = pickStage(detail.labels) ?? "(unknown)";
+  const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const body = overrideComment({
+    key: parsed.key,
+    disposition: parsed.disposition,
+    reason: parsed.reason,
+    stage,
+    timestamp: ts,
+    footer: cfg.marker_footer,
+  });
+  await postComment(cfg, issueNumber, body);
+  // If the item is blocked (e.g. a review round blocked on this finding), clear
+  // the blocker so a subsequent run can re-evaluate with the override applied.
+  if (isBlocked(detail.labels)) {
+    await clearBlocked(cfg, issueNumber);
+  }
+  console.log(
+    `[pipeline] #${issueNumber}: recorded override for finding ${parsed.key} (${parsed.disposition}). ` +
+      `Re-run the pipeline to advance with the override applied.`,
+  );
 }
 
 // ---------------------------------------------------------------------------

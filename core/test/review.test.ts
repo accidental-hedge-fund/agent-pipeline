@@ -22,6 +22,7 @@ import {
 } from "../scripts/stages/review.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
+import { findingKey } from "../scripts/review-policy.ts";
 import type { PipelineConfig, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -361,6 +362,9 @@ const cfg = {
   harnesses: { reviewer: "codex", implementer: "claude" },
   repo_dir: "/tmp/repo",
   models: { review: "opus" },
+  // Default policy: block on every finding (block_threshold "low", min_confidence 0)
+  // — reproduces pre-#17 behavior so existing routing assertions hold.
+  review_policy: { block_threshold: "low", min_confidence: 0 },
 } as unknown as PipelineConfig;
 
 interface Recorder {
@@ -548,6 +552,75 @@ test("advanceReview: needs-attention WITH findings still routes to fix (no re-re
     advanced: true,
     from: "review-1",
     to: "fix-1",
-    summary: "1 findings",
+    // Under the default policy (block_threshold "low") the finding blocks, so the
+    // item still routes to fix-1; the summary now distinguishes blocking findings.
+    summary: "1 blocking findings",
   });
+});
+
+// ---------------------------------------------------------------------------
+// Severity policy + audited overrides (#17)
+// ---------------------------------------------------------------------------
+
+const NA_MEDIUM =
+  '{"verdict":"needs-attention","summary":"minor","findings":' +
+  '[{"severity":"medium","title":"nit","body":"b","confidence":0.9,"recommendation":"tidy"}],' +
+  '"next_steps":[]}';
+
+const policyHighCfg = {
+  ...cfg,
+  review_policy: { block_threshold: "high", min_confidence: 0 },
+} as unknown as PipelineConfig;
+
+test("advanceReview (#17): review-1 with only sub-threshold findings advances to review-2, not fix-1", async (t) => {
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(policyHighCfg, 9, 1, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(rec.transitions, [{ to: "review-2" }], "all-advisory → advance, not fix-1");
+  assert.equal(outcome.advanced, true);
+  assert.equal(outcome.to, "review-2");
+  assert.match(outcome.summary, /below policy/);
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review 1 advanced under severity policy")),
+    "an audited advisory-advance comment must be posted",
+  );
+});
+
+test("advanceReview (#17): review-2 with only sub-threshold findings advances to pre-merge", async (t) => {
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(policyHighCfg, 9, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }]);
+  assert.equal(outcome.to, "pre-merge");
+});
+
+test("advanceReview (#17): an operator override on a blocking finding advances instead of routing to fix", async (t) => {
+  // Default policy blocks every finding; NA_WITH_FINDING is a high-severity bug.
+  // An override sentinel on its content-addressed key makes it non-blocking, so
+  // the item advances even though nothing was re-implemented — the #56 escape hatch.
+  const key = findingKey({ severity: "high", title: "bug" });
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{ body: `<!-- pipeline-override: ${key} rejected -->` }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 9, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }], "overridden finding → advance, not fix-2");
+  assert.match(outcome.summary, /below policy/);
 });
