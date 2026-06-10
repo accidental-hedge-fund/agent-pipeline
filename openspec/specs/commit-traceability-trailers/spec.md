@@ -5,7 +5,7 @@ TBD - created by archiving change stamp-commits-issue-traceability. Update Purpo
 ## Requirements
 ### Requirement: Direct pipeline commits carry Issue and Pipeline-Run trailers
 
-Every commit created directly by the pipeline (docs-update, openspec-archive, openspec-init) SHALL include the following two git trailers at the end of the commit message, separated from the subject/body by a blank line:
+Every commit created directly by the pipeline (openspec-archive, openspec-init) SHALL include the following two git trailers at the end of the commit message, separated from the subject/body by a blank line:
 
 ```
 Issue: #<issueNumber>
@@ -13,10 +13,6 @@ Pipeline-Run: <pipelineRunId>
 ```
 
 Where `<issueNumber>` is the GitHub issue number driving the pipeline run, and `<pipelineRunId>` is the run identifier generated at pipeline invocation time.
-
-#### Scenario: Docs-update commit has trailers
-- **WHEN** the pipeline creates a docs-update commit in `pre_merge.ts`
-- **THEN** the commit message ends with a blank line followed by `Issue: #<n>` and `Pipeline-Run: <id>` trailers
 
 #### Scenario: Openspec-archive commit has trailers
 - **WHEN** the pipeline creates an openspec-archive commit in `pre_merge.ts`
@@ -54,7 +50,7 @@ The templates SHALL provide `{{issue_number}}` and `{{pipeline_run_id}}` as pre-
 The pipeline orchestrator SHALL generate a `pipelineRunId` once at the start of processing an issue and reuse the same value for all commit operations during that invocation. The format SHALL be `<issueNumber>/<UTC-ISO-datetime>` (e.g., `42/2026-06-08T14:32:00Z`).
 
 #### Scenario: Run ID is the same for all commits in a run
-- **WHEN** the pipeline produces multiple commits for the same issue in one invocation (e.g., implementation commit + docs-update commit)
+- **WHEN** the pipeline produces multiple commits for the same issue in one invocation (e.g., implementation commit + openspec-archive commit)
 - **THEN** all commits carry the same `Pipeline-Run:` trailer value
 
 #### Scenario: Run ID format is greppable

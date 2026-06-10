@@ -78,30 +78,6 @@ After each test-fix harness invocation within the test gate, the pipeline SHALL 
 
 ---
 
-### Requirement: Docs-update step verifies docs-only file constraint
-
-After the docs-update harness completes and before pushing, the pipeline SHALL verify that no application code or test files appear in the set of changed files in `headBefore..HEAD` (or in the uncommitted dirty tree). The constraint is an allow-list: every modified file path must match a documentation-file pattern (`*.md`, `*.txt`, `*.rst`, `*.adoc`, paths under `docs/` or `doc/`, and extensionless named docs files such as `README`, `CHANGELOG`, `LICENSE`). Any path that does not match — application code, config such as `package.json`, or CI workflows — is denied.
-
-#### Scenario: Docs-update only touches documentation files
-
-- **WHEN** the docs-update harness exits 0 and new commits exist on `headBefore..HEAD`
-- **AND** every modified file path matches documentation-file patterns only
-- **THEN** the step SHALL push the docs commit and return `waiting` to trigger CI
-
-#### Scenario: Docs-update modifies application code — step blocks
-
-- **WHEN** the docs-update harness exits 0 and new commits exist on `headBefore..HEAD`
-- **AND** one or more modified file paths do not match any documentation-file pattern
-- **THEN** the step SHALL block with reason: `"Docs-update commit modified non-documentation files: <list>"`
-- **AND** SHALL NOT push the commits
-
-#### Scenario: Docs-update produces no commits — step proceeds without blocking
-
-- **WHEN** the docs-update harness exits 0 and no new commits exist on `headBefore..HEAD`
-- **THEN** the step SHALL proceed normally (no docs needed — not a violation)
-
----
-
 ### Requirement: Plan-revision output includes machine-checkable feedback acknowledgement
 
 The plan-revision harness output SHALL contain a `## Feedback Incorporated` section with at least one `[ADDRESSED]` or `[DEFERRED]` bullet item per feedback point from the plan review. The pipeline SHALL verify the presence of this section before posting the revised plan as an issue comment.

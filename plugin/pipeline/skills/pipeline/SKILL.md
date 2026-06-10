@@ -75,7 +75,7 @@ build step). First-ever invocation runs `npm install` automatically.
 
 Required:
 - `gh` CLI authenticated against the target repo
-- `claude` CLI on PATH — the primary harness (planning, implementation, fixes, docs)
+- `claude` CLI on PATH — the primary harness (planning, implementation, fixes)
 - `codex` CLI on PATH and authenticated — the reviewer harness
 - *(Optional)* the **codex-plugin-cc companion** (`codex-companion.mjs`) — only needed if you
   set `reviewMode: codex-companion`. The default `prompt-harness` mode reviews by invoking the
@@ -315,7 +315,7 @@ When the loop ends, the skill prints:
 - **No `pipeline:*` label** → refuse with opt-in instructions.
 - **Stage handler error** → posts a `blocked` label + structured comment
   with reason; loop terminates and shows the latest blocker.
-- **Primary harness fails (planning/implementation/fix/docs)** → blocked unless the stage explicitly defines a safe fallback.
+- **Primary harness fails (planning/implementation/fix)** → blocked unless the stage explicitly defines a safe fallback.
 
 ## What this skill never does
 
