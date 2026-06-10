@@ -41,8 +41,11 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
   const body = src.slice(bodyStart, i - 1);
   const fields: string[] = [];
   for (const line of body.split("\n")) {
-    const m = line.match(/^\s+(\w+)\??:/);
-    if (m) fields.push(m[1]);
+    // Accepts all valid TS property forms regardless of indentation:
+    //   optional leading spaces (column 0 allowed), optional 'readonly' modifier,
+    //   bare or "quoted" identifier, optional '?' for optional properties.
+    const m = line.match(/^\s*(?:readonly\s+)?(?:(\w+)|"(\w+)")\??:/);
+    if (m) fields.push(m[1] ?? m[2]);
   }
   return fields;
 }
@@ -82,6 +85,27 @@ function extractRenderedSchemaBlock(rendered: string): string {
   if (!m) throw new Error("Could not find fenced schema block in rendered prompt");
   return m[1];
 }
+
+// Regression: parseInterfaceFields must detect all valid TS property forms.
+// Each bypass form below was a latent hole in the old /^\s+(\w+)\??:/ regex.
+test("parseInterfaceFields regression: unindented, readonly, quoted, and optional properties are all detected", () => {
+  const src = `
+interface SyntheticA {
+  indented: string;
+unindented: string;
+  readonly readonlyField: string;
+  "quotedField": string;
+  optional?: number;
+// comment: ignored
+}
+`;
+  const fields = parseInterfaceFields(src, "SyntheticA");
+  assert.deepEqual(
+    fields,
+    ["indented", "unindented", "readonlyField", "quotedField", "optional"],
+    "parseInterfaceFields must detect unindented, readonly, quoted, and optional properties",
+  );
+});
 
 const declaredFields = [...REVIEW_SCHEMA_FIELDS.verdict, ...REVIEW_SCHEMA_FIELDS.finding];
 
