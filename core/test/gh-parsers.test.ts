@@ -7,6 +7,7 @@ import {
   getHarnessLabel,
   isBlocked,
   parseChecksAggregate,
+  parseClosingIssueRefs,
   parseMergeable,
   parsePrMergeState,
   pickStage,
@@ -258,6 +259,41 @@ test("parsePrMergeState: single merged PR → merged=true with prNumber and head
 test("parsePrMergeState: empty array → merged=false", () => {
   const result = parsePrMergeState("[]");
   assert.equal(result.merged, false);
+});
+
+// ---------- parseClosingIssueRefs (#76 regression) ----------
+
+test("parseClosingIssueRefs: constructs nameWithOwner from owner.login + name (realistic gh payload)", () => {
+  // gh pr view --json closingIssuesReferences emits repository { id, name, owner { id, login } },
+  // NOT repository { nameWithOwner }. This test guards against silent drift.
+  const ghPayload = JSON.stringify({
+    closingIssuesReferences: [
+      {
+        number: 42,
+        repository: {
+          id: "R_kgDOAbc123",
+          name: "repo",
+          owner: { id: "O_kgDOXyz789", login: "owner" },
+        },
+      },
+      {
+        number: 7,
+        repository: {
+          id: "R_kgDODef456",
+          name: "other-repo",
+          owner: { id: "O_kgDOUvw012", login: "other-owner" },
+        },
+      },
+    ],
+  });
+  const refs = parseClosingIssueRefs(ghPayload);
+  assert.equal(refs.length, 2);
+  assert.deepEqual(refs[0], { number: 42, nameWithOwner: "owner/repo" });
+  assert.deepEqual(refs[1], { number: 7, nameWithOwner: "other-owner/other-repo" });
+});
+
+test("parseClosingIssueRefs: returns empty array when field is absent", () => {
+  assert.deepEqual(parseClosingIssueRefs("{}"), []);
 });
 
 // ---------- resolvePrForIssue (#76) ----------
