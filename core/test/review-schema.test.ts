@@ -20,6 +20,7 @@ import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
   substitute,
+  _testing,
 } from "../scripts/prompts/index.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -70,6 +71,16 @@ function parseSchemaBlockFields(block: string): { verdict: string[]; finding: st
     }
   }
   return { verdict, finding };
+}
+
+// Pull the fenced code block that immediately follows "Return ONLY valid JSON
+// matching this schema" in a rendered review prompt. The extracted text must
+// equal REVIEW_VERDICT_SCHEMA_BLOCK exactly — any extra or missing field in a
+// hand-copied block causes this comparison to fail.
+function extractRenderedSchemaBlock(rendered: string): string {
+  const m = rendered.match(/Return ONLY valid JSON[^\n]*\n\n```\n([\s\S]*?)\n```/);
+  if (!m) throw new Error("Could not find fenced schema block in rendered prompt");
+  return m[1];
 }
 
 const declaredFields = [...REVIEW_SCHEMA_FIELDS.verdict, ...REVIEW_SCHEMA_FIELDS.finding];
@@ -183,6 +194,15 @@ test("both review prompts substitute the schema block (no literal placeholder, a
         `${name}: rendered prompt is missing schema field "${field}"`,
       );
     }
+    // Extract the fenced schema block from the rendered prompt and compare it
+    // exactly to REVIEW_VERDICT_SCHEMA_BLOCK. A hand-copied block with extra
+    // fields or reordered keys fails here even if it contains all current fields.
+    const extracted = extractRenderedSchemaBlock(out);
+    assert.equal(
+      extracted,
+      REVIEW_VERDICT_SCHEMA_BLOCK,
+      `${name}: extracted schema block must exactly match REVIEW_VERDICT_SCHEMA_BLOCK (extra fields or drift fail here)`,
+    );
   }
 });
 
@@ -193,4 +213,26 @@ test("unresolved {{schema_block}} is a hard error, not a prompt sent with a lite
     () => substitute("schema:\n```\n{{schema_block}}\n```\n", { other: "x" }),
     /Unfilled prompt placeholder\(s\) \{\{schema_block\}\}/,
   );
+});
+
+test("review prompt templates use {{schema_block}} placeholder and do not embed the schema literally", () => {
+  // If either template drops the placeholder in favour of a hand-copied block,
+  // substitute() would silently ignore the schema_block value and the reviewer
+  // would receive whatever literal text the template author typed — bypassing
+  // the single-source guard entirely. This test closes that gap by asserting
+  // both that the placeholder is present and that the schema constant itself is
+  // not duplicated verbatim in the template file.
+  const { loadTemplate } = _testing;
+  for (const name of ["review_standard", "review_adversarial"]) {
+    const tmpl = loadTemplate(name);
+    assert.match(
+      tmpl,
+      /\{\{\s*schema_block\s*\}\}/,
+      `${name}.md must contain {{schema_block}} placeholder — a literal hand-copied block bypasses the single-source guard`,
+    );
+    assert.ok(
+      !tmpl.includes(REVIEW_VERDICT_SCHEMA_BLOCK),
+      `${name}.md must not embed the schema block literally — use {{schema_block}} instead`,
+    );
+  }
 });
