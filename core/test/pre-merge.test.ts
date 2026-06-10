@@ -82,7 +82,7 @@ function makeArchiveDeps(opts: {
       // status --porcelain → empty so the proceed path returns before commit/push.
       return { stdout: "", stderr: "", code: 0 };
     },
-    branchFixCommits: async () => opts.fixCommits,
+    branchDeveloperCommits: async () => opts.fixCommits,
     openspecArchive: async (_wt, id) => {
       rec.archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
@@ -173,14 +173,14 @@ test("maybeArchiveOpenspec: proceeds when the fix ALSO updated the spec delta (r
 });
 
 // ---------------------------------------------------------------------------
-// enforceSpecConsistencyGuard — conservative-open when no fix round ran
+// enforceSpecConsistencyGuard — conservative-open when no developer commits ran
 // ---------------------------------------------------------------------------
 
-test("enforceSpecConsistencyGuard: no fix-round commits → never blocks (does not even read the verdict)", async () => {
+test("enforceSpecConsistencyGuard: no non-internal commits → never blocks (does not even read the verdict)", async () => {
   let issueDetailReads = 0;
   let blocks = 0;
   const deps: SpecConsistencyDeps = {
-    branchFixCommits: async () => [], // no fix commit on the branch
+    branchDeveloperCommits: async () => [], // no non-internal commits on the branch
     getIssueDetail: (async () => {
       issueDetailReads++;
       return { comments: [] };
@@ -191,8 +191,65 @@ test("enforceSpecConsistencyGuard: no fix-round commits → never blocks (does n
   };
   const out = await enforceSpecConsistencyGuard(cfg, 106, "/fake/wt", [ID], deps);
   assert.equal(out, null);
-  assert.equal(issueDetailReads, 0, "skips the verdict read when no fix round ran");
+  assert.equal(issueDetailReads, 0, "skips the verdict read when nothing moved");
   assert.equal(blocks, 0);
+});
+
+// Regression for review-2 finding: a non-fix-subject developer commit that
+// touches core/scripts/ must NOT bypass the guard when no spec delta was updated
+// and the reviewer flagged divergence. Before the fix, computeBranchDeveloperCommits
+// filtered to commits-after-first-fix-round-subject, so a plain developer commit
+// (e.g. "feat: improve algo") caused branchDeveloperCommits to return [] and the
+// guard silently returned null — letting archiving corrupt the living spec.
+test("maybeArchiveOpenspec: non-fix-subject developer commit that moved code is still caught by the guard", async (t) => {
+  const DEV_SHA = "cafebabe";
+  const rec: ArchiveRec = { archiveCalls: [], blocked: [] };
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: async () => ({ path: "/fake/wt", slug: "issue-106" }),
+    openspecIsActive: () => true,
+    changeDirExists: () => true,
+    gitInWorktree: async (_cwd, args) => {
+      // Branch diff (origin/main...HEAD) — spec delta is present (authored at planning).
+      if (args[0] === "diff" && args.some((a) => typeof a === "string" && a.includes("..."))) {
+        return { stdout: BRANCH_DIFF, stderr: "", code: 0 };
+      }
+      // git log: a developer commit with no "fix: address review" prefix.
+      if (args[0] === "log") {
+        return { stdout: `${DEV_SHA}\x1ffeat: improve algorithm performance\n`, stderr: "", code: 0 };
+      }
+      // Per-commit diff: the developer commit touched only implementation, not the spec.
+      if (args[0] === "diff" && args.some((a) => typeof a === "string" && a.includes("^"))) {
+        return { stdout: `${IMPL_PATH}\n`, stderr: "", code: 0 };
+      }
+      // status --porcelain: clean.
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    openspecArchive: async (_wt, id) => {
+      rec.archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    },
+    getIssueDetail: async () =>
+      ({ comments: [{ author: "claude", body: REVIEW_DIVERGENCE, createdAt: "2026-06-10T00:00:00Z" }] }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
+      >,
+    setBlocked: async (_cfg, _n, reason, stage) => {
+      rec.blocked.push({ reason, stage: String(stage) });
+    },
+    // branchDeveloperCommits is intentionally NOT provided — the real
+    // computeBranchDeveloperCommits runs via the mocked gitInWorktree above.
+  };
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, 106, "106/run", deps);
+  });
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "blocked", reason: `stale OpenSpec delta (${ID})` },
+    "developer commit without fix-round subject must still trigger the guard",
+  );
+  assert.deepEqual(rec.archiveCalls, [], "must NOT archive a stale delta");
+  assert.equal(rec.blocked.length, 1, "must label the issue blocked");
+  assert.match(rec.blocked[0].reason, /stale spec delta/i);
 });
 
 // ---------------------------------------------------------------------------
