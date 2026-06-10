@@ -614,7 +614,15 @@ export async function createPr(
   return Number.parseInt(match[1], 10);
 }
 
-/** Minimal open-PR shape needed by resolvePrForIssue. */
+/** Structured closing-issue reference returned by the GH API (includes repo). */
+export interface ClosingIssueRef {
+  number: number;
+  nameWithOwner: string;
+}
+
+/** Minimal open-PR shape needed by resolvePrForIssue. Carries the PR's own
+ *  closing-issue references so resolution needs a single `gh pr list` call —
+ *  no per-PR `gh pr view` fan-out (#76/#97). */
 export interface PrCandidate {
   number: number;
   headRefName: string;
@@ -622,27 +630,62 @@ export interface PrCandidate {
    *  headRefName is only the branch name and can spoof `pipeline/<N>-`, so the
    *  branch fast path must not trust it (#76). */
   isCrossRepository: boolean;
+  /** The issues this PR closes, repo-qualified (from the same list query). */
+  closingIssues: ClosingIssueRef[];
 }
 
-/** Structured closing-issue reference returned by the GH API (includes repo). */
-export interface ClosingIssueRef {
-  number: number;
-  nameWithOwner: string;
+/** Normalize a gh `closingIssuesReferences` array into ClosingIssueRef[]. gh
+ *  emits `repository { id, name, owner { id, login } }` (NOT a `nameWithOwner`
+ *  field), so the repo-qualified name is reconstructed as `owner.login/name`.
+ *  Refs without a repository are dropped. Exported for tests. */
+export function normalizeClosingRefs(
+  raw:
+    | { number: number; repository?: { name: string; owner: { login: string } } }[]
+    | undefined,
+): ClosingIssueRef[] {
+  return (raw ?? [])
+    .filter((r) => r.repository)
+    .map((r) => ({
+      number: r.number,
+      nameWithOwner: `${r.repository!.owner.login}/${r.repository!.name}`,
+    }));
 }
 
-/** Resolve the PR for an issue using exactly two strategies, in order:
+/** Parse `gh pr list --json number,headRefName,isCrossRepository,closingIssuesReferences`
+ *  into PrCandidate[]. One query carries everything resolvePrForIssue needs.
+ *  Exported for tests. */
+export function parsePrList(stdout: string): PrCandidate[] {
+  const data = JSON.parse(stdout) as {
+    number: number;
+    headRefName: string;
+    isCrossRepository?: boolean;
+    closingIssuesReferences?: {
+      number: number;
+      repository?: { name: string; owner: { login: string } };
+    }[];
+  }[];
+  return data.map((pr) => ({
+    number: pr.number,
+    headRefName: pr.headRefName,
+    isCrossRepository: pr.isCrossRepository ?? false,
+    closingIssues: normalizeClosingRefs(pr.closingIssuesReferences),
+  }));
+}
+
+/** Resolve the PR for an issue from a single PR-list fetch, in two strategies:
  *    1. Head branch starts with `pipeline/<N>-` AND the PR is not from a fork
- *       (fast path, no extra API calls; a fork PR can spoof the branch name).
- *    2. The PR's closingIssuesReferences contains the issue in targetRepo (authoritative link).
+ *       (a fork PR can spoof the branch name).
+ *    2. The PR's closingIssuesReferences contains the issue in targetRepo
+ *       (authoritative link).
  *  Returns null when neither matches. Deliberately NO body/title text search —
  *  a PR that merely mentions `#N` must not resolve as issue N's PR (#76).
- *  Cross-repo closing refs (OWNER/REPO#N targeting a different repo) are ignored. */
-export async function resolvePrForIssue(
+ *  Cross-repo closing refs (OWNER/REPO#N targeting a different repo) are ignored.
+ *  Pure and synchronous: resolution does no per-PR API calls (#97). */
+export function resolvePrForIssue(
   prs: PrCandidate[],
   issueNumber: number,
   targetRepo: string,
-  getClosingIssueRefs: (prNumber: number) => Promise<ClosingIssueRef[]>,
-): Promise<number | null> {
+): number | null {
   const branchPrefix = `pipeline/${issueNumber}-`;
   for (const pr of prs) {
     // A fork PR's headRefName is only the branch name and can spoof the prefix,
@@ -650,55 +693,31 @@ export async function resolvePrForIssue(
     if (!pr.isCrossRepository && pr.headRefName.startsWith(branchPrefix)) return pr.number;
   }
 
+  const target = targetRepo.toLowerCase();
   for (const pr of prs) {
-    const refs = await getClosingIssueRefs(pr.number);
-    if (refs.some((r) => r.nameWithOwner.toLowerCase() === targetRepo.toLowerCase() && r.number === issueNumber)) {
+    if (
+      pr.closingIssues.some(
+        (r) => r.nameWithOwner.toLowerCase() === target && r.number === issueNumber,
+      )
+    ) {
       return pr.number;
     }
   }
   return null;
 }
 
-/** Parse the raw JSON from `gh pr view --json closingIssuesReferences`.
- *  gh CLI emits `repository { id, name, owner { id, login } }`, NOT `nameWithOwner`. */
-export function parseClosingIssueRefs(stdout: string): ClosingIssueRef[] {
-  const data = JSON.parse(stdout) as {
-    closingIssuesReferences?: {
-      number: number;
-      repository: { name: string; owner: { login: string } };
-    }[];
-  };
-  return (data.closingIssuesReferences ?? []).map((r) => ({
-    number: r.number,
-    nameWithOwner: `${r.repository.owner.login}/${r.repository.name}`,
-  }));
-}
-
-async function getPrClosingIssueRefs(
-  cfg: PipelineConfig,
-  prNumber: number,
-): Promise<ClosingIssueRef[]> {
-  const stdout = await ghRun([
-    "pr",
-    "view",
-    String(prNumber),
-    "--json",
-    "closingIssuesReferences",
-    "-R",
-    cfg.repo,
-  ]);
-  return parseClosingIssueRefs(stdout);
-}
-
 export async function getPrForIssue(
   cfg: PipelineConfig,
   issueNumber: number,
 ): Promise<number | null> {
+  // A single list query carries number + branch + fork flag + closing refs, so
+  // resolution never fans out to one `gh pr view` per open PR (#97). A transient
+  // failure on an unrelated PR can no longer abort the shared resolver.
   const stdout = await ghRun([
     "pr",
     "list",
     "--json",
-    "number,headRefName,isCrossRepository",
+    "number,headRefName,isCrossRepository,closingIssuesReferences",
     "--state",
     "open",
     "-L",
@@ -706,8 +725,7 @@ export async function getPrForIssue(
     "-R",
     cfg.repo,
   ]);
-  const prs = JSON.parse(stdout) as PrCandidate[];
-  return resolvePrForIssue(prs, issueNumber, cfg.repo, (n) => getPrClosingIssueRefs(cfg, n));
+  return resolvePrForIssue(parsePrList(stdout), issueNumber, cfg.repo);
 }
 
 // ---------------------------------------------------------------------------

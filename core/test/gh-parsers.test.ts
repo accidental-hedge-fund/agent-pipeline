@@ -6,13 +6,14 @@ import {
   extractHumanPlanComments,
   getHarnessLabel,
   isBlocked,
+  normalizeClosingRefs,
   parseChecksAggregate,
-  parseClosingIssueRefs,
   parseMergeable,
+  parsePrList,
   parsePrMergeState,
   pickStage,
   resolvePrForIssue,
-  type ClosingIssueRef,
+  type PrCandidate,
 } from "../scripts/gh.ts";
 import {
   formatReviewComment,
@@ -261,142 +262,129 @@ test("parsePrMergeState: empty array → merged=false", () => {
   assert.equal(result.merged, false);
 });
 
-// ---------- parseClosingIssueRefs (#76 regression) ----------
+// ---------- normalizeClosingRefs + parsePrList (#76/#97) ----------
 
-test("parseClosingIssueRefs: constructs nameWithOwner from owner.login + name (realistic gh payload)", () => {
-  // gh pr view --json closingIssuesReferences emits repository { id, name, owner { id, login } },
-  // NOT repository { nameWithOwner }. This test guards against silent drift.
-  const ghPayload = JSON.stringify({
-    closingIssuesReferences: [
-      {
-        number: 42,
-        repository: {
-          id: "R_kgDOAbc123",
-          name: "repo",
-          owner: { id: "O_kgDOXyz789", login: "owner" },
-        },
-      },
-      {
-        number: 7,
-        repository: {
-          id: "R_kgDODef456",
-          name: "other-repo",
-          owner: { id: "O_kgDOUvw012", login: "other-owner" },
-        },
-      },
-    ],
+test("normalizeClosingRefs: constructs nameWithOwner from owner.login + name (realistic gh shape)", () => {
+  // gh emits repository { id, name, owner { id, login } }, NOT a nameWithOwner field.
+  const raw = [
+    { number: 42, repository: { name: "repo", owner: { login: "owner" } } },
+    { number: 7, repository: { name: "other-repo", owner: { login: "other-owner" } } },
+  ];
+  assert.deepEqual(normalizeClosingRefs(raw), [
+    { number: 42, nameWithOwner: "owner/repo" },
+    { number: 7, nameWithOwner: "other-owner/other-repo" },
+  ]);
+});
+
+test("normalizeClosingRefs: undefined/empty and repository-less refs are dropped", () => {
+  assert.deepEqual(normalizeClosingRefs(undefined), []);
+  assert.deepEqual(normalizeClosingRefs([]), []);
+  assert.deepEqual(normalizeClosingRefs([{ number: 9 }]), []); // no repository → dropped
+});
+
+test("parsePrList: a single list query yields candidates carrying their closing refs (#97)", () => {
+  // The shape of `gh pr list --json number,headRefName,isCrossRepository,closingIssuesReferences`.
+  const stdout = JSON.stringify([
+    {
+      number: 96,
+      headRefName: "pipeline/76-fix",
+      isCrossRepository: false,
+      closingIssuesReferences: [
+        { number: 76, repository: { name: "repo", owner: { login: "owner" } } },
+      ],
+    },
+    { number: 7, headRefName: "feat/x", isCrossRepository: true },
+  ]);
+  const prs = parsePrList(stdout);
+  assert.equal(prs.length, 2);
+  assert.deepEqual(prs[0], {
+    number: 96,
+    headRefName: "pipeline/76-fix",
+    isCrossRepository: false,
+    closingIssues: [{ number: 76, nameWithOwner: "owner/repo" }],
   });
-  const refs = parseClosingIssueRefs(ghPayload);
-  assert.equal(refs.length, 2);
-  assert.deepEqual(refs[0], { number: 42, nameWithOwner: "owner/repo" });
-  assert.deepEqual(refs[1], { number: 7, nameWithOwner: "other-owner/other-repo" });
+  assert.equal(prs[1].isCrossRepository, true);
+  assert.deepEqual(prs[1].closingIssues, [], "missing closing refs → empty");
 });
 
-test("parseClosingIssueRefs: returns empty array when field is absent", () => {
-  assert.deepEqual(parseClosingIssueRefs("{}"), []);
-});
-
-// ---------- resolvePrForIssue (#76) ----------
+// ---------- resolvePrForIssue (#76/#97) — pure, synchronous, single-call ----------
 
 const TARGET_REPO = "owner/repo";
 
-function refs(...nums: number[]): ClosingIssueRef[] {
-  return nums.map((n) => ({ number: n, nameWithOwner: TARGET_REPO }));
+function cand(
+  number: number,
+  headRefName: string,
+  opts: { fork?: boolean; closes?: number[] } = {},
+): PrCandidate {
+  return {
+    number,
+    headRefName,
+    isCrossRepository: opts.fork ?? false,
+    closingIssues: (opts.closes ?? []).map((n) => ({ number: n, nameWithOwner: TARGET_REPO })),
+  };
 }
 
-test("resolvePrForIssue: branch-prefix match returns the PR without fetching closing refs", async () => {
-  let fetches = 0;
-  const prs = [
-    { number: 7, headRefName: "feat/unrelated", isCrossRepository: false },
-    { number: 9, headRefName: "pipeline/42-my-feature", isCrossRepository: false },
-  ];
-  const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => {
-    fetches++;
-    return [];
-  });
-  assert.equal(result, 9);
-  assert.equal(fetches, 0);
+test("resolvePrForIssue: branch-prefix match returns the PR (no closing refs needed)", () => {
+  const prs = [cand(7, "feat/unrelated"), cand(9, "pipeline/42-my-feature")];
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), 9);
 });
 
-test("resolvePrForIssue: a FORK PR cannot spoof the branch fast path (#76 adversarial regression)", async () => {
-  // A fork PR's headRefName is just the branch name and can be `pipeline/42-*`
-  // without belonging to cfg.repo or closing #42. It must NOT win the fast path;
-  // it falls through to closing references, which here do not link #42 → null.
-  const prs = [
-    { number: 13, headRefName: "pipeline/42-spoofed", isCrossRepository: true },
-  ];
-  let fetches = 0;
-  const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => {
-    fetches++;
-    return []; // fork PR does not actually close #42
-  });
-  assert.equal(result, null, "a fork branch must not be trusted by the fast path");
-  assert.equal(fetches, 1, "the fork PR must fall through to the closing-ref check");
+test("resolvePrForIssue: a FORK PR cannot spoof the branch fast path (#76 adversarial regression)", () => {
+  // Fork branch can be `pipeline/42-*` without closing #42 → must not match.
+  const prs = [cand(13, "pipeline/42-spoofed", { fork: true })];
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), null);
 });
 
-test("resolvePrForIssue: a same-repo branch match still wins even with a fork PR present (#76)", async () => {
-  const prs = [
-    { number: 13, headRefName: "pipeline/42-spoofed", isCrossRepository: true },
-    { number: 9, headRefName: "pipeline/42-real", isCrossRepository: false },
-  ];
-  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), 9);
+test("resolvePrForIssue: a same-repo branch match still wins even with a fork PR present (#76)", () => {
+  const prs = [cand(13, "pipeline/42-spoofed", { fork: true }), cand(9, "pipeline/42-real")];
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), 9);
 });
 
-test("resolvePrForIssue: branch prefix requires the trailing dash (no pipeline/420-* match for #42)", async () => {
-  const prs = [{ number: 9, headRefName: "pipeline/420-other-issue" }];
-  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), null);
+test("resolvePrForIssue: branch prefix requires the trailing dash (no pipeline/420-* match for #42)", () => {
+  assert.equal(resolvePrForIssue([cand(9, "pipeline/420-other-issue")], 42, TARGET_REPO), null);
 });
 
-test("resolvePrForIssue: falls back to closingIssuesReferences when no pipeline branch", async () => {
-  const prs = [
-    { number: 7, headRefName: "feat/unrelated" },
-    { number: 9, headRefName: "fix/other-work" },
-  ];
-  const closing: Record<number, ClosingIssueRef[]> = { 7: refs(13), 9: refs(42, 50) };
-  assert.equal(
-    await resolvePrForIssue(prs, 42, TARGET_REPO, async (n) => closing[n] ?? []),
-    9,
-  );
+test("resolvePrForIssue: falls back to closingIssuesReferences when no pipeline branch", () => {
+  const prs = [cand(7, "feat/unrelated", { closes: [13] }), cand(9, "fix/other-work", { closes: [42, 50] })];
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), 9);
 });
 
-test("resolvePrForIssue: PR that merely mentions the issue number is NOT matched (#76 regression)", async () => {
-  // The original bug: PR #66 closed #20 but hard-coded "issue 42" / "Fixes #42"
-  // in its body (a unit-test fixture), and --status resolved it as #42's PR.
-  // Body text plays no part in resolution — only closing references count.
-  const prs = [
+test("resolvePrForIssue: PR that merely mentions the issue number is NOT matched (#76 regression)", () => {
+  // The original bug: a PR closing #20 but hard-coding "Fixes #42" in its body was
+  // resolved as #42's PR. Body text plays no part — only closing references count.
+  const prs = [cand(66, "fix/testgate-fixture", { closes: [20] })];
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), null);
+});
+
+test("resolvePrForIssue: cross-repo closing ref is not matched (#76 adversarial regression)", () => {
+  // A PR in cfg.repo closes other/repo#42 — same number, different repo.
+  const prs: PrCandidate[] = [
     {
-      number: 66,
-      headRefName: "fix/testgate-fixture",
-      body: "Adds a unit-test fixture that hard-codes issue 42.\n\nFixes #42 appears here only as fixture text.",
+      number: 11,
+      headRefName: "feat/something",
+      isCrossRepository: false,
+      closingIssues: [{ number: 42, nameWithOwner: "other/repo" }],
     },
   ];
-  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => refs(20)), null);
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), null);
 });
 
-test("resolvePrForIssue: cross-repo closing ref is not matched (#76 adversarial regression)", async () => {
-  // A PR in cfg.repo closes other/repo#42 — the same number as our target issue
-  // but in a different repository. Must not resolve as cfg.repo#42's PR.
-  const prs = [{ number: 11, headRefName: "feat/something" }];
-  const result = await resolvePrForIssue(prs, 42, TARGET_REPO, async () => [
-    { number: 42, nameWithOwner: "other/repo" },
-  ]);
-  assert.equal(result, null);
+test("resolvePrForIssue: returns null when no PR matches either strategy", () => {
+  assert.equal(resolvePrForIssue([cand(7, "feat/unrelated")], 42, TARGET_REPO), null);
 });
 
-test("resolvePrForIssue: returns null when no PR matches either strategy", async () => {
-  const prs = [{ number: 7, headRefName: "feat/unrelated" }];
-  assert.equal(await resolvePrForIssue(prs, 42, TARGET_REPO, async () => []), null);
-});
-
-test("resolvePrForIssue: closing ref matches despite mixed casing in owner/repo (#76 review-2 regression)", async () => {
-  // GitHub owner/repo identifiers are case-insensitive; cfg.repo may have different
-  // casing than what closingIssuesReferences returns (canonical GitHub casing).
-  // e.g. cfg uses "Owner/Repo" but GitHub returns "owner/repo" in the API response.
-  const prs = [{ number: 11, headRefName: "feat/something" }];
-  const result = await resolvePrForIssue(prs, 42, "Owner/Repo", async () => [
-    { number: 42, nameWithOwner: "owner/repo" },
-  ]);
-  assert.equal(result, 11);
+test("resolvePrForIssue: closing ref matches despite mixed casing in owner/repo (#76 review-2 regression)", () => {
+  // GitHub owner/repo identifiers are case-insensitive; cfg.repo casing may differ
+  // from the canonical casing closingIssuesReferences returns.
+  const prs: PrCandidate[] = [
+    {
+      number: 11,
+      headRefName: "feat/something",
+      isCrossRepository: false,
+      closingIssues: [{ number: 42, nameWithOwner: "owner/repo" }],
+    },
+  ];
+  assert.equal(resolvePrForIssue(prs, 42, "Owner/Repo"), 11);
 });
 
 // ---------- extractHumanPlanComments (#26) ----------
