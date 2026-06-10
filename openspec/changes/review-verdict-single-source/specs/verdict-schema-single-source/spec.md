@@ -3,6 +3,8 @@
 ### Requirement: Single source of truth for the review verdict JSON schema
 The review verdict JSON schema (fields, types, and nesting) SHALL be defined once as a TypeScript constant or structured metadata object (`REVIEW_VERDICT_SCHEMA_BLOCK` or equivalent) exported from `core/scripts/types.ts` or a co-located `review-schema.ts`. No other file in the codebase SHALL contain a hand-copied duplicate of this schema block.
 
+Single-sourcing here means exactly one authored copy of the schema **text** (which expresses the field names, their type hints, and nesting). Enforcing agreement of field value *types* between that text and the `ReviewFinding`/`ReviewVerdict` interfaces at test time is **out of scope** for this change (see the *Drift guard test* requirement below and #85); the drift guard added here is field-name-scoped.
+
 #### Scenario: Schema constant is the only copy
 - **WHEN** `review_standard.md` or `review_adversarial.md` is rendered
 - **THEN** the emitted JSON schema block SHALL be derived from the shared constant, not from literal text embedded in the `.md` file
@@ -24,6 +26,8 @@ Both `review_standard.md` and `review_adversarial.md` SHALL use a `{{schema_bloc
 
 ### Requirement: Drift guard test
 A test SHALL assert that every field declared in `ReviewFinding` and `ReviewVerdict` is present in `REVIEW_VERDICT_SCHEMA_BLOCK`, and that every field named in `REVIEW_VERDICT_SCHEMA_BLOCK` corresponds to a field in `ReviewFinding` or `ReviewVerdict`. The test SHALL fail if either side has a field the other lacks.
+
+This requirement covers **field-name** drift only (a field added, renamed, or removed). Detecting drift in a field's value **type** (e.g. `number` → `string`) or in the schema's **nesting/shape** while the field name is unchanged is **out of scope** for this change and is tracked separately in #85. A name-level guard satisfies this requirement.
 
 #### Scenario: Types and schema block agree — test passes
 - **WHEN** `ReviewFinding` and `ReviewVerdict` fields exactly match the fields enumerated in `REVIEW_VERDICT_SCHEMA_BLOCK`

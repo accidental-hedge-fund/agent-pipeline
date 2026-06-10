@@ -9,6 +9,10 @@ The review verdict JSON schema is hand-copied verbatim into two prompt files (`r
 - Add a test that compares the fields declared in `ReviewFinding`/`ReviewVerdict` against the fields embedded in both review prompts and fails on any mismatch (field added, renamed, or removed on either side).
 - No behavior change to the produced verdict shape, the review checklists, or any other prompt content.
 
+### Scope boundary (deferred to #85)
+
+The drift *test* detects **field-name** drift (a field added, renamed, or removed). It does **not** compare a field's value *type* (e.g. `line_start: number` → `string`) or the schema's nesting/shape when the field name is unchanged. That heavier structured-metadata/AST comparison was deliberately rejected here as over-engineering for a flat, fixed-shape object (see `design.md`), and is tracked as a separate scoped change in #85. This change single-sources the schema text and guards field-name drift, which is this issue's stated acceptance criterion.
+
 ## Capabilities
 
 ### New Capabilities
