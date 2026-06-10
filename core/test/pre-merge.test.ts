@@ -14,6 +14,7 @@ import {
   reviewFlagsSpecDivergence,
   specDeltaIsStale,
   type AdvancePreMergeDeps,
+  type FixCommit,
   type SpecConsistencyDeps,
 } from "../scripts/stages/pre_merge.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
@@ -66,7 +67,7 @@ interface ArchiveRec {
 }
 
 function makeArchiveDeps(opts: {
-  fixDiffPaths: string[];
+  fixCommits: FixCommit[];
   reviewBody: string;
 }): { deps: AdvancePreMergeDeps; rec: ArchiveRec } {
   const rec: ArchiveRec = { archiveCalls: [], blocked: [] };
@@ -81,7 +82,7 @@ function makeArchiveDeps(opts: {
       // status --porcelain → empty so the proceed path returns before commit/push.
       return { stdout: "", stderr: "", code: 0 };
     },
-    branchFixDiffPaths: async () => opts.fixDiffPaths,
+    branchFixCommits: async () => opts.fixCommits,
     openspecArchive: async (_wt, id) => {
       rec.archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
@@ -106,7 +107,7 @@ test("maybeArchiveOpenspec: blocks (no archive) when a fix moved code but not th
   // call openspecArchive("c106") and return the waiting/null archive outcome —
   // both assertions below would then fail.
   const { deps, rec } = makeArchiveDeps({
-    fixDiffPaths: [IMPL_PATH], // fix touched code; the change's specs/** untouched
+    fixCommits: [{ sha: "s1", paths: [IMPL_PATH] }], // fix touched code; the change's specs/** untouched
     reviewBody: REVIEW_DIVERGENCE,
   });
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -126,7 +127,7 @@ test("maybeArchiveOpenspec: blocks (no archive) when a fix moved code but not th
 
 test("maybeArchiveOpenspec: proceeds to archive when the reviewer did NOT flag divergence (no false positive)", async (t) => {
   const { deps, rec } = makeArchiveDeps({
-    fixDiffPaths: [IMPL_PATH], // same structural signal as the blocking case…
+    fixCommits: [{ sha: "s1", paths: [IMPL_PATH] }], // same structural signal as the blocking case…
     reviewBody: REVIEW_CLEAN, // …but the reviewer saw no divergence → spec presumed consistent
   });
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -145,7 +146,7 @@ test("maybeArchiveOpenspec: approving summary with 'no divergence' language does
   // + "OpenSpec" in the approving summary, causing a false-positive block even
   // though the reviewer found no actual divergence finding.
   const { deps, rec } = makeArchiveDeps({
-    fixDiffPaths: [IMPL_PATH], // code moved (structural signal present)
+    fixCommits: [{ sha: "s1", paths: [IMPL_PATH] }], // code moved (structural signal present)
     reviewBody: REVIEW_APPROVE_DIVERGENCE_IN_SUMMARY,
   });
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -159,7 +160,7 @@ test("maybeArchiveOpenspec: approving summary with 'no divergence' language does
 
 test("maybeArchiveOpenspec: proceeds when the fix ALSO updated the spec delta (revision happened)", async (t) => {
   const { deps, rec } = makeArchiveDeps({
-    fixDiffPaths: [IMPL_PATH, SPEC_PATH], // fix updated the spec to match the code
+    fixCommits: [{ sha: "s1", paths: [IMPL_PATH, SPEC_PATH] }], // fix updated spec + code in same commit
     reviewBody: REVIEW_DIVERGENCE, // even though an earlier verdict flagged divergence
   });
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -179,7 +180,7 @@ test("enforceSpecConsistencyGuard: no fix-round commits → never blocks (does n
   let issueDetailReads = 0;
   let blocks = 0;
   const deps: SpecConsistencyDeps = {
-    branchFixDiffPaths: async () => [], // no fix commit on the branch
+    branchFixCommits: async () => [], // no fix commit on the branch
     getIssueDetail: (async () => {
       issueDetailReads++;
       return { comments: [] };
@@ -199,31 +200,75 @@ test("enforceSpecConsistencyGuard: no fix-round commits → never blocks (does n
 // ---------------------------------------------------------------------------
 
 test("specDeltaIsStale: impl changed + spec delta untouched → stale", () => {
-  assert.equal(specDeltaIsStale(ID, [IMPL_PATH]), true);
-  assert.equal(specDeltaIsStale(ID, [IMPL_PATH, "plugin/scripts/foo.ts"]), true);
+  assert.equal(specDeltaIsStale(ID, [{ sha: "s1", paths: [IMPL_PATH] }]), true);
+  assert.equal(specDeltaIsStale(ID, [{ sha: "s1", paths: [IMPL_PATH, "plugin/scripts/foo.ts"] }]), true);
 });
 
-test("specDeltaIsStale: spec delta also changed → not stale (revision happened)", () => {
-  assert.equal(specDeltaIsStale(ID, [IMPL_PATH, SPEC_PATH]), false);
+test("specDeltaIsStale: spec delta changed in same commit as impl → not stale (revision happened)", () => {
+  assert.equal(specDeltaIsStale(ID, [{ sha: "s1", paths: [IMPL_PATH, SPEC_PATH] }]), false);
+});
+
+test("specDeltaIsStale: spec updated in LATER commit than impl → not stale", () => {
+  assert.equal(
+    specDeltaIsStale(ID, [
+      { sha: "s1", paths: [IMPL_PATH] },
+      { sha: "s2", paths: [SPEC_PATH] },
+    ]),
+    false,
+  );
 });
 
 test("specDeltaIsStale: only the spec changed (no impl) → not stale", () => {
-  assert.equal(specDeltaIsStale(ID, [SPEC_PATH]), false);
+  assert.equal(specDeltaIsStale(ID, [{ sha: "s1", paths: [SPEC_PATH] }]), false);
 });
 
-test("specDeltaIsStale: empty fix diff → not stale", () => {
+test("specDeltaIsStale: empty fix commits → not stale", () => {
   assert.equal(specDeltaIsStale(ID, []), false);
 });
 
 test("specDeltaIsStale: a DIFFERENT change's spec edit does not satisfy this change's specUpdated", () => {
   // Impl changed; only some OTHER change's specs were edited → c106's delta is
   // still stale. (Editing another change's spec is not editing c106's.)
-  assert.equal(specDeltaIsStale(ID, [IMPL_PATH, "openspec/changes/other/specs/x/spec.md"]), true);
+  assert.equal(
+    specDeltaIsStale(ID, [
+      { sha: "s1", paths: [IMPL_PATH, "openspec/changes/other/specs/x/spec.md"] },
+    ]),
+    true,
+  );
 });
 
 test("specDeltaIsStale: changes confined to openspec/ are never 'impl' → not stale", () => {
   // No implementation moved (everything is under openspec/), so nothing drifted.
-  assert.equal(specDeltaIsStale(ID, ["openspec/changes/other/specs/x/spec.md"]), false);
+  assert.equal(
+    specDeltaIsStale(ID, [{ sha: "s1", paths: ["openspec/changes/other/specs/x/spec.md"] }]),
+    false,
+  );
+});
+
+// Regression test for Finding 1 (review 2): an early fix-1 spec edit must NOT
+// protect against a later fix-2 commit that moved code without touching the spec.
+test("specDeltaIsStale: early spec edit in fix-1 does NOT protect against later code-only fix-2 (order-aware regression)", () => {
+  // fix-1: updated both code and spec (consistent at that point)
+  // fix-2: updated only code again → spec is now behind → STALE
+  assert.equal(
+    specDeltaIsStale(ID, [
+      { sha: "s1", paths: [IMPL_PATH, SPEC_PATH] }, // fix-1 revised both
+      { sha: "s2", paths: [IMPL_PATH] },             // fix-2 moved code only → stale
+    ]),
+    true,
+    "a fix that touches impl AFTER the last spec edit should be detected as stale",
+  );
+});
+
+test("specDeltaIsStale: fix-2 updates spec after fix-1 code-only commit → not stale", () => {
+  // fix-1: only code; fix-2: updates spec after the code change → consistent
+  assert.equal(
+    specDeltaIsStale(ID, [
+      { sha: "s1", paths: [IMPL_PATH] },             // fix-1 code only
+      { sha: "s2", paths: [IMPL_PATH, SPEC_PATH] },  // fix-2 syncs spec
+    ]),
+    false,
+  );
 });
 
 // ---------------------------------------------------------------------------

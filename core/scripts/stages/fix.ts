@@ -23,7 +23,9 @@ import {
   type VerifyResult,
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId } from "../traceability.ts";
+import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
+import type { ValidateResult } from "../openspec.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
@@ -33,11 +35,20 @@ export interface AdvanceFixOpts {
   pipelineRunId?: string;
 }
 
+/** Injectable seams for {@link advanceFix} — overridable in tests. */
+export interface AdvanceFixDeps {
+  /** Files changed between two SHAs (defaults to `git diff --name-only from to`). */
+  gitDiffFiles?: (wtPath: string, from: string, to: string) => Promise<string[]>;
+  /** Validate one OpenSpec change (defaults to `openspec.validateItem`). */
+  openspecValidateItem?: (wtPath: string, id: string) => Promise<ValidateResult>;
+}
+
 export async function advanceFix(
   cfg: PipelineConfig,
   issueNumber: number,
   round: 1 | 2,
   opts: AdvanceFixOpts = {},
+  deps: AdvanceFixDeps = {},
 ): Promise<Outcome> {
   const stage: Stage = round === 1 ? "fix-1" : "fix-2";
   const harness = cfg.harnesses.implementer;
@@ -126,6 +137,19 @@ export async function advanceFix(
     if (!commitCheck.ok) {
       await setBlocked(cfg, issueNumber, commitCheck.reason, stage);
       return { advanced: false, status: "blocked", reason: commitCheck.reason };
+    }
+  }
+
+  // ---- OpenSpec spec-delta validation (#106): if the harness revised any
+  //      spec delta files, validate the change before push/advance ----
+  if (headBefore && headAfter && headBefore !== headAfter) {
+    const specCheck = await enforceOpenspecSpecDeltaValidation(wt.path, headBefore, headAfter, {
+      gitDiffFiles: deps.gitDiffFiles ?? defaultGitDiffFiles,
+      openspecValidateItem: deps.openspecValidateItem ?? openspec.validateItem,
+    });
+    if (!specCheck.ok) {
+      await setBlocked(cfg, issueNumber, specCheck.reason, stage);
+      return { advanced: false, status: "blocked", reason: specCheck.reason };
     }
   }
 
@@ -228,4 +252,55 @@ export function extractReviewFindings(
         b.toUpperCase().includes("REQUEST CHANGES")),
   );
   return m?.body ?? "";
+}
+
+// ---------------------------------------------------------------------------
+// OpenSpec spec-delta validation — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+async function defaultGitDiffFiles(wtPath: string, from: string, to: string): Promise<string[]> {
+  const r = await gitInWorktree(wtPath, ["diff", "--name-only", from, to], { ignoreFailure: true });
+  return r.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * After a fix harness runs, check whether it revised any OpenSpec spec delta
+ * files (`openspec/changes/<id>/specs/**`). When it did, validate the change
+ * before push. A structural validation failure blocks the fix round so the LLM
+ * cannot silently commit a broken spec delta. Returns `{ ok: true }` when no
+ * spec files were touched or all touched changes pass validation. Exported for
+ * direct unit testing; called from `advanceFix` with injectable deps.
+ */
+export async function enforceOpenspecSpecDeltaValidation(
+  wtPath: string,
+  headBefore: string,
+  headAfter: string,
+  deps: {
+    gitDiffFiles: (wtPath: string, from: string, to: string) => Promise<string[]>;
+    openspecValidateItem: (wtPath: string, id: string) => Promise<ValidateResult>;
+  },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (headBefore === headAfter) return { ok: true };
+  const changed = await deps.gitDiffFiles(wtPath, headBefore, headAfter);
+  const specDeltaIds = new Set<string>();
+  for (const f of changed) {
+    const m = f.replace(/\\/g, "/").match(/^openspec\/changes\/([^/]+)\/specs\//);
+    if (m) specDeltaIds.add(m[1]);
+  }
+  if (specDeltaIds.size === 0) return { ok: true };
+  for (const id of specDeltaIds) {
+    const vr = await deps.openspecValidateItem(wtPath, id);
+    if (!vr.valid && !vr.unavailable) {
+      const detail =
+        vr.issues.map((i) => i.message).filter(Boolean).join("; ") ||
+        vr.raw.slice(0, 400);
+      return {
+        ok: false,
+        reason:
+          `OpenSpec change '${id}' spec delta is structurally invalid after fix-round revision: ` +
+          `${detail}. Resolve the validation error before advancing.`,
+      };
+    }
+  }
+  return { ok: true };
 }

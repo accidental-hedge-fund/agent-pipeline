@@ -75,8 +75,8 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   openspecIsActive?: typeof openspec.isActive;
   changeDirExists?: typeof openspec.changeDirExists;
   openspecArchive?: typeof openspec.archive;
-  /** Repo-relative paths changed by the branch's fix-round commits (guard input). */
-  branchFixDiffPaths?: (wtPath: string, baseBranch: string) => Promise<string[]>;
+  /** Per-commit paths for the branch's fix-round commits (guard input). */
+  branchFixCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
 }
 
 export async function advance(
@@ -405,8 +405,8 @@ export async function maybeArchiveOpenspec(
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
-  const branchFixDiffPathsFn =
-    deps.branchFixDiffPaths ?? ((wtPath, base) => computeFixDiffPaths(gitFn, wtPath, base));
+  const branchFixCommitsFn =
+    deps.branchFixCommits ?? ((wtPath, base) => computeFixCommits(gitFn, wtPath, base));
 
   const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt || !isActiveFn(cfg, wt.path)) return null;
@@ -429,7 +429,7 @@ export async function maybeArchiveOpenspec(
   // fold a stale delta into the living specs (silent corruption) and re-review
   // would keep re-anchoring on the wrong delta. Block and surface it instead.
   const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
-    branchFixDiffPaths: branchFixDiffPathsFn,
+    branchFixCommits: branchFixCommitsFn,
     getIssueDetail: getIssueDetailFn,
     setBlocked: setBlockedFn,
   });
@@ -479,9 +479,19 @@ export async function maybeArchiveOpenspec(
 // OpenSpec spec/code consistency guard (#106)
 // ---------------------------------------------------------------------------
 
+/**
+ * One fix-round commit with the repo-relative paths it changed.
+ * Ordered: index 0 is the earliest commit in the fix range, last is HEAD.
+ * Exported for tests.
+ */
+export interface FixCommit {
+  sha: string;
+  paths: string[];
+}
+
 /** Deps for {@link enforceSpecConsistencyGuard} — injectable fakes in tests. */
 export interface SpecConsistencyDeps {
-  branchFixDiffPaths: (wtPath: string, baseBranch: string) => Promise<string[]>;
+  branchFixCommits: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
   getIssueDetail: typeof getIssueDetail;
   setBlocked: typeof setBlocked;
 }
@@ -491,7 +501,9 @@ export interface SpecConsistencyDeps {
  * a blocked Outcome (and labels the issue) when a change's spec delta is stale
  * relative to the implementation, or null to proceed. "Stale" requires all of:
  *   1. fix-round commits changed implementation files,
- *   2. the change's `specs/**` were NOT among those changes, and
+ *   2. the change's `specs/**` were NOT updated AFTER the last implementation
+ *      change (order-aware: an earlier spec edit does not protect against a
+ *      later code-only fix), and
  *   3. the most recent review verdict flagged a code/spec divergence.
  * Missing any one → proceed (conservative-open: avoid false positives on fix
  * rounds that correctly left a still-accurate spec unchanged). Exported for tests.
@@ -503,12 +515,12 @@ export async function enforceSpecConsistencyGuard(
   changeIds: string[],
   deps: SpecConsistencyDeps,
 ): Promise<Outcome | null> {
-  const fixDiffPaths = await deps.branchFixDiffPaths(wtPath, cfg.base_branch);
+  const fixCommits = await deps.branchFixCommits(wtPath, cfg.base_branch);
   // No fix-round commits → the implementation never moved after planning, so a
   // fix cannot have drifted the delta. Nothing to guard.
-  if (fixDiffPaths.length === 0) return null;
+  if (fixCommits.length === 0) return null;
 
-  const stale = changeIds.find((id) => specDeltaIsStale(id, fixDiffPaths));
+  const stale = changeIds.find((id) => specDeltaIsStale(id, fixCommits));
   if (!stale) return null;
 
   // The structural signal (code changed, spec didn't) only matters if the
@@ -530,52 +542,70 @@ export async function enforceSpecConsistencyGuard(
 const FIX_COMMIT_RE = /^fix:\s+address review \d+ findings/i;
 
 /**
- * Repo-relative paths changed by the branch's fix-round commits — the diff from
- * the parent of the FIRST `fix: address review N findings` commit through HEAD.
- * The full branch diff cannot be used: planning authors the spec deltas on the
- * same branch, so `specs/**` would always appear "changed" and the guard could
- * never detect a fix that left them behind. Returns [] when the branch has no
- * fix commit (no fix round ran).
+ * Per-commit paths for the branch's fix-round commits, in chronological order
+ * (oldest first). Starts at the FIRST `fix: address review N findings` commit
+ * and includes all subsequent commits through HEAD. Per-commit rather than a
+ * collapsed range so the stale guard can compare the order of the last
+ * implementation-changing commit against the last spec-delta-changing commit.
+ * Returns [] when the branch has no fix commit (no fix round ran).
  */
-async function computeFixDiffPaths(
+async function computeFixCommits(
   gitFn: typeof gitInWorktree,
   wtPath: string,
   baseBranch: string,
-): Promise<string[]> {
+): Promise<FixCommit[]> {
   const log = await gitFn(
     wtPath,
     ["log", "--reverse", "--format=%H%x1f%s", `origin/${baseBranch}..HEAD`],
     { ignoreFailure: true },
   );
+  const allCommits: { sha: string; subj: string }[] = [];
   let firstFixSha: string | null = null;
   for (const line of log.stdout.split("\n")) {
     const sep = line.indexOf("\x1f");
     if (sep === -1) continue;
     const sha = line.slice(0, sep).trim();
-    if (sha && FIX_COMMIT_RE.test(line.slice(sep + 1).trim())) {
-      firstFixSha = sha;
-      break;
-    }
+    if (!sha) continue;
+    const subj = line.slice(sep + 1).trim();
+    allCommits.push({ sha, subj });
+    if (!firstFixSha && FIX_COMMIT_RE.test(subj)) firstFixSha = sha;
   }
   if (!firstFixSha) return [];
-  const diff = await gitFn(wtPath, ["diff", "--name-only", `${firstFixSha}^`, "HEAD"], {
-    ignoreFailure: true,
-  });
-  return diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  const firstFixIdx = allCommits.findIndex((c) => c.sha === firstFixSha);
+  if (firstFixIdx === -1) return [];
+
+  const result: FixCommit[] = [];
+  for (const { sha } of allCommits.slice(firstFixIdx)) {
+    const diff = await gitFn(wtPath, ["diff", "--name-only", `${sha}^`, sha], {
+      ignoreFailure: true,
+    });
+    const paths = diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+    result.push({ sha, paths });
+  }
+  return result;
 }
 
 /**
  * Structural half of the guard: did fix rounds change implementation files
- * (anything outside `openspec/`) while leaving change `id`'s spec deltas
- * untouched? Pure; exported for tests.
+ * (anything outside `openspec/`) in a commit that came AFTER the last spec-delta
+ * update? Order-aware: an early spec edit in fix-1 does not protect against a
+ * later fix-2 commit that moved the code without touching the spec. Pure; exported
+ * for tests.
  */
-export function specDeltaIsStale(id: string, fixDiffPaths: string[]): boolean {
-  const paths = fixDiffPaths.map((p) => p.replace(/\\/g, "/").trim()).filter(Boolean);
-  if (paths.length === 0) return false;
+export function specDeltaIsStale(id: string, commits: FixCommit[]): boolean {
+  if (commits.length === 0) return false;
   const specPrefix = `openspec/changes/${id}/specs/`;
-  const specUpdated = paths.some((p) => p.startsWith(specPrefix));
-  const touchedImpl = paths.some((p) => !p.startsWith("openspec/"));
-  return touchedImpl && !specUpdated;
+  let lastSpecIdx = -1;
+  let lastImplIdx = -1;
+  for (let i = 0; i < commits.length; i++) {
+    const paths = commits[i].paths.map((p) => p.replace(/\\/g, "/").trim()).filter(Boolean);
+    if (paths.some((p) => p.startsWith(specPrefix))) lastSpecIdx = i;
+    if (paths.some((p) => !p.startsWith("openspec/"))) lastImplIdx = i;
+  }
+  // Stale when impl was changed AND the last impl commit is more recent (higher
+  // index) than the last spec commit. lastSpecIdx === -1 means spec was never
+  // updated in the fix range, so any impl change is stale.
+  return lastImplIdx !== -1 && lastImplIdx > lastSpecIdx;
 }
 
 /**
