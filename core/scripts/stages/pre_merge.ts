@@ -11,6 +11,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  findLatestCommentMatching,
   getIssueDetail,
   getPrChecks,
   getPrCommits,
@@ -67,6 +68,15 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   tryRebaseAndPush?: typeof tryRebaseAndPush;
   rebaseAlreadyAttempted?: typeof rebaseAlreadyAttempted;
   markRebaseAttempted?: typeof markRebaseAttempted;
+  // Seams for the OpenSpec archive step + its consistency guard (#106), so
+  // maybeArchiveOpenspec is testable without a real worktree, git, openspec
+  // CLI, or GitHub.
+  gitInWorktree?: typeof gitInWorktree;
+  openspecIsActive?: typeof openspec.isActive;
+  changeDirExists?: typeof openspec.changeDirExists;
+  openspecArchive?: typeof openspec.archive;
+  /** Repo-relative paths changed by the branch's fix-round commits (guard input). */
+  branchFixDiffPaths?: (wtPath: string, baseBranch: string) => Promise<string[]>;
 }
 
 export async function advance(
@@ -111,7 +121,7 @@ export async function advance(
   if (shaGate) return shaGate;
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, getForIssueFn);
+  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, deps);
   if (archiveOutcome) return archiveOutcome;
 
   // ---- Step 0.5: early conflict detection (#95) ----
@@ -378,31 +388,56 @@ export function staleReviewNotice(reviewedSha: string | null, headSha: string): 
  * their spec deltas fold into the living `openspec/specs/`. Idempotent: a change
  * already archived is no longer an active dir, so it drops out of the candidate
  * set. Returns a `waiting` Outcome after pushing (CI must re-run), a `blocked`
- * Outcome on failure, or null when there is nothing to do (continue the gate).
+ * Outcome on failure or a stale-delta divergence (#106), or null when there is
+ * nothing to do (continue the gate). Exported for tests; all I/O is injectable
+ * via {@link AdvancePreMergeDeps}.
  */
-async function maybeArchiveOpenspec(
+export async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
   issueNumber: number,
   pipelineRunId: string,
-  getForIssueFn: typeof getForIssue = getForIssue,
+  deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome | null> {
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
+  const gitFn = deps.gitInWorktree ?? gitInWorktree;
+  const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
+  const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
+  const archiveFn = deps.openspecArchive ?? openspec.archive;
+  const branchFixDiffPathsFn =
+    deps.branchFixDiffPaths ?? ((wtPath, base) => computeFixDiffPaths(gitFn, wtPath, base));
+
   const wt = await getForIssueFn(cfg, issueNumber);
-  if (!wt || !openspec.isActive(cfg, wt.path)) return null;
+  if (!wt || !isActiveFn(cfg, wt.path)) return null;
 
   // Changes this PR branch introduced, still active (not yet archived).
-  const diff = await gitInWorktree(
+  const diff = await gitFn(
     wt.path,
     ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
     { ignoreFailure: true },
   );
   const candidates = openspec
     .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
-    .filter((id) => openspec.changeDirExists(wt.path, id));
+    .filter((id) => changeDirExistsFn(wt.path, id));
   if (candidates.length === 0) return null; // already archived, or none
+
+  // ---- Consistency guard (#106): never archive a delta the code outgrew ----
+  // OpenSpec deltas are authored at planning time and frozen; fix rounds only
+  // edit code. If a material fix moved the implementation but left the change's
+  // specs/** untouched AND the reviewer flagged the divergence, archiving would
+  // fold a stale delta into the living specs (silent corruption) and re-review
+  // would keep re-anchoring on the wrong delta. Block and surface it instead.
+  const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
+    branchFixDiffPaths: branchFixDiffPathsFn,
+    getIssueDetail: getIssueDetailFn,
+    setBlocked: setBlockedFn,
+  });
+  if (guard) return guard;
 
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
-    const res = await openspec.archive(wt.path, id);
+    const res = await archiveFn(wt.path, id);
     if (res.unavailable) {
       console.log(
         `[pipeline] #${issueNumber}: openspec CLI unavailable; skipping archive (non-blocking)`,
@@ -410,25 +445,25 @@ async function maybeArchiveOpenspec(
       return null;
     }
     if (!res.success) {
-      await setBlocked(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge");
+      await setBlockedFn(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge");
       return { advanced: false, status: "blocked", reason: `openspec archive failed (${id})` };
     }
   }
 
   // Commit + push the archived specs so CI validates the finalized state.
-  await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
-  const status = await gitInWorktree(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
+  const status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
-  await gitInWorktree(
+  await gitFn(
     wt.path,
     ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
     { ignoreFailure: true },
   );
-  const push = await gitInWorktree(wt.path, ["push", "origin", branchName(issueNumber, wt.slug)], {
+  const push = await gitFn(wt.path, ["push", "origin", branchName(issueNumber, wt.slug)], {
     ignoreFailure: true,
   });
   if (push.code !== 0) {
-    await setBlocked(
+    await setBlockedFn(
       cfg,
       issueNumber,
       `Git push failed after OpenSpec archive: ${push.stderr.trim()}`,
@@ -438,6 +473,152 @@ async function maybeArchiveOpenspec(
   }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
   return { advanced: false, status: "waiting", reason: "openspec change archived; CI re-running" };
+}
+
+// ---------------------------------------------------------------------------
+// OpenSpec spec/code consistency guard (#106)
+// ---------------------------------------------------------------------------
+
+/** Deps for {@link enforceSpecConsistencyGuard} — injectable fakes in tests. */
+export interface SpecConsistencyDeps {
+  branchFixDiffPaths: (wtPath: string, baseBranch: string) => Promise<string[]>;
+  getIssueDetail: typeof getIssueDetail;
+  setBlocked: typeof setBlocked;
+}
+
+/**
+ * Pre-archive backstop for "fix rounds don't revise the change" (#106). Returns
+ * a blocked Outcome (and labels the issue) when a change's spec delta is stale
+ * relative to the implementation, or null to proceed. "Stale" requires all of:
+ *   1. fix-round commits changed implementation files,
+ *   2. the change's `specs/**` were NOT among those changes, and
+ *   3. the most recent review verdict flagged a code/spec divergence.
+ * Missing any one → proceed (conservative-open: avoid false positives on fix
+ * rounds that correctly left a still-accurate spec unchanged). Exported for tests.
+ */
+export async function enforceSpecConsistencyGuard(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  wtPath: string,
+  changeIds: string[],
+  deps: SpecConsistencyDeps,
+): Promise<Outcome | null> {
+  const fixDiffPaths = await deps.branchFixDiffPaths(wtPath, cfg.base_branch);
+  // No fix-round commits → the implementation never moved after planning, so a
+  // fix cannot have drifted the delta. Nothing to guard.
+  if (fixDiffPaths.length === 0) return null;
+
+  const stale = changeIds.find((id) => specDeltaIsStale(id, fixDiffPaths));
+  if (!stale) return null;
+
+  // The structural signal (code changed, spec didn't) only matters if the
+  // reviewer actually saw a divergence — otherwise the spec is presumed
+  // consistent (the reviewer reviewed against it and did not object), and the
+  // frozen delta is helping (case A: code drifted from a correct spec).
+  const detail = await deps.getIssueDetail(cfg, issueNumber);
+  const reviewBody = latestReviewBody(detail.comments);
+  if (!reviewBody || !reviewFlagsSpecDivergence(reviewBody)) return null;
+
+  await deps.setBlocked(cfg, issueNumber, staleSpecDeltaBlockReason(stale), "pre-merge");
+  return { advanced: false, status: "blocked", reason: `stale OpenSpec delta (${stale})` };
+}
+
+const FIX_COMMIT_RE = /^fix:\s+address review \d+ findings/i;
+
+/**
+ * Repo-relative paths changed by the branch's fix-round commits — the diff from
+ * the parent of the FIRST `fix: address review N findings` commit through HEAD.
+ * The full branch diff cannot be used: planning authors the spec deltas on the
+ * same branch, so `specs/**` would always appear "changed" and the guard could
+ * never detect a fix that left them behind. Returns [] when the branch has no
+ * fix commit (no fix round ran).
+ */
+async function computeFixDiffPaths(
+  gitFn: typeof gitInWorktree,
+  wtPath: string,
+  baseBranch: string,
+): Promise<string[]> {
+  const log = await gitFn(
+    wtPath,
+    ["log", "--reverse", "--format=%H%x1f%s", `origin/${baseBranch}..HEAD`],
+    { ignoreFailure: true },
+  );
+  let firstFixSha: string | null = null;
+  for (const line of log.stdout.split("\n")) {
+    const sep = line.indexOf("\x1f");
+    if (sep === -1) continue;
+    const sha = line.slice(0, sep).trim();
+    if (sha && FIX_COMMIT_RE.test(line.slice(sep + 1).trim())) {
+      firstFixSha = sha;
+      break;
+    }
+  }
+  if (!firstFixSha) return [];
+  const diff = await gitFn(wtPath, ["diff", "--name-only", `${firstFixSha}^`, "HEAD"], {
+    ignoreFailure: true,
+  });
+  return diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Structural half of the guard: did fix rounds change implementation files
+ * (anything outside `openspec/`) while leaving change `id`'s spec deltas
+ * untouched? Pure; exported for tests.
+ */
+export function specDeltaIsStale(id: string, fixDiffPaths: string[]): boolean {
+  const paths = fixDiffPaths.map((p) => p.replace(/\\/g, "/").trim()).filter(Boolean);
+  if (paths.length === 0) return false;
+  const specPrefix = `openspec/changes/${id}/specs/`;
+  const specUpdated = paths.some((p) => p.startsWith(specPrefix));
+  const touchedImpl = paths.some((p) => !p.startsWith("openspec/"));
+  return touchedImpl && !specUpdated;
+}
+
+/**
+ * Verdict half of the guard: does a review verdict body flag a divergence
+ * between the implementation and the spec delta? Requires both a spec/requirement
+ * reference AND a divergence cue, so an incidental "spec" mention does not trip
+ * it. Pure; exported for tests.
+ */
+export function reviewFlagsSpecDivergence(reviewBody: string): boolean {
+  const t = reviewBody.toLowerCase();
+  const mentionsSpec = /\b(?:open)?spec(?:s|ification)?\b/.test(t) || t.includes("requirement");
+  if (!mentionsSpec) return false;
+  return (
+    /\bdiverg(?:e|es|ed|ing|ence)\b/.test(t) ||
+    /\binconsisten(?:t|cy)\b/.test(t) ||
+    /\b(?:does not|doesn't|did not|didn't|no longer)\s+(?:match|matches|reflect|reflects|describe|describes|capture|captures|align|aligns)\b/.test(t) ||
+    /\bout of (?:sync|date)\b/.test(t) ||
+    /\b(?:stale|outdated)\b/.test(t) ||
+    /\bcontradicts?\b/.test(t) ||
+    /\bmismatch(?:es|ed)?\b/.test(t)
+  );
+}
+
+/** Latest review verdict comment body (round 1 or 2), or null when none exists. */
+function latestReviewBody(
+  comments: { author: string; body: string; createdAt: string }[],
+): string | null {
+  const m = findLatestCommentMatching(
+    comments,
+    (b) => b.startsWith("## Review 1") || b.startsWith("## Review 2"),
+  );
+  return m?.body ?? null;
+}
+
+/** Operator-facing block reason naming the stale-delta condition and the fix. */
+function staleSpecDeltaBlockReason(id: string): string {
+  return [
+    `OpenSpec change \`${id}\` has a stale spec delta: fix rounds changed implementation files but did`,
+    `not update the change's \`specs/**\`, and the most recent review verdict flagged a divergence between`,
+    `the code and the spec. Archiving now would fold a delta into the living \`openspec/specs/\` that does`,
+    `not describe the merged implementation.`,
+    ``,
+    `To resolve, update \`openspec/changes/${id}/specs/**\` (and \`tasks.md\`) so the spec matches the`,
+    `implemented behavior, then re-run \`openspec validate ${id}\` and push. Any commit that brings the`,
+    `spec delta into agreement clears this guard. If the reviewer's divergence finding is a false positive,`,
+    `the correct resolution is still to update the delta so the living spec states the actual behavior.`,
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------

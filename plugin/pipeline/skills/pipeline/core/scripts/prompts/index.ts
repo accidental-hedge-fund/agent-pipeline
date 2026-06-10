@@ -270,6 +270,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     review_findings: a.reviewFindings,
     pipeline_run_id: a.pipelineRunId,
     spec_context: specContextSection(a.specContext),
+    spec_revision_instruction: fixSpecRevisionInstruction(a.specContext),
   });
 }
 
@@ -318,9 +319,32 @@ function specContextSection(specContext?: string): string {
   if (!specContext || !specContext.trim()) return "";
   return (
     "\n## OpenSpec — Intended Behavior (spec deltas)\n\n" +
-    "This work must satisfy these requirement changes.\n\n" +
+    "This work must stay consistent with these requirement changes.\n\n" +
     specContext.trim() +
     "\n"
+  );
+}
+
+/**
+ * Fix-round-only instruction (#106): when OpenSpec spec deltas are present, the
+ * fix harness is permitted — and instructed — to revise the active change's
+ * `specs/**` deltas if a finding's fix changes behavior they describe, so the
+ * frozen-at-planning delta cannot drift out of sync with the implementation.
+ * Empty (and the prompt unchanged) when no spec context is present, so the
+ * non-OpenSpec fix path is identical. Self-delimiting (leading + trailing
+ * newline) so it renders cleanly when placed adjacent to {@link specContextSection}.
+ */
+function fixSpecRevisionInstruction(specContext?: string): string {
+  if (!specContext || !specContext.trim()) return "";
+  return (
+    "\n### OpenSpec — keep the spec delta consistent with your fix\n\n" +
+    "If addressing a finding changes behavior described by the spec deltas above, update the active " +
+    "OpenSpec change's `specs/**` files (and `tasks.md`) so the spec matches the new behavior, then run " +
+    "`openspec validate <id>` (the change you are working on) and include the updated spec files in the " +
+    "**same** fix commit. This is the one exception to \"Do NOT change anything unrelated\" below: spec-delta " +
+    "files your fix makes inaccurate SHALL be brought back into agreement. Do not otherwise rewrite the " +
+    "spec — change only what your behavioral fix requires, and if no finding changes described behavior, " +
+    "leave the spec deltas untouched.\n"
   );
 }
 

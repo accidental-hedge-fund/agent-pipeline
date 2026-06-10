@@ -5,7 +5,7 @@ This is fix round {{fix_round}} — addressing findings from the {{review_type}}
 ## Review Findings
 
 {{review_findings}}
-{{spec_context}}
+{{spec_context}}{{spec_revision_instruction}}
 ## Instructions
 
 1. Address EACH finding listed above. For each:
