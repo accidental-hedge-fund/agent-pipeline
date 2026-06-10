@@ -76,12 +76,8 @@ build step). First-ever invocation runs `npm install` automatically.
 Required:
 - `gh` CLI authenticated against the target repo
 - `claude` CLI on PATH — the primary harness (planning, implementation, fixes)
-- `codex` CLI on PATH and authenticated — the reviewer harness
-- *(Optional)* the **codex-plugin-cc companion** (`codex-companion.mjs`) — only needed if you
-  set `reviewMode: codex-companion`. The default `prompt-harness` mode reviews by invoking the
-  `codex` CLI directly with a JSON-returning prompt, so **no review plugin is required**. To opt
-  in: `/plugin marketplace add openai/codex-plugin-cc` then `/plugin install codex@openai-codex`
-  (override its path with `PIPELINE_CODEX_COMPANION`).
+- `codex` CLI on PATH and authenticated — the reviewer harness (`prompt-harness` mode
+  invokes it directly with a JSON-returning prompt, so **no review plugin is required**)
 - Node 24+
 - The user's Claude Code subscription provides the LLM budget — this skill
   never reads `ANTHROPIC_API_KEY`
@@ -94,16 +90,12 @@ A repo can opt-in to overrides by committing `.github/pipeline.yml`:
 base_branch: main                # default 'main'
 worktree_root: .worktrees        # relative to repo root
 max_concurrent_worktrees: 5
-auto_merge: false                # always false in v2; do not enable
 auto_recovery_max_retries: 2
 implementation_timeout: 1200     # seconds
 review_timeout: 1200
 fix_timeout: 1200
 ci_timeout: 900
 ci_poll_interval: 30
-harnesses:
-  implementer: claude            # legacy key accepted but ignored
-  reviewer: codex                # legacy key accepted but ignored
 models:
   planning: sonnet
   review: opus
@@ -113,7 +105,7 @@ domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
 
-If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation (documentation updates included, when `steps.docs` is on), and fixes; Codex is always secondary for review/adversarial review. Legacy `.github/pipeline.yml` `harnesses` keys are accepted for compatibility but ignored so repo config cannot invert a Claude-invoked pipeline run.
+If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation (documentation updates included, when `steps.docs` is on), and fixes; Codex is always secondary for review/adversarial review. Harness roles come from the install profile — a `harnesses:` key in `.github/pipeline.yml` is rejected at config-parse time, so repo config cannot invert a Claude-invoked pipeline run.
 
 ## Run flow
 
@@ -231,7 +223,7 @@ Examples that DO push:
 - `[pipeline] #N: implementation done (Xs, harness=Y)`
 - `[pipeline] #N: PR #M created`
 - `[pipeline] #N: ready → review-1: PR #M opened`
-- `[pipeline] #N: review-1 by /codex:review`
+- `[pipeline] #N: review-1 by codex`
 - `[pipeline] #N: verdict=approve findings=0`
 - `[pipeline] #N: review-1 → review-2: standard review approved`
 - … and so on, all the way through `→ ready-to-deploy`
@@ -319,7 +311,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs (cfg.auto_merge is honored as `false` only).
+- Auto-merge PRs — there is no merge stage, no merge command, and no `auto_merge` config key.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.
@@ -333,8 +325,8 @@ When the loop ends, the skill prints:
 - `core/scripts/gh.ts` — typed wrappers for the `gh` CLI
 - `core/scripts/worktree.ts` — `pipeline-{N}-{slug}` worktree lifecycle
 - `core/scripts/harness.ts` — `invoke("claude" | "codex", cwd, prompt)` (planning/impl/fix)
-- `core/scripts/stages/review.ts` — review-1/review-2 drive Codex via the codex-plugin-cc
-  companion (`/codex:review` / `/codex:adversarial-review`)
+- `core/scripts/stages/review.ts` — review-1/review-2 invoke the `codex` CLI directly
+  with the pipeline's JSON-returning review prompt
 - `core/scripts/lock.ts` — PID-based lock at `/tmp/pipeline-{domain}.lock`
 - `core/scripts/stages/*.ts` — one file per stage (planning, review, fix, pre_merge, eval, deploy_ready, auto_recover)
 - `core/scripts/prompts/*.md` — prompt templates with `{{placeholders}}`

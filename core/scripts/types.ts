@@ -28,7 +28,7 @@ export type OpenspecMode = "auto" | "on" | "off";
 export interface PipelineConfig {
   profile_name: string;
   invocation: string;
-  review_mode: "claude-companion" | "codex-companion" | "prompt-harness";
+  review_mode: "prompt-harness";
   marker_footer: string;
   implementation_ready_message: string;
   conventions_default: string;
@@ -38,7 +38,6 @@ export interface PipelineConfig {
   base_branch: string;
   worktree_root: string;   // relative to repo_dir, default ".worktrees"
   max_concurrent_worktrees: number;
-  auto_merge: boolean;
   auto_recovery_max_retries: number;
   // Timeouts (seconds)
   implementation_timeout: number;
@@ -46,7 +45,8 @@ export interface PipelineConfig {
   fix_timeout: number;
   ci_timeout: number;
   ci_poll_interval: number;
-  // Harnesses + models
+  // Harness roles (always taken from the active profile — repo config cannot
+  // set them) + models
   harnesses: { implementer: Harness; reviewer: Harness };
   models: { planning: string; review: string; fix: string };
   // OpenSpec (spec-driven development) integration. "auto" activates only when
@@ -105,18 +105,30 @@ export interface PipelineConfig {
   domain_description?: string;
 }
 
-export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"> = {
+// Keys resolved from the active profile at config time, never from defaults
+// or `.github/pipeline.yml`.
+type ProfileSourcedKeys =
+  | "profile_name"
+  | "invocation"
+  | "review_mode"
+  | "marker_footer"
+  | "implementation_ready_message"
+  | "conventions_default"
+  | "harnesses";
+
+export const DEFAULT_CONFIG: Omit<
+  PipelineConfig,
+  "domain" | "repo" | "repo_dir" | ProfileSourcedKeys
+> = {
   base_branch: "main",
   worktree_root: ".worktrees",
   max_concurrent_worktrees: 5,
-  auto_merge: false,
   auto_recovery_max_retries: 2,
   implementation_timeout: 2400,
   review_timeout: 1500,
   fix_timeout: 2400,
   ci_timeout: 900,
   ci_poll_interval: 30,
-  harnesses: { implementer: "codex", reviewer: "claude" },
   models: { planning: "sonnet", review: "opus", fix: "sonnet" },
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },

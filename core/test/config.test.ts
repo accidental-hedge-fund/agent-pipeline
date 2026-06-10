@@ -51,7 +51,6 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.equal(cfg.auto_merge, false);
     assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude" });
     assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
@@ -59,13 +58,9 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
   }
 });
 
-test("resolveConfig: merges file overrides over defaults but keeps Codex/Claude harness split", async () => {
+test("resolveConfig: merges file overrides over defaults; harness roles come from the profile", async () => {
   const repo = makeFakeRepo(`base_branch: staging
 max_concurrent_worktrees: 7
-auto_merge: false
-harnesses:
-  implementer: claude
-  reviewer: codex
 models:
   planning: sonnet
   review: opus
@@ -82,6 +77,42 @@ models:
     assert.equal(cfg.max_concurrent_worktrees, 7);
     assert.equal(cfg.harnesses.implementer, "codex");
     assert.equal(cfg.harnesses.reviewer, "claude");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---- dead-surface keys removed in #93: strict schema rejects them outright ----
+
+test("resolveConfig: a harnesses block is rejected with an error naming the key", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementer: claude\n  reviewer: codex\n`);
+  const binDir = makeFakeGh("acme/dead1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harnesses"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: auto_merge is rejected with an error naming the key", async () => {
+  const repo = makeFakeRepo(`auto_merge: true\n`);
+  const binDir = makeFakeGh("acme/dead2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("auto_merge"),
+    );
   } finally {
     process.env.PATH = oldPath;
   }

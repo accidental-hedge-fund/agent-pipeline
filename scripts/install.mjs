@@ -17,7 +17,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -139,38 +138,7 @@ function which(bin) {
   return r.status === 0;
 }
 
-// The Codex ($pipeline) profile reviews by driving Claude Code through the
-// cc-plugin-codex companion (claude-companion.mjs). It is a SEPARATE plugin,
-// not shipped here. Detect it so a Codex install surfaces the dependency.
-function companionPresent() {
-  if (process.env.PIPELINE_CC_COMPANION) return existsSync(process.env.PIPELINE_CC_COMPANION);
-  const codexHome = process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(HOME, ".codex");
-  return [
-    join(codexHome, "plugins", "cache", "local-plugins", "cc", "local", "scripts", "claude-companion.mjs"),
-    join(codexHome, "plugins", "cc", "scripts", "claude-companion.mjs"),
-  ].some((p) => existsSync(p));
-}
-
-// The Claude (/pipeline) profile reviews by driving Codex through the
-// codex-plugin-cc companion (codex-companion.mjs). It is a SEPARATE Claude Code
-// plugin, not shipped here. Detect it so a Claude install surfaces the dependency.
-function codexCompanionPresent() {
-  if (process.env.PIPELINE_CODEX_COMPANION) return existsSync(process.env.PIPELINE_CODEX_COMPANION);
-  const claudeDir = process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(HOME, ".claude");
-  const candidates = [
-    join(claudeDir, "plugins", "marketplaces", "openai-codex", "plugins", "codex", "scripts", "codex-companion.mjs"),
-  ];
-  // Versioned install cache: plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs
-  const cacheBase = join(claudeDir, "plugins", "cache", "openai-codex", "codex");
-  if (existsSync(cacheBase)) {
-    for (const version of readdirSync(cacheBase)) {
-      candidates.push(join(cacheBase, version, "scripts", "codex-companion.mjs"));
-    }
-  }
-  return candidates.some((p) => existsSync(p));
-}
-
-function preflight(hosts) {
+function preflight() {
   log("\nPrerequisite check (warnings do not block install; the skill needs these at run time):");
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
   if (nodeMajor >= 24) log(`  ✓ node ${process.versions.node} (>= 24)`);
@@ -188,17 +156,6 @@ function preflight(hosts) {
   // `openspec.enabled` in .github/pipeline.yml) need the CLI. Info, not a warning.
   if (which("openspec")) log("  ✓ openspec (optional) — for OpenSpec-enabled repos");
   else log("  ℹ openspec not found (optional) — only for OpenSpec-enabled repos; install: npm i -g @fission-ai/openspec");
-  // Review companions are OPTIONAL — only the legacy `*-companion` reviewMode uses
-  // them. The default `prompt-harness` mode reviews via the reviewer CLI directly,
-  // so no plugin is required. Info, not a warning.
-  if (hosts.includes("codex")) {
-    if (companionPresent()) log("  ✓ cc companion (claude-companion.mjs) — optional, for reviewMode: claude-companion");
-    else log("  ℹ cc-plugin-codex companion not found (optional) — only needed if you set reviewMode: claude-companion");
-  }
-  if (hosts.includes("claude")) {
-    if (codexCompanionPresent()) log("  ✓ codex companion (codex-companion.mjs) — optional, for reviewMode: codex-companion");
-    else log("  ℹ codex-plugin-cc companion not found (optional) — only needed if you set reviewMode: codex-companion");
-  }
   log("");
 }
 
@@ -400,20 +357,6 @@ function uninstallHost(host, dryRun) {
 // Confirmed install commands — re-verify against upstream READMEs on each
 // installer release:
 //
-//   cc-plugin-codex (sendbird/cc-plugin-codex) — Codex host companion:
-//     Install:  npx --yes cc-plugin-codex install
-//     Update:   npx --yes cc-plugin-codex update
-//     Detect:   companionPresent() — claude-companion.mjs in ~/.codex/plugins
-//     Host:     codex (the $pipeline flow drives Claude Code through this companion)
-//     Note:     Optional — only needed for reviewMode: claude-companion
-//
-//   codex-plugin-cc (openai/codex-plugin-cc) — Claude host companion:
-//     Install:  npx --yes codex-plugin-cc install
-//     Update:   npx --yes codex-plugin-cc install (re-install is idempotent)
-//     Detect:   codexCompanionPresent() — codex-companion.mjs in ~/.claude/plugins
-//     Host:     claude (the /pipeline flow drives Codex through this companion)
-//     Note:     Optional — only needed for reviewMode: codex-companion
-//
 //   openspec (@fission-ai/openspec) — OpenSpec CLI:
 //     Install:  npm install -g @fission-ai/openspec@latest
 //     Update:   npm install -g @fission-ai/openspec@latest (idempotent)
@@ -427,25 +370,6 @@ function uninstallHost(host, dryRun) {
 //     Gate:     last30days.enabled: true in .github/pipeline.yml
 
 const DEPS = {
-  "cc-plugin-codex": {
-    label: "cc-plugin-codex",
-    description: "Claude Code companion for Codex cross-review (optional — for reviewMode: claude-companion)",
-    hosts: ["codex"],
-    featureGate: null,
-    installCmd: ["npx", "--yes", "cc-plugin-codex", "install"],
-    updateCmd: ["npx", "--yes", "cc-plugin-codex", "update"],
-    manualInstall: "npx cc-plugin-codex install",
-  },
-  "codex-plugin-cc": {
-    label: "codex-plugin-cc",
-    description: "Codex companion for Claude Code cross-review (optional — for reviewMode: codex-companion)",
-    hosts: ["claude"],
-    featureGate: null,
-    // Installed via Claude Code plugin marketplace — cannot be automated from a shell installer.
-    installCmd: null,
-    updateCmd: null,
-    manualInstall: "In Claude Code: /plugin marketplace add openai/codex-plugin-cc  →  /plugin install codex@openai-codex",
-  },
   openspec: {
     label: "openspec CLI (@fission-ai/openspec)",
     description: "OpenSpec planning CLI — required for openspec-enabled repos",
@@ -465,56 +389,6 @@ const DEPS = {
     manualInstall: "npx skills add mvanhorn/last30days-skill -g",
   },
 };
-
-// Returns { present, version } for cc-plugin-codex.
-function companionPresentWithVersion() {
-  if (process.env.PIPELINE_CC_COMPANION) {
-    const present = existsSync(process.env.PIPELINE_CC_COMPANION);
-    return { present, version: null };
-  }
-  if (!companionPresent()) return { present: false, version: null };
-  const codexHome = process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(HOME, ".codex");
-  // Try to read version from the cached package.json
-  const candidates = [
-    join(codexHome, "plugins", "cache", "local-plugins", "cc", "local", "package.json"),
-    join(codexHome, "plugins", "cc", "package.json"),
-  ];
-  for (const pkgPath of candidates) {
-    if (existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-        if (pkg.version) return { present: true, version: pkg.version };
-      } catch {}
-    }
-  }
-  return { present: true, version: null };
-}
-
-// Returns { present, version } for codex-plugin-cc.
-function codexCompanionPresentWithVersion() {
-  if (process.env.PIPELINE_CODEX_COMPANION) {
-    const present = existsSync(process.env.PIPELINE_CODEX_COMPANION);
-    return { present, version: null };
-  }
-  if (!codexCompanionPresent()) return { present: false, version: null };
-  const claudeDir = process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(HOME, ".claude");
-  // Versioned cache: plugins/cache/openai-codex/codex/<version>/package.json
-  const cacheBase = join(claudeDir, "plugins", "cache", "openai-codex", "codex");
-  if (existsSync(cacheBase)) {
-    const versions = readdirSync(cacheBase).sort();
-    for (const v of versions.reverse()) {
-      const pkgPath = join(cacheBase, v, "package.json");
-      if (existsSync(pkgPath)) {
-        try {
-          const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-          return { present: true, version: pkg.version || v };
-        } catch {}
-      }
-    }
-    if (versions.length > 0) return { present: true, version: versions[0] };
-  }
-  return { present: true, version: null };
-}
 
 // Returns version string (or "unknown") if openspec is installed, null if not.
 function openspecPresent() {
@@ -566,8 +440,6 @@ function last30daysPresent() {
 // Returns { present, version } for a dependency key.
 function detectDep(key) {
   switch (key) {
-    case "cc-plugin-codex": return companionPresentWithVersion();
-    case "codex-plugin-cc": return codexCompanionPresentWithVersion();
     case "openspec": { const v = openspecPresent(); return { present: v !== null, version: v }; }
     case "last30days": { const v = last30daysPresent(); return { present: v !== null, version: v }; }
     default: return { present: false, version: null };
@@ -587,8 +459,6 @@ function fetchLatestVersion(key) {
   }
   // GitHub releases via gh CLI for other deps
   const repos = {
-    "cc-plugin-codex": "sendbird/cc-plugin-codex",
-    "codex-plugin-cc": "openai/codex-plugin-cc",
     last30days: "mvanhorn/last30days-skill",
   };
   const repo = repos[key];
@@ -643,14 +513,8 @@ function findGitRoot(startDir) {
 // Returns the ordered list of dep keys relevant to the current install.
 // repoPath should be the git root so feature flags and openspec/ detection are
 // repo-relative regardless of what subdirectory the installer was invoked from.
-function getRelevantDeps(hosts, pipelineConfig, repoPath) {
+function getRelevantDeps(pipelineConfig, repoPath) {
   const relevant = [];
-
-  // Companion plugins gated by host.
-  // cc-plugin-codex: Codex host — the $pipeline flow drives Claude through this companion.
-  if (hosts.includes("codex")) relevant.push("cc-plugin-codex");
-  // codex-plugin-cc: Claude host — the /pipeline flow drives Codex through this companion.
-  if (hosts.includes("claude")) relevant.push("codex-plugin-cc");
 
   // OpenSpec — gated by feature flag (supports auto|on|off and boolean equivalents).
   const openspecVal = pipelineConfig?.openspec?.enabled;
@@ -853,7 +717,7 @@ async function main() {
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
-    preflight(hosts);
+    preflight();
     log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
     for (const h of hosts) {
       if (h === "claude") {
@@ -872,7 +736,7 @@ async function main() {
     // Dependency-prompting phase: run after core install, never blocks completion.
     const repoPath = findGitRoot(process.cwd());
     const pipelineConfig = readPipelineConfig(repoPath);
-    const relevantDeps = getRelevantDeps(hosts, pipelineConfig, repoPath);
+    const relevantDeps = getRelevantDeps(pipelineConfig, repoPath);
     const autoAccept = yesDeps || process.env.PIPELINE_INSTALL_DEPS === "1";
     const depResults = await promptDeps(relevantDeps, {
       dryRun,
@@ -899,8 +763,6 @@ export {
   uniqueBackupPath,
   relocatePersonalSkill,
   offerRelocationWith,
-  companionPresentWithVersion,
-  codexCompanionPresentWithVersion,
   openspecPresent,
   last30daysPresent,
   detectDep,

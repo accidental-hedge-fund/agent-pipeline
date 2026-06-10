@@ -40,9 +40,8 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **Node ≥ 24** with **`npm`** (npm ships with Node and installs the core's dependencies — commander, js-yaml, zod). The core runs TypeScript directly via native type-stripping; no build step.
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
 - **Both `claude` and `codex` CLIs** on PATH and **authenticated** — each run uses one to implement and the other to review.
-- **Review runs on the *other* harness, invoked directly** (default `reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the other harness's CLI installed and authenticated.
-  - *Optional companion modes* (`codex-companion` / `claude-companion`) drive the reviewer through a third-party plugin instead. See [Advanced topics](#advanced-topics).
-- `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude/OpenClaw) or `AGENTS.md` (Codex).
+- **Review runs on the *other* harness, invoked directly** (`reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the other harness's CLI installed and authenticated.
+- `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude) or `AGENTS.md` (Codex).
 - **Optional:** the [OpenSpec](https://openspec.dev/) CLI (`npm i -g @fission-ai/openspec`) — only needed for repos that opt into the OpenSpec planning flow.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
 
@@ -106,7 +105,7 @@ node agent-pipeline/scripts/install.mjs install        # --host claude|codex|all
 
 The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks the skill up live.
 
-After the core install, the installer detects which optional companion plugins and feature tools are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install. One exception: `codex-plugin-cc` (the Codex companion for the Claude-primary flow) requires a manual step inside Claude Code — the installer prints the command to run rather than installing it directly.
+After the core install, the installer detects which optional feature tools (the OpenSpec CLI, the last30days skill) are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install.
 
 To skip all prompts and auto-accept in non-interactive environments:
 
@@ -126,9 +125,7 @@ npx github:accidental-hedge-fund/agent-pipeline install --host claude
 codex login                                            # the reviewer — review invokes `codex` directly
 ```
 
-By default (`reviewMode: prompt-harness`) review invokes the `codex` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `codex` CLI.
-
-*(Optional: to use Codex's native review via the `codex-plugin-cc` companion instead, set `reviewMode: codex-companion` and run the companion's install steps.)*
+Review (`reviewMode: prompt-harness`) invokes the `codex` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `codex` CLI.
 
 #### Codex as the primary harness (`$pipeline`)
 
@@ -139,9 +136,7 @@ npx github:accidental-hedge-fund/agent-pipeline install --host codex
 claude auth login                                      # the reviewer — review invokes `claude` directly
 ```
 
-By default (`reviewMode: prompt-harness`) review invokes the `claude` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `claude` CLI. Then restart Codex and run `$pipeline N`.
-
-*(Optional: to use Claude Code's native review via the `cc-plugin-codex` companion instead, set `reviewMode: claude-companion` and run `npx cc-plugin-codex install`.)*
+Review (`reviewMode: prompt-harness`) invokes the `claude` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `claude` CLI. Then restart Codex and run `$pipeline N`.
 
 ### Claude Code plugin marketplace (versioned, auto-updatable)
 
@@ -224,7 +219,8 @@ eval_gate:                           # run the repo's eval harness after pre-mer
 review_policy:                       # which review findings block progression vs. merely advise
   block_threshold: low               # critical|high|medium|low — findings below this advise, not block (default: low = block on every finding)
   min_confidence: 0                  # 0..1 — findings below this confidence advise, not block (default: 0 = no confidence gate)
-# `harnesses:` here is accepted for back-compat but IGNORED — the install profile owns it.
+# Harness roles (implementer/reviewer) are owned by the install profile and cannot
+# be set here — a `harnesses:` key is rejected at config-parse time.
 ```
 
 ## Test/build gate (optional, default on)
@@ -397,49 +393,6 @@ Requires the `last30days` skill installed (`/plugin marketplace add mvanhorn/las
 
 **Data-source keys** are configured in the skill, not this pipeline. The two highest-lift keys are `BRAVE_SEARCH_API_KEY` (free [Brave Search API](https://brave.com/search/api/)) and `SCRAPECREATORS_API_KEY` (fuller social/X coverage). Without any keys the skill still runs on free public sources. See the [skill's setup guide](https://github.com/mvanhorn/last30days-skill#setup) for full instructions.
 
-### Optional companion review modes
-
-By default the reviewer harness is called directly with the pipeline's own JSON-returning review prompt (`reviewMode: prompt-harness`). This requires no extra plugins and is the recommended starting point.
-
-If you prefer the reviewer to run through a third-party plugin — so it sees a richer plugin context rather than a raw CLI invocation — two companion modes are available:
-
-| `reviewMode` | When the implementer is Claude | When the implementer is Codex |
-|---|---|---|
-| `prompt-harness` (default) | Codex CLI called directly | Claude CLI called directly |
-| `codex-companion` | Codex drives review via the **codex-plugin-cc** plugin | *(same harness, uses codex-plugin-cc)* |
-| `claude-companion` | Claude Code drives review via the **cc-plugin-codex** plugin | *(same harness, uses cc-plugin-codex)* |
-
-**Install the companion plugin** for your desired mode:
-
-```bash
-# codex-companion — install codex-plugin-cc into Claude Code (two steps)
-/plugin marketplace add openai/codex-plugin-cc
-/plugin install codex@openai-codex
-
-# claude-companion — install cc-plugin-codex into Codex
-npx cc-plugin-codex install
-```
-
-**Set the mode** by editing the profile JSON for your host (`core/profiles/claude.json` or `core/profiles/codex.json`):
-
-```json
-{ "reviewMode": "codex-companion" }
-```
-
-The `reviewMode` field is profile-level and is not configurable via `.github/pipeline.yml`.
-
-**Override the companion script path** (optional, for custom plugin installs):
-
-```bash
-# codex-companion path override
-PIPELINE_CODEX_COMPANION=/path/to/codex-companion.mjs /pipeline N
-
-# claude-companion path override
-PIPELINE_CC_COMPANION=/path/to/claude-companion.mjs /pipeline N
-```
-
-If the companion script cannot be found at any of the default locations and no env-var override is set, the pipeline blocks with an install hint rather than silently falling back.
-
 ---
 
 ## How the two hosts share one core
@@ -450,7 +403,7 @@ If the companion script cannot be found at any of the default locations and no e
 |---|---|---|
 | invocation | `/pipeline` | `$pipeline` |
 | implementer / reviewer | claude / codex | codex / claude |
-| review mode | `prompt-harness` (default) | `prompt-harness` (default) |
+| review mode | `prompt-harness` | `prompt-harness` |
 | reviewer (direct, JSON prompt) | `codex` CLI | `claude` CLI |
 | conventions file | `CLAUDE.md` | `AGENTS.md` |
 
@@ -461,7 +414,7 @@ Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one s
 ```text
 core/                 single source of truth (host-agnostic TypeScript)
   scripts/            orchestrator, stages/, prompts/, gh/worktree/lock/harness
-  profiles/           claude.json · codex.json · openclaw.json  ← the host seam
+  profiles/           claude.json · codex.json  ← the host seam
   test/               node --test suite
 hosts/
   claude/SKILL.md     Claude overlay (/pipeline, Monitor/PushNotification flow)

@@ -2,9 +2,7 @@
 
 ## Purpose
 How a repo configures the pipeline through `.github/pipeline.yml`: discovery from the git root, YAML parsing and strict schema validation, the precedence of CLI overrides over file config over `DEFAULT_CONFIG`, and the safety floor (the never-auto-merge guarantee is structural; harness roles come from the profile, not file config). Per-feature config blocks (`test_gate`, `eval_gate`, `openspec`, `last30days`) are refined by their own delta specs; this baseline covers loading, validation, and precedence.
-
 ## Requirements
-
 ### Requirement: Config discovered from the git-root .github/pipeline.yml
 `resolveConfig()` SHALL walk up from the target path (or cwd) to the enclosing `.git` root and load `.github/pipeline.yml` if present. When the file is absent, every non-identity field SHALL take its `DEFAULT_CONFIG` value.
 
@@ -35,18 +33,18 @@ For each field, an explicit CLI override (e.g. `--base`) SHALL win over the file
 - **THEN** the resolved `base_branch` SHALL be `develop`
 
 ### Requirement: Never-auto-merge safety floor is structural, not config-forced
-The `auto_merge` key SHALL be accepted in config for back-compat, but the pipeline SHALL never read or act on it: there is no merge stage and no merge command (see `pipeline-state-machine`). A repo cannot enable auto-merge through config because nothing consumes the value.
+The pipeline SHALL never merge automatically: there is no merge stage and no merge command (see `pipeline-state-machine`). The `auto_merge` key SHALL be absent from `PartialConfigSchema`; a repo that sets it SHALL receive a strict-schema parse error identifying the offending key. The never-auto-merge guarantee is not config-governed — it is structural.
 
-#### Scenario: auto_merge true is inert
+#### Scenario: auto_merge key rejected
 - **WHEN** `.github/pipeline.yml` sets `auto_merge: true`
-- **THEN** the value SHALL have no effect — the pipeline still stops at `ready-to-deploy`
+- **THEN** `resolveConfig()` SHALL throw with a parse error identifying `auto_merge` as an unknown key
 
 ### Requirement: Harness roles come from the active profile, not file config
-The `harnesses` (`implementer`/`reviewer`) SHALL be taken from the active profile (`profile.harnesses`). A `harnesses` block in `.github/pipeline.yml` is accepted for back-compat but ignored, so repo config cannot invert a host-invoked run.
+The `harnesses` (`implementer`/`reviewer`) SHALL be taken from the active profile (`profile.harnesses`). The `harnesses` key SHALL be absent from `PartialConfigSchema`; a repo that sets it SHALL receive a strict-schema parse error. Repo config cannot influence harness role assignment.
 
-#### Scenario: file harnesses ignored
-- **WHEN** the run uses the `claude` profile and the file sets `harnesses: { implementer: codex, reviewer: claude }`
-- **THEN** the resolved `harnesses` SHALL remain `{ implementer: "claude", reviewer: "codex" }` from the profile
+#### Scenario: harnesses key rejected
+- **WHEN** `.github/pipeline.yml` sets a `harnesses:` block
+- **THEN** `resolveConfig()` SHALL throw with a parse error identifying `harnesses` as an unknown key
 
 ### Requirement: Protected steps cannot be disabled via config
 The `steps:` block SHALL accept only the four toggleable keys (`plan_review`, `standard_review`, `adversarial_review`, `docs`); any other key (e.g. an attempt to disable a structural step) SHALL be rejected at validation time.
@@ -54,3 +52,4 @@ The `steps:` block SHALL accept only the four toggleable keys (`plan_review`, `s
 #### Scenario: unknown step key rejected
 - **WHEN** `.github/pipeline.yml` adds an unrecognized key under `steps:`
 - **THEN** validation SHALL fail and `resolveConfig()` SHALL throw
+

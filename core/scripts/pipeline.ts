@@ -79,7 +79,7 @@ async function main(): Promise<void> {
     .option("--repo-path <path>", "override the target repo working tree")
     .option("--base <branch>", "override the base branch (default: from .github/pipeline.yml or 'main')")
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
-    .option("--profile <name>", "shared-core profile to use: codex, claude, or openclaw", process.env.PIPELINE_PROFILE ?? "codex")
+    .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .parse(process.argv);
 
   const opts = cmd.opts<CliOpts>();

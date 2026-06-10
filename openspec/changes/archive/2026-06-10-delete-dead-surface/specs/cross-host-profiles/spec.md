@@ -1,8 +1,5 @@
-# cross-host-profiles Specification
+## MODIFIED Requirements
 
-## Purpose
-The host seam that lets one shared core ship as both `/pipeline` (Claude Code) and `$pipeline` (Codex): a JSON profile per host that fixes the harness roles, the review mode, and host-specific presentation defaults. Roles are harness-relative — the invoking host is always the implementer; the other harness reviews.
-## Requirements
 ### Requirement: Profiles are named JSON files loaded by name
 Profiles SHALL live at `core/profiles/<name>.json` and be loaded by `loadProfile(name)`. The repo ships exactly two profiles: `claude` and `codex`. Each profile SHALL define `name`, `displayName`, `invocation`, `harnesses` (`implementer` + `reviewer`), `reviewMode`, and host presentation defaults (`markerFooter`, `implementationReadyMessage`, `conventionsDefault`).
 
@@ -31,19 +28,3 @@ Every shipped profile SHALL set `reviewMode: "prompt-harness"` — review invoke
 #### Scenario: default review mode
 - **WHEN** either `claude` or `codex` is loaded
 - **THEN** its `reviewMode` SHALL be `"prompt-harness"`
-
-### Requirement: The profile, not file config, selects the per-role harness
-At stage execution, the implementer-role harness (`harnesses.implementer`) SHALL run planning/implementation/fix and the reviewer-role harness (`harnesses.reviewer`) SHALL run review, dispatched by `invoke(...)`. These come from the profile and cannot be overridden by `.github/pipeline.yml` (see `pipeline-configuration`).
-
-#### Scenario: role drives CLI invocation
-- **WHEN** planning runs under the `claude` profile
-- **THEN** the implementer CLI invoked SHALL be `claude`
-- **AND** the subsequent review SHALL invoke the `codex` CLI
-
-### Requirement: Default profile is codex
-When no profile is specified (neither an explicit option nor `PIPELINE_PROFILE`), `resolveConfig()` SHALL load the `codex` profile.
-
-#### Scenario: no profile specified
-- **WHEN** `resolveConfig()` runs with no profile option and `PIPELINE_PROFILE` unset
-- **THEN** the `codex` profile SHALL be loaded
-

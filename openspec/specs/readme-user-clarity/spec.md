@@ -30,7 +30,7 @@ The README SHALL include a dedicated quickstart (or "Getting Started") section t
 ---
 
 ### Requirement: Optional and advanced topics are visually separated from core flow
-Advanced, optional, or less-common topics — including OpenSpec integration, last30days context, configurable steps, eval gate, companion review modes, and development — SHALL appear in sections that are clearly labeled as optional/advanced and positioned after the core getting-started flow, so a newcomer can reach a working setup without reading through advanced content.
+Advanced, optional, or less-common topics — including OpenSpec integration, last30days context, configurable steps, eval gate, and development — SHALL appear in sections that are clearly labeled as optional/advanced and positioned after the core getting-started flow, so a newcomer can reach a working setup without reading through advanced content. Companion review modes are removed and SHALL NOT appear as optional topics.
 
 #### Scenario: Newcomer can reach working setup without reading optional sections
 - **WHEN** a first-time reader follows only the prerequisite, install, and quickstart sections
@@ -39,8 +39,6 @@ Advanced, optional, or less-common topics — including OpenSpec integration, la
 #### Scenario: Optional sections are labeled
 - **WHEN** a section covers an optional feature
 - **THEN** the section heading or lead sentence SHALL indicate the feature is optional (e.g., "(optional)", "default off", or similar)
-
----
 
 ### Requirement: README is navigable without reading in full
 The README SHALL be skimmable and anchor-navigable: it SHALL use a consistent heading hierarchy (one H1, logical H2/H3 sections), section titles that reflect their content, and working anchor links or a table of contents so a returning user can jump directly to install, usage, configuration, or troubleshooting without reading the entire document.
@@ -64,13 +62,11 @@ Every instruction, command, flag, and description in the README SHALL reflect th
 
 #### Scenario: Reviewer wiring description matches default behavior
 - **WHEN** the README describes how review is invoked
-- **THEN** it SHALL accurately describe the default `reviewMode: prompt-harness` path (direct CLI invocation with a JSON prompt, no plugin required) and SHALL clearly distinguish this default from the optional companion modes
+- **THEN** it SHALL accurately describe the `reviewMode: prompt-harness` path (direct CLI invocation with a JSON prompt, no plugin required); the companion modes (`claude-companion`, `codex-companion`) SHALL NOT be mentioned as valid or optional alternatives
 
 #### Scenario: Config key examples are valid
 - **WHEN** the README shows a `.github/pipeline.yml` example block
-- **THEN** every key shown SHALL be a currently recognized config key; no deprecated or non-existent keys SHALL appear
-
----
+- **THEN** every key shown SHALL be a currently recognized config key; no deprecated or non-existent keys (`auto_merge`, `harnesses`) SHALL appear
 
 ### Requirement: Formatting and code blocks render correctly on GitHub
 All Markdown formatting SHALL follow GitHub-Flavored Markdown conventions: fenced code blocks SHALL specify a language hint where appropriate, inline code SHALL use backticks, links SHALL be valid and resolvable, and no mixed or inconsistent heading/list styles SHALL appear in the same section.

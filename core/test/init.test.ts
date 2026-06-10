@@ -148,7 +148,6 @@ test("scaffoldDefaultConfig: scaffolded file round-trips through resolveConfig w
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.equal(cfg.auto_merge, DEFAULT_CONFIG.auto_merge);
     assert.equal(cfg.auto_recovery_max_retries, DEFAULT_CONFIG.auto_recovery_max_retries);
     assert.equal(cfg.implementation_timeout, DEFAULT_CONFIG.implementation_timeout);
     assert.equal(cfg.review_timeout, DEFAULT_CONFIG.review_timeout);
