@@ -49,11 +49,11 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 
 ## Release plan (sem-ver)
 
-Post-1.0 the open backlog is **entirely additive or internal hardening — no breaking changes.** This was verified 2026-06-10 by a per-issue classification with an adversarial breaking-change check; the verifier agreed on all 14 issues. Each new key (#40, #70, #23, #21) is optional and its **default reproduces current behavior**, so existing configs and runs are unchanged — that, not schema mechanics, is what keeps these MINOR rather than MAJOR. (Top-level config is `.strict()`, so an old config that omits the new key still validates; the new key is always added *optional*, never required. Note `models.*` is itself non-`.strict()` with required inner fields, so #70's `models.implementing` must land as an added **optional** field, not a new required one.) A 2.0 would instead require removing/renaming a key, changing a default, making a dead key live, or breaking the verdict output schema — nothing open does that.
+Post-1.0 the open backlog is **entirely additive or internal hardening — no breaking changes.** This was verified 2026-06-10 by a per-issue classification with an adversarial breaking-change check; the verifier agreed on all 14 issues. (**#106**, filed later the same day, was classified patch/additive on the same basis — internal hardening, no config or output-schema change.) Each new key (#40, #70, #23, #21) is optional and its **default reproduces current behavior**, so existing configs and runs are unchanged — that, not schema mechanics, is what keeps these MINOR rather than MAJOR. (Top-level config is `.strict()`, so an old config that omits the new key still validates; the new key is always added *optional*, never required. Note `models.*` is itself non-`.strict()` with required inner fields, so #70's `models.implementing` must land as an added **optional** field, not a new required one.) A 2.0 would instead require removing/renaming a key, changing a default, making a dead key live, or breaking the verdict output schema — nothing open does that.
 
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
-| **v1.0.1** | patch | Dev-loop convergence | #95, #75 | Pure self-heal bug fixes; no public surface or config. Lowest-risk, no in-set deps, and it hardens the loop that ships everything after it. |
+| **v1.0.1** | patch | Dev-loop convergence | #95, #75, #106 | Pure self-heal bug fixes; no public surface or config. Lowest-risk, no in-set deps, and it hardens the loop that ships everything after it. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -65,6 +65,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 |---|--------|--------|-------|-----------|------------|
 | #95 | patch | none | dev-loop convergence | v1.0.1 | — |
 | #75 | patch | none | dev-loop convergence | v1.0.1 | #61 ✓ |
+| #106 | patch | none | dev-loop convergence | v1.0.1 | — |
 | #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
@@ -86,6 +87,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 
 - **#95** — pre-merge polling hangs when a PR is **CONFLICTING**: no `pull_request` CI runs ever start, so the gate polls to its timeout. Detect CONFLICTING + auto-rebase. *Real run-loop hang; zero config; no in-set deps.*
 - **#75** — Zero-machinery `plugin/` mirror regen: repo-local conventions instruction + commit the mirror after editing `core/`; the #61 test gate stays the backstop. *No generator-detection/config in the generic core. Kills the recurring one-attempt fix-round waste.*
+- **#106** — OpenSpec spec deltas go **stale on a material review fix**: fix rounds edit code but aren't told (or verified) to revise the change's `specs/**`, so `maybeArchiveOpenspec` folds a stale delta into the living specs and re-review anchored on the stale delta can fight the now-correct code. Make the spec follow the code on the fix path + a verify-don't-prompt pre-merge consistency guard. *Living-spec correctness + convergence; no config; hardens the OpenSpec-in-planning flow. Minimal fix (a); the heavier `review → plan-revision` edge (b) defers to v1.1.0 if needed.*
 
 ### v1.1.0 — review quality (minor)
 
