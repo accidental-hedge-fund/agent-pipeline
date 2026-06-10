@@ -45,6 +45,16 @@ const REVIEW_CLEAN = [
   "The implementation matches the spec delta correctly; only a minor naming nit, nothing blocking.",
 ].join("\n");
 
+// Approving summary that contains BOTH "divergence" and "OpenSpec" — but no
+// Findings section. Before the fix this would trip the guard because
+// reviewFlagsSpecDivergence was called on the full body.
+const REVIEW_APPROVE_DIVERGENCE_IN_SUMMARY = [
+  "## Review 1 (Standard) — approve (commit def5678)",
+  "**Reviewer**: codex",
+  "",
+  "No divergence from the OpenSpec delta; implementation matches.",
+].join("\n");
+
 async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
   t.mock.method(console, "log", () => {});
   await fn();
@@ -127,6 +137,24 @@ test("maybeArchiveOpenspec: proceeds to archive when the reviewer did NOT flag d
   assert.equal(out, null);
   assert.deepEqual(rec.archiveCalls, [ID], "archive must proceed when there is no flagged divergence");
   assert.equal(rec.blocked.length, 0, "the consistency guard must not block here");
+});
+
+test("maybeArchiveOpenspec: approving summary with 'no divergence' language does not trip guard (regression for f13d9b94)", async (t) => {
+  // Bites without the fix: before extractFindingsSection was introduced,
+  // reviewFlagsSpecDivergence scanned the full review body and found "divergence"
+  // + "OpenSpec" in the approving summary, causing a false-positive block even
+  // though the reviewer found no actual divergence finding.
+  const { deps, rec } = makeArchiveDeps({
+    fixDiffPaths: [IMPL_PATH], // code moved (structural signal present)
+    reviewBody: REVIEW_APPROVE_DIVERGENCE_IN_SUMMARY,
+  });
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, 106, "106/run", deps);
+  });
+  assert.equal(out, null, "approving summary must not block when there is no Findings section");
+  assert.deepEqual(rec.archiveCalls, [ID], "archive must proceed");
+  assert.equal(rec.blocked.length, 0, "false-positive block must not occur");
 });
 
 test("maybeArchiveOpenspec: proceeds when the fix ALSO updated the spec delta (revision happened)", async (t) => {

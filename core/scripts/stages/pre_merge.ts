@@ -515,9 +515,13 @@ export async function enforceSpecConsistencyGuard(
   // reviewer actually saw a divergence — otherwise the spec is presumed
   // consistent (the reviewer reviewed against it and did not object), and the
   // frozen delta is helping (case A: code drifted from a correct spec).
+  // Only inspect the structured "### Findings" block, not the full review body:
+  // an approving summary like "No divergence from the OpenSpec delta; matches"
+  // would otherwise trip the guard even though no finding flags divergence.
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   const reviewBody = latestReviewBody(detail.comments);
-  if (!reviewBody || !reviewFlagsSpecDivergence(reviewBody)) return null;
+  const findingsSection = reviewBody ? extractFindingsSection(reviewBody) : null;
+  if (!findingsSection || !reviewFlagsSpecDivergence(findingsSection)) return null;
 
   await deps.setBlocked(cfg, issueNumber, staleSpecDeltaBlockReason(stale), "pre-merge");
   return { advanced: false, status: "blocked", reason: `stale OpenSpec delta (${stale})` };
@@ -572,6 +576,22 @@ export function specDeltaIsStale(id: string, fixDiffPaths: string[]): boolean {
   const specUpdated = paths.some((p) => p.startsWith(specPrefix));
   const touchedImpl = paths.some((p) => !p.startsWith("openspec/"));
   return touchedImpl && !specUpdated;
+}
+
+/**
+ * Extracts the content of the `### Findings` block from a formatted review
+ * comment, returning null when no such section exists. This restricts the
+ * divergence guard to actual reviewer findings rather than the summary prose,
+ * preventing approving summaries that incidentally mention "divergence" or
+ * "spec" from being misread as flagging a code/spec divergence.
+ */
+function extractFindingsSection(reviewBody: string): string | null {
+  const marker = "\n### Findings";
+  const start = reviewBody.indexOf(marker);
+  if (start === -1) return null;
+  const after = reviewBody.slice(start + marker.length);
+  const nextSection = after.search(/\n###? /);
+  return nextSection === -1 ? after : after.slice(0, nextSection);
 }
 
 /**
