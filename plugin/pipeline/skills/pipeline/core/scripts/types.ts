@@ -87,6 +87,18 @@ export interface PipelineConfig {
     timeout: number;   // seconds
     max_attempts: number; // total attempts (1 = no retry)
   };
+  // Review severity policy (#17). Declares which finding severities block
+  // progression vs. merely advise. Findings below `block_threshold` (or below
+  // `min_confidence`) are recorded as advisory and do NOT route to a fix round;
+  // when a review produces only advisory/overridden findings the item advances
+  // as if approved. Operator overrides of individual blocking findings are
+  // audited via `pipeline-override` comment sentinels. Default
+  // (`block_threshold: "low"`, `min_confidence: 0`) blocks on every finding,
+  // reproducing pre-#17 behavior.
+  review_policy: {
+    block_threshold: "critical" | "high" | "medium" | "low";
+    min_confidence: number; // 0..1; findings below this advise rather than block
+  };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -111,6 +123,7 @@ export const DEFAULT_CONFIG: Omit<PipelineConfig, "domain" | "repo" | "repo_dir"
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
+  review_policy: { block_threshold: "low" as const, min_confidence: 0 },
 };
 
 // ---------------------------------------------------------------------------

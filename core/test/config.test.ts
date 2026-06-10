@@ -269,3 +269,91 @@ test("resolveConfig: eval_gate enabled:false keeps other defaults", async () => 
     process.env.PATH = oldPath;
   }
 });
+
+// ---- review_policy (#17) ----
+
+test("resolveConfig: review_policy defaults apply when absent (blocks every finding)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/rp0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_policy.block_threshold, DEFAULT_CONFIG.review_policy.block_threshold);
+    assert.equal(cfg.review_policy.block_threshold, "low");
+    assert.equal(cfg.review_policy.min_confidence, DEFAULT_CONFIG.review_policy.min_confidence);
+    assert.equal(cfg.review_policy.min_confidence, 0);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_policy block_threshold + min_confidence override merge", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  block_threshold: high\n  min_confidence: 0.7\n`);
+  const binDir = makeFakeGh("acme/rp1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_policy.block_threshold, "high");
+    assert.equal(cfg.review_policy.min_confidence, 0.7);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: a partial review_policy keeps the other field at its default", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  block_threshold: critical\n`);
+  const binDir = makeFakeGh("acme/rp2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_policy.block_threshold, "critical");
+    assert.equal(cfg.review_policy.min_confidence, DEFAULT_CONFIG.review_policy.min_confidence);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: invalid review_policy.block_threshold is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  block_threshold: blocker\n`);
+  const binDir = makeFakeGh("acme/rp3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_policy.min_confidence out of [0,1] is rejected", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  min_confidence: 1.5\n`);
+  const binDir = makeFakeGh("acme/rp4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown review_policy key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  block_threshold: high\n  bogus: 1\n`);
+  const binDir = makeFakeGh("acme/rp5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
