@@ -91,6 +91,51 @@ for (const docs of [true, false]) {
 }
 
 // ---------------------------------------------------------------------------
+// Stale-snapshot regression (#95): conflict developed after CI passed
+// ---------------------------------------------------------------------------
+
+test("pre-merge: post-CI conflict is caught by fresh Step 2 fetch, not stale pre-CI snapshot (#95)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  // Track getPrDetail call order: call 1 = Step 0.5 (early check), call 2 = Step 2 (after CI).
+  let getPrDetailCalls = 0;
+  let rebaseCalled = false;
+
+  const deps: AdvancePreMergeDeps = {
+    getPrForIssue: async () => PR_NUMBER,
+    // No review comment → SHA gate returns null without calling getPrDetail.
+    getIssueDetail: async () => ({ comments: [] }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>>,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      if (getPrDetailCalls === 1) {
+        // Step 0.5 early check: clean — should NOT trigger early-conflict path.
+        return { head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" } as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>;
+      }
+      // Step 2 after CI: PR became conflicting while CI was running.
+      return { head_sha: SHA_HEAD, mergeable: false, mergeable_state: "DIRTY" } as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>;
+    },
+    getPrCommits: async () => [],
+    getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
+    getForIssue: async () => ({ path: "/fake/wt", slug: "slug" }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getForIssue"]>>>,
+    rebaseAlreadyAttempted: () => false,
+    tryRebaseAndPush: async () => { rebaseCalled = true; return true; },
+    markRebaseAttempted: () => {},
+    setBlocked: async () => {},
+    transition: async () => {},
+    postComment: async () => {},
+  };
+
+  const out = await advance(makeCfg(false), 95, {}, deps);
+
+  // Must NOT advance — the post-CI conflict must be caught.
+  assert.equal(out.advanced, false, "must not advance when conflict detected at Step 2");
+  assert.equal(out.status, "waiting");
+  assert.equal(out.reason, "rebase-resolved; CI re-running");
+  assert.equal(rebaseCalled, true, "tryRebaseAndPush must be invoked for the post-CI conflict");
+  assert.equal(getPrDetailCalls, 2, "getPrDetail called once before CI and once after CI passes");
+});
+
+// ---------------------------------------------------------------------------
 // isPipelineInternalCommit — only the OpenSpec archive prefix survives (#91)
 // ---------------------------------------------------------------------------
 

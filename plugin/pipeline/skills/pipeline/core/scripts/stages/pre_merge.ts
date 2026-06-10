@@ -119,9 +119,9 @@ export async function advance(
   // GitHub cannot build the pull_request merge ref for a CONFLICTING PR, so
   // no pull_request-triggered check runs are ever created — polling for
   // checks would wait out ci_timeout for runs that cannot appear. Fetch PR
-  // detail once (also threaded to the Step 2 mergeability check) and route a
-  // conflict straight to the rebase path. UNKNOWN (GitHub still computing
-  // mergeability) is NOT a conflict and falls through to the CI poll.
+  // detail and route a conflict straight to the rebase path. UNKNOWN (GitHub
+  // still computing mergeability) is NOT a conflict and falls through to the
+  // CI poll.
   const prDetail = await getPrDetailFn(cfg, prNumber);
   if (parseMergeable(prDetail) === "conflict") {
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
@@ -162,11 +162,11 @@ export async function advance(
   }
 
   // ---- Step 2: mergeability ----
-  // Re-uses the prDetail fetched before the CI poll, so within one advance()
-  // call a conflict is normally intercepted by Step 0.5; this branch is kept
-  // (now bounded by the same rebase guard) as defense in depth should the
-  // early check ever be reordered away from the poll entry.
-  const mergeStatus = parseMergeable(prDetail);
+  // Re-fetch after CI passes to catch conflicts that developed while CI was
+  // running. Reusing the pre-CI snapshot could let a PR that became
+  // CONFLICTING after the early check slip through to ready-to-deploy.
+  const freshPrDetail = await getPrDetailFn(cfg, prNumber);
+  const mergeStatus = parseMergeable(freshPrDetail);
   if (mergeStatus === "conflict") {
     return recoverFromMergeConflict(cfg, issueNumber, deps);
   }
