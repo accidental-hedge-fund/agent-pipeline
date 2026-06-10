@@ -17,7 +17,6 @@ import {
   getPrDetail,
   getPrForIssue,
   parseChecksAggregate,
-  parseMergeable,
   postComment,
   setBlocked,
   transition,
@@ -172,12 +171,23 @@ export async function advance(
   // Re-fetch after CI passes to catch conflicts that developed while CI was
   // running. Reusing the pre-CI snapshot could let a PR that became
   // CONFLICTING after the early check slip through to ready-to-deploy.
+  // Use a narrow true-conflict predicate (same as Step 0.5) rather than
+  // parseMergeable(), which also maps BEHIND/BLOCKED to "conflict". BEHIND
+  // is an out-of-date branch (code is compatible, not conflicting); BLOCKED
+  // is branch-protection preventing the merge. Routing those states to
+  // recoverFromMergeConflict consumes the rebase marker and then blocks on
+  // the next poll with a misleading "merge conflict — manual rebase needed"
+  // reason for a PR that never had a real code conflict.
   const freshPrDetail = await getPrDetailFn(cfg, prNumber);
-  const mergeStatus = parseMergeable(freshPrDetail);
-  if (mergeStatus === "conflict") {
+  const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
+  const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
+  if (isFreshConflict) {
     return recoverFromMergeConflict(cfg, issueNumber, deps);
   }
-  if (mergeStatus === "unknown") {
+  if (freshState === "BEHIND" || freshState === "BLOCKED") {
+    return { advanced: false, status: "waiting", reason: `GitHub mergeability: ${freshState.toLowerCase()}` };
+  }
+  if (freshPrDetail.mergeable === null && freshState !== "CLEAN" && freshState !== "HAS_HOOKS") {
     return { advanced: false, status: "waiting", reason: "GitHub still computing mergeability" };
   }
 

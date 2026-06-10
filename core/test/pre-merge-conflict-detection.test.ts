@@ -142,32 +142,81 @@ test("UNKNOWN mergeability does not enter the early-conflict path; CI poll proce
   assert.deepEqual(rec.blocked, []);
 });
 
-test("BLOCKED mergeable_state does not trigger early-conflict path; CI poll proceeds (#95)", async (t) => {
+test("BLOCKED mergeable_state does not trigger early-conflict path; post-CI gate returns waiting (#95)", async (t) => {
   // mergeable: null + mergeable_state: BLOCKED → branch protection or required reviews,
-  // not a merge conflict. The EARLY conflict check must not bypass CI for this state.
-  // (parseMergeable maps BLOCKED to "conflict" for the post-CI mergeability gate — that
-  // is intentional and separate from this test's concern.)
+  // not a merge conflict. Must not bypass CI and must not consume the rebase marker.
   const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BLOCKED" });
   let out;
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
   assert.equal(rec.ciPolls, 1, "BLOCKED state must still poll CI — not bypassed by the early-conflict check");
-  // The post-CI mergeability gate sees parseMergeable → "conflict" and attempts a rebase;
-  // that is expected. The critical invariant is that ciPolls === 1.
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" },
+    "post-CI gate must return waiting for BLOCKED, not trigger conflict recovery",
+  );
+  assert.equal(rec.rebaseCalls, 0, "BLOCKED must not consume the rebase slot");
+  assert.deepEqual(rec.marked, [], "BLOCKED must not set the rebase-attempted marker");
   assert.deepEqual(rec.blocked, []);
 });
 
-test("BEHIND mergeable_state does not trigger early-conflict path; CI poll proceeds (#95)", async (t) => {
+test("BEHIND mergeable_state does not trigger early-conflict path; post-CI gate returns waiting (#95)", async (t) => {
   // mergeable: null + mergeable_state: BEHIND → branch is out of date with base,
-  // not a merge conflict. The EARLY conflict check must not bypass CI for this state.
+  // not a merge conflict. Must not bypass CI and must not consume the rebase marker.
   const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
   let out;
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
   assert.equal(rec.ciPolls, 1, "BEHIND state must still poll CI — not bypassed by the early-conflict check");
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "waiting", reason: "GitHub mergeability: behind" },
+    "post-CI gate must return waiting for BEHIND, not trigger conflict recovery",
+  );
+  assert.equal(rec.rebaseCalls, 0, "BEHIND must not consume the rebase slot");
+  assert.deepEqual(rec.marked, [], "BEHIND must not set the rebase-attempted marker");
   assert.deepEqual(rec.blocked, []);
+});
+
+test("BLOCKED with rebase marker present does not set merge-conflict block reason (#95)", async (t) => {
+  // Regression for Review 2 finding: BLOCKED was mapped to "conflict" by parseMergeable(),
+  // which caused recoverFromMergeConflict to be called. On a subsequent poll with the marker
+  // present, the PR would block with "merge conflict — manual rebase needed" — wrong message
+  // for a PR that only needs branch protection to clear.
+  const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BLOCKED" });
+  deps.rebaseAlreadyAttempted = () => true;
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" },
+    "marker-present BLOCKED must still return waiting, not a conflict block",
+  );
+  assert.deepEqual(rec.blocked, [], "must not call setBlocked for a BLOCKED-state PR");
+  assert.equal(rec.rebaseCalls, 0, "must not attempt a second rebase");
+});
+
+test("BEHIND with rebase marker present does not set merge-conflict block reason (#95)", async (t) => {
+  // Regression for Review 2 finding: BEHIND was mapped to "conflict" by parseMergeable(),
+  // which on a second poll (marker present) would block with "merge conflict — manual rebase
+  // needed" — wrong message for a PR that is just behind the base branch.
+  const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
+  deps.rebaseAlreadyAttempted = () => true;
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "waiting", reason: "GitHub mergeability: behind" },
+    "marker-present BEHIND must still return waiting, not a conflict block",
+  );
+  assert.deepEqual(rec.blocked, [], "must not call setBlocked for a BEHIND-state PR");
+  assert.equal(rec.rebaseCalls, 0, "must not attempt a second rebase");
 });
 
 test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)", async (t) => {
