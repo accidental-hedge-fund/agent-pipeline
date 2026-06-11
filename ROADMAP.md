@@ -2,7 +2,7 @@
 
 Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-10.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence; see Shipped. Everything below v1.0.1 is the post-1.0.1 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties; see Shipped. Everything below v1.0.2 is the post-1.0.2 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -36,6 +36,15 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
 
+**v1.0.2 — dev-loop convergence (cont.) + CLI niceties (shipped 2026-06-11, tag `v1.0.2`):**
+
+| # | What | PR |
+|---|------|-----|
+| #108 | inject repo conventions into the `fix`/`test-fix` prompts (editing fix rounds no longer rely on best-effort host auto-load) | #121 |
+| #115 | `--status` surfaces the needs-human punch-list (count + resume steps), not just the bare stage | #118 |
+| #116 | warn when a `models.*` alias is set on a Codex-backed step (silently inert); nested `models` schema is now `.strict()` so typo'd keys fail loudly | #119 |
+| #117 | CLI: add `--version` flag (print package version + exit); the install shim answers it before npm provisioning | #120 |
+
 **v1.0.1 — dev-loop convergence (shipped 2026-06-10, tag `v1.0.1`):**
 
 | # | What | PR |
@@ -64,7 +73,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
 | **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
-| **v1.0.2** | patch | Dev-loop convergence (cont.) | #108 | Inject repo conventions into the `fix`/`test-fix` prompts. Sequences after #110 — shares the `fix.md` / `buildFixPrompt` path. |
+| **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -79,6 +88,9 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #110 | patch | changed default (placeholder/defect) | dev-loop convergence | v1.0.1 | — |
 | #106 | patch | none | dev-loop convergence | v1.0.1 | #110 (co-ship) |
 | #108 | patch | none | dev-loop convergence | v1.0.2 | #110 |
+| #115 | patch | none | dev-loop convergence | v1.0.2 | — |
+| #116 | patch | models keys → optional + `.strict()` | config visibility | v1.0.2 | — |
+| #117 | patch | none | CLI niceties | v1.0.2 | — |
 | #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
@@ -95,10 +107,6 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
 ## Remaining work — detail (grouped by release)
-
-### v1.0.2 — dev-loop convergence, continued (patch)
-
-- **#108** — `fix` & `test-fix` prompts don't inject repo conventions, so editing fix rounds rely on best-effort host auto-load. Inject conventions into those prompts. *Sequence after #110 — shares the `fix.md` / `buildFixPrompt` path.*
 
 ### v1.1.0 — review quality (minor)
 
