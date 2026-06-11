@@ -147,6 +147,27 @@ Review (`reviewMode: prompt-harness`) invokes the `claude` CLI directly with a J
 
 This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`). If you have a personal install at `~/.claude/skills/pipeline`, the installer detects it automatically and offers to relocate it to a timestamped backup — no data is lost. Update later with `/plugin marketplace update ahf-tools`.
 
+### Install a specific version
+
+The bare `npx github:…` commands above install the **latest** code (the default branch). To install a specific released version instead, pin the git ref with `#<tag>` — released versions are tagged `vMAJOR.MINOR.PATCH` (see the [tags](https://github.com/accidental-hedge-fund/agent-pipeline/tags)):
+
+```bash
+# Install exactly v1.0.1 (any host flag works the same way)
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.0.1 install --host claude
+```
+
+Everything else is identical to the latest-version commands — `#v1.0.1` just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
+
+```bash
+gh repo clone accidental-hedge-fund/agent-pipeline
+cd agent-pipeline && git checkout v1.0.1
+node scripts/install.mjs install --host claude
+```
+
+Confirm what's installed at any time with `pipeline --version` (or `/pipeline --version` / `$pipeline --version`).
+
+> The plugin marketplace path above always tracks the **latest** published version and is not a way to pin an older release — use the `#<tag>` form for that.
+
 ## Usage
 
 ```text
