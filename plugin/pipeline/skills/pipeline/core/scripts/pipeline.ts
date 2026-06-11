@@ -13,6 +13,7 @@
 // /tmp/pipeline-{domain}-{N}.lock) so multiple pipeline runs on different
 // issues coexist.
 
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
@@ -44,6 +45,13 @@ import { LABEL_PREFIX, reviewStageSkipTarget, type Outcome, type PipelineConfig,
 
 const MAX_ITERATIONS = 12;
 
+// Package version, single-sourced from package.json so a version bump is reflected
+// automatically. The path is `../package.json` (core/package.json) and is mirror-safe:
+// build.mjs copies `package.json` alongside `scripts/` into the generated plugin, so the
+// same relative path resolves in both the dev and installed layouts.
+const require = createRequire(import.meta.url);
+export const VERSION: string = (require("../package.json") as { version: string }).version;
+
 interface CliOpts {
   status?: boolean;
   unblock?: string;
@@ -64,6 +72,7 @@ async function main(): Promise<void> {
   cmd
     .name("pipeline")
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
+    .version(VERSION, "-V, --version", "print version and exit")
     .argument("[number]", "issue or PR number (required unless --cleanup)")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")

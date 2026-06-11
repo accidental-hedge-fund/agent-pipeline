@@ -9,7 +9,7 @@
 //   2. Provision dependencies on first run (idempotent `npm ci` into core/).
 //   3. Exec the shared core with this host's profile baked in.
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
@@ -31,6 +31,15 @@ const entry = join(coreDir, "scripts", "pipeline.ts");
 if (!existsSync(entry)) {
   console.error(`pipeline: core not found at ${entry}. Re-run the installer.`);
   process.exit(1);
+}
+
+// Short-circuit for --version / -V: must work before dependency provisioning
+// because the version is available in core/package.json which is always present.
+const rawArgs = process.argv.slice(2);
+if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
+  const pkg = JSON.parse(readFileSync(join(coreDir, "package.json"), "utf8"));
+  process.stdout.write(pkg.version + "\n");
+  process.exit(0);
 }
 
 // First-run dependency provisioning. Skipped once core/node_modules exists, so
