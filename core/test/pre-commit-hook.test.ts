@@ -118,3 +118,70 @@ test("pre-commit hook: exits 0 when all core/ changes are staged with no unstage
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression: untracked source files must not leak into the mirror
+// ---------------------------------------------------------------------------
+
+test("pre-commit hook: aborts when untracked file exists under core/", () => {
+  const dir = makeRepo();
+  try {
+    // Stage a change to core/a.ts ...
+    fs.writeFileSync(path.join(dir, "core/a.ts"), "export const a = 2;\n");
+    execSync("git add core/a.ts", { cwd: dir });
+    // ... while an untracked file exists under core/ (build.mjs would copy it into plugin/).
+    fs.mkdirSync(path.join(dir, "core", "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "core", "scripts", "scratch.ts"), "// scratch\n");
+
+    const { status, stdout } = runHook(dir);
+    assert.equal(status, 1, "hook must exit 1 when untracked core/ files exist");
+    assert.match(stdout, /untracked files/i, "hook must mention untracked files");
+    assert.match(stdout, /core\/scripts\/scratch\.ts/, "hook must name the untracked file");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2: hosts/_shared/ is a build input and must trigger regeneration
+// ---------------------------------------------------------------------------
+
+function makeRepoWithShared(): string {
+  const dir = makeRepo();
+  fs.mkdirSync(path.join(dir, "hosts", "_shared"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "hosts", "_shared", "entry.template.mjs"), "template\n");
+  execSync("git add hosts/_shared/", { cwd: dir });
+  execSync('git commit -m "add hosts/_shared"', { cwd: dir });
+  return dir;
+}
+
+test("pre-commit hook: triggers regeneration when hosts/_shared/ change is staged", () => {
+  const dir = makeRepoWithShared();
+  try {
+    fs.writeFileSync(path.join(dir, "hosts", "_shared", "entry.template.mjs"), "updated\n");
+    execSync("git add hosts/_shared/", { cwd: dir });
+
+    const { status, stdout } = runHook(dir);
+    assert.equal(status, 0, "hook must run regeneration for staged hosts/_shared/ changes");
+    assert.match(stdout, /regenerating plugin\/ mirror/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pre-commit hook: aborts when tracked hosts/_shared/ file has unstaged modifications", () => {
+  const dir = makeRepoWithShared();
+  try {
+    // Stage a core/ change so the early-exit path does not fire ...
+    fs.writeFileSync(path.join(dir, "core", "a.ts"), "export const a = 2;\n");
+    execSync("git add core/a.ts", { cwd: dir });
+    // ... but leave an unstaged modification to hosts/_shared/.
+    fs.writeFileSync(path.join(dir, "hosts", "_shared", "entry.template.mjs"), "modified\n");
+
+    const { status, stdout } = runHook(dir);
+    assert.equal(status, 1, "hook must exit 1 when unstaged hosts/_shared/ changes exist");
+    assert.match(stdout, /unstaged changes/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
