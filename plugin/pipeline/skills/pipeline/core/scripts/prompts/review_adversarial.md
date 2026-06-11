@@ -9,6 +9,8 @@ Your job is to break confidence in the change, not to validate it.
 
 {{review1_section}}
 
+{{prior_review2_findings}}
+
 {{spec_context}}
 
 ## Operating Stance
@@ -47,8 +49,10 @@ A finding should answer:
 3. What is the likely impact?
 4. What concrete change would reduce the risk?
 
-Prefer one strong finding over several weak ones. Do not dilute serious issues with filler.
+Enumerate EVERY material finding at or above the severity bar in this pass — do not hold secondary issues back for a later round. A complete first pass lets the fix resolve everything at once and converge in a single round; dripping findings one-per-round is a primary cause of non-converging review loops. Do not dilute serious issues with filler.
 If the change looks safe, say so directly and return no findings.
+
+{{severity_rubric}}
 
 Return ONLY valid JSON matching this schema (no markdown fences, no commentary outside the JSON):
 

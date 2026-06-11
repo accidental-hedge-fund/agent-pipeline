@@ -335,6 +335,37 @@ test("review_adversarial: includes review1 section when provided", () => {
   assert.match(out, /ROUND-ONE-SUMMARY/);
 });
 
+test("review_adversarial: omits the ratchet section on a first run, includes it on a re-run", () => {
+  const base = { cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "diff" };
+  const first = buildReviewAdversarialPrompt(base);
+  assert.doesNotMatch(first, /Prior Adversarial Findings/);
+  const rerun = buildReviewAdversarialPrompt({
+    ...base,
+    priorReview2Findings: "## Review 2 — needs-attention\n- [HIGH] stranding",
+  });
+  assert.match(rerun, /Prior Adversarial Findings \(this is a re-review\)/);
+  assert.match(rerun, /verify EACH prior finding is resolved/);
+  assert.match(rerun, /stranding/);
+});
+
+test("review prompts: both include the shared severity rubric (calibration for the policy threshold)", () => {
+  const std = buildReviewStandardPrompt({
+    cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d",
+  });
+  const adv = buildReviewAdversarialPrompt({ cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "d" });
+  for (const out of [std, adv]) {
+    assert.match(out, /## Severity Rubric/);
+    assert.match(out, /do NOT inflate/);
+    assert.match(out, /machine-readable class/); // the `category` tagging guidance
+  }
+});
+
+test("review_adversarial: enumerate-all replaces the old one-finding-at-a-time instruction (the drip fix)", () => {
+  const out = buildReviewAdversarialPrompt({ cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "d" });
+  assert.match(out, /Enumerate EVERY material finding/);
+  assert.doesNotMatch(out, /Prefer one strong finding/);
+});
+
 test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
   const r1 = buildFixPrompt({
     issueNumber: 5,
@@ -367,6 +398,24 @@ test("fix prompt: instructs the trailers with substituted issue + run id (#20)",
   assert.match(out, /Issue: #5/);
   assert.match(out, /Pipeline-Run: 5\/2026-06-08T14:32:00Z/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix prompt: includes prior-round history only when provided (the don't-revert guard)", () => {
+  const without = buildFixPrompt({
+    issueNumber: 5, title: "t", reviewFindings: "f", fixRound: 2, pipelineRunId: "r",
+  });
+  assert.doesNotMatch(without, /Prior Review Rounds/);
+  const withHistory = buildFixPrompt({
+    issueNumber: 5,
+    title: "t",
+    reviewFindings: "f",
+    priorReviewHistory: "--- Prior review 2 attempt 1 ---\nflipped publicly_accessible back to false",
+    fixRound: 2,
+    pipelineRunId: "r",
+  });
+  assert.match(withHistory, /Prior Review Rounds \(history\)/);
+  assert.match(withHistory, /Do NOT revert a fix/);
+  assert.match(withHistory, /publicly_accessible/);
 });
 
 test("test_fix prompt: includes command, attempt counter, and failure output", () => {

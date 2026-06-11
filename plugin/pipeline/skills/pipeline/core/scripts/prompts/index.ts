@@ -201,6 +201,22 @@ Documentation is part of this change — update it in the same commit(s) so revi
 If no documentation is affected, change nothing — do not add boilerplate docs.
 `;
 
+// Shared finding-severity rubric injected into BOTH review prompts so the
+// reviewer's severity labels stay calibrated to what `review_policy.block_threshold`
+// actually blocks on (#17). Single-sourced (like {{schema_block}}) so the two
+// prompts cannot drift. An inflated severity turns an advisory note into a
+// blocking fix round and is a primary cause of non-converging review loops.
+const SEVERITY_RUBRIC = `## Severity Rubric
+
+Rate each finding honestly against real-world impact — do NOT inflate. The policy blocks at its \`block_threshold\` and advances on anything below, so severity is the difference between a blocking fix round and an advisory note.
+
+- **critical** — data loss/corruption, security or auth-boundary bypass, customer-facing outage, or an irreversible/unrecoverable state change.
+- **high** — a real correctness defect, a race/ordering bug with concrete impact, or a failure path that strands a production dependency.
+- **medium** — degraded-but-recoverable behavior, a missing edge case, or a hazard that needs a specific trigger to bite.
+- **low** — defensive hardening, observability gaps, or minor inconsistencies unlikely to affect production.
+
+Set each finding's \`category\` to a short machine-readable class (e.g. \`spec-divergence\`, \`correctness\`, \`security\`, \`data-loss\`, \`concurrency\`, \`observability\`) so downstream gates can key on the field instead of parsing prose.`;
+
 export interface BuildReviewArgs extends BuildPlanArgs {
   plan: string;
   diff: string;
@@ -219,6 +235,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     body: a.body || "(no description)",
     plan: a.plan,
     spec_context: specSection(a.specContext),
+    severity_rubric: SEVERITY_RUBRIC,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -227,6 +244,10 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
 export interface BuildAdversarialArgs extends BuildPlanArgs {
   diff: string;
   review1Summary?: string;
+  /** Prior round-2 review comment, supplied only when review-2 is RE-running
+   * after a fix (the convergence ratchet). Scopes the re-review to "verify
+   * these are resolved + only escalating new findings" instead of a fresh hunt. */
+  priorReview2Findings?: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
 }
@@ -236,6 +257,9 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
   const review1Section = a.review1Summary
     ? `## Review 1 Summary (already addressed)\n\n${a.review1Summary}\n\nThe issues above were already fixed. Focus on finding NEW problems.`
     : "";
+  const priorReview2Section = a.priorReview2Findings
+    ? `## Prior Adversarial Findings (this is a re-review)\n\nThe previous adversarial round raised the findings below; a fix has since landed:\n\n${a.priorReview2Findings}\n\nFirst, verify EACH prior finding is resolved — if any regressed, re-raise it. Then you may raise NEW findings, but only those introduced by the changes since that review and at or above the severity of the findings being fixed. Do not re-scan unchanged code for fresh lower-grade tangents — that is what prevents the review from converging.`
+    : "";
   return substitute(loadTemplate("review_adversarial"), {
     domain_name: dc.name,
     domain_description: dc.description,
@@ -244,7 +268,9 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     title: a.title,
     body: a.body || "(no description)",
     review1_section: review1Section,
+    prior_review2_findings: priorReview2Section,
     spec_context: specSection(a.specContext),
+    severity_rubric: SEVERITY_RUBRIC,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -254,6 +280,9 @@ export interface BuildFixArgs {
   issueNumber: number;
   title: string;
   reviewFindings: string;
+  /** Findings from ALL prior rounds on this PR (not just the current one), so the
+   * fixer doesn't revert an earlier fix and re-trigger a resolved finding. */
+  priorReviewHistory?: string;
   fixRound: 1 | 2;
   /** Pipeline run identifier for the commit traceability trailers (#20). */
   pipelineRunId: string;
@@ -268,6 +297,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     fix_round: String(a.fixRound),
     review_type: a.fixRound === 1 ? "standard" : "adversarial",
     review_findings: a.reviewFindings,
+    prior_review_history: fixHistorySection(a.priorReviewHistory),
     pipeline_run_id: a.pipelineRunId,
     spec_context: specContextSection(a.specContext),
   });
@@ -311,6 +341,18 @@ function specSection(specContext?: string): string {
     "## OpenSpec — Intended Behavior (spec deltas)\n\n" +
     "The diff must satisfy these requirement changes. Flag any divergence from them.\n\n" +
     specContext.trim()
+  );
+}
+
+function fixHistorySection(history?: string): string {
+  if (!history || !history.trim()) return "";
+  return (
+    "\n## Prior Review Rounds (history)\n\n" +
+    "These are findings from earlier rounds on this PR and the fixes already applied for them. " +
+    "Do NOT revert a fix you previously made to satisfy a prior finding; if a prior fix is missing " +
+    "from the current code, reapply it.\n\n" +
+    history.trim() +
+    "\n"
   );
 }
 

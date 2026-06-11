@@ -81,6 +81,7 @@ type RunReviewFn = (
   detail: { title: string; body: string },
   plan: string,
   review1Summary: string | undefined,
+  priorReview2Findings: string | undefined,
   diff: string,
   round: 1 | 2,
   cwd: string,
@@ -173,6 +174,10 @@ export async function advanceReview(
   const detail = await getIssueDetailFn(cfg, issueNumber);
   const plan = extractPlan(detail.comments);
   const review1Summary = round === 2 ? extractReview1Summary(detail.comments) : undefined;
+  // Convergence ratchet: when review-2 is RE-running after a fix, hand the prior
+  // round's findings to the reviewer so it verifies resolution + only escalates,
+  // instead of re-hunting the whole diff for fresh lower-grade tangents (the drip).
+  const priorReview2Findings = round === 2 ? extractReview2Findings(detail.comments) : undefined;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would invoke ${reviewer} for ${stage}`);
@@ -189,6 +194,7 @@ export async function advanceReview(
     detail,
     plan,
     review1Summary,
+    priorReview2Findings,
     diff,
     round,
     cwd,
@@ -300,6 +306,37 @@ export async function advanceReview(
     };
   }
 
+  // Bounded rounds: cap how many times this review round may re-run before we
+  // stop looping. After `max_adversarial_rounds` passes still produce blocking
+  // findings, record them as advisory and route to the `needs-human` terminal —
+  // a human owns the residual call — instead of burning another fix→re-review
+  // cycle to the iteration cap. `detail.comments` excludes the current round's
+  // verdict (posted after the snapshot was fetched), so prior+1 = this round's number.
+  const roundCap = cfg.review_policy.max_adversarial_rounds;
+  const priorRounds = countPriorRounds(detail.comments, round);
+  if (roundCap > 0 && priorRounds + 1 >= roundCap) {
+    await postCommentFn(
+      cfg,
+      issueNumber,
+      reviewCeilingComment(cfg, round, reviewer, partition, roundCap),
+    );
+    await transitionFn(
+      cfg,
+      issueNumber,
+      stage,
+      "needs-human",
+      `Review ${round} hit the ${roundCap}-round ceiling with ` +
+        `${partition.blocking.length} finding(s) still blocking. Recorded as advisory; parked at ` +
+        `needs-human for a human to override or fix (will NOT auto-advance to ready-to-deploy).`,
+    );
+    return {
+      advanced: true,
+      from: stage,
+      to: "needs-human",
+      summary: `review ceiling: ${partition.blocking.length} unresolved blocking → needs-human`,
+    };
+  }
+
   const fixStage: Stage = round === 1 ? "fix-1" : "fix-2";
   const advisoryNote =
     partition.advisory.length || partition.overridden.length
@@ -356,6 +393,45 @@ function advisoryAdvanceComment(
   return lines.join("\n");
 }
 
+/**
+ * Punch-list comment posted when a review round hits the `max_adversarial_rounds`
+ * ceiling: the still-blocking findings are recorded as advisory and the item is
+ * parked at `needs-human`. Lists each with its override-key so a human can accept
+ * it (`--override`) or fix it, then relabel to resume. Never auto-advances.
+ */
+function reviewCeilingComment(
+  cfg: PipelineConfig,
+  round: 1 | 2,
+  reviewer: string,
+  partition: PartitionResult,
+  cap: number,
+): string {
+  const lines = [
+    `## Pipeline: Review ceiling reached — human decision required`,
+    "",
+    `**Reviewer**: ${reviewer}`,
+    `Review ${round} re-ran ${cap} times and still has ${partition.blocking.length} blocking ` +
+      `finding(s). To stop looping, they are recorded as **advisory** and this item is parked at ` +
+      `\`needs-human\` — it will NOT auto-advance to ready-to-deploy.`,
+    "",
+    "### Unresolved blocking findings",
+  ];
+  for (const f of partition.blocking) {
+    const loc = f.file ? ` — \`${f.file}${f.line_start ? `:${f.line_start}` : ""}\`` : "";
+    lines.push(`- \`${findingKey(f)}\` **[${(f.severity ?? "medium").toUpperCase()}]** ${f.title}${loc}`);
+  }
+  lines.push(
+    "",
+    "### To resume",
+    `- Accept a finding: comment \`--override "<key>: <reason>"\` (audited), then relabel ` +
+      `\`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
+    `- Or fix the finding(s) by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
+    "",
+    (cfg.marker_footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
+  );
+  return lines.join("\n");
+}
+
 /** Default {@link RunReviewFn}: runs the prompt-harness reviewer. */
 const defaultRunReview: RunReviewFn = (
   cfg,
@@ -363,12 +439,13 @@ const defaultRunReview: RunReviewFn = (
   detail,
   plan,
   review1Summary,
+  priorReview2Findings,
   diff,
   round,
   cwd,
   opts,
 ) =>
-  invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, diff, round, cwd, opts);
+  invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, priorReview2Findings, diff, round, cwd, opts);
 
 async function invokePromptHarnessReview(
   cfg: PipelineConfig,
@@ -377,6 +454,7 @@ async function invokePromptHarnessReview(
   body: string,
   plan: string,
   review1Summary: string | undefined,
+  priorReview2Findings: string | undefined,
   diff: string,
   round: 1 | 2,
   cwd: string,
@@ -385,7 +463,7 @@ async function invokePromptHarnessReview(
   const specContext = openspec.openspecContext(cfg, cwd);
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
-    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, specContext });
+    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext });
   return invoke(cfg.harnesses.reviewer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
     model: opts.model ?? cfg.models.review,
@@ -685,6 +763,26 @@ function extractReview1Summary(comments: { body: string }[]): string {
     (b) => b.startsWith(REVIEW_MARKER_PREFIX_R1),
   );
   return (m?.body ?? "").slice(0, 2000);
+}
+
+/** Latest prior `## Review 2` comment, for the convergence ratchet — fed back to
+ * the reviewer on a re-run so it verifies resolution + only escalates instead of
+ * re-hunting the whole diff. `undefined` when review-2 has not run before. */
+function extractReview2Findings(comments: { body: string }[]): string | undefined {
+  const m = findLatestCommentMatching(
+    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+    (b) => b.startsWith(REVIEW_MARKER_PREFIX_R2),
+  );
+  return m?.body ? m.body.slice(0, 2000) : undefined;
+}
+
+/** How many prior `## Review {round}` verdict comments already exist on the issue.
+ * Excludes the current round's comment, which is posted to the PR only after the
+ * in-memory `detail` snapshot was fetched. Drives the bounded-rounds ceiling.
+ * Exported for tests. */
+export function countPriorRounds(comments: { body: string }[], round: 1 | 2): number {
+  const prefix = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
+  return comments.filter((c) => c.body.startsWith(prefix)).length;
 }
 
 /** Which review round a comment body belongs to, or null if it isn't one. */

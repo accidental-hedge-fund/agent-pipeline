@@ -13,10 +13,14 @@ export const STAGES = [
   "pre-merge",
   "eval-gate",
   "ready-to-deploy",
+  // Terminal off-ramp: a review round hit `max_adversarial_rounds` with findings
+  // still blocking. The item stops here with an advisory punch-list for a human
+  // to override or fix — it is never auto-advanced to ready-to-deploy.
+  "needs-human",
 ] as const;
 export type Stage = (typeof STAGES)[number];
 
-export const TERMINAL_STAGES = new Set<Stage>(["ready-to-deploy"]);
+export const TERMINAL_STAGES = new Set<Stage>(["ready-to-deploy", "needs-human"]);
 export const LABEL_PREFIX = "pipeline:";
 export const BLOCKED_LABEL = "blocked";
 export const HARNESS_LABEL_PREFIX = "harness:";
@@ -92,12 +96,17 @@ export interface PipelineConfig {
   // `min_confidence`) are recorded as advisory and do NOT route to a fix round;
   // when a review produces only advisory/overridden findings the item advances
   // as if approved. Operator overrides of individual blocking findings are
-  // audited via `pipeline-override` comment sentinels. Default
-  // (`block_threshold: "low"`, `min_confidence: 0`) blocks on every finding,
-  // reproducing pre-#17 behavior.
+  // audited via `pipeline-override` comment sentinels. The default
+  // (`block_threshold: "high"`, `min_confidence: 0.7`) advances on advisory-grade
+  // findings so sound changes converge autonomously; set `block_threshold: "low"`
+  // to block on every finding (pre-1.0.1 behavior). `max_adversarial_rounds` caps
+  // how many times a review round may re-run before still-blocking findings are
+  // recorded as advisory and the item is routed to the `needs-human` terminal
+  // instead of looping to the iteration cap.
   review_policy: {
     block_threshold: "critical" | "high" | "medium" | "low";
     min_confidence: number; // 0..1; findings below this advise rather than block
+    max_adversarial_rounds: number; // cap review-round re-runs before needs-human
   };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
@@ -135,7 +144,7 @@ export const DEFAULT_CONFIG: Omit<
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
-  review_policy: { block_threshold: "low" as const, min_confidence: 0 },
+  review_policy: { block_threshold: "high" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
 };
 
 // ---------------------------------------------------------------------------
@@ -206,6 +215,12 @@ export interface ReviewFinding {
   line_end?: number;
   confidence: number;
   recommendation: string;
+  // Optional machine-readable class (e.g. "spec-divergence", "correctness",
+  // "security"). Lets a gate read a structured field instead of inferring intent
+  // from free-text prose — prose inference oscillates false-pos/false-neg and
+  // never converges (the #106 detector failure). Gates SHOULD key on this, never
+  // on keyword-matching a finding's body.
+  category?: string;
 }
 
 export interface ReviewVerdict {

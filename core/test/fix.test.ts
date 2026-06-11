@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { enforceFixCommitGate } from "../scripts/stages/fix.ts";
+import { enforceFixCommitGate, extractAllReviewFindingsHistory } from "../scripts/stages/fix.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 
 function msgsDeps(messages: string[]): VerifyDeps {
@@ -14,6 +14,32 @@ function msgsDeps(messages: string[]): VerifyDeps {
     gitDirtyFiles: async () => [],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Cross-round finding history (1.0.1 convergence: stop the fixer reverting prior fixes)
+// ---------------------------------------------------------------------------
+
+const r2 = (n: number) => ({
+  body: `## Review 2 (Adversarial) — needs-attention\n\n### Findings\n\nfinding ${n}`,
+});
+
+test("extractAllReviewFindingsHistory: empty when fewer than two matching rounds", () => {
+  assert.equal(extractAllReviewFindingsHistory([], 2), "");
+  assert.equal(extractAllReviewFindingsHistory([r2(1)], 2), "", "only the current round → no prior history");
+  assert.equal(
+    extractAllReviewFindingsHistory([{ body: "## Implementation Plan" }, r2(1)], 2),
+    "",
+  );
+});
+
+test("extractAllReviewFindingsHistory: joins prior rounds, excluding the most recent (current) one", () => {
+  const out = extractAllReviewFindingsHistory([r2(1), r2(2), r2(3)], 2);
+  assert.match(out, /Prior review 2 attempt 1/);
+  assert.match(out, /Prior review 2 attempt 2/);
+  assert.match(out, /finding 1/);
+  assert.match(out, /finding 2/);
+  assert.doesNotMatch(out, /finding 3/); // the latest is supplied verbatim as current findings
+});
 
 // ---------------------------------------------------------------------------
 // Fix round 1 (4.3 / 4.4)

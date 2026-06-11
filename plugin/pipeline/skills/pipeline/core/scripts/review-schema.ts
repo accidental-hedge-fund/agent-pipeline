@@ -32,7 +32,8 @@ export const REVIEW_VERDICT_SCHEMA_BLOCK = `{
             "line_start": <int>,
             "line_end": <int>,
             "confidence": <0.0-1.0>,
-            "recommendation": "<concrete fix>"
+            "recommendation": "<concrete fix>",
+            "category": "<optional: spec-divergence|correctness|security|...>"
         }
     ],
     "next_steps": ["<action item>"]
@@ -54,6 +55,7 @@ const FINDING_FIELD_GUARD: Record<keyof ReviewFinding, true> = {
   line_end: true,
   confidence: true,
   recommendation: true,
+  category: true,
 };
 const VERDICT_FIELD_GUARD: Record<Exclude<keyof ReviewVerdict, "commitSha">, true> = {
   verdict: true,

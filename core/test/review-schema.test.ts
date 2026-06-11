@@ -181,6 +181,7 @@ test("drift guard: schema block preserves the historical field order and nesting
     "line_end",
     "confidence",
     "recommendation",
+    "category",
   ]);
   assert.deepEqual(parsed.verdict, REVIEW_SCHEMA_FIELDS.verdict);
   assert.deepEqual(parsed.finding, REVIEW_SCHEMA_FIELDS.finding);

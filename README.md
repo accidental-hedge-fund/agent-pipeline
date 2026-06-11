@@ -217,8 +217,9 @@ eval_gate:                           # run the repo's eval harness after pre-mer
   timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
   max_attempts: 2                    # total attempts before giving up (1 = no retry)
 review_policy:                       # which review findings block progression vs. merely advise
-  block_threshold: low               # critical|high|medium|low — findings below this advise, not block (default: low = block on every finding)
-  min_confidence: 0                  # 0..1 — findings below this confidence advise, not block (default: 0 = no confidence gate)
+  block_threshold: high              # critical|high|medium|low — findings below this advise, not block (default: high; set 'low' to block on every finding)
+  min_confidence: 0.7                # 0..1 — findings below this confidence advise, not block (default: 0.7)
+  max_adversarial_rounds: 3          # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to pipeline:needs-human
 # Harness roles (implementer/reviewer) are owned by the install profile and cannot
 # be set here — a `harnesses:` key is rejected at config-parse time.
 ```
@@ -355,10 +356,11 @@ When disabled (the default), pre-merge advances straight to `ready-to-deploy` an
 
 ### Review severity policy & audited overrides
 
-By default **every** review finding blocks: a `needs-attention` verdict routes to a fix round regardless of how severe or confident the finding is. `review_policy` lets a repo declare which findings actually block:
+By default only **high/critical, well-confident** findings block: a `needs-attention` verdict routes to a fix round only when a finding meets the severity threshold and the confidence floor. `review_policy` lets a repo tune this:
 
-- **`block_threshold`** (`critical`|`high`|`medium`|`low`, default `low`) — findings whose severity is **below** the threshold are recorded as **advisory** and do not route to a fix round. The default `low` blocks on everything (pre-policy behavior); set `high` to let medium/low findings advise without blocking.
-- **`min_confidence`** (`0`..`1`, default `0`) — findings whose reported confidence is below this floor advise rather than block, even if high-severity.
+- **`block_threshold`** (`critical`|`high`|`medium`|`low`, default `high`) — findings whose severity is **below** the threshold are recorded as **advisory** and do not route to a fix round. The default `high` lets medium/low findings advise without blocking, so sound changes converge autonomously; set `low` to block on every finding (pre-1.0.1 behavior).
+- **`min_confidence`** (`0`..`1`, default `0.7`) — findings whose reported confidence is below this floor advise rather than block, even if high-severity.
+- **`max_adversarial_rounds`** (integer, default `3`) — caps how many times a review round may re-run after a fix. Once a round hits the cap with findings still blocking, they are recorded as advisory and the item is parked at the **`pipeline:needs-human`** terminal with a punch-list comment — it never loops to exhaustion and never auto-advances with unresolved blocking findings. Resume by `--override`-ing or fixing the findings, then relabel `pipeline:needs-human` → `pipeline:review-2`.
 
 When a review produces findings but **none block** under the policy, the item advances as if approved, and an audited *"advanced under severity policy"* comment records the advisory findings (each with its key, severity, and why it didn't block). The pipeline still stops at `ready-to-deploy` — you still own the merge.
 
@@ -369,7 +371,7 @@ When a review produces findings but **none block** under the policy, the item ad
 /pipeline N --override "<override-key>: deferred #123 — tracked separately"
 ```
 
-This posts an audited `## Pipeline: Finding override` comment (the recording account is the *who*, your reason the *why*) and clears the `blocked` label; re-run `/pipeline N` to advance with the override applied. The key is content-addressed, so a finding the reviewer re-emits on a later commit keeps the same key and the override keeps applying. **Rollback** is `review_policy: { block_threshold: low, min_confidence: 0 }` (the default).
+This posts an audited `## Pipeline: Finding override` comment (the recording account is the *who*, your reason the *why*) and clears the `blocked` label; re-run `/pipeline N` to advance with the override applied. The key is content-addressed, so a finding the reviewer re-emits on a later commit keeps the same key and the override keeps applying. **Rollback** to the pre-1.0.1 block-on-everything behavior is `review_policy: { block_threshold: low, min_confidence: 0 }`.
 
 ### OpenSpec integration
 

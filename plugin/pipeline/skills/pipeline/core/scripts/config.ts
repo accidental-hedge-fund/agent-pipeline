@@ -68,6 +68,7 @@ const PartialConfigSchema = z.object({
     .object({
       block_threshold: z.enum(["critical", "high", "medium", "low"]).optional(),
       min_confidence: z.number().min(0).max(1).optional(),
+      max_adversarial_rounds: z.number().int().positive().optional(),
     })
     .strict()
     .optional(),
@@ -198,6 +199,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig.review_policy?.block_threshold ?? DEFAULT_CONFIG.review_policy.block_threshold,
       min_confidence:
         fileConfig.review_policy?.min_confidence ?? DEFAULT_CONFIG.review_policy.min_confidence,
+      max_adversarial_rounds:
+        fileConfig.review_policy?.max_adversarial_rounds ??
+        DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -311,7 +315,8 @@ eval_gate: # run the repo's eval harness after pre-merge
   max_attempts: ${d.eval_gate.max_attempts} # total attempts before giving up (1 = no retry)
 
 review_policy: # which review findings block progression vs. merely advise (#17)
-  block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block
+  block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
   min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
+  max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
 `;
 }

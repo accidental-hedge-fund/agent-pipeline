@@ -325,7 +325,14 @@ export async function ensurePipelineLabels(cfg: PipelineConfig): Promise<void> {
     { name: "harness:codex", color: "0052CC", description: "Pipeline item owned by Codex primary harness" },
     ...STAGES.map((stage) => ({
       name: `${LABEL_PREFIX}${stage}`,
-      color: stage === "ready-to-deploy" ? "0E8A16" : stage.includes("review") ? "5319E7" : "1D76DB",
+      color:
+        stage === "ready-to-deploy"
+          ? "0E8A16"
+          : stage === "needs-human"
+            ? "D93F0B"
+            : stage.includes("review")
+              ? "5319E7"
+              : "1D76DB",
       description: `Pipeline stage: ${stage}`,
     })),
   ];
