@@ -439,6 +439,28 @@ export async function postComment(
   ]);
 }
 
+/**
+ * Post a comment on the PULL REQUEST (not the linked issue). The pipeline does all
+ * its review bookkeeping on the issue, but a human merges the PR — so findings the
+ * pipeline advanced past as advisory can slip the merge button if they live only
+ * on the issue. This surfaces them where the merge decision is made.
+ */
+export async function postPrComment(
+  cfg: PipelineConfig,
+  prNumber: number,
+  body: string,
+): Promise<void> {
+  await ghRun([
+    "pr",
+    "comment",
+    String(prNumber),
+    "--body",
+    body,
+    "-R",
+    cfg.repo,
+  ]);
+}
+
 export async function transition(
   cfg: PipelineConfig,
   issueNumber: number,

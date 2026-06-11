@@ -303,7 +303,7 @@ test("resolveConfig: eval_gate enabled:false keeps other defaults", async () => 
 
 // ---- review_policy (#17) ----
 
-test("resolveConfig: review_policy defaults apply when absent (advisory-grade findings advance; bounded rounds)", async () => {
+test("resolveConfig: review_policy defaults apply when absent (block medium+, conf floor 0.7, bounded rounds)", async () => {
   const repo = makeFakeRepo(null);
   const binDir = makeFakeGh("acme/rp0");
   const oldPath = process.env.PATH;
@@ -312,7 +312,7 @@ test("resolveConfig: review_policy defaults apply when absent (advisory-grade fi
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
     assert.equal(cfg.review_policy.block_threshold, DEFAULT_CONFIG.review_policy.block_threshold);
-    assert.equal(cfg.review_policy.block_threshold, "high");
+    assert.equal(cfg.review_policy.block_threshold, "medium");
     assert.equal(cfg.review_policy.min_confidence, DEFAULT_CONFIG.review_policy.min_confidence);
     assert.equal(cfg.review_policy.min_confidence, 0.7);
     assert.equal(
@@ -335,7 +335,7 @@ test("resolveConfig: review_policy.max_adversarial_rounds override merges", asyn
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
     assert.equal(cfg.review_policy.max_adversarial_rounds, 2);
     // untouched fields keep their defaults
-    assert.equal(cfg.review_policy.block_threshold, "high");
+    assert.equal(cfg.review_policy.block_threshold, "medium");
   } finally {
     process.env.PATH = oldPath;
   }

@@ -217,7 +217,7 @@ eval_gate:                           # run the repo's eval harness after pre-mer
   timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
   max_attempts: 2                    # total attempts before giving up (1 = no retry)
 review_policy:                       # which review findings block progression vs. merely advise
-  block_threshold: high              # critical|high|medium|low — findings below this advise, not block (default: high; set 'low' to block on every finding)
+  block_threshold: medium            # critical|high|medium|low — findings below this advise, not block (default: medium; 'high' = more throughput, 'low' = block on everything)
   min_confidence: 0.7                # 0..1 — findings below this confidence advise, not block (default: 0.7)
   max_adversarial_rounds: 3          # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to pipeline:needs-human
 # Harness roles (implementer/reviewer) are owned by the install profile and cannot
@@ -358,7 +358,7 @@ When disabled (the default), pre-merge advances straight to `ready-to-deploy` an
 
 By default only **high/critical, well-confident** findings block: a `needs-attention` verdict routes to a fix round only when a finding meets the severity threshold and the confidence floor. `review_policy` lets a repo tune this:
 
-- **`block_threshold`** (`critical`|`high`|`medium`|`low`, default `high`) — findings whose severity is **below** the threshold are recorded as **advisory** and do not route to a fix round. The default `high` lets medium/low findings advise without blocking, so sound changes converge autonomously; set `low` to block on every finding (pre-1.0.1 behavior).
+- **`block_threshold`** (`critical`|`high`|`medium`|`low`, default `medium`) — findings whose severity is **below** the threshold are recorded as **advisory** and do not route to a fix round. The default `medium` blocks medium-and-above (only low-severity findings advise), so real issues are fixed or explicitly overridden rather than silently advised past at merge (review comments land on the issue, but a human merges the PR). Set `high` to also advise medium findings (more throughput, less rigor), or `low` to block on every finding.
 - **`min_confidence`** (`0`..`1`, default `0.7`) — findings whose reported confidence is below this floor advise rather than block, even if high-severity.
 - **`max_adversarial_rounds`** (integer, default `3`) — caps how many times a review round may re-run after a fix. Once a round hits the cap with findings still blocking, they are recorded as advisory and the item is parked at the **`pipeline:needs-human`** terminal with a punch-list comment — it never loops to exhaustion and never auto-advances with unresolved blocking findings. Resume by `--override`-ing or fixing the findings, then relabel `pipeline:needs-human` → `pipeline:review-2`.
 

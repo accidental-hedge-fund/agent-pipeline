@@ -1,7 +1,7 @@
 // Terminal stage. Posts a final summary on the issue, removes the worktree.
 // Idempotent — safe to call multiple times.
 
-import { addLabelToPr, getIssueDetail, getPrForIssue, postComment } from "../gh.ts";
+import { addLabelToPr, getIssueDetail, getPrForIssue, postComment, postPrComment } from "../gh.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import { getForIssue, removeWorktree } from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
@@ -20,6 +20,12 @@ export async function finalize(
 
   if (!alreadyPosted) {
     const prRef = prNumber ? `PR #${prNumber}` : "(no PR found)";
+    // Surface unresolved advisory findings at the merge point. Each advisory
+    // advance posts a "advanced under severity policy" comment; if any exist, the
+    // human should weigh them before merging (they were not fixed).
+    const advisoryRounds = detail.comments.filter(
+      (c) => c.body.startsWith("## Pipeline: Review") && c.body.includes("advanced under severity policy"),
+    ).length;
     const summary = [
       FINAL_SUMMARY_MARKER,
       "",
@@ -29,6 +35,13 @@ export async function finalize(
       `- **Reviewer**: ${cfg.harnesses.reviewer}`,
       `- **CI**: passing`,
       `- **Conflicts**: none`,
+      ...(advisoryRounds
+        ? [
+            "",
+            `⚠️ **${advisoryRounds} review round(s) advanced with advisory findings** that were not fixed — ` +
+              `review the advisory comments on this PR before merging.`,
+          ]
+        : []),
       "",
       "Ready to merge. The pipeline does NOT auto-merge — push the merge button when you're satisfied.",
       "",
@@ -37,6 +50,18 @@ export async function finalize(
     ].join("\n");
     await postComment(cfg, issueNumber, summary);
     console.log(`[pipeline] #${issueNumber}: final summary posted`);
+    // Mirror the summary onto the PR — the merge decision happens there, not on
+    // the issue. Best-effort; the issue copy is authoritative.
+    if (prNumber) {
+      try {
+        await postPrComment(cfg, prNumber, summary);
+      } catch (err) {
+        console.log(
+          `[pipeline] #${issueNumber}: could not post final summary to PR #${prNumber} ` +
+            `(${(err as Error).message}); skipping (non-blocking)`,
+        );
+      }
+    }
   } else {
     console.log(`[pipeline] #${issueNumber}: final summary already exists`);
   }
