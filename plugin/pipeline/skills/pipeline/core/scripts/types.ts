@@ -97,9 +97,12 @@ export interface PipelineConfig {
   // when a review produces only advisory/overridden findings the item advances
   // as if approved. Operator overrides of individual blocking findings are
   // audited via `pipeline-override` comment sentinels. The default
-  // (`block_threshold: "high"`, `min_confidence: 0.7`) advances on advisory-grade
-  // findings so sound changes converge autonomously; set `block_threshold: "low"`
-  // to block on every finding (pre-1.0.1 behavior). `max_adversarial_rounds` caps
+  // (`block_threshold: "medium"`, `min_confidence: 0.7`) blocks medium-and-above
+  // so real issues are fixed or explicitly overridden — not silently advised past
+  // at the merge button (review comments land on the issue, but a human merges the
+  // PR). Set `block_threshold: "high"` to also advise medium findings (more
+  // throughput, less rigor) or `"low"` to block on every finding.
+  // `max_adversarial_rounds` caps
   // how many times a review round may re-run before still-blocking findings are
   // recorded as advisory and the item is routed to the `needs-human` terminal
   // instead of looping to the iteration cap.
@@ -144,7 +147,7 @@ export const DEFAULT_CONFIG: Omit<
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
-  review_policy: { block_threshold: "high" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
 };
 
 // ---------------------------------------------------------------------------

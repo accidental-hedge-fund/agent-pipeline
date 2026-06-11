@@ -373,6 +373,7 @@ interface Recorder {
   transitions: { to: Stage }[];
   blocked: string[];
   comments: string[];
+  prComments: string[];
 }
 
 /**
@@ -381,7 +382,7 @@ interface Recorder {
  * reused if more invocations occur than entries provided).
  */
 function makeDeps(stdouts: string[]): { deps: AdvanceReviewDeps; rec: Recorder } {
-  const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], comments: [] };
+  const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], comments: [], prComments: [] };
   const result = (stdout: string): HarnessResult => ({
     success: true,
     stdout,
@@ -411,6 +412,9 @@ function makeDeps(stdouts: string[]): { deps: AdvanceReviewDeps; rec: Recorder }
     getForIssue: async () => null,
     postComment: async (_cfg, _n, body) => {
       rec.comments.push(body);
+    },
+    postPrComment: async (_cfg, _pr, body) => {
+      rec.prComments.push(body);
     },
     transition: async (_cfg, _n, _from, to) => {
       rec.transitions.push({ to });
@@ -627,8 +631,8 @@ test("advanceReview (#17): an operator override on a blocking finding advances i
 });
 
 // ---------------------------------------------------------------------------
-// Convergence hotfix (1.0.1): the high default advances advisory-grade findings,
-// and a round ceiling routes to needs-human instead of looping to exhaustion.
+// Convergence hotfix (1.0.1): a round ceiling routes to needs-human instead of
+// looping to exhaustion. Uses the shipped default policy (block medium+, cap 3).
 // ---------------------------------------------------------------------------
 
 const cfgConverge = {
@@ -637,7 +641,7 @@ const cfgConverge = {
   repo_dir: "/tmp/repo",
   models: { review: "opus" },
   marker_footer: "*Automated by Claude Code Pipeline Skill*",
-  review_policy: { block_threshold: "high", min_confidence: 0.7, max_adversarial_rounds: 3 },
+  review_policy: { block_threshold: "medium", min_confidence: 0.7, max_adversarial_rounds: 3 },
 } as unknown as PipelineConfig;
 
 // `NA_MEDIUM` (declared above for the #17 tests) advances under the high default;
@@ -713,4 +717,35 @@ test("countPriorRounds: counts prior review-N verdict comments by header", () =>
   assert.equal(countPriorRounds(comments, 2), 2);
   assert.equal(countPriorRounds(comments, 1), 1);
   assert.equal(countPriorRounds([], 2), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Merge-point visibility: advisory findings are mirrored to the PR, not left
+// only on the issue (a human merges the PR, not the issue).
+// ---------------------------------------------------------------------------
+
+test("advisory findings are mirrored to the PR for merge-point visibility", async (t) => {
+  // A medium finding under the high threshold is advisory → the item advances; the
+  // record must land on the PR, since review bookkeeping otherwise lives only on
+  // the issue while the human merges the PR.
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  await quiet(t, async () => {
+    await advanceReview(policyHighCfg, 9, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }], "advisory advance");
+  assert.equal(rec.prComments.length, 1, "advisory comment mirrored to the PR exactly once");
+  assert.match(rec.prComments[0], /advanced under severity policy/);
+  assert.match(rec.prComments[0], /not fixed/);
+  assert.match(rec.prComments[0], /before merging/);
+});
+
+test("a blocking finding routes to fix and does NOT post to the PR (only advisory advances mirror)", async (t) => {
+  // Default policy (cfg, block_threshold "low") blocks the high finding → fix-2,
+  // no advisory advance, so nothing is mirrored to the PR.
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  await quiet(t, async () => {
+    await advanceReview(cfg, 9, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  assert.deepEqual(rec.prComments, [], "no PR mirror when the item routes to a fix round");
 });

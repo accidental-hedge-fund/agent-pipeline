@@ -16,6 +16,7 @@ import {
   getPrDiff,
   getPrForIssue,
   postComment,
+  postPrComment,
   setBlocked,
   transition,
 } from "../gh.ts";
@@ -69,6 +70,7 @@ export interface AdvanceReviewDeps {
   getIssueDetail?: typeof getIssueDetail;
   getForIssue?: typeof getForIssue;
   postComment?: typeof postComment;
+  postPrComment?: typeof postPrComment;
   transition?: typeof transition;
   setBlocked?: typeof setBlocked;
   /** Runs one review round and returns the raw harness result. */
@@ -102,6 +104,7 @@ export async function advanceReview(
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getForIssueFn = deps.getForIssue ?? getForIssue;
   const postCommentFn = deps.postComment ?? postComment;
+  const postPrCommentFn = deps.postPrComment ?? postPrComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const runReviewFn = deps.runReview ?? defaultRunReview;
@@ -288,7 +291,20 @@ export async function advanceReview(
   const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides);
 
   if (partition.blocking.length === 0) {
-    await postCommentFn(cfg, issueNumber, advisoryAdvanceComment(cfg, round, reviewer, partition));
+    const advisory = advisoryAdvanceComment(cfg, round, reviewer, partition);
+    await postCommentFn(cfg, issueNumber, advisory);
+    // Also surface on the PR: review bookkeeping lives on the issue, but a human
+    // merges the PR — advisory findings recorded only on the issue can slip the
+    // merge button. Best-effort (the issue record is authoritative).
+    if (partition.advisory.length || partition.overridden.length) {
+      try {
+        await postPrCommentFn(cfg, prNumber, advisory);
+      } catch (err) {
+        console.warn(
+          `[pipeline] #${issueNumber}: could not mirror advisory findings to PR #${prNumber}: ${(err as Error).message}`,
+        );
+      }
+    }
     const toStage: Stage = round === 1 ? "review-2" : "pre-merge";
     await transitionFn(
       cfg,
@@ -388,6 +404,12 @@ function advisoryAdvanceComment(
     for (const { finding, key, disposition } of partition.overridden) {
       lines.push(`- \`${key}\` **[${(finding.severity ?? "medium").toUpperCase()}]** ${finding.title} — ${disposition}`);
     }
+  }
+  if (partition.advisory.length) {
+    lines.push(
+      "",
+      "⚠️ The advisory findings above were **not fixed** — review them before merging this PR.",
+    );
   }
   lines.push("", (cfg.marker_footer ?? "*Automated by Claude Code Pipeline Skill*").trim());
   return lines.join("\n");
