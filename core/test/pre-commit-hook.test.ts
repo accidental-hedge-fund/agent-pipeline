@@ -185,3 +185,40 @@ test("pre-commit hook: aborts when tracked hosts/_shared/ file has unstaged modi
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Finding (review 2): staged renames out of source dirs must still trigger regen
+// ---------------------------------------------------------------------------
+
+test("pre-commit hook: triggers regeneration when a core/ file is renamed out of core/", () => {
+  const dir = makeRepo();
+  try {
+    // Stage a rename of a core/ file to a non-source directory.
+    // Without --no-renames, `git diff --cached --name-only` reports only the
+    // destination path (docs/a.ts), missing the core/ prefix and skipping regen.
+    // With --no-renames the source deletion (core/a.ts) is also reported, so the
+    // grep triggers regeneration as required.
+    fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+    execSync("git mv core/a.ts docs/a.ts", { cwd: dir });
+
+    const { status, stdout } = runHook(dir);
+    assert.equal(status, 0, "hook must run regeneration when a core/ file is renamed out");
+    assert.match(stdout, /regenerating plugin\/ mirror/i, "hook must mention regeneration");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pre-commit hook: triggers regeneration when a hosts/_shared/ file is renamed out", () => {
+  const dir = makeRepoWithShared();
+  try {
+    fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
+    execSync("git mv hosts/_shared/entry.template.mjs docs/entry.template.mjs", { cwd: dir });
+
+    const { status, stdout } = runHook(dir);
+    assert.equal(status, 0, "hook must run regeneration when a hosts/_shared/ file is renamed out");
+    assert.match(stdout, /regenerating plugin\/ mirror/i, "hook must mention regeneration");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
