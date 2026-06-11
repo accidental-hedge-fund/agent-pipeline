@@ -90,7 +90,7 @@ test("needsHumanPunchlist: returns null for an empty comment list", () => {
 // 3.3 helper: multiple ceiling comments → last one wins
 // ---------------------------------------------------------------------------
 
-test("needsHumanPunchlist: with multiple ceiling comments, uses the latest (highest index)", () => {
+test("needsHumanPunchlist: with multiple ceiling comments, uses the latest (highest index) for the count", () => {
   const comments: Comment[] = [
     ceilingComment({ round: 2, findings: TWO_FINDINGS, createdAt: "2026-06-10T00:00:00Z" }),
     { author: "human", body: "fixed one of them", createdAt: "2026-06-10T01:00:00Z" },
@@ -99,10 +99,21 @@ test("needsHumanPunchlist: with multiple ceiling comments, uses the latest (high
   ];
   const out = needsHumanPunchlist(comments);
   assert.ok(out !== null);
-  // Count + resume label come from the LAST ceiling comment, not the first.
+  // Count comes from the LAST ceiling comment, not the first.
   assert.match(out, /1 unresolved blocking finding\b/, `should use the last ceiling's count; got:\n${out}`);
-  assert.match(out, /pipeline:review-1/, `should use the last ceiling's resume round; got:\n${out}`);
-  assert.doesNotMatch(out, /pipeline:review-2/, `must not use the stale first ceiling; got:\n${out}`);
+  // Resume target is always review-2 regardless of which round hit the ceiling.
+  assert.match(out, /pipeline:review-2/, `resume target must always be review-2; got:\n${out}`);
+});
+
+// Regression for finding e8b1f0b4: a round-1 ceiling comment must not emit review-1 as the resume
+// target. The regex in the old ceilingResumeLabel() matched the first pipeline:review-N in the
+// body, which could be review-1 from finding prose or the To resume section of a round-1 comment.
+test("needsHumanPunchlist: a round-1 ceiling comment always emits pipeline:review-2 as the resume target", () => {
+  // The round-1 ceiling comment body contains "pipeline:review-1" in its "To resume" section.
+  const out = needsHumanPunchlist([ceilingComment({ round: 1, findings: TWO_FINDINGS })]);
+  assert.ok(out !== null);
+  assert.match(out, /pipeline:review-2/, `resume target must be review-2, not review-1; got:\n${out}`);
+  assert.doesNotMatch(out, /pipeline:review-1/, `must not emit review-1 as resume target; got:\n${out}`);
 });
 
 // ---------------------------------------------------------------------------

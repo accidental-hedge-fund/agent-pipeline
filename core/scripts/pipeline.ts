@@ -302,12 +302,11 @@ export function needsHumanPunchlist(
   if (body === undefined) return null;
 
   const count = countCeilingFindings(body);
-  const resumeLabel = ceilingResumeLabel(body);
   const noun = count === 1 ? "finding" : "findings";
   return [
     `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
     `To resume: accept a finding with \`--override "<key>: <reason>"\` (audited) or fix it by hand,`,
-    `then relabel \`pipeline:needs-human\` → \`${resumeLabel}\`.`,
+    `then relabel \`pipeline:needs-human\` → \`pipeline:review-2\`.`,
   ].join("\n");
 }
 
@@ -323,13 +322,6 @@ function countCeilingFindings(body: string): number {
     if (lines[i].startsWith("- ")) count++;
   }
   return count;
-}
-
-/** The review round the ceiling comment names as the resume target — review-1 or
- *  review-2 (the ceiling is reachable from either). Defaults to review-2. */
-function ceilingResumeLabel(body: string): string {
-  const m = body.match(/pipeline:review-([12])/);
-  return m ? `pipeline:review-${m[1]}` : "pipeline:review-2";
 }
 
 // ---------------------------------------------------------------------------
