@@ -108,9 +108,9 @@ review_timeout: 1200
 fix_timeout: 1200
 ci_timeout: 900
 ci_poll_interval: 30
-models:
-  planning: sonnet
-  review: opus
+models:                          # only the claude harness honors these; a key
+  planning: sonnet               # whose role runs on codex is ignored and a
+  review: opus                   # config warning is printed (planning/fix → implementer, review → reviewer)
   fix: sonnet
 conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
 domain_name: lyric-utils

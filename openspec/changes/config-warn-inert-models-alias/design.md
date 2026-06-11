@@ -43,6 +43,10 @@ Each of `models.review`, `models.planning`, and `models.fix` is checked independ
 
 The guard condition is `fileConfig.models?.<key> !== undefined`, not a value comparison. Since `fileConfig` contains only what was explicitly parsed from the file (the Zod schema marks `models` as optional), any key present in `fileConfig.models` was user-authored.
 
+### Relax the `models` schema to per-key-optional (required for partial blocks)
+
+Per-key explicit-set detection presumes a partial `models:` block (e.g. only `review:`) is valid. The original schema required **all three** of `planning`/`review`/`fix` whenever `models` was present, so `models.review` alone would fail validation and `resolveConfig` would throw — the "specific key absent → no warning" scenario could never be reached. We therefore loosen each sub-key to `z.string().optional()` and switch the merge from the whole-object `fileConfig.models ?? DEFAULT_CONFIG.models` to the per-key `fileConfig.models?.<key> ?? DEFAULT_CONFIG.models.<key>` fallback that every sibling block (`openspec`, `steps`, `test_gate`, `eval_gate`, `review_policy`) already uses. The resolved-config shape is unchanged — `config.models` always carries all three keys — so no downstream consumer (`planning.ts`, `fix.ts`, `review.ts`, `testgate.ts`) is affected. This corrects the earlier "no schema changes" framing in the proposal: the relaxation is a prerequisite, not a scope expansion.
+
 ## Risks / Trade-offs
 
 - **Warning noise if the profile ever changes:** if a repo that warned on `codex` later switches to a `claude` profile, the warning stops automatically (the profile drives the check). No stale warnings.

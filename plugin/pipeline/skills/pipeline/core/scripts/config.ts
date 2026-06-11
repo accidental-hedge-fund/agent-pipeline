@@ -19,11 +19,14 @@ const PartialConfigSchema = z.object({
   fix_timeout: z.number().int().positive().optional(),
   ci_timeout: z.number().int().positive().optional(),
   ci_poll_interval: z.number().int().positive().optional(),
+  // Each alias is independently optional so a partial `models:` block (e.g.
+  // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
+  // and the inert-alias warning keys off which sub-keys were explicitly set.
   models: z
     .object({
-      planning: z.string(),
-      review: z.string(),
-      fix: z.string(),
+      planning: z.string().optional(),
+      review: z.string().optional(),
+      fix: z.string().optional(),
     })
     .optional(),
   openspec: z
@@ -166,7 +169,11 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     // Harness roles are profile-relative; repo config cannot set them (the
     // strict schema rejects a `harnesses:` key outright).
     harnesses: profile.harnesses,
-    models: fileConfig.models ?? DEFAULT_CONFIG.models,
+    models: {
+      planning: fileConfig.models?.planning ?? DEFAULT_CONFIG.models.planning,
+      review: fileConfig.models?.review ?? DEFAULT_CONFIG.models.review,
+      fix: fileConfig.models?.fix ?? DEFAULT_CONFIG.models.fix,
+    },
     openspec: {
       enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
       bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
@@ -207,7 +214,40 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
   };
+  warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
+}
+
+// Each `models.*` alias is honored by exactly one harness role. `models.review`
+// drives the reviewer; `models.planning`/`models.fix` drive the implementer.
+const MODEL_ALIAS_ROLES = [
+  { key: "review", role: "reviewer" },
+  { key: "planning", role: "implementer" },
+  { key: "fix", role: "implementer" },
+] as const;
+
+/**
+ * Warn (non-blocking) about `models.*` aliases that were explicitly set in
+ * `.github/pipeline.yml` but are silently inert because the backing harness
+ * role is `codex` — `harness.ts` passes `--model` only on the `claude` branch
+ * (the codex branch ignores it). Advisory only: no throw, no fallback, and the
+ * resolved config is unchanged (the inert alias is preserved in `config.models`).
+ * Keys absent from `fileConfig.models` take their value from DEFAULT_CONFIG and
+ * never warn — only user-authored, inert config does.
+ */
+function warnInertModelAliases(
+  fileModels: z.infer<typeof PartialConfigSchema>["models"],
+  harnesses: PipelineConfig["harnesses"],
+): void {
+  if (!fileModels) return;
+  for (const { key, role } of MODEL_ALIAS_ROLES) {
+    const value = fileModels[key];
+    if (value === undefined) continue;
+    if (harnesses[role] !== "codex") continue;
+    console.warn(
+      `[pipeline] config warning: models.${key} is set to "${value}" but the ${role} harness is "codex" — model aliases are only honored by the claude harness. The setting is ignored.`,
+    );
+  }
 }
 
 function findGitRoot(start: string): string | null {
@@ -282,10 +322,10 @@ fix_timeout: ${d.fix_timeout} # seconds per fix stage
 ci_timeout: ${d.ci_timeout} # seconds to wait for CI at pre-merge
 ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
 
-models: # model alias per phase (resolved by the active harness)
-  planning: ${d.models.planning}
-  review: ${d.models.review}
-  fix: ${d.models.fix}
+# models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Uncomment to override.
+#   planning: ${d.models.planning} # implementer harness
+#   review: ${d.models.review} # reviewer harness
+#   fix: ${d.models.fix} # implementer harness
 
 openspec:
   enabled: ${d.openspec.enabled} # auto | on | off

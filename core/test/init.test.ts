@@ -178,6 +178,35 @@ test("scaffoldDefaultConfig: scaffolded file round-trips through resolveConfig w
   }
 });
 
+test("scaffoldDefaultConfig: scaffolded file emits no inert-models warning on resolve (#116)", async () => {
+  // The scaffold leaves `models:` commented out, so a freshly-scaffolded repo
+  // does not trip the inert-alias warning under the default codex profile
+  // (where planning/fix map to the codex implementer). The warning fires only
+  // on user-authored aliases, not on the tool's own default output.
+  const repo = makeTempRepo();
+  const binDir = makeFakeGhBin({ repoSlug: "acme/scaffold-no-warn" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  const origWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "));
+  };
+  try {
+    await scaffoldDefaultConfig(repo);
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(
+      warnings.filter((w) => w.includes("models.")),
+      [],
+      `scaffolded config tripped an inert-models warning: ${JSON.stringify(warnings)}`,
+    );
+  } finally {
+    console.warn = origWarn;
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 3.5 CLI-level: `pipeline init` positional arg routes to init, not numeric error
 // ---------------------------------------------------------------------------
