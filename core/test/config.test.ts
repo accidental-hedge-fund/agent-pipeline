@@ -409,3 +409,231 @@ test("resolveConfig: unknown review_policy key is rejected (strict schema)", asy
     process.env.PATH = oldPath;
   }
 });
+
+// ---- inert models.* alias warning (#116) ----
+//
+// Model selection is claude-only (harness.ts passes --model only on the claude
+// branch). A models.* alias whose backing harness role is `codex` is silently
+// ignored, so resolveConfig warns. The `codex` profile is implementer=codex /
+// reviewer=claude; the `claude` profile is implementer=claude / reviewer=codex —
+// so we pick the profile that makes the target role codex (or not).
+
+/** Run `fn`, capturing console.warn output; restore the original after. */
+async function captureWarnings(fn: () => void | Promise<void>): Promise<string[]> {
+  const warnings: string[] = [];
+  const orig = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "));
+  };
+  try {
+    await fn();
+  } finally {
+    console.warn = orig;
+  }
+  return warnings;
+}
+
+test("resolveConfig: models.review set + reviewer=codex warns it is inert", async () => {
+  const repo = makeFakeRepo(`models:\n  review: opus\n`);
+  const binDir = makeFakeGh("acme/im1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      // claude profile → reviewer=codex
+      cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    });
+    const hit = warnings.find((w) => w.includes("models.review"));
+    assert.ok(hit, `expected a warning for models.review, got: ${JSON.stringify(warnings)}`);
+    assert.match(hit!, /opus/);
+    assert.match(hit!, /codex/);
+    assert.match(hit!, /ignored/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.planning set + implementer=codex warns it is inert", async () => {
+  const repo = makeFakeRepo(`models:\n  planning: sonnet\n`);
+  const binDir = makeFakeGh("acme/im2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      // codex profile (default) → implementer=codex
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
+    const hit = warnings.find((w) => w.includes("models.planning"));
+    assert.ok(hit, `expected a warning for models.planning, got: ${JSON.stringify(warnings)}`);
+    assert.match(hit!, /sonnet/);
+    assert.match(hit!, /codex/);
+    assert.match(hit!, /ignored/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.fix set + implementer=codex warns it is inert", async () => {
+  const repo = makeFakeRepo(`models:\n  fix: haiku\n`);
+  const binDir = makeFakeGh("acme/im3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
+    const hit = warnings.find((w) => w.includes("models.fix"));
+    assert.ok(hit, `expected a warning for models.fix, got: ${JSON.stringify(warnings)}`);
+    assert.match(hit!, /haiku/);
+    assert.match(hit!, /ignored/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review set + reviewer=claude does NOT warn", async () => {
+  const repo = makeFakeRepo(`models:\n  review: opus\n`);
+  const binDir = makeFakeGh("acme/im4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      // codex profile (default) → reviewer=claude
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.planning set + implementer=claude does NOT warn", async () => {
+  const repo = makeFakeRepo(`models:\n  planning: sonnet\n`);
+  const binDir = makeFakeGh("acme/im5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      // claude profile → implementer=claude
+      cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    });
+    const planningWarn = warnings.find((w) => w.includes("models.planning"));
+    assert.equal(planningWarn, undefined, `unexpected warning: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: no models block + codex harness does NOT warn", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/im6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: partial models block (review only) warns per-key, not for absent keys", async () => {
+  // models.review set but planning/fix absent, under codex profile
+  // (implementer=codex, reviewer=claude). review→reviewer=claude → no warn;
+  // planning/fix absent → no warn. Proves the partial block validates and that
+  // detection is per explicitly-set key, not "models block present at all".
+  const repo = makeFakeRepo(`models:\n  review: opus\n`);
+  const binDir = makeFakeGh("acme/im7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.equal(
+      warnings.find((w) => w.includes("models.planning")),
+      undefined,
+      `unexpected models.planning warning: ${JSON.stringify(warnings)}`,
+    );
+    assert.deepEqual(warnings, [], `expected no warnings at all, got: ${JSON.stringify(warnings)}`);
+    // Partial block resolves: explicit key kept, absent keys fall back to defaults.
+    assert.equal(cfg.models.review, "opus");
+    assert.equal(cfg.models.planning, DEFAULT_CONFIG.models.planning);
+    assert.equal(cfg.models.fix, DEFAULT_CONFIG.models.fix);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: inert warning is non-blocking — config unchanged, alias preserved", async () => {
+  // codex profile, models.planning inert (implementer=codex). The warning must
+  // not throw or mutate the resolved config: the alias stays in cfg.models.
+  const repo = makeFakeRepo(`models:\n  planning: haiku\n`);
+  const binDir = makeFakeGh("acme/im8");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.ok(warnings.some((w) => w.includes("models.planning")));
+    // Alias preserved despite being inert; siblings keep defaults.
+    assert.equal(cfg.models.planning, "haiku");
+    assert.equal(cfg.models.review, DEFAULT_CONFIG.models.review);
+    assert.equal(cfg.models.fix, DEFAULT_CONFIG.models.fix);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---- models schema strictness (#116 follow-up) ----
+// A typo-only models block (e.g. `reviwe: opus`) must be rejected rather than
+// silently accepted with the unknown key stripped (which would produce a
+// default-value config with no warning, masking the misconfiguration).
+
+test("resolveConfig: unknown models key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`models:\n  reviwe: opus\n`);
+  const binDir = makeFakeGh("acme/models-strict1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("reviwe"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: partial known models block (single key) is still valid", async () => {
+  // Regression guard: .strict() must not break partial models blocks that only
+  // set one of the three known keys.
+  const repo = makeFakeRepo(`models:\n  fix: sonnet\n`);
+  const binDir = makeFakeGh("acme/models-strict2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.models.fix, "sonnet");
+    assert.equal(cfg.models.planning, DEFAULT_CONFIG.models.planning);
+    assert.equal(cfg.models.review, DEFAULT_CONFIG.models.review);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
