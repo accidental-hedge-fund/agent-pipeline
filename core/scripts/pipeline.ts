@@ -214,11 +214,28 @@ async function resolveIssueNumber(cfg: PipelineConfig, number: number): Promise<
 // Status mode
 // ---------------------------------------------------------------------------
 
-async function runStatus(cfg: PipelineConfig, issueNumber: number): Promise<void> {
-  const detail = await getIssueDetail(cfg, issueNumber);
+/** First line of the punch-list comment posted when a review round hits the
+ *  round ceiling and parks the item at `needs-human` (emitted by review.ts's
+ *  `reviewCeilingComment`). A controlled string the pipeline owns end-to-end. */
+const REVIEW_CEILING_MARKER = "## Pipeline: Review ceiling reached";
+
+/** IO seam for {@link runStatus} so unit tests inject fakes — no real gh. */
+export interface RunStatusDeps {
+  getIssueDetail: typeof getIssueDetail;
+  getPrForIssue: typeof getPrForIssue;
+}
+
+const defaultRunStatusDeps: RunStatusDeps = { getIssueDetail, getPrForIssue };
+
+export async function runStatus(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: RunStatusDeps = defaultRunStatusDeps,
+): Promise<void> {
+  const detail = await deps.getIssueDetail(cfg, issueNumber);
   const stage = pickStage(detail.labels);
   const blocked = isBlocked(detail.labels);
-  const prNumber = await getPrForIssue(cfg, issueNumber);
+  const prNumber = await deps.getPrForIssue(cfg, issueNumber);
 
   console.log(`#${detail.number} — ${detail.title}`);
   console.log(`State: ${detail.state}`);
@@ -247,6 +264,72 @@ async function runStatus(cfg: PipelineConfig, issueNumber: number): Promise<void
     const firstLine = lastReview.body.split("\n", 1)[0];
     console.log(`Last review: ${firstLine}`);
   }
+
+  // #115: parked at `needs-human` → surface the punch-list (unresolved blocking
+  // count + resume steps) so the operator knows what to do, not just the bare
+  // stage. Gated on the stage so every other stage's output is unchanged.
+  if (stage === "needs-human") {
+    const punchlist = needsHumanPunchlist(detail.comments);
+    console.log("");
+    console.log(
+      punchlist ??
+        `Needs human, but no ${REVIEW_CEILING_MARKER.replace(/^## /, "")} comment was found. ` +
+          `Override (\`--override "<key>: <reason>"\`) or fix the residual findings, then relabel ` +
+          `\`pipeline:needs-human\` → \`pipeline:review-2\` to resume.`,
+    );
+  }
+}
+
+/**
+ * Pure helper (#115): build the `needs-human` punch-list from the issue's
+ * comments — the count of still-blocking findings plus the resume steps. Reads
+ * only controlled strings the pipeline itself emits in the latest
+ * `## Pipeline: Review ceiling reached` comment; returns `null` when no such
+ * comment exists (the caller prints a graceful fallback). Total function: no
+ * network, git, or subprocess calls.
+ */
+export function needsHumanPunchlist(
+  comments: { author: string; body: string; createdAt: string }[],
+): string | null {
+  // Latest ceiling comment wins (highest index): a re-run posts a fresh one.
+  let body: string | undefined;
+  for (let i = comments.length - 1; i >= 0; i--) {
+    if (comments[i].body.startsWith(REVIEW_CEILING_MARKER)) {
+      body = comments[i].body;
+      break;
+    }
+  }
+  if (body === undefined) return null;
+
+  const count = countCeilingFindings(body);
+  const resumeLabel = ceilingResumeLabel(body);
+  const noun = count === 1 ? "finding" : "findings";
+  return [
+    `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
+    `To resume: accept a finding with \`--override "<key>: <reason>"\` (audited) or fix it by hand,`,
+    `then relabel \`pipeline:needs-human\` → \`${resumeLabel}\`.`,
+  ].join("\n");
+}
+
+/** Count the `- ` bullets under the controlled `### Unresolved blocking findings`
+ *  heading, stopping at the next `### ` section. */
+function countCeilingFindings(body: string): number {
+  const lines = body.split("\n");
+  const start = lines.findIndex((l) => l.trim() === "### Unresolved blocking findings");
+  if (start === -1) return 0;
+  let count = 0;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].startsWith("### ")) break; // next section ends the list
+    if (lines[i].startsWith("- ")) count++;
+  }
+  return count;
+}
+
+/** The review round the ceiling comment names as the resume target — review-1 or
+ *  review-2 (the ceiling is reachable from either). Defaults to review-2. */
+function ceilingResumeLabel(body: string): string {
+  const m = body.match(/pipeline:review-([12])/);
+  return m ? `pipeline:review-${m[1]}` : "pipeline:review-2";
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +453,7 @@ async function runAdvance(
         );
         const ceiling = [...detail.comments]
           .reverse()
-          .find((c) => c.body.startsWith("## Pipeline: Review ceiling reached"));
+          .find((c) => c.body.startsWith(REVIEW_CEILING_MARKER));
         if (ceiling) console.log(ceiling.body);
         break;
       }
