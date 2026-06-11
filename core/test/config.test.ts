@@ -597,3 +597,43 @@ test("resolveConfig: inert warning is non-blocking — config unchanged, alias p
     process.env.PATH = oldPath;
   }
 });
+
+// ---- models schema strictness (#116 follow-up) ----
+// A typo-only models block (e.g. `reviwe: opus`) must be rejected rather than
+// silently accepted with the unknown key stripped (which would produce a
+// default-value config with no warning, masking the misconfiguration).
+
+test("resolveConfig: unknown models key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`models:\n  reviwe: opus\n`);
+  const binDir = makeFakeGh("acme/models-strict1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("reviwe"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: partial known models block (single key) is still valid", async () => {
+  // Regression guard: .strict() must not break partial models blocks that only
+  // set one of the three known keys.
+  const repo = makeFakeRepo(`models:\n  fix: sonnet\n`);
+  const binDir = makeFakeGh("acme/models-strict2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.models.fix, "sonnet");
+    assert.equal(cfg.models.planning, DEFAULT_CONFIG.models.planning);
+    assert.equal(cfg.models.review, DEFAULT_CONFIG.models.review);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

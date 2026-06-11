@@ -28,6 +28,7 @@ const PartialConfigSchema = z.object({
       review: z.string().optional(),
       fix: z.string().optional(),
     })
+    .strict()
     .optional(),
   openspec: z
     .object({
