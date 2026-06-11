@@ -58,6 +58,7 @@ $pipeline N --base branch                override base branch
 $pipeline N --repo-path path             target a different repo working tree
 $pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
 $pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
+$pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are

@@ -1,6 +1,6 @@
 ## Context
 
-The pipeline CLI is built on commander (v12) inside `core/scripts/pipeline.ts`. Commander provides a first-class `.version(str, flags, desc)` method that wires the flag, prints the string, and exits 0 — no custom action handler needed. The version string must be sourced from `core/package.json` at runtime so future `npm version` bumps are automatically reflected.
+The pipeline CLI is built on commander (v14) inside `core/scripts/pipeline.ts`. Commander provides a first-class `.version(str, flags, desc)` method that wires the flag, prints the string, and exits 0 — no custom action handler needed. The version string must be sourced from `core/package.json` at runtime so future `npm version` bumps are automatically reflected.
 
 Node 24 native type-stripping is used (no `tsc`, no build step), so ESM `import` assertions or `createRequire` are the reading options.
 
@@ -26,8 +26,10 @@ Node 24 native type-stripping is used (no `tsc`, no build step), so ESM `import`
 ```ts
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { version } = require('../../package.json');
+const { version } = require('../package.json');
 ```
+
+The path is `../package.json` — i.e. `core/package.json` relative to `core/scripts/pipeline.ts`, **not** `../../` (which would resolve to the repo-root `package.json` in dev and a nonexistent file in the installed plugin). This is mirror-safe: `build.mjs` copies `package.json` alongside `scripts/` into `plugin/.../core/`, so the same relative path resolves in both the dev and installed layouts.
 
 **Alternative considered**: `fs.readFileSync` with a relative path — works but is more fragile to file moves and requires manual JSON parsing. `createRequire` resolves via Node's module resolution, which is path-stable.
 

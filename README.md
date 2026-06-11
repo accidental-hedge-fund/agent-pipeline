@@ -158,6 +158,7 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
 The number is auto-detected as an issue or PR. PRs resolve to their linked closing issue; PRs with no `Closes #N` are refused. Items must carry a `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
