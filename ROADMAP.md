@@ -2,7 +2,7 @@
 
 Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-10.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready; everything below is the post-1.0 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence; see Shipped. Everything below v1.0.1 is the post-1.0.1 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -36,6 +36,16 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
 
+**v1.0.1 — dev-loop convergence (shipped 2026-06-10, tag `v1.0.1`):**
+
+| # | What | PR |
+|---|------|-----|
+| #95 | pre-merge auto-rebase when a PR is CONFLICTING (no `pull_request` CI) | #105 |
+| #75 | zero-machinery `plugin/` mirror regen after editing `core/` | #104 |
+| #110 | convergence hotfix — severity-policy default fix, single-sourced rubric, enumerate-all + re-review ratchet, bounded rounds → `needs-human` terminal, fixer history, structured `category` field | #111 |
+| #110 follow-up | default `block_threshold` → `medium`/`0.7`; mirror advisory findings to the PR (issue-only review comments slip the merge button) | #112 |
+| #106 | OpenSpec spec-drift consistency guard — deterministic file-path (`specDeltaIsStale`) + structured `category: spec-divergence` marker, never prose (supersedes #109) | #113 |
+
 **v1.0.0 — external-ready (tagged 2026-06-10, commit `450b537`):**
 
 | # | What | PR |
@@ -53,7 +63,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
-| **v1.0.1** | patch | Dev-loop convergence | #95, #75, #110, #106 | Self-heal fixes (#95/#75, shipped) + the loop-convergence hotfix (**#110**: severity-default fix, rubric, ratchet, bounded rounds → `needs-human`) + the spec-drift gate redesign (**#106**) that *consumes* #110's structured `category` field — co-shipped so the field is load-bearing in the same release, not speculative surface. All hand-built (they can't dogfood the loop they fix). |
+| **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
 | **v1.0.2** | patch | Dev-loop convergence (cont.) | #108 | Inject repo conventions into the `fix`/`test-fix` prompts. Sequences after #110 — shares the `fix.md` / `buildFixPrompt` path. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
@@ -85,13 +95,6 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
 ## Remaining work — detail (grouped by release)
-
-### v1.0.1 — dev-loop convergence (patch)
-
-- **#95** — pre-merge polling hangs when a PR is **CONFLICTING**: no `pull_request` CI runs ever start, so the gate polls to its timeout. Detect CONFLICTING + auto-rebase. *Real run-loop hang; zero config; no in-set deps.*
-- **#75** — Zero-machinery `plugin/` mirror regen: repo-local conventions instruction + commit the mirror after editing `core/`; the #61 test gate stays the backstop. *No generator-detection/config in the generic core. Kills the recurring one-attempt fix-round waste.*
-- **#110** — **Convergence hotfix.** review-2 never terminated — it looped to the iteration cap on nearly every non-doc change, proven across two repos/instances (agent-pipeline #106, contractiq #275). Three causes: the *drip* (reviewer surfaces one finding per round + full re-review every commit), the `low/0` *block-on-everything* default (#17's policy inert at its own default), and *no honest terminal*. Fix: default `block_threshold: medium` / `min_confidence: 0.7` / `max_adversarial_rounds: 3`; a single-sourced severity rubric; enumerate-all + a re-review ratchet; bounded rounds → new `needs-human` terminal with a punch-list; full cross-round fixer history; an optional structured `category` field. *Hand-built (it can't dogfood the loop it fixes); `block_threshold: low` restores old behavior; sem-ver rule amended for the placeholder-defect default.*
-- **#106** — OpenSpec spec deltas go **stale on a material review fix**: fix rounds edit code but aren't told (or verified) to revise the change's `specs/**`, so `maybeArchiveOpenspec` folds a stale delta into the living specs and re-review anchored on the stale delta can fight the now-correct code. Make the spec follow the code on the fix path + a verify-don't-prompt pre-merge consistency guard, keyed on #110's structured `category` field / a deterministic file-path signal — **not** prose inference (the original detector was an adversarially-unwinnable keyword matcher). *Co-ships with #110 so the `category` field has its consumer in-release. Minimal fix (a); the heavier `review → plan-revision` edge (b) defers to v1.1.0 if needed.*
 
 ### v1.0.2 — dev-loop convergence, continued (patch)
 
