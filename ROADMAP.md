@@ -53,8 +53,8 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
-| **v1.0.1** | patch | Dev-loop convergence | #95, #75, #110 | Self-heal fixes (#95/#75, shipped) + the loop-convergence hotfix (**#110**: severity-default fix, severity rubric, ratchet, bounded rounds → `needs-human`). Hand-built — it can't dogfood the loop it fixes. Ships alone so #106/#108 can ride the fixed loop. |
-| **v1.0.2** | patch | Dev-loop convergence (cont.) | #106, #108 | Run through the now-converging loop after #110. #106 also redesigns its prose detector to the structured `category`/file-path signal #110 adds; #108 injects conventions into the fix/test-fix prompts. |
+| **v1.0.1** | patch | Dev-loop convergence | #95, #75, #110, #106 | Self-heal fixes (#95/#75, shipped) + the loop-convergence hotfix (**#110**: severity-default fix, rubric, ratchet, bounded rounds → `needs-human`) + the spec-drift gate redesign (**#106**) that *consumes* #110's structured `category` field — co-shipped so the field is load-bearing in the same release, not speculative surface. All hand-built (they can't dogfood the loop they fix). |
+| **v1.0.2** | patch | Dev-loop convergence (cont.) | #108 | Inject repo conventions into the `fix`/`test-fix` prompts. Sequences after #110 — shares the `fix.md` / `buildFixPrompt` path. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -67,7 +67,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #95 | patch | none | dev-loop convergence | v1.0.1 | — |
 | #75 | patch | none | dev-loop convergence | v1.0.1 | #61 ✓ |
 | #110 | patch | changed default (placeholder/defect) | dev-loop convergence | v1.0.1 | — |
-| #106 | patch | none | dev-loop convergence | v1.0.2 | #110 |
+| #106 | patch | none | dev-loop convergence | v1.0.1 | #110 (co-ship) |
 | #108 | patch | none | dev-loop convergence | v1.0.2 | #110 |
 | #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
@@ -91,10 +91,10 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 - **#95** — pre-merge polling hangs when a PR is **CONFLICTING**: no `pull_request` CI runs ever start, so the gate polls to its timeout. Detect CONFLICTING + auto-rebase. *Real run-loop hang; zero config; no in-set deps.*
 - **#75** — Zero-machinery `plugin/` mirror regen: repo-local conventions instruction + commit the mirror after editing `core/`; the #61 test gate stays the backstop. *No generator-detection/config in the generic core. Kills the recurring one-attempt fix-round waste.*
 - **#110** — **Convergence hotfix.** review-2 never terminated — it looped to the iteration cap on nearly every non-doc change, proven across two repos/instances (agent-pipeline #106, contractiq #275). Three causes: the *drip* (reviewer surfaces one finding per round + full re-review every commit), the `low/0` *block-on-everything* default (#17's policy inert at its own default), and *no honest terminal*. Fix: default `block_threshold: high` / `min_confidence: 0.7` / `max_adversarial_rounds: 3`; a single-sourced severity rubric; enumerate-all + a re-review ratchet; bounded rounds → new `needs-human` terminal with a punch-list; full cross-round fixer history; an optional structured `category` field. *Hand-built (it can't dogfood the loop it fixes); `block_threshold: low` restores old behavior; sem-ver rule amended for the placeholder-defect default.*
+- **#106** — OpenSpec spec deltas go **stale on a material review fix**: fix rounds edit code but aren't told (or verified) to revise the change's `specs/**`, so `maybeArchiveOpenspec` folds a stale delta into the living specs and re-review anchored on the stale delta can fight the now-correct code. Make the spec follow the code on the fix path + a verify-don't-prompt pre-merge consistency guard, keyed on #110's structured `category` field / a deterministic file-path signal — **not** prose inference (the original detector was an adversarially-unwinnable keyword matcher). *Co-ships with #110 so the `category` field has its consumer in-release. Minimal fix (a); the heavier `review → plan-revision` edge (b) defers to v1.1.0 if needed.*
 
 ### v1.0.2 — dev-loop convergence, continued (patch)
 
-- **#106** — OpenSpec spec deltas go **stale on a material review fix**: fix rounds edit code but aren't told (or verified) to revise the change's `specs/**`, so `maybeArchiveOpenspec` folds a stale delta into the living specs and re-review anchored on the stale delta can fight the now-correct code. Make the spec follow the code on the fix path + a verify-don't-prompt pre-merge consistency guard, keyed on #110's structured `category` field / a deterministic file-path signal — **not** prose inference (the original detector was an adversarially-unwinnable keyword matcher). *Minimal fix (a); the heavier `review → plan-revision` edge (b) defers to v1.1.0 if needed.*
 - **#108** — `fix` & `test-fix` prompts don't inject repo conventions, so editing fix rounds rely on best-effort host auto-load. Inject conventions into those prompts. *Sequence after #110 — shares the `fix.md` / `buildFixPrompt` path.*
 
 ### v1.1.0 — review quality (minor)
