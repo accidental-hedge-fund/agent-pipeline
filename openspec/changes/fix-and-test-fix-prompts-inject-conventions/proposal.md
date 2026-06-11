@@ -9,6 +9,7 @@ The `buildFixPrompt` and `buildTestFixPrompt` builders omit the `conventions` ke
 - `buildFixPrompt` passes `conventions: readConventions(cfg)` in the interpolation map.
 - `buildTestFixPrompt` passes `conventions: readConventions(cfg)` in the interpolation map.
 - `implementing.md` line 15 is updated to name the profile-appropriate conventions file (CLAUDE.md / AGENTS.md) instead of hardcoding only "CLAUDE.md", so the instruction is accurate under the Codex profile.
+- The implementing prompt's docs-update checklist (`DOCS_INSTRUCTION_SECTION` in `index.ts`) likewise names CLAUDE.md / AGENTS.md instead of CLAUDE.md only — the same conventions-file reference appears there, so it must also be host-accurate.
 - `hosts/codex/SKILL.md` per-repo-config example uses `AGENTS.md` (or omits the filename) instead of `CLAUDE.md`.
 - Unit tests assert that `buildFixPrompt` and `buildTestFixPrompt` embed the injected conventions content; the tests bite without the fix.
 
@@ -24,7 +25,7 @@ The `buildFixPrompt` and `buildTestFixPrompt` builders omit the `conventions` ke
 
 ## Impact
 
-- `core/scripts/prompts/index.ts` — `buildFixPrompt` and `buildTestFixPrompt` builders.
+- `core/scripts/prompts/index.ts` — `buildFixPrompt` and `buildTestFixPrompt` builders (add `cfg` + conventions injection); `DOCS_INSTRUCTION_SECTION` conventions-file reference made host-neutral.
 - `core/scripts/prompts/fix.md` and `test_fix.md` — new `{{conventions}}` placeholder.
 - `core/scripts/prompts/implementing.md` line 15 — conventions filename reference.
 - `hosts/codex/SKILL.md` — per-repo-config example.

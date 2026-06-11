@@ -2,6 +2,8 @@ You are fixing code review findings for issue #{{issue_number}}: {{title}}
 
 This is fix round {{fix_round}} — addressing findings from the {{review_type}} review.
 
+{{conventions}}
+
 ## Review Findings
 
 {{review_findings}}

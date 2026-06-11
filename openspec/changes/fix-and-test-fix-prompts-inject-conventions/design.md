@@ -31,11 +31,11 @@ Alternatives considered:
 
 Line 15 of `implementing.md` instructs the harness to "Read CLAUDE.md". Under the Codex profile, the conventions file is `AGENTS.md`. The simplest fix is to phrase the instruction as "Read the conventions file (CLAUDE.md or AGENTS.md depending on your host)" — accurate under both profiles without introducing a new placeholder.
 
-### 3. No structural change to the `buildPromptArgs` call shape
+### 3. Add `cfg` to `BuildFixArgs` / `BuildTestFixArgs`
 
-The builder functions already accept a `cfg` argument from which `readConventions(cfg)` is called. Adding `conventions` to the map is a one-line change per builder — no signature changes, no new dependencies.
+Unlike the other builders (whose args extend `BuildPlanArgs`, which already carries `cfg`), `BuildFixArgs` and `BuildTestFixArgs` are standalone interfaces with no `cfg` field. We add `cfg: PipelineConfig` to both so `readConventions(cfg)` can be called the same way the implementing builder does. Both production call sites (`stages/fix.ts`, `testgate.ts`) already have `cfg` in scope, so threading it through is a one-line change at each; the unit tests pass `cfg: dummyConfig()`.
 
 ## Risks / Trade-offs
 
 - [Risk] Conventions content adds ~200–8000 chars to every fix and test-fix prompt. → Mitigation: the cap is already enforced by `readConventions`; the 8000-char ceiling is appropriate for providing context without token bloat.
-- [Risk] A repo with no conventions file (stub path) injects an empty string. → Mitigation: `readConventions` already returns `""` in that case; the placeholder renders to empty, which is harmless.
+- [Risk] A repo with no conventions file (stub path) injects unexpected content. → Mitigation: `readConventions` returns a short "no conventions file found" stub (not an empty string and never a throw); the fix/test-fix prompts render exactly the same stub the implementing prompt already does, so the behavior is consistent and harmless.

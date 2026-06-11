@@ -16,10 +16,10 @@
 - **THEN** the returned prompt string SHALL contain the content read from that conventions file
 - **AND** the prompt SHALL NOT require any host auto-load to deliver conventions to the editing harness
 
-#### Scenario: absent conventions file renders empty without error
+#### Scenario: absent conventions file renders the readConventions stub without error
 
 - **WHEN** `buildFixPrompt` or `buildTestFixPrompt` is called and no conventions file exists at the resolved path
-- **THEN** the `{{conventions}}` placeholder SHALL render as an empty string
+- **THEN** the `{{conventions}}` placeholder SHALL render the same `readConventions` stub that `buildImplementingPrompt` produces (the "no conventions file found" notice), not an unfilled placeholder
 - **AND** the builder SHALL NOT throw or block prompt construction
 
 ### Requirement: fix and test-fix conventions injection has regression tests

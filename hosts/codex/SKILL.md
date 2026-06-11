@@ -112,7 +112,7 @@ models:
   planning: sonnet
   review: opus
   fix: sonnet
-conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
+conventions_md_path: AGENTS.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
