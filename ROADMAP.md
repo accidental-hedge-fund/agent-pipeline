@@ -75,7 +75,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
 | **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
 | **v1.0.3** | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. Dev-tooling only — no published-artifact/runtime change; rides the patch line. Keeps the committed mirror (it's load-bearing for the marketplace) and automates the regen *authoring*, not the mirror itself. |
-| **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
+| **v1.1.0** | minor | Review quality | #19, #25, #57, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #85 (patch) folds in as same-theme gate hardening. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
 | *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
@@ -96,7 +96,6 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
-| #84 | minor | none | review quality | v1.1.0 | #57 |
 | #85 | patch | none | review quality | v1.1.0 | #83 ✓ |
 | #39 | minor | none | reviewer pluggability | v1.2.0 | — |
 | #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
@@ -117,7 +116,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 ### v1.1.0 — review quality (minor)
 
 - **#19 + #25** — Closed-loop learning + research-grounded planning. **Rescoped:** human-curated lessons file via the existing `readConventions` injection (no pipeline-written store); strengthen the single planning prompt in-call (no fan-out calls). Mutual pair — build together.
-- **#57 + #84** — Upgrade the review prompts (**both kept**): severity rubric, confidence calibration (aligned to #17's `min_confidence`), diff-scoping, **strip the deterministic asks** (`review_standard.md:20-21` — the test gate + CI already prove them), **differentiate round-1 vs round-2** to cut overlap, and **enumerate every instance per finding class** (#84) so a defect class converges in one round. *Builds on the single-sourced `{{schema_block}}` shipped in #83.*
+- **#57** — Upgrade the review prompts. ✅ *Already shipped via #110:* the severity rubric (`SEVERITY_RUBRIC` → `{{severity_rubric}}`) and **enumerate every instance per finding class** (which closed #84). **Remaining:** confidence calibration (aligned to #17's `min_confidence`), few-shot examples, diff-scoping/blast-radius, false-positive-cost framing, risk-first standard-prompt structure, **strip the deterministic asks** (`review_standard.md:20-21` — the test gate + CI already prove them), and **differentiate round-1 vs round-2** to cut overlap. *Builds on the single-sourced `{{schema_block}}` shipped in #83.*
 - **#85** — Extend the verdict drift guard to value-type/nesting (lightweight type-token comparison only). *Unblocked now that #83 has shipped; same review-gate theme.*
 
 ### v1.2.0 — reviewer pluggability & per-step models (minor)
@@ -140,14 +139,15 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 - **#24** — The pipeline never extends past `ready-to-deploy` (no auto-merge / preview / canary / rollback). **Closed — still holds** (12 PRs left for human merge across the 2026-06-08/09 run, zero auto-merges).
 - **Review steps stay on by default (2026-06-10).** Plan-review and both review rounds are not disabled or default-demoted. Per-repo `steps.*` toggles (#13) remain available for those who opt out; the default favors rigor.
 - **#31 — SPIKE: convert to `/loop`. Closed: do not adopt.** Would replace a deterministic in-process loop with model-mediated re-invocations and fork the Claude-only `/loop` against the shared core; the cron/interval pattern was already rejected (`pipeline.ts:407-412`).
-- **#18 — Multiple review critics + quorum. Closed: against direction.** N critics over the same diff amplify reviewer false-positive churn (the #17 problem) and build on dead config surface; the existing two-round review plus #57/#84 prompt work is the sanctioned path to depth.
+- **#18 — Multiple review critics + quorum. Closed: against direction.** N critics over the same diff amplify reviewer false-positive churn (the #17 problem) and build on dead config surface; the existing two-round review plus #57 prompt work is the sanctioned path to depth.
 - **#22 — Differentiated failure handling. Closed: already shipped** piecewise (test-gate fix loop, CI/conflict auto-rebase, auto-recover, openspec gate); the remaining label-taxonomy adds state with no routing payoff.
 - **#74 — Test-fix trailer stamping. Closed: already resolved** on `main` (`test_fix.md:21-26` instructs; `testgate.ts:243-248` enforces; tests cover it).
+- **#84 — Adversarial prompt enumerate-every-instance. Closed: superseded by #110 (shipped v1.0.1).** The instruction *"Enumerate EVERY material finding at or above the severity bar in this pass — do not hold secondary issues back for a later round"* is live in both review prompts (`review_adversarial.md:52`, `review_standard.md:29`) and the old "prefer one strong finding" bias was removed; the structured `category` field carries multi-location findings. The remaining review-prompt upgrades live in #57. *(Closed 2026-06-11 from a backlog-validity audit; adversarially verified.)*
 - **Dedup the committed `core/`→`plugin/` mirror? Closed: no — keep it, automate the regen (→ #124, v1.0.3).** Verified the `/plugin marketplace add` install path *requires* a committed `plugin/` tree on the default branch (Claude Code copies plugins to a cache — no build-on-install, cannot reference files outside the plugin dir, skips out-of-tree symlinks). So the duplication is load-bearing, not waste. Symlink, generate-on-release, and drop-the-marketplace were all rejected (broken by the copy-only constraint / unverified ref-targeting / capability loss). The only real cost is the doubled diff + forgotten-regen rounds, which #124 removes by automating *authoring* (local pre-commit hook), keeping the mirror and the `build.mjs --check` gate intact.
 
 ## Notes
 
-- The **review layer** runs `reviewMode: prompt-harness` (reviewer CLI invoked directly with a JSON-returning prompt; companion plugins optional) — standard + adversarial passes, both carrying real weight. #56 (shipped in 1.0) single-sourced the verdict schema; #57/#84/#85 harden the prompts and drift guard; #17 (merged) gives it an audited convergence escape hatch.
+- The **review layer** runs `reviewMode: prompt-harness` (reviewer CLI invoked directly with a JSON-returning prompt; companion plugins optional) — standard + adversarial passes, both carrying real weight. #56 (shipped in 1.0) single-sourced the verdict schema; #57/#85 harden the prompts and drift guard; #17 (merged) gives it an audited convergence escape hatch.
 - The **mirror-staleness dogfooding** (#61) is active: every run's test gate runs `npm run ci` (includes `build.mjs --check`). #75 removes the remaining manual-regen friction.
 - Within a release, issues are value-ranked; releases are ordered by dependency + theme cohesion (v1.0.1 first — lowest-risk, no deps, hardens the self-dev loop).
 - Every open issue carries a `release:v*` label mirroring this plan (applied 2026-06-10); research trackers #14/#27 are intentionally unlabeled.
