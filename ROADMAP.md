@@ -74,6 +74,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 |---|---|---|---|---|
 | **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
 | **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
+| **v1.0.3** | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. Dev-tooling only — no published-artifact/runtime change; rides the patch line. Keeps the committed mirror (it's load-bearing for the marketplace) and automates the regen *authoring*, not the mirror itself. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #84, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #84 builds on #57; #85 (patch) folds in as same-theme gate hardening. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -91,6 +92,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #115 | patch | none | dev-loop convergence | v1.0.2 | — |
 | #116 | patch | models keys → optional + `.strict()` | config visibility | v1.0.2 | — |
 | #117 | patch | none | CLI niceties | v1.0.2 | — |
+| #124 | patch | none (dev-tooling, not shipped) | dev-loop convergence | v1.0.3 | — |
 | #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
@@ -107,6 +109,10 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
 ## Remaining work — detail (grouped by release)
+
+### v1.0.3 — dev-loop convergence, continued / contributor tooling (patch)
+
+- **#124** — pre-commit hook to auto-regenerate the `plugin/` mirror after `core/` edits. The committed mirror is **load-bearing** (verified: `/plugin marketplace add` requires a committed plugin tree on the default branch — copies to a cache, no build-on-install, can't reference outside the plugin dir, skips out-of-tree symlinks), so the duplication stays; this removes the *manual* regen (the #1 wasted-CI-round cause) by automating its authoring, and keeps `build.mjs --check` as the clone-independent enforcement. *Explicitly **not** a CI bot-commit: that commit would land post-verdict, fail `isPipelineInternalCommit`, and re-trigger the #16 SHA-gate every round — the #98 cascade.*
 
 ### v1.1.0 — review quality (minor)
 
@@ -137,6 +143,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 - **#18 — Multiple review critics + quorum. Closed: against direction.** N critics over the same diff amplify reviewer false-positive churn (the #17 problem) and build on dead config surface; the existing two-round review plus #57/#84 prompt work is the sanctioned path to depth.
 - **#22 — Differentiated failure handling. Closed: already shipped** piecewise (test-gate fix loop, CI/conflict auto-rebase, auto-recover, openspec gate); the remaining label-taxonomy adds state with no routing payoff.
 - **#74 — Test-fix trailer stamping. Closed: already resolved** on `main` (`test_fix.md:21-26` instructs; `testgate.ts:243-248` enforces; tests cover it).
+- **Dedup the committed `core/`→`plugin/` mirror? Closed: no — keep it, automate the regen (→ #124, v1.0.3).** Verified the `/plugin marketplace add` install path *requires* a committed `plugin/` tree on the default branch (Claude Code copies plugins to a cache — no build-on-install, cannot reference files outside the plugin dir, skips out-of-tree symlinks). So the duplication is load-bearing, not waste. Symlink, generate-on-release, and drop-the-marketplace were all rejected (broken by the copy-only constraint / unverified ref-targeting / capability loss). The only real cost is the doubled diff + forgotten-regen rounds, which #124 removes by automating *authoring* (local pre-commit hook), keeping the mirror and the `build.mjs --check` gate intact.
 
 ## Notes
 
