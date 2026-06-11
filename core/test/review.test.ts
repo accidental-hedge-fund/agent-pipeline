@@ -13,14 +13,19 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   advanceReview,
   countPriorRounds,
+  diffFilePaths,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
   type AdvanceReviewDeps,
 } from "../scripts/stages/review.ts";
+import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import { findingKey } from "../scripts/review-policy.ts";
@@ -787,4 +792,76 @@ test("a blocking finding routes to fix and does NOT post to the PR (only advisor
   });
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
   assert.deepEqual(rec.prComments, [], "no PR mirror when the item routes to a fix round");
+});
+
+// ---------------------------------------------------------------------------
+// diffFilePaths — spec-context regression (#115)
+// Verifies that review prompt construction uses the branch-diff-derived OpenSpec
+// change, not changes[0] (which may be an unrelated pre-existing change).
+// ---------------------------------------------------------------------------
+
+test("diffFilePaths: extracts file paths from a unified diff", () => {
+  const diff = [
+    "diff --git a/src/index.ts b/src/index.ts",
+    "index abc..def 100644",
+    "--- a/src/index.ts",
+    "+++ b/src/index.ts",
+    "@@ -1,2 +1,3 @@",
+    "+export const x = 1;",
+    "diff --git a/openspec/changes/feature-spec/specs/spec.md b/openspec/changes/feature-spec/specs/spec.md",
+    "--- a/openspec/changes/feature-spec/specs/spec.md",
+    "+++ b/openspec/changes/feature-spec/specs/spec.md",
+    "@@ -0,0 +1 @@",
+    "+## REQ-NEW",
+  ].join("\n");
+
+  const paths = diffFilePaths(diff);
+  assert.deepEqual(paths.sort(), [
+    "openspec/changes/feature-spec/specs/spec.md",
+    "src/index.ts",
+  ].sort());
+});
+
+test("diffFilePaths: returns empty array for an empty diff", () => {
+  assert.deepEqual(diffFilePaths(""), []);
+});
+
+test("diffFilePaths: multi-change worktree — review spec context uses branch-introduced change only", () => {
+  // Regression: a worktree may have a pre-existing 'old-change' (from a fix round)
+  // AND the branch-introduced 'new-feature' change. openspecContext() would pick
+  // changes[0] (alphabetically 'new-feature' or 'old-change' depending on ordering),
+  // potentially returning the wrong spec. openspecContextFromDiff (now used by review)
+  // must pick only 'new-feature' because only that change appears in the PR diff.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "review-test-"));
+  const oldSpecs = path.join(dir, "openspec", "changes", "old-change", "specs");
+  const newSpecs = path.join(dir, "openspec", "changes", "new-feature", "specs");
+  fs.mkdirSync(oldSpecs, { recursive: true });
+  fs.mkdirSync(newSpecs, { recursive: true });
+  fs.writeFileSync(path.join(oldSpecs, "spec.md"), "REQ-OLD-UNRELATED");
+  fs.writeFileSync(path.join(newSpecs, "spec.md"), "REQ-NEW-FEATURE");
+
+  // Build a unified diff that only touches new-feature (old-change was on base branch).
+  const diff = [
+    "diff --git a/src/feature.ts b/src/feature.ts",
+    "--- a/src/feature.ts",
+    "+++ b/src/feature.ts",
+    "@@ -0,0 +1 @@",
+    "+export const f = 1;",
+    "diff --git a/openspec/changes/new-feature/specs/spec.md b/openspec/changes/new-feature/specs/spec.md",
+    "--- /dev/null",
+    "+++ b/openspec/changes/new-feature/specs/spec.md",
+    "@@ -0,0 +1 @@",
+    "+REQ-NEW-FEATURE",
+  ].join("\n");
+
+  // Simulate what invokePromptHarnessReview now does: derive paths from diff, then
+  // call openspecContextFromDiff. This is the regression path — must not include
+  // REQ-OLD-UNRELATED even though old-change exists in the worktree.
+  const paths = diffFilePaths(diff);
+  const specContext = openspecContextFromDiff({ openspec: { enabled: "on" } }, dir, paths);
+
+  assert.match(specContext, /REQ-NEW-FEATURE/);
+  assert.ok(!specContext.includes("REQ-OLD-UNRELATED"), "must not include pre-existing change's spec");
+
+  fs.rmSync(dir, { recursive: true, force: true });
 });

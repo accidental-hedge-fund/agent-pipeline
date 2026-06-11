@@ -27,6 +27,7 @@ import {
 } from "../prompts/index.ts";
 import { getForIssue } from "../worktree.ts";
 import * as openspec from "../openspec.ts";
+import { openspecContextFromDiff } from "../openspec.ts";
 import {
   categoryMarker,
   extractOverrides,
@@ -470,6 +471,20 @@ const defaultRunReview: RunReviewFn = (
 ) =>
   invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, priorReview2Findings, diff, round, cwd, opts);
 
+/**
+ * Extract repo-relative file paths from a unified diff string.
+ * Parses `diff --git a/<path> b/<path>` header lines produced by `gh pr diff`.
+ * Exported for unit tests.
+ */
+export function diffFilePaths(diff: string): string[] {
+  const paths = new Set<string>();
+  for (const line of diff.split("\n")) {
+    const m = line.match(/^diff --git a\/.+ b\/(.+)$/);
+    if (m) paths.add(m[1]);
+  }
+  return [...paths];
+}
+
 async function invokePromptHarnessReview(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -483,7 +498,7 @@ async function invokePromptHarnessReview(
   cwd: string,
   opts: AdvanceReviewOpts,
 ): Promise<HarnessResult> {
-  const specContext = openspec.openspecContext(cfg, cwd);
+  const specContext = openspecContextFromDiff(cfg, cwd, diffFilePaths(diff));
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
     : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext });
