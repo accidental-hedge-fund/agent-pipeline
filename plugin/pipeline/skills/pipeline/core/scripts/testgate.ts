@@ -194,6 +194,7 @@ export async function runTestGate(
     const fixHeadBefore = await gitHeadFn(wtPath);
 
     const prompt = buildTestFixPrompt({
+      cfg,
       issueNumber,
       command: label,
       attempt,

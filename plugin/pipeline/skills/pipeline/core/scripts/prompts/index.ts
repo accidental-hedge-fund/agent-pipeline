@@ -193,7 +193,7 @@ const DOCS_INSTRUCTION_SECTION = `
 
 Documentation is part of this change — update it in the same commit(s) so reviewers see code and docs together. Check and update where affected:
 - **README.md** — if user-visible setup, workflows, features, or operations changed
-- **CLAUDE.md** — if the change affects conventions agents need to know
+- **CLAUDE.md / AGENTS.md** (this repo's conventions file) — if the change affects conventions agents need to know
 - **Config docs and examples** — if config keys, flags, env vars, or setup steps were added or changed
 - **Docstrings/comments in the files you changed** — if they are now inaccurate
 - **Repo-local ops docs or runbooks** — if the change touches what they describe
@@ -277,6 +277,10 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
 }
 
 export interface BuildFixArgs {
+  /** Used to embed the target repo's conventions via {@link readConventions},
+   * the same way {@link buildImplementingPrompt} does (#108) — so the editing
+   * fix round is convention-aware explicitly, not via best-effort host auto-load. */
+  cfg: PipelineConfig;
   issueNumber: number;
   title: string;
   reviewFindings: string;
@@ -292,6 +296,7 @@ export interface BuildFixArgs {
 
 export function buildFixPrompt(a: BuildFixArgs): string {
   return substitute(loadTemplate("fix"), {
+    conventions: readConventions(a.cfg),
     issue_number: String(a.issueNumber),
     title: a.title,
     fix_round: String(a.fixRound),
@@ -305,6 +310,10 @@ export function buildFixPrompt(a: BuildFixArgs): string {
 }
 
 export interface BuildTestFixArgs {
+  /** Used to embed the target repo's conventions via {@link readConventions} (#108),
+   * mirroring {@link buildImplementingPrompt} so the test-fix editing round is
+   * convention-aware explicitly rather than via best-effort host auto-load. */
+  cfg: PipelineConfig;
   issueNumber: number;
   /** Human-readable command string (e.g. "pnpm run test"). */
   command: string;
@@ -318,6 +327,7 @@ export interface BuildTestFixArgs {
 
 export function buildTestFixPrompt(a: BuildTestFixArgs): string {
   return substitute(loadTemplate("test_fix"), {
+    conventions: readConventions(a.cfg),
     issue_number: String(a.issueNumber),
     command: a.command,
     attempt: String(a.attempt),

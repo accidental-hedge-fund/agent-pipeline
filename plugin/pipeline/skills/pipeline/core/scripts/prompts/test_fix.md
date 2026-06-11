@@ -1,5 +1,7 @@
 You are fixing failing tests/build for issue #{{issue_number}}.
 
+{{conventions}}
+
 The repository's own test/build command was run in the worktree and FAILED:
 
     {{command}}

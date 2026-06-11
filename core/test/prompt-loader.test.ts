@@ -3,6 +3,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   buildFixPrompt,
   buildImplementingPrompt,
@@ -39,6 +42,17 @@ function dummyConfig(): PipelineConfig {
     domain_name: "Widget",
     domain_description: "the example widget service",
   };
+}
+
+/**
+ * Config whose `conventions_md_path` resolves to a real, non-empty file on disk
+ * containing `marker`, so `readConventions(cfg)` returns that content. Used to
+ * assert the fix/test-fix prompts actually embed target-repo conventions (#108).
+ */
+function configWithConventions(marker: string): PipelineConfig {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-conv-"));
+  fs.writeFileSync(path.join(dir, "CONVENTIONS.md"), marker);
+  return { ...dummyConfig(), repo_dir: dir, conventions_md_path: "CONVENTIONS.md" };
 }
 
 test("substitute: simple replacement", () => {
@@ -249,6 +263,23 @@ test("implementing prompt: includes plan", () => {
   assert.match(out, /PLAN-CONTENT-XYZ/);
 });
 
+// #108: the conventions instruction must be accurate under BOTH profiles — the
+// codex profile's conventions file is AGENTS.md, so the instruction must not name
+// only CLAUDE.md. dummyConfig has no real conventions file (stub), so AGENTS.md can
+// only come from the instruction line itself.
+test("implementing prompt: conventions instruction names both CLAUDE.md and AGENTS.md, not just CLAUDE.md (#108)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "p",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /AGENTS\.md/, "instruction must name AGENTS.md so it is correct under the codex profile");
+  assert.match(out, /CLAUDE\.md/);
+});
+
 test("implementing prompt: instructs the trailers with substituted issue + run id (#20)", () => {
   const out = buildImplementingPrompt({
     cfg: dummyConfig(),
@@ -276,6 +307,9 @@ test("implementing prompt: docsEnabled adds the documentation-update instruction
   assert.match(out, /## Documentation Updates/);
   assert.match(out, /README\.md/);
   assert.match(out, /CLAUDE\.md/);
+  // #108: the docs-update ask also names the conventions file; it must name
+  // AGENTS.md too so it is accurate under the codex profile, not CLAUDE.md only.
+  assert.match(out, /AGENTS\.md/);
   assert.match(out, /do not add boilerplate docs/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
   assert.doesNotMatch(out, /\n\n\n/);
@@ -368,6 +402,7 @@ test("review_adversarial: enumerate-all replaces the old one-finding-at-a-time i
 
 test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
   const r1 = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5,
     title: "t",
     reviewFindings: "FINDINGS-X",
@@ -375,6 +410,7 @@ test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
     pipelineRunId: "5/2026-06-08T14:32:00Z",
   });
   const r2 = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5,
     title: "t",
     reviewFindings: "FINDINGS-X",
@@ -389,6 +425,7 @@ test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
 
 test("fix prompt: spec-revision instruction + consistency framing only when OpenSpec context is present (#106)", () => {
   const withSpec = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5,
     title: "t",
     reviewFindings: "f",
@@ -401,6 +438,7 @@ test("fix prompt: spec-revision instruction + consistency framing only when Open
   assert.doesNotMatch(withSpec, /must satisfy these requirement changes/);
 
   const withoutSpec = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5,
     title: "t",
     reviewFindings: "f",
@@ -413,6 +451,7 @@ test("fix prompt: spec-revision instruction + consistency framing only when Open
 
 test("fix prompt: instructs the trailers with substituted issue + run id (#20)", () => {
   const out = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5,
     title: "t",
     reviewFindings: "f",
@@ -426,10 +465,12 @@ test("fix prompt: instructs the trailers with substituted issue + run id (#20)",
 
 test("fix prompt: includes prior-round history only when provided (the don't-revert guard)", () => {
   const without = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5, title: "t", reviewFindings: "f", fixRound: 2, pipelineRunId: "r",
   });
   assert.doesNotMatch(without, /Prior Review Rounds/);
   const withHistory = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 5,
     title: "t",
     reviewFindings: "f",
@@ -442,8 +483,71 @@ test("fix prompt: includes prior-round history only when provided (the don't-rev
   assert.match(withHistory, /publicly_accessible/);
 });
 
+// #108: the fix and test-fix prompts must embed the target repo's conventions
+// explicitly (via readConventions → {{conventions}}), the same way implementing
+// does — not rely on best-effort host auto-load of CLAUDE.md/AGENTS.md. These two
+// tests bite: drop the `conventions` key from the builder map (or the placeholder
+// from the template) and the asserted content disappears / substitute throws.
+test("fix prompt: embeds the target repo's conventions (#108)", () => {
+  const marker = "EDIT-core-NEVER-plugin-GOLDEN-RULE-7f3a";
+  const out = buildFixPrompt({
+    cfg: configWithConventions(marker),
+    issueNumber: 5,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "r",
+  });
+  assert.match(out, new RegExp(marker), "fix prompt is missing the injected conventions content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("test_fix prompt: embeds the target repo's conventions (#108)", () => {
+  const marker = "RUN-npm-run-ci-BEFORE-DONE-9c2b";
+  const out = buildTestFixPrompt({
+    cfg: configWithConventions(marker),
+    issueNumber: 15,
+    command: "npm test",
+    attempt: 1,
+    maxAttempts: 3,
+    output: "fail",
+    pipelineRunId: "r",
+  });
+  assert.match(out, new RegExp(marker), "test-fix prompt is missing the injected conventions content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+// #108: when no conventions file exists at the resolved path the injection must
+// degrade gracefully to readConventions' stub (identical to implementing.md) —
+// it must not throw or leave an unfilled placeholder. dummyConfig's repo_dir does
+// not exist, so readConventions returns its stub.
+test("fix/test-fix prompts: render the readConventions stub (no throw) when no conventions file (#108)", () => {
+  const fixOut = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 5,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "r",
+  });
+  const testFixOut = buildTestFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 5,
+    command: "npm test",
+    attempt: 1,
+    maxAttempts: 3,
+    output: "fail",
+    pipelineRunId: "r",
+  });
+  assert.match(fixOut, /no conventions file found/);
+  assert.match(testFixOut, /no conventions file found/);
+  assert.doesNotMatch(fixOut, /\{\{[a-zA-Z_]+\}\}/);
+  assert.doesNotMatch(testFixOut, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("test_fix prompt: includes command, attempt counter, and failure output", () => {
   const out = buildTestFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 15,
     command: "pnpm run test",
     attempt: 2,
@@ -460,6 +564,7 @@ test("test_fix prompt: includes command, attempt counter, and failure output", (
 
 test("test_fix prompt: instructs the trailers with substituted issue + run id (#20)", () => {
   const out = buildTestFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 15,
     command: "npm test",
     attempt: 1,
@@ -474,6 +579,7 @@ test("test_fix prompt: instructs the trailers with substituted issue + run id (#
 
 test("test_fix prompt: large failure output is truncated", () => {
   const out = buildTestFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 1,
     command: "npm test",
     attempt: 1,
@@ -587,6 +693,7 @@ test("implementing prompt: no spec section + no leftover placeholders when specC
 
 test("fix prompt: injects OpenSpec spec context when provided", () => {
   const out = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 13,
     title: "t",
     reviewFindings: "FINDINGS",
@@ -600,6 +707,7 @@ test("fix prompt: injects OpenSpec spec context when provided", () => {
 
 test("fix prompt: no spec section + no leftover placeholders when specContext absent", () => {
   const out = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 13,
     title: "t",
     reviewFindings: "FINDINGS",
@@ -651,6 +759,7 @@ test("implementing prompt: no extra blank lines when specContext absent", () => 
 
 test("fix prompt: no extra blank lines when specContext absent", () => {
   const out = buildFixPrompt({
+    cfg: dummyConfig(),
     issueNumber: 13,
     title: "t",
     reviewFindings: "FINDINGS",

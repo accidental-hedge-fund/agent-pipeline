@@ -100,6 +100,7 @@ export async function advanceFix(
   const diffPaths = branchDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
   const specContext = openspecContextFromDiff(cfg, wt.path, diffPaths);
   const prompt = buildFixPrompt({
+    cfg,
     issueNumber,
     title: detail.title,
     reviewFindings: findings,

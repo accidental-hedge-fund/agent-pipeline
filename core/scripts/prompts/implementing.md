@@ -12,7 +12,7 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 {{spec_context}}
 ## Instructions
 
-1. Read CLAUDE.md in this repo for full conventions.
+1. Read this repo's conventions file (`CLAUDE.md` or `AGENTS.md`, depending on your host) for the full conventions — an excerpt is already included above.
 2. Implement the plan above. Write clean, well-tested code appropriate to the repo stack.
 3. Reuse existing repo patterns for routing, shared utilities, schema changes, tests, and CI-facing checks instead of inventing parallel paths.
 4. Write or update tests that cover the new or changed behavior, focusing on the smallest relevant suites for the touched surfaces.

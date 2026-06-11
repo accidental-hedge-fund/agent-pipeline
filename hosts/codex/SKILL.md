@@ -113,7 +113,7 @@ models:                          # only the claude harness honors these; a key
   planning: sonnet               # whose role runs on codex is ignored and a
   review: opus                   # config warning is printed (planning/fix → implementer, review → reviewer)
   fix: sonnet
-conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
+conventions_md_path: AGENTS.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
