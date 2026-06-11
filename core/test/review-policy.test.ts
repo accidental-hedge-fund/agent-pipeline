@@ -11,6 +11,9 @@ import {
   isValidFindingKey,
   overrideComment,
   parseOverrideArg,
+  SPEC_DIVERGENCE_CATEGORY,
+  categoryMarker,
+  reviewCommentFlagsSpecDivergence,
   type ReviewPolicy,
 } from "../scripts/review-policy.ts";
 import type { ReviewFinding } from "../scripts/types.ts";
@@ -205,4 +208,23 @@ test("parseOverrideArg: errors on missing colon, bad key, empty reason", () => {
   assert.ok("error" in parseOverrideArg("a1b2c3d4 no colon here"));
   assert.ok("error" in parseOverrideArg("nothex: reason"));
   assert.ok("error" in parseOverrideArg("a1b2c3d4:   "));
+});
+
+// ---- structured spec-divergence marker (#106) ----
+
+test("reviewCommentFlagsSpecDivergence: matches the emitted marker, not prose", () => {
+  const withMarker = `### Findings\n\n**1. [HIGH] x** ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}`;
+  assert.equal(reviewCommentFlagsSpecDivergence(withMarker), true);
+
+  // Prose that *describes* divergence but carries no marker must NOT match.
+  const prose = "The code diverges from the spec and is inconsistent with the requirement.";
+  assert.equal(reviewCommentFlagsSpecDivergence(prose), false);
+
+  // A different category marker must not match.
+  assert.equal(reviewCommentFlagsSpecDivergence(`x ${categoryMarker("correctness")}`), false);
+  assert.equal(reviewCommentFlagsSpecDivergence(""), false);
+});
+
+test("categoryMarker: single-sources the exact emitted token", () => {
+  assert.equal(categoryMarker(SPEC_DIVERGENCE_CATEGORY), "`category: spec-divergence`");
 });

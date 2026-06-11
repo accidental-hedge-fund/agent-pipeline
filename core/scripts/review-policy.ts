@@ -49,6 +49,28 @@ export function findingKey(f: Pick<ReviewFinding, "severity" | "file" | "title">
   return createHash("sha1").update(basis).digest("hex").slice(0, 8);
 }
 
+/**
+ * Structured finding category (#106) that flags a divergence between the code and
+ * the OpenSpec spec delta. The pre-merge consistency guard keys on THIS — emitted
+ * into the review comment by `formatReviewComment` from the reviewer's structured
+ * `ReviewFinding.category` field — never on free-text prose. Prose keyword-matching
+ * is adversarially unwinnable (it oscillates false-pos ↔ false-neg); a controlled
+ * marker we emit and read is a total function over a structured input.
+ */
+export const SPEC_DIVERGENCE_CATEGORY = "spec-divergence";
+
+/** The exact (backtick-wrapped) token rendered per categorized finding in a review
+ * comment, and matched by the guard. Single-sourced so emit + read cannot drift. */
+export function categoryMarker(category: string): string {
+  return `\`category: ${category}\``;
+}
+
+/** True when a rendered review comment carries a spec-divergence finding marker.
+ * Exact-marker match (not prose inference). Pure; exported for tests. */
+export function reviewCommentFlagsSpecDivergence(reviewBody: string): boolean {
+  return reviewBody.includes(categoryMarker(SPEC_DIVERGENCE_CATEGORY));
+}
+
 export interface PartitionResult {
   /** Findings that block: at/above threshold, at/above confidence, not overridden. */
   blocking: ReviewFinding[];

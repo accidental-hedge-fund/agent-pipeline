@@ -245,6 +245,45 @@ test("formatReviewComment: omits the sentinel when no SHA was resolved (#16)", (
   assert.ok(!md.includes("(commit "), "no short SHA in header when commitSha is empty");
 });
 
+test("formatReviewComment: renders the structured category marker for a tagged finding (#106)", () => {
+  const md = formatReviewComment(
+    {
+      verdict: "needs-attention",
+      summary: "x",
+      findings: [
+        {
+          severity: "high",
+          title: "code diverged from spec",
+          body: "b",
+          confidence: 0.9,
+          recommendation: "update the delta",
+          category: "spec-divergence",
+        },
+      ],
+      next_steps: [],
+      commitSha: SHA_A,
+    },
+    2,
+    "codex",
+  );
+  assert.match(md, /`category: spec-divergence`/, "category emitted as a controlled marker");
+  // A finding without a category emits no marker.
+  const md2 = formatReviewComment(
+    {
+      verdict: "needs-attention",
+      summary: "x",
+      findings: [
+        { severity: "high", title: "t", body: "b", confidence: 0.9, recommendation: "r" },
+      ],
+      next_steps: [],
+      commitSha: SHA_A,
+    },
+    2,
+    "codex",
+  );
+  assert.ok(!md2.includes("`category:"), "no marker when the finding has no category");
+});
+
 test("extractReviewedSha: reads the sentinel from the most recent review comment (#16)", () => {
   const comments = [
     { body: `## Review 1 (Standard) — approve (commit ${SHA_A.slice(0, 7)})\n\nok\n\n<!-- reviewed-sha: ${SHA_A} -->` },

@@ -27,6 +27,7 @@ import {
 import { getForIssue } from "../worktree.ts";
 import * as openspec from "../openspec.ts";
 import {
+  categoryMarker,
   extractOverrides,
   findingKey,
   partitionFindings,
@@ -723,7 +724,10 @@ export function formatReviewComment(
         ? `${f.file ?? ""}:${f.line_start}-${f.line_end ?? f.line_start}`
         : f.file ?? "";
       const conf = f.confidence !== undefined ? ` (confidence: ${f.confidence})` : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\``);
+      // Emit the structured `category` as a controlled marker so deterministic
+      // gates (e.g. the #106 spec-drift guard) can read it without parsing prose.
+      const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
