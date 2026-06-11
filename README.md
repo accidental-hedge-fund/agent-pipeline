@@ -467,13 +467,14 @@ node scripts/install.mjs uninstall --host all
 ## Development
 
 ```bash
+npm run setup-hooks               # one-time per clone: auto-regenerate plugin/ on core/ commits
 cd core && npm ci && npm test     # node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
 npm run ci                        # run the full CI command (tests + build check + install smoke)
 ```
 
-After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this).
+After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this). Run `npm run setup-hooks` once per clone to install a local pre-commit hook that does this for you: when a commit touches `core/` or `hosts/claude/` it regenerates and stages `plugin/` + `.claude-plugin/marketplace.json` automatically. It's convenience only — `build.mjs --check` in CI stays the authoritative gate, and `git commit --no-verify` bypasses it.
 
 ## License
 

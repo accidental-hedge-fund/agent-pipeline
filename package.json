@@ -22,8 +22,9 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:check": "node scripts/build.mjs --check",
+    "setup-hooks": "node scripts/setup-hooks.mjs",
     "install:local": "node scripts/install.mjs install",
-    "test": "(cd core && npm install --no-audit --no-fund && npm test) && node --test scripts/install.test.mjs",
+    "test": "(cd core && npm install --no-audit --no-fund && npm test) && node --test scripts/*.test.mjs",
     "ci:core": "(cd core && npm ci --no-audit --no-fund && npm test)",
     "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke",
     "ci:install-smoke": "node scripts/ci-install-smoke.mjs"
