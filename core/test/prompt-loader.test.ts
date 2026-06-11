@@ -387,6 +387,30 @@ test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
   assert.match(r2, /FINDINGS-X/);
 });
 
+test("fix prompt: spec-revision instruction + consistency framing only when OpenSpec context is present (#106)", () => {
+  const withSpec = buildFixPrompt({
+    issueNumber: 5,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "r",
+    specContext: "#### cap/spec.md\n\n### Requirement: X SHALL do Y",
+  });
+  assert.match(withSpec, /keep the spec delta consistent with your fix/);
+  assert.match(withSpec, /must stay consistent with/);
+  assert.doesNotMatch(withSpec, /must satisfy these requirement changes/);
+
+  const withoutSpec = buildFixPrompt({
+    issueNumber: 5,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "r",
+  });
+  assert.doesNotMatch(withoutSpec, /keep the spec delta consistent with your fix/);
+  assert.doesNotMatch(withoutSpec, /\{\{[a-zA-Z_]+\}\}/, "no leftover placeholders on the non-OpenSpec path");
+});
+
 test("fix prompt: instructs the trailers with substituted issue + run id (#20)", () => {
   const out = buildFixPrompt({
     issueNumber: 5,
