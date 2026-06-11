@@ -303,7 +303,7 @@ test("resolveConfig: eval_gate enabled:false keeps other defaults", async () => 
 
 // ---- review_policy (#17) ----
 
-test("resolveConfig: review_policy defaults apply when absent (blocks every finding)", async () => {
+test("resolveConfig: review_policy defaults apply when absent (advisory-grade findings advance; bounded rounds)", async () => {
   const repo = makeFakeRepo(null);
   const binDir = makeFakeGh("acme/rp0");
   const oldPath = process.env.PATH;
@@ -312,9 +312,30 @@ test("resolveConfig: review_policy defaults apply when absent (blocks every find
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
     assert.equal(cfg.review_policy.block_threshold, DEFAULT_CONFIG.review_policy.block_threshold);
-    assert.equal(cfg.review_policy.block_threshold, "low");
+    assert.equal(cfg.review_policy.block_threshold, "high");
     assert.equal(cfg.review_policy.min_confidence, DEFAULT_CONFIG.review_policy.min_confidence);
-    assert.equal(cfg.review_policy.min_confidence, 0);
+    assert.equal(cfg.review_policy.min_confidence, 0.7);
+    assert.equal(
+      cfg.review_policy.max_adversarial_rounds,
+      DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
+    );
+    assert.equal(cfg.review_policy.max_adversarial_rounds, 3);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_policy.max_adversarial_rounds override merges", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  max_adversarial_rounds: 2\n`);
+  const binDir = makeFakeGh("acme/rp-cap");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_policy.max_adversarial_rounds, 2);
+    // untouched fields keep their defaults
+    assert.equal(cfg.review_policy.block_threshold, "high");
   } finally {
     process.env.PATH = oldPath;
   }

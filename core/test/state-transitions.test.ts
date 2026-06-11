@@ -7,7 +7,7 @@ import { reviewStageSkipTarget, STAGES, type Stage } from "../scripts/types.ts";
 
 interface ExpectedTransition {
   from: Stage;
-  outcome: "approve" | "needs-attention" | "advance" | "stay";
+  outcome: "approve" | "needs-attention" | "advance" | "stay" | "ceiling";
   to: Stage;
 }
 
@@ -15,9 +15,11 @@ const TABLE: ExpectedTransition[] = [
   { from: "ready",         outcome: "advance",        to: "review-1" },        // planning.ts internally runs planning + plan-review + implementation
   { from: "review-1",      outcome: "approve",        to: "review-2" },
   { from: "review-1",      outcome: "needs-attention", to: "fix-1" },
+  { from: "review-1",      outcome: "ceiling",        to: "needs-human" },     // max_adversarial_rounds reached with findings still blocking
   { from: "fix-1",         outcome: "advance",        to: "review-2" },
   { from: "review-2",      outcome: "approve",        to: "pre-merge" },
   { from: "review-2",      outcome: "needs-attention", to: "fix-2" },
+  { from: "review-2",      outcome: "ceiling",        to: "needs-human" },     // max_adversarial_rounds reached with findings still blocking
   { from: "fix-2",         outcome: "advance",        to: "pre-merge" },
   { from: "pre-merge",     outcome: "advance",        to: "eval-gate" },
   { from: "eval-gate",     outcome: "advance",        to: "ready-to-deploy" },
@@ -47,6 +49,7 @@ test("state machine: forward path covers ready → ready-to-deploy", () => {
 test("state machine: terminal stages set", async () => {
   const { TERMINAL_STAGES } = await import("../scripts/types.ts");
   assert.ok(TERMINAL_STAGES.has("ready-to-deploy"));
+  assert.ok(TERMINAL_STAGES.has("needs-human"), "needs-human is a terminal off-ramp");
 });
 
 test("state machine: review verdict mapping", () => {
@@ -79,6 +82,7 @@ test("state machine: STAGES order is forward", () => {
     "pre-merge",
     "eval-gate",
     "ready-to-deploy",
+    "needs-human",
   ];
   assert.deepEqual([...STAGES], expected);
 });

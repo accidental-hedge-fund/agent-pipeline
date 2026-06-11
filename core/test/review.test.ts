@@ -15,6 +15,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
   advanceReview,
+  countPriorRounds,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
@@ -623,4 +624,93 @@ test("advanceReview (#17): an operator override on a blocking finding advances i
   assert.deepEqual(rec.blocked, []);
   assert.deepEqual(rec.transitions, [{ to: "pre-merge" }], "overridden finding → advance, not fix-2");
   assert.match(outcome.summary, /below policy/);
+});
+
+// ---------------------------------------------------------------------------
+// Convergence hotfix (1.0.1): the high default advances advisory-grade findings,
+// and a round ceiling routes to needs-human instead of looping to exhaustion.
+// ---------------------------------------------------------------------------
+
+const cfgConverge = {
+  review_mode: "prompt-harness",
+  harnesses: { reviewer: "codex", implementer: "claude" },
+  repo_dir: "/tmp/repo",
+  models: { review: "opus" },
+  marker_footer: "*Automated by Claude Code Pipeline Skill*",
+  review_policy: { block_threshold: "high", min_confidence: 0.7, max_adversarial_rounds: 3 },
+} as unknown as PipelineConfig;
+
+// `NA_MEDIUM` (declared above for the #17 tests) advances under the high default;
+// the shipped default value (high/0.7/3) is asserted in config.test.ts. These
+// tests cover the bounded-rounds ceiling, which has no prior coverage.
+
+test("convergence: review-2 at the round ceiling with a blocking finding → needs-human + punch-list (never fix-2 or auto-advance)", async (t) => {
+  const priorR2 = (sha: string) => ({
+    body:
+      `## Review 2 (Adversarial) — needs-attention (commit ${sha})\n\n` +
+      `**Reviewer**: codex\n\nfindings\n\n<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]); // high-severity → blocking under high threshold
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      // two prior review-2 rounds already happened; this run is the 3rd (cap = 3)
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "ceiling must NOT route to another fix round");
+  assert.ok(
+    !rec.transitions.some((x) => x.to === "pre-merge" || x.to === "ready-to-deploy"),
+    "must NOT auto-advance while a finding is still blocking",
+  );
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "a punch-list comment is posted at the ceiling",
+  );
+  assert.equal(outcome.to, "needs-human");
+});
+
+test("convergence: one round below the ceiling still routes a blocking finding to a fix round", async (t) => {
+  const priorR2 = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha})\n\n<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      comments: [priorR2("a".repeat(40))], // only 1 prior round; this is the 2nd (< cap 3)
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "below the ceiling, a blocking finding still gets a fix round");
+});
+
+test("countPriorRounds: counts prior review-N verdict comments by header", () => {
+  const comments = [
+    { body: "## Implementation Plan\n..." },
+    { body: "## Review 1 (Standard) — approve\n..." },
+    { body: "## Review 2 (Adversarial) — needs-attention\n..." },
+    { body: "## Review 2 (Adversarial) — needs-attention\n..." },
+    { body: "an unrelated comment" },
+  ];
+  assert.equal(countPriorRounds(comments, 2), 2);
+  assert.equal(countPriorRounds(comments, 1), 1);
+  assert.equal(countPriorRounds([], 2), 0);
 });

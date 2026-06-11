@@ -363,6 +363,18 @@ async function runAdvance(
         break;
       }
 
+      if (stage === "needs-human") {
+        console.log(
+          `[pipeline] #${issueNumber}: parked at needs-human — a review round hit the round ceiling. ` +
+            `Override (--override) or fix the residual findings, then relabel pipeline:needs-human → pipeline:review-2 to resume.`,
+        );
+        const ceiling = [...detail.comments]
+          .reverse()
+          .find((c) => c.body.startsWith("## Pipeline: Review ceiling reached"));
+        if (ceiling) console.log(ceiling.body);
+        break;
+      }
+
       if (isBlocked(detail.labels)) {
         if (stage === "implementing") {
           console.log(`[pipeline] #${issueNumber}: blocked at implementing — attempting auto-recovery`);
@@ -457,6 +469,14 @@ async function dispatch(
       return evalStage.advanceEval(cfg, issueNumber, { dryRun });
     case "ready-to-deploy":
       return deployReady.finalize(cfg, issueNumber);
+    case "needs-human":
+      // Terminal off-ramp; the loop breaks before reaching dispatch, but keep the
+      // switch exhaustive so it never falls through to the unknown-stage error.
+      return {
+        advanced: false,
+        status: "finalized",
+        reason: "needs-human is terminal; a human must override or fix the residual findings",
+      };
     case "backlog":
       return {
         advanced: false,

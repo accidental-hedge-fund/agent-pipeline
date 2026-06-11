@@ -26,7 +26,9 @@ Evaluate the diff against these criteria:
 Use `approve` if the code is correct, well-tested, and follows conventions.
 Use `needs-attention` if there are issues that must be fixed before merge.
 
-Report only material findings. No style nits, no speculative concerns without evidence.
+Report only material findings. No style nits, no speculative concerns without evidence. Enumerate EVERY material finding at or above the severity bar in this pass — do not hold issues back for a later round; a complete first pass lets the fix converge in one round.
+
+{{severity_rubric}}
 
 Return ONLY valid JSON matching this schema (no markdown fences, no commentary outside the JSON):
 

@@ -92,6 +92,7 @@ export async function advanceFix(
     issueNumber,
     title: detail.title,
     reviewFindings: findings,
+    priorReviewHistory: extractAllReviewFindingsHistory(detail.comments, round),
     fixRound: round,
     pipelineRunId,
     specContext,
@@ -228,4 +229,32 @@ export function extractReviewFindings(
         b.toUpperCase().includes("REQUEST CHANGES")),
   );
   return m?.body ?? "";
+}
+
+/**
+ * All prior review-{round} finding comments on the issue (oldest-first, excluding
+ * the most recent, which is already supplied verbatim as the current findings),
+ * joined with dividers. Gives the fix harness the full cross-round history so it
+ * does not revert an earlier fix and re-trigger a finding that was already
+ * resolved (the #275 publicly_accessible oscillation). Returns "" when there is
+ * at most one such comment (nothing prior to show).
+ */
+export function extractAllReviewFindingsHistory(
+  comments: { body: string }[],
+  round: 1 | 2,
+): string {
+  const marker = `## Review ${round}`;
+  const matches = comments.filter(
+    (c) =>
+      c.body.startsWith(marker) &&
+      (c.body.includes("needs-attention") ||
+        c.body.includes("### Findings") ||
+        c.body.toUpperCase().includes("REQUEST_CHANGES") ||
+        c.body.toUpperCase().includes("REQUEST CHANGES")),
+  );
+  if (matches.length <= 1) return "";
+  return matches
+    .slice(0, -1)
+    .map((c, i) => `--- Prior review ${round} attempt ${i + 1} ---\n${c.body}`)
+    .join("\n\n");
 }
