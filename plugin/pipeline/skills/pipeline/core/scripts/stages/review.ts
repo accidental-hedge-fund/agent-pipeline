@@ -53,6 +53,11 @@ const REVIEW_MARKER_PREFIX_R2 = "## Review 2";
 // lets extractReviewedSha pick the LAST occurrence, guarding against injected
 // sentinel content appearing earlier in the comment body.
 const REVIEWED_SHA_RE = /^<!-- reviewed-sha: ([0-9a-fA-F]{40}) -->$/gm;
+// Machine-readable blocking-keys marker emitted by formatReviewComment (#133).
+// Anchored to a full line + global flag so extractBlockingKeysFromComment picks
+// the LAST occurrence, guarding against injected marker content earlier in the
+// comment body (reviewer-authored finding bodies can appear before the footer).
+const PIPELINE_BLOCKING_KEYS_RE = /^<!-- pipeline-blocking-keys: ([0-9a-f,]*) -->$/gm;
 
 export interface AdvanceReviewOpts {
   dryRun?: boolean;
@@ -219,9 +224,8 @@ export async function advanceReview(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );
 
-  await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
-
   if (verdict.verdict === "approve") {
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
     if (round === 1) {
       await transitionFn(
         cfg,
@@ -268,6 +272,7 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
     const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
     await setBlockedFn(
       cfg,
@@ -291,8 +296,17 @@ export async function advanceReview(
   // ran and its findings are on the record — the item advances as if approved.
   const overrides = extractOverrides(detail.comments);
   const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides);
+  // Blocking keys set: derived here after policy partitioning so the review
+  // comment can embed the pipeline-blocking-keys marker (#133 fix). Only
+  // computed once; shared by all blocking-path branches below.
+  const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
   if (partition.blocking.length === 0) {
+    // Pass the empty blockingKeysSet so formatReviewComment emits an authoritative
+    // empty marker (#133 fix 2): prevents extractBlockingKeysFromComment from
+    // falling back to all override-key tokens on a re-review where an advisory
+    // finding later crosses the policy threshold.
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet));
     const advisory = advisoryAdvanceComment(cfg, round, reviewer, partition);
     await postCommentFn(cfg, issueNumber, advisory);
     // Also surface on the PR: review bookkeeping lives on the issue, but a human
@@ -324,19 +338,66 @@ export async function advanceReview(
     };
   }
 
+  // Post the verdict comment WITH the pipeline-blocking-keys marker so future
+  // recurrence checks can distinguish prior blocking findings from advisory ones.
+  await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet));
+
+  // Prior verdict comments for THIS round, oldest → newest. `detail.comments`
+  // was snapshotted before the current verdict was posted, so the last entry is
+  // the round that ran immediately before this one. Drives the recurrence check
+  // and the RECURRING/NEW punch-list tags (#133), and the bounded-rounds ceiling.
+  const roundPrefix = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
+  const priorRoundComments = detail.comments.filter((c) => c.body.startsWith(roundPrefix));
+  const roundCap = cfg.review_policy.max_adversarial_rounds;
+
+  // Recurrence-aware early park (#133): a blocking finding whose content-addressed
+  // key (`findingKey`: severity|file|title) already appeared in the immediately-
+  // prior round survived a fix attempt unchanged — a proven non-convergence
+  // signal that a human is needed NOW, not after the remaining round budget.
+  // Pure set-comparison of controlled strings the pipeline itself emits; a
+  // reworded or re-severitied finding carries a different key and is treated as
+  // new (no early park). Parks at the same safe `needs-human` terminal as the
+  // ceiling — this can only END the loop earlier, never advance or override.
+  const lastPriorRound = priorRoundComments[priorRoundComments.length - 1];
+  const priorKeys = lastPriorRound
+    ? extractBlockingKeysFromComment(lastPriorRound.body)
+    : new Set<string>();
+  const recurring = partition.blocking.filter((f) => priorKeys.has(findingKey(f)));
+  if (recurring.length > 0) {
+    await postCommentFn(
+      cfg,
+      issueNumber,
+      reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence"),
+    );
+    await transitionFn(
+      cfg,
+      issueNumber,
+      stage,
+      "needs-human",
+      `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
+        `finding key after a fix round — a proven non-convergence signal. Recorded as advisory; ` +
+        `parked at needs-human early, without consuming the remaining round budget (will NOT ` +
+        `auto-advance to ready-to-deploy).`,
+    );
+    return {
+      advanced: true,
+      from: stage,
+      to: "needs-human",
+      summary: `recurrence: ${recurring.length} blocking finding(s) unchanged after a fix → needs-human`,
+    };
+  }
+
   // Bounded rounds: cap how many times this review round may re-run before we
   // stop looping. After `max_adversarial_rounds` passes still produce blocking
   // findings, record them as advisory and route to the `needs-human` terminal —
   // a human owns the residual call — instead of burning another fix→re-review
   // cycle to the iteration cap. `detail.comments` excludes the current round's
   // verdict (posted after the snapshot was fetched), so prior+1 = this round's number.
-  const roundCap = cfg.review_policy.max_adversarial_rounds;
-  const priorRounds = countPriorRounds(detail.comments, round);
-  if (roundCap > 0 && priorRounds + 1 >= roundCap) {
+  if (roundCap > 0 && priorRoundComments.length + 1 >= roundCap) {
     await postCommentFn(
       cfg,
       issueNumber,
-      reviewCeilingComment(cfg, round, reviewer, partition, roundCap),
+      reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments),
     );
     await transitionFn(
       cfg,
@@ -418,31 +479,52 @@ function advisoryAdvanceComment(
 }
 
 /**
- * Punch-list comment posted when a review round hits the `max_adversarial_rounds`
- * ceiling: the still-blocking findings are recorded as advisory and the item is
- * parked at `needs-human`. Lists each with its override-key so a human can accept
- * it (`--override`) or fix it, then relabel to resume. Never auto-advances.
+ * Punch-list comment posted when the fix↔review loop stops converging: a review
+ * round hit the `max_adversarial_rounds` ceiling, or a blocking finding
+ * re-emerged with an unchanged key right after a fix round (#133 — `trigger:
+ * "recurrence"`, same comment shape, posted before the round budget is
+ * exhausted; the `--status` punch-list keys on the shared header). The
+ * still-blocking findings are recorded as advisory and the item is parked at
+ * `needs-human`. Each finding is tagged `RECURRING (n rounds)` / `NEW` by
+ * set-membership of its content-addressed key against the prior same-round
+ * verdict comments, and listed with its override-key so a human can accept it
+ * (`--override`) or fix it, then relabel to resume. Never auto-advances.
+ * Exported for tests.
  */
-function reviewCeilingComment(
+export function reviewCeilingComment(
   cfg: PipelineConfig,
   round: 1 | 2,
   reviewer: string,
   partition: PartitionResult,
   cap: number,
+  priorReviewComments: { body: string }[],
+  trigger: "ceiling" | "recurrence" = "ceiling",
 ): string {
+  const priorKeySets = priorReviewComments.map((c) => extractAllKeysFromComment(c.body));
+  const explanation =
+    trigger === "recurrence"
+      ? `Review ${round} re-emitted blocking finding(s) with an unchanged finding key after a ` +
+        `fix round — a proven non-convergence signal. To stop looping, they are recorded as ` +
+        `**advisory** and this item is parked at \`needs-human\` — it will NOT auto-advance to ` +
+        `ready-to-deploy.`
+      : `Review ${round} re-ran ${cap} times and still has ${partition.blocking.length} blocking ` +
+        `finding(s). To stop looping, they are recorded as **advisory** and this item is parked at ` +
+        `\`needs-human\` — it will NOT auto-advance to ready-to-deploy.`;
   const lines = [
     `## Pipeline: Review ceiling reached — human decision required`,
     "",
     `**Reviewer**: ${reviewer}`,
-    `Review ${round} re-ran ${cap} times and still has ${partition.blocking.length} blocking ` +
-      `finding(s). To stop looping, they are recorded as **advisory** and this item is parked at ` +
-      `\`needs-human\` — it will NOT auto-advance to ready-to-deploy.`,
+    explanation,
     "",
     "### Unresolved blocking findings",
   ];
   for (const f of partition.blocking) {
+    const key = findingKey(f);
     const loc = f.file ? ` — \`${f.file}${f.line_start ? `:${f.line_start}` : ""}\`` : "";
-    lines.push(`- \`${findingKey(f)}\` **[${(f.severity ?? "medium").toUpperCase()}]** ${f.title}${loc}`);
+    lines.push(
+      `- **${recurrenceTag(key, priorKeySets)}** \`${key}\` ` +
+        `**[${(f.severity ?? "medium").toUpperCase()}]** ${f.title}${loc}`,
+    );
   }
   lines.push(
     "",
@@ -733,6 +815,7 @@ export function formatReviewComment(
   verdictOrRound: (ReviewVerdict & { _raw?: string }) | 1 | 2,
   roundOrReviewer: 1 | 2 | string,
   maybeReviewer?: string,
+  blockingKeys?: Set<string>,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -778,6 +861,16 @@ export function formatReviewComment(
     for (const step of verdict.next_steps) lines.push(`- ${step}`);
   }
   lines.push(cfgFooter(cfg));
+  // Machine-readable blocking-keys marker (#133): records which findings were
+  // above the severity policy at post time so future rounds can distinguish
+  // prior blocking from advisory findings when checking for recurrence.
+  // Emitted when `blockingKeys` is supplied — including as an empty list for
+  // advisory-only rounds (no blocking findings). An empty marker is authoritative:
+  // extractBlockingKeysFromComment will NOT fall back to all override-key tokens.
+  // Omitted when no `blockingKeys` arg is provided (approve and 0-findings paths).
+  if (blockingKeys !== undefined) {
+    lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
+  }
   // Sentinel last (#16): a dedicated, anchorable line the gate reads back to
   // verify the verdict still covers HEAD. Omitted when no SHA was resolved.
   if (verdict.commitSha) {
@@ -824,6 +917,111 @@ function extractReview2Findings(comments: { body: string }[]): string | undefine
 export function countPriorRounds(comments: { body: string }[], round: 1 | 2): number {
   const prefix = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
   return comments.filter((c) => c.body.startsWith(prefix)).length;
+}
+
+/**
+ * Collect every content-addressed finding key a review verdict comment carries
+ * by scanning all `` `override-key: <8-hex>` `` tokens. This includes advisory
+ * findings as well as blocking ones — used for RECURRING/NEW punch-list tagging
+ * where the count should reflect every prior appearance, not just blocking ones.
+ * Pure and total: any string yields a Set without throwing.
+ */
+function extractAllKeysFromComment(body: string): Set<string> {
+  const keys = new Set<string>();
+  const re = /`override-key: ([0-9a-f]{8})`/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) keys.add(m[1]);
+  return keys;
+}
+
+/**
+ * Collect the BLOCKING finding keys from a review verdict comment for the
+ * recurrence early-park check (#133). Prefers the `pipeline-blocking-keys`
+ * machine-readable marker that `formatReviewComment` embeds after policy
+ * partitioning (which distinguishes blocking from advisory findings). Falls
+ * back to all `override-key` tokens only for comments without the marker (legacy
+ * comments predating #133). Two hardening properties (#133 fix 2):
+ * - Anchored full-line regex: rejects any marker embedded mid-line in reviewer prose.
+ * - Last-occurrence selection: mitigates a reviewer body that places a spoofed
+ *   full-line marker before the real pipeline-emitted footer marker.
+ * - Empty marker is authoritative: an advisory-only round emits an empty list and
+ *   extractBlockingKeysFromComment returns an empty Set (no fallback to all keys).
+ * Pure and total: no network, git, or subprocess calls.
+ */
+export function extractBlockingKeysFromComment(body: string): Set<string> {
+  PIPELINE_BLOCKING_KEYS_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = PIPELINE_BLOCKING_KEYS_RE.exec(body)) !== null) {
+    lastMatch = cur;
+  }
+  PIPELINE_BLOCKING_KEYS_RE.lastIndex = 0;
+  if (lastMatch !== null) {
+    const keys = new Set<string>();
+    for (const k of lastMatch[1].split(",")) {
+      if (/^[0-9a-f]{8}$/.test(k)) keys.add(k);
+    }
+    return keys;
+  }
+  return extractAllKeysFromComment(body);
+}
+
+/**
+ * The punch-list tag for a finding key (#133): `RECURRING (n rounds)` where `n`
+ * counts the prior same-round verdict comments that carried the key, or `NEW`
+ * when none did (or the key is unparseable). Single-sourced so the posted
+ * punch-list comment and the `--status` re-derivation cannot drift.
+ */
+export function recurrenceTag(key: string | undefined, priorKeySets: Set<string>[]): string {
+  const n = key === undefined ? 0 : priorKeySets.filter((s) => s.has(key)).length;
+  return n > 0 ? `RECURRING (${n} rounds)` : "NEW";
+}
+
+// A punch-list finding line's already-rendered tag prefix, stripped before
+// re-deriving so tags are never doubled when `--status` re-reads a comment
+// this code emitted.
+const PUNCHLIST_TAG_RE = /^\*\*(?:NEW|RECURRING \(\d+ rounds?\))\*\*\s+/;
+// The finding's key within a punch-list line: the first backticked token that is
+// exactly 8 lowercase hex chars (the same shape `--override` accepts).
+const PUNCHLIST_KEY_RE = /`([0-9a-f]{8})`/;
+
+/**
+ * Re-derive the RECURRING/NEW tag for each punch-list finding line when the
+ * ceiling comment is read back (the `--status` needs-human surface, #133).
+ * `ceilingIdx` is the ceiling comment's index within `comments`. "Prior" rounds
+ * exclude the verdict comment that triggered the park — the nearest `## Review N`
+ * comment before the ceiling comment — because its keys ARE the punch-list:
+ * counting it would tag every finding RECURRING. This reproduces exactly the
+ * comment set the tags were derived from when the punch-list was posted. Lines
+ * with no parseable key are tagged NEW. Pure string work over controlled
+ * pipeline-emitted comments; total on malformed input.
+ */
+export function tagCeilingFindingLines(
+  findingLines: string[],
+  comments: { body: string }[],
+  ceilingIdx: number,
+): string[] {
+  let triggerIdx = -1;
+  for (let i = ceilingIdx - 1; i >= 0; i--) {
+    if (reviewRoundOf(comments[i].body) !== null) {
+      triggerIdx = i;
+      break;
+    }
+  }
+  const priorKeySets: Set<string>[] = [];
+  if (triggerIdx !== -1) {
+    const triggerRound = reviewRoundOf(comments[triggerIdx].body);
+    for (let i = 0; i < triggerIdx; i++) {
+      if (reviewRoundOf(comments[i].body) === triggerRound) {
+        priorKeySets.push(extractAllKeysFromComment(comments[i].body));
+      }
+    }
+  }
+  return findingLines.map((line) => {
+    const rest = line.replace(/^- /, "").replace(PUNCHLIST_TAG_RE, "");
+    const key = rest.match(PUNCHLIST_KEY_RE)?.[1];
+    return `- ${recurrenceTag(key, priorKeySets)} ${rest}`;
+  });
 }
 
 /** Which review round a comment body belongs to, or null if it isn't one. */
