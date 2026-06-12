@@ -28,6 +28,7 @@ import {
   isBlocked,
   pickStage,
   postComment,
+  silentTransition,
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, withLock } from "./lock.ts";
@@ -52,7 +53,7 @@ const MAX_ITERATIONS = 12;
 const require = createRequire(import.meta.url);
 export const VERSION: string = (require("../package.json") as { version: string }).version;
 
-interface CliOpts {
+export interface CliOpts {
   status?: boolean;
   unblock?: string;
   override?: string;
@@ -80,7 +81,7 @@ async function main(): Promise<void> {
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
       "--override <spec>",
-      'disposition a review finding so it no longer blocks: "<override-key>: <reason>" (key from the review comment; reason may lead with "rejected" or "deferred #N")',
+      'disposition a review finding so it no longer blocks, then auto-resume the advance loop: "<override-key>: <reason>" (key from the review comment; reason may lead with "rejected" or "deferred #N")',
     )
     .option("--once", "advance one stage and stop")
     .option("--dry-run", "log what would happen without invoking harnesses or modifying GitHub")
@@ -158,7 +159,7 @@ async function main(): Promise<void> {
     return;
   }
   if (opts.override !== undefined) {
-    await runOverride(cfg, issueNumber, opts.override);
+    await runOverride(cfg, issueNumber, opts.override, opts);
     return;
   }
   await runAdvance(cfg, issueNumber, opts);
@@ -283,8 +284,8 @@ export async function runStatus(
     console.log(
       punchlist ??
         `Needs human, but no ${REVIEW_CEILING_MARKER.replace(/^## /, "")} comment was found. ` +
-          `Override (\`--override "<key>: <reason>"\`) or fix the residual findings, then relabel ` +
-          `\`pipeline:needs-human\` → \`pipeline:review-2\` to resume.`,
+          `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
+          `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
   }
 }
@@ -313,15 +314,32 @@ export function needsHumanPunchlist(
   }
   if (ceilingIdx === -1) return null;
 
-  const findings = ceilingFindingLines(comments[ceilingIdx].body);
+  const body = comments[ceilingIdx].body;
+  const findings = ceilingFindingLines(body);
   const count = findings.length;
   const noun = count === 1 ? "finding" : "findings";
+  const round = ceilingRound(body) ?? 2;
   return [
     `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
     ...reviewStage.tagCeilingFindingLines(findings, comments, ceilingIdx),
-    `To resume: accept a finding with \`--override "<key>: <reason>"\` (audited) or fix it by hand,`,
-    `then relabel \`pipeline:needs-human\` → \`pipeline:review-2\`.`,
+    `To resume:`,
+    `- \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
+    `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
   ].join("\n");
+}
+
+/**
+ * The review round recorded in a ceiling comment (#135) — the round `--override`
+ * auto-resumes into. Reads the controlled `Review N re-ran …` line the pipeline
+ * itself emits (review.ts's `reviewCeilingComment`). Line-anchored and
+ * first-match-wins: the controlled line precedes any reviewer-authored finding
+ * text, so injected content later in the body can never override it (the
+ * e8b1f0b4 lesson — a whole-body `pipeline:review-N` regex matched finding
+ * prose). Returns null when the line is absent.
+ */
+export function ceilingRound(body: string): 1 | 2 | null {
+  const m = body.match(/^Review ([12]) re-ran /m);
+  return m ? (Number(m[1]) as 1 | 2) : null;
 }
 
 /** The `- ` bullet lines under the controlled `### Unresolved blocking findings`
@@ -369,16 +387,51 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
 }
 
 // ---------------------------------------------------------------------------
-// Override mode (#17): disposition a review finding so it no longer blocks
+// Override mode (#17): disposition a review finding so it no longer blocks,
+// then auto-resume the advance loop (#135).
 // ---------------------------------------------------------------------------
 
-async function runOverride(cfg: PipelineConfig, issueNumber: number, spec: string): Promise<void> {
+/** IO seam for {@link runOverride} so unit tests inject fakes — no real gh. */
+export interface RunOverrideDeps {
+  getIssueDetail: typeof getIssueDetail;
+  postComment: typeof postComment;
+  clearBlocked: typeof clearBlocked;
+  silentTransition: typeof silentTransition;
+  /** The advance loop re-entered after the disposition is recorded (#135). */
+  runAdvance: typeof runAdvance;
+}
+
+const defaultRunOverrideDeps: RunOverrideDeps = {
+  getIssueDetail,
+  postComment,
+  clearBlocked,
+  silentTransition,
+  runAdvance,
+};
+
+export async function runOverride(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  spec: string,
+  opts: CliOpts,
+  deps: RunOverrideDeps = defaultRunOverrideDeps,
+): Promise<void> {
+  // --dry-run is incompatible: --override always records an audited disposition
+  // (postComment, clearBlocked, silentTransition).  Allowing the combination would
+  // silently mutate label state under the mode advertised as "no GitHub writes".
+  if (opts.dryRun) {
+    console.error(
+      "pipeline: --override cannot be combined with --dry-run — --override always records an audited disposition.",
+    );
+    process.exitCode = 2;
+    return;
+  }
   const parsed = parseOverrideArg(spec);
   if ("error" in parsed) {
     console.error(`pipeline: ${parsed.error}`);
     process.exit(2);
   }
-  const detail = await getIssueDetail(cfg, issueNumber);
+  const detail = await deps.getIssueDetail(cfg, issueNumber);
   const stage = pickStage(detail.labels) ?? "(unknown)";
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const body = overrideComment({
@@ -389,16 +442,46 @@ async function runOverride(cfg: PipelineConfig, issueNumber: number, spec: strin
     timestamp: ts,
     footer: cfg.marker_footer,
   });
-  await postComment(cfg, issueNumber, body);
+  await deps.postComment(cfg, issueNumber, body);
   // If the item is blocked (e.g. a review round blocked on this finding), clear
-  // the blocker so a subsequent run can re-evaluate with the override applied.
+  // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
-    await clearBlocked(cfg, issueNumber);
+    await deps.clearBlocked(cfg, issueNumber);
   }
   console.log(
-    `[pipeline] #${issueNumber}: recorded override for finding ${parsed.key} (${parsed.disposition}). ` +
-      `Re-run the pipeline to advance with the override applied.`,
+    `[pipeline] #${issueNumber}: recorded override for finding ${parsed.key} (${parsed.disposition}).`,
   );
+
+  // #135: the human's judgment WAS the key+reason — everything from here is
+  // deterministic (the advance loop re-runs partitionFindings against the
+  // sentinel just posted), so re-enter the loop instead of asking for a manual
+  // re-run. From needs-human, first flip back to the review round recorded in
+  // the ceiling comment — the same relabel the operator previously did by hand.
+  // Fail-safe: remaining blockers re-park at needs-human; the resumed loop never
+  // advances past an unresolved one, and still stops at ready-to-deploy.
+  if (stage === "needs-human") {
+    const ceiling = [...detail.comments]
+      .reverse()
+      .find((c) => c.body.startsWith(REVIEW_CEILING_MARKER));
+    const round = ceiling ? ceilingRound(ceiling.body) : null;
+    if (round === null) {
+      console.error(
+        `pipeline: #${issueNumber} is at needs-human but ` +
+          (ceiling
+            ? `the latest "${REVIEW_CEILING_MARKER.replace(/^## /, "")}" comment does not name the review round to resume. `
+            : `no "${REVIEW_CEILING_MARKER.replace(/^## /, "")}" comment was found. `) +
+          `The override is recorded; relabel \`pipeline:needs-human\` → \`pipeline:review-<round>\` and re-run to apply it.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const to: Stage = round === 1 ? "review-1" : "review-2";
+    await deps.silentTransition(cfg, issueNumber, "needs-human", to);
+    console.log(
+      `[pipeline] #${issueNumber}: needs-human → ${to} (resuming the round that hit the ceiling)`,
+    );
+  }
+  await deps.runAdvance(cfg, issueNumber, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -454,13 +537,16 @@ async function runAdvance(
       }
 
       if (stage === "needs-human") {
-        console.log(
-          `[pipeline] #${issueNumber}: parked at needs-human — a review round hit the round ceiling. ` +
-            `Override (--override) or fix the residual findings, then relabel pipeline:needs-human → pipeline:review-2 to resume.`,
-        );
         const ceiling = [...detail.comments]
           .reverse()
           .find((c) => c.body.startsWith(REVIEW_CEILING_MARKER));
+        const round = ceiling ? ceilingRound(ceiling.body) : null;
+        const resumeLabel = round !== null ? `pipeline:review-${round}` : "pipeline:review-<round>";
+        console.log(
+          `[pipeline] #${issueNumber}: parked at needs-human — a review round hit the round ceiling. ` +
+            `Disposition a finding with --override "<key>: <reason>" (records the decision and auto-resumes), ` +
+            `or fix the residual findings and relabel pipeline:needs-human → ${resumeLabel} to resume.`,
+        );
         if (ceiling) console.log(ceiling.body);
         break;
       }
