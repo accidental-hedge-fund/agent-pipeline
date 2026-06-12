@@ -36,6 +36,7 @@ import {
   type PartitionResult,
 } from "../review-policy.ts";
 import type {
+  BlockerKind,
   Outcome,
   PipelineConfig,
   ReviewFinding,
@@ -123,7 +124,7 @@ export async function advanceReview(
 
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
   if (!prNumber) {
-    await setBlockedFn(cfg, issueNumber, "No pull request found for this issue.", stage);
+    await setBlockedFn(cfg, issueNumber, "No pull request found for this issue.", stage, "pr-creation-failed");
     return { advanced: false, status: "blocked", reason: "no PR found" };
   }
 
@@ -135,7 +136,7 @@ export async function advanceReview(
   try {
     const sha = (await getPrDetailFn(cfg, prNumber)).head_sha ?? "";
     if (!/^[0-9a-f]{40}$/i.test(sha)) {
-      await setBlockedFn(cfg, issueNumber, `PR head SHA is missing or invalid: "${sha}"`, stage);
+      await setBlockedFn(cfg, issueNumber, `PR head SHA is missing or invalid: "${sha}"`, stage, "harness-failure");
       return { advanced: false, status: "blocked", reason: "invalid SHA" };
     }
     commitSha = sha;
@@ -145,6 +146,7 @@ export async function advanceReview(
       issueNumber,
       `Could not resolve PR head SHA: ${(err as Error).message}`,
       stage,
+      "harness-failure",
     );
     return { advanced: false, status: "blocked", reason: "SHA resolution failed" };
   }
@@ -154,11 +156,11 @@ export async function advanceReview(
     diff = await getPrDiffFn(cfg, prNumber);
   } catch (err) {
     const e = err as Error;
-    await setBlockedFn(cfg, issueNumber, `Could not retrieve PR diff: ${e.message}`, stage);
+    await setBlockedFn(cfg, issueNumber, `Could not retrieve PR diff: ${e.message}`, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason: e.message };
   }
   if (!diff.trim()) {
-    await setBlockedFn(cfg, issueNumber, "PR has an empty diff.", stage);
+    await setBlockedFn(cfg, issueNumber, "PR has an empty diff.", stage, "harness-failure");
     return { advanced: false, status: "blocked", reason: "empty diff" };
   }
 
@@ -173,6 +175,7 @@ export async function advanceReview(
         `PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} → ${postDiffSha.slice(0, 7)}). ` +
           `Re-run the review stage to evaluate a stable HEAD.`,
         stage,
+        "harness-failure",
       );
       return { advanced: false, status: "blocked", reason: "HEAD moved during diff fetch" };
     }
@@ -215,7 +218,7 @@ export async function advanceReview(
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    await setBlockedFn(cfg, issueNumber, `Review harness (${reviewer}) failed: ${reason}`, stage);
+    await setBlockedFn(cfg, issueNumber, `Review harness (${reviewer}) failed: ${reason}`, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
 
@@ -281,6 +284,7 @@ export async function advanceReview(
         `so there is nothing concrete to fix. The reviewer output likely could not be parsed into ` +
         `a structured verdict. Raw reviewer output:\n\n${raw}`,
       stage,
+      "harness-failure",
     );
     return {
       advanced: false,

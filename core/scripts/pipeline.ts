@@ -571,7 +571,7 @@ async function runAdvance(
           console.log(blockerComment.body);
         }
         console.log(
-          `[pipeline] To unblock: $pipeline ${issueNumber} --unblock "<answer>"`,
+          `[pipeline] #${issueNumber}: follow the "### How to unblock" steps in the comment above to resume.`,
         );
         break;
       }

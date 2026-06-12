@@ -18,7 +18,7 @@ import {
   transition as defaultTransition,
 } from "../gh.ts";
 import { runCapped } from "../harness.ts";
-import type { Outcome, PipelineConfig, Stage } from "../types.ts";
+import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const MAX_COMMENT_OUTPUT = 2000;
 
@@ -66,6 +66,7 @@ export interface EvalDeps {
     issueNumber: number,
     reason: string,
     stage: Stage | null,
+    kind?: BlockerKind,
   ) => Promise<void>;
   postComment?: (
     cfg: PipelineConfig,
@@ -114,6 +115,7 @@ export async function advanceEval(
       issueNumber,
       "`eval_gate.enabled` is true but no `command` is configured. Set `eval_gate.command` in `.github/pipeline.yml`.",
       "eval-gate",
+      "eval-gate-misconfigured",
     );
     return { advanced: false, status: "blocked", reason: "eval_gate.command not set" };
   }
@@ -126,6 +128,7 @@ export async function advanceEval(
       issueNumber,
       "eval-gate: no worktree found for this issue. The worktree may have been removed prematurely.",
       "eval-gate",
+      "worktree-missing",
     );
     return { advanced: false, status: "blocked", reason: "no worktree" };
   }
@@ -194,6 +197,7 @@ export async function advanceEval(
       issueNumber,
       `Eval gate timed out${attempts} (${timeoutSec}s limit).\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
       "eval-gate",
+      "harness-failure",
     );
     return { advanced: false, status: "blocked", reason: `eval gate timed out${attempts}` };
   }
@@ -205,6 +209,7 @@ export async function advanceEval(
       issueNumber,
       `Eval gate runner/tooling error${attempts} — the eval command could not be executed.\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
       "eval-gate",
+      "harness-failure",
     );
     return { advanced: false, status: "blocked", reason: `eval gate runner error${attempts}` };
   }
@@ -222,6 +227,7 @@ export async function advanceEval(
     issueNumber,
     `Eval gate failed${attempts}.\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
     "eval-gate",
+    "eval-gate-failed",
   );
   return { advanced: false, status: "blocked", reason: `eval gate failed${attempts}` };
 }
