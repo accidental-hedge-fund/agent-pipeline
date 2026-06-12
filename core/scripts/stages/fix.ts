@@ -23,6 +23,7 @@ import {
   type VerifyResult,
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId } from "../traceability.ts";
+import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
@@ -122,15 +123,27 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason };
   }
 
-  const headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   if (headBefore && headAfter && headBefore === headAfter) {
-    await setBlocked(
-      cfg,
+    // #131: the harness reported success without committing — salvage real
+    // uncommitted work into a commit instead of discarding it. A clean
+    // worktree (nothing salvaged) keeps the existing block path.
+    const salvaged = await trySalvageUncommittedWork(
+      wt.path,
       issueNumber,
-      `${stage} reported success but produced no new commits.`,
-      stage,
+      pipelineRunId,
+      fixSalvageStageLabel(round, issueNumber),
     );
-    return { advanced: false, status: "blocked", reason: "no new commits" };
+    if (!salvaged) {
+      await setBlocked(
+        cfg,
+        issueNumber,
+        `${stage} reported success but produced no new commits.`,
+        stage,
+      );
+      return { advanced: false, status: "blocked", reason: "no new commits" };
+    }
+    headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   }
 
   // ---- Verify fix-round commit message format (#68) ----
@@ -203,6 +216,21 @@ export async function advanceFix(
       summary: "fixes pushed",
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Salvage stage label (#131) — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage label for a salvaged fix-round commit. Includes the round's prescribed
+ * commit subject so the salvage commit body satisfies `enforceFixCommitGate`'s
+ * message pattern (matched against subject + body) and the salvaged run
+ * proceeds to the test gate. Exported so tests can pin the label against the
+ * gate's actual pattern (drift between the two fails the contract test).
+ */
+export function fixSalvageStageLabel(round: 1 | 2, issueNumber: number): string {
+  return `fix-${round} (prescribed commit: "fix: address review ${round} findings (#${issueNumber})")`;
 }
 
 // ---------------------------------------------------------------------------
