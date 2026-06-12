@@ -836,7 +836,10 @@ function detailWithComments(comments: { body: string }[]) {
   } as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
 }
 
-test("extractBlockingKeysFromComment: collects every override-key from a real review comment (#133)", () => {
+test("extractBlockingKeysFromComment: no marker present — falls back to all override-key tokens (#133)", () => {
+  // Comments without a pipeline-blocking-keys marker (e.g. posted by old code)
+  // fall back to returning all override-key tokens so the recurrence check
+  // remains conservative (over-fires rather than silently misses).
   const other: ReviewFinding = {
     severity: "medium",
     title: "second",
@@ -846,7 +849,32 @@ test("extractBlockingKeysFromComment: collects every override-key from a real re
     recommendation: "r",
   };
   const { body } = priorVerdictComment(2, [FINDING_BUG, other]);
+  assert.doesNotMatch(body, /pipeline-blocking-keys/, "priorVerdictComment must not emit the marker");
   assert.deepEqual(extractBlockingKeysFromComment(body), new Set([KEY_BUG, findingKey(other)]));
+});
+
+test("extractBlockingKeysFromComment: marker present — returns only the listed blocking keys (#133 fix)", () => {
+  // When formatReviewComment embeds a pipeline-blocking-keys marker, only those
+  // keys are returned — advisory finding keys in the same comment are excluded.
+  const advisory: ReviewFinding = {
+    severity: "medium",
+    title: "advisory-finding",
+    body: "b",
+    confidence: 0.4,
+    recommendation: "r",
+  };
+  const advisoryKey = findingKey(advisory);
+  const body = formatReviewComment(
+    cfgConverge,
+    { verdict: "needs-attention", summary: "s", findings: [FINDING_BUG, advisory], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set([KEY_BUG]),  // only FINDING_BUG is blocking
+  );
+  assert.match(body, new RegExp(`pipeline-blocking-keys: ${KEY_BUG}`), "marker must list only the blocking key");
+  assert.ok(body.includes(advisoryKey), "comment body still carries the advisory key as override-key");
+  assert.deepEqual(extractBlockingKeysFromComment(body), new Set([KEY_BUG]), "must return only blocking keys from marker");
+  assert.ok(!extractBlockingKeysFromComment(body).has(advisoryKey), "advisory key must NOT be returned");
 });
 
 test("extractBlockingKeysFromComment: approve comment with no findings → empty set (#133)", () => {
@@ -1000,6 +1028,57 @@ test("recurrence (#133): round-1 recurrence parks from review-1 too", async (t) 
   assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
   assert.equal(outcome.from, "review-1");
   assert.equal(outcome.to, "needs-human");
+});
+
+test("recurrence (#133 fix): prior advisory finding that later meets threshold is NOT treated as recurring — routes to fix", async (t) => {
+  // Regression for the finding: prior comment had FINDING_BUG (blocking) and
+  // FINDING_FORMERLY_ADVISORY (advisory — confidence below min_confidence). The
+  // pipeline-blocking-keys marker in the prior comment records only the blocking
+  // key. In the current round, FINDING_FORMERLY_ADVISORY re-appears with higher
+  // confidence, now crossing the threshold. Without the fix, extractBlockingKeys
+  // returned all keys (including the advisory one), triggering a false early park.
+  // With the fix, only the prior *blocking* key is in priorKeys → no early park.
+  const FINDING_FORMERLY_ADVISORY: ReviewFinding = {
+    severity: "medium",  // at block_threshold "medium" in cfgConverge, but…
+    title: "advisory-turned-blocking",
+    body: "b",
+    confidence: 0.4,  // below min_confidence 0.7 → was advisory in prior round
+    recommendation: "r",
+  };
+  const keyAdvisory = findingKey(FINDING_FORMERLY_ADVISORY);
+
+  // Build a prior round comment that includes BOTH findings, but marks only
+  // FINDING_BUG as blocking via the pipeline-blocking-keys marker.
+  const priorVerdict = {
+    verdict: "needs-attention" as const,
+    summary: "prior round",
+    findings: [FINDING_BUG, FINDING_FORMERLY_ADVISORY],
+    next_steps: [],
+    commitSha: SHA_A,
+  };
+  const priorComment = {
+    body: formatReviewComment(cfgConverge, priorVerdict, 2, "codex", new Set([KEY_BUG])),
+  };
+  // Sanity: the prior comment body should contain both keys but the
+  // pipeline-blocking-keys marker should only list KEY_BUG.
+  assert.ok(priorComment.body.includes(keyAdvisory), "prior comment must include the advisory key");
+  assert.match(priorComment.body, new RegExp(`pipeline-blocking-keys: ${KEY_BUG}`), "marker lists only the blocking key");
+  assert.doesNotMatch(priorComment.body, new RegExp(`pipeline-blocking-keys:.*${keyAdvisory}`), "marker must NOT include the advisory key");
+
+  // Current round re-emits the formerly-advisory finding with confidence 0.9 →
+  // now blocking (confidence ≥ 0.7). Same severity+title → same findingKey.
+  const currentNaVerdictJson =
+    `{"verdict":"needs-attention","summary":"advisory finding now meets threshold","findings":` +
+    `[{"severity":"medium","title":"advisory-turned-blocking","body":"b","confidence":0.9,"recommendation":"r"}],` +
+    `"next_steps":[]}`;
+
+  const { deps, rec } = makeDeps([currentNaVerdictJson]);
+  deps.getIssueDetail = async () => detailWithComments([priorComment]);
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "must route to fix, not early-park at needs-human");
+  assert.ok(!rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")), "no early-park ceiling comment");
 });
 
 // ---------------------------------------------------------------------------

@@ -219,9 +219,8 @@ export async function advanceReview(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );
 
-  await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
-
   if (verdict.verdict === "approve") {
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
     if (round === 1) {
       await transitionFn(
         cfg,
@@ -268,6 +267,7 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
     const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
     await setBlockedFn(
       cfg,
@@ -291,8 +291,13 @@ export async function advanceReview(
   // ran and its findings are on the record — the item advances as if approved.
   const overrides = extractOverrides(detail.comments);
   const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides);
+  // Blocking keys set: derived here after policy partitioning so the review
+  // comment can embed the pipeline-blocking-keys marker (#133 fix). Only
+  // computed once; shared by all blocking-path branches below.
+  const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
   if (partition.blocking.length === 0) {
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
     const advisory = advisoryAdvanceComment(cfg, round, reviewer, partition);
     await postCommentFn(cfg, issueNumber, advisory);
     // Also surface on the PR: review bookkeeping lives on the issue, but a human
@@ -323,6 +328,10 @@ export async function advanceReview(
       summary: `${verdict.findings.length} findings below policy — advanced`,
     };
   }
+
+  // Post the verdict comment WITH the pipeline-blocking-keys marker so future
+  // recurrence checks can distinguish prior blocking findings from advisory ones.
+  await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet));
 
   // Prior verdict comments for THIS round, oldest → newest. `detail.comments`
   // was snapshotted before the current verdict was posted, so the last entry is
@@ -482,7 +491,7 @@ export function reviewCeilingComment(
   priorReviewComments: { body: string }[],
   trigger: "ceiling" | "recurrence" = "ceiling",
 ): string {
-  const priorKeySets = priorReviewComments.map((c) => extractBlockingKeysFromComment(c.body));
+  const priorKeySets = priorReviewComments.map((c) => extractAllKeysFromComment(c.body));
   const explanation =
     trigger === "recurrence"
       ? `Review ${round} re-emitted blocking finding(s) with an unchanged finding key after a ` +
@@ -797,6 +806,7 @@ export function formatReviewComment(
   verdictOrRound: (ReviewVerdict & { _raw?: string }) | 1 | 2,
   roundOrReviewer: 1 | 2 | string,
   maybeReviewer?: string,
+  blockingKeys?: Set<string>,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -842,6 +852,13 @@ export function formatReviewComment(
     for (const step of verdict.next_steps) lines.push(`- ${step}`);
   }
   lines.push(cfgFooter(cfg));
+  // Machine-readable blocking-keys marker (#133): records which findings were
+  // above the severity policy at post time so future rounds can distinguish
+  // prior blocking from advisory findings when checking for recurrence.
+  // Omitted when no blocking keys are supplied (approve, no-blocking paths).
+  if (blockingKeys && blockingKeys.size > 0) {
+    lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
+  }
   // Sentinel last (#16): a dedicated, anchorable line the gate reads back to
   // verify the verdict still covers HEAD. Omitted when no SHA was resolved.
   if (verdict.commitSha) {
@@ -891,19 +908,39 @@ export function countPriorRounds(comments: { body: string }[], round: 1 | 2): nu
 }
 
 /**
- * Collect the content-addressed finding keys a review verdict comment carries,
- * by scanning for the backtick-wrapped `override-key: <8-hex>` tokens that
- * `formatReviewComment` embeds per finding (#133). Pure and total: any string
- * (empty, malformed, non-review) yields a Set without throwing — no network,
- * git, or subprocess calls. Shared by the recurrence early-park check and the
- * RECURRING/NEW punch-list tags.
+ * Collect every content-addressed finding key a review verdict comment carries
+ * by scanning all `` `override-key: <8-hex>` `` tokens. This includes advisory
+ * findings as well as blocking ones — used for RECURRING/NEW punch-list tagging
+ * where the count should reflect every prior appearance, not just blocking ones.
+ * Pure and total: any string yields a Set without throwing.
  */
-export function extractBlockingKeysFromComment(body: string): Set<string> {
+function extractAllKeysFromComment(body: string): Set<string> {
   const keys = new Set<string>();
   const re = /`override-key: ([0-9a-f]{8})`/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(body)) !== null) keys.add(m[1]);
   return keys;
+}
+
+/**
+ * Collect the BLOCKING finding keys from a review verdict comment for the
+ * recurrence early-park check (#133). Prefers the `pipeline-blocking-keys`
+ * machine-readable marker that `formatReviewComment` embeds after policy
+ * partitioning (which distinguishes blocking from advisory findings). Falls
+ * back to all `override-key` tokens for comments that predate the marker
+ * (conservative: may over-trigger on advisory-turned-blocking findings, same
+ * as the original behaviour). Pure and total: no network, git, or subprocess calls.
+ */
+export function extractBlockingKeysFromComment(body: string): Set<string> {
+  const markerMatch = body.match(/<!-- pipeline-blocking-keys: ([0-9a-f,]*) -->/);
+  if (markerMatch && markerMatch[1]) {
+    const keys = new Set<string>();
+    for (const k of markerMatch[1].split(",")) {
+      if (/^[0-9a-f]{8}$/.test(k)) keys.add(k);
+    }
+    return keys;
+  }
+  return extractAllKeysFromComment(body);
 }
 
 /**
@@ -953,7 +990,7 @@ export function tagCeilingFindingLines(
     const triggerRound = reviewRoundOf(comments[triggerIdx].body);
     for (let i = 0; i < triggerIdx; i++) {
       if (reviewRoundOf(comments[i].body) === triggerRound) {
-        priorKeySets.push(extractBlockingKeysFromComment(comments[i].body));
+        priorKeySets.push(extractAllKeysFromComment(comments[i].body));
       }
     }
   }
