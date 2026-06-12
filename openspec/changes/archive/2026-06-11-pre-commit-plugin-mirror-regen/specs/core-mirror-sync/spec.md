@@ -1,8 +1,5 @@
-# core-mirror-sync Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change fix-harness-regenerate-mirror. Update Purpose after archive.
-## Requirements
 ### Requirement: Repo-local agent instructions SHALL direct harnesses to regenerate the plugin/ mirror after editing core/
 
 Every repo-local context file read by an agent harness (`CLAUDE.md` at the repo root, `hosts/claude/SKILL.md`, and the Codex-host equivalent) SHALL contain an explicit instruction stating that after any edit to a file under `core/`, the harness SHALL run `node scripts/build.mjs` and include the regenerated `plugin/` directory in the same commit. When the pre-commit hook (`.githooks/pre-commit`) is active in a contributor's clone, the hook SHALL fulfill this instruction automatically; the harness instruction remains normative for agent contexts where git hooks do not run.
@@ -39,4 +36,3 @@ Every repo-local context file read by an agent harness (`CLAUDE.md` at the repo 
 - **WHEN** a harness commit edits `core/` but omits the regenerated `plugin/` mirror
 - **THEN** `npm run ci` (which runs `build.mjs --check`) SHALL still detect and fail on the stale mirror
 - **AND** the bounded fix loop SHALL self-heal the omission as before
-

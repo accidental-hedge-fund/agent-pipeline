@@ -1,0 +1,56 @@
+#!/bin/sh
+# Auto-regenerate the committed plugin/ mirror when a commit touches its sources.
+#
+# plugin/ is a generated mirror of core/ (+ hosts/claude/ + hosts/_shared/).
+# Forgetting to re-run `node scripts/build.mjs` after a core/ edit is this
+# repo's #1 wasted-CI-round cause. When a commit stages any path under core/,
+# hosts/claude/, or hosts/_shared/, this hook regenerates the mirror and stages
+# plugin/ + .claude-plugin/marketplace.json so the doubled diff lands in the
+# same commit automatically.
+#
+# Opt in per clone with `npm run setup-hooks`. This is convenience, not a gate:
+# `node scripts/build.mjs --check` in `npm run ci` / CI remains the authoritative,
+# clone-independent enforcement, and `git commit --no-verify` bypasses this hook.
+
+set -e
+
+# Run from the repo root so `node scripts/build.mjs` and the staged paths resolve.
+cd "$(git rev-parse --show-toplevel)"
+
+# Only regenerate when the staged change set touches the mirror's sources.
+# (No --diff-filter: a staged deletion under core/ must also re-sync the mirror.)
+# hosts/_shared/ is included because build.mjs reads hosts/_shared/entry.template.mjs
+# to generate the committed plugin shim.
+staged=$(git diff --cached --name-only --no-renames)
+if ! printf '%s\n' "$staged" | grep -Eq '^(core/|hosts/claude/|hosts/_shared/)'; then
+  exit 0
+fi
+
+echo "pre-commit: core/, hosts/claude/, or hosts/_shared/ staged — regenerating plugin/ mirror"
+
+# Guard: abort if the working tree has unstaged tracked edits under the mirror sources.
+# build.mjs reads the working tree, not the index, so an unstaged source change
+# would produce a mirror that doesn't match the staged source files — violating
+# the mirror contract and silently committing effects of un-staged work.
+unstaged_src=$(git diff --name-only -- core/ hosts/claude/ hosts/_shared/)
+if [ -n "$unstaged_src" ]; then
+  echo "pre-commit: aborting — unstaged changes found in mirror sources:"
+  printf '%s\n' "$unstaged_src" | sed 's/^/  /'
+  echo "Stage or stash all core/, hosts/claude/, and hosts/_shared/ changes before committing."
+  exit 1
+fi
+
+# Guard: abort if untracked files exist under mirror sources.
+# build.mjs copies the working tree, so an untracked file would be embedded in
+# the generated plugin/ mirror even though it is not staged — leaking local
+# scratch content into a published commit.
+untracked_src=$(git ls-files --others --exclude-standard -- core/ hosts/claude/ hosts/_shared/)
+if [ -n "$untracked_src" ]; then
+  echo "pre-commit: aborting — untracked files found in mirror sources:"
+  printf '%s\n' "$untracked_src" | sed 's/^/  /'
+  echo "Track, stash, or remove untracked files in core/ and hosts/ before committing."
+  exit 1
+fi
+
+node scripts/build.mjs
+git add plugin/ .claude-plugin/marketplace.json
