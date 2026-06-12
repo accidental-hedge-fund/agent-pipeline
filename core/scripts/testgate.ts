@@ -21,6 +21,7 @@ import {
   type VerifyResult,
 } from "./verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
+import { trySalvageUncommittedWork } from "./salvage-harness-work.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -68,6 +69,29 @@ export interface TestGateDeps {
    *  fix harness creates. Returns [] when `baseRef` equals HEAD (no new commits)
    *  or when the git command fails (non-git directory). */
   gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
+  /** Salvage uncommitted test-fix work into a commit (#131). Returns true when
+   *  a salvage commit was created. Injectable for tests. */
+  salvage?: (
+    wtPath: string,
+    issueNumber: number,
+    pipelineRunId: string,
+    stageLabel: string,
+  ) => Promise<boolean>;
+}
+
+// ---------------------------------------------------------------------------
+// Salvage stage label (#131) — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage label for a salvaged test-fix commit. Includes the prescribed test-fix
+ * commit subject so the salvage commit body satisfies
+ * `enforceTestFixCommitFormat`'s message pattern (matched against subject +
+ * body) and the loop proceeds to re-run the test command. Exported so tests
+ * can pin the label against the gate's actual pattern.
+ */
+export function testFixSalvageStageLabel(issueNumber: number): string {
+  return `test-fix (prescribed commit: "fix: resolve test/build failures (#${issueNumber})")`;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +168,7 @@ export async function runTestGate(
     deps.verifyTestFix ??
     ((wt: string, hb: string) => enforceTestFixCommitFormat(issueNumber, wt, hb));
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
+  const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
 
   const command = cfg.test_gate.command ? shellSplit(cfg.test_gate.command) : detectFn(wtPath);
   if (!command) return { skipped: true };
@@ -213,6 +238,16 @@ export async function runTestGate(
         ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
         : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;
       return { skipped: false, passed: false, attempts: attempt, blockReason: reason };
+    }
+
+    // #131: the fix harness may have done the work without committing — salvage
+    // real uncommitted changes into a commit before the clean-tree and commit
+    // checks below. Only the no-new-commit case salvages; a harness that
+    // committed AND left dirt still hits the dirty block (its commits must not
+    // be silently amended with leftovers).
+    const headAfterFix = await gitHeadFn(wtPath);
+    if (headBefore && headAfterFix === headBefore && (await gitDirtyFn(wtPath))) {
+      await salvageFn(wtPath, issueNumber, pipelineRunId, testFixSalvageStageLabel(issueNumber));
     }
 
     // Require a clean worktree after every fix attempt regardless of whether HEAD

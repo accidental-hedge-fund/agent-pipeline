@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   detectTestCommand,
+  enforceTestFixCommitFormat,
   runTestGate,
   runTests,
   shellSplit,
@@ -643,4 +644,167 @@ test("gate (regression / #20, trailer enforcement): multiple fix commits, one mi
   assert.equal(out.passed, false);
   assert.equal(invoked, 1);
   assert.match(out.blockReason ?? "", /trailers/i);
+});
+
+// ---------------------------------------------------------------------------
+// Uncommitted-work salvage in the test-fix loop (#131)
+// ---------------------------------------------------------------------------
+
+test("gate (#131): fix harness edits but doesn't commit → salvage runs, tests re-run and pass", async () => {
+  let runs = 0;
+  let dirty = false;
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({}),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => (runs++ === 0 ? failResult : passResult),
+      invoke: async () => {
+        dirty = true; // the harness edited the worktree without committing
+        return okInvoke();
+      },
+      gitHead: async () => "h0", // HEAD never advances: no harness commit
+      gitDirty: async () => dirty,
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        dirty = false; // salvage committed the leftover work
+        return true;
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 1);
+  assert.equal(salvageCalls.length, 1);
+  assert.match(salvageCalls[0], /test-fix/);
+  assert.match(
+    salvageCalls[0],
+    /fix: resolve test\/build failures \(#42\)/,
+    "stage label carries the prescribed subject for the format gate",
+  );
+});
+
+test("gate (#131, bites): salvage that salvages nothing → dirty block exactly as before", async () => {
+  // Same scenario, but the salvage no-ops (pre-#131 behavior): the leftover
+  // work stays uncommitted and the existing dirty block must fire.
+  let dirty = false;
+  const out = await runTestGate(
+    cfgWith({}),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => {
+        dirty = true;
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      salvage: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(out.passed, false);
+  assert.match(out.blockReason ?? "", /Fix harness left uncommitted changes/);
+});
+
+test("gate (#131): salvaged but tests still fail → blocked with the test-gate reason", async () => {
+  // Salvage never bypasses validation: a broken salvaged change exhausts the
+  // fix attempts and blocks with the captured test output.
+  let dirty = false;
+  let salvaged = 0;
+  const out = await runTestGate(
+    cfgWith({ max_attempts: 1 }),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => {
+        dirty = true;
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      salvage: async () => {
+        salvaged++;
+        dirty = false;
+        return true;
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(salvaged, 1);
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 1);
+  assert.match(out.blockReason ?? "", /FAIL: 1 test failed/);
+});
+
+test("gate (#131): clean worktree with no commit → salvage not attempted, no-commit block unchanged", async () => {
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({}),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => okInvoke(),
+      gitHead: async () => "h0",
+      gitDirty: async () => false, // genuinely empty harness run
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        return true;
+      },
+      // Real format gate over an empty range → the existing no-commit block.
+      verifyTestFix: (wt, hb) =>
+        enforceTestFixCommitFormat(42, wt, hb, {
+          gitMessages: async () => [],
+          gitDiffFiles: async () => [],
+          gitDirtyFiles: async () => [],
+        }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(salvageCalls.length, 0, "clean worktree must not attempt salvage");
+  assert.equal(out.passed, false);
+  assert.match(out.blockReason ?? "", /No commits found in the range/);
+});
+
+test("gate (#131): harness committed AND left dirt → salvage not attempted, dirty block unchanged", async () => {
+  let head = 0;
+  let dirtyCalls = 0;
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({}),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => okInvoke(),
+      gitHead: async () => `h${head++}`, // HEAD advances: the harness committed
+      gitDirty: async () => dirtyCalls++ > 0, // clean pre-gate, dirty after the fix
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        return true;
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(salvageCalls.length, 0, "salvage applies only to the no-new-commit case");
+  assert.equal(out.passed, false);
+  assert.match(out.blockReason ?? "", /Fix harness left uncommitted changes/);
 });
