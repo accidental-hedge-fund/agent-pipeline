@@ -289,23 +289,31 @@ test_gate:
 
 ### Pipeline is blocked
 
-When the pipeline cannot advance on its own, it applies a `blocked` label to the issue and posts a comment explaining why. To unblock:
+When the pipeline cannot advance on its own, it applies a `blocked` label to the issue and posts a `## Pipeline: Blocked` comment explaining why. The comment's **### How to unblock** section states the recovery verb that actually resolves *that* blocker class — it is recipe-specific, not a one-size hint. For example:
 
-1. Read the blocker comment on the issue.
-2. Address the root cause (fix failing tests, answer a question, supply missing context, etc.).
-3. Clear the label and re-invoke using `--unblock`:
+- **Test/build gate failed** → fix the failing test(s) in the worktree, commit, then re-run.
+- **Merge conflict / branch behind** → rebase on the latest target, resolve, push, then re-run.
+- **OpenSpec change invalid** → run `openspec validate <change>`, fix the errors, commit, then re-run.
+- **No commits produced** → finish and commit the work in the worktree (the pipeline salvages real uncommitted work automatically), then re-run.
+- **Needs a human decision** → fix the findings and re-run, **or** record an audited disposition with `--override "<finding-key>: <reason>"`.
+
+To unblock:
+
+1. Read the blocker comment and follow its **### How to unblock** recipe.
+2. Address the root cause in the worktree (fix tests, rebase, validate specs, etc.) and commit.
+3. Re-run the pipeline — it picks up from the blocked stage:
+
+```bash
+gh issue edit N --remove-label "blocked"
+/pipeline N   # or: $pipeline N
+```
+
+For a blocker that only needs a human answer (no code change), post the answer and clear the label in one step:
 
 ```bash
 /pipeline N --unblock "your answer or context here"
 # or for Codex:
 $pipeline N --unblock "your answer or context here"
-```
-
-Or clear the label manually and re-run normally:
-
-```bash
-gh issue edit N --remove-label "blocked"
-/pipeline N   # or: $pipeline N
 ```
 
 ### Common blockers

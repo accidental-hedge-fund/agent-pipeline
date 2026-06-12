@@ -93,14 +93,14 @@ export async function advance(
     });
   } catch (err) {
     const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Plan generation failed: ${e.message}`, "ready");
+    await setBlocked(cfg, issueNumber, `Plan generation failed: ${e.message}`, "ready", "plan-gen-failed");
     return { advanced: false, status: "blocked", reason: `plan failed: ${e.message}` };
   }
   if (!planResult.success || !planResult.stdout.trim()) {
     const reason = planResult.timed_out
       ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
       : `Plan generation failed (exit ${planResult.exit_code})`;
-    await setBlocked(cfg, issueNumber, reason, "ready");
+    await setBlocked(cfg, issueNumber, reason, "ready", "plan-gen-failed");
     return { advanced: false, status: "blocked", reason };
   }
   const plan = planResult.stdout.trim();
@@ -140,7 +140,7 @@ export async function advance(
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
         : `Plan review failed (exit ${reviewResult.exit_code})`;
-      await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review");
+      await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
     const planReview = reviewResult.stdout.trim();
@@ -162,13 +162,13 @@ export async function advance(
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
         : `Plan revision failed (exit ${revisionResult.exit_code})`;
-      await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
+      await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
     const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
     if (!ackCheck.ok) {
-      await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review");
+      await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
       return { advanced: false, status: "blocked", reason: ackCheck.reason };
     }
     if (ackCheck.warning) {
@@ -178,7 +178,7 @@ export async function advance(
     if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
       const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
-      await setBlocked(cfg, issueNumber, reason, "plan-review");
+      await setBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
       return { advanced: false, status: "blocked", reason };
     }
     await postComment(
@@ -198,7 +198,7 @@ export async function advance(
     console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
   } catch (err) {
     const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, preImplStage);
+    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, preImplStage, "worktree-creation-failed");
     return { advanced: false, status: "blocked", reason: e.message };
   }
 
@@ -232,6 +232,7 @@ export async function advance(
       issueNumber,
       `Implementation harness (${primary}) failed: ${reason}`,
       "implementing",
+      "harness-failure",
     );
     return { advanced: false, status: "blocked", reason };
   }
@@ -253,6 +254,7 @@ export async function advance(
       issueNumber,
       `Implementation harness (${primary}) completed but produced no commits.`,
       "implementing",
+      "no-commits",
     );
     return { advanced: false, status: "blocked", reason: "no commits produced" };
   }
@@ -261,7 +263,7 @@ export async function advance(
   if (implHeadBefore) {
     const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
     if (!implCheck.ok) {
-      await setBlocked(cfg, issueNumber, implCheck.reason, "implementing");
+      await setBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
       return { advanced: false, status: "blocked", reason: implCheck.reason };
     }
   }
@@ -269,7 +271,7 @@ export async function advance(
   // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
   const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
+    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
   }
 
@@ -284,6 +286,7 @@ export async function advance(
       issueNumber,
       `Git push failed: ${push.stderr.trim()}`,
       "implementing",
+      "push-failed",
     );
     return { advanced: false, status: "blocked", reason: `push failed` };
   }
@@ -316,7 +319,7 @@ export async function advance(
     if (existing) {
       prNumber = existing;
     } else {
-      await setBlocked(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing");
+      await setBlocked(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
       return { advanced: false, status: "blocked", reason: e.message };
     }
   }
@@ -382,7 +385,7 @@ async function advanceOpenspec(
     console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
   } catch (err) {
     const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, "ready");
+    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, "ready", "worktree-creation-failed");
     return { advanced: false, status: "blocked", reason: e.message };
   }
 
@@ -395,6 +398,7 @@ async function advanceOpenspec(
         "OpenSpec is required (openspec.enabled: on) but this repo has no `openspec/` " +
           "workspace. Set `openspec.bootstrap: true` in .github/pipeline.yml, or run `openspec init`.",
         "ready",
+        "needs-human",
       );
       return { advanced: false, status: "blocked", reason: "openspec not initialized" };
     }
@@ -407,11 +411,12 @@ async function advanceOpenspec(
         "OpenSpec bootstrap requested but the `openspec` CLI is not on PATH " +
           "(install: `npm i -g @fission-ai/openspec`).",
         "ready",
+        "needs-human",
       );
       return { advanced: false, status: "blocked", reason: "openspec CLI unavailable" };
     }
     if (!initRes.success) {
-      await setBlocked(cfg, issueNumber, `openspec init failed:\n${initRes.output}`, "ready");
+      await setBlocked(cfg, issueNumber, `openspec init failed:\n${initRes.output}`, "ready", "needs-human");
       return { advanced: false, status: "blocked", reason: "openspec init failed" };
     }
     await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
@@ -437,7 +442,7 @@ async function advanceOpenspec(
     const reason = planResult.timed_out
       ? `timed out after ${planResult.duration.toFixed(0)}s`
       : `exit ${planResult.exit_code}`;
-    await setBlocked(cfg, issueNumber, `OpenSpec proposal authoring (${primary}) failed: ${reason}`, "ready");
+    await setBlocked(cfg, issueNumber, `OpenSpec proposal authoring (${primary}) failed: ${reason}`, "ready", "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
 
@@ -463,7 +468,7 @@ async function advanceOpenspec(
         ? "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
           "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`)."
         : changeResult.reason;
-    await setBlocked(cfg, issueNumber, blockMsg, "ready");
+    await setBlocked(cfg, issueNumber, blockMsg, "ready", "needs-human");
     return { advanced: false, status: "blocked", reason: changeResult.reason };
   }
   const changeId = changeResult.changeId;
@@ -479,7 +484,7 @@ async function advanceOpenspec(
       },
     });
     if (!authorCheck.ok) {
-      await setBlocked(cfg, issueNumber, authorCheck.reason, "ready");
+      await setBlocked(cfg, issueNumber, authorCheck.reason, "ready", "needs-human");
       return { advanced: false, status: "blocked", reason: authorCheck.reason };
     }
   }
@@ -489,7 +494,7 @@ async function advanceOpenspec(
   // ---- Validate the change structurally. ----
   const v1 = await openspec.validateItem(wt.path, changeId);
   if (!v1.unavailable && !v1.valid) {
-    await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` is invalid:\n${formatIssues(v1)}`, "planning");
+    await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` is invalid:\n${formatIssues(v1)}`, "planning", "openspec-invalid");
     return { advanced: false, status: "blocked", reason: "openspec change invalid" };
   }
 
@@ -528,7 +533,7 @@ async function advanceOpenspec(
       const reason = reviewResult.timed_out
         ? `timed out after ${reviewResult.duration.toFixed(0)}s`
         : `exit ${reviewResult.exit_code}`;
-      await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review");
+      await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
     const planReview = reviewResult.stdout.trim();
@@ -553,13 +558,13 @@ async function advanceOpenspec(
       const reason = revisionResult.timed_out
         ? `timed out after ${revisionResult.duration.toFixed(0)}s`
         : `exit ${revisionResult.exit_code}`;
-      await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review");
+      await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
     const osAckCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
     if (!osAckCheck.ok) {
-      await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review");
+      await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review", "needs-human");
       return { advanced: false, status: "blocked", reason: osAckCheck.reason };
     }
     if (osAckCheck.warning) {
@@ -567,14 +572,14 @@ async function advanceOpenspec(
     }
     const v2 = await openspec.validateItem(wt.path, changeId);
     if (!v2.unavailable && !v2.valid) {
-      await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`, "plan-review");
+      await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`, "plan-review", "openspec-invalid");
       return { advanced: false, status: "blocked", reason: "openspec change invalid after revision" };
     }
     revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || proposal;
     if (!validateHumanFeedbackAck(revisedProposal, humanComments)) {
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
       const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
-      await setBlocked(cfg, issueNumber, reason, "plan-review");
+      await setBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
       return { advanced: false, status: "blocked", reason };
     }
     // Recompute spec deltas: revision may have updated the spec files.
@@ -614,7 +619,7 @@ async function advanceOpenspec(
   );
   if (!result.success) {
     const reason = result.timed_out ? `timed out after ${result.duration.toFixed(0)}s` : `exit ${result.exit_code}`;
-    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) failed: ${reason}`, "implementing");
+    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) failed: ${reason}`, "implementing", "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
   console.log(`[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`);
@@ -624,7 +629,7 @@ async function advanceOpenspec(
 
   // ---- Verify commits, push, open PR, implementing → review-1. ----
   if (!(await hasCommitsAhead(wt.path, cfg.base_branch))) {
-    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing");
+    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing", "no-commits");
     return { advanced: false, status: "blocked", reason: "no commits produced" };
   }
 
@@ -632,20 +637,20 @@ async function advanceOpenspec(
   if (osImplHeadBefore) {
     const osImplCheck = await enforceImplCommitRef(issueNumber, wt.path, osImplHeadBefore);
     if (!osImplCheck.ok) {
-      await setBlocked(cfg, issueNumber, osImplCheck.reason, "implementing");
+      await setBlocked(cfg, issueNumber, osImplCheck.reason, "implementing", "needs-human");
       return { advanced: false, status: "blocked", reason: osImplCheck.reason };
     }
   }
   // ---- test/build gate (#15) — must pass before opening a PR ----
   const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing");
+    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
   }
   const branch = branchName(issueNumber, slug);
   const push = await gitInWorktree(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
   if (push.code !== 0) {
-    await setBlocked(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing");
+    await setBlocked(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing", "push-failed");
     return { advanced: false, status: "blocked", reason: "push failed" };
   }
   const planExcerpt =
@@ -671,7 +676,7 @@ async function advanceOpenspec(
     if (existing) {
       prNumber = existing;
     } else {
-      await setBlocked(cfg, issueNumber, `PR creation failed: ${(err as Error).message}`, "implementing");
+      await setBlocked(cfg, issueNumber, `PR creation failed: ${(err as Error).message}`, "implementing", "pr-creation-failed");
       return { advanced: false, status: "blocked", reason: (err as Error).message };
     }
   }

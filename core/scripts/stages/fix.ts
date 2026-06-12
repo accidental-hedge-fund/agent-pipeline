@@ -59,7 +59,7 @@ export async function advanceFix(
 
   const wt = await getForIssue(cfg, issueNumber);
   if (!wt) {
-    await setBlocked(cfg, issueNumber, "No worktree found. Cannot apply fixes.", stage);
+    await setBlocked(cfg, issueNumber, "No worktree found. Cannot apply fixes.", stage, "worktree-missing");
     return { advanced: false, status: "blocked", reason: "no worktree" };
   }
 
@@ -119,7 +119,7 @@ export async function advanceFix(
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    await setBlocked(cfg, issueNumber, `Fix harness (${harness}) failed: ${reason}`, stage);
+    await setBlocked(cfg, issueNumber, `Fix harness (${harness}) failed: ${reason}`, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
 
@@ -140,6 +140,7 @@ export async function advanceFix(
         issueNumber,
         `${stage} reported success but produced no new commits.`,
         stage,
+        "no-commits",
       );
       return { advanced: false, status: "blocked", reason: "no new commits" };
     }
@@ -150,7 +151,7 @@ export async function advanceFix(
   if (headBefore) {
     const commitCheck = await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
     if (!commitCheck.ok) {
-      await setBlocked(cfg, issueNumber, commitCheck.reason, stage);
+      await setBlocked(cfg, issueNumber, commitCheck.reason, stage, "needs-human");
       return { advanced: false, status: "blocked", reason: commitCheck.reason };
     }
   }
@@ -163,7 +164,7 @@ export async function advanceFix(
       openspecValidateItem: deps.openspecValidateItem ?? openspec.validateItem,
     });
     if (!specCheck.ok) {
-      await setBlocked(cfg, issueNumber, specCheck.reason, stage);
+      await setBlocked(cfg, issueNumber, specCheck.reason, stage, "openspec-invalid");
       return { advanced: false, status: "blocked", reason: specCheck.reason };
     }
   }
@@ -171,7 +172,7 @@ export async function advanceFix(
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
   const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
   if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage);
+    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage, "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
   }
 
@@ -183,6 +184,7 @@ export async function advanceFix(
       issueNumber,
       `Git push failed after fix: ${push.stderr.trim()}`,
       stage,
+      "push-failed",
     );
     return { advanced: false, status: "blocked", reason: "push failed" };
   }

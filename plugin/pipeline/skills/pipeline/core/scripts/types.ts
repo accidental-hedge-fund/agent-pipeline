@@ -27,6 +27,96 @@ export const HARNESS_LABEL_PREFIX = "harness:";
 
 export type Harness = "claude" | "codex";
 
+// ---------------------------------------------------------------------------
+// Blocker kinds (#134) — closed set of structurally-distinct failure classes.
+//
+// `setBlocked` posts the same "## Pipeline: Blocked" comment for every blocker,
+// but the recovery VERB differs per class: a test-gate failure wants "fix the
+// test, commit, re-run"; a merge conflict wants "rebase, push, re-run"; a
+// needs-human off-ramp wants "fix or --override". The uniform `--unblock` hint
+// (a label-clear + comment, no recovery) is the right verb for none of these.
+// The call site always knows its class, so the recipe is a static lookup over a
+// closed enum — not an inference about repo state.
+// ---------------------------------------------------------------------------
+// Single runtime source of truth (mirrors STAGES/Stage above) so the
+// exhaustiveness test can iterate the kinds — `BlockerKind` is stripped at
+// runtime, but `BLOCKER_KINDS` survives.
+export const BLOCKER_KINDS = [
+  "needs-human",
+  "test-gate-exhausted",
+  "no-commits",
+  "harness-failure",
+  "openspec-invalid",
+  "openspec-stale-delta",
+  "merge-conflict",
+  "worktree-missing",
+  "worktree-creation-failed",
+  "pr-creation-failed",
+  "plan-gen-failed",
+  "push-failed",
+] as const;
+export type BlockerKind = (typeof BLOCKER_KINDS)[number];
+
+/** Default kind when a `setBlocked` call omits one (backward-compatible). */
+export const DEFAULT_BLOCKER_KIND: BlockerKind = "needs-human";
+
+/**
+ * Per-kind "### How to unblock" recipe text. `{{N}}` is substituted with the
+ * issue number at render time (see `renderRecipe` in gh.ts). Each recipe states
+ * the verb that actually resolves its class — never the generic `--unblock`,
+ * which only clears the label. Pinned by `blocked-recipes.test.ts`: changing or
+ * dropping a recipe fails CI.
+ */
+export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
+  "needs-human":
+    "A human decision is required. Fix the findings described above and re-run " +
+    "`$pipeline {{N}}`, or record an audited disposition with " +
+    '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past an ' +
+    "accepted or out-of-scope finding (the key comes from the review comment).",
+  "test-gate-exhausted":
+    "The test/build gate failed after the pipeline's fix attempts were " +
+    "exhausted. Fix the failing test(s) or build error in the worktree, commit " +
+    "the fix, then re-run `$pipeline {{N}}`.",
+  "no-commits":
+    "The harness reported success but committed nothing and the worktree is " +
+    "clean. Finish the work and commit it in the worktree (or re-run the step " +
+    "manually), then re-run `$pipeline {{N}}`. If real changes are sitting " +
+    "uncommitted in the worktree, committing them lets the pipeline salvage and " +
+    "continue (#131).",
+  "harness-failure":
+    "The harness process crashed or timed out (see the error above). " +
+    "Investigate and fix the root cause, then re-run `$pipeline {{N}}`. A " +
+    "transient timeout can usually just be re-run as-is.",
+  "openspec-invalid":
+    "The OpenSpec change is structurally invalid. Run `openspec validate " +
+    "<change>` in the worktree, fix the reported errors, commit, then re-run " +
+    "`$pipeline {{N}}`.",
+  "openspec-stale-delta":
+    "The OpenSpec spec delta is stale relative to the committed code. Reconcile " +
+    "the spec delta with the implementation (or run `openspec archive " +
+    "<change>`), commit, then re-run `$pipeline {{N}}`.",
+  "merge-conflict":
+    "The branch could not be merged or auto-rebased onto the target branch. " +
+    "Rebase the branch on the latest target, resolve the conflicts, push, then " +
+    "re-run `$pipeline {{N}}`.",
+  "worktree-missing":
+    "The worktree for this issue no longer exists, so fixes can't be applied. " +
+    "Re-run `$pipeline {{N}}` to recreate it from the branch, then continue.",
+  "worktree-creation-failed":
+    "Creating the worktree failed (see the error above). Check disk space and " +
+    "git state (stale worktrees, lock files), then re-run `$pipeline {{N}}`.",
+  "pr-creation-failed":
+    "Opening the pull request failed (see the error above). Check GitHub " +
+    "permissions and rate limits, then re-run `$pipeline {{N}}`.",
+  "plan-gen-failed":
+    "Plan generation failed (see the error above). Fix the root cause (often a " +
+    "transient harness error), then re-run `$pipeline {{N}}`.",
+  "push-failed":
+    "Pushing the branch failed for a non-conflict reason (see stderr above). " +
+    "Resolve the push error (auth, remote, or branch protection), then re-run " +
+    "`$pipeline {{N}}`.",
+};
+
 export type OpenspecMode = "auto" | "on" | "off";
 
 export interface PipelineConfig {
