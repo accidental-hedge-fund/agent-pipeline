@@ -1,6 +1,6 @@
 {
   "name": "agent-pipeline",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Label-driven GitHub issue→ready-to-deploy pipeline skill for Claude Code and Codex, built from a single shared TypeScript core.",
   "type": "module",
   "private": true,
