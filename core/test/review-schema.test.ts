@@ -361,8 +361,8 @@ interface SyntheticFinding {
 // `line_start?: number` -> `string` while the block still hints `<int>` slips
 // through. This compares each scalar field's TS type category against the schema
 // block's value-hint category, so a number-vs-quoted (or string-vs-bare) drift
-// fails. Array fields are excluded from tsTypes; unrecognised tokens mismatch
-// against any concrete schema hint.
+// fails. Array fields (tsCat === "other") are excluded; if the schema hint for a
+// scalar TS field is "other" or absent, that is itself a mismatch.
 test("drift guard: value-type tokens match schema block value hints", () => {
   const tsTypes: Record<string, string> = {
     ...parseInterfaceFieldTypes(typesSrc, "ReviewFinding"),
@@ -376,16 +376,17 @@ test("drift guard: value-type tokens match schema block value hints", () => {
 
   const mismatches: string[] = [];
   for (const [field, token] of Object.entries(tsTypes)) {
-    const blockCat = hints[field];
-    // Array fields are excluded from tsTypes (parseInterfaceFieldTypes). Fields
-    // whose schema hint is "other" (arrays, nested objects) are skipped here.
-    // An unrecognised TS token ("other") is treated as a mismatch when blockCat
-    // is a concrete scalar category, catching drift like `string | undefined` vs
-    // `<int>` that the old "skip other" approach missed.
-    if (blockCat === undefined || blockCat === "other") continue;
     const tsCat = classifyTsType(token);
-    if (tsCat !== blockCat) {
-      mismatches.push(`${field}: types.ts \`${token}\` (${tsCat}) vs schema block hint (${blockCat})`);
+    if (tsCat === "other") continue; // arrays/non-scalar TS fields have no comparable hint
+    const blockCat = hints[field];
+    // Scalar TS field (number or string): the schema block MUST carry a matching
+    // concrete hint. blockCat "other" means the schema carries a non-scalar value
+    // (e.g. an array `["..."]` or unquoted bare text) for a field the type system
+    // declares as scalar — that is drift. blockCat undefined is already caught by
+    // the field-name guard but surfaced here for completeness.
+    if (blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      const hint = blockCat ?? "absent";
+      mismatches.push(`${field}: types.ts \`${token}\` (${tsCat}) vs schema block hint (${hint})`);
     }
   }
 
@@ -394,6 +395,45 @@ test("drift guard: value-type tokens match schema block value hints", () => {
     [],
     `value-type drift between ReviewFinding/ReviewVerdict and REVIEW_VERDICT_SCHEMA_BLOCK:\n  ${mismatches.join("\n  ")}\n` +
       `Update the schema block value hint or the TS field type so both agree.`,
+  );
+});
+
+// Regression (#85 finding 2): the prior fix still skipped schema-side "other" hints,
+// so changing a scalar string field's schema block value from a quoted hint to an
+// unsupported non-scalar form (e.g. `["<...>"]`) was invisible to the guard. The fix
+// inverts the skip condition: skip only when the *TS* side is non-scalar, so a scalar
+// TS field with a schema-side "other" hint is reported as a mismatch.
+test("drift guard: scalar TS field with unsupported schema hint (other) is a mismatch (regression #85 finding 2)", () => {
+  // Simulate `summary: string` with its schema hint changed to an array form.
+  const syntheticSrc = `
+interface SyntheticVerdict {
+  summary: string;
+  confidence: number;
+}
+`;
+  const syntheticBlock = `{
+    "summary": ["<terse ship/no-ship assessment>"],
+    "confidence": <0.0-1.0>
+}`;
+
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticVerdict");
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    if (tsCat === "other") continue;
+    const blockCat = hints[field];
+    if (blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      const hint = blockCat ?? "absent";
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${hint})`);
+    }
+  }
+
+  assert.deepEqual(
+    mismatches,
+    ["summary: `string` (string) vs schema (other)"],
+    "drift guard must catch scalar TS string field whose schema hint is a non-scalar/unsupported form",
   );
 });
 
