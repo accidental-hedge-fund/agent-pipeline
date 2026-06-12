@@ -896,6 +896,58 @@ test("extractBlockingKeysFromComment: empty/malformed bodies → empty set, no t
   assert.equal(extractBlockingKeysFromComment("`override-key: ABCDEF12`").size, 0);
 });
 
+test("extractBlockingKeysFromComment: empty blocking-keys marker → empty set (authoritative, no fallback) (#133 fix 2)", () => {
+  // Regression for finding 1: advisory-only rounds now emit an empty marker.
+  // extractBlockingKeysFromComment must treat the marker as authoritative even when
+  // the key list is empty — it must NOT fall back to all override-key tokens.
+  const advisory: ReviewFinding = {
+    severity: "medium",
+    title: "advisory-finding",
+    body: "b",
+    confidence: 0.4,
+    recommendation: "r",
+  };
+  const advisoryKey = findingKey(advisory);
+  // formatReviewComment with an empty blockingKeys Set emits the empty marker
+  const body = formatReviewComment(
+    cfgConverge,
+    { verdict: "needs-attention", summary: "all advisory", findings: [advisory], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set<string>(),
+  );
+  assert.match(body, /pipeline-blocking-keys: /, "must emit the empty marker");
+  assert.ok(body.includes(advisoryKey), "body still carries the advisory override-key");
+  // The empty marker is authoritative — must NOT fall back to the advisory key
+  assert.equal(extractBlockingKeysFromComment(body).size, 0, "empty marker → empty set, no fallback");
+  assert.ok(!extractBlockingKeysFromComment(body).has(advisoryKey), "advisory key must NOT appear in result");
+});
+
+test("extractBlockingKeysFromComment: spoofed marker in finding body — uses last (real footer) marker (#133 fix 2)", () => {
+  // Regression for finding 2: an earlier occurrence of the marker (e.g. injected
+  // by reviewer body text on its own line) must not override the real footer marker.
+  // The fix anchors to full lines AND picks the LAST occurrence.
+  const spoofKey = "deadbeef";
+  const realKey = "12ab34cd";
+  const body = [
+    "## Review 2 (Adversarial) — needs-attention",
+    "",
+    "**1. [HIGH] real finding** `override-key: 12ab34cd`",
+    "A reviewer body that injects the marker on its own line:",
+    `<!-- pipeline-blocking-keys: ${spoofKey} -->`,
+    "",
+    "*Automated by Claude Code Pipeline Skill*",
+    `<!-- pipeline-blocking-keys: ${realKey} -->`,
+    "",
+    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+  ].join("\n");
+
+  const result = extractBlockingKeysFromComment(body);
+  assert.ok(result.has(realKey), "real footer marker key must be present");
+  assert.ok(!result.has(spoofKey), "spoofed earlier marker must NOT be used");
+  assert.equal(result.size, 1, "exactly one key from the last (real) marker");
+});
+
 test("reviewCeilingComment: tags findings RECURRING (n rounds) by prior-round key membership, NEW otherwise (#133)", () => {
   const fresh: ReviewFinding = {
     severity: "high",
@@ -1079,6 +1131,57 @@ test("recurrence (#133 fix): prior advisory finding that later meets threshold i
   });
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "must route to fix, not early-park at needs-human");
   assert.ok(!rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")), "no early-park ceiling comment");
+});
+
+test("recurrence (#133 fix 2): advisory-only prior round emits empty marker — re-review now blocking routes to fix", async (t) => {
+  // Regression for finding 1: when a prior round has advisory-only findings,
+  // the fixed code passes an empty blockingKeysSet to formatReviewComment so an
+  // authoritative empty marker is emitted. Without this fix, extractBlockingKeys
+  // would fall back to all override-key tokens, causing a false early-park when
+  // the same advisory finding later crosses the policy threshold.
+  const ADVISORY_FINDING: ReviewFinding = {
+    severity: "medium",
+    title: "advisory-initially",
+    body: "b",
+    confidence: 0.4,  // below min_confidence 0.7 → advisory in the prior round
+    recommendation: "r",
+  };
+  const advisoryKey = findingKey(ADVISORY_FINDING);
+
+  // Build a prior comment as the FIXED advisory-only path would emit it: empty marker.
+  const priorComment = {
+    body: formatReviewComment(
+      cfgConverge,
+      { verdict: "needs-attention", summary: "all advisory", findings: [ADVISORY_FINDING], next_steps: [], commitSha: SHA_A },
+      2,
+      "codex",
+      new Set<string>(),
+    ),
+  };
+  // Sanity: the empty marker is present, but the advisory key is NOT a blocking key.
+  assert.match(priorComment.body, /pipeline-blocking-keys: /, "prior comment must emit the empty marker");
+  assert.ok(priorComment.body.includes(advisoryKey), "prior comment still carries the override-key");
+  assert.equal(extractBlockingKeysFromComment(priorComment.body).size, 0,
+    "empty marker must yield empty blocking-key set (no fallback to advisory key)");
+
+  // Current round: same finding at confidence 0.9 → now blocking (≥ 0.7 threshold).
+  const currentNaVerdictJson = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "advisory finding now meets threshold",
+    findings: [{ ...ADVISORY_FINDING, confidence: 0.9 }],
+    next_steps: [],
+  });
+
+  const { deps, rec } = makeDeps([currentNaVerdictJson]);
+  deps.getIssueDetail = async () => detailWithComments([priorComment]);
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "must route to fix, not early-park");
+  assert.ok(
+    !rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "no false early-park ceiling comment",
+  );
 });
 
 // ---------------------------------------------------------------------------

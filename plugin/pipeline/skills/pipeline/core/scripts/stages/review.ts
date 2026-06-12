@@ -53,6 +53,11 @@ const REVIEW_MARKER_PREFIX_R2 = "## Review 2";
 // lets extractReviewedSha pick the LAST occurrence, guarding against injected
 // sentinel content appearing earlier in the comment body.
 const REVIEWED_SHA_RE = /^<!-- reviewed-sha: ([0-9a-fA-F]{40}) -->$/gm;
+// Machine-readable blocking-keys marker emitted by formatReviewComment (#133).
+// Anchored to a full line + global flag so extractBlockingKeysFromComment picks
+// the LAST occurrence, guarding against injected marker content earlier in the
+// comment body (reviewer-authored finding bodies can appear before the footer).
+const PIPELINE_BLOCKING_KEYS_RE = /^<!-- pipeline-blocking-keys: ([0-9a-f,]*) -->$/gm;
 
 export interface AdvanceReviewOpts {
   dryRun?: boolean;
@@ -297,7 +302,11 @@ export async function advanceReview(
   const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
   if (partition.blocking.length === 0) {
-    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
+    // Pass the empty blockingKeysSet so formatReviewComment emits an authoritative
+    // empty marker (#133 fix 2): prevents extractBlockingKeysFromComment from
+    // falling back to all override-key tokens on a re-review where an advisory
+    // finding later crosses the policy threshold.
+    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet));
     const advisory = advisoryAdvanceComment(cfg, round, reviewer, partition);
     await postCommentFn(cfg, issueNumber, advisory);
     // Also surface on the PR: review bookkeeping lives on the issue, but a human
@@ -855,8 +864,11 @@ export function formatReviewComment(
   // Machine-readable blocking-keys marker (#133): records which findings were
   // above the severity policy at post time so future rounds can distinguish
   // prior blocking from advisory findings when checking for recurrence.
-  // Omitted when no blocking keys are supplied (approve, no-blocking paths).
-  if (blockingKeys && blockingKeys.size > 0) {
+  // Emitted when `blockingKeys` is supplied — including as an empty list for
+  // advisory-only rounds (no blocking findings). An empty marker is authoritative:
+  // extractBlockingKeysFromComment will NOT fall back to all override-key tokens.
+  // Omitted when no `blockingKeys` arg is provided (approve and 0-findings paths).
+  if (blockingKeys !== undefined) {
     lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
   }
   // Sentinel last (#16): a dedicated, anchorable line the gate reads back to
@@ -927,15 +939,26 @@ function extractAllKeysFromComment(body: string): Set<string> {
  * recurrence early-park check (#133). Prefers the `pipeline-blocking-keys`
  * machine-readable marker that `formatReviewComment` embeds after policy
  * partitioning (which distinguishes blocking from advisory findings). Falls
- * back to all `override-key` tokens for comments that predate the marker
- * (conservative: may over-trigger on advisory-turned-blocking findings, same
- * as the original behaviour). Pure and total: no network, git, or subprocess calls.
+ * back to all `override-key` tokens only for comments without the marker (legacy
+ * comments predating #133). Two hardening properties (#133 fix 2):
+ * - Anchored full-line regex: rejects any marker embedded mid-line in reviewer prose.
+ * - Last-occurrence selection: mitigates a reviewer body that places a spoofed
+ *   full-line marker before the real pipeline-emitted footer marker.
+ * - Empty marker is authoritative: an advisory-only round emits an empty list and
+ *   extractBlockingKeysFromComment returns an empty Set (no fallback to all keys).
+ * Pure and total: no network, git, or subprocess calls.
  */
 export function extractBlockingKeysFromComment(body: string): Set<string> {
-  const markerMatch = body.match(/<!-- pipeline-blocking-keys: ([0-9a-f,]*) -->/);
-  if (markerMatch && markerMatch[1]) {
+  PIPELINE_BLOCKING_KEYS_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = PIPELINE_BLOCKING_KEYS_RE.exec(body)) !== null) {
+    lastMatch = cur;
+  }
+  PIPELINE_BLOCKING_KEYS_RE.lastIndex = 0;
+  if (lastMatch !== null) {
     const keys = new Set<string>();
-    for (const k of markerMatch[1].split(",")) {
+    for (const k of lastMatch[1].split(",")) {
       if (/^[0-9a-f]{8}$/.test(k)) keys.add(k);
     }
     return keys;

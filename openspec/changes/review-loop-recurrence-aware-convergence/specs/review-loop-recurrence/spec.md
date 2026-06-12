@@ -36,18 +36,41 @@ A finding whose `severity` or `title` changes carries a different `findingKey` a
 - **AND** SHALL NOT count it as a recurrence for the early-park trigger
 
 ### Requirement: Blocking key extraction is pure and deterministic
-The pipeline SHALL extract blocking `findingKey` values from an existing Review-N comment body by scanning for the `` `override-key: <8-hex-char>` `` pattern embedded by `formatReviewComment`. This extraction SHALL be implemented as a pure function `extractBlockingKeysFromComment(body: string): Set<string>` that performs no network, git, or subprocess calls.
+The pipeline SHALL extract blocking `findingKey` values from an existing Review-N comment body using the `pipeline-blocking-keys` HTML-comment marker embedded by `formatReviewComment` after policy partitioning. `extractBlockingKeysFromComment(body: string): Set<string>` SHALL be a pure function that performs no network, git, or subprocess calls. When the marker is present, it SHALL be treated as authoritative — even when its key list is empty — and the function SHALL NOT fall back to all `` `override-key` `` tokens. When the marker is absent (legacy comments predating the marker), the function SHALL fall back to all `` `override-key: <8-hex-char>` `` tokens as a conservative approximation.
 
-#### Scenario: Review comment with findings
-- **WHEN** `extractBlockingKeysFromComment` is called with a review comment body that contains one or more `` `override-key: <key>` `` tokens
-- **THEN** it SHALL return a `Set<string>` containing exactly those keys (8-character hex strings)
+`formatReviewComment` SHALL emit the marker whenever a `blockingKeys` set is supplied, including an empty set for advisory-only rounds (where findings exist but none are blocking). This ensures that a prior advisory-only round cannot seed a false recurrence trigger on a later round where those same findings cross the policy threshold.
+
+The marker extraction SHALL be robust against injection: the implementation SHALL use a full-line-anchored regex and SHALL choose the LAST occurrence when multiple markers appear in the body (guarding against reviewer-authored body text that places a spoofed marker before the real pipeline-emitted footer marker).
+
+#### Scenario: Review comment with blocking marker present — returns only marker keys
+- **WHEN** `extractBlockingKeysFromComment` is called with a comment body containing a `pipeline-blocking-keys` marker
+- **THEN** it SHALL return a `Set<string>` containing exactly the keys listed in the marker (8-character hex strings)
+- **AND** it SHALL NOT include advisory `` `override-key` `` tokens that appear elsewhere in the body
+
+#### Scenario: Review comment with empty blocking marker — authoritative empty set
+- **WHEN** `extractBlockingKeysFromComment` is called with a comment body containing an empty `pipeline-blocking-keys` marker (advisory-only round)
+- **THEN** it SHALL return an empty `Set<string>` without falling back to override-key tokens in the body
+
+#### Scenario: Advisory-only round emits the empty marker
+- **WHEN** a needs-attention verdict round has findings but none meet the blocking policy
+- **THEN** `formatReviewComment` SHALL be called with an empty `blockingKeys` Set
+- **AND** the emitted comment SHALL contain `<!-- pipeline-blocking-keys:  -->`
+
+#### Scenario: Spoofed marker before the real footer — last occurrence wins
+- **WHEN** a review comment body contains a full-line `pipeline-blocking-keys` marker in reviewer-authored content BEFORE the real pipeline-emitted footer marker
+- **THEN** `extractBlockingKeysFromComment` SHALL use the LAST occurrence (the real footer marker)
+- **AND** SHALL ignore any earlier occurrence
+
+#### Scenario: No marker present — falls back to all override-key tokens
+- **WHEN** `extractBlockingKeysFromComment` is called with a comment body that contains no `pipeline-blocking-keys` marker (legacy comment predating the feature)
+- **THEN** it SHALL return a `Set<string>` containing all `` `override-key: <key>` `` tokens found in the body
 
 #### Scenario: Review comment with no findings (approve verdict)
-- **WHEN** `extractBlockingKeysFromComment` is called with a comment body containing no `` `override-key: <key>` `` tokens
+- **WHEN** `extractBlockingKeysFromComment` is called with a comment body containing no `` `override-key: <key>` `` tokens and no `pipeline-blocking-keys` marker
 - **THEN** it SHALL return an empty `Set<string>`
 
 #### Scenario: Malformed or empty body
-- **WHEN** `extractBlockingKeysFromComment` is called with an empty string or a body containing no override-key tokens
+- **WHEN** `extractBlockingKeysFromComment` is called with an empty string or a body containing no override-key tokens and no marker
 - **THEN** it SHALL return an empty `Set<string>` without throwing
 
 ### Requirement: RECURRING / NEW tags on the needs-human punch-list
