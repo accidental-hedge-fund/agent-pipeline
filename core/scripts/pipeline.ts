@@ -292,9 +292,12 @@ export async function runStatus(
 
 /**
  * Pure helper (#115): build the `needs-human` punch-list from the issue's
- * comments — the count of still-blocking findings plus the resume steps. Reads
- * only controlled strings the pipeline itself emits in the latest
- * `## Pipeline: Review ceiling reached` comment; returns `null` when no such
+ * comments — the count of still-blocking findings, each finding line tagged
+ * `RECURRING (n rounds)` / `NEW` (#133), plus the resume steps. Reads only
+ * controlled strings the pipeline itself emits in the latest
+ * `## Pipeline: Review ceiling reached` comment (posted at the round ceiling or
+ * on a recurrence-triggered early park — same header) and the prior Review-N
+ * verdict comments the tags are derived from; returns `null` when no ceiling
  * comment exists (the caller prints a graceful fallback). Total function: no
  * network, git, or subprocess calls.
  */
@@ -302,20 +305,23 @@ export function needsHumanPunchlist(
   comments: { author: string; body: string; createdAt: string }[],
 ): string | null {
   // Latest ceiling comment wins (highest index): a re-run posts a fresh one.
-  let body: string | undefined;
+  let ceilingIdx = -1;
   for (let i = comments.length - 1; i >= 0; i--) {
     if (comments[i].body.startsWith(REVIEW_CEILING_MARKER)) {
-      body = comments[i].body;
+      ceilingIdx = i;
       break;
     }
   }
-  if (body === undefined) return null;
+  if (ceilingIdx === -1) return null;
 
-  const count = countCeilingFindings(body);
+  const body = comments[ceilingIdx].body;
+  const findings = ceilingFindingLines(body);
+  const count = findings.length;
   const noun = count === 1 ? "finding" : "findings";
   const round = ceilingRound(body) ?? 2;
   return [
     `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
+    ...reviewStage.tagCeilingFindingLines(findings, comments, ceilingIdx),
     `To resume:`,
     `- \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
     `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
@@ -336,18 +342,19 @@ export function ceilingRound(body: string): 1 | 2 | null {
   return m ? (Number(m[1]) as 1 | 2) : null;
 }
 
-/** Count the `- ` bullets under the controlled `### Unresolved blocking findings`
- *  heading, stopping at the next `### ` section. */
-function countCeilingFindings(body: string): number {
+/** The `- ` bullet lines under the controlled `### Unresolved blocking findings`
+ *  heading, stopping at the next `### ` section. Their count is the
+ *  blocking-finding count. */
+function ceilingFindingLines(body: string): string[] {
   const lines = body.split("\n");
   const start = lines.findIndex((l) => l.trim() === "### Unresolved blocking findings");
-  if (start === -1) return 0;
-  let count = 0;
+  if (start === -1) return [];
+  const found: string[] = [];
   for (let i = start + 1; i < lines.length; i++) {
     if (lines[i].startsWith("### ")) break; // next section ends the list
-    if (lines[i].startsWith("- ")) count++;
+    if (lines[i].startsWith("- ")) found.push(lines[i]);
   }
-  return count;
+  return found;
 }
 
 // ---------------------------------------------------------------------------

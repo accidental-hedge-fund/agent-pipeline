@@ -37,6 +37,7 @@ import {
 } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
+import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
 import {
@@ -239,6 +240,11 @@ export async function advance(
     `[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`,
   );
 
+  // #131: the implementer may have done the work without committing — salvage
+  // real uncommitted changes into a commit before the no-commit checks below.
+  // A clean worktree (nothing salvaged) keeps the existing block path.
+  await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
+
   // ---- Step 8: verify commits ----
   const ahead = await hasCommitsAhead(wt.path, cfg.base_branch);
   if (!ahead) {
@@ -435,6 +441,16 @@ async function advanceOpenspec(
     return { advanced: false, status: "blocked", reason };
   }
 
+  // #131: salvage authoring work the harness left uncommitted before the
+  // commit-range verification below (the change folder may exist only on disk).
+  await salvageIfNoNewCommit(
+    wt.path,
+    issueNumber,
+    pipelineRunId,
+    "OpenSpec authoring",
+    osAuthorHeadBefore,
+  );
+
   // ---- Discover the change the implementer created. ----
   const after = openspec.listChangeDirs(wt.path);
   const fresh = after.filter((c) => !before.includes(c));
@@ -603,6 +619,9 @@ async function advanceOpenspec(
   }
   console.log(`[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`);
 
+  // #131: salvage uncommitted implementer work before the no-commit checks.
+  await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", osImplHeadBefore);
+
   // ---- Verify commits, push, open PR, implementing → review-1. ----
   if (!(await hasCommitsAhead(wt.path, cfg.base_branch))) {
     await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing");
@@ -695,6 +714,32 @@ export function enforceOpenspecChangeSingular(
     return { ok: false, reason: "no openspec change created" };
   }
   return { ok: true, changeId };
+}
+
+// ---------------------------------------------------------------------------
+// Uncommitted-work salvage pre-pass (#131)
+// ---------------------------------------------------------------------------
+
+/**
+ * When the harness produced no new commit (`HEAD` still equals `headBefore`),
+ * salvage any uncommitted work in the worktree into a commit so the downstream
+ * commit-range checks validate it instead of blocking on "no commits". A clean
+ * worktree salvages nothing and the caller's existing block path is unchanged.
+ */
+async function salvageIfNoNewCommit(
+  wtPath: string,
+  issueNumber: number,
+  pipelineRunId: string,
+  stageLabel: string,
+  headBefore: string,
+): Promise<void> {
+  if (!headBefore) return;
+  const headAfter = (
+    await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  if (headAfter && headAfter === headBefore) {
+    await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel);
+  }
 }
 
 // ---------------------------------------------------------------------------

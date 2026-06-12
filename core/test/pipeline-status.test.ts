@@ -120,6 +120,117 @@ test("needsHumanPunchlist: a round-1 ceiling comment emits review-1 as the manua
 });
 
 // ---------------------------------------------------------------------------
+// #133: RECURRING / NEW tags on the punch-list finding lines, re-derived from
+// the prior Review-N verdict comments in the same comment list.
+// ---------------------------------------------------------------------------
+
+const KEY_REC = "deadbeef";
+const KEY_NEW = "0badf00d";
+
+/** A Review-N verdict comment carrying the given finding keys in the
+ *  `override-key:` token form `formatReviewComment` renders. */
+function verdictComment(round: 1 | 2, keys: string[], createdAt: string): Comment {
+  const lines = [
+    `## Review ${round} (Adversarial) — needs-attention (commit abcdef0)`,
+    "**Reviewer**: codex",
+    "",
+    "summary",
+    "",
+    "### Findings",
+    ...keys.map((k, i) => `**${i + 1}. [HIGH] finding ${i}** (confidence: 0.9) \`override-key: ${k}\``),
+  ];
+  return { author: "pipeline-bot", body: lines.join("\n"), createdAt };
+}
+
+test("needsHumanPunchlist (#133): findings with prior-round history are tagged RECURRING (n rounds)", () => {
+  const comments: Comment[] = [
+    verdictComment(2, [KEY_REC], "2026-06-12T00:00:00Z"),
+    verdictComment(2, [KEY_REC], "2026-06-12T01:00:00Z"),
+    // The triggering verdict (nearest Review comment before the ceiling): its
+    // keys ARE the punch-list and must NOT count toward n.
+    verdictComment(2, [KEY_REC, KEY_NEW], "2026-06-12T02:00:00Z"),
+    ceilingComment({
+      round: 2,
+      findings: [
+        `**RECURRING (2 rounds)** \`${KEY_REC}\` **[HIGH]** Race in cache — \`src/cache.ts:7\``,
+        `**NEW** \`${KEY_NEW}\` **[HIGH]** Fresh bug`,
+      ],
+      createdAt: "2026-06-12T03:00:00Z",
+    }),
+  ];
+  const out = needsHumanPunchlist(comments);
+  assert.ok(out !== null);
+  assert.match(out, /- RECURRING \(2 rounds\) `deadbeef`/, `expected RECURRING (2 rounds); got:\n${out}`);
+  assert.match(out, /- NEW `0badf00d`/, `expected NEW for the fresh key; got:\n${out}`);
+  assert.match(out, /2 unresolved blocking findings/, `count must still be derived; got:\n${out}`);
+});
+
+test("needsHumanPunchlist (#133): a key present only in the TRIGGERING verdict is NEW (trigger exclusion)", () => {
+  // Without excluding the verdict that triggered the park, every punch-list key
+  // would count once and everything would read RECURRING (1 rounds).
+  const comments: Comment[] = [
+    verdictComment(2, [KEY_NEW], "2026-06-12T00:00:00Z"),
+    ceilingComment({
+      round: 2,
+      findings: [`**NEW** \`${KEY_NEW}\` **[HIGH]** Fresh bug`],
+      createdAt: "2026-06-12T01:00:00Z",
+    }),
+  ];
+  const out = needsHumanPunchlist(comments);
+  assert.ok(out !== null);
+  assert.match(out, /- NEW `0badf00d`/, `got:\n${out}`);
+  assert.doesNotMatch(out, /RECURRING/, `the triggering verdict must not count; got:\n${out}`);
+});
+
+test("needsHumanPunchlist (#133): legacy untagged finding lines are tagged from prior-round history", () => {
+  const comments: Comment[] = [
+    verdictComment(2, [KEY_REC], "2026-06-12T00:00:00Z"),
+    verdictComment(2, [KEY_REC], "2026-06-12T01:00:00Z"), // trigger
+    ceilingComment({
+      round: 2,
+      findings: [`\`${KEY_REC}\` **[HIGH]** Old-format line — \`src/x.ts:1\``],
+      createdAt: "2026-06-12T02:00:00Z",
+    }),
+  ];
+  const out = needsHumanPunchlist(comments);
+  assert.ok(out !== null);
+  assert.match(out, /- RECURRING \(1 rounds\) `deadbeef`/, `legacy line must be re-derived; got:\n${out}`);
+});
+
+test("needsHumanPunchlist (#133): tags are not doubled when re-reading an already-tagged line", () => {
+  const out = needsHumanPunchlist([
+    ceilingComment({ round: 2, findings: [`**NEW** \`${KEY_NEW}\` **[HIGH]** Fresh bug`] }),
+  ]);
+  assert.ok(out !== null);
+  assert.match(out, /- NEW `0badf00d`/, `got:\n${out}`);
+  assert.doesNotMatch(out, /NEW \*\*NEW\*\*|NEW NEW/, `tag must be stripped before re-tagging; got:\n${out}`);
+});
+
+test("needsHumanPunchlist (#133): a finding line with no parseable key is tagged NEW by default", () => {
+  // `abc123` is only 6 hex chars — not a valid finding key — and prior history
+  // exists, so only the key-less default can produce NEW here.
+  const comments: Comment[] = [
+    verdictComment(2, [KEY_REC], "2026-06-12T00:00:00Z"),
+    verdictComment(2, [KEY_REC], "2026-06-12T01:00:00Z"),
+    ceilingComment({ round: 2, findings: [TWO_FINDINGS[0]], createdAt: "2026-06-12T02:00:00Z" }),
+  ];
+  const out = needsHumanPunchlist(comments);
+  assert.ok(out !== null);
+  assert.match(out, /- NEW `abc123`/, `unparseable key must default to NEW; got:\n${out}`);
+});
+
+test("needsHumanPunchlist (#133): no prior Review-N comments at all → every finding tagged NEW", () => {
+  const out = needsHumanPunchlist([ceilingComment({ round: 2, findings: TWO_FINDINGS })]);
+  assert.ok(out !== null);
+  // Isolate finding lines by their NEW/RECURRING tag (#133), not by the `- `
+  // bullet prefix: the resume steps (#135) are also `- ` bullets, so a bare
+  // startsWith("- ") would also match them.
+  const findingLines = out.split("\n").filter((l) => /^- (NEW|RECURRING)\b/.test(l));
+  assert.equal(findingLines.length, 2, `got:\n${out}`);
+  for (const l of findingLines) assert.match(l, /^- NEW /, `got line: ${l}`);
+});
+
+// ---------------------------------------------------------------------------
 // runStatus integration — capture console.log via injected IO (no real gh)
 // ---------------------------------------------------------------------------
 
