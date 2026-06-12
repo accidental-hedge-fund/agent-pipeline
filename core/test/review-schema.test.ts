@@ -61,13 +61,14 @@ function classifyTsType(token: string): "number" | "string" | "other" {
   if (token.endsWith("[]")) return "other"; // arrays: findings, next_steps
   if (token === "number") return "number";
   if (token === "string" || token.startsWith('"')) return "string"; // string or string-literal union
-  // Nullable scalars: strip a trailing `| null` or `| undefined` and re-classify.
-  // The recursion peels chained nullables (`string | null | undefined`). Nullability
-  // is not value-type drift — `string | null` is still string-valued, and the schema
-  // block placeholder cannot express null — so we normalise to the base scalar.
-  // A genuinely unrecognised base type still returns "other", which the guard treats
-  // as a mismatch (fail closed), never a silent skip.
-  const stripped = token.replace(/\s*\|\s*(?:null|undefined)\s*$/, "").trim();
+  // Optional spelling: strip a trailing `| undefined` (presence, not value type —
+  // equivalent to the `?` optional fields) and re-classify. `| null` is deliberately
+  // NOT stripped: a JSON `null` is a real emitted VALUE the schema-block placeholder
+  // cannot express, so `string | null` stays "other" and the guard fails it closed
+  // against a concrete hint (null ≠ undefined; per adversarial review). A genuinely
+  // unrecognised base type also returns "other", which the guard treats as a
+  // mismatch, never a silent skip.
+  const stripped = token.replace(/\s*\|\s*undefined\s*$/, "").trim();
   if (stripped !== token) return classifyTsType(stripped);
   return "other";
 }
@@ -360,32 +361,38 @@ interface SyntheticFinding {
 });
 
 // Regression (#85 round 3): the value-type guard must not silently SKIP a scalar
-// field whose TS token classifies as "other". classifyTsType normalises nullable
-// scalars (`T | null` / `T | undefined`) to their base type, so "other" now means
-// genuinely-unrecognised drift — which the guard reports as a mismatch (fail
-// closed), symmetrically with the schema side, rather than continuing past it.
-// (The earlier fixes oscillated by moving a `continue` between the TS and schema
-// sides; this asserts the symmetric, non-skipping behavior.)
-test("value-type guard normalises nullable scalars and fails closed on unrecognised tokens (#85)", () => {
-  // Nullable scalars peel to their base type — nullability is not value-type drift.
-  assert.equal(classifyTsType("string | null"), "string");
-  assert.equal(classifyTsType("number | null"), "number");
-  assert.equal(classifyTsType("string | null | undefined"), "string");
-  assert.equal(classifyTsType("number | undefined | null"), "number");
-  assert.equal(classifyTsType('"a" | "b" | null'), "string");
-  // Genuinely unrecognised forms stay "other".
+// field whose TS token classifies as "other" — an unrecognised token on EITHER side
+// is a mismatch (fail closed), never a `continue`. The earlier fixes oscillated by
+// moving a skip between the TS and schema sides. It also draws the optional-vs-null
+// line: `| undefined`/optional `?` is about presence (normalise to the base scalar),
+// but `| null` is a real emitted JSON value the schema-block placeholder can't
+// express, so it stays "other" and fails closed (per adversarial review — null ≠
+// undefined).
+test("value-type guard: optional normalises, but null + unrecognised tokens fail closed (#85)", () => {
+  // Optional spelling normalises — presence, not value type.
+  assert.equal(classifyTsType("string | undefined"), "string");
+  assert.equal(classifyTsType("number | undefined"), "number");
+  assert.equal(classifyTsType('"a" | "b" | undefined'), "string");
+  // `| null` is a real emitted value the hint vocabulary can't express → stays "other".
+  assert.equal(classifyTsType("string | null"), "other");
+  assert.equal(classifyTsType("number | null"), "other");
+  assert.equal(classifyTsType("string | null | undefined"), "other");
+  assert.equal(classifyTsType("number | undefined | null"), "other");
+  // Genuinely unrecognised forms also stay "other".
   assert.equal(classifyTsType("Record<string, number>"), "other");
 
   const syntheticSrc = [
     "export interface SyntheticOther {",
-    "  summary: string | null;", // nullable string → normalises to "string"
-    "  line_start: Record<string, number>;", // unrecognised → "other"
+    "  summary: string | null;", // null is a real value → "other" → fails closed
+    "  file: string | undefined;", // optional → normalises to "string" → matches
+    "  line_start: Record<string, number>;", // unrecognised → "other" → fails closed
     "}",
   ].join("\n");
-  // Schema block: string field hinted quoted, number field hinted bare-angle.
+  // Schema block: string fields hinted quoted, number field hinted bare-angle.
   const syntheticBlock = [
     "{",
     '  "summary": "<one-line>",',
+    '  "file": "<path>",',
     '  "findings": [',
     "    {",
     '      "line_start": <int>',
@@ -406,12 +413,16 @@ test("value-type guard normalises nullable scalars and fails closed on unrecogni
     }
   }
 
-  // summary (string | null → string) vs "<one-line>" (string) → matches, no skip.
-  // line_start (Record<…> → other) vs <int> (number) → fails closed, not skipped.
+  // file (string | undefined → string) vs "<path>" (string) → matches (optional ok).
+  // summary (string | null → other) vs "<one-line>" (string) → fails closed.
+  // line_start (Record<…> → other) vs <int> (number) → fails closed.
   assert.deepEqual(
-    mismatches,
-    ["line_start: `Record<string, number>` (other) vs schema (number)"],
-    "nullable scalars must normalise and match; an unrecognised scalar token must fail closed, not skip",
+    mismatches.sort(),
+    [
+      "line_start: `Record<string, number>` (other) vs schema (number)",
+      "summary: `string | null` (other) vs schema (string)",
+    ],
+    "null + unrecognised tokens must fail closed against a concrete hint; optional must normalise and match",
   );
 });
 
