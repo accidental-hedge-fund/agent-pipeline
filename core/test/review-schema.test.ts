@@ -50,6 +50,51 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
   return fields;
 }
 
+// Map a TypeScript scalar type annotation to the schema-block hint vocabulary:
+//   number              -> a bare angle-bracket hint  (<int>, <0.0-1.0>)
+//   string / "a" | "b"  -> a quoted hint              ("<text>", "x" | "y")
+// Arrays and any other compound token are "other" and excluded from the value-type
+// guard. A future scalar type (e.g. boolean) would need a new bucket here and a
+// matching schema-block hint convention in classifySchemaHint.
+function classifyTsType(token: string): "number" | "string" | "other" {
+  if (token.endsWith("[]")) return "other"; // arrays: findings, next_steps
+  if (token === "number") return "number";
+  if (token === "string" || token.startsWith('"')) return "string"; // string or string-literal union
+  return "other";
+}
+
+// Like `parseInterfaceFields`, but returns each field's value-type annotation
+// token (the text after `:`, up to a `;`, the start of a `//` comment, or EOL),
+// keyed by field name. Only scalar fields are kept: array/compound types classify
+// as "other" (via classifyTsType) and are skipped, since the schema block carries
+// no comparable scalar hint for them. Kept separate from `parseInterfaceFields`
+// so that function's `string[]` contract and its callers stay untouched (#85).
+function parseInterfaceFieldTypes(src: string, interfaceName: string): Record<string, string> {
+  const marker = `interface ${interfaceName} {`;
+  const start = src.indexOf(marker);
+  if (start === -1) throw new Error(`Interface ${interfaceName} not found in types.ts`);
+  const bodyStart = src.indexOf("{", start) + 1;
+  let depth = 1;
+  let i = bodyStart;
+  while (i < src.length && depth > 0) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") depth--;
+    i++;
+  }
+  const body = src.slice(bodyStart, i - 1);
+  const types: Record<string, string> = {};
+  for (const line of body.split("\n")) {
+    // Same property forms as parseInterfaceFields, plus a third group capturing
+    // the annotation token (stops at `;`, a `//` comment, or end-of-line).
+    const m = line.match(/^\s*(?:readonly\s+)?(?:(\w+)|"(\w+)")\??:\s*([^;/\n]+)/);
+    if (!m) continue;
+    const token = m[3].trim();
+    if (classifyTsType(token) === "other") continue; // arrays / nested: no scalar hint
+    types[m[1] ?? m[2]] = token;
+  }
+  return types;
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const typesSrc = readFileSync(join(__dirname, "../scripts/types.ts"), "utf-8");
 
@@ -74,6 +119,40 @@ function parseSchemaBlockFields(block: string): { verdict: string[]; finding: st
     }
   }
   return { verdict, finding };
+}
+
+// A schema-block value hint is `number` when it's a bare angle-bracket placeholder
+// (<int>, <0.0-1.0>) and `string` when it's quoted ("<text>", "x" | "y"). Anything
+// else — an array (`[`, `["<...>"]`) or nested object — is "other" and excluded
+// from the value-type guard.
+function classifySchemaHint(value: string): "number" | "string" | "other" {
+  if (value.startsWith('"')) return "string";
+  if (value.startsWith("<")) return "number";
+  return "other";
+}
+
+// Companion to parseSchemaBlockFields: instead of just key order, capture each
+// scalar key's value *category* so the drift guard can compare it to the matching
+// TS field's type. Mirrors that walk (verdict keys at depth 1, finding keys at
+// depth 3) and reads the value text after the key, classifying it via
+// classifySchemaHint. Array/object values (findings, next_steps) classify as
+// "other" and are skipped by the guard.
+function parseSchemaBlockValueHints(block: string): Record<string, "number" | "string" | "other"> {
+  const hints: Record<string, "number" | "string" | "other"> = {};
+  let depth = 0;
+  for (let i = 0; i < block.length; i++) {
+    const ch = block[i];
+    if (ch === "{" || ch === "[") depth++;
+    else if (ch === "}" || ch === "]") depth--;
+    else if (ch === '"') {
+      const m = block.slice(i).match(/^"(\w+)"\s*:\s*([^\n]*)/);
+      if (m && (depth === 1 || depth === 3)) {
+        const value = m[2].replace(/,\s*$/, "").trim();
+        hints[m[1]] = classifySchemaHint(value);
+      }
+    }
+  }
+  return hints;
 }
 
 // Pull the fenced code block that immediately follows "Return ONLY valid JSON
@@ -104,6 +183,36 @@ unindented: string;
     fields,
     ["indented", "unindented", "readonlyField", "quotedField", "optional"],
     "parseInterfaceFields must detect unindented, readonly, quoted, and optional properties",
+  );
+});
+
+// Regression: parseInterfaceFieldTypes must capture the scalar annotation token
+// per field (number, string, string-literal union, optional/readonly forms) and
+// skip array/compound fields, which carry no scalar hint in the schema block.
+test("parseInterfaceFieldTypes regression: captures scalar tokens and skips array fields", () => {
+  const src = `
+interface SyntheticB {
+  count: number;
+  label: string;
+  kind: "a" | "b" | "c";
+  optionalCount?: number;
+  readonly tag: string;
+  items: string[];
+  nested: ReviewFinding[];
+// comment: ignored
+}
+`;
+  const types = parseInterfaceFieldTypes(src, "SyntheticB");
+  assert.deepEqual(
+    types,
+    {
+      count: "number",
+      label: "string",
+      kind: '"a" | "b" | "c"',
+      optionalCount: "number",
+      tag: "string",
+    },
+    "parseInterfaceFieldTypes must capture number/string/union/optional/readonly scalar tokens and skip arrays",
   );
 });
 
@@ -185,6 +294,43 @@ test("drift guard: schema block preserves the historical field order and nesting
   ]);
   assert.deepEqual(parsed.verdict, REVIEW_SCHEMA_FIELDS.verdict);
   assert.deepEqual(parsed.finding, REVIEW_SCHEMA_FIELDS.finding);
+});
+
+// Value-type drift guard (#85): the field-name guards above keep the *keys* in
+// sync but discard the `: number` / `: string` annotation, so flipping
+// `line_start?: number` -> `string` while the block still hints `<int>` slips
+// through. This compares each scalar field's TS type category against the schema
+// block's value-hint category, so a number-vs-quoted (or string-vs-bare) drift
+// fails. parseInterfaceFieldTypes already excludes non-scalar (array) fields.
+test("drift guard: value-type tokens match schema block value hints", () => {
+  const tsTypes: Record<string, string> = {
+    ...parseInterfaceFieldTypes(typesSrc, "ReviewFinding"),
+    ...parseInterfaceFieldTypes(typesSrc, "ReviewVerdict"),
+  };
+  // commitSha is stamped by the pipeline from the PR head and never appears in
+  // the schema block (see the field-name guard above), so it has no hint to match.
+  delete tsTypes.commitSha;
+
+  const hints = parseSchemaBlockValueHints(REVIEW_VERDICT_SCHEMA_BLOCK);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const blockCat = hints[field];
+    // Only scalar-vs-scalar pairs are in scope; the field-name guard already
+    // covers presence, and array/nested values classify as "other" here.
+    if (blockCat === undefined || blockCat === "other") continue;
+    const tsCat = classifyTsType(token);
+    if (tsCat !== blockCat) {
+      mismatches.push(`${field}: types.ts \`${token}\` (${tsCat}) vs schema block hint (${blockCat})`);
+    }
+  }
+
+  assert.deepEqual(
+    mismatches,
+    [],
+    `value-type drift between ReviewFinding/ReviewVerdict and REVIEW_VERDICT_SCHEMA_BLOCK:\n  ${mismatches.join("\n  ")}\n` +
+      `Update the schema block value hint or the TS field type so both agree.`,
+  );
 });
 
 test("both review prompts substitute the schema block (no literal placeholder, all fields present)", () => {
