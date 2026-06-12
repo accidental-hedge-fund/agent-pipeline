@@ -62,7 +62,7 @@ test("no recipe leaves a literal {{N}} after rendering", () => {
 const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
   "needs-human":
     "A human decision is required. Fix the findings described above, remove the " +
-    "`pipeline:blocked` label, and re-run `$pipeline 7`. Or record an " +
+    "`blocked` label, and re-run `$pipeline 7`. Or record an " +
     "audited disposition with " +
     '`$pipeline 7 --override "<finding-key>: <reason>"` to advance past an ' +
     "accepted or out-of-scope finding (the key comes from the review comment; " +
@@ -70,58 +70,64 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
   "test-gate-exhausted":
     "The test/build gate failed after the pipeline's fix attempts were " +
     "exhausted. Fix the failing test(s) or build error in the worktree, commit " +
-    "the fix, remove the `pipeline:blocked` label, then re-run `$pipeline 7`.",
+    "the fix, remove the `blocked` label, then re-run `$pipeline 7`.",
   "no-commits":
     "The harness reported success but committed nothing and the worktree is " +
     "clean. Finish the work and commit it in the worktree (or re-run the step " +
-    "manually), remove the `pipeline:blocked` label, then re-run " +
+    "manually), remove the `blocked` label, then re-run " +
     "`$pipeline 7`. If real changes are sitting uncommitted in the worktree, " +
     "committing them lets the pipeline salvage and continue (#131).",
   "harness-failure":
     "The harness process crashed or timed out (see the error above). " +
-    "Investigate and fix the root cause, remove the `pipeline:blocked` label, " +
+    "Investigate and fix the root cause, remove the `blocked` label, " +
     "then re-run `$pipeline 7`. A transient timeout can usually just be " +
     "unblocked and re-run as-is.",
   "openspec-invalid":
     "The OpenSpec change is structurally invalid. Run `openspec validate " +
     "<change>` in the worktree, fix the reported errors, commit, remove the " +
-    "`pipeline:blocked` label, then re-run `$pipeline 7`.",
+    "`blocked` label, then re-run `$pipeline 7`.",
   "openspec-stale-delta":
     "The OpenSpec spec delta is stale relative to the committed code. Reconcile " +
     "the spec delta with the implementation (or run `openspec archive " +
-    "<change>`), commit, remove the `pipeline:blocked` label, then re-run " +
+    "<change>`), commit, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
   "merge-conflict":
     "The branch could not be merged or auto-rebased onto the target branch. " +
     "Rebase the branch on the latest target, resolve the conflicts, push, " +
-    "remove the `pipeline:blocked` label, then re-run `$pipeline 7`.",
+    "remove the `blocked` label, then re-run `$pipeline 7`.",
   "worktree-missing":
-    "The worktree for this issue no longer exists, so fixes can't be applied. " +
-    "Remove the `pipeline:blocked` label and re-run `$pipeline 7` to " +
-    "recreate it from the branch, then continue.",
+    "The worktree for this issue no longer exists. The fix stage cannot run " +
+    "without it — re-running will block again immediately. Recreate it manually " +
+    "from the issue's branch (`git worktree add`), remove the `blocked` label, " +
+    "then re-run `$pipeline 7`.",
   "worktree-creation-failed":
     "Creating the worktree failed (see the error above). Check disk space and " +
-    "git state (stale worktrees, lock files), remove the `pipeline:blocked` " +
+    "git state (stale worktrees, lock files), remove the `blocked` " +
     "label, then re-run `$pipeline 7`.",
   "pr-creation-failed":
     "Opening the pull request failed (see the error above). Check GitHub " +
-    "permissions and rate limits, remove the `pipeline:blocked` label, then " +
+    "permissions and rate limits, remove the `blocked` label, then " +
     "re-run `$pipeline 7`.",
+  "no-pull-request":
+    "No pull request was found for this issue. The implementation stage may " +
+    "not have run yet, or the PR was closed. Open or reopen a pull request " +
+    "from the issue's branch, remove the `blocked` label, then re-run " +
+    "`$pipeline 7`.",
   "plan-gen-failed":
     "Plan generation failed (see the error above). Fix the root cause (often a " +
-    "transient harness error), remove the `pipeline:blocked` label, then re-run " +
+    "transient harness error), remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
   "push-failed":
     "Pushing the branch failed for a non-conflict reason (see stderr above). " +
     "Resolve the push error (auth, remote, or branch protection), remove the " +
-    "`pipeline:blocked` label, then re-run `$pipeline 7`.",
+    "`blocked` label, then re-run `$pipeline 7`.",
   "eval-gate-misconfigured":
     "`eval_gate.enabled` is true but no command is configured. Set " +
     "`eval_gate.command` in `.github/pipeline.yml`, remove the " +
-    "`pipeline:blocked` label, then re-run `$pipeline 7`.",
+    "`blocked` label, then re-run `$pipeline 7`.",
   "eval-gate-failed":
     "The eval gate failed (see output above). Fix the failing evals in the " +
-    "worktree, commit, remove the `pipeline:blocked` label, then re-run " +
+    "worktree, commit, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
 };
 
@@ -178,7 +184,7 @@ test("test-gate-exhausted directs to fix the test, commit, clear label, and re-r
   const body = comment("test-gate-exhausted");
   assert.ok(body.includes("Fix the failing test"));
   assert.ok(body.includes("commit"));
-  assert.ok(body.includes("pipeline:blocked"));
+  assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));
   assert.ok(!body.includes("--unblock"));
 });
@@ -187,14 +193,14 @@ test("needs-human directs to fix-and-re-run OR --override, and mentions label cl
   const body = comment("needs-human");
   assert.ok(body.includes("re-run `$pipeline 7`"));
   assert.ok(body.includes("--override"));
-  assert.ok(body.includes("pipeline:blocked"));
+  assert.ok(body.includes("`blocked`"));
 });
 
 test("openspec-invalid directs to openspec validate, fix, commit, clear label, re-run", () => {
   const body = comment("openspec-invalid");
   assert.ok(body.includes("openspec validate"));
   assert.ok(body.includes("commit"));
-  assert.ok(body.includes("pipeline:blocked"));
+  assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));
 });
 
@@ -203,7 +209,7 @@ test("merge-conflict directs to rebase, resolve, push, clear label, re-run", () 
   assert.ok(body.includes("Rebase"));
   assert.ok(body.includes("resolve"));
   assert.ok(body.includes("push"));
-  assert.ok(body.includes("pipeline:blocked"));
+  assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));
 });
 
@@ -224,7 +230,7 @@ test("eval-gate-misconfigured directs to set the command, clear label, re-run", 
   const body = comment("eval-gate-misconfigured");
   assert.ok(body.includes("eval_gate.command"));
   assert.ok(body.includes(".github/pipeline.yml"));
-  assert.ok(body.includes("pipeline:blocked"));
+  assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));
   assert.ok(!body.includes("--unblock"));
 });
@@ -233,7 +239,7 @@ test("eval-gate-failed directs to fix evals, commit, clear label, re-run", () =>
   const body = comment("eval-gate-failed");
   assert.ok(body.includes("eval"));
   assert.ok(body.includes("commit"));
-  assert.ok(body.includes("pipeline:blocked"));
+  assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));
   assert.ok(!body.includes("--unblock"));
 });
@@ -290,4 +296,62 @@ test("every production setBlocked call passes an explicit BlockerKind", () => {
       );
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Regression guard: label name correctness (Finding 1, review 2).
+// Recipes must name the real `blocked` label, not the non-existent
+// `pipeline:blocked` label. A recipe mentioning `pipeline:blocked` would
+// leave the real blocked label in place after the operator follows it.
+// ---------------------------------------------------------------------------
+
+test("no recipe mentions the non-existent 'pipeline:blocked' label", () => {
+  for (const kind of BLOCKER_KINDS) {
+    const rendered = renderRecipe(kind, 42);
+    assert.ok(
+      !rendered.includes("pipeline:blocked"),
+      `recipe for "${kind}" references the non-existent pipeline:blocked label — use the real BLOCKED_LABEL ("blocked")`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// worktree-missing: recipe must not promise re-run recreates the worktree
+// (Finding 2, review 2). The fix/eval stages call getForIssue and block
+// immediately — they never call createWorktree.
+// ---------------------------------------------------------------------------
+
+test("worktree-missing recipe does not falsely promise re-run will recreate the worktree", () => {
+  const rendered = renderRecipe("worktree-missing", 42);
+  assert.ok(
+    !rendered.includes("recreate it from the branch"),
+    "worktree-missing recipe must not claim re-running recreates the worktree",
+  );
+  assert.ok(
+    rendered.includes("git worktree add"),
+    "worktree-missing recipe must direct the operator to manually recreate with git worktree add",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// no-pull-request: review stage uses this kind when no PR is found (not
+// pr-creation-failed, which implies an API error during PR creation). The
+// recipe must direct the operator to open/reopen a PR, not to check
+// API permissions.
+// ---------------------------------------------------------------------------
+
+test("no-pull-request kind has a recipe that directs to open/reopen a pull request", () => {
+  const body = comment("no-pull-request");
+  assert.ok(body.includes("pull request"), "no-pull-request recipe must mention pull request");
+  assert.ok(body.includes("`blocked`"), "no-pull-request recipe must mention clearing the blocked label");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "no-pull-request recipe must direct to re-run");
+  assert.ok(!body.includes("--unblock"), "no-pull-request recipe must not direct to --unblock");
+});
+
+test("review stage uses no-pull-request kind (not pr-creation-failed) for missing PR", () => {
+  const src = readFileSync(join(__dirname, "../scripts/stages/review.ts"), "utf-8");
+  assert.ok(
+    !src.includes('"pr-creation-failed"'),
+    'review.ts must not use "pr-creation-failed" — the review stage does not create PRs; use "no-pull-request" for missing-PR cases',
+  );
 });

@@ -124,7 +124,7 @@ export async function advanceReview(
 
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
   if (!prNumber) {
-    await setBlockedFn(cfg, issueNumber, "No pull request found for this issue.", stage, "pr-creation-failed");
+    await setBlockedFn(cfg, issueNumber, "No pull request found for this issue.", stage, "no-pull-request");
     return { advanced: false, status: "blocked", reason: "no PR found" };
   }
 
