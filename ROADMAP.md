@@ -81,6 +81,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
 | **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
 | **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
+| **v1.0.4** | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Move *deterministic* recovery + a sharper hand-off into the skill: salvage uncommitted work (#131), recurrence-aware park-earlier + RECURRING/NEW tags (#133), stage-aware recovery recipes (#134), override auto-resume (#135). All **zero-authority** (gate-certified, or a human's prior decision); no auto-merge, no review demotion. Same family as #95/#98/#75. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #85 (patch) folds in as same-theme gate hardening. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -99,6 +100,10 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #116 | patch | models keys → optional + `.strict()` | config visibility | v1.0.2 | — |
 | #117 | patch | none | CLI niceties | v1.0.2 | — |
 | #124 | patch | none (dev-tooling, not shipped) | dev-loop convergence | v1.0.3 | — |
+| #131 | patch | none | recovery robustness | v1.0.4 | — |
+| #133 | patch | none | recovery robustness | v1.0.4 | — |
+| #134 | patch | none | recovery robustness | v1.0.4 | — |
+| #135 | patch | none | recovery robustness | v1.0.4 | — |
 | #19 | minor | none | review quality | v1.1.0 | #25 (co-ship) |
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
@@ -114,6 +119,15 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
 ## Remaining work — detail (grouped by release)
+
+### v1.0.4 — dev-loop convergence, continued / recovery robustness (patch)
+
+- **#131** — salvage uncommitted harness work instead of hard-blocking. When an implementer/fix harness does the work but doesn't `git commit`, the stage blocks with "no commits in range" and the verified change is lost (observed on #57). Commit the leftover worktree changes (with `#20` trailers + commit format) and let the existing test gate validate them, rather than discard/block. The current `auto_recover` is too narrow — its `hasCommitsAhead` guard no-ops when *any* commit is ahead (e.g. the OpenSpec planning commit), and it *discards* rather than salvages. *Moves one of the few operator-driven recoveries into the skill; no config/contract change.*
+- **#133** — recurrence-aware review loop: park at `needs-human` on the first *unchanged* re-emit of a blocking finding (content-addressed `findingKey`) instead of grinding to the round ceiling, and tag each parked finding `RECURRING (n)` / `NEW`. Diagnosis + anti-thrash earlier-park; zero authority (only ends the loop earlier at the safe terminal + adds a tag).
+- **#134** — stage-aware recovery recipe in `setBlocked`: the uniform `--unblock` hint is the *wrong verb* for most blockers (it only clears the label — the #57 trap). State the kind-specific resume verb per blocker class (closed enum, static lookup). Presentation only, zero authority.
+- **#135** — override auto-resume: after `--override` records the audited disposition, re-enter the review round automatically (and relabel `needs-human → review-N`) instead of two more hand actions. The human already decided (the key+reason); the resume re-runs the same deterministic partition and re-parks if blockers remain.
+
+> **Design line for this cluster (from the 2026-06-12 recovery-direction analysis):** automate a recovery step *only* when it adds **zero new authority over what ships** — a human's prior decision (#135), a deterministic gate that re-certifies (#131), or a re-entry/diagnosis that never advances past review (#133/#134). The bright line is **authority, not intelligence**: the hand-off can get arbitrarily smart; the *decision* (override-vs-fix-vs-adopt, retry-harder) stays with a human. `needs-human` is a feature, not a deficiency.
 
 ### v1.1.0 — review quality (minor)
 
