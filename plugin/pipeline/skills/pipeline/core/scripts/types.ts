@@ -98,9 +98,10 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "<change>` in the worktree, fix the reported errors, commit, remove the " +
     "`blocked` label, then re-run `$pipeline {{N}}`.",
   "openspec-stale-delta":
-    "The OpenSpec spec delta is stale relative to the committed code. Reconcile " +
-    "the spec delta with the implementation (or run `openspec archive " +
-    "<change>`), commit, remove the `blocked` label, then re-run " +
+    "The OpenSpec spec delta is stale relative to the committed code. Update " +
+    "`openspec/changes/<id>/specs/**` and `tasks.md` to match the " +
+    "implementation, run `openspec validate <id>` to confirm the change is " +
+    "valid, commit, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
   "merge-conflict":
     "The branch could not be merged or auto-rebased onto the target branch. " +

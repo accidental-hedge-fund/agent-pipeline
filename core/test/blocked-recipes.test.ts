@@ -87,9 +87,10 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "<change>` in the worktree, fix the reported errors, commit, remove the " +
     "`blocked` label, then re-run `$pipeline 7`.",
   "openspec-stale-delta":
-    "The OpenSpec spec delta is stale relative to the committed code. Reconcile " +
-    "the spec delta with the implementation (or run `openspec archive " +
-    "<change>`), commit, remove the `blocked` label, then re-run " +
+    "The OpenSpec spec delta is stale relative to the committed code. Update " +
+    "`openspec/changes/<id>/specs/**` and `tasks.md` to match the " +
+    "implementation, run `openspec validate <id>` to confirm the change is " +
+    "valid, commit, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
   "merge-conflict":
     "The branch could not be merged or auto-rebased onto the target branch. " +
@@ -202,6 +203,15 @@ test("openspec-invalid directs to openspec validate, fix, commit, clear label, r
   assert.ok(body.includes("commit"));
   assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));
+});
+
+test("openspec-stale-delta directs to update spec delta, validate, commit, clear label, re-run — never archive", () => {
+  const body = comment("openspec-stale-delta");
+  assert.ok(body.includes("openspec validate"), "should mention openspec validate");
+  assert.ok(body.includes("commit"), "should mention commit");
+  assert.ok(body.includes("`blocked`"), "should mention the blocked label");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "should mention re-run");
+  assert.ok(!body.includes("openspec archive"), "must not tell operator to archive (bypasses the guard)");
 });
 
 test("merge-conflict directs to rebase, resolve, push, clear label, re-run", () => {
