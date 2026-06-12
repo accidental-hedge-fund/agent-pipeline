@@ -53,24 +53,27 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
 // Map a TypeScript scalar type annotation to the schema-block hint vocabulary:
 //   number              -> a bare angle-bracket hint  (<int>, <0.0-1.0>)
 //   string / "a" | "b"  -> a quoted hint              ("<text>", "x" | "y")
-// Arrays are "other" and excluded from the value-type guard. `T | undefined`
-// nullable forms strip the suffix and re-classify — e.g. `string | undefined`
-// → "string". An unrecognised token that is NOT an array still returns "other",
-// which the drift guard treats as a mismatch against any concrete schema hint.
+// Validates EVERY union arm rather than shortcutting on the first one. `undefined`
+// arms are dropped (optional — about field presence, not value type, like the `?`
+// fields). All remaining arms must agree on a single scalar value type; a `null`
+// arm, a mixed union (e.g. `"low" | number`), an array, or any unrecognised arm
+// makes the whole token "other", which the drift guard treats as a mismatch (fail
+// closed) against a concrete schema hint — never a silent skip. (null ≠ undefined;
+// the per-side skip, the first-arm shortcut, and the trailing-only strip were all
+// adversarial-review gaps — validating every arm closes them at the root.)
 function classifyTsType(token: string): "number" | "string" | "other" {
-  if (token.endsWith("[]")) return "other"; // arrays: findings, next_steps
-  if (token === "number") return "number";
-  if (token === "string" || token.startsWith('"')) return "string"; // string or string-literal union
-  // Optional spelling: strip a trailing `| undefined` (presence, not value type —
-  // equivalent to the `?` optional fields) and re-classify. `| null` is deliberately
-  // NOT stripped: a JSON `null` is a real emitted VALUE the schema-block placeholder
-  // cannot express, so `string | null` stays "other" and the guard fails it closed
-  // against a concrete hint (null ≠ undefined; per adversarial review). A genuinely
-  // unrecognised base type also returns "other", which the guard treats as a
-  // mismatch, never a silent skip.
-  const stripped = token.replace(/\s*\|\s*undefined\s*$/, "").trim();
-  if (stripped !== token) return classifyTsType(stripped);
-  return "other";
+  const arms = token
+    .split("|")
+    .map((a) => a.trim())
+    .filter((a) => a.length > 0 && a !== "undefined");
+  if (arms.length === 0) return "other";
+  const armCat = (arm: string): "number" | "string" | "other" => {
+    if (arm === "number") return "number";
+    if (arm === "string" || /^".*"$/.test(arm)) return "string"; // string or string literal
+    return "other"; // null, arrays, mixed/unrecognised → fail closed
+  };
+  const cats = new Set(arms.map(armCat));
+  return cats.size === 1 && !cats.has("other") ? [...cats][0]! : "other";
 }
 
 // Like `parseInterfaceFields`, but returns each field's raw value-type annotation
@@ -378,6 +381,14 @@ test("value-type guard: optional normalises, but null + unrecognised tokens fail
   assert.equal(classifyTsType("number | null"), "other");
   assert.equal(classifyTsType("string | null | undefined"), "other");
   assert.equal(classifyTsType("number | undefined | null"), "other");
+  // Clean string-literal unions (the real `verdict` / `severity` fields) → "string".
+  assert.equal(classifyTsType('"approve" | "needs-attention"'), "string");
+  assert.equal(classifyTsType('"critical" | "high" | "medium" | "low"'), "string");
+  // ...but EVERY arm is validated: a literal union with a null or non-string arm
+  // (or a mixed union) fails closed — the first-arm `"` shortcut was a real gap.
+  assert.equal(classifyTsType('"a" | "b" | null'), "other");
+  assert.equal(classifyTsType('"low" | number'), "other");
+  assert.equal(classifyTsType('"approve" | "needs-attention" | undefined'), "string");
   // Genuinely unrecognised forms also stay "other".
   assert.equal(classifyTsType("Record<string, number>"), "other");
 
