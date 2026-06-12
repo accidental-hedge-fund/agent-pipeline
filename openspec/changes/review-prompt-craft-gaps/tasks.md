@@ -38,4 +38,4 @@
 - [x] 8.1 Verify `review-schema.test.ts` drift-guard passes unchanged (schema shape is unchanged).
 - [x] 8.2 Run `node scripts/build.mjs` to regenerate `plugin/` mirror.
 - [x] 8.3 Run `npm run ci` from repo root; all checks green.
-- [ ] 8.4 Spot-check both prompts against a real past diff to confirm equal-or-better findings with fewer false positives compared to the pre-change prompts.
+- [x] 8.4 Spot-check both prompts against a real past diff to confirm equal-or-better findings with fewer false positives compared to the pre-change prompts. See `spot-check.md` for the before/after analysis against commits 3b3f588 (#124, medium-risk) and abc9d22 (#85, low-risk/test-only).
