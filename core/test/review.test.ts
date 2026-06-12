@@ -20,16 +20,18 @@ import {
   advanceReview,
   countPriorRounds,
   diffFilePaths,
+  extractBlockingKeysFromComment,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
+  reviewCeilingComment,
   type AdvanceReviewDeps,
 } from "../scripts/stages/review.ts";
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import { findingKey } from "../scripts/review-policy.ts";
-import type { PipelineConfig, Stage } from "../scripts/types.ts";
+import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // parseStructuredVerdict — parse paths
@@ -792,6 +794,212 @@ test("a blocking finding routes to fix and does NOT post to the PR (only advisor
   });
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
   assert.deepEqual(rec.prComments, [], "no PR mirror when the item routes to a fix round");
+});
+
+// ---------------------------------------------------------------------------
+// Recurrence-aware convergence (#133): extractBlockingKeysFromComment, the
+// RECURRING/NEW punch-list tags, and the early park in advanceReview.
+// ---------------------------------------------------------------------------
+
+// The same finding NA_WITH_FINDING carries — shares its content-addressed key.
+const FINDING_BUG: ReviewFinding = {
+  severity: "high",
+  title: "bug",
+  body: "b",
+  confidence: 0.8,
+  recommendation: "fix it",
+};
+const KEY_BUG = findingKey(FINDING_BUG);
+
+/** A prior-round verdict comment emitted by the REAL formatter, so the
+ *  emit↔read round-trip is what's under test (no hand-rolled fixture drift). */
+function priorVerdictComment(round: 1 | 2, findings: ReviewFinding[]): { body: string } {
+  return {
+    body: formatReviewComment(
+      { verdict: "needs-attention", summary: "prior round", findings, next_steps: [], commitSha: SHA_A },
+      round,
+      "codex",
+    ),
+  };
+}
+
+function detailWithComments(comments: { body: string }[]) {
+  return {
+    number: 1,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "u",
+    labels: [],
+    comments,
+  } as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+}
+
+test("extractBlockingKeysFromComment: collects every override-key from a real review comment (#133)", () => {
+  const other: ReviewFinding = {
+    severity: "medium",
+    title: "second",
+    file: "src/x.ts",
+    body: "b",
+    confidence: 0.9,
+    recommendation: "r",
+  };
+  const { body } = priorVerdictComment(2, [FINDING_BUG, other]);
+  assert.deepEqual(extractBlockingKeysFromComment(body), new Set([KEY_BUG, findingKey(other)]));
+});
+
+test("extractBlockingKeysFromComment: approve comment with no findings → empty set (#133)", () => {
+  const body = formatReviewComment(
+    { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+  );
+  assert.equal(extractBlockingKeysFromComment(body).size, 0);
+});
+
+test("extractBlockingKeysFromComment: empty/malformed bodies → empty set, no throw (#133)", () => {
+  assert.equal(extractBlockingKeysFromComment("").size, 0);
+  assert.equal(extractBlockingKeysFromComment("prose with no keys").size, 0);
+  // Near-miss tokens must not match: 7 hex, 9 hex, non-hex, uppercase.
+  assert.equal(extractBlockingKeysFromComment("`override-key: abc1234`").size, 0);
+  assert.equal(extractBlockingKeysFromComment("`override-key: abcdef123`").size, 0);
+  assert.equal(extractBlockingKeysFromComment("`override-key: abcdefgh`").size, 0);
+  assert.equal(extractBlockingKeysFromComment("`override-key: ABCDEF12`").size, 0);
+});
+
+test("reviewCeilingComment: tags findings RECURRING (n rounds) by prior-round key membership, NEW otherwise (#133)", () => {
+  const fresh: ReviewFinding = {
+    severity: "high",
+    title: "fresh bug",
+    body: "b",
+    confidence: 0.9,
+    recommendation: "r",
+  };
+  const partition = { blocking: [FINDING_BUG, fresh], advisory: [], overridden: [] };
+  const priors = [priorVerdictComment(2, [FINDING_BUG]), priorVerdictComment(2, [FINDING_BUG])];
+  const md = reviewCeilingComment(cfgConverge, 2, "codex", partition, 3, priors);
+  assert.match(md, new RegExp(`\\*\\*RECURRING \\(2 rounds\\)\\*\\* \`${KEY_BUG}\``), md);
+  assert.match(md, new RegExp(`\\*\\*NEW\\*\\* \`${findingKey(fresh)}\``), md);
+});
+
+test("reviewCeilingComment: no prior round comments → every finding tagged NEW (#133)", () => {
+  const partition = { blocking: [FINDING_BUG], advisory: [], overridden: [] };
+  const md = reviewCeilingComment(cfgConverge, 2, "codex", partition, 3, []);
+  assert.match(md, new RegExp(`\\*\\*NEW\\*\\* \`${KEY_BUG}\``));
+  assert.doesNotMatch(md, /RECURRING/);
+});
+
+test("reviewCeilingComment: recurrence trigger keeps the ceiling header (status keys on it) but explains the early park (#133)", () => {
+  const partition = { blocking: [FINDING_BUG], advisory: [], overridden: [] };
+  const md = reviewCeilingComment(
+    cfgConverge,
+    2,
+    "codex",
+    partition,
+    3,
+    [priorVerdictComment(2, [FINDING_BUG])],
+    "recurrence",
+  );
+  assert.ok(md.startsWith("## Pipeline: Review ceiling reached"), "recurrence park must reuse the ceiling header");
+  assert.match(md, /unchanged finding key after a fix round/);
+  assert.doesNotMatch(md, /re-ran \d+ times/, "the round-ceiling wording must not appear on a recurrence park");
+  assert.match(md, /\*\*RECURRING \(1 rounds\)\*\*/);
+  // Resume steps identical in shape to the ceiling-triggered comment.
+  assert.match(md, /--override "<key>: <reason>"/);
+  assert.match(md, /pipeline:needs-human` → `pipeline:review-2/);
+});
+
+test("recurrence (#133): blocking finding re-emitted with an unchanged key after a fix → early park at needs-human", async (t) => {
+  // Only ONE prior round under cap 3 — without the recurrence check this routes
+  // to fix-2 (the pre-#133 behavior), so this test bites.
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "must NOT consume another fix round");
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
+  const punch = rec.comments.find((c) => c.startsWith("## Pipeline: Review ceiling reached"));
+  assert.ok(punch, "the tagged punch-list comment must be posted before transitioning");
+  assert.match(punch!, /RECURRING \(1 rounds\)/);
+  assert.equal(outcome.to, "needs-human");
+  assert.match(outcome.summary, /recurrence/);
+});
+
+test("recurrence (#133): all-new blocking keys → no early park, routes to fix as before", async (t) => {
+  const prior = priorVerdictComment(2, [
+    { severity: "high", title: "a different bug", body: "b", confidence: 0.9, recommendation: "r" },
+  ]);
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([prior]);
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  assert.ok(!rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")));
+});
+
+test("recurrence (#133): severity change → different key → treated as new, no early park", async (t) => {
+  // Same title/file, but the prior round emitted it at medium severity. The key
+  // hashes severity|file|title, so it differs → no recurrence.
+  const prior = priorVerdictComment(2, [{ ...FINDING_BUG, severity: "medium" }]);
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([prior]);
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+});
+
+test("recurrence (#133): no prior Review-N comment → no recurrence check, normal routing", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]); // default deps: no comments
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+});
+
+test("recurrence (#133): only the IMMEDIATELY-prior round counts (re-introduced ≠ recurring)", async (t) => {
+  // Key present two rounds ago but ABSENT from the immediately-prior round: it
+  // may have been re-introduced by new work, not a failed fix — no early park.
+  // Cap of 5 keeps the round ceiling out of the way (2 priors + 1 < 5).
+  const cfgCap5 = {
+    ...cfgConverge,
+    review_policy: { block_threshold: "medium", min_confidence: 0.7, max_adversarial_rounds: 5 },
+  } as unknown as PipelineConfig;
+  const priorOld = priorVerdictComment(2, [FINDING_BUG]);
+  const priorLatest = priorVerdictComment(2, [
+    { severity: "high", title: "unrelated", body: "b", confidence: 0.9, recommendation: "r" },
+  ]);
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([priorOld, priorLatest]);
+  await quiet(t, async () => {
+    await advanceReview(cfgCap5, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "absent from the immediately-prior round → no early park");
+});
+
+test("recurrence (#133): a round-1 key does not trigger an early park for round 2", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(1, [FINDING_BUG])]);
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+});
+
+test("recurrence (#133): round-1 recurrence parks from review-1 too", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(1, [FINDING_BUG])]);
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 1, 1, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
+  assert.equal(outcome.from, "review-1");
+  assert.equal(outcome.to, "needs-human");
 });
 
 // ---------------------------------------------------------------------------
