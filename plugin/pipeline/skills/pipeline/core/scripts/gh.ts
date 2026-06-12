@@ -10,8 +10,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   BLOCKED_LABEL,
+  BLOCKER_RECIPES,
+  DEFAULT_BLOCKER_KIND,
   LABEL_PREFIX,
   STAGES,
+  type BlockerKind,
   type CheckRun,
   type ItemDetail,
   type PipelineConfig,
@@ -519,29 +522,56 @@ export async function silentTransition(
   ]);
 }
 
+/**
+ * Render a blocker recipe (`BLOCKER_RECIPES[kind]`) for a concrete issue by
+ * substituting the `{{N}}` issue-number placeholder. Pure + exported so the
+ * snapshot test pins the rendered text without going through `setBlocked`'s I/O.
+ */
+export function renderRecipe(kind: BlockerKind, issueNumber: number): string {
+  return BLOCKER_RECIPES[kind].replaceAll("{{N}}", String(issueNumber));
+}
+
+/**
+ * Build the "## Pipeline: Blocked" comment body. Pure + exported for unit tests
+ * (`setBlocked` itself does real `gh` I/O). The "### How to unblock" section
+ * renders the kind-specific recipe (#134) — the generic `--unblock` hint is the
+ * wrong verb for most blocker classes.
+ */
+export function buildBlockedComment(args: {
+  issueNumber: number;
+  stageStr: string;
+  harness: string;
+  ts: string;
+  reason: string;
+  kind: BlockerKind;
+}): string {
+  return [
+    `## Pipeline: Blocked at ${String(args.stageStr).replace(/-/g, " ")}`,
+    "",
+    `**Harness**: ${args.harness}`,
+    `**Blocked since**: ${args.ts}`,
+    "",
+    "### Why",
+    args.reason,
+    "",
+    "### How to unblock",
+    renderRecipe(args.kind, args.issueNumber),
+  ].join("\n") + COMMENT_FOOTER;
+}
+
 export async function setBlocked(
   cfg: PipelineConfig,
   issueNumber: number,
   reason: string,
   stage: Stage | null = null,
+  kind: BlockerKind = DEFAULT_BLOCKER_KIND,
 ): Promise<void> {
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const detail = await getIssueDetail(cfg, issueNumber);
   const stageStr = stage ?? pickStage(detail.labels) ?? "unknown";
   const harness = getHarnessLabel(detail.labels) ?? "unassigned";
 
-  const body = [
-    `## Pipeline: Blocked at ${String(stageStr).replace(/-/g, " ")}`,
-    "",
-    `**Harness**: ${harness}`,
-    `**Blocked since**: ${ts}`,
-    "",
-    "### Why",
-    reason,
-    "",
-    "### How to unblock",
-    `Run \`$pipeline ${issueNumber} --unblock "<your answer>"\` to post the answer and clear the label.`,
-  ].join("\n") + COMMENT_FOOTER;
+  const body = buildBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind });
 
   await ghRun([
     "issue",

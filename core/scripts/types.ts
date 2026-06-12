@@ -27,6 +27,122 @@ export const HARNESS_LABEL_PREFIX = "harness:";
 
 export type Harness = "claude" | "codex";
 
+// ---------------------------------------------------------------------------
+// Blocker kinds (#134) — closed set of structurally-distinct failure classes.
+//
+// `setBlocked` posts the same "## Pipeline: Blocked" comment for every blocker,
+// but the recovery VERB differs per class: a test-gate failure wants "fix the
+// test, commit, re-run"; a merge conflict wants "rebase, push, re-run"; a
+// needs-human off-ramp wants "fix or --override". The uniform `--unblock` hint
+// (a label-clear + comment, no recovery) is the right verb for none of these.
+// The call site always knows its class, so the recipe is a static lookup over a
+// closed enum — not an inference about repo state.
+// ---------------------------------------------------------------------------
+// Single runtime source of truth (mirrors STAGES/Stage above) so the
+// exhaustiveness test can iterate the kinds — `BlockerKind` is stripped at
+// runtime, but `BLOCKER_KINDS` survives.
+export const BLOCKER_KINDS = [
+  "needs-human",
+  "test-gate-exhausted",
+  "no-commits",
+  "harness-failure",
+  "openspec-invalid",
+  "openspec-stale-delta",
+  "merge-conflict",
+  "worktree-missing",
+  "worktree-creation-failed",
+  "pr-creation-failed",
+  "no-pull-request",
+  "plan-gen-failed",
+  "push-failed",
+  "eval-gate-misconfigured",
+  "eval-gate-failed",
+] as const;
+export type BlockerKind = (typeof BLOCKER_KINDS)[number];
+
+/** Default kind when a `setBlocked` call omits one (backward-compatible). */
+export const DEFAULT_BLOCKER_KIND: BlockerKind = "needs-human";
+
+/**
+ * Per-kind "### How to unblock" recipe text. `{{N}}` is substituted with the
+ * issue number at render time (see `renderRecipe` in gh.ts). Each recipe states
+ * the verb that actually resolves its class — never the generic `--unblock`,
+ * which only clears the label. Pinned by `blocked-recipes.test.ts`: changing or
+ * dropping a recipe fails CI.
+ */
+export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
+  "needs-human":
+    "A human decision is required. Fix the findings described above, remove the " +
+    "`blocked` label, and re-run `$pipeline {{N}}`. Or record an " +
+    "audited disposition with " +
+    '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past an ' +
+    "accepted or out-of-scope finding (the key comes from the review comment; " +
+    "`--override` clears the label and resumes automatically).",
+  "test-gate-exhausted":
+    "The test/build gate failed after the pipeline's fix attempts were " +
+    "exhausted. Fix the failing test(s) or build error in the worktree, commit " +
+    "the fix, remove the `blocked` label, then re-run `$pipeline {{N}}`.",
+  "no-commits":
+    "The harness reported success but committed nothing and the worktree is " +
+    "clean. Finish the work and commit it in the worktree (or re-run the step " +
+    "manually), remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`. If real changes are sitting uncommitted in the worktree, " +
+    "committing them lets the pipeline salvage and continue (#131).",
+  "harness-failure":
+    "The harness process crashed or timed out (see the error above). " +
+    "Investigate and fix the root cause, remove the `blocked` label, " +
+    "then re-run `$pipeline {{N}}`. A transient timeout can usually just be " +
+    "unblocked and re-run as-is.",
+  "openspec-invalid":
+    "The OpenSpec change is structurally invalid. Run `openspec validate " +
+    "<change>` in the worktree, fix the reported errors, commit, remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
+  "openspec-stale-delta":
+    "The OpenSpec spec delta is stale relative to the committed code. Update " +
+    "`openspec/changes/<id>/specs/**` and `tasks.md` to match the " +
+    "implementation, run `openspec validate <id>` to confirm the change is " +
+    "valid, commit, remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "merge-conflict":
+    "The branch could not be merged or auto-rebased onto the target branch. " +
+    "Rebase the branch on the latest target, resolve the conflicts, push, " +
+    "remove the `blocked` label, then re-run `$pipeline {{N}}`.",
+  "worktree-missing":
+    "The worktree for this issue no longer exists. The fix stage cannot run " +
+    "without it — re-running will block again immediately. Recreate it manually " +
+    "from the issue's branch (`git worktree add`), remove the `blocked` label, " +
+    "then re-run `$pipeline {{N}}`.",
+  "worktree-creation-failed":
+    "Creating the worktree failed (see the error above). Check disk space and " +
+    "git state (stale worktrees, lock files), remove the `blocked` " +
+    "label, then re-run `$pipeline {{N}}`.",
+  "pr-creation-failed":
+    "Opening the pull request failed (see the error above). Check GitHub " +
+    "permissions and rate limits, remove the `blocked` label, then " +
+    "re-run `$pipeline {{N}}`.",
+  "no-pull-request":
+    "No pull request was found for this issue. The implementation stage may " +
+    "not have run yet, or the PR was closed. Open or reopen a pull request " +
+    "from the issue's branch, remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "plan-gen-failed":
+    "Plan generation failed (see the error above). Fix the root cause (often a " +
+    "transient harness error), remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "push-failed":
+    "Pushing the branch failed for a non-conflict reason (see stderr above). " +
+    "Resolve the push error (auth, remote, or branch protection), remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
+  "eval-gate-misconfigured":
+    "`eval_gate.enabled` is true but no command is configured. Set " +
+    "`eval_gate.command` in `.github/pipeline.yml`, remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
+  "eval-gate-failed":
+    "The eval gate failed (see output above). Fix the failing evals in the " +
+    "worktree, commit, remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+};
+
 export type OpenspecMode = "auto" | "on" | "off";
 
 export interface PipelineConfig {

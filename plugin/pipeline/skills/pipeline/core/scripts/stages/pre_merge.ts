@@ -102,7 +102,7 @@ export async function advance(
 
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
   if (!prNumber) {
-    await setBlockedFn(cfg, issueNumber, "No pull request found for pre-merge gate.", "pre-merge");
+    await setBlockedFn(cfg, issueNumber, "No pull request found for pre-merge gate.", "pre-merge", "needs-human");
     return { advanced: false, status: "blocked", reason: "no PR" };
   }
 
@@ -174,6 +174,7 @@ export async function advance(
       issueNumber,
       `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
       "pre-merge",
+      "test-gate-exhausted",
     );
     return { advanced: false, status: "blocked", reason: "CI failed" };
   }
@@ -215,6 +216,7 @@ export async function advance(
       issueNumber,
       "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.",
       "pre-merge",
+      "merge-conflict",
     );
     return { advanced: false, status: "blocked", reason: "branch behind base" };
   }
@@ -245,6 +247,7 @@ export async function advance(
         issueNumber,
         `OpenSpec validation failed (\`openspec validate --all\`):\n${detail}`,
         "pre-merge",
+        "openspec-invalid",
       );
       return { advanced: false, status: "blocked", reason: "openspec validation failed" };
     } else {
@@ -444,7 +447,7 @@ export async function maybeArchiveOpenspec(
       return null;
     }
     if (!res.success) {
-      await setBlockedFn(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge");
+      await setBlockedFn(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge", "openspec-invalid");
       return { advanced: false, status: "blocked", reason: `openspec archive failed (${id})` };
     }
   }
@@ -467,6 +470,7 @@ export async function maybeArchiveOpenspec(
       issueNumber,
       `Git push failed after OpenSpec archive: ${push.stderr.trim()}`,
       "pre-merge",
+      "push-failed",
     );
     return { advanced: false, status: "blocked", reason: "push failed after archive" };
   }
@@ -530,7 +534,7 @@ export async function enforceSpecConsistencyGuard(
   const reviewBody = latestReviewBody(detail.comments);
   if (!reviewBody || !reviewCommentFlagsSpecDivergence(reviewBody)) return null;
 
-  await deps.setBlocked(cfg, issueNumber, staleSpecDeltaBlockReason(stale), "pre-merge");
+  await deps.setBlocked(cfg, issueNumber, staleSpecDeltaBlockReason(stale), "pre-merge", "openspec-stale-delta");
   return { advanced: false, status: "blocked", reason: `stale OpenSpec delta (${stale})` };
 }
 
@@ -651,6 +655,7 @@ async function recoverFromMergeConflict(
     issueNumber,
     "PR has a merge conflict with the base branch that could not be automatically rebased — manual rebase needed.",
     "pre-merge",
+    "merge-conflict",
   );
   return { advanced: false, status: "blocked", reason: "merge conflict" };
 }
