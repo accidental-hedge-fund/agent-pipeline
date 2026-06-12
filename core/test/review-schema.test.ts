@@ -53,22 +53,30 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
 // Map a TypeScript scalar type annotation to the schema-block hint vocabulary:
 //   number              -> a bare angle-bracket hint  (<int>, <0.0-1.0>)
 //   string / "a" | "b"  -> a quoted hint              ("<text>", "x" | "y")
-// Arrays and any other compound token are "other" and excluded from the value-type
-// guard. A future scalar type (e.g. boolean) would need a new bucket here and a
-// matching schema-block hint convention in classifySchemaHint.
+// Arrays are "other" and excluded from the value-type guard. `T | undefined`
+// nullable forms strip the suffix and re-classify — e.g. `string | undefined`
+// → "string". An unrecognised token that is NOT an array still returns "other",
+// which the drift guard treats as a mismatch against any concrete schema hint.
 function classifyTsType(token: string): "number" | "string" | "other" {
   if (token.endsWith("[]")) return "other"; // arrays: findings, next_steps
   if (token === "number") return "number";
   if (token === "string" || token.startsWith('"')) return "string"; // string or string-literal union
+  // Nullable scalars: `T | undefined` — strip the suffix and re-classify.
+  // Handles `string | undefined`, `number | undefined`, and literal unions like
+  // `"a" | "b" | undefined`. An unrecognised T will still return "other".
+  const stripped = token.replace(/\s*\|\s*undefined\s*$/, "").trim();
+  if (stripped !== token) return classifyTsType(stripped);
   return "other";
 }
 
-// Like `parseInterfaceFields`, but returns each field's value-type annotation
-// token (the text after `:`, up to a `;`, the start of a `//` comment, or EOL),
-// keyed by field name. Only scalar fields are kept: array/compound types classify
-// as "other" (via classifyTsType) and are skipped, since the schema block carries
-// no comparable scalar hint for them. Kept separate from `parseInterfaceFields`
-// so that function's `string[]` contract and its callers stay untouched (#85).
+// Like `parseInterfaceFields`, but returns each field's raw value-type annotation
+// token (the text after `:`, up to a `;`, a `//` comment, or EOL), keyed by field
+// name. Array fields (ending with `[]`) are excluded since the schema block carries
+// no comparable scalar hint for them; all other fields are kept, including ones
+// whose annotation is not yet classified (e.g. `string | undefined`) — the drift
+// guard treats an unrecognised token as a mismatch when the schema block carries a
+// concrete hint. Kept separate from `parseInterfaceFields` so that function's
+// `string[]` contract and its callers stay untouched (#85).
 function parseInterfaceFieldTypes(src: string, interfaceName: string): Record<string, string> {
   const marker = `interface ${interfaceName} {`;
   const start = src.indexOf(marker);
@@ -89,7 +97,7 @@ function parseInterfaceFieldTypes(src: string, interfaceName: string): Record<st
     const m = line.match(/^\s*(?:readonly\s+)?(?:(\w+)|"(\w+)")\??:\s*([^;/\n]+)/);
     if (!m) continue;
     const token = m[3].trim();
-    if (classifyTsType(token) === "other") continue; // arrays / nested: no scalar hint
+    if (token.endsWith("[]")) continue; // arrays: no scalar hint in schema block
     types[m[1] ?? m[2]] = token;
   }
   return types;
@@ -186,10 +194,11 @@ unindented: string;
   );
 });
 
-// Regression: parseInterfaceFieldTypes must capture the scalar annotation token
-// per field (number, string, string-literal union, optional/readonly forms) and
-// skip array/compound fields, which carry no scalar hint in the schema block.
-test("parseInterfaceFieldTypes regression: captures scalar tokens and skips array fields", () => {
+// Regression: parseInterfaceFieldTypes must capture the annotation token per field
+// (number, string, string-literal union, nullable `T | undefined`, optional/readonly
+// forms) and skip only array fields. Before #85-fix2, `string | undefined` was
+// classified as "other" and silently dropped — this test fails without that fix.
+test("parseInterfaceFieldTypes regression: captures scalar tokens, nullable unions, and skips array fields", () => {
   const src = `
 interface SyntheticB {
   count: number;
@@ -197,6 +206,7 @@ interface SyntheticB {
   kind: "a" | "b" | "c";
   optionalCount?: number;
   readonly tag: string;
+  nullable: string | undefined;
   items: string[];
   nested: ReviewFinding[];
 // comment: ignored
@@ -211,8 +221,9 @@ interface SyntheticB {
       kind: '"a" | "b" | "c"',
       optionalCount: "number",
       tag: "string",
+      nullable: "string | undefined",
     },
-    "parseInterfaceFieldTypes must capture number/string/union/optional/readonly scalar tokens and skip arrays",
+    "parseInterfaceFieldTypes must capture number/string/union/nullable/optional/readonly tokens and skip arrays",
   );
 });
 
@@ -296,12 +307,62 @@ test("drift guard: schema block preserves the historical field order and nesting
   assert.deepEqual(parsed.finding, REVIEW_SCHEMA_FIELDS.finding);
 });
 
+// Regression (#85 finding 1): before the fix, parseInterfaceFieldTypes dropped
+// `string | undefined` (classified as "other" → skipped), so renaming
+// `line_start?: number` to `line_start: string | undefined` while the schema
+// block still carried `<int>` was invisible to the guard. The fix changes
+// parseInterfaceFieldTypes to skip only `[]` arrays, and extends classifyTsType
+// to resolve `T | undefined` → classifyTsType(T).
+test("drift guard: string union type vs bare hint is a mismatch (regression #85 finding 1)", () => {
+  // Simulate a field rewritten to `string | undefined` while schema still says <int>
+  const syntheticSrc = `
+interface SyntheticFinding {
+  line_start: string | undefined;
+  confidence: number;
+}
+`;
+  const syntheticBlock = `{
+    "findings": [
+        {
+            "line_start": <int>,
+            "confidence": <0.0-1.0>
+        }
+    ]
+}`;
+
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticFinding");
+  assert.ok(
+    "line_start" in tsTypes,
+    "parseInterfaceFieldTypes must include `string | undefined` fields (not skip them as 'other')",
+  );
+  assert.equal(tsTypes.line_start, "string | undefined");
+
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const blockCat = hints[field];
+    if (blockCat === undefined || blockCat === "other") continue;
+    const tsCat = classifyTsType(token);
+    if (tsCat !== blockCat) {
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${blockCat})`);
+    }
+  }
+
+  assert.deepEqual(
+    mismatches,
+    ["line_start: `string | undefined` (string) vs schema (number)"],
+    "drift guard must catch `string | undefined` vs `<int>` as a type-token mismatch",
+  );
+});
+
 // Value-type drift guard (#85): the field-name guards above keep the *keys* in
 // sync but discard the `: number` / `: string` annotation, so flipping
 // `line_start?: number` -> `string` while the block still hints `<int>` slips
 // through. This compares each scalar field's TS type category against the schema
 // block's value-hint category, so a number-vs-quoted (or string-vs-bare) drift
-// fails. parseInterfaceFieldTypes already excludes non-scalar (array) fields.
+// fails. Array fields are excluded from tsTypes; unrecognised tokens mismatch
+// against any concrete schema hint.
 test("drift guard: value-type tokens match schema block value hints", () => {
   const tsTypes: Record<string, string> = {
     ...parseInterfaceFieldTypes(typesSrc, "ReviewFinding"),
@@ -316,8 +377,11 @@ test("drift guard: value-type tokens match schema block value hints", () => {
   const mismatches: string[] = [];
   for (const [field, token] of Object.entries(tsTypes)) {
     const blockCat = hints[field];
-    // Only scalar-vs-scalar pairs are in scope; the field-name guard already
-    // covers presence, and array/nested values classify as "other" here.
+    // Array fields are excluded from tsTypes (parseInterfaceFieldTypes). Fields
+    // whose schema hint is "other" (arrays, nested objects) are skipped here.
+    // An unrecognised TS token ("other") is treated as a mismatch when blockCat
+    // is a concrete scalar category, catching drift like `string | undefined` vs
+    // `<int>` that the old "skip other" approach missed.
     if (blockCat === undefined || blockCat === "other") continue;
     const tsCat = classifyTsType(token);
     if (tsCat !== blockCat) {
