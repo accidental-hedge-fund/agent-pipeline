@@ -2,7 +2,7 @@
 
 Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-10.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties; see Shipped. Everything below v1.0.2 is the post-1.0.2 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror); see Shipped. Everything below v1.0.3 is the post-1.0.3 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -35,6 +35,12 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #64 | tighten SKILL.md monitor-filter guidance | #69 |
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
+
+**v1.0.3 — contributor tooling (shipped 2026-06-11, tag `v1.0.3`):**
+
+| # | What | PR |
+|---|------|-----|
+| #124 | pre-commit hook auto-regenerates + stages the `plugin/` mirror after `core/` edits — kills the forgot-to-regen wasted round; `build.mjs --check` stays the enforcement | #126 |
 
 **v1.0.2 — dev-loop convergence (cont.) + CLI niceties (shipped 2026-06-11, tag `v1.0.2`):**
 
@@ -74,7 +80,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 |---|---|---|---|---|
 | **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
 | **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
-| **v1.0.3** | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. Dev-tooling only — no published-artifact/runtime change; rides the patch line. Keeps the committed mirror (it's load-bearing for the marketplace) and automates the regen *authoring*, not the mirror itself. |
+| **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #85 (patch) folds in as same-theme gate hardening. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -108,10 +114,6 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
 ## Remaining work — detail (grouped by release)
-
-### v1.0.3 — dev-loop convergence, continued / contributor tooling (patch)
-
-- **#124** — pre-commit hook to auto-regenerate the `plugin/` mirror after `core/` edits. The committed mirror is **load-bearing** (verified: `/plugin marketplace add` requires a committed plugin tree on the default branch — copies to a cache, no build-on-install, can't reference outside the plugin dir, skips out-of-tree symlinks), so the duplication stays; this removes the *manual* regen (the #1 wasted-CI-round cause) by automating its authoring, and keeps `build.mjs --check` as the clone-independent enforcement. *Explicitly **not** a CI bot-commit: that commit would land post-verdict, fail `isPipelineInternalCommit`, and re-trigger the #16 SHA-gate every round — the #98 cascade.*
 
 ### v1.1.0 — review quality (minor)
 
