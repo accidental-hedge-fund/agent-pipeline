@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { domainContext, readConventions } from "../config.ts";
 import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
+import { DEFAULT_CONFIG } from "../types.ts";
 import type { PipelineConfig } from "../types.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -254,7 +255,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     plan: a.plan,
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
-    confidence_calibration: CONFIDENCE_CALIBRATION_BLOCK,
+    confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -290,7 +291,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     prior_review2_findings: priorReview2Section,
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
-    confidence_calibration: CONFIDENCE_CALIBRATION_BLOCK,
+    confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -423,6 +424,26 @@ function fixSpecRevisionInstruction(specContext?: string): string {
 function truncateDiff(diff: string, cap: number): string {
   if (diff.length <= cap) return diff;
   return diff.slice(0, cap) + `\n\n[...diff truncated at ${Math.floor(cap / 1000)}KB]`;
+}
+
+/**
+ * Augments the shared calibration block with the active review_policy values so
+ * reviewers can tell concretely whether a given confidence score will block or
+ * advise under this repo's configuration (#57). Falls back to DEFAULT_CONFIG when
+ * cfg.review_policy is absent (e.g. in tests that omit it).
+ */
+function buildConfidenceCalibrationWithPolicy(
+  reviewPolicy?: { min_confidence?: number; block_threshold?: string },
+): string {
+  const defaults = DEFAULT_CONFIG.review_policy;
+  const minConf = reviewPolicy?.min_confidence ?? defaults.min_confidence;
+  const blockThresh = reviewPolicy?.block_threshold ?? defaults.block_threshold;
+  return (
+    CONFIDENCE_CALIBRATION_BLOCK +
+    `\n\nActive policy: min_confidence \`${minConf}\`, block_threshold \`${blockThresh}\`. ` +
+    `Findings with confidence < ${minConf} are advisory regardless of severity; ` +
+    `at or above ${minConf} they block when severity meets the \`${blockThresh}\` threshold.`
+  );
 }
 
 // Exported for tests. CONFIDENCE_CALIBRATION_BLOCK is exposed so the drift test

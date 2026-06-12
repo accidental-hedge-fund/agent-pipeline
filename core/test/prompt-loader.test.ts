@@ -421,6 +421,19 @@ test("review prompts: both embed the shared confidence calibration block byte-fo
   }
 });
 
+test("review prompts: active review_policy values appear in both rendered prompts with non-default policy (#57)", () => {
+  const customCfg = {
+    ...dummyConfig(),
+    review_policy: { min_confidence: 0.9, block_threshold: "high" as const, max_adversarial_rounds: 3 },
+  };
+  const std = buildReviewStandardPrompt({ cfg: customCfg, issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d" });
+  const adv = buildReviewAdversarialPrompt({ cfg: customCfg, issueNumber: 7, title: "T", body: "B", diff: "d" });
+  for (const out of [std, adv]) {
+    assert.match(out, /0\.9/, "active min_confidence not rendered in prompt");
+    assert.match(out, /`high`/, "active block_threshold not rendered in prompt");
+  }
+});
+
 test("review prompts: both scope review to the diff + blast radius, before the checklist/finding bar (#57)", () => {
   const { std, adv } = builtReviewPrompts();
   for (const out of [std, adv]) {
