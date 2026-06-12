@@ -200,5 +200,5 @@ test("runStatus: a needs-human stage with NO ceiling comment prints a graceful f
   assert.equal(lines[2], "Stage: needs-human");
   const text = lines.join("\n");
   assert.match(text, /no Pipeline: Review ceiling reached comment was found/, `fallback missing; got:\n${text}`);
-  assert.match(text, /pipeline:needs-human` → `pipeline:review-2/, `fallback resume hint missing; got:\n${text}`);
+  assert.match(text, /pipeline:needs-human` → `pipeline:review-<round>/, `fallback resume hint missing; got:\n${text}`);
 });

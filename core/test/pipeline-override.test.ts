@@ -395,3 +395,35 @@ test("runOverride (#135): blocked at review-1 enters the advance loop directly w
   assert.equal(rec.advances, 1, "the advance loop must be entered");
   assert.deepEqual(rec.sequence, ["post", "clearBlocked", "advance"]);
 });
+
+// ---------------------------------------------------------------------------
+// 2.6 --dry-run --override is rejected as a usage error before any GitHub write
+// ---------------------------------------------------------------------------
+
+test("runOverride: --dry-run --override is rejected as a usage error; no GitHub writes are made", async (t) => {
+  // Regression for finding 1 of review 2: runOverride must not mutate any label
+  // or post any comment when --dry-run is set — it exits with code 2 instead.
+  const detail = detailAt(["pipeline:needs-human"], [ceilingComment({ round: 2, findings: ["`k1` A"] })]);
+  const { deps, rec } = makeOverrideDeps(detail);
+  const errors: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  });
+  const originalExitCode = process.exitCode;
+  try {
+    await quiet(t, async () => {
+      await runOverride(CFG, 7, `${KEY_A}: rejected — false positive`, { dryRun: true }, deps);
+    });
+    assert.equal(process.exitCode, 2, "must set exit code 2");
+  } finally {
+    process.exitCode = originalExitCode;
+  }
+  assert.equal(rec.posted.length, 0, "must not post any comment");
+  assert.equal(rec.clearedBlocked, 0, "must not clear blocked");
+  assert.equal(rec.flips.length, 0, "must not flip any label");
+  assert.equal(rec.advances, 0, "must not enter the advance loop");
+  assert.ok(
+    errors.some((e) => e.includes("--override") && e.includes("--dry-run")),
+    `error must mention both flags; got:\n${errors.join("\n")}`,
+  );
+});

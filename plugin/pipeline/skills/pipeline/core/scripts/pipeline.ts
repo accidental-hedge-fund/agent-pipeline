@@ -285,7 +285,7 @@ export async function runStatus(
       punchlist ??
         `Needs human, but no ${REVIEW_CEILING_MARKER.replace(/^## /, "")} comment was found. ` +
           `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
-          `\`pipeline:needs-human\` → \`pipeline:review-2\` to resume.`,
+          `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
   }
 }
@@ -409,6 +409,16 @@ export async function runOverride(
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
 ): Promise<void> {
+  // --dry-run is incompatible: --override always records an audited disposition
+  // (postComment, clearBlocked, silentTransition).  Allowing the combination would
+  // silently mutate label state under the mode advertised as "no GitHub writes".
+  if (opts.dryRun) {
+    console.error(
+      "pipeline: --override cannot be combined with --dry-run — --override always records an audited disposition.",
+    );
+    process.exitCode = 2;
+    return;
+  }
   const parsed = parseOverrideArg(spec);
   if ("error" in parsed) {
     console.error(`pipeline: ${parsed.error}`);
@@ -453,7 +463,7 @@ export async function runOverride(
           (ceiling
             ? `the latest "${REVIEW_CEILING_MARKER.replace(/^## /, "")}" comment does not name the review round to resume. `
             : `no "${REVIEW_CEILING_MARKER.replace(/^## /, "")}" comment was found. `) +
-          `The override is recorded; relabel \`pipeline:needs-human\` → \`pipeline:review-2\` and re-run to apply it.`,
+          `The override is recorded; relabel \`pipeline:needs-human\` → \`pipeline:review-<round>\` and re-run to apply it.`,
       );
       process.exitCode = 1;
       return;
@@ -520,14 +530,16 @@ async function runAdvance(
       }
 
       if (stage === "needs-human") {
-        console.log(
-          `[pipeline] #${issueNumber}: parked at needs-human — a review round hit the round ceiling. ` +
-            `Disposition a finding with --override "<key>: <reason>" (records the decision and auto-resumes), ` +
-            `or fix the residual findings and relabel pipeline:needs-human → pipeline:review-2 to resume.`,
-        );
         const ceiling = [...detail.comments]
           .reverse()
           .find((c) => c.body.startsWith(REVIEW_CEILING_MARKER));
+        const round = ceiling ? ceilingRound(ceiling.body) : null;
+        const resumeLabel = round !== null ? `pipeline:review-${round}` : "pipeline:review-<round>";
+        console.log(
+          `[pipeline] #${issueNumber}: parked at needs-human — a review round hit the round ceiling. ` +
+            `Disposition a finding with --override "<key>: <reason>" (records the decision and auto-resumes), ` +
+            `or fix the residual findings and relabel pipeline:needs-human → ${resumeLabel} to resume.`,
+        );
         if (ceiling) console.log(ceiling.body);
         break;
       }
