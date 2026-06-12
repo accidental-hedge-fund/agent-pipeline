@@ -61,10 +61,13 @@ function classifyTsType(token: string): "number" | "string" | "other" {
   if (token.endsWith("[]")) return "other"; // arrays: findings, next_steps
   if (token === "number") return "number";
   if (token === "string" || token.startsWith('"')) return "string"; // string or string-literal union
-  // Nullable scalars: `T | undefined` — strip the suffix and re-classify.
-  // Handles `string | undefined`, `number | undefined`, and literal unions like
-  // `"a" | "b" | undefined`. An unrecognised T will still return "other".
-  const stripped = token.replace(/\s*\|\s*undefined\s*$/, "").trim();
+  // Nullable scalars: strip a trailing `| null` or `| undefined` and re-classify.
+  // The recursion peels chained nullables (`string | null | undefined`). Nullability
+  // is not value-type drift — `string | null` is still string-valued, and the schema
+  // block placeholder cannot express null — so we normalise to the base scalar.
+  // A genuinely unrecognised base type still returns "other", which the guard treats
+  // as a mismatch (fail closed), never a silent skip.
+  const stripped = token.replace(/\s*\|\s*(?:null|undefined)\s*$/, "").trim();
   if (stripped !== token) return classifyTsType(stripped);
   return "other";
 }
@@ -356,6 +359,62 @@ interface SyntheticFinding {
   );
 });
 
+// Regression (#85 round 3): the value-type guard must not silently SKIP a scalar
+// field whose TS token classifies as "other". classifyTsType normalises nullable
+// scalars (`T | null` / `T | undefined`) to their base type, so "other" now means
+// genuinely-unrecognised drift — which the guard reports as a mismatch (fail
+// closed), symmetrically with the schema side, rather than continuing past it.
+// (The earlier fixes oscillated by moving a `continue` between the TS and schema
+// sides; this asserts the symmetric, non-skipping behavior.)
+test("value-type guard normalises nullable scalars and fails closed on unrecognised tokens (#85)", () => {
+  // Nullable scalars peel to their base type — nullability is not value-type drift.
+  assert.equal(classifyTsType("string | null"), "string");
+  assert.equal(classifyTsType("number | null"), "number");
+  assert.equal(classifyTsType("string | null | undefined"), "string");
+  assert.equal(classifyTsType("number | undefined | null"), "number");
+  assert.equal(classifyTsType('"a" | "b" | null'), "string");
+  // Genuinely unrecognised forms stay "other".
+  assert.equal(classifyTsType("Record<string, number>"), "other");
+
+  const syntheticSrc = [
+    "export interface SyntheticOther {",
+    "  summary: string | null;", // nullable string → normalises to "string"
+    "  line_start: Record<string, number>;", // unrecognised → "other"
+    "}",
+  ].join("\n");
+  // Schema block: string field hinted quoted, number field hinted bare-angle.
+  const syntheticBlock = [
+    "{",
+    '  "summary": "<one-line>",',
+    '  "findings": [',
+    "    {",
+    '      "line_start": <int>',
+    "    }",
+    "  ]",
+    "}",
+  ].join("\n");
+
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticOther");
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    const blockCat = hints[field];
+    if (tsCat === "other" || blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${blockCat ?? "absent"})`);
+    }
+  }
+
+  // summary (string | null → string) vs "<one-line>" (string) → matches, no skip.
+  // line_start (Record<…> → other) vs <int> (number) → fails closed, not skipped.
+  assert.deepEqual(
+    mismatches,
+    ["line_start: `Record<string, number>` (other) vs schema (number)"],
+    "nullable scalars must normalise and match; an unrecognised scalar token must fail closed, not skip",
+  );
+});
+
 // Value-type drift guard (#85): the field-name guards above keep the *keys* in
 // sync but discard the `: number` / `: string` annotation, so flipping
 // `line_start?: number` -> `string` while the block still hints `<int>` slips
@@ -377,14 +436,15 @@ test("drift guard: value-type tokens match schema block value hints", () => {
   const mismatches: string[] = [];
   for (const [field, token] of Object.entries(tsTypes)) {
     const tsCat = classifyTsType(token);
-    if (tsCat === "other") continue; // arrays/non-scalar TS fields have no comparable hint
     const blockCat = hints[field];
-    // Scalar TS field (number or string): the schema block MUST carry a matching
-    // concrete hint. blockCat "other" means the schema carries a non-scalar value
-    // (e.g. an array `["..."]` or unquoted bare text) for a field the type system
-    // declares as scalar — that is drift. blockCat undefined is already caught by
-    // the field-name guard but surfaced here for completeness.
-    if (blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+    // Array fields are already excluded at parse time, so every field reaching here
+    // is scalar-intended. Fail closed SYMMETRICALLY: an unrecognised token on either
+    // side is itself drift, never a silent skip. tsCat "other" = an unsupported TS
+    // form for a scalar field; blockCat "other" = a non-scalar schema value (e.g. an
+    // array `["..."]` or unquoted bare text) for a field the type system declares
+    // scalar. blockCat undefined is already caught by the field-name guard; surfaced
+    // here for completeness.
+    if (tsCat === "other" || blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
       const hint = blockCat ?? "absent";
       mismatches.push(`${field}: types.ts \`${token}\` (${tsCat}) vs schema block hint (${hint})`);
     }
