@@ -284,7 +284,7 @@ export async function runStatus(
     console.log(
       punchlist ??
         `Needs human, but no ${REVIEW_CEILING_MARKER.replace(/^## /, "")} comment was found. ` +
-          `Override (\`--override "<key>: <reason>"\`) or fix the residual findings, then relabel ` +
+          `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-2\` to resume.`,
     );
   }
@@ -313,10 +313,12 @@ export function needsHumanPunchlist(
 
   const count = countCeilingFindings(body);
   const noun = count === 1 ? "finding" : "findings";
+  const round = ceilingRound(body) ?? 2;
   return [
     `Needs human: ${count} unresolved blocking ${noun} from the review ceiling.`,
-    `To resume: accept a finding with \`--override "<key>: <reason>"\` (audited) or fix it by hand,`,
-    `then relabel \`pipeline:needs-human\` → \`pipeline:review-2\`.`,
+    `To resume:`,
+    `- \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
+    `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
   ].join("\n");
 }
 

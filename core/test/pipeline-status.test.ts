@@ -27,8 +27,7 @@ function ceilingComment(opts: { round: 1 | 2; findings: string[]; createdAt?: st
     ...opts.findings.map((f) => `- ${f}`),
     "",
     "### To resume",
-    "- Accept a finding: comment `--override \"<key>: <reason>\"` (audited), then relabel " +
-      `\`pipeline:needs-human\` → \`pipeline:review-${opts.round}\`.`,
+    "- Accept a finding: `--override \"<key>: <reason>\"` (audited) — records the decision and auto-resumes.",
     `- Or fix the finding(s) by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${opts.round}\`.`,
     "",
     "*Automated by Claude Code Pipeline Skill*",
@@ -49,8 +48,9 @@ test("needsHumanPunchlist: well-formed ceiling comment returns the finding count
   const out = needsHumanPunchlist([ceilingComment({ round: 2, findings: TWO_FINDINGS })]);
   assert.ok(out !== null, "expected a punch-list string, got null");
   assert.match(out, /2 unresolved blocking findings/, `count missing; got:\n${out}`);
-  // Resume hint: override + fix-by-hand + relabel to the round the comment names.
+  // Override path auto-resumes; fix-by-hand path still needs relabel to the ceiling round.
   assert.match(out, /--override "<key>: <reason>"/, `override hint missing; got:\n${out}`);
+  assert.match(out, /auto-resumes/, `auto-resume hint missing; got:\n${out}`);
   assert.match(out, /fix it by hand/, `fix-by-hand hint missing; got:\n${out}`);
   assert.match(out, /pipeline:needs-human` → `pipeline:review-2/, `relabel hint missing; got:\n${out}`);
 });
@@ -101,19 +101,22 @@ test("needsHumanPunchlist: with multiple ceiling comments, uses the latest (high
   assert.ok(out !== null);
   // Count comes from the LAST ceiling comment, not the first.
   assert.match(out, /1 unresolved blocking finding\b/, `should use the last ceiling's count; got:\n${out}`);
-  // Resume target is always review-2 regardless of which round hit the ceiling.
-  assert.match(out, /pipeline:review-2/, `resume target must always be review-2; got:\n${out}`);
+  // Resume target is computed from the latest ceiling round (round-1 → review-1).
+  assert.match(out, /pipeline:review-1/, `resume target must be review-1 (from latest ceiling round); got:\n${out}`);
+  assert.doesNotMatch(out, /pipeline:review-2/, `must not show review-2 when latest ceiling is round-1; got:\n${out}`);
 });
 
-// Regression for finding e8b1f0b4: a round-1 ceiling comment must not emit review-1 as the resume
-// target. The regex in the old ceilingResumeLabel() matched the first pipeline:review-N in the
-// body, which could be review-1 from finding prose or the To resume section of a round-1 comment.
-test("needsHumanPunchlist: a round-1 ceiling comment always emits pipeline:review-2 as the resume target", () => {
-  // The round-1 ceiling comment body contains "pipeline:review-1" in its "To resume" section.
+// The manual fix resume target is the ceiling round, not always review-2.
+// ceilingRound() uses the anchored "Review N re-ran …" line (introduced in #135),
+// so reviewer-authored finding prose cannot inject a wrong round.
+test("needsHumanPunchlist: a round-1 ceiling comment emits review-1 as the manual fix resume target", () => {
   const out = needsHumanPunchlist([ceilingComment({ round: 1, findings: TWO_FINDINGS })]);
   assert.ok(out !== null);
-  assert.match(out, /pipeline:review-2/, `resume target must be review-2, not review-1; got:\n${out}`);
-  assert.doesNotMatch(out, /pipeline:review-1/, `must not emit review-1 as resume target; got:\n${out}`);
+  // Fix-by-hand path uses the ceiling round directly.
+  assert.match(out, /pipeline:review-1/, `must emit review-1 for round-1 ceiling; got:\n${out}`);
+  assert.doesNotMatch(out, /pipeline:review-2/, `must not emit review-2 for round-1 ceiling; got:\n${out}`);
+  // Override path auto-resumes — does not mention a specific review stage.
+  assert.match(out, /auto-resumes/, `override path must mention auto-resumes; got:\n${out}`);
 });
 
 // ---------------------------------------------------------------------------

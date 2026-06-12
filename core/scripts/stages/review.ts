@@ -447,8 +447,7 @@ function reviewCeilingComment(
   lines.push(
     "",
     "### To resume",
-    `- Accept a finding: comment \`--override "<key>: <reason>"\` (audited), then relabel ` +
-      `\`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
+    `- Accept a finding: \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
     `- Or fix the finding(s) by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
     "",
     (cfg.marker_footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),

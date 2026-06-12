@@ -40,8 +40,7 @@ function ceilingComment(opts: { round: 1 | 2; findings: string[]; createdAt?: st
     ...opts.findings.map((f) => `- ${f}`),
     "",
     "### To resume",
-    "- Accept a finding: comment `--override \"<key>: <reason>\"` (audited), then relabel " +
-      `\`pipeline:needs-human\` → \`pipeline:review-${opts.round}\`.`,
+    "- Accept a finding: `--override \"<key>: <reason>\"` (audited) — records the decision and auto-resumes.",
     `- Or fix the finding(s) by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${opts.round}\`.`,
     "",
     "*Automated by Claude Code Pipeline Skill*",
