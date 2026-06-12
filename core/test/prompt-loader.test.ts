@@ -493,6 +493,22 @@ test("review_adversarial: operating stance instructs de-dup against round-1 / pr
   assert.match(adv, /unless new evidence materially elevates/);
 });
 
+test("review_adversarial: re-review with priorReview2Findings — Operating Stance preserves the ratchet, not just suppresses unresolved findings (#57)", () => {
+  const base = { cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "diff" };
+  const rerun = buildReviewAdversarialPrompt({
+    ...base,
+    priorReview2Findings: "## Review 2\n- [HIGH] missing null guard on checkout path",
+  });
+  // Injected section (from buildReviewAdversarialPrompt) carries the ratchet
+  assert.match(rerun, /verify EACH prior finding is resolved/);
+  // Template-level Operating Stance must explicitly state the ratchet obligation for
+  // prior round-2 re-review — it must not only tell the reviewer to suppress.
+  assert.match(rerun, /ratchet obligation overrides de-duplication/);
+  assert.match(rerun, /re-raise every finding/);
+  // De-dup still applies to round-1 summaries (the existing instruction is preserved)
+  assert.match(rerun, /round-1 summary appears above, do NOT re-raise/);
+});
+
 test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
   const r1 = buildFixPrompt({
     cfg: dummyConfig(),

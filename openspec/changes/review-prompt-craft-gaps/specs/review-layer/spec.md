@@ -74,9 +74,11 @@ The adversarial prompt SHALL NOT mandate the full enterprise-flavored catalogue 
 - **WHEN** the repo's `{{conventions}}` and diff contain no evidence of multi-tenancy or PHI handling
 - **THEN** the reviewer SHALL NOT emit findings about tenant isolation or PHI retention
 
-### Requirement: The adversarial review prompt SHALL reduce overlap with round-1 findings
+### Requirement: The adversarial review prompt SHALL reduce overlap with round-1 findings and preserve the round-2 ratchet
 
-`review_adversarial.md` SHALL instruct the reviewer to avoid re-raising findings already present in `{{review1_section}}` or `{{prior_review2_findings}}` unless new evidence materially changes the assessment. The adversarial round's budget SHALL be directed toward attack vectors and failure modes not yet covered by the standard round.
+`review_adversarial.md` SHALL instruct the reviewer to avoid re-raising findings already present in `{{review1_section}}` unless new evidence materially changes the assessment. The adversarial round's budget SHALL be directed toward attack vectors and failure modes not yet covered by the standard round.
+
+When `{{prior_review2_findings}}` is present (this is a re-review after a fix), the ratchet obligation overrides de-duplication: the reviewer SHALL re-raise every prior finding that the fix left unresolved or regressed. De-duplication applies only to new findings that are entirely unrelated to the prior round-2 findings. A reviewer SHALL NOT suppress a still-failing prior finding solely on the basis that it appeared before.
 
 Both prompts SHALL include a round-role summary at the start: standard = "broad risk survey, first pass"; adversarial = "targeted deep-dive on high-risk vectors not yet resolved by round-1".
 
@@ -89,3 +91,13 @@ Both prompts SHALL include a round-role summary at the start: standard = "broad 
 
 - **WHEN** the adversarial reviewer finds new evidence that materially changes the severity or scope of a finding already present in `{{review1_section}}`
 - **THEN** the adversarial reviewer MAY re-raise the finding with the new evidence explicitly stated
+
+#### Scenario: Adversarial re-reviewer re-raises an unresolved prior round-2 finding
+
+- **WHEN** this is a re-review (prior adversarial findings are present) and a prior finding is still unresolved or regressed after the fix
+- **THEN** the reviewer SHALL re-raise that finding regardless of whether it appeared in the prior round, and SHALL NOT suppress it on de-duplication grounds
+
+#### Scenario: Adversarial re-reviewer suppresses a fully-resolved prior round-2 finding
+
+- **WHEN** this is a re-review and a prior finding is demonstrably fixed in the new diff
+- **THEN** the reviewer SHALL NOT re-emit it

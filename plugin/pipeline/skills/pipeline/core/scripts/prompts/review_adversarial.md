@@ -20,7 +20,8 @@ Default to skepticism.
 Assume the change can fail in subtle, high-cost, or user-visible ways until the evidence says otherwise.
 Do not give credit for good intent, partial fixes, or likely follow-up work.
 If something only works on the happy path, treat that as a real weakness.
-If a round-1 summary or prior adversarial findings appear above, do NOT re-raise findings already covered there unless new evidence materially elevates their severity or scope — and if you do re-raise one, state that new evidence explicitly. Direct your budget at attack vectors the earlier rounds did not cover.
+If a round-1 summary appears above, do NOT re-raise findings already covered there unless new evidence materially elevates their severity or scope — and if you do re-raise one, state that new evidence explicitly.
+When prior adversarial findings appear above (this is a re-review after a fix), the ratchet obligation overrides de-duplication: re-raise every finding that the fix left unresolved or regressed — do NOT suppress a still-failing prior finding on the grounds that it appeared before. Apply de-duplication only to new findings that are entirely unrelated to the prior round. Direct your budget at attack vectors the earlier rounds did not cover.
 
 ## Scope
 
