@@ -949,3 +949,103 @@ test("fix prompt: no extra blank lines when specContext absent", () => {
   });
   assert.doesNotMatch(out, /\n\n\n/);
 });
+
+// #19: closed-loop learning — the human-curated lessons convention. A target repo's
+// conventions file (CLAUDE.md/AGENTS.md by default, or conventions_md_path) is the
+// carry-forward home for recurring-mistake "lessons"; the pipeline READS it into every
+// stage prompt via readConventions → {{conventions}} and NEVER writes it. These tests
+// bite: drop the `conventions` key from a builder (or its template placeholder) and the
+// marker vanishes / substitute throws; add any write path and the no-write tests fail.
+
+/**
+ * Config whose DEFAULT conventions path (`CLAUDE.md`, with no `conventions_md_path`
+ * set) resolves to a real file containing `marker`. Proves the lessons convention
+ * requires no config key beyond the `CLAUDE.md` default (#19) — dummyConfig sets
+ * neither `conventions_md_path` nor `conventions_default`, so readConventions falls
+ * through to `CLAUDE.md`.
+ */
+function configWithDefaultConventions(marker: string): PipelineConfig {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-lessons-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), marker);
+  return { ...dummyConfig(), repo_dir: dir };
+}
+
+/**
+ * Exercise every stage prompt builder that injects conventions, against `cfg`, in
+ * one pass. Used by the no-write tests to assert the conventions file is read-only
+ * across the full set of builders (#19).
+ */
+function buildAllStagePrompts(cfg: PipelineConfig): void {
+  buildPlanningPrompt({ cfg, issueNumber: 19, title: "t", body: "b" });
+  buildPlanningOpenspecPrompt({ cfg, issueNumber: 19, title: "t", body: "b", pipelineRunId: "19/x" });
+  buildPlanReviewPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", reviewer: "claude", implementer: "codex" });
+  buildPlanRevisionPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", feedback: "f", reviewer: "claude", implementer: "codex" });
+  buildImplementingPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", pipelineRunId: "19/x" });
+  buildReviewStandardPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d" });
+  buildReviewAdversarialPrompt({ cfg, issueNumber: 19, title: "t", body: "b", diff: "d" });
+  buildFixPrompt({ cfg, issueNumber: 19, title: "t", reviewFindings: "f", fixRound: 1, pipelineRunId: "19/x" });
+  buildTestFixPrompt({ cfg, issueNumber: 19, command: "npm test", attempt: 1, maxAttempts: 3, output: "o", pipelineRunId: "19/x" });
+}
+
+test("lessons convention (#19): planning prompt embeds the conventions/lessons content via the default CLAUDE.md path (no config key)", () => {
+  const marker = "LESSON-always-regenerate-the-plugin-mirror-after-core-edits-a91f";
+  const out = buildPlanningPrompt({
+    cfg: configWithDefaultConventions(marker),
+    issueNumber: 19,
+    title: "t",
+    body: "b",
+  });
+  assert.match(out, new RegExp(marker), "planning prompt is missing the injected conventions/lessons content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("lessons convention (#19): both review prompts embed the conventions/lessons content", () => {
+  const marker = "LESSON-prefer-deps-seams-no-real-network-in-unit-tests-2c7d";
+  const std = buildReviewStandardPrompt({
+    cfg: configWithConventions(marker), issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d",
+  });
+  const adv = buildReviewAdversarialPrompt({
+    cfg: configWithConventions(marker), issueNumber: 19, title: "t", body: "b", diff: "d",
+  });
+  for (const out of [std, adv]) {
+    assert.match(out, new RegExp(marker), "review prompt is missing the injected conventions/lessons content");
+    assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  }
+});
+
+test("lessons convention (#19): planning + review render the readConventions stub when no conventions file exists (no throw)", () => {
+  const cfg = dummyConfig(); // repo_dir does not exist → readConventions returns its stub
+  const planning = buildPlanningPrompt({ cfg, issueNumber: 19, title: "t", body: "b" });
+  const std = buildReviewStandardPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d" });
+  for (const out of [planning, std]) {
+    assert.match(out, /no conventions file found/);
+    assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  }
+});
+
+test("lessons convention (#19): no stage prompt builder writes to the conventions file (content + mtime unchanged)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-nowrite-"));
+  const conv = path.join(dir, "CONVENTIONS.md");
+  const content = "## Lessons / Gotchas\n- never regress the review-SHA gate\n";
+  fs.writeFileSync(conv, content);
+  const cfg = { ...dummyConfig(), repo_dir: dir, conventions_md_path: "CONVENTIONS.md" };
+
+  const mtimeBefore = fs.statSync(conv).mtimeMs;
+  const dirBefore = fs.readdirSync(dir).sort();
+
+  buildAllStagePrompts(cfg);
+
+  assert.equal(fs.readFileSync(conv, "utf8"), content, "conventions file content was mutated by a prompt builder");
+  assert.equal(fs.statSync(conv).mtimeMs, mtimeBefore, "conventions file mtime changed → it was opened for writing");
+  assert.deepEqual(fs.readdirSync(dir).sort(), dirBefore, "a prompt builder created an unexpected file in the repo dir");
+});
+
+test("lessons convention (#19): no stage prompt builder creates a conventions file when none exists", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-nocreate-"));
+  const cfg = { ...dummyConfig(), repo_dir: dir, conventions_md_path: "CONVENTIONS.md" };
+  assert.deepEqual(fs.readdirSync(dir), [], "precondition: temp dir starts empty");
+
+  buildAllStagePrompts(cfg);
+
+  assert.deepEqual(fs.readdirSync(dir), [], "a prompt builder created the conventions file the pipeline must never write");
+});
