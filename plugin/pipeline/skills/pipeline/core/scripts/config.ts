@@ -312,39 +312,46 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   const headCut = crossing.length ? Math.min(...crossing.map((s) => s.start)) : capChars;
 
   let out = text.slice(0, headCut).trimEnd() + "\n\n[…conventions truncated]";
-  // Spend a real remaining carry-forward budget (sectionCap), counting separators
-  // and the clip marker, so the excerpt is bounded no matter how many sections
-  // exist AND no section is dropped while budget remains:
-  //   Pass 1 — append, in document order, every at-risk section that fits whole;
-  //            skip (don't drop) any too large for the CURRENT remaining budget so
-  //            a big early section can't starve a smaller later one that still fits.
-  //   Pass 2 — if budget remains, clip the first skipped (oversized) section into
-  //            it, so a large section is still represented rather than silently lost.
-  // Whatever still doesn't fit is disclosed, never silently dropped. Both passes
-  // only ever spend from `remaining`, so total carry-forward stays within sectionCap.
+  // Water-fill the carry-forward budget (sectionCap) across at-risk sections in
+  // document order. Before spending on a section, RESERVE a minimum share for each
+  // later section the budget can still afford, then let this section use whatever
+  // is left over its own minimum. One rule, all layouts:
+  //   • the reserve stops an earlier/larger section from consuming the budget and
+  //     starving later ones (a big section is clipped, not allowed to hog);
+  //   • giving back the reserve when few sections remain lets an early section grow
+  //     and lets compact sections cost only their actual size — so every section
+  //     that fits is fully included and a large early section is still represented;
+  //   • spending is always bounded by `remaining`, so the total stays within
+  //     sectionCap no matter how many sections exist.
+  // Sections that no longer fit even minimally are disclosed, never silently dropped.
   const SEP = "\n\n";
   const CLIP_MARKER = "\n\n[…lessons section truncated]";
-  const MIN_CLIP_TEXT = 40; // only bother clipping if a useful slice of the section survives
+  const MIN_SHARE = 120; // guaranteed minimum representation per section (heading + a little)
+  const MIN_PIECE = 40; // minimum useful clipped text before the marker
   let remaining = sectionCap;
   let appended = 0;
-  const skipped = [];
-  for (const s of atRisk) {
+  for (let i = 0; i < atRisk.length; i++) {
+    const s = atRisk[i]!;
+    const sectionsAfter = atRisk.length - i - 1;
+    // How many later sections can still get their minimum (minus this one's minimum).
+    const affordableAfter = Math.max(0, Math.floor(remaining / MIN_SHARE) - 1);
+    const reserve = Math.min(sectionsAfter, affordableAfter) * MIN_SHARE;
+    const allow = remaining - reserve;
     const full = text.slice(s.start, s.end).trimEnd();
-    const cost = SEP.length + full.length;
-    if (cost <= remaining) {
+    const costFull = SEP.length + full.length;
+    if (costFull <= allow) {
       out += SEP + full;
-      remaining -= cost;
+      remaining -= costFull;
       appended++;
-    } else {
-      skipped.push(s);
+    } else if (allow >= SEP.length + MIN_PIECE + CLIP_MARKER.length) {
+      const textRoom = allow - SEP.length - CLIP_MARKER.length;
+      const piece = full.slice(0, textRoom).trimEnd() + CLIP_MARKER;
+      out += SEP + piece;
+      remaining -= SEP.length + piece.length;
+      appended++;
     }
-  }
-  if (skipped.length > 0 && remaining >= SEP.length + MIN_CLIP_TEXT + CLIP_MARKER.length) {
-    const s = skipped.shift();
-    const full = text.slice(s.start, s.end).trimEnd();
-    const textRoom = remaining - SEP.length - CLIP_MARKER.length;
-    out += SEP + full.slice(0, textRoom).trimEnd() + CLIP_MARKER;
-    appended++;
+    // else: not enough budget to represent this section meaningfully → omit it
+    // (disclosed below) and keep scanning; a later smaller section may still fit.
   }
   const omitted = atRisk.length - appended;
   if (omitted > 0) {

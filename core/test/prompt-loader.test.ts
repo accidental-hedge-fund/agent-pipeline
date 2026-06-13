@@ -1233,3 +1233,29 @@ test("readConventions: every compact section that fits the budget is included â€
   assert.doesNotMatch(result, /more lessons\/gotchas section/, "nothing should be omitted while the budget still has room");
   assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
 });
+
+test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {
+  // Regression for the round-5 finding: a budget loop that appends later compact
+  // sections first could consume the budget and leave a large early cap-crossing
+  // Lessons section entirely unrepresented â€” and headCut already trimmed its in-cap
+  // bytes, so it vanished. The reserve guarantees the early section a represented
+  // (clipped) slice even when many compact sections follow.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-early-vs-many-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  const preamble = "# Conventions\n\n" + "x".repeat(7950);
+  // Big cap-crossing Lessons section (heading just before the cap, huge body past it).
+  const bigLessons = "\n\n## Lessons\n\n- critical early lesson that must survive\n" + "- filler lesson bullet\n".repeat(400);
+  let gotchas = "";
+  for (let i = 0; i < 80; i++) gotchas += `\n## Gotchas ${i}\n\n- gotcha ${i}\n`;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + bigLessons + gotchas);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(
+    result,
+    /critical early lesson that must survive/,
+    "the large early Lessons section was starved entirely by later compact sections",
+  );
+  assert.match(result, /lessons section truncated/, "the large early section should be clipped, not dropped");
+  assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
+});
