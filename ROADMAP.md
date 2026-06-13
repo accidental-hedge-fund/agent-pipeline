@@ -2,7 +2,7 @@
 
 Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-10.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror); see Shipped. Everything below v1.0.3 is the post-1.0.3 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. Everything below v1.0.4 is the post-1.0.4 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -35,6 +35,15 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #64 | tighten SKILL.md monitor-filter guidance | #69 |
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
+
+**v1.0.4 — recovery robustness (shipped 2026-06-12, tag `v1.0.4`):**
+
+| # | What | PR |
+|---|------|-----|
+| #131 | salvage uncommitted harness work (commit + test-gate-certify) instead of hard-blocking | #137 |
+| #133 | recurrence-aware review loop — park earlier on an unchanged re-emit + `RECURRING`/`NEW` tags | #136 |
+| #134 | stage-aware recovery recipe in `setBlocked` (the right resume verb per blocker; correct label, no unsafe actions) | #139 |
+| #135 | override auto-resume — apply a human's recorded `--override` disposition automatically | #138 |
 
 **v1.0.3 — contributor tooling (shipped 2026-06-11, tag `v1.0.3`):**
 
@@ -81,7 +90,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
 | **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
 | **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
-| **v1.0.4** | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Move *deterministic* recovery + a sharper hand-off into the skill: salvage uncommitted work (#131), recurrence-aware park-earlier + RECURRING/NEW tags (#133), stage-aware recovery recipes (#134), override auto-resume (#135). All **zero-authority** (gate-certified, or a human's prior decision); no auto-merge, no review demotion. Same family as #95/#98/#75. |
+| **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See **Shipped** above. |
 | **v1.1.0** | minor | Review quality | #19, #25, #57, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #85 (patch) folds in as same-theme gate hardening. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
@@ -120,14 +129,9 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 
 ## Remaining work — detail (grouped by release)
 
-### v1.0.4 — dev-loop convergence, continued / recovery robustness (patch)
+### Recovery-automation design line (retained from v1.0.4 — shipped)
 
-- **#131** — salvage uncommitted harness work instead of hard-blocking. When an implementer/fix harness does the work but doesn't `git commit`, the stage blocks with "no commits in range" and the verified change is lost (observed on #57). Commit the leftover worktree changes (with `#20` trailers + commit format) and let the existing test gate validate them, rather than discard/block. The current `auto_recover` is too narrow — its `hasCommitsAhead` guard no-ops when *any* commit is ahead (e.g. the OpenSpec planning commit), and it *discards* rather than salvages. *Moves one of the few operator-driven recoveries into the skill; no config/contract change.*
-- **#133** — recurrence-aware review loop: park at `needs-human` on the first *unchanged* re-emit of a blocking finding (content-addressed `findingKey`) instead of grinding to the round ceiling, and tag each parked finding `RECURRING (n)` / `NEW`. Diagnosis + anti-thrash earlier-park; zero authority (only ends the loop earlier at the safe terminal + adds a tag).
-- **#134** — stage-aware recovery recipe in `setBlocked`: the uniform `--unblock` hint is the *wrong verb* for most blockers (it only clears the label — the #57 trap). State the kind-specific resume verb per blocker class (closed enum, static lookup). Presentation only, zero authority.
-- **#135** — override auto-resume: after `--override` records the audited disposition, re-enter the review round automatically (and relabel `needs-human → review-N`) instead of two more hand actions. The human already decided (the key+reason); the resume re-runs the same deterministic partition and re-parks if blockers remain.
-
-> **Design line for this cluster (from the 2026-06-12 recovery-direction analysis):** automate a recovery step *only* when it adds **zero new authority over what ships** — a human's prior decision (#135), a deterministic gate that re-certifies (#131), or a re-entry/diagnosis that never advances past review (#133/#134). The bright line is **authority, not intelligence**: the hand-off can get arbitrarily smart; the *decision* (override-vs-fix-vs-adopt, retry-harder) stays with a human. `needs-human` is a feature, not a deficiency.
+> **Design line (from the 2026-06-12 recovery-direction analysis; governs future recovery work):** automate a recovery step *only* when it adds **zero new authority over what ships** — a human's prior decision (#135), a deterministic gate that re-certifies (#131), or a re-entry/diagnosis that never advances past review (#133/#134). The bright line is **authority, not intelligence**: the hand-off can get arbitrarily smart; the *decision* (override-vs-fix-vs-adopt, retry-harder) stays with a human. `needs-human` is a feature, not a deficiency.
 
 ### v1.1.0 — review quality (minor)
 
