@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { domainContext, readConventions } from "../config.ts";
 import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
+import { DEFAULT_CONFIG } from "../types.ts";
 import type { PipelineConfig } from "../types.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -217,6 +218,24 @@ Rate each finding honestly against real-world impact — do NOT inflate. The pol
 
 Set each finding's \`category\` to a short machine-readable class (e.g. \`spec-divergence\`, \`correctness\`, \`security\`, \`data-loss\`, \`concurrency\`, \`observability\`) so downstream gates can key on the field instead of parsing prose.`;
 
+// Shared confidence calibration injected into BOTH review prompts (#57), single-
+// sourced like SEVERITY_RUBRIC so the two rounds cannot drift. It gives the
+// `confidence` field consistent meaning run-to-run and ties it to
+// `review_policy.min_confidence` (#86): a finding below the policy floor is
+// advisory regardless of severity, so honest low confidence is how the reviewer
+// flags uncertainty without forcing a wasted fix round. Bands reference the
+// policy concept, not the configured number, so the text stays correct when a
+// repo tunes its floor.
+const CONFIDENCE_CALIBRATION_BLOCK = `## Confidence Calibration
+
+Set each finding's \`confidence\` honestly — do NOT default to a high value. The active \`review_policy\` treats a finding whose \`confidence\` is below its \`min_confidence\` floor as ADVISORY (recorded, but it does not block) regardless of severity; a finding at or above the floor blocks per the severity \`block_threshold\`. Calibrated confidence is how you flag genuine uncertainty without forcing a fix round.
+
+- **High (>= 0.8)** — you have concrete evidence in the diff; the finding is fully traceable to a specific code path you can point at.
+- **Medium (0.5–0.8)** — you have a reasonable basis but cannot rule out missing context; the finding is plausible, not certain.
+- **Low (< 0.5)** — you are speculating or lack the context to be sure; the finding may not apply at all.
+
+If you cannot trace a finding to a specific code path in the diff, its confidence belongs below 0.5 — or omit the finding entirely.`;
+
 export interface BuildReviewArgs extends BuildPlanArgs {
   plan: string;
   diff: string;
@@ -236,6 +255,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     plan: a.plan,
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
+    confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -271,6 +291,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     prior_review2_findings: priorReview2Section,
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
+    confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -405,5 +426,26 @@ function truncateDiff(diff: string, cap: number): string {
   return diff.slice(0, cap) + `\n\n[...diff truncated at ${Math.floor(cap / 1000)}KB]`;
 }
 
-// Exported for tests
-export const _testing = { loadTemplate };
+/**
+ * Augments the shared calibration block with the active review_policy values so
+ * reviewers can tell concretely whether a given confidence score will block or
+ * advise under this repo's configuration (#57). Falls back to DEFAULT_CONFIG when
+ * cfg.review_policy is absent (e.g. in tests that omit it).
+ */
+function buildConfidenceCalibrationWithPolicy(
+  reviewPolicy?: { min_confidence?: number; block_threshold?: string },
+): string {
+  const defaults = DEFAULT_CONFIG.review_policy;
+  const minConf = reviewPolicy?.min_confidence ?? defaults.min_confidence;
+  const blockThresh = reviewPolicy?.block_threshold ?? defaults.block_threshold;
+  return (
+    CONFIDENCE_CALIBRATION_BLOCK +
+    `\n\nActive policy: min_confidence \`${minConf}\`, block_threshold \`${blockThresh}\`. ` +
+    `Findings with confidence < ${minConf} are advisory regardless of severity; ` +
+    `at or above ${minConf} they block when severity meets the \`${blockThresh}\` threshold.`
+  );
+}
+
+// Exported for tests. CONFIDENCE_CALIBRATION_BLOCK is exposed so the drift test
+// can assert both review prompts embed the shared constant byte-for-byte.
+export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK };

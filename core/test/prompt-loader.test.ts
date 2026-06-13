@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  _testing,
   buildFixPrompt,
   buildImplementingPrompt,
   buildPlanningOpenspecPrompt,
@@ -398,6 +399,127 @@ test("review_adversarial: enumerate-all replaces the old one-finding-at-a-time i
   const out = buildReviewAdversarialPrompt({ cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "d" });
   assert.match(out, /Enumerate EVERY material finding/);
   assert.doesNotMatch(out, /Prefer one strong finding/);
+});
+
+// #57 prompt-craft helpers: build both review prompts with the same dummy inputs.
+function builtReviewPrompts(): { std: string; adv: string } {
+  const std = buildReviewStandardPrompt({
+    cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d",
+  });
+  const adv = buildReviewAdversarialPrompt({ cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "d" });
+  return { std, adv };
+}
+
+test("review prompts: both embed the shared confidence calibration block byte-for-byte (#57)", () => {
+  const { std, adv } = builtReviewPrompts();
+  for (const out of [std, adv]) {
+    // The single-sourced constant, verbatim — drift between rounds is structurally impossible.
+    assert.ok(out.includes(_testing.CONFIDENCE_CALIBRATION_BLOCK), "prompt is missing the shared calibration block");
+    assert.match(out, /## Confidence Calibration/);
+    assert.match(out, /min_confidence/); // ties bands to the #86 policy floor
+    assert.match(out, /block_threshold/);
+  }
+});
+
+test("review prompts: active review_policy values appear in both rendered prompts with non-default policy (#57)", () => {
+  const customCfg = {
+    ...dummyConfig(),
+    review_policy: { min_confidence: 0.9, block_threshold: "high" as const, max_adversarial_rounds: 3 },
+  };
+  const std = buildReviewStandardPrompt({ cfg: customCfg, issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d" });
+  const adv = buildReviewAdversarialPrompt({ cfg: customCfg, issueNumber: 7, title: "T", body: "B", diff: "d" });
+  for (const out of [std, adv]) {
+    assert.match(out, /0\.9/, "active min_confidence not rendered in prompt");
+    assert.match(out, /`high`/, "active block_threshold not rendered in prompt");
+  }
+});
+
+test("review prompts: both scope review to the diff + blast radius, before the checklist/finding bar (#57)", () => {
+  const { std, adv } = builtReviewPrompts();
+  for (const out of [std, adv]) {
+    assert.match(out, /## Scope/);
+    assert.match(out, /blast radius/);
+    assert.match(out, /out of scope/);
+  }
+  // Spec: the scoping instruction precedes the finding bar / checklist so the
+  // reviewer scopes before they assess.
+  assert.ok(std.indexOf("## Scope") < std.indexOf("Reference dimensions"));
+  assert.ok(adv.indexOf("## Scope") < adv.indexOf("## Finding Bar"));
+});
+
+test("review prompts: both frame the false-positive cost and the advisory-band escape hatch (#57)", () => {
+  const { std, adv } = builtReviewPrompts();
+  for (const out of [std, adv]) {
+    assert.match(out, /## False-Positive Cost/);
+    assert.match(out, /full fix cycle/);
+    assert.match(out, /advisory band/);
+  }
+});
+
+test("review prompts: each carries round-tailored few-shot examples + the anchor-only guard (#57)", () => {
+  const { std, adv } = builtReviewPrompts();
+  for (const out of [std, adv]) {
+    assert.match(out, /## Calibration Examples/);
+    assert.match(out, /A model finding/);
+    assert.match(out, /A suppressed concern/);
+    assert.match(out, /never report them as findings/);
+  }
+  // Round-specific (intentionally NOT single-sourced): the examples match each round's stance.
+  assert.match(std, /welcome email/);
+  assert.match(adv, /double-charges on retry/);
+});
+
+test("review_standard: risk-first structure with the checklist demoted to reference dimensions (#57)", () => {
+  const { std } = builtReviewPrompts();
+  assert.match(std, /## Review Method — Risk First/);
+  assert.match(std, /Start your `summary` with a risk tier/);
+  assert.match(std, /Reference dimensions \(allocate depth by risk, not equally\)/);
+  // Risk assessment comes before the dimensions list.
+  assert.ok(std.indexOf("Risk First") < std.indexOf("Reference dimensions"));
+});
+
+test("review_standard: deterministic CI-answered asks are removed (#57)", () => {
+  const { std } = builtReviewPrompts();
+  assert.doesNotMatch(std, /Acceptance criteria met\?/);
+  assert.doesNotMatch(std, /CI expectations/);
+});
+
+test("review_adversarial: two-tier attack surface — core always, enterprise items repo-tailored (#57)", () => {
+  const { adv } = builtReviewPrompts();
+  assert.match(adv, /Core tier — evaluate the diff against ALL of these on every run/);
+  assert.match(adv, /Repo-tailored tier/);
+  assert.match(adv, /only those that fit this repo/);
+  // The enterprise-flavored items are conditional examples, not core mandates.
+  assert.match(adv, /tenant isolation only if the repo is multi-tenant/);
+  assert.match(adv, /PHI \/ sensitive-data retention only if it handles such data/);
+});
+
+test("review prompts: round-role summaries differentiate round-1 from round-2 (#57)", () => {
+  const { std, adv } = builtReviewPrompts();
+  assert.match(std, /broad risk survey, first pass/);
+  assert.match(adv, /targeted deep-dive on high-risk vectors not yet resolved by round-1/);
+});
+
+test("review_adversarial: operating stance instructs de-dup against round-1 / prior round-2 findings (#57)", () => {
+  const { adv } = builtReviewPrompts();
+  assert.match(adv, /do NOT re-raise findings already covered/);
+  assert.match(adv, /unless new evidence materially elevates/);
+});
+
+test("review_adversarial: re-review with priorReview2Findings — Operating Stance preserves the ratchet, not just suppresses unresolved findings (#57)", () => {
+  const base = { cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "diff" };
+  const rerun = buildReviewAdversarialPrompt({
+    ...base,
+    priorReview2Findings: "## Review 2\n- [HIGH] missing null guard on checkout path",
+  });
+  // Injected section (from buildReviewAdversarialPrompt) carries the ratchet
+  assert.match(rerun, /verify EACH prior finding is resolved/);
+  // Template-level Operating Stance must explicitly state the ratchet obligation for
+  // prior round-2 re-review — it must not only tell the reviewer to suppress.
+  assert.match(rerun, /ratchet obligation overrides de-duplication/);
+  assert.match(rerun, /re-raise every finding/);
+  // De-dup still applies to round-1 summaries (the existing instruction is preserved)
+  assert.match(rerun, /round-1 summary appears above, do NOT re-raise/);
 });
 
 test("fix prompt: round 1 = standard, round 2 = adversarial", () => {
