@@ -30,3 +30,8 @@ Before the revised plan, output a `## Feedback Incorporated` section that lists 
 Every reviewer feedback item MUST appear as either `[ADDRESSED]` or `[DEFERRED]`. Do not omit items.
 
 Then return the final revised implementation plan in Markdown. Do not implement code yet.
+
+The revised plan MUST preserve or regenerate these two required sections — do not drop them even if the reviewer feedback did not address them:
+
+1. **Approach**: Include at least one concrete repo-pattern citation — name the actual file and the pattern it establishes — and explain how the plan follows it. Do not substitute generic advice for a real pattern.
+2. **Acceptance criteria**: A checkable list (`- [ ]`) of observable outcomes that make this issue done. Each item MUST be falsifiable: a concrete, verifiable behavior or artifact, not a restatement of the approach or an implementation step.

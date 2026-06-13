@@ -14,7 +14,7 @@ This repo uses **OpenSpec** (spec-driven development). Create a new OpenSpec cha
 
 1. Create the change using this repo's OpenSpec workflow (e.g. `openspec new change <kebab-name>`), choosing a short, descriptive kebab-case name derived from the issue.
 2. Author the artifacts under `openspec/changes/<name>/`:
-   - `proposal.md` — why this change, what it does, and its scope.
+   - `proposal.md` — why this change, what it does, and its scope. Include an explicit **acceptance-criteria** list: checkable items (`- [ ]`) stating the observable, falsifiable outcomes that make this issue done — concrete verifiable behaviors or artifacts, not restatements of the approach. This mirrors the non-OpenSpec planning path; the spec deltas' `#### Scenario:` blocks then make those criteria precise.
    - `tasks.md` — an ordered implementation checklist.
    - `design.md` — technical decisions (only if the change is non-trivial).
    - spec deltas under `openspec/changes/<name>/specs/<capability>/spec.md` — the requirement additions/changes this introduces.
