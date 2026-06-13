@@ -117,6 +117,12 @@ domain_description: a quantitative finance Python library
 
 If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation (documentation updates included, when `steps.docs` is on), and fixes; Codex is always secondary for review/adversarial review. Harness roles come from the install profile — a `harnesses:` key in `.github/pipeline.yml` is rejected at config-parse time, so repo config cannot invert a Claude-invoked pipeline run.
 
+## Conventions & carry-forward lessons
+
+`readConventions` reads the target repo's conventions file (`conventions_md_path`, else `CLAUDE.md` on this host) and injects an excerpt into **every** stage prompt — planning, plan-review, plan-revision, implementing, both review rounds, and both fix rounds — via the `{{conventions}}` placeholder. This makes the conventions file the natural home for **carry-forward lessons**: a maintainer-curated `## Lessons / Gotchas` section (or a dedicated lessons file pointed at by `conventions_md_path`) recording recurring findings and repo-specific hazards. It is ordinary conventions text, so it rides the existing injection with **no extra config key, store, or flag** beyond the `conventions_md_path` / `CLAUDE.md` default.
+
+The contract is **read-only**: no stage ever writes to, appends to, or creates the conventions file — the maintainer curates the lessons by hand and the pipeline carries them forward. A repo with no conventions file is unaffected (`readConventions` returns a benign stub and every stage proceeds).
+
 ## Run flow
 
 For every invocation:

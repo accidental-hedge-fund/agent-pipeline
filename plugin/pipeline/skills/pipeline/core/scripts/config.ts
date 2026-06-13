@@ -275,7 +275,89 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   }
   const text = fs.readFileSync(filePath, "utf8");
   if (text.length <= capChars) return text;
-  return text.slice(0, capChars) + "\n\n[…conventions truncated]";
+
+  // Cap for any preserved carry-forward content to keep total output bounded.
+  const sectionCap = Math.floor(capChars / 4);
+
+  // Scan for ALL supported carry-forward headings — Lessons or Gotchas (including
+  // combined headings like "Lessons / Gotchas") — anywhere in the file. A
+  // maintainer-curated section can sit at any depth, so we preserve every such
+  // section the plain cap would drop or clip, not just the first match. (Looking
+  // at only the first heading let an early in-cap section hide a later after-cap
+  // one — the #19 review-ceiling finding.) Each section ends at the next heading
+  // of the same or higher level (or EOF).
+  const carryRe = /^(#+)[ \t]+(Lessons|Gotchas)\b/gim;
+  const sections = [...text.matchAll(carryRe)].map((m) => {
+    const level = m[1]!.length;
+    const headingLineEnd = text.indexOf("\n", m.index);
+    const afterHeadingLine = headingLineEnd >= 0 ? text.slice(headingLineEnd + 1) : "";
+    const nextHeadingRe = new RegExp(`^#{1,${level}}[ \\t]+`, "m");
+    const nextM = nextHeadingRe.exec(afterHeadingLine);
+    const end = nextM ? headingLineEnd + 1 + nextM.index : text.length;
+    return { start: m.index, end };
+  });
+
+  // A section is "at risk" of truncation when it is not fully inside the head
+  // excerpt: its body extends past the cap, or it starts after the cap entirely.
+  // Sections wholly within the head already ride along in text.slice(0, capChars).
+  const atRisk = sections.filter((s) => s.end > capChars);
+  if (atRisk.length === 0) {
+    return text.slice(0, capChars) + "\n\n[…conventions truncated]";
+  }
+
+  // If any at-risk section crosses the cap boundary, cut the head at that
+  // section's start so the section is included whole exactly once (no
+  // duplication). Otherwise keep the full head and append the after-cap section(s).
+  const crossing = atRisk.filter((s) => s.start < capChars);
+  const headCut = crossing.length ? Math.min(...crossing.map((s) => s.start)) : capChars;
+
+  let out = text.slice(0, headCut).trimEnd() + "\n\n[…conventions truncated]";
+  // Water-fill the carry-forward budget (sectionCap) across at-risk sections in
+  // document order. Before spending on a section, RESERVE a minimum share for each
+  // later section the budget can still afford, then let this section use whatever
+  // is left over its own minimum. One rule, all layouts:
+  //   • the reserve stops an earlier/larger section from consuming the budget and
+  //     starving later ones (a big section is clipped, not allowed to hog);
+  //   • giving back the reserve when few sections remain lets an early section grow
+  //     and lets compact sections cost only their actual size — so every section
+  //     that fits is fully included and a large early section is still represented;
+  //   • spending is always bounded by `remaining`, so the total stays within
+  //     sectionCap no matter how many sections exist.
+  // Sections that no longer fit even minimally are disclosed, never silently dropped.
+  const SEP = "\n\n";
+  const CLIP_MARKER = "\n\n[…lessons section truncated]";
+  const MIN_SHARE = 120; // guaranteed minimum representation per section (heading + a little)
+  const MIN_PIECE = 40; // minimum useful clipped text before the marker
+  let remaining = sectionCap;
+  let appended = 0;
+  for (let i = 0; i < atRisk.length; i++) {
+    const s = atRisk[i]!;
+    const sectionsAfter = atRisk.length - i - 1;
+    // How many later sections can still get their minimum (minus this one's minimum).
+    const affordableAfter = Math.max(0, Math.floor(remaining / MIN_SHARE) - 1);
+    const reserve = Math.min(sectionsAfter, affordableAfter) * MIN_SHARE;
+    const allow = remaining - reserve;
+    const full = text.slice(s.start, s.end).trimEnd();
+    const costFull = SEP.length + full.length;
+    if (costFull <= allow) {
+      out += SEP + full;
+      remaining -= costFull;
+      appended++;
+    } else if (allow >= SEP.length + MIN_PIECE + CLIP_MARKER.length) {
+      const textRoom = allow - SEP.length - CLIP_MARKER.length;
+      const piece = full.slice(0, textRoom).trimEnd() + CLIP_MARKER;
+      out += SEP + piece;
+      remaining -= SEP.length + piece.length;
+      appended++;
+    }
+    // else: not enough budget to represent this section meaningfully → omit it
+    // (disclosed below) and keep scanning; a later smaller section may still fit.
+  }
+  const omitted = atRisk.length - appended;
+  if (omitted > 0) {
+    out += SEP + `[…${omitted} more lessons/gotchas section(s) truncated]`;
+  }
+  return out;
 }
 
 export function domainContext(cfg: PipelineConfig): { name: string; description: string } {

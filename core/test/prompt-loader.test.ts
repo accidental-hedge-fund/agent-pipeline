@@ -19,6 +19,7 @@ import {
   buildTestFixPrompt,
   substitute,
 } from "../scripts/prompts/index.ts";
+import { readConventions } from "../scripts/config.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 function dummyConfig(): PipelineConfig {
@@ -346,10 +347,8 @@ test("implementing prompt: docsEnabled adds the documentation-update instruction
   });
   assert.match(out, /## Documentation Updates/);
   assert.match(out, /README\.md/);
-  assert.match(out, /CLAUDE\.md/);
-  // #108: the docs-update ask also names the conventions file; it must name
-  // AGENTS.md too so it is accurate under the codex profile, not CLAUDE.md only.
-  assert.match(out, /AGENTS\.md/);
+  assert.match(out, /CLAUDE\.md/); // appears in the read-conventions instruction (line 1 of implementing.md)
+  assert.match(out, /AGENTS\.md/); // same read instruction — both appear regardless of the docs-update section
   assert.match(out, /do not add boilerplate docs/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
   assert.doesNotMatch(out, /\n\n\n/);
@@ -948,4 +947,315 @@ test("fix prompt: no extra blank lines when specContext absent", () => {
     fixRound: 1,
   });
   assert.doesNotMatch(out, /\n\n\n/);
+});
+
+// #19: closed-loop learning — the human-curated lessons convention. A target repo's
+// conventions file (CLAUDE.md/AGENTS.md by default, or conventions_md_path) is the
+// carry-forward home for recurring-mistake "lessons"; the pipeline READS it into every
+// stage prompt via readConventions → {{conventions}} and NEVER writes it. These tests
+// bite: drop the `conventions` key from a builder (or its template placeholder) and the
+// marker vanishes / substitute throws; add any write path and the no-write tests fail.
+
+/**
+ * Config whose DEFAULT conventions path (`CLAUDE.md`, with no `conventions_md_path`
+ * set) resolves to a real file containing `marker`. Proves the lessons convention
+ * requires no config key beyond the `CLAUDE.md` default (#19) — dummyConfig sets
+ * neither `conventions_md_path` nor `conventions_default`, so readConventions falls
+ * through to `CLAUDE.md`.
+ */
+function configWithDefaultConventions(marker: string): PipelineConfig {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-lessons-"));
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), marker);
+  return { ...dummyConfig(), repo_dir: dir };
+}
+
+/**
+ * Exercise every stage prompt builder that injects conventions, against `cfg`, in
+ * one pass. Used by the no-write tests to assert the conventions file is read-only
+ * across the full set of builders (#19).
+ */
+function buildAllStagePrompts(cfg: PipelineConfig): void {
+  buildPlanningPrompt({ cfg, issueNumber: 19, title: "t", body: "b" });
+  buildPlanningOpenspecPrompt({ cfg, issueNumber: 19, title: "t", body: "b", pipelineRunId: "19/x" });
+  buildPlanReviewPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", reviewer: "claude", implementer: "codex" });
+  buildPlanRevisionPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", feedback: "f", reviewer: "claude", implementer: "codex" });
+  // docsEnabled: true exercises the DOCS_INSTRUCTION_SECTION path (#19 fix-2: must not instruct writing to conventions file)
+  buildImplementingPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", pipelineRunId: "19/x", docsEnabled: true });
+  buildReviewStandardPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d" });
+  buildReviewAdversarialPrompt({ cfg, issueNumber: 19, title: "t", body: "b", diff: "d" });
+  buildFixPrompt({ cfg, issueNumber: 19, title: "t", reviewFindings: "f", fixRound: 1, pipelineRunId: "19/x" });
+  buildTestFixPrompt({ cfg, issueNumber: 19, command: "npm test", attempt: 1, maxAttempts: 3, output: "o", pipelineRunId: "19/x" });
+}
+
+test("lessons convention (#19): planning prompt embeds the conventions/lessons content via the default CLAUDE.md path (no config key)", () => {
+  const marker = "LESSON-always-regenerate-the-plugin-mirror-after-core-edits-a91f";
+  const out = buildPlanningPrompt({
+    cfg: configWithDefaultConventions(marker),
+    issueNumber: 19,
+    title: "t",
+    body: "b",
+  });
+  assert.match(out, new RegExp(marker), "planning prompt is missing the injected conventions/lessons content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("lessons convention (#19): both review prompts embed the conventions/lessons content", () => {
+  const marker = "LESSON-prefer-deps-seams-no-real-network-in-unit-tests-2c7d";
+  const std = buildReviewStandardPrompt({
+    cfg: configWithConventions(marker), issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d",
+  });
+  const adv = buildReviewAdversarialPrompt({
+    cfg: configWithConventions(marker), issueNumber: 19, title: "t", body: "b", diff: "d",
+  });
+  for (const out of [std, adv]) {
+    assert.match(out, new RegExp(marker), "review prompt is missing the injected conventions/lessons content");
+    assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  }
+});
+
+test("lessons convention (#19): planning + review render the readConventions stub when no conventions file exists (no throw)", () => {
+  const cfg = dummyConfig(); // repo_dir does not exist → readConventions returns its stub
+  const planning = buildPlanningPrompt({ cfg, issueNumber: 19, title: "t", body: "b" });
+  const std = buildReviewStandardPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d" });
+  for (const out of [planning, std]) {
+    assert.match(out, /no conventions file found/);
+    assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+  }
+});
+
+test("lessons convention (#19): no stage prompt builder writes to the conventions file (content + mtime unchanged)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-nowrite-"));
+  const conv = path.join(dir, "CONVENTIONS.md");
+  const content = "## Lessons / Gotchas\n- never regress the review-SHA gate\n";
+  fs.writeFileSync(conv, content);
+  const cfg = { ...dummyConfig(), repo_dir: dir, conventions_md_path: "CONVENTIONS.md" };
+
+  const mtimeBefore = fs.statSync(conv).mtimeMs;
+  const dirBefore = fs.readdirSync(dir).sort();
+
+  buildAllStagePrompts(cfg);
+
+  assert.equal(fs.readFileSync(conv, "utf8"), content, "conventions file content was mutated by a prompt builder");
+  assert.equal(fs.statSync(conv).mtimeMs, mtimeBefore, "conventions file mtime changed → it was opened for writing");
+  assert.deepEqual(fs.readdirSync(dir).sort(), dirBefore, "a prompt builder created an unexpected file in the repo dir");
+});
+
+test("lessons convention (#19): no stage prompt builder creates a conventions file when none exists", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-nocreate-"));
+  const cfg = { ...dummyConfig(), repo_dir: dir, conventions_md_path: "CONVENTIONS.md" };
+  assert.deepEqual(fs.readdirSync(dir), [], "precondition: temp dir starts empty");
+
+  buildAllStagePrompts(cfg);
+
+  assert.deepEqual(fs.readdirSync(dir), [], "a prompt builder created the conventions file the pipeline must never write");
+});
+
+// Fix-round-2 regressions: review 2 findings (a88df12d + 6e81eca8)
+
+test("implementing prompt (docs-enabled): does NOT instruct the harness to write to the conventions file (#19 fix-2)", () => {
+  // The DOCS_INSTRUCTION_SECTION must not contain a bullet asking the
+  // implementer to update CLAUDE.md / AGENTS.md — the conventions file is
+  // read-only from the pipeline's perspective (spec: pipeline SHALL NOT write).
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 19,
+    title: "t",
+    body: "b",
+    plan: "p",
+    pipelineRunId: "19/x",
+    docsEnabled: true,
+  });
+  assert.doesNotMatch(out, /conventions agents need to know/, "docs instruction must not ask the implementer to write to the conventions file");
+  // The docs-update section must still list the real doc targets.
+  assert.match(out, /## Documentation Updates/);
+  assert.match(out, /README\.md/);
+});
+
+test("readConventions: lessons section beyond the 8000-char cap is preserved in the excerpt (#19 fix-2)", () => {
+  // A common CLAUDE.md layout puts Lessons / Gotchas near the bottom.  If the
+  // file exceeds the cap, the section would be silently dropped — breaking the
+  // carry-forward contract.  readConventions must detect and preserve it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-lessons-"));
+  const preamble = "# Conventions\n\n" + "x".repeat(8000);
+  const lessons =
+    "\n\n#### Lessons / Gotchas\n\n- never skip the review step\n- always regenerate the plugin mirror\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + lessons);
+  const cfg = { ...dummyConfig(), repo_dir: dir }; // no conventions_md_path → defaults to CLAUDE.md
+  const result = readConventions(cfg);
+  assert.match(result, /never skip the review step/, "lessons section was truncated out of the excerpt");
+  assert.match(result, /always regenerate the plugin mirror/);
+  assert.match(result, /conventions truncated/, "truncation marker must still appear before the lessons section");
+});
+
+test("readConventions: very large lessons section beyond the cap is still bounded (#19 fix-3)", () => {
+  // Regression for Finding 1: a massive lessons section must not bypass the cap
+  // and push the returned string to unbounded length.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-large-lessons-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4); // 2000
+  const preamble = "# Conventions\n\n" + "x".repeat(capChars);
+  // Lessons section is 10× the sectionCap — must be truncated.
+  const bigBody = "- lesson bullet\n".repeat(Math.ceil((sectionCap * 10) / "- lesson bullet\n".length));
+  const lessons = "\n\n#### Lessons / Gotchas\n\n" + bigBody;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + lessons);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  // Total output must stay well within 2× capChars (cap + sectionCap + markers).
+  assert.ok(result.length <= capChars + sectionCap + 200, `output too large: ${result.length}`);
+  // The lessons section clipping marker must appear.
+  assert.match(result, /lessons section truncated/, "missing per-section truncation marker");
+  // The main truncation marker must also appear.
+  assert.match(result, /conventions truncated/);
+});
+
+test("readConventions: Gotchas-only section beyond the cap is preserved (#19 fix-3)", () => {
+  // Regression for Finding 2a: a standalone Gotchas heading (not starting with
+  // "Lessons") beyond the cap must also be preserved — not silently dropped.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-gotchas-"));
+  const preamble = "# Conventions\n\n" + "x".repeat(8000);
+  const gotchas = "\n\n#### Gotchas\n\n- do not edit plugin/ by hand\n- always run npm run ci\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + gotchas);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(result, /do not edit plugin\/ by hand/, "Gotchas section was truncated out of the excerpt");
+  assert.match(result, /always run npm run ci/);
+  assert.match(result, /conventions truncated/);
+});
+
+test("readConventions: lessons section heading before cap with body after cap is fully included (#19 fix-3)", () => {
+  // Regression for Finding 2b: when the heading starts just before the 8000-char
+  // cap but the section body extends past it, the body must not be cut off.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-boundary-lessons-"));
+  const capChars = 8000;
+  // Place the heading at 7990 so m.index < capChars but body is after the cap.
+  const preamble = "# Conventions\n\n" + "x".repeat(7970);
+  const lessons = "\n\n#### Lessons\n\n- critical lesson that lives past the cap\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + lessons);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(result, /critical lesson that lives past the cap/, "section body past the cap was truncated out");
+  assert.match(result, /conventions truncated/);
+});
+
+test("readConventions: an early in-cap Lessons heading does not hide a later after-cap Gotchas section (#19 review-ceiling)", () => {
+  // Regression for the review-ceiling finding: readConventions previously
+  // considered only the FIRST carry-forward heading. An early "## Lessons"
+  // section that ends before the cap would become that first match and fall
+  // through to plain truncation, silently dropping a LATER after-cap "#### Gotchas"
+  // section. ALL supported carry-forward headings must be scanned, not just the first.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-multi-heading-"));
+  // The early Lessons section is closed by a same-level "## Setup" heading BEFORE
+  // the cap, so it ends within the head excerpt and is not itself at-risk. Under
+  // the old first-match-only logic it became the sole considered heading and the
+  // function fell through to plain truncation, dropping the late Gotchas section.
+  const early = "# Conventions\n\n## Lessons\n\n- an early lesson near the top\n\n## Setup\n\n";
+  const filler = "x".repeat(8000);
+  const late = "\n\n#### Gotchas\n\n- a late gotcha that must survive truncation\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), early + filler + late);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(
+    result,
+    /a late gotcha that must survive truncation/,
+    "later after-cap Gotchas section was dropped because only the first carry-forward heading was scanned",
+  );
+  assert.match(result, /conventions truncated/);
+  // Bound is preserved: head (<= cap) + one section (<= sectionCap) + markers.
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  assert.ok(result.length <= capChars + sectionCap + 200, `output too large: ${result.length}`);
+});
+
+test("readConventions: a large earlier cap-crossing section cannot starve a later after-cap section (#19 review-ceiling-2)", () => {
+  // Regression for the round-2 ceiling finding: with a single shared budget
+  // consumed in document order, a big earlier cap-crossing "## Lessons" section
+  // would exhaust the whole sectionCap before a later after-cap "## Gotchas"
+  // section was appended — dropping it. Each at-risk section must get a
+  // guaranteed per-section share so no earlier section can starve a later one.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-starve-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  // Heading sits just before the cap; body is huge and extends well past it.
+  const preamble = "# Conventions\n\n" + "x".repeat(7950);
+  const bigLessons = "\n\n## Lessons\n\n" + "- a recurring lesson bullet\n".repeat(300); // ~8400-char body
+  const lateGotchas = "\n## Gotchas\n\n- a late gotcha that must not be starved\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + bigLessons + lateGotchas);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(
+    result,
+    /a late gotcha that must not be starved/,
+    "later after-cap Gotchas section was starved by the earlier large cap-crossing Lessons section",
+  );
+  assert.match(result, /a recurring lesson bullet/, "earlier Lessons section should still be represented");
+  assert.match(result, /lessons section truncated/, "the large earlier section must be clipped, not unbounded");
+  assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
+});
+
+test("readConventions: thousands of at-risk sections still stay within the documented bound (#19 review-ceiling-3)", () => {
+  // Regression for the round-3 ceiling finding: the per-section share floored to 1
+  // when section count exceeded sectionCap, and clip-marker overhead was not counted
+  // against the budget — so many small after-cap Lessons/Gotchas headings produced
+  // output an order of magnitude over the cap (~107k for 3000 sections). The total
+  // must stay bounded regardless of how many at-risk sections exist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-many-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  const preamble = "# Conventions\n\n" + "x".repeat(capChars);
+  let many = "";
+  for (let i = 0; i < 3000; i++) many += `\n\n#### Gotchas ${i}\n\n- gotcha ${i}\n`;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + many);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  // Bounded regardless of section count: head (<= cap) + carry-forward (<= sectionCap) + markers.
+  assert.ok(result.length <= capChars + sectionCap + 300, `output exceeded the cap: ${result.length}`);
+  // The first section is still represented…
+  assert.match(result, /gotcha 0\b/, "the first at-risk section must be represented");
+  // …and the omitted remainder is disclosed, not silently dropped.
+  assert.match(result, /more lessons\/gotchas section/, "omitted sections must be disclosed");
+});
+
+test("readConventions: every compact section that fits the budget is included — no premature omission (#19 review-ceiling-4)", () => {
+  // Regression for the round-4 finding: a fixed represented-count cap dropped
+  // sections that still fit the carry-forward budget. With 17 compact after-cap
+  // Gotchas sections (well within cap + budget), every one — including the 17th
+  // (index 16) — must be included, and nothing should be omitted while budget remains.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-seventeen-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  const preamble = "# Conventions\n\n" + "x".repeat(capChars);
+  let many = "";
+  for (let i = 0; i < 17; i++) many += `\n\n#### Gotchas ${i}\n\n- gotcha ${i}\n`;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + many);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(result, /gotcha 16\b/, "a later compact section was omitted even though it fits the carry-forward budget");
+  assert.doesNotMatch(result, /more lessons\/gotchas section/, "nothing should be omitted while the budget still has room");
+  assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
+});
+
+test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {
+  // Regression for the round-5 finding: a budget loop that appends later compact
+  // sections first could consume the budget and leave a large early cap-crossing
+  // Lessons section entirely unrepresented — and headCut already trimmed its in-cap
+  // bytes, so it vanished. The reserve guarantees the early section a represented
+  // (clipped) slice even when many compact sections follow.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-early-vs-many-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  const preamble = "# Conventions\n\n" + "x".repeat(7950);
+  // Big cap-crossing Lessons section (heading just before the cap, huge body past it).
+  const bigLessons = "\n\n## Lessons\n\n- critical early lesson that must survive\n" + "- filler lesson bullet\n".repeat(400);
+  let gotchas = "";
+  for (let i = 0; i < 80; i++) gotchas += `\n## Gotchas ${i}\n\n- gotcha ${i}\n`;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + bigLessons + gotchas);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(
+    result,
+    /critical early lesson that must survive/,
+    "the large early Lessons section was starved entirely by later compact sections",
+  );
+  assert.match(result, /lessons section truncated/, "the large early section should be clipped, not dropped");
+  assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
 });
