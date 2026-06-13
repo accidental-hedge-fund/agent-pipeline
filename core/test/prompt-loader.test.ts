@@ -1191,3 +1191,26 @@ test("readConventions: a large earlier cap-crossing section cannot starve a late
   assert.match(result, /lessons section truncated/, "the large earlier section must be clipped, not unbounded");
   assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
 });
+
+test("readConventions: thousands of at-risk sections still stay within the documented bound (#19 review-ceiling-3)", () => {
+  // Regression for the round-3 ceiling finding: the per-section share floored to 1
+  // when section count exceeded sectionCap, and clip-marker overhead was not counted
+  // against the budget — so many small after-cap Lessons/Gotchas headings produced
+  // output an order of magnitude over the cap (~107k for 3000 sections). The total
+  // must stay bounded regardless of how many at-risk sections exist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-many-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  const preamble = "# Conventions\n\n" + "x".repeat(capChars);
+  let many = "";
+  for (let i = 0; i < 3000; i++) many += `\n\n#### Gotchas ${i}\n\n- gotcha ${i}\n`;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + many);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  // Bounded regardless of section count: head (<= cap) + carry-forward (<= sectionCap) + markers.
+  assert.ok(result.length <= capChars + sectionCap + 300, `output exceeded the cap: ${result.length}`);
+  // The first section is still represented…
+  assert.match(result, /gotcha 0\b/, "the first at-risk section must be represented");
+  // …and the omitted remainder is disclosed, not silently dropped.
+  assert.match(result, /more lessons\/gotchas section/, "omitted sections must be disclosed");
+});

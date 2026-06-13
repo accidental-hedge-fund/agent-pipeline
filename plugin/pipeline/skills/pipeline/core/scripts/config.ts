@@ -312,24 +312,31 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   const headCut = crossing.length ? Math.min(...crossing.map((s) => s.start)) : capChars;
 
   let out = text.slice(0, headCut).trimEnd() + "\n\n[…conventions truncated]";
-  // Preserve every at-risk section in document order, but give each a guaranteed
-  // per-section share of the budget so an earlier large (e.g. cap-crossing)
-  // section cannot starve a later supported one — a single shared budget consumed
-  // in order let a big early section drop a late after-cap section entirely.
-  // Unused share rolls forward, so a small early section donates rather than
-  // wastes its slice; total preserved still stays within sectionCap.
-  const baseShare = Math.max(1, Math.floor(sectionCap / atRisk.length));
-  let carry = 0;
-  for (const s of atRisk) {
-    const share = baseShare + carry;
+  // Preserve at-risk sections within a HARD total budget (sectionCap) that the
+  // output cannot exceed no matter how many sections exist. Two guarantees:
+  //   1. Bounded — cap how many sections we represent (sectionCap / MIN_SHARE) and
+  //      count the clip-marker overhead inside each section's share, so a file with
+  //      thousands of carry-forward headings can't blow past the budget via markers.
+  //   2. Fair — each represented section gets an equal share, in document order,
+  //      so a large earlier (e.g. cap-crossing) section can't starve a later one.
+  // Any sections beyond the represented count are disclosed, never silently dropped.
+  const SECTION_SEP = "\n\n";
+  const CLIP_MARKER = "\n\n[…lessons section truncated]";
+  const MIN_SHARE = 120; // a heading plus a little content stays useful
+  const represented = Math.min(atRisk.length, Math.max(1, Math.floor(sectionCap / MIN_SHARE)));
+  const perShare = Math.floor(sectionCap / represented);
+  for (let i = 0; i < represented; i++) {
+    const s = atRisk[i]!;
     let piece = text.slice(s.start, s.end).trimEnd();
-    if (piece.length > share) {
-      piece = piece.slice(0, share).trimEnd() + "\n\n[…lessons section truncated]";
-      carry = 0;
-    } else {
-      carry = share - piece.length;
+    if (piece.length > perShare) {
+      // Reserve room for the clip marker WITHIN the share so text + marker ≤ perShare.
+      piece = piece.slice(0, Math.max(0, perShare - CLIP_MARKER.length)).trimEnd() + CLIP_MARKER;
     }
-    out += "\n\n" + piece;
+    out += SECTION_SEP + piece;
+  }
+  const omitted = atRisk.length - represented;
+  if (omitted > 0) {
+    out += SECTION_SEP + `[…${omitted} more lessons/gotchas section(s) truncated]`;
   }
   return out;
 }
