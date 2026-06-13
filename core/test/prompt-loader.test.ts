@@ -142,6 +142,45 @@ test("planning prompt: no carry-forward section + no leftover placeholders when 
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+// #25: planning must mandate repo-pattern research before drafting and require an
+// explicit, checkable acceptance-criteria section. These assert the prompt text
+// the harness receives; drop either edit from planning.md and they fail.
+test("planning prompt: mandates reading repo files + citing a concrete pattern before drafting (#25)", () => {
+  const out = buildPlanningPrompt({ cfg: dummyConfig(), issueNumber: 42, title: "t", body: "b" });
+  assert.match(out, /Research first/);
+  assert.match(out, /read the files most directly in scope/);
+  assert.match(out, /Cite at least one concrete pattern from the repo files you read/);
+  // The conventions excerpt alone must be declared insufficient.
+  assert.match(out, /not a substitute for reading the actual code/);
+});
+
+test("planning prompt: requires a checkable, falsifiable Acceptance criteria section (#25)", () => {
+  const out = buildPlanningPrompt({ cfg: dummyConfig(), issueNumber: 42, title: "t", body: "b" });
+  assert.match(out, /### Acceptance criteria/);
+  assert.match(out, /falsifiable/);
+  assert.match(out, /observable outcomes that make this issue done/);
+  // The Acceptance criteria section precedes Test strategy in the output structure
+  // (tests map to criteria), so the order in the rendered prompt is criteria → tests.
+  assert.ok(
+    out.indexOf("### Acceptance criteria") < out.indexOf("### Test strategy"),
+    "Acceptance criteria must appear before Test strategy in the plan format",
+  );
+});
+
+test("planning_openspec prompt: instructs an explicit checkable acceptance-criteria list in the proposal (#25)", () => {
+  const out = buildPlanningOpenspecPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 7,
+    title: "t",
+    body: "b",
+    pipelineRunId: "7/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /acceptance-criteria/);
+  assert.match(out, /falsifiable/);
+  assert.match(out, /mirrors the non-OpenSpec planning path/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("review_standard: injects OpenSpec spec context when provided", () => {
   const out = buildReviewStandardPrompt({
     cfg: dummyConfig(),
