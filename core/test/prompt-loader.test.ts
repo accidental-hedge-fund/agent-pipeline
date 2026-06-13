@@ -1136,3 +1136,32 @@ test("readConventions: lessons section heading before cap with body after cap is
   assert.match(result, /critical lesson that lives past the cap/, "section body past the cap was truncated out");
   assert.match(result, /conventions truncated/);
 });
+
+test("readConventions: an early in-cap Lessons heading does not hide a later after-cap Gotchas section (#19 review-ceiling)", () => {
+  // Regression for the review-ceiling finding: readConventions previously
+  // considered only the FIRST carry-forward heading. An early "## Lessons"
+  // section that ends before the cap would become that first match and fall
+  // through to plain truncation, silently dropping a LATER after-cap "#### Gotchas"
+  // section. ALL supported carry-forward headings must be scanned, not just the first.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-multi-heading-"));
+  // The early Lessons section is closed by a same-level "## Setup" heading BEFORE
+  // the cap, so it ends within the head excerpt and is not itself at-risk. Under
+  // the old first-match-only logic it became the sole considered heading and the
+  // function fell through to plain truncation, dropping the late Gotchas section.
+  const early = "# Conventions\n\n## Lessons\n\n- an early lesson near the top\n\n## Setup\n\n";
+  const filler = "x".repeat(8000);
+  const late = "\n\n#### Gotchas\n\n- a late gotcha that must survive truncation\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), early + filler + late);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(
+    result,
+    /a late gotcha that must survive truncation/,
+    "later after-cap Gotchas section was dropped because only the first carry-forward heading was scanned",
+  );
+  assert.match(result, /conventions truncated/);
+  // Bound is preserved: head (<= cap) + one section (<= sectionCap) + markers.
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  assert.ok(result.length <= capChars + sectionCap + 200, `output too large: ${result.length}`);
+});

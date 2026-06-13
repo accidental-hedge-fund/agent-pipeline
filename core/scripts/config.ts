@@ -276,45 +276,57 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   const text = fs.readFileSync(filePath, "utf8");
   if (text.length <= capChars) return text;
 
-  // Cap for any preserved carry-forward section to keep total output bounded.
+  // Cap for any preserved carry-forward content to keep total output bounded.
   const sectionCap = Math.floor(capChars / 4);
 
-  // Scan for a supported carry-forward heading: Lessons or Gotchas (including
-  // combined headings like "Lessons / Gotchas"). Preserve it when it starts
-  // after the cap (entirely truncated away) OR when it starts within the cap
-  // but its body extends past it (partial truncation).
-  const carryRe = /^(#+)[ \t]+(Lessons|Gotchas)\b/im;
-  const m = carryRe.exec(text);
-  if (m) {
-    const level = m[1].length;
-    // Find the end of the section: next heading at the same or higher level.
+  // Scan for ALL supported carry-forward headings — Lessons or Gotchas (including
+  // combined headings like "Lessons / Gotchas") — anywhere in the file. A
+  // maintainer-curated section can sit at any depth, so we preserve every such
+  // section the plain cap would drop or clip, not just the first match. (Looking
+  // at only the first heading let an early in-cap section hide a later after-cap
+  // one — the #19 review-ceiling finding.) Each section ends at the next heading
+  // of the same or higher level (or EOF).
+  const carryRe = /^(#+)[ \t]+(Lessons|Gotchas)\b/gim;
+  const sections = [...text.matchAll(carryRe)].map((m) => {
+    const level = m[1]!.length;
     const headingLineEnd = text.indexOf("\n", m.index);
     const afterHeadingLine = headingLineEnd >= 0 ? text.slice(headingLineEnd + 1) : "";
     const nextHeadingRe = new RegExp(`^#{1,${level}}[ \\t]+`, "m");
     const nextM = nextHeadingRe.exec(afterHeadingLine);
-    const sectionEnd = nextM ? headingLineEnd + 1 + nextM.index : text.length;
+    const end = nextM ? headingLineEnd + 1 + nextM.index : text.length;
+    return { start: m.index, end };
+  });
 
-    if (m.index >= capChars || sectionEnd > capChars) {
-      let preserved = text.slice(m.index, sectionEnd).trimEnd();
-      const clipped = preserved.length > sectionCap;
-      if (clipped) preserved = preserved.slice(0, sectionCap).trimEnd();
-      const clippedMarker = clipped ? "\n\n[…lessons section truncated]" : "";
-
-      if (m.index >= capChars) {
-        // Section is entirely beyond the cap: append after the main truncation marker.
-        return (
-          text.slice(0, capChars) +
-          "\n\n[…conventions truncated]\n\n" +
-          preserved + clippedMarker
-        );
-      }
-      // Section starts within the cap but body extends past it: include the
-      // full section so carry-forward bullets are not cut off.
-      return text.slice(0, m.index) + preserved + clippedMarker + "\n\n[…conventions truncated]";
-    }
+  // A section is "at risk" of truncation when it is not fully inside the head
+  // excerpt: its body extends past the cap, or it starts after the cap entirely.
+  // Sections wholly within the head already ride along in text.slice(0, capChars).
+  const atRisk = sections.filter((s) => s.end > capChars);
+  if (atRisk.length === 0) {
+    return text.slice(0, capChars) + "\n\n[…conventions truncated]";
   }
 
-  return text.slice(0, capChars) + "\n\n[…conventions truncated]";
+  // If any at-risk section crosses the cap boundary, cut the head at that
+  // section's start so the section is included whole exactly once (no
+  // duplication). Otherwise keep the full head and append the after-cap section(s).
+  const crossing = atRisk.filter((s) => s.start < capChars);
+  const headCut = crossing.length ? Math.min(...crossing.map((s) => s.start)) : capChars;
+
+  let out = text.slice(0, headCut).trimEnd() + "\n\n[…conventions truncated]";
+  // Preserve at-risk sections in document order within a single shared budget so
+  // the total stays bounded regardless of how many sections (or how large) exist.
+  let budget = sectionCap;
+  for (const s of atRisk) {
+    if (budget <= 0) break;
+    let piece = text.slice(s.start, s.end).trimEnd();
+    if (piece.length > budget) {
+      piece = piece.slice(0, budget).trimEnd() + "\n\n[…lessons section truncated]";
+      budget = 0;
+    } else {
+      budget -= piece.length;
+    }
+    out += "\n\n" + piece;
+  }
+  return out;
 }
 
 export function domainContext(cfg: PipelineConfig): { name: string; description: string } {
