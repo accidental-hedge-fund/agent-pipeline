@@ -1214,3 +1214,22 @@ test("readConventions: thousands of at-risk sections still stay within the docum
   // …and the omitted remainder is disclosed, not silently dropped.
   assert.match(result, /more lessons\/gotchas section/, "omitted sections must be disclosed");
 });
+
+test("readConventions: every compact section that fits the budget is included — no premature omission (#19 review-ceiling-4)", () => {
+  // Regression for the round-4 finding: a fixed represented-count cap dropped
+  // sections that still fit the carry-forward budget. With 17 compact after-cap
+  // Gotchas sections (well within cap + budget), every one — including the 17th
+  // (index 16) — must be included, and nothing should be omitted while budget remains.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-seventeen-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  const preamble = "# Conventions\n\n" + "x".repeat(capChars);
+  let many = "";
+  for (let i = 0; i < 17; i++) many += `\n\n#### Gotchas ${i}\n\n- gotcha ${i}\n`;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + many);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(result, /gotcha 16\b/, "a later compact section was omitted even though it fits the carry-forward budget");
+  assert.doesNotMatch(result, /more lessons\/gotchas section/, "nothing should be omitted while the budget still has room");
+  assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
+});
