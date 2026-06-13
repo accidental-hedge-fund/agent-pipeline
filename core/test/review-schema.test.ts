@@ -50,6 +50,66 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
   return fields;
 }
 
+// Map a TypeScript scalar type annotation to the schema-block hint vocabulary:
+//   number              -> a bare angle-bracket hint  (<int>, <0.0-1.0>)
+//   string / "a" | "b"  -> a quoted hint              ("<text>", "x" | "y")
+// Validates EVERY union arm rather than shortcutting on the first one. `undefined`
+// arms are dropped (optional — about field presence, not value type, like the `?`
+// fields). All remaining arms must agree on a single scalar value type; a `null`
+// arm, a mixed union (e.g. `"low" | number`), an array, or any unrecognised arm
+// makes the whole token "other", which the drift guard treats as a mismatch (fail
+// closed) against a concrete schema hint — never a silent skip. (null ≠ undefined;
+// the per-side skip, the first-arm shortcut, and the trailing-only strip were all
+// adversarial-review gaps — validating every arm closes them at the root.)
+function classifyTsType(token: string): "number" | "string" | "other" {
+  const arms = token
+    .split("|")
+    .map((a) => a.trim())
+    .filter((a) => a.length > 0 && a !== "undefined");
+  if (arms.length === 0) return "other";
+  const armCat = (arm: string): "number" | "string" | "other" => {
+    if (arm === "number") return "number";
+    if (arm === "string" || /^".*"$/.test(arm)) return "string"; // string or string literal
+    return "other"; // null, arrays, mixed/unrecognised → fail closed
+  };
+  const cats = new Set(arms.map(armCat));
+  return cats.size === 1 && !cats.has("other") ? [...cats][0]! : "other";
+}
+
+// Like `parseInterfaceFields`, but returns each field's raw value-type annotation
+// token (the text after `:`, up to a `;`, a `//` comment, or EOL), keyed by field
+// name. Array fields (ending with `[]`) are excluded since the schema block carries
+// no comparable scalar hint for them; all other fields are kept, including ones
+// whose annotation is not yet classified (e.g. `string | undefined`) — the drift
+// guard treats an unrecognised token as a mismatch when the schema block carries a
+// concrete hint. Kept separate from `parseInterfaceFields` so that function's
+// `string[]` contract and its callers stay untouched (#85).
+function parseInterfaceFieldTypes(src: string, interfaceName: string): Record<string, string> {
+  const marker = `interface ${interfaceName} {`;
+  const start = src.indexOf(marker);
+  if (start === -1) throw new Error(`Interface ${interfaceName} not found in types.ts`);
+  const bodyStart = src.indexOf("{", start) + 1;
+  let depth = 1;
+  let i = bodyStart;
+  while (i < src.length && depth > 0) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") depth--;
+    i++;
+  }
+  const body = src.slice(bodyStart, i - 1);
+  const types: Record<string, string> = {};
+  for (const line of body.split("\n")) {
+    // Same property forms as parseInterfaceFields, plus a third group capturing
+    // the annotation token (stops at `;`, a `//` comment, or end-of-line).
+    const m = line.match(/^\s*(?:readonly\s+)?(?:(\w+)|"(\w+)")\??:\s*([^;/\n]+)/);
+    if (!m) continue;
+    const token = m[3].trim();
+    if (token.endsWith("[]")) continue; // arrays: no scalar hint in schema block
+    types[m[1] ?? m[2]] = token;
+  }
+  return types;
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const typesSrc = readFileSync(join(__dirname, "../scripts/types.ts"), "utf-8");
 
@@ -74,6 +134,40 @@ function parseSchemaBlockFields(block: string): { verdict: string[]; finding: st
     }
   }
   return { verdict, finding };
+}
+
+// A schema-block value hint is `number` when it's a bare angle-bracket placeholder
+// (<int>, <0.0-1.0>) and `string` when it's quoted ("<text>", "x" | "y"). Anything
+// else — an array (`[`, `["<...>"]`) or nested object — is "other" and excluded
+// from the value-type guard.
+function classifySchemaHint(value: string): "number" | "string" | "other" {
+  if (value.startsWith('"')) return "string";
+  if (value.startsWith("<")) return "number";
+  return "other";
+}
+
+// Companion to parseSchemaBlockFields: instead of just key order, capture each
+// scalar key's value *category* so the drift guard can compare it to the matching
+// TS field's type. Mirrors that walk (verdict keys at depth 1, finding keys at
+// depth 3) and reads the value text after the key, classifying it via
+// classifySchemaHint. Array/object values (findings, next_steps) classify as
+// "other" and are skipped by the guard.
+function parseSchemaBlockValueHints(block: string): Record<string, "number" | "string" | "other"> {
+  const hints: Record<string, "number" | "string" | "other"> = {};
+  let depth = 0;
+  for (let i = 0; i < block.length; i++) {
+    const ch = block[i];
+    if (ch === "{" || ch === "[") depth++;
+    else if (ch === "}" || ch === "]") depth--;
+    else if (ch === '"') {
+      const m = block.slice(i).match(/^"(\w+)"\s*:\s*([^\n]*)/);
+      if (m && (depth === 1 || depth === 3)) {
+        const value = m[2].replace(/,\s*$/, "").trim();
+        hints[m[1]] = classifySchemaHint(value);
+      }
+    }
+  }
+  return hints;
 }
 
 // Pull the fenced code block that immediately follows "Return ONLY valid JSON
@@ -104,6 +198,39 @@ unindented: string;
     fields,
     ["indented", "unindented", "readonlyField", "quotedField", "optional"],
     "parseInterfaceFields must detect unindented, readonly, quoted, and optional properties",
+  );
+});
+
+// Regression: parseInterfaceFieldTypes must capture the annotation token per field
+// (number, string, string-literal union, nullable `T | undefined`, optional/readonly
+// forms) and skip only array fields. Before #85-fix2, `string | undefined` was
+// classified as "other" and silently dropped — this test fails without that fix.
+test("parseInterfaceFieldTypes regression: captures scalar tokens, nullable unions, and skips array fields", () => {
+  const src = `
+interface SyntheticB {
+  count: number;
+  label: string;
+  kind: "a" | "b" | "c";
+  optionalCount?: number;
+  readonly tag: string;
+  nullable: string | undefined;
+  items: string[];
+  nested: ReviewFinding[];
+// comment: ignored
+}
+`;
+  const types = parseInterfaceFieldTypes(src, "SyntheticB");
+  assert.deepEqual(
+    types,
+    {
+      count: "number",
+      label: "string",
+      kind: '"a" | "b" | "c"',
+      optionalCount: "number",
+      tag: "string",
+      nullable: "string | undefined",
+    },
+    "parseInterfaceFieldTypes must capture number/string/union/nullable/optional/readonly tokens and skip arrays",
   );
 });
 
@@ -185,6 +312,211 @@ test("drift guard: schema block preserves the historical field order and nesting
   ]);
   assert.deepEqual(parsed.verdict, REVIEW_SCHEMA_FIELDS.verdict);
   assert.deepEqual(parsed.finding, REVIEW_SCHEMA_FIELDS.finding);
+});
+
+// Regression (#85 finding 1): before the fix, parseInterfaceFieldTypes dropped
+// `string | undefined` (classified as "other" → skipped), so renaming
+// `line_start?: number` to `line_start: string | undefined` while the schema
+// block still carried `<int>` was invisible to the guard. The fix changes
+// parseInterfaceFieldTypes to skip only `[]` arrays, and extends classifyTsType
+// to resolve `T | undefined` → classifyTsType(T).
+test("drift guard: string union type vs bare hint is a mismatch (regression #85 finding 1)", () => {
+  // Simulate a field rewritten to `string | undefined` while schema still says <int>
+  const syntheticSrc = `
+interface SyntheticFinding {
+  line_start: string | undefined;
+  confidence: number;
+}
+`;
+  const syntheticBlock = `{
+    "findings": [
+        {
+            "line_start": <int>,
+            "confidence": <0.0-1.0>
+        }
+    ]
+}`;
+
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticFinding");
+  assert.ok(
+    "line_start" in tsTypes,
+    "parseInterfaceFieldTypes must include `string | undefined` fields (not skip them as 'other')",
+  );
+  assert.equal(tsTypes.line_start, "string | undefined");
+
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const blockCat = hints[field];
+    if (blockCat === undefined || blockCat === "other") continue;
+    const tsCat = classifyTsType(token);
+    if (tsCat !== blockCat) {
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${blockCat})`);
+    }
+  }
+
+  assert.deepEqual(
+    mismatches,
+    ["line_start: `string | undefined` (string) vs schema (number)"],
+    "drift guard must catch `string | undefined` vs `<int>` as a type-token mismatch",
+  );
+});
+
+// Regression (#85 round 3): the value-type guard must not silently SKIP a scalar
+// field whose TS token classifies as "other" — an unrecognised token on EITHER side
+// is a mismatch (fail closed), never a `continue`. The earlier fixes oscillated by
+// moving a skip between the TS and schema sides. It also draws the optional-vs-null
+// line: `| undefined`/optional `?` is about presence (normalise to the base scalar),
+// but `| null` is a real emitted JSON value the schema-block placeholder can't
+// express, so it stays "other" and fails closed (per adversarial review — null ≠
+// undefined).
+test("value-type guard: optional normalises, but null + unrecognised tokens fail closed (#85)", () => {
+  // Optional spelling normalises — presence, not value type.
+  assert.equal(classifyTsType("string | undefined"), "string");
+  assert.equal(classifyTsType("number | undefined"), "number");
+  assert.equal(classifyTsType('"a" | "b" | undefined'), "string");
+  // `| null` is a real emitted value the hint vocabulary can't express → stays "other".
+  assert.equal(classifyTsType("string | null"), "other");
+  assert.equal(classifyTsType("number | null"), "other");
+  assert.equal(classifyTsType("string | null | undefined"), "other");
+  assert.equal(classifyTsType("number | undefined | null"), "other");
+  // Clean string-literal unions (the real `verdict` / `severity` fields) → "string".
+  assert.equal(classifyTsType('"approve" | "needs-attention"'), "string");
+  assert.equal(classifyTsType('"critical" | "high" | "medium" | "low"'), "string");
+  // ...but EVERY arm is validated: a literal union with a null or non-string arm
+  // (or a mixed union) fails closed — the first-arm `"` shortcut was a real gap.
+  assert.equal(classifyTsType('"a" | "b" | null'), "other");
+  assert.equal(classifyTsType('"low" | number'), "other");
+  assert.equal(classifyTsType('"approve" | "needs-attention" | undefined'), "string");
+  // Genuinely unrecognised forms also stay "other".
+  assert.equal(classifyTsType("Record<string, number>"), "other");
+
+  const syntheticSrc = [
+    "export interface SyntheticOther {",
+    "  summary: string | null;", // null is a real value → "other" → fails closed
+    "  file: string | undefined;", // optional → normalises to "string" → matches
+    "  line_start: Record<string, number>;", // unrecognised → "other" → fails closed
+    "}",
+  ].join("\n");
+  // Schema block: string fields hinted quoted, number field hinted bare-angle.
+  const syntheticBlock = [
+    "{",
+    '  "summary": "<one-line>",',
+    '  "file": "<path>",',
+    '  "findings": [',
+    "    {",
+    '      "line_start": <int>',
+    "    }",
+    "  ]",
+    "}",
+  ].join("\n");
+
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticOther");
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    const blockCat = hints[field];
+    if (tsCat === "other" || blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${blockCat ?? "absent"})`);
+    }
+  }
+
+  // file (string | undefined → string) vs "<path>" (string) → matches (optional ok).
+  // summary (string | null → other) vs "<one-line>" (string) → fails closed.
+  // line_start (Record<…> → other) vs <int> (number) → fails closed.
+  assert.deepEqual(
+    mismatches.sort(),
+    [
+      "line_start: `Record<string, number>` (other) vs schema (number)",
+      "summary: `string | null` (other) vs schema (string)",
+    ],
+    "null + unrecognised tokens must fail closed against a concrete hint; optional must normalise and match",
+  );
+});
+
+// Value-type drift guard (#85): the field-name guards above keep the *keys* in
+// sync but discard the `: number` / `: string` annotation, so flipping
+// `line_start?: number` -> `string` while the block still hints `<int>` slips
+// through. This compares each scalar field's TS type category against the schema
+// block's value-hint category, so a number-vs-quoted (or string-vs-bare) drift
+// fails. Array fields (tsCat === "other") are excluded; if the schema hint for a
+// scalar TS field is "other" or absent, that is itself a mismatch.
+test("drift guard: value-type tokens match schema block value hints", () => {
+  const tsTypes: Record<string, string> = {
+    ...parseInterfaceFieldTypes(typesSrc, "ReviewFinding"),
+    ...parseInterfaceFieldTypes(typesSrc, "ReviewVerdict"),
+  };
+  // commitSha is stamped by the pipeline from the PR head and never appears in
+  // the schema block (see the field-name guard above), so it has no hint to match.
+  delete tsTypes.commitSha;
+
+  const hints = parseSchemaBlockValueHints(REVIEW_VERDICT_SCHEMA_BLOCK);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    const blockCat = hints[field];
+    // Array fields are already excluded at parse time, so every field reaching here
+    // is scalar-intended. Fail closed SYMMETRICALLY: an unrecognised token on either
+    // side is itself drift, never a silent skip. tsCat "other" = an unsupported TS
+    // form for a scalar field; blockCat "other" = a non-scalar schema value (e.g. an
+    // array `["..."]` or unquoted bare text) for a field the type system declares
+    // scalar. blockCat undefined is already caught by the field-name guard; surfaced
+    // here for completeness.
+    if (tsCat === "other" || blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      const hint = blockCat ?? "absent";
+      mismatches.push(`${field}: types.ts \`${token}\` (${tsCat}) vs schema block hint (${hint})`);
+    }
+  }
+
+  assert.deepEqual(
+    mismatches,
+    [],
+    `value-type drift between ReviewFinding/ReviewVerdict and REVIEW_VERDICT_SCHEMA_BLOCK:\n  ${mismatches.join("\n  ")}\n` +
+      `Update the schema block value hint or the TS field type so both agree.`,
+  );
+});
+
+// Regression (#85 finding 2): the prior fix still skipped schema-side "other" hints,
+// so changing a scalar string field's schema block value from a quoted hint to an
+// unsupported non-scalar form (e.g. `["<...>"]`) was invisible to the guard. The fix
+// inverts the skip condition: skip only when the *TS* side is non-scalar, so a scalar
+// TS field with a schema-side "other" hint is reported as a mismatch.
+test("drift guard: scalar TS field with unsupported schema hint (other) is a mismatch (regression #85 finding 2)", () => {
+  // Simulate `summary: string` with its schema hint changed to an array form.
+  const syntheticSrc = `
+interface SyntheticVerdict {
+  summary: string;
+  confidence: number;
+}
+`;
+  const syntheticBlock = `{
+    "summary": ["<terse ship/no-ship assessment>"],
+    "confidence": <0.0-1.0>
+}`;
+
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticVerdict");
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    if (tsCat === "other") continue;
+    const blockCat = hints[field];
+    if (blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      const hint = blockCat ?? "absent";
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${hint})`);
+    }
+  }
+
+  assert.deepEqual(
+    mismatches,
+    ["summary: `string` (string) vs schema (other)"],
+    "drift guard must catch scalar TS string field whose schema hint is a non-scalar/unsupported form",
+  );
 });
 
 test("both review prompts substitute the schema block (no literal placeholder, all fields present)", () => {
