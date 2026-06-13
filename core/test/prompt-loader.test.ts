@@ -785,6 +785,27 @@ test("plan_revision prompt: no extra blank lines when specContext absent", () =>
   assert.doesNotMatch(out, /\n\n\n/);
 });
 
+// #25: the revision prompt must require preserving/regenerating the planning
+// contract established by planning.md — concrete repo-pattern citation in Approach
+// and a checkable Acceptance criteria section. Without this, a reviewed plan can
+// silently lose these sections before the implementer sees the revised plan.
+test("plan_revision prompt: requires preserving Approach citation and Acceptance criteria (#25)", () => {
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 11,
+    title: "t",
+    body: "b",
+    plan: "p",
+    feedback: "fb",
+    reviewer: "codex",
+    implementer: "claude",
+  });
+  assert.match(out, /Acceptance criteria/, "revision prompt must mention Acceptance criteria");
+  assert.match(out, /falsifiable/, "revision prompt must require falsifiable criteria");
+  assert.match(out, /concrete repo-pattern citation|concrete.*repo.*pattern|repo-pattern citation/, "revision prompt must require a concrete repo-pattern citation in Approach");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("implementing prompt: no extra blank lines when specContext absent", () => {
   const out = buildImplementingPrompt({
     cfg: dummyConfig(),
