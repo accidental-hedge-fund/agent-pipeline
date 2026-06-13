@@ -1,8 +1,8 @@
 # Roadmap
 
-Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-10.
+Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-13.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. Everything below v1.0.4 is the post-1.0.4 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. Everything below v1.1.0 is the post-1.1.0 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -35,6 +35,15 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #64 | tighten SKILL.md monitor-filter guidance | #69 |
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
+
+**v1.1.0 — review quality (shipped 2026-06-13, tag `v1.1.0`) — first minor:**
+
+| # | What | PR |
+|---|------|-----|
+| #85 | verdict drift guard extended to value-types/nesting, not just field names (every union arm validated; `\| null` fails closed, `\| undefined` normalizes) | #129 |
+| #57 | world-class review prompts — severity rubric, confidence calibration, few-shot, diff-scoping/blast-radius, deterministic-ask removal, round-1↔round-2 differentiation | #130 |
+| #25 | research-grounded planning — mine repo patterns + prior plans, emit checkable acceptance criteria (OpenSpec planning-context seam) | #141 |
+| #19 | closed-loop learning — human-curated lessons carried forward via `readConventions` injection (no pipeline-written store); reserve-aware water-filling truncation hardened over 5 adversarial review rounds (all real findings; #143 folded in, #144 filed for override-key durability) | #142 |
 
 **v1.0.4 — recovery robustness (shipped 2026-06-12, tag `v1.0.4`):**
 
@@ -91,8 +100,8 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
 | **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
 | **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See **Shipped** above. |
-| **v1.1.0** | minor | Review quality | #19, #25, #57, #85 | New planning/review capability, no breaking change. #19↔#25 ship together; #85 (patch) folds in as same-theme gate hardening. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
-| **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. |
+| **v1.1.0** ✅ shipped | minor | Review quality | #19, #25, #57, #85 | Shipped 2026-06-13 (tag `v1.1.0`) — first minor. New planning/review capability, no breaking change. See **Shipped** above for per-PR detail. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
+| **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. #144 (override durability) is convergence-robustness hardening, no new surface. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
 | *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
@@ -120,6 +129,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #39 | minor | none | reviewer pluggability | v1.2.0 | — |
 | #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
 | #70 | minor | adds key | per-step models | v1.2.0 | #91 ✓ |
+| #144 | patch | none | convergence robustness | v1.2.0 | — |
 | #23 | minor | adds key | graduated autonomy | v1.3.0 | — |
 | #21 | minor | adds key | execution isolation | v1.3.0 | #93 ✓ |
 | #14 | none | — | research | *(none)* | — |
@@ -133,17 +143,20 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 
 > **Design line (from the 2026-06-12 recovery-direction analysis; governs future recovery work):** automate a recovery step *only* when it adds **zero new authority over what ships** — a human's prior decision (#135), a deterministic gate that re-certifies (#131), or a re-entry/diagnosis that never advances past review (#133/#134). The bright line is **authority, not intelligence**: the hand-off can get arbitrarily smart; the *decision* (override-vs-fix-vs-adopt, retry-harder) stays with a human. `needs-human` is a feature, not a deficiency.
 
-### v1.1.0 — review quality (minor)
+### v1.1.0 — review quality (shipped 2026-06-13, tag `v1.1.0`)
 
-- **#19 + #25** — Closed-loop learning + research-grounded planning. **Rescoped:** human-curated lessons file via the existing `readConventions` injection (no pipeline-written store); strengthen the single planning prompt in-call (no fan-out calls). Mutual pair — build together.
-- **#57** — Upgrade the review prompts. ✅ *Already shipped via #110:* the severity rubric (`SEVERITY_RUBRIC` → `{{severity_rubric}}`) and **enumerate every instance per finding class** (which closed #84). **Remaining:** confidence calibration (aligned to #17's `min_confidence`), few-shot examples, diff-scoping/blast-radius, false-positive-cost framing, risk-first standard-prompt structure, **strip the deterministic asks** (`review_standard.md:20-21` — the test gate + CI already prove them), and **differentiate round-1 vs round-2** to cut overlap. *Builds on the single-sourced `{{schema_block}}` shipped in #83.*
-- **#85** — Extend the verdict drift guard to value-type/nesting (lightweight type-token comparison only). *Unblocked now that #83 has shipped; same review-gate theme.*
+As-built (see **Shipped** for PRs):
+
+- **#19 + #25** — Closed-loop learning + research-grounded planning, shipped as the rescoped pair: human-curated lessons carried forward via the existing `readConventions` injection (no pipeline-written store), and an in-call strengthened planning prompt that mines repo patterns/prior plans and emits checkable acceptance criteria (no fan-out calls). #19's `readConventions` truncation was hardened over five adversarial review rounds into a **reserve-aware water-filling** allocation (every at-risk lessons/gotchas section fairly represented, bounded regardless of count); the deferred follow-up #143 was folded into that fix, and **#144** was filed for the residual override-key-durability weakness it exposed (→ v1.2.0).
+- **#57** — Review prompts upgraded to world-class: confidence calibration (aligned to #17's `min_confidence`), few-shot examples, diff-scoping/blast-radius, false-positive-cost framing, risk-first standard-prompt structure, deterministic-ask removal, and round-1↔round-2 differentiation — on top of the rubric + enumerate-every-instance already shipped via #110.
+- **#85** — Verdict drift guard extended to value-types/nesting (every union arm validated; `| null` fails closed, `| undefined` normalizes), not just field names.
 
 ### v1.2.0 — reviewer pluggability & per-step models (minor)
 
 - **#39** — No-review-harness fallback: degrade to a clearly-labeled same-harness self-review when the reviewer CLI is unavailable (failure-triggered, at the invoke seam, **no new config key**).
 - **#40** — Configurable review harness: generalize `invoke()` and add a real, honored reviewer-selection key. *Note: #93 deleted the old ignored `harnesses` key, so this **adds a fresh key** (purely additive), not a revival of a dead one.* Sequence after #39.
 - **#70** — Per-step model config: add `models.implementing` only; drop `models.docs` (folds into impl under #91) and the identifier allowlist; warn when `models.*` is set on a codex step.
+- **#144** — Override durability: keep a recorded `--override` applying when the reviewer rewords a finding's title (stable finding identity, e.g. `severity | file | line` or normalized-title match instead of raw-title hash). Convergence-robustness item surfaced by #19's 5-round truncation churn — defer-via-override couldn't converge because each reworded title minted a new key. Same non-convergence family as #133.
 
 ### v1.3.0 — graduated autonomy & isolation (minor)
 
