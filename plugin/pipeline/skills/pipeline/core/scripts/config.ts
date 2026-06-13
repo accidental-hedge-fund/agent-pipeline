@@ -312,17 +312,22 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   const headCut = crossing.length ? Math.min(...crossing.map((s) => s.start)) : capChars;
 
   let out = text.slice(0, headCut).trimEnd() + "\n\n[…conventions truncated]";
-  // Preserve at-risk sections in document order within a single shared budget so
-  // the total stays bounded regardless of how many sections (or how large) exist.
-  let budget = sectionCap;
+  // Preserve every at-risk section in document order, but give each a guaranteed
+  // per-section share of the budget so an earlier large (e.g. cap-crossing)
+  // section cannot starve a later supported one — a single shared budget consumed
+  // in order let a big early section drop a late after-cap section entirely.
+  // Unused share rolls forward, so a small early section donates rather than
+  // wastes its slice; total preserved still stays within sectionCap.
+  const baseShare = Math.max(1, Math.floor(sectionCap / atRisk.length));
+  let carry = 0;
   for (const s of atRisk) {
-    if (budget <= 0) break;
+    const share = baseShare + carry;
     let piece = text.slice(s.start, s.end).trimEnd();
-    if (piece.length > budget) {
-      piece = piece.slice(0, budget).trimEnd() + "\n\n[…lessons section truncated]";
-      budget = 0;
+    if (piece.length > share) {
+      piece = piece.slice(0, share).trimEnd() + "\n\n[…lessons section truncated]";
+      carry = 0;
     } else {
-      budget -= piece.length;
+      carry = share - piece.length;
     }
     out += "\n\n" + piece;
   }

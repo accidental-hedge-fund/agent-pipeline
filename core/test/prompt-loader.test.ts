@@ -1165,3 +1165,29 @@ test("readConventions: an early in-cap Lessons heading does not hide a later aft
   const sectionCap = Math.floor(capChars / 4);
   assert.ok(result.length <= capChars + sectionCap + 200, `output too large: ${result.length}`);
 });
+
+test("readConventions: a large earlier cap-crossing section cannot starve a later after-cap section (#19 review-ceiling-2)", () => {
+  // Regression for the round-2 ceiling finding: with a single shared budget
+  // consumed in document order, a big earlier cap-crossing "## Lessons" section
+  // would exhaust the whole sectionCap before a later after-cap "## Gotchas"
+  // section was appended — dropping it. Each at-risk section must get a
+  // guaranteed per-section share so no earlier section can starve a later one.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-starve-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4);
+  // Heading sits just before the cap; body is huge and extends well past it.
+  const preamble = "# Conventions\n\n" + "x".repeat(7950);
+  const bigLessons = "\n\n## Lessons\n\n" + "- a recurring lesson bullet\n".repeat(300); // ~8400-char body
+  const lateGotchas = "\n## Gotchas\n\n- a late gotcha that must not be starved\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + bigLessons + lateGotchas);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(
+    result,
+    /a late gotcha that must not be starved/,
+    "later after-cap Gotchas section was starved by the earlier large cap-crossing Lessons section",
+  );
+  assert.match(result, /a recurring lesson bullet/, "earlier Lessons section should still be represented");
+  assert.match(result, /lessons section truncated/, "the large earlier section must be clipped, not unbounded");
+  assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
+});
