@@ -275,6 +275,26 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   }
   const text = fs.readFileSync(filePath, "utf8");
   if (text.length <= capChars) return text;
+
+  // When truncating, look for a lessons/gotchas heading beyond the cap and
+  // preserve it so carry-forward context is not silently dropped.
+  const lessonsRe = /^(#+)[ \t]+Lessons\b/im;
+  const m = lessonsRe.exec(text);
+  if (m && m.index >= capChars) {
+    const level = m[1].length;
+    // Find the end of the section: next heading at the same or higher level.
+    const lessonLineEnd = text.indexOf("\n", m.index);
+    const afterLessonsLine = lessonLineEnd >= 0 ? text.slice(lessonLineEnd + 1) : "";
+    const nextHeadingRe = new RegExp(`^#{1,${level}}[ \\t]+`, "m");
+    const nextM = nextHeadingRe.exec(afterLessonsLine);
+    const sectionEnd = nextM ? lessonLineEnd + 1 + nextM.index : text.length;
+    return (
+      text.slice(0, capChars) +
+      "\n\n[…conventions truncated]\n\n" +
+      text.slice(m.index, sectionEnd).trimEnd()
+    );
+  }
+
   return text.slice(0, capChars) + "\n\n[…conventions truncated]";
 }
 

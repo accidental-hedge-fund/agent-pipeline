@@ -17,3 +17,12 @@
 
 - [x] 4.1 Run `node scripts/build.mjs` to regenerate `plugin/` if any `core/` source file was touched; confirm output is clean.
 - [x] 4.2 Run `npm run ci` from repo root; all checks green before marking done.
+
+## 5. Fix-round-2 findings (review 2 adversarial)
+
+- [x] 5.1 Remove the `CLAUDE.md / AGENTS.md` bullet from `DOCS_INSTRUCTION_SECTION` so the default docs-enabled implementing prompt cannot instruct the AI to write to the conventions file (override-key: a88df12d).
+- [x] 5.2 Update `buildAllStagePrompts` in `prompt-loader.test.ts` to call `buildImplementingPrompt` with `docsEnabled: true` so the no-write tests cover the docs-enabled path.
+- [x] 5.3 Add regression: docs-enabled implementing prompt does NOT contain a write-to-conventions-file instruction.
+- [x] 5.4 Update `readConventions` to detect a lessons heading beyond the 8 000-char cap and append the section after the truncation marker (override-key: 6e81eca8).
+- [x] 5.5 Add regression: `readConventions` preserves a lessons section that appears after the 8 000-char cap.
+- [x] 5.6 Add truncation-preservation scenario to the spec delta and regenerate the plugin mirror; re-run `npm run ci`.

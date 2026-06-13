@@ -194,7 +194,6 @@ const DOCS_INSTRUCTION_SECTION = `
 
 Documentation is part of this change — update it in the same commit(s) so reviewers see code and docs together. Check and update where affected:
 - **README.md** — if user-visible setup, workflows, features, or operations changed
-- **CLAUDE.md / AGENTS.md** (this repo's conventions file) — if the change affects conventions agents need to know
 - **Config docs and examples** — if config keys, flags, env vars, or setup steps were added or changed
 - **Docstrings/comments in the files you changed** — if they are now inaccurate
 - **Repo-local ops docs or runbooks** — if the change touches what they describe

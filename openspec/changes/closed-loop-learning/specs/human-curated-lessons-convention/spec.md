@@ -23,6 +23,13 @@ A target repo MAY include a `#### Lessons / Gotchas` section (or equivalent name
 - **AND** the pipeline advances an issue through a fix stage
 - **THEN** the fix prompt SHALL contain the lessons content as part of the injected conventions block
 
+#### Scenario: Lessons section beyond the readConventions excerpt cap is preserved in stage prompts
+
+- **WHEN** a target repo's conventions file is longer than the `readConventions` excerpt cap (default 8 000 chars)
+- **AND** a lessons section heading (`#### Lessons` or equivalent) appears after the cap
+- **THEN** `readConventions` SHALL include the lessons section in the returned excerpt
+- **AND** a truncation marker SHALL appear between the beginning of the file and the preserved lessons section
+
 ### Requirement: The pipeline SHALL NOT write to or create the conventions file
 
 No pipeline code path — planning, review, fix, pre-merge, eval, deploy-ready, or auto-recover — SHALL create, overwrite, or append to the file resolved by `readConventions`. Labels and issue/PR comments remain the only pipeline-owned state; the conventions file is owned entirely by the repo maintainer.

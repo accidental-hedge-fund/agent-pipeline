@@ -19,6 +19,7 @@ import {
   buildTestFixPrompt,
   substitute,
 } from "../scripts/prompts/index.ts";
+import { readConventions } from "../scripts/config.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 function dummyConfig(): PipelineConfig {
@@ -346,10 +347,8 @@ test("implementing prompt: docsEnabled adds the documentation-update instruction
   });
   assert.match(out, /## Documentation Updates/);
   assert.match(out, /README\.md/);
-  assert.match(out, /CLAUDE\.md/);
-  // #108: the docs-update ask also names the conventions file; it must name
-  // AGENTS.md too so it is accurate under the codex profile, not CLAUDE.md only.
-  assert.match(out, /AGENTS\.md/);
+  assert.match(out, /CLAUDE\.md/); // appears in the read-conventions instruction (line 1 of implementing.md)
+  assert.match(out, /AGENTS\.md/); // same read instruction — both appear regardless of the docs-update section
   assert.match(out, /do not add boilerplate docs/);
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
   assert.doesNotMatch(out, /\n\n\n/);
@@ -980,7 +979,8 @@ function buildAllStagePrompts(cfg: PipelineConfig): void {
   buildPlanningOpenspecPrompt({ cfg, issueNumber: 19, title: "t", body: "b", pipelineRunId: "19/x" });
   buildPlanReviewPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", reviewer: "claude", implementer: "codex" });
   buildPlanRevisionPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", feedback: "f", reviewer: "claude", implementer: "codex" });
-  buildImplementingPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", pipelineRunId: "19/x" });
+  // docsEnabled: true exercises the DOCS_INSTRUCTION_SECTION path (#19 fix-2: must not instruct writing to conventions file)
+  buildImplementingPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", pipelineRunId: "19/x", docsEnabled: true });
   buildReviewStandardPrompt({ cfg, issueNumber: 19, title: "t", body: "b", plan: "p", diff: "d" });
   buildReviewAdversarialPrompt({ cfg, issueNumber: 19, title: "t", body: "b", diff: "d" });
   buildFixPrompt({ cfg, issueNumber: 19, title: "t", reviewFindings: "f", fixRound: 1, pipelineRunId: "19/x" });
@@ -1048,4 +1048,41 @@ test("lessons convention (#19): no stage prompt builder creates a conventions fi
   buildAllStagePrompts(cfg);
 
   assert.deepEqual(fs.readdirSync(dir), [], "a prompt builder created the conventions file the pipeline must never write");
+});
+
+// Fix-round-2 regressions: review 2 findings (a88df12d + 6e81eca8)
+
+test("implementing prompt (docs-enabled): does NOT instruct the harness to write to the conventions file (#19 fix-2)", () => {
+  // The DOCS_INSTRUCTION_SECTION must not contain a bullet asking the
+  // implementer to update CLAUDE.md / AGENTS.md — the conventions file is
+  // read-only from the pipeline's perspective (spec: pipeline SHALL NOT write).
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 19,
+    title: "t",
+    body: "b",
+    plan: "p",
+    pipelineRunId: "19/x",
+    docsEnabled: true,
+  });
+  assert.doesNotMatch(out, /conventions agents need to know/, "docs instruction must not ask the implementer to write to the conventions file");
+  // The docs-update section must still list the real doc targets.
+  assert.match(out, /## Documentation Updates/);
+  assert.match(out, /README\.md/);
+});
+
+test("readConventions: lessons section beyond the 8000-char cap is preserved in the excerpt (#19 fix-2)", () => {
+  // A common CLAUDE.md layout puts Lessons / Gotchas near the bottom.  If the
+  // file exceeds the cap, the section would be silently dropped — breaking the
+  // carry-forward contract.  readConventions must detect and preserve it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-lessons-"));
+  const preamble = "# Conventions\n\n" + "x".repeat(8000);
+  const lessons =
+    "\n\n#### Lessons / Gotchas\n\n- never skip the review step\n- always regenerate the plugin mirror\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + lessons);
+  const cfg = { ...dummyConfig(), repo_dir: dir }; // no conventions_md_path → defaults to CLAUDE.md
+  const result = readConventions(cfg);
+  assert.match(result, /never skip the review step/, "lessons section was truncated out of the excerpt");
+  assert.match(result, /always regenerate the plugin mirror/);
+  assert.match(result, /conventions truncated/, "truncation marker must still appear before the lessons section");
 });
