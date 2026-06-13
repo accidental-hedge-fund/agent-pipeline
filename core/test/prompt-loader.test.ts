@@ -1086,3 +1086,53 @@ test("readConventions: lessons section beyond the 8000-char cap is preserved in 
   assert.match(result, /always regenerate the plugin mirror/);
   assert.match(result, /conventions truncated/, "truncation marker must still appear before the lessons section");
 });
+
+test("readConventions: very large lessons section beyond the cap is still bounded (#19 fix-3)", () => {
+  // Regression for Finding 1: a massive lessons section must not bypass the cap
+  // and push the returned string to unbounded length.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-large-lessons-"));
+  const capChars = 8000;
+  const sectionCap = Math.floor(capChars / 4); // 2000
+  const preamble = "# Conventions\n\n" + "x".repeat(capChars);
+  // Lessons section is 10× the sectionCap — must be truncated.
+  const bigBody = "- lesson bullet\n".repeat(Math.ceil((sectionCap * 10) / "- lesson bullet\n".length));
+  const lessons = "\n\n#### Lessons / Gotchas\n\n" + bigBody;
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + lessons);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  // Total output must stay well within 2× capChars (cap + sectionCap + markers).
+  assert.ok(result.length <= capChars + sectionCap + 200, `output too large: ${result.length}`);
+  // The lessons section clipping marker must appear.
+  assert.match(result, /lessons section truncated/, "missing per-section truncation marker");
+  // The main truncation marker must also appear.
+  assert.match(result, /conventions truncated/);
+});
+
+test("readConventions: Gotchas-only section beyond the cap is preserved (#19 fix-3)", () => {
+  // Regression for Finding 2a: a standalone Gotchas heading (not starting with
+  // "Lessons") beyond the cap must also be preserved — not silently dropped.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-gotchas-"));
+  const preamble = "# Conventions\n\n" + "x".repeat(8000);
+  const gotchas = "\n\n#### Gotchas\n\n- do not edit plugin/ by hand\n- always run npm run ci\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + gotchas);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(result, /do not edit plugin\/ by hand/, "Gotchas section was truncated out of the excerpt");
+  assert.match(result, /always run npm run ci/);
+  assert.match(result, /conventions truncated/);
+});
+
+test("readConventions: lessons section heading before cap with body after cap is fully included (#19 fix-3)", () => {
+  // Regression for Finding 2b: when the heading starts just before the 8000-char
+  // cap but the section body extends past it, the body must not be cut off.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-trunc-boundary-lessons-"));
+  const capChars = 8000;
+  // Place the heading at 7990 so m.index < capChars but body is after the cap.
+  const preamble = "# Conventions\n\n" + "x".repeat(7970);
+  const lessons = "\n\n#### Lessons\n\n- critical lesson that lives past the cap\n";
+  fs.writeFileSync(path.join(dir, "CLAUDE.md"), preamble + lessons);
+  const cfg = { ...dummyConfig(), repo_dir: dir };
+  const result = readConventions(cfg);
+  assert.match(result, /critical lesson that lives past the cap/, "section body past the cap was truncated out");
+  assert.match(result, /conventions truncated/);
+});

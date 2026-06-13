@@ -276,23 +276,42 @@ export function readConventions(cfg: PipelineConfig, capChars = 8000): string {
   const text = fs.readFileSync(filePath, "utf8");
   if (text.length <= capChars) return text;
 
-  // When truncating, look for a lessons/gotchas heading beyond the cap and
-  // preserve it so carry-forward context is not silently dropped.
-  const lessonsRe = /^(#+)[ \t]+Lessons\b/im;
-  const m = lessonsRe.exec(text);
-  if (m && m.index >= capChars) {
+  // Cap for any preserved carry-forward section to keep total output bounded.
+  const sectionCap = Math.floor(capChars / 4);
+
+  // Scan for a supported carry-forward heading: Lessons or Gotchas (including
+  // combined headings like "Lessons / Gotchas"). Preserve it when it starts
+  // after the cap (entirely truncated away) OR when it starts within the cap
+  // but its body extends past it (partial truncation).
+  const carryRe = /^(#+)[ \t]+(Lessons|Gotchas)\b/im;
+  const m = carryRe.exec(text);
+  if (m) {
     const level = m[1].length;
     // Find the end of the section: next heading at the same or higher level.
-    const lessonLineEnd = text.indexOf("\n", m.index);
-    const afterLessonsLine = lessonLineEnd >= 0 ? text.slice(lessonLineEnd + 1) : "";
+    const headingLineEnd = text.indexOf("\n", m.index);
+    const afterHeadingLine = headingLineEnd >= 0 ? text.slice(headingLineEnd + 1) : "";
     const nextHeadingRe = new RegExp(`^#{1,${level}}[ \\t]+`, "m");
-    const nextM = nextHeadingRe.exec(afterLessonsLine);
-    const sectionEnd = nextM ? lessonLineEnd + 1 + nextM.index : text.length;
-    return (
-      text.slice(0, capChars) +
-      "\n\n[…conventions truncated]\n\n" +
-      text.slice(m.index, sectionEnd).trimEnd()
-    );
+    const nextM = nextHeadingRe.exec(afterHeadingLine);
+    const sectionEnd = nextM ? headingLineEnd + 1 + nextM.index : text.length;
+
+    if (m.index >= capChars || sectionEnd > capChars) {
+      let preserved = text.slice(m.index, sectionEnd).trimEnd();
+      const clipped = preserved.length > sectionCap;
+      if (clipped) preserved = preserved.slice(0, sectionCap).trimEnd();
+      const clippedMarker = clipped ? "\n\n[…lessons section truncated]" : "";
+
+      if (m.index >= capChars) {
+        // Section is entirely beyond the cap: append after the main truncation marker.
+        return (
+          text.slice(0, capChars) +
+          "\n\n[…conventions truncated]\n\n" +
+          preserved + clippedMarker
+        );
+      }
+      // Section starts within the cap but body extends past it: include the
+      // full section so carry-forward bullets are not cut off.
+      return text.slice(0, m.index) + preserved + clippedMarker + "\n\n[…conventions truncated]";
+    }
   }
 
   return text.slice(0, capChars) + "\n\n[…conventions truncated]";
