@@ -728,6 +728,37 @@ test("runStartPreflightGate — disabled (runOnStart:false, no --doctor) runs no
   assert.equal(gate.result, null);
 });
 
+// Regression (#146 review 2): when doctor.runOnStart:true and gh fails during
+// config resolution (repo:""), the run-start gate must block and print the
+// doctor summary — not exit through the generic config-error path.
+test("runStartPreflightGate — repo:'' (gh failure) blocks with doctor summary on repo-access", async () => {
+  // Simulate the state after resolveConfig tolerating gh failure: repo stays "".
+  const cfg = makeConfig({ repo: "", doctor: { runOnStart: true, failFast: false } });
+  let preflightCalled = false;
+  // Fake deps: gh --version ok (cli:gh passes), but auth/repo view fail.
+  const innerDeps: DoctorDeps = fakeDeps({
+    execCheck: (file, args) => {
+      if (file === "gh" && (args.includes("status") || args.includes("view"))) return false;
+      return true;
+    },
+    exec: () => ({ ok: true, stdout: "feature/branch\n", stderr: "" }),
+    fsExists: () => false, // skip optional checks (package-install, openspec, plugin-mirror)
+  });
+  const gateDeps: PreflightCliDeps = {
+    runPreflight: (config, _d, opts) => {
+      preflightCalled = true;
+      return runPreflight(config, innerDeps, opts);
+    },
+    storePreflightResult: async () => {},
+  };
+  const output = await captureConsole(async () => {
+    const gate = await runStartPreflightGate(cfg, {} as CliOpts, gateDeps);
+    assert.equal(gate.proceed, false, "gate must block when checks fail");
+  });
+  assert.equal(preflightCalled, true, "preflight must run — not the config-error path");
+  assert.match(output, /Result: FAIL/, "doctor summary must be printed when gate blocks");
+});
+
 test("runStartPreflightGate — the --doctor flag enables the gate even when config is off", async () => {
   let preflightCalls = 0;
   const deps: PreflightCliDeps = {

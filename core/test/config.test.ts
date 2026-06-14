@@ -716,3 +716,26 @@ test("resolveConfig: non-boolean doctor.runOnStart is rejected", async () => {
     process.env.PATH = oldPath;
   }
 });
+
+// Regression (#146 review 2): when pipeline.yml sets doctor.runOnStart: true,
+// resolveConfig must tolerate a gh failure (return repo:"") so the run-start
+// preflight gate — not the generic config-error path — reports the failure.
+test("resolveConfig: doctor.runOnStart:true tolerates gh failure and returns repo:''", async () => {
+  const repo = makeFakeRepo(`doctor:\n  runOnStart: true\n`);
+  // Fake gh that always exits non-zero.
+  const binDir = fs.mkdtempSync(path.join(tmpRoot, "bin-"));
+  const ghPath = path.join(binDir, "gh");
+  fs.writeFileSync(ghPath, `#!/usr/bin/env bash\nexit 1\n`);
+  fs.chmodSync(ghPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // Must NOT throw — the preflight gate owns the failure, not resolveConfig.
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.repo, "", "repo must be '' when gh fails and runOnStart tolerates it");
+    assert.equal(cfg.doctor.runOnStart, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

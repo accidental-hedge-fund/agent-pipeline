@@ -117,27 +117,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     );
   }
 
-  // Discover owner/name via gh.
-  let repo: string;
-  try {
-    const out = execFileSync("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], {
-      cwd: repoDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    repo = out.trim();
-  } catch (err) {
-    if (!opts.tolerateGhFailure) {
-      throw new Error(
-        `Failed to discover GitHub repo for ${repoDir} via 'gh repo view'. Make sure 'gh' is authenticated.`,
-      );
-    }
-    // gh unavailable or auth expired: set repo="" so the caller can still run
-    // doctor checks (cli:gh, github-auth, repo-access) which surface the real failure.
-    repo = "";
-  }
-
-  // Load file config if present.
+  // Load file config BEFORE gh repo discovery so doctor.runOnStart can be
+  // detected and incorporated into tolerateGhFailure. Without this ordering a
+  // repo with doctor.runOnStart: true would still exit via the generic config-
+  // error path when gh is missing/auth-expired — before the preflight gate ran.
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   let fileConfig: z.infer<typeof PartialConfigSchema> = {};
   if (fs.existsSync(configPath)) {
@@ -159,6 +142,32 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig = result.data;
       }
     }
+  }
+
+  // tolerateGhFailure: caller flag (standalone doctor / --doctor) OR
+  // doctor.runOnStart: true from the local config.  In both cases resolveConfig
+  // must not throw on a gh failure so that the preflight gate can run and report
+  // the real CLI/auth/repo-access failure with actionable remediation text.
+  const tolerateGhFailure = opts.tolerateGhFailure || (fileConfig.doctor?.runOnStart === true);
+
+  // Discover owner/name via gh.
+  let repo: string;
+  try {
+    const out = execFileSync("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], {
+      cwd: repoDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    repo = out.trim();
+  } catch (err) {
+    if (!tolerateGhFailure) {
+      throw new Error(
+        `Failed to discover GitHub repo for ${repoDir} via 'gh repo view'. Make sure 'gh' is authenticated.`,
+      );
+    }
+    // gh unavailable or auth expired: set repo="" so the caller can still run
+    // doctor checks (cli:gh, github-auth, repo-access) which surface the real failure.
+    repo = "";
   }
 
   const merged: PipelineConfig = {
