@@ -427,7 +427,10 @@ interface Recorder {
  * reviewer output returned on the i-th review invocation (the last entry is
  * reused if more invocations occur than entries provided).
  */
-function makeDeps(stdouts: string[]): { deps: AdvanceReviewDeps; rec: Recorder } {
+function makeDeps(
+  stdouts: string[],
+  opts: { selfReview?: boolean } = {},
+): { deps: AdvanceReviewDeps; rec: Recorder } {
   const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], comments: [], prComments: [] };
   const result = (stdout: string): HarnessResult => ({
     success: true,
@@ -471,7 +474,13 @@ function makeDeps(stdouts: string[]): { deps: AdvanceReviewDeps; rec: Recorder }
     runReview: async () => {
       const stdout = stdouts[Math.min(rec.runReviewCalls, stdouts.length - 1)];
       rec.runReviewCalls += 1;
-      return result(stdout);
+      // Mirror invokeReviewer's shape: on the #39 self-review fallback the
+      // implementer ("claude") reviewed; otherwise the configured reviewer ("codex").
+      return {
+        result: result(stdout),
+        effectiveReviewer: opts.selfReview ? "claude" : "codex",
+        selfReview: opts.selfReview ?? false,
+      };
     },
   };
   return { deps, rec };
@@ -513,6 +522,49 @@ test("advanceReview: needs-attention+0 findings on first attempt re-reviews inst
     to: "review-2",
     summary: "approved (0 findings)",
   });
+});
+
+test("advanceReview (#39): same-harness self-review labels the comment AND the transition, still advances", async (t) => {
+  // The configured reviewer (codex) was unspawnable, so the implementer (claude)
+  // self-reviewed; the fallback flag flows through to the disclosure.
+  const { deps, rec } = makeDeps([APPROVE], { selfReview: true });
+  const notes: string[] = [];
+  deps.transition = async (_cfg, _n, _from, _to, note) => {
+    notes.push(note ?? "");
+  };
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+
+  // Per the maintainer decision: a self-review approval advances normally — it is
+  // never blocked solely for being a self-review.
+  assert.equal(outcome!.advanced, true);
+  assert.equal(outcome!.to, "review-2");
+  assert.deepEqual(rec.blocked, [], "a self-review must not block solely for being a self-review");
+
+  // Disclosure on the posted review comment.
+  assert.equal(rec.comments.length, 1);
+  assert.match(rec.comments[0], /Same-harness self-review/);
+  assert.match(rec.comments[0], /`codex` is not installed/);
+  assert.match(rec.comments[0], /implementing harness `claude`/);
+
+  // Disclosure on the stage transition.
+  assert.ok(
+    notes.some((n) => /\(self-review\)/.test(n)),
+    "the stage-transition message must label the self-review",
+  );
+
+  // Contrast: a normal cross-harness review posts no such banner.
+  const { deps: normalDeps, rec: normalRec } = makeDeps([APPROVE]);
+  await quiet(t, async () => {
+    await advanceReview(cfg, 1, 1, {}, 0, normalDeps);
+  });
+  assert.equal(normalRec.comments.length, 1);
+  assert.ok(
+    !/Same-harness self-review/.test(normalRec.comments[0]),
+    "a normal cross-harness review must NOT carry the self-review banner",
+  );
 });
 
 test("advanceReview: re-review (retryCount=1) with needs-attention+0 findings blocks, never fixes", async (t) => {

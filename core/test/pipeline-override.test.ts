@@ -201,13 +201,19 @@ function makeReviewDeps(
     setBlocked: async (_cfg, _n, reason) => {
       rec.blocked.push(reason);
     },
+    // Mirror invokeReviewer's ReviewerInvocation shape (#39): a normal
+    // cross-harness review by the configured reviewer.
     runReview: async () => ({
-      success: true,
-      stdout,
-      stderr: "",
-      exit_code: 0,
-      duration: 0.1,
-      timed_out: false,
+      result: {
+        success: true,
+        stdout,
+        stderr: "",
+        exit_code: 0,
+        duration: 0.1,
+        timed_out: false,
+      },
+      effectiveReviewer: "codex",
+      selfReview: false,
     }),
   };
   return { deps, rec };
