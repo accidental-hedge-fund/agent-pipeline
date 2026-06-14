@@ -2,7 +2,7 @@
 
 Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-14.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. Everything below v1.1.0 is the post-1.1.0 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. **v1.1.1 shipped 2026-06-14** (tag `v1.1.1`) — capability/evidence hardening: deterministic `doctor` preflight and per-run evidence bundles; see Shipped. Everything below v1.1.1 is the post-1.1.1 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -35,6 +35,15 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #64 | tighten SKILL.md monitor-filter guidance | #69 |
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
+
+**v1.1.1 — capability/evidence hardening (shipped 2026-06-14, tag `v1.1.1`):**
+
+| # | What | PR |
+|---|------|-----|
+| #146 | `doctor` / preflight: deterministic capability check (gh auth/repo, harness availability, worktree cleanliness, OpenSpec, mirror, deps, eval cmd) before expensive autonomous work — standalone `--doctor` + opt-in run-start gate; no model invocation | #151 |
+| #147 | per-run evidence bundle: machine-readable artifact (issue/PR, branch, SHAs, stage transitions, harness identity, commands, test/eval outcomes, verdicts, overrides, recovery events) + human-readable summary; audit/debug only, not a second state machine | #152 |
+
+(#143 — the `readConventions` truncation-fairness follow-up originally slotted here — was folded into #19's reserve-aware water-filling fix and shipped in v1.1.0; closed as done.)
 
 **v1.1.0 — review quality (shipped 2026-06-13, tag `v1.1.0`) — first minor:**
 
@@ -101,7 +110,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
 | **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See **Shipped** above. |
 | **v1.1.0** ✅ shipped | minor | Review quality | #19, #25, #57, #85 | Shipped 2026-06-13 (tag `v1.1.0`) — first minor. New planning/review capability, no breaking change. See **Shipped** above for per-PR detail. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
-| **v1.1.1** | patch | Capability/evidence hardening | #143, #146, #147 | Tightens run reliability and inspectability after v1.1.0 without changing shipped behavior: fair context truncation, deterministic preflight, and local evidence bundles. |
+| **v1.1.1** ✅ shipped | patch | Capability/evidence hardening | #146, #147 | Shipped 2026-06-14 (tag `v1.1.1`). Deterministic `doctor` preflight + per-run evidence bundles; no change to shipped run behavior. (#143 folded into v1.1.0.) See **Shipped** above. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. #144 (override durability) is convergence-robustness hardening, no new surface. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21, #149 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. #149 adds bounded continuation budgets on top of existing `needs-human` semantics; no merge/deploy authority. |
 | **v1.4.0** | minor | Evidence gates & private evals | #148 | Adds an optional reviewer-owned private shipcheck gate before `ready-to-deploy`; advisory-first, no default behavior change. |
@@ -165,13 +174,13 @@ As-built (see **Shipped** for PRs):
 - **#57** — Review prompts upgraded to world-class: confidence calibration (aligned to #17's `min_confidence`), few-shot examples, diff-scoping/blast-radius, false-positive-cost framing, risk-first standard-prompt structure, deterministic-ask removal, and round-1↔round-2 differentiation — on top of the rubric + enumerate-every-instance already shipped via #110.
 - **#85** — Verdict drift guard extended to value-types/nesting (every union arm validated; `| null` fails closed, `| undefined` normalizes), not just field names.
 
-### v1.1.1 — capability/evidence hardening (patch)
+### v1.1.1 — capability/evidence hardening (shipped 2026-06-14, tag `v1.1.1`)
 
-SmallHarness-inspired hardening that makes runs cheaper to diagnose and less likely to waste harness time on setup defects:
+SmallHarness-inspired hardening that makes runs cheaper to diagnose and less likely to waste harness time on setup defects. As-built (see **Shipped** for PRs):
 
-- **#143** — `readConventions`: principled, provably-fair multi-section truncation under large convention files. This is the already-filed patch follow-up from #19's truncation work.
-- **#146** — `doctor` / preflight capability checks before expensive autonomous work: GitHub auth/repo access, harness availability, worktree cleanliness, OpenSpec availability, plugin mirror state, dependency state, and declared eval command availability. Deterministic, no model invocation.
-- **#147** — Per-run evidence bundle: compact machine-readable artifact recording issue/PR, branch, commit SHAs, stage transitions, harness identity, prompts/context inputs, commands, test/eval outcomes, review verdicts, overrides, recovery events, and final handoff state. This is an audit/debug artifact, not a second state machine.
+- **#146** — `doctor` / preflight capability checks before expensive autonomous work: GitHub auth/repo access, harness availability, worktree cleanliness, OpenSpec availability, plugin mirror state, dependency state, and declared eval command availability. Standalone `--doctor` plus an opt-in run-start gate; deterministic, no model invocation. (Review caught a real spec-divergence where the config-enabled run-start path still ran `gh` before the preflight — fixed before ship.)
+- **#147** — Per-run evidence bundle: compact machine-readable artifact recording issue/PR, branch, commit SHAs, stage transitions, harness identity, prompts/context inputs, commands, test/eval outcomes, review verdicts, overrides, recovery events, and final handoff state, plus a printable human-readable summary. An audit/debug artifact, not a second state machine.
+- **#143** — folded into #19's reserve-aware water-filling truncation fix and shipped in v1.1.0; closed as done (not a separate v1.1.1 deliverable).
 
 ### v1.2.0 — reviewer pluggability & per-step models (minor)
 
