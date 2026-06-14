@@ -174,9 +174,10 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
   });
 
   // 3. Repo access — token can actually see the configured repo.
-  //    When config.repo is "" (gh was unavailable during config resolution —
-  //    tolerateGhFailure path), skip this check; cli:gh / github-auth (checks 1-2)
-  //    already surface the real failure with actionable remediation.
+  //    When config.repo is "" (gh was unavailable or the checkout could not be
+  //    resolved to a GitHub repo during config resolution), fail with remediation
+  //    rather than skipping: a missing repo name IS a repo-access failure and the
+  //    spec requires it to appear in the failing check set.
   checks.push({
     id: "repo-access",
     description: config.repo
@@ -184,8 +185,9 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
       : "Authenticated token can access the configured repo",
     run: async (deps) => {
       if (!config.repo) {
-        return skip(
-          "repo name not available (gh was unreachable during startup) — see cli:gh / github-auth checks",
+        return fail(
+          "could not determine the GitHub repo for this checkout — gh was unavailable or the checkout cannot be resolved to a GitHub repo",
+          `Set \`repo: owner/name\` in \`.github/pipeline.yml\`, run \`gh auth login\` if authentication is expired, or ensure the checkout at ${config.repo_dir} is a GitHub-linked repo accessible to your token.`,
         );
       }
       return (await deps.execCheck("gh", ["repo", "view", config.repo]))
@@ -302,7 +304,30 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
     },
   });
 
-  // 8. Eval command (conditional) — when the eval gate is enabled with a
+  // 8. Plugin mirror check (conditional) — for repos that have a generated
+  //    `plugin/` mirror driven by `scripts/build.mjs` (the agent-pipeline golden
+  //    rule). Running `node scripts/build.mjs --check` without actually building
+  //    catches stale mirrors before CI does. The check is guarded by the presence
+  //    of both artifacts so it is a no-op in repos without this pattern.
+  checks.push({
+    id: "plugin-mirror",
+    description: "Generated plugin/ mirror is in sync with core/ (scripts/build.mjs --check)",
+    run: async (deps) => {
+      const buildScript = path.join(config.repo_dir, "scripts", "build.mjs");
+      const pluginDir = path.join(config.repo_dir, "plugin");
+      if (!(await deps.fsExists(buildScript)) || !(await deps.fsExists(pluginDir))) {
+        return skip("no scripts/build.mjs or plugin/ directory — plugin mirror check is not applicable");
+      }
+      return (await deps.execCheck("node", [buildScript, "--check"]))
+        ? pass("plugin/ mirror is in sync with core/")
+        : fail(
+            "plugin/ mirror is out of sync with core/",
+            "Run `node scripts/build.mjs` from the repo root to regenerate the plugin/ mirror, then commit the result.",
+          );
+    },
+  });
+
+  // 9. Eval command (conditional) — when the eval gate is enabled with a
   //    configured command, verify its binary resolves on PATH (without running it).
   checks.push({
     id: "eval-command",

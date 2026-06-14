@@ -406,13 +406,47 @@ test("check eval-command — env-prefixed command fails when the real binary is 
   assert.equal(seenBin, "my-eval-runner", "must probe `my-eval-runner`, not the VAR assignment");
 });
 
-// Regression: repo-access check skips gracefully when config.repo is "" (gh unavailable
-// during config resolution — tolerateGhFailure path). cli:gh / github-auth check first.
-test("check repo-access — skips gracefully when config.repo is empty (gh unavailable)", async () => {
+// ---------------------------------------------------------------------------
+// plugin-mirror check (conditional)
+// ---------------------------------------------------------------------------
+
+test("check plugin-mirror — skips when scripts/build.mjs is absent", async () => {
+  const r = await getCheck(makeConfig(), "plugin-mirror").run(
+    fakeDeps({ fsExists: (p) => !p.includes("build.mjs") }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check plugin-mirror — skips when plugin/ directory is absent", async () => {
+  const r = await getCheck(makeConfig(), "plugin-mirror").run(
+    fakeDeps({ fsExists: (p) => !p.endsWith("plugin") }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check plugin-mirror — passes when node scripts/build.mjs --check succeeds", async () => {
+  const r = await getCheck(makeConfig(), "plugin-mirror").run(
+    fakeDeps({ execCheck: () => true, fsExists: () => true }),
+  );
+  assert.equal(r.status, "pass");
+});
+
+test("check plugin-mirror — fails with build.mjs remediation when the mirror is stale", async () => {
+  const r = await getCheck(makeConfig(), "plugin-mirror").run(
+    fakeDeps({ execCheck: () => false, fsExists: () => true }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.remediation!, /build\.mjs/i);
+});
+
+// When config.repo is "" (gh was unavailable or the checkout cannot be resolved to a
+// GitHub repo during config resolution), repo-access must fail — not skip. The spec
+// requires a failing check with remediation, not a silent omission from the result set.
+test("check repo-access — fails with remediation when config.repo is empty", async () => {
   const cfg = makeConfig({ repo: "" });
   const r = await getCheck(cfg, "repo-access").run(fakeDeps({ execCheck: () => false }));
-  assert.equal(r.status, "skip", "repo-access must skip, not fail, when repo name is unavailable");
-  assert.match(r.detail, /cli:gh|github-auth|unreachable/, "skip reason must mention earlier checks");
+  assertFailWithRemediation(r);
+  assert.match(r.remediation!, /pipeline\.yml|gh auth login|token/i, "remediation must guide fixing repo resolution");
 });
 
 // ---------------------------------------------------------------------------
@@ -431,9 +465,16 @@ test("runPreflight — all checks pass → ok true, no failures", async () => {
 
 test("runPreflight — one failing check with failFast:false runs every check, ok false", async () => {
   // node missing → cli:node fails; everything else passes/skips.
+  // Keep plugin-mirror skipped (build.mjs absent) so only cli:node fails — the
+  // plugin-mirror check also calls execCheck("node", ...) and would otherwise add
+  // a second failure, obscuring the "exactly one failure" assertion.
   const cfg = makeConfig();
   const allChecks = buildPreflightChecks(cfg).length;
-  const result = await runPreflight(cfg, fakeDeps({ execCheck: (f) => f !== "node" }), { failFast: false });
+  const result = await runPreflight(
+    cfg,
+    fakeDeps({ execCheck: (f) => f !== "node", fsExists: (p) => !p.includes("build.mjs") }),
+    { failFast: false },
+  );
   assert.equal(result.ok, false);
   assert.equal(result.checks.length, allChecks, "collect-all must run every check");
   const node = result.checks.find((c) => c.id === "cli:node");

@@ -120,14 +120,34 @@ async function main(): Promise<void> {
       profile: opts.profile,
       // init must tolerate an invalid existing config: warn + fall back to defaults
       // so label-ensure still runs and the file is preserved rather than blocked.
-      tolerateInvalidConfig: isInit || isDoctorCommand,
-      // doctor must tolerate a gh failure so it can run its own cli/auth/repo-access
-      // checks and print the required per-check summary instead of exiting with code 2
-      // before the doctor checks ever run.
-      tolerateGhFailure: isDoctorCommand,
+      tolerateInvalidConfig: isInit,
+      // doctor (both standalone and run-start via --doctor) must tolerate a gh failure
+      // so it can run its own cli/auth/repo-access checks and print the required
+      // per-check summary instead of exiting with code 2 before the doctor checks run.
+      tolerateGhFailure: isDoctorCommand || !!opts.doctor,
     });
   } catch (err) {
     const e = err as Error;
+    if (isDoctorCommand) {
+      // Surface config parse/validation errors as a failing preflight summary (spec: #146)
+      // rather than the generic exit-2 path — a broken pipeline.yml is itself a setup
+      // defect the doctor command is designed to surface.
+      const result: PreflightResult = {
+        ok: false,
+        checks: [
+          {
+            id: "config",
+            description: "Pipeline config (.github/pipeline.yml) is valid",
+            status: "fail",
+            detail: `Invalid .github/pipeline.yml: ${e.message}`,
+            remediation: `Fix the validation errors in \`.github/pipeline.yml\` and re-run \`pipeline doctor\`.`,
+          },
+        ],
+        ranAt: new Date().toISOString(),
+      };
+      console.log(formatDoctorSummary(result));
+      process.exit(1);
+    }
     console.error(`pipeline: ${e.message}`);
     process.exit(2);
   }
@@ -160,40 +180,65 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Resolve N → issue number.
+  // ---- Mode dispatch (bypass paths) ----
+  // Status, unblock, and override resolve their own issue number and bypass the
+  // run-start preflight gate: status is read-only, and unblock/override are recovery
+  // actions for a stuck run (blocking them with a preflight failure would prevent
+  // recovery).
+  if (opts.status) {
+    let issueNumber: number;
+    try {
+      issueNumber = await resolveIssueNumber(cfg, number);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runStatus(cfg, issueNumber);
+    return;
+  }
+  if (opts.unblock !== undefined) {
+    let issueNumber: number;
+    try {
+      issueNumber = await resolveIssueNumber(cfg, number);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runUnblock(cfg, issueNumber, opts.unblock);
+    return;
+  }
+  if (opts.override !== undefined) {
+    let issueNumber: number;
+    try {
+      issueNumber = await resolveIssueNumber(cfg, number);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runOverride(cfg, issueNumber, opts.override, opts);
+    return;
+  }
+
+  // Run-start preflight (#146): runs BEFORE issue/PR resolution so that a broken
+  // gh/auth/repo-access environment is caught and reported by the doctor summary
+  // rather than a generic issue-resolution error. Opt-in via `doctor.runOnStart`
+  // config or the `--doctor` flag. A failing preflight aborts before planning;
+  // no planning/implementation/review tokens are consumed.
+  const gate = await runStartPreflightGate(cfg, opts);
+  if (!gate.proceed) {
+    process.exit(1);
+  }
+
+  // Resolve N → issue number (after preflight so env is confirmed healthy).
   let issueNumber: number;
   try {
     issueNumber = await resolveIssueNumber(cfg, number);
   } catch (err) {
     const e = err as Error;
     console.error(`pipeline: ${e.message}`);
-    process.exit(1);
-  }
-
-  // ---- Mode dispatch ----
-  if (opts.status) {
-    await runStatus(cfg, issueNumber);
-    return;
-  }
-  // Recovery actions (unblock, override) bypass the run-start gate — they act on an
-  // already-running pipeline where the environment is assumed set up, and blocking
-  // them with a preflight failure would prevent recovery from a stuck run.
-  if (opts.unblock !== undefined) {
-    await runUnblock(cfg, issueNumber, opts.unblock);
-    return;
-  }
-  if (opts.override !== undefined) {
-    await runOverride(cfg, issueNumber, opts.override, opts);
-    return;
-  }
-
-  // Run-start preflight (#146): opt-in via `doctor.runOnStart` config or the
-  // `--doctor` flag. Runs BEFORE label initialisation so a failing environment
-  // does not result in unnecessary GitHub label mutations. A failing preflight
-  // aborts the advance before planning; no planning/implementation/review tokens
-  // are consumed.
-  const gate = await runStartPreflightGate(cfg, opts);
-  if (!gate.proceed) {
     process.exit(1);
   }
 
