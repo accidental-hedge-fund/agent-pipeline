@@ -35,7 +35,7 @@ import {
   partitionFindings,
   type PartitionResult,
 } from "../review-policy.ts";
-import { recordReview } from "../evidence-bundle.ts";
+import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
 import type {
   BlockerKind,
   Outcome,
@@ -607,6 +607,14 @@ async function invokePromptHarnessReview(
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
     : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext });
+  if (opts.stateDir) {
+    await recordPrompt(
+      opts.stateDir,
+      issueNumber,
+      `review-${round}`,
+      makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", cfg.harnesses.reviewer, prompt),
+    ).catch(() => {});
+  }
   return invoke(cfg.harnesses.reviewer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
     model: opts.model ?? cfg.models.review,

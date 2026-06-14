@@ -7,11 +7,15 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   advance,
   isPipelineInternalCommit,
   type AdvancePreMergeDeps,
 } from "../scripts/stages/pre_merge.ts";
+import { readBundle } from "../scripts/evidence-bundle.ts";
 import type { PipelineConfig, Stage } from "../scripts/types.ts";
 
 const SHA_HEAD = "2222222222222222222222222222222222222222";
@@ -133,6 +137,47 @@ test("pre-merge: post-CI conflict is caught by fresh Step 2 fetch, not stale pre
   assert.equal(out.reason, "rebase-resolved; CI re-running");
   assert.equal(rebaseCalled, true, "tryRebaseAndPush must be invoked for the post-CI conflict");
   assert.equal(getPrDetailCalls, 2, "getPrDetail called once before CI and once after CI passes");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 7 regression: stateDir wired into advance — CI check recorded
+// ---------------------------------------------------------------------------
+
+test("pre-merge: CI check result recorded in evidence bundle when stateDir provided (finding 7)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const dir = await mkdtemp(join(tmpdir(), "pre-merge-evidence-test-"));
+  try {
+    const SHA = "3333333333333333333333333333333333333333";
+    const PR = 88;
+
+    const deps: AdvancePreMergeDeps = {
+      getPrForIssue: async () => PR,
+      getIssueDetail: async () => ({ comments: [] }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>>,
+      getPrDetail: async () => ({ head_sha: SHA, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>,
+      getPrCommits: async () => [],
+      getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
+      getForIssue: async () => null, // no worktree → archive + spec gates skip
+      postComment: async () => {},
+      transition: async () => {},
+      setBlocked: async () => {},
+    };
+
+    await advance(makeCfg(false), 88, { stateDir: dir }, deps);
+
+    const bundle = await readBundle(dir, 88);
+    assert.ok(bundle, "evidence bundle must be created by advance when stateDir provided");
+    const preMerge = bundle!.stages.find((s) => s.stage === "pre-merge");
+    // The orchestrator records stage enter/exit; CI command appears via recordCommand inside advance.
+    // Without a worktree there is no archive push or rebase, so only the CI check is recorded.
+    const ciCmd = bundle!.stages
+      .flatMap((s) => s.commands)
+      .find((c) => c.cmd.startsWith("gh pr checks"));
+    assert.ok(ciCmd, "gh pr checks command must be recorded in evidence bundle");
+    assert.equal(ciCmd!.exitCode, 0, "passed CI checks must have exitCode 0");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

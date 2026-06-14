@@ -26,7 +26,7 @@ The evidence bundle SHALL contain the following identity fields, set at creation
 ---
 
 ### Requirement: Bundle records stage transitions incrementally
-For each pipeline stage, the bundle SHALL record: `stage` (the stage name string), `enteredAt` (ISO 8601 timestamp when the stage handler was entered), `exitedAt` (ISO 8601 timestamp when the stage handler returned), `outcome` (one of `"advanced"`, `"blocked"`, `"skipped"`, or `"error"`), `commits` (array of commit SHA strings produced during the stage), and `commands` (array of `CommandRecord` objects).
+For each pipeline stage, the bundle SHALL record: `stage` (the stage name string), `enteredAt` (ISO 8601 timestamp when the stage handler was entered), `exitedAt` (ISO 8601 timestamp when the stage handler returned), `outcome` (one of `"advanced"`, `"blocked"`, `"skipped"`, or `"error"`), `commits` (array of commit SHA strings produced during the stage), `commands` (array of `CommandRecord` objects), and `prompts` (array of `PromptRecord` objects recorded at each harness invocation).
 
 #### Scenario: stage entry recorded
 - **WHEN** a stage handler calls `recordStage()` with `{ stage, enteredAt }`
@@ -40,6 +40,28 @@ For each pipeline stage, the bundle SHALL record: `stage` (the stage name string
 #### Scenario: multiple stages recorded in order
 - **WHEN** stages `planning` → `review` → `pre-merge` each call `recordStage()`
 - **THEN** the bundle `stages` array SHALL contain entries for all three stages in insertion order
+
+---
+
+### Requirement: Bundle records compact prompt/context metadata per harness invocation
+Each harness prompt sent during a review or fix stage SHALL be recorded as a `PromptRecord` appended to that stage's `prompts` array. A `PromptRecord` SHALL contain: `kind` (short label for what the prompt does, e.g. `"review-standard"`), `harness` (the harness name), `hash` (8-character hex prefix of SHA-1 of the redacted prompt content), and `excerpt` (first 500 characters of the redacted prompt). The same secret-redaction rules that apply to `CommandRecord` SHALL apply to `PromptRecord`. Every `StageRecord` SHALL initialize with an empty `prompts` array.
+
+#### Scenario: review prompt recorded
+- **WHEN** `invokePromptHarnessReview()` is called with `opts.stateDir` set
+- **THEN** a `PromptRecord` SHALL be appended to the `review-N` stage entry before `invoke()` is called
+- **AND** `kind` SHALL be `"review-standard"` for round 1 and `"review-adversarial"` for round 2
+
+#### Scenario: fix prompt recorded
+- **WHEN** `advanceFix()` calls `buildFixPrompt()` and `opts.stateDir` is set
+- **THEN** a `PromptRecord` SHALL be appended to the `fix-N` stage entry before `invoke()` is called
+
+#### Scenario: prompt excerpt capped at 500 characters
+- **WHEN** a prompt exceeds 500 characters
+- **THEN** `excerpt` SHALL contain only the first 500 characters of the redacted prompt
+
+#### Scenario: no raw secret values in prompt record
+- **WHEN** a prompt contains a GitHub token or env var value matching the secret pattern
+- **THEN** those values SHALL be replaced with `[REDACTED]` in both `hash` input and `excerpt`
 
 ---
 

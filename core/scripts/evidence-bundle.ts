@@ -12,6 +12,7 @@
 // four allowed fields survive — so raw env vars, tokens, or secrets can never
 // reach the bundle through this path.
 
+import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -19,6 +20,7 @@ import {
   type CommandRecord,
   type EvidenceBundle,
   type OverrideRecord,
+  type PromptRecord,
   type RecoveryRecord,
   type ReviewRecord,
   type StageRecord,
@@ -156,7 +158,12 @@ export async function createBundle(
   return bundle;
 }
 
-/** Upsert a stage entry by name: create it on first sight, merge fields after. */
+/** Upsert a stage entry: create or update the currently-open entry for the stage.
+ *
+ * "Open" means the entry has no `exitedAt` yet. On a second visit to the same
+ * stage (e.g. review-1 → fix-1 → review-1), the first visit's entry is already
+ * closed, so a new entry is appended for the second visit. This preserves the
+ * full convergence history instead of overwriting the earlier transition. */
 export async function recordStage(
   stateDir: string,
   issue: number,
@@ -164,7 +171,14 @@ export async function recordStage(
   deps: BundleDeps = defaultDeps,
 ): Promise<void> {
   const bundle = await loadForUpdate(stateDir, issue, deps);
-  let entry = bundle.stages.find((s) => s.stage === update.stage);
+  // Find the last open (exitedAt === null) entry for this stage name.
+  let entry: StageRecord | undefined;
+  for (let i = bundle.stages.length - 1; i >= 0; i--) {
+    if (bundle.stages[i].stage === update.stage && bundle.stages[i].exitedAt === null) {
+      entry = bundle.stages[i];
+      break;
+    }
+  }
   if (!entry) {
     entry = {
       stage: update.stage,
@@ -173,6 +187,7 @@ export async function recordStage(
       outcome: null,
       commits: [],
       commands: [],
+      prompts: [],
     };
     bundle.stages.push(entry);
   }
@@ -238,12 +253,59 @@ export async function recordCommand(
       outcome: null,
       commits: [],
       commands: [],
+      prompts: [],
     };
     bundle.stages.push(entry);
   }
   entry.commands.push(
     makeCommandRecord(cmd.cmd, cmd.exitCode, cmd.durationMs, cmd.outputExcerpt),
   );
+  await writeBundle(stateDir, issue, bundle, deps);
+}
+
+/** Build a sanitized `PromptRecord`. The prompt content is passed through the
+ *  same secret-redaction path as `CommandRecord`, and then hashed (SHA-1 prefix)
+ *  and excerpted so no raw secret can survive in the bundle. */
+export function makePromptRecord(kind: string, harness: string, prompt: string): PromptRecord {
+  const redacted = redactSecrets(prompt);
+  return {
+    kind,
+    harness,
+    hash: createHash("sha1").update(redacted).digest("hex").slice(0, 8),
+    excerpt: redacted.slice(0, OUTPUT_EXCERPT_CAP),
+  };
+}
+
+/** Append a prompt record to the currently-open stage entry (creating the entry
+ *  if absent). Mirrors the "last-open" logic of {@link recordStage}. */
+export async function recordPrompt(
+  stateDir: string,
+  issue: number,
+  stageName: string,
+  record: PromptRecord,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  let entry: StageRecord | undefined;
+  for (let i = bundle.stages.length - 1; i >= 0; i--) {
+    if (bundle.stages[i].stage === stageName && bundle.stages[i].exitedAt === null) {
+      entry = bundle.stages[i];
+      break;
+    }
+  }
+  if (!entry) {
+    entry = {
+      stage: stageName,
+      enteredAt: null,
+      exitedAt: null,
+      outcome: null,
+      commits: [],
+      commands: [],
+      prompts: [],
+    };
+    bundle.stages.push(entry);
+  }
+  entry.prompts.push(record);
   await writeBundle(stateDir, issue, bundle, deps);
 }
 

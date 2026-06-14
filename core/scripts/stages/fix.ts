@@ -27,6 +27,7 @@ import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
+import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
@@ -113,6 +114,14 @@ export async function advanceFix(
     pipelineRunId,
     specContext,
   });
+  if (opts.stateDir) {
+    await recordPrompt(
+      opts.stateDir,
+      issueNumber,
+      stage,
+      makePromptRecord(`fix-${round}`, harness, prompt),
+    ).catch(() => {});
+  }
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
     model: opts.model ?? cfg.models.fix,

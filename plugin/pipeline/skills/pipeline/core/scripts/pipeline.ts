@@ -713,21 +713,37 @@ async function runAdvance(
           enteredAt: evidenceTimestamp(),
         }).catch(() => {});
       }
-      const out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir);
+      let out: Outcome;
+      try {
+        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir);
+      } catch (err) {
+        // Stage threw — record an error outcome before rethrowing so the bundle
+        // never shows a perpetually in-progress stage.
+        if (stateDir) {
+          await recordStage(stateDir, issueNumber, {
+            stage: auditStage,
+            exitedAt: evidenceTimestamp(),
+            outcome: "error",
+            commits: [],
+          }).catch(() => {});
+        }
+        throw err;
+      }
 
       // Post-dispatch: collect commits produced during this stage (before recording exit).
       if (stateDir) {
         let stageCommits: string[] = [];
-        if (headBeforeDispatch) {
-          const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
-          if (wtAfter) {
-            const logResult = await gitInWorktree(
-              wtAfter.path,
-              ["log", "--pretty=format:%H", `${headBeforeDispatch}..HEAD`],
-              { ignoreFailure: true },
-            );
-            stageCommits = logResult.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-          }
+        const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
+        if (wtAfter) {
+          // If no worktree existed before dispatch (e.g., planning creates it), fall
+          // back to origin/<base_branch> so all planning commits are captured.
+          const rangeStart = headBeforeDispatch || `origin/${cfg.base_branch}`;
+          const logResult = await gitInWorktree(
+            wtAfter.path,
+            ["log", "--pretty=format:%H", `${rangeStart}..HEAD`],
+            { ignoreFailure: true },
+          );
+          stageCommits = logResult.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
         }
         await recordStage(stateDir, issueNumber, {
           stage: auditStage,
@@ -755,11 +771,19 @@ async function runAdvance(
       // --dry-run (stateDir undefined): no local write, no GitHub comment.
       if (stateDir) {
         try {
-          // Refresh PR/branch — may have been null at bundle creation if planning hadn't run yet.
+          // Refresh PR/branch — may have been null at bundle creation if planning
+          // hadn't run yet. Only patch non-null values: deployReady removes the
+          // worktree before this block runs, so latestBranch is null on a successful
+          // ready-to-deploy run. Overwriting with null would erase the captured branch.
           const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
           const latestWt = await getForIssue(cfg, issueNumber).catch(() => null);
           const latestBranch = latestWt ? branchName(issueNumber, latestWt.slug) : null;
-          await patchBundleIdentity(stateDir, issueNumber, { pr: latestPr, branch: latestBranch }).catch(() => {});
+          const identityPatch: { pr?: number | null; branch?: string | null } = {};
+          if (latestPr !== null) identityPatch.pr = latestPr;
+          if (latestBranch !== null) identityPatch.branch = latestBranch;
+          if (identityPatch.pr !== undefined || identityPatch.branch !== undefined) {
+            await patchBundleIdentity(stateDir, issueNumber, identityPatch).catch(() => {});
+          }
           const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
         } catch {
@@ -863,7 +887,7 @@ async function dispatch(
       // exit the loop, requiring the user to re-invoke. Our skill is
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
-      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId });
+      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
     case "eval-gate":
       return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":

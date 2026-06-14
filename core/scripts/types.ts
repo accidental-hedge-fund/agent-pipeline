@@ -384,8 +384,21 @@ export interface CommandRecord {
 /** Terminal disposition of a stage handler for this run. */
 export type StageOutcome = "advanced" | "blocked" | "skipped" | "error";
 
+/** Compact metadata about a harness prompt sent during a stage. Tokens/secrets
+ *  are excluded via the same redaction path as `CommandRecord`. */
+export interface PromptRecord {
+  /** Short label for what this prompt does: "review-standard", "review-adversarial", "fix-1", etc. */
+  kind: string;
+  /** Harness that received the prompt ("claude" or "codex"). */
+  harness: string;
+  /** 8-char hex prefix of SHA-1 of the redacted prompt content — stable fingerprint. */
+  hash: string;
+  /** First 500 characters of the redacted prompt — enough context to diagnose review divergence. */
+  excerpt: string;
+}
+
 /** One stage's slice of the run: when it was entered/exited, how it ended, the
- *  commits it produced, and the commands it ran. */
+ *  commits it produced, the commands it ran, and the prompts it sent to harnesses. */
 export interface StageRecord {
   stage: string;
   enteredAt: string | null;
@@ -393,6 +406,7 @@ export interface StageRecord {
   outcome: StageOutcome | null;
   commits: string[];
   commands: CommandRecord[];
+  prompts: PromptRecord[];
 }
 
 /** Summary of one review round's verdict. `findingCounts` maps severity → count. */

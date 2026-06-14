@@ -154,6 +154,15 @@ export async function advanceEval(
         output: `[eval-gate stage timeout (${timeoutSec}s) exceeded before attempt ${attempt}]`,
         durationSec: timeoutSec,
       };
+      // Record the timeout as a failed attempt before breaking.
+      if (opts.stateDir) {
+        await recordCommand(
+          opts.stateDir,
+          issueNumber,
+          "eval-gate",
+          makeCommandRecord(cfg.eval_gate.command, 1, 0, lastResult.output),
+        ).catch(() => {});
+      }
       break;
     }
 
@@ -163,29 +172,28 @@ export async function advanceEval(
       console.log(`[pipeline] #${issueNumber}: eval-gate running \`${cfg.eval_gate.command}\``);
     }
     lastResult = await runFn(cfg.eval_gate.command, wt.path, remainingSec);
+
+    // Record each attempt immediately so retries are not collapsed into one record.
+    if (opts.stateDir) {
+      await recordCommand(
+        opts.stateDir,
+        issueNumber,
+        "eval-gate",
+        makeCommandRecord(
+          cfg.eval_gate.command,
+          lastResult.passed ? 0 : 1,
+          lastResult.durationSec * 1000,
+          lastResult.output,
+        ),
+      ).catch(() => {});
+    }
+
     if (lastResult.passed) break;
   }
 
   const result = lastResult!;
   const outcome = result.passed ? "PASS" : "FAIL";
   const excerpt = truncate(result.output, MAX_COMMENT_OUTPUT);
-
-  // Evidence bundle (#147): record the eval command run. `EvalRunResult` reports
-  // pass/fail, not an exit code, so synthesize 0/1. Best-effort + gated on
-  // opts.stateDir, so unit tests (which don't inject one) have no fs side effects.
-  if (opts.stateDir) {
-    await recordCommand(
-      opts.stateDir,
-      issueNumber,
-      "eval-gate",
-      makeCommandRecord(
-        cfg.eval_gate.command,
-        result.passed ? 0 : 1,
-        result.durationSec * 1000,
-        result.output,
-      ),
-    ).catch(() => {});
-  }
 
   // Always record the result on the issue.
   const commentBody = buildEvalComment({

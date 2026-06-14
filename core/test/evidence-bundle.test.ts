@@ -9,12 +9,14 @@ import {
   finalizeBundle,
   formatSummary,
   makeCommandRecord,
+  makePromptRecord,
   markNotified,
   OUTPUT_EXCERPT_CAP,
   patchBundleIdentity,
   readBundle,
   recordCommand,
   recordOverride,
+  recordPrompt,
   recordRecovery,
   recordReview,
   recordStage,
@@ -462,6 +464,128 @@ test("recordStage: commits field records SHAs and is preserved across exit updat
   const b = readState(files);
   assert.deepEqual(b.stages[0].commits, shas, "commits SHAs must be recorded");
   assert.equal(b.stages.length, 1, "no duplicate stage entry");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4 regression: repeated stage visits append; earlier data is preserved
+// ---------------------------------------------------------------------------
+
+test("recordStage: second visit to same stage appends a new entry, first entry preserved", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+
+  // First visit: review-1 enter + exit
+  await recordStage(STATE, ISSUE, { stage: "review-1", enteredAt: "2026-06-14T20:00:00Z" }, deps);
+  await recordStage(STATE, ISSUE, { stage: "review-1", exitedAt: "2026-06-14T20:05:00Z", outcome: "blocked" }, deps);
+  // Intervening fix-1 stage
+  await recordStage(STATE, ISSUE, { stage: "fix-1", enteredAt: "2026-06-14T20:06:00Z" }, deps);
+  await recordStage(STATE, ISSUE, { stage: "fix-1", exitedAt: "2026-06-14T20:10:00Z", outcome: "advanced" }, deps);
+  // Second visit: review-1 again
+  await recordStage(STATE, ISSUE, { stage: "review-1", enteredAt: "2026-06-14T20:11:00Z" }, deps);
+  await recordStage(STATE, ISSUE, { stage: "review-1", exitedAt: "2026-06-14T20:16:00Z", outcome: "advanced" }, deps);
+
+  const b = readState(files);
+  const review1Entries = b.stages.filter((s) => s.stage === "review-1");
+  assert.equal(review1Entries.length, 2, "second visit must append a new entry");
+  assert.equal(review1Entries[0].outcome, "blocked", "first visit outcome must be preserved");
+  assert.equal(review1Entries[0].exitedAt, "2026-06-14T20:05:00Z", "first visit exitedAt must be preserved");
+  assert.equal(review1Entries[1].outcome, "advanced", "second visit outcome must be set");
+  assert.equal(review1Entries[1].enteredAt, "2026-06-14T20:11:00Z", "second visit enteredAt must be set");
+  // fix-1 entry must be between the two review-1 entries in insertion order
+  const stages = b.stages.map((s) => s.stage);
+  assert.deepEqual(stages, ["review-1", "fix-1", "review-1"], "insertion order must be preserved");
+});
+
+test("recordStage: exit update on open entry does not create a duplicate", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+
+  await recordStage(STATE, ISSUE, { stage: "review-2", enteredAt: "2026-06-14T21:00:00Z" }, deps);
+  await recordStage(STATE, ISSUE, { stage: "review-2", exitedAt: "2026-06-14T21:10:00Z", outcome: "advanced" }, deps);
+
+  const b = readState(files);
+  assert.equal(b.stages.length, 1, "no duplicate from enter+exit on same visit");
+  assert.equal(b.stages[0].enteredAt, "2026-06-14T21:00:00Z");
+  assert.equal(b.stages[0].exitedAt, "2026-06-14T21:10:00Z");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 regression: PromptRecord schema + recordPrompt API
+// ---------------------------------------------------------------------------
+
+test("makePromptRecord: returns four required fields; hash is 8 hex chars; excerpt capped at 500", () => {
+  const longPrompt = "You are a code reviewer. ".repeat(100); // > 500 chars
+  const rec = makePromptRecord("review-standard", "claude", longPrompt);
+  assert.deepEqual(Object.keys(rec).sort(), ["excerpt", "harness", "hash", "kind"]);
+  assert.equal(rec.kind, "review-standard");
+  assert.equal(rec.harness, "claude");
+  assert.match(rec.hash, /^[0-9a-f]{8}$/, "hash must be 8 lowercase hex chars");
+  assert.equal(rec.excerpt.length, OUTPUT_EXCERPT_CAP, "excerpt must be capped at 500");
+});
+
+test("makePromptRecord: two identical prompts produce the same hash", () => {
+  const prompt = "Fix the following findings.";
+  const r1 = makePromptRecord("fix-1", "codex", prompt);
+  const r2 = makePromptRecord("fix-1", "codex", prompt);
+  assert.equal(r1.hash, r2.hash, "identical prompts must hash identically");
+});
+
+test("makePromptRecord: two different prompts produce different hashes", () => {
+  const r1 = makePromptRecord("review-standard", "claude", "Prompt A");
+  const r2 = makePromptRecord("review-adversarial", "claude", "Prompt B");
+  assert.notEqual(r1.hash, r2.hash, "different prompts must produce different hashes");
+});
+
+test("makePromptRecord: redacts token patterns from excerpt", () => {
+  const fakeToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+  const rec = makePromptRecord("review-standard", "claude", `Use token ${fakeToken} for auth`);
+  assert.ok(!rec.excerpt.includes(fakeToken), "token must not appear in excerpt");
+  assert.ok(rec.excerpt.includes("[REDACTED]"), "excerpt must contain redaction marker");
+});
+
+test("recordPrompt: appends prompt record to open stage entry", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  await recordStage(STATE, ISSUE, { stage: "review-1", enteredAt: "2026-06-14T20:00:00Z" }, deps);
+  const rec = makePromptRecord("review-standard", "claude", "You are a reviewer. Review this diff.");
+  await recordPrompt(STATE, ISSUE, "review-1", rec, deps);
+  const b = readState(files);
+  const entry = b.stages.find((s) => s.stage === "review-1")!;
+  assert.ok(entry, "review-1 stage entry must exist");
+  assert.equal(entry.prompts.length, 1, "one prompt record must be appended");
+  assert.equal(entry.prompts[0].kind, "review-standard");
+  assert.equal(entry.prompts[0].harness, "claude");
+  assert.match(entry.prompts[0].hash, /^[0-9a-f]{8}$/);
+});
+
+test("recordPrompt: second prompt for same stage appends (does not overwrite)", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  await recordStage(STATE, ISSUE, { stage: "fix-1", enteredAt: "2026-06-14T20:00:00Z" }, deps);
+  await recordPrompt(STATE, ISSUE, "fix-1", makePromptRecord("fix-1", "codex", "First prompt"), deps);
+  await recordPrompt(STATE, ISSUE, "fix-1", makePromptRecord("fix-1", "codex", "Second prompt after revision"), deps);
+  const b = readState(files);
+  const entry = b.stages.find((s) => s.stage === "fix-1")!;
+  assert.equal(entry.prompts.length, 2, "both prompt records must be appended");
+});
+
+test("recordPrompt: creates stage entry if absent (recreate-if-missing)", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  // No recordStage call — entry is absent.
+  await recordPrompt(STATE, ISSUE, "review-2", makePromptRecord("review-adversarial", "codex", "Adversarial prompt"), deps);
+  const b = readState(files);
+  const entry = b.stages.find((s) => s.stage === "review-2")!;
+  assert.ok(entry, "entry must be created when absent");
+  assert.equal(entry.prompts.length, 1);
+});
+
+test("recordStage: new stage entry always starts with empty prompts array", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  await recordStage(STATE, ISSUE, { stage: "planning", enteredAt: "t1" }, deps);
+  const b = readState(files);
+  assert.deepEqual(b.stages[0].prompts, [], "new stage entry must have empty prompts array");
 });
 
 // ---------------------------------------------------------------------------
