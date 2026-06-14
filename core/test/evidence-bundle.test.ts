@@ -11,6 +11,7 @@ import {
   makeCommandRecord,
   markNotified,
   OUTPUT_EXCERPT_CAP,
+  patchBundleIdentity,
   readBundle,
   recordCommand,
   recordOverride,
@@ -221,6 +222,39 @@ test("recordCommand: strips any extra/secret-bearing field a caller smuggles in"
   assert.ok(!raw.includes("ghp_abcdef"), "token must not appear in the bundle");
 });
 
+test("makeCommandRecord: redacts known GitHub token patterns from cmd and outputExcerpt", () => {
+  const fakeToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+  const rec = makeCommandRecord(
+    `curl -H "Authorization: token ${fakeToken}" https://api.github.com`,
+    0,
+    100,
+    `Authenticated as user — token ${fakeToken} accepted`,
+  );
+  assert.ok(!rec.cmd.includes(fakeToken), "token must not appear in cmd");
+  assert.ok(!rec.outputExcerpt.includes(fakeToken), "token must not appear in outputExcerpt");
+  assert.ok(rec.cmd.includes("[REDACTED]"), "cmd must contain redaction marker");
+  assert.ok(rec.outputExcerpt.includes("[REDACTED]"), "outputExcerpt must contain redaction marker");
+});
+
+test("makeCommandRecord: redacts env var values whose name matches secret pattern", () => {
+  const secretValue = "very_secret_bearer_value_xyz_abc";
+  const saved = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = secretValue;
+  try {
+    const rec = makeCommandRecord(
+      `deploy --auth ${secretValue}`,
+      0,
+      100,
+      `Authorization: Bearer ${secretValue}`,
+    );
+    assert.ok(!rec.cmd.includes(secretValue), "secret env value must not appear in cmd");
+    assert.ok(!rec.outputExcerpt.includes(secretValue), "secret env value must not appear in outputExcerpt");
+  } finally {
+    if (saved === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = saved;
+  }
+});
+
 test("recordCommand: output excerpt capped at 500 even when passed oversized", async () => {
   const { files, deps } = memFs();
   await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
@@ -378,6 +412,56 @@ test("formatSummary: partial run (no finalState) is labeled as such", () => {
     notifiedAt: null,
   };
   assert.match(formatSummary(partial), /partial run/i);
+});
+
+// ---------------------------------------------------------------------------
+// patchBundleIdentity
+// ---------------------------------------------------------------------------
+
+test("patchBundleIdentity: updates pr and branch without touching other fields", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: ["claude"] }, deps);
+  await recordStage(STATE, ISSUE, { stage: "planning", enteredAt: "t1" }, deps);
+
+  await patchBundleIdentity(STATE, ISSUE, { pr: 456, branch: "pipeline/147-fix" }, deps);
+
+  const b = readState(files);
+  assert.equal(b.pr, 456, "pr must be updated");
+  assert.equal(b.branch, "pipeline/147-fix", "branch must be updated");
+  // Other fields must be untouched.
+  assert.deepEqual(b.stages.map((s) => s.stage), ["planning"], "stages must be preserved");
+  assert.deepEqual(b.harnesses, ["claude"], "harnesses must be preserved");
+  assert.equal(b.finalState, null, "finalState must remain null");
+  assert.equal(b.runId, "r", "runId must be preserved");
+});
+
+test("patchBundleIdentity: can clear pr to null and leave branch alone", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: 99, branch: "pipeline/147-x", harnesses: [] }, deps);
+  await patchBundleIdentity(STATE, ISSUE, { pr: null }, deps);
+  const b = readState(files);
+  assert.equal(b.pr, null, "pr must be set to null");
+  assert.equal(b.branch, "pipeline/147-x", "branch must be unaffected when not passed");
+});
+
+// ---------------------------------------------------------------------------
+// recordStage: commits field
+// ---------------------------------------------------------------------------
+
+test("recordStage: commits field records SHAs and is preserved across exit update", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+
+  const shas = [
+    "abc123def456abc123def456abc123def456abc1",
+    "def456abc123def456abc123def456abc123def4",
+  ];
+  await recordStage(STATE, ISSUE, { stage: "planning", enteredAt: "t1" }, deps);
+  await recordStage(STATE, ISSUE, { stage: "planning", exitedAt: "t2", outcome: "advanced", commits: shas }, deps);
+
+  const b = readState(files);
+  assert.deepEqual(b.stages[0].commits, shas, "commits SHAs must be recorded");
+  assert.equal(b.stages.length, 1, "no duplicate stage entry");
 });
 
 // ---------------------------------------------------------------------------

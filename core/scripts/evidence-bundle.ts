@@ -183,6 +183,26 @@ export async function recordStage(
   await writeBundle(stateDir, issue, bundle, deps);
 }
 
+// Patterns for token formats that must never appear in a bundle.
+const SECRET_VALUE_RE = /(ghp|ghs|gho|ghr|github_pat)_[A-Za-z0-9_]{10,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}/g;
+
+// Env-var names whose values are treated as secrets and redacted.
+const SECRET_NAME_RE = /TOKEN|SECRET|PASSWORD|APIKEY|API_KEY|_PASS$|_KEY$/i;
+
+/** Replace known secret patterns (token formats + env var values) with `[REDACTED]`.
+ *  Applied to both `cmd` and raw output before recording. */
+function redactSecrets(text: string): string {
+  // 1. Redact by token format pattern (no env dependency — catches embedded tokens).
+  let result = text.replace(SECRET_VALUE_RE, "[REDACTED]");
+  // 2. Redact values of env vars whose name looks like a secret.
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value && value.length >= 8 && SECRET_NAME_RE.test(name)) {
+      result = result.split(value).join("[REDACTED]");
+    }
+  }
+  return result;
+}
+
 /** Build a sanitized `CommandRecord` — the single chokepoint that enforces the
  *  four-field shape and the 500-char output cap (sensitive-value exclusion). */
 export function makeCommandRecord(
@@ -192,10 +212,10 @@ export function makeCommandRecord(
   output: string,
 ): CommandRecord {
   return {
-    cmd,
+    cmd: redactSecrets(cmd),
     exitCode,
     durationMs: Math.round(durationMs),
-    outputExcerpt: (output ?? "").slice(0, OUTPUT_EXCERPT_CAP),
+    outputExcerpt: redactSecrets(output ?? "").slice(0, OUTPUT_EXCERPT_CAP),
   };
 }
 
@@ -275,6 +295,21 @@ export async function finalizeBundle(
   bundle.finalizedAt = nowIso();
   await writeBundle(stateDir, issue, bundle, deps);
   return bundle;
+}
+
+/** Refresh identity fields that may have been null at bundle creation (e.g. `pr`
+ *  and `branch` are unknown before planning creates the worktree and PR).
+ *  Only the supplied fields are touched; everything else is preserved. */
+export async function patchBundleIdentity(
+  stateDir: string,
+  issue: number,
+  patch: { pr?: number | null; branch?: string | null },
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  if (patch.pr !== undefined) bundle.pr = patch.pr;
+  if (patch.branch !== undefined) bundle.branch = patch.branch;
+  await writeBundle(stateDir, issue, bundle, deps);
 }
 
 /** Stamp the bundle with the path-notification timestamp (orchestrator calls this

@@ -35,12 +35,13 @@ import {
 import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
-import { branchName, getForIssue, sweepMergedWorktrees } from "./worktree.ts";
+import { branchName, getForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
 import {
   bundlePath,
   createBundle,
   finalizeBundle,
   markNotified,
+  patchBundleIdentity,
   printSummary,
   readBundle,
   recordOverride,
@@ -675,12 +676,34 @@ async function runAdvance(
         (stage === "review-2" && !cfg.steps.adversarial_review)
       ) {
         const to = reviewStageSkipTarget(cfg, stage);
+        const skipStage = evidenceStageName(stage);
+        const skipEnteredAt = evidenceTimestamp();
         await transition(cfg, issueNumber, stage, to, `${stage} step disabled in this repo's config; skipping.`);
         console.log(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
+        finalStage = to;
+        if (stateDir) {
+          await recordStage(stateDir, issueNumber, {
+            stage: skipStage,
+            enteredAt: skipEnteredAt,
+            exitedAt: evidenceTimestamp(),
+            outcome: "skipped",
+          }).catch(() => {});
+        }
         if (opts.once) break;
         continue;
+      }
+
+      // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
+      let headBeforeDispatch = "";
+      if (stateDir) {
+        const wtBefore = await getForIssue(cfg, issueNumber).catch(() => null);
+        if (wtBefore) {
+          headBeforeDispatch = (
+            await gitInWorktree(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+          ).stdout.trim();
+        }
       }
 
       const auditStage = evidenceStageName(stage);
@@ -691,11 +714,26 @@ async function runAdvance(
         }).catch(() => {});
       }
       const out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir);
+
+      // Post-dispatch: collect commits produced during this stage (before recording exit).
       if (stateDir) {
+        let stageCommits: string[] = [];
+        if (headBeforeDispatch) {
+          const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
+          if (wtAfter) {
+            const logResult = await gitInWorktree(
+              wtAfter.path,
+              ["log", "--pretty=format:%H", `${headBeforeDispatch}..HEAD`],
+              { ignoreFailure: true },
+            );
+            stageCommits = logResult.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+          }
+        }
         await recordStage(stateDir, issueNumber, {
           stage: auditStage,
           exitedAt: evidenceTimestamp(),
           outcome: evidenceOutcome(out),
+          commits: stageCommits,
         }).catch(() => {});
       }
       printOutcome(issueNumber, stage, out);
@@ -703,6 +741,7 @@ async function runAdvance(
       if (out.advanced) {
         transitions++;
         lastStage = (out as { to: Stage }).to;
+        finalStage = lastStage; // keep final-state accurate when --once breaks after an advance
       } else {
         // No advance: blocked, waiting, no-op, finalized, error → stop.
         break;
@@ -716,6 +755,11 @@ async function runAdvance(
       // --dry-run (stateDir undefined): no local write, no GitHub comment.
       if (stateDir) {
         try {
+          // Refresh PR/branch — may have been null at bundle creation if planning hadn't run yet.
+          const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+          const latestWt = await getForIssue(cfg, issueNumber).catch(() => null);
+          const latestBranch = latestWt ? branchName(issueNumber, latestWt.slug) : null;
+          await patchBundleIdentity(stateDir, issueNumber, { pr: latestPr, branch: latestBranch }).catch(() => {});
           const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
         } catch {
