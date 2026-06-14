@@ -113,7 +113,18 @@ Command stdout/stderr: truncated to 500 characters in the bundle (same cap as re
 
 ### D8: Bundle writer is a pure module — no side effects beyond file I/O
 
-**Decision**: The evidence-bundle module does not call `gh`, does not post comments itself, and does not read config. The orchestrator (`pipeline.ts`) owns the notification comment after calling `finalizeBundle()`. This keeps the module testable in isolation.
+**Decision**: The evidence-bundle module does not call `gh`, does not post comments itself, and does not read config. The orchestrator (`pipeline.ts`) owns the notification comment after calling `finalizeBundle()` (via the module's `markNotified()` to stamp `notifiedAt`). This keeps the module testable in isolation.
+
+### D9: Who calls which writer — orchestrator owns the stage lifecycle; stages own their internal events
+
+**Decision**: Split the recording responsibility:
+
+- The **orchestrator** records the stage *lifecycle* — it brackets each `dispatch()` call with `recordStage({ enteredAt })` / `recordStage({ exitedAt, outcome })`, mapping the stage's `Outcome` to the bundle outcome enum, and it records `createBundle`/`finalizeBundle`/`recordOverride` (the override reason is only available at the CLI boundary). The dispatched `ready` label is recorded under the name `planning`.
+- The **stages** record their own *internal events* — `review.ts` → `recordReview`; the test gate (`testgate.ts`) and eval gate (`eval.ts`) → `recordCommand`; `auto_recover.ts` → `recordRecovery`. These are data only the stage sees.
+
+**Why not record entry/exit inside each stage** (the literal first reading of the tasks): a single orchestrator bracket yields a gap-free per-stage timeline from one place, versus threading `recordStage` through every `transition()`/`setBlocked()` return path across seven large stage files (easy to miss a path, noisy diff). Stage names are normalized so the orchestrator's `planning`/`fix-1`/`fix-2`/`eval-gate` entries and the stages' `recordCommand` calls merge into the same entries.
+
+**Test-safety**: stage-level recording is gated on a `stateDir` the orchestrator threads through each stage's opts (mirroring the existing `pipelineRunId` threading). Unit tests that call a stage directly pass no `stateDir`, so recording is a no-op — the "no real network/git/subprocess (or fs) in unit tests" contract is preserved. Every record call at a stage or orchestrator site is also `.catch()`-wrapped: a failed read/write can never affect a label transition or the run outcome (the supplement rule).
 
 ## Risks / Trade-offs
 

@@ -34,6 +34,9 @@ export interface AdvanceFixOpts {
   model?: string;
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
+  /** Evidence-bundle run/state dir (#147); when set, the test gate records its
+   *  command runs under this round's stage. Undefined → recording disabled. */
+  stateDir?: string;
 }
 
 /** Injectable seams for {@link advanceFix} — overridable in tests. */
@@ -170,7 +173,7 @@ export async function advanceFix(
   }
 
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, stage, opts.stateDir);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage, "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };

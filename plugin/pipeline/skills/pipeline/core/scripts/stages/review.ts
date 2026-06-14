@@ -35,6 +35,7 @@ import {
   partitionFindings,
   type PartitionResult,
 } from "../review-policy.ts";
+import { recordReview } from "../evidence-bundle.ts";
 import type {
   BlockerKind,
   Outcome,
@@ -63,6 +64,9 @@ const PIPELINE_BLOCKING_KEYS_RE = /^<!-- pipeline-blocking-keys: ([0-9a-f,]*) --
 export interface AdvanceReviewOpts {
   dryRun?: boolean;
   model?: string;
+  /** Evidence-bundle run/state dir (#147); when set, each round's verdict is
+   *  recorded. Undefined → recording disabled (no fs side effects in tests). */
+  stateDir?: string;
 }
 
 /**
@@ -226,6 +230,22 @@ export async function advanceReview(
   console.log(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );
+
+  // Evidence bundle (#147): record this round's verdict summary (round, reviewed
+  // SHA, verdict, per-severity finding counts) — no raw reviewer prose. Best-effort
+  // + gated on opts.stateDir, so unit tests have no filesystem side effects.
+  if (opts.stateDir) {
+    const findingCounts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+    for (const f of verdict.findings) {
+      findingCounts[f.severity] = (findingCounts[f.severity] ?? 0) + 1;
+    }
+    await recordReview(opts.stateDir, issueNumber, {
+      round,
+      sha: commitSha,
+      verdict: verdict.verdict,
+      findingCounts,
+    }).catch(() => {});
+  }
 
   if (verdict.verdict === "approve") {
     await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));

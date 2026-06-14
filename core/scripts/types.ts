@@ -353,3 +353,94 @@ export interface ReviewVerdict {
   // (HEAD moved) and re-review instead of trusting it.
   commitSha: string;
 }
+
+// ---------------------------------------------------------------------------
+// Evidence bundle (#147) — a compact, machine-readable per-run audit artifact.
+//
+// One JSON file per run at `<stateDir>/<issue>/evidence.json`, accumulated
+// incrementally as stages execute and finalized when the run ends. It records
+// WHAT happened (stage transitions, commands, review verdicts, overrides,
+// recoveries) so a run can be debugged/handed off without stitching the story
+// from comments, commits, and logs. It is a write-only SUPPLEMENT: no pipeline
+// logic reads it to make label/blocking/routing decisions, and GitHub labels +
+// comments remain the authoritative state. Sensitive values (raw env vars,
+// tokens, secrets) are never recorded — a `CommandRecord` carries only a command
+// string, exit code, duration, and a capped output excerpt.
+// ---------------------------------------------------------------------------
+
+/** Current evidence-bundle JSON schema version. Bump on a breaking change. */
+export const EVIDENCE_SCHEMA_VERSION = 1;
+
+/** A single shell command executed by a stage. Deliberately minimal: only these
+ *  four fields are ever recorded, so no raw env value, token, or secret can leak
+ *  (#147). `outputExcerpt` is the first 500 chars of combined stdout/stderr. */
+export interface CommandRecord {
+  cmd: string;
+  exitCode: number;
+  durationMs: number;
+  outputExcerpt: string;
+}
+
+/** Terminal disposition of a stage handler for this run. */
+export type StageOutcome = "advanced" | "blocked" | "skipped" | "error";
+
+/** One stage's slice of the run: when it was entered/exited, how it ended, the
+ *  commits it produced, and the commands it ran. */
+export interface StageRecord {
+  stage: string;
+  enteredAt: string | null;
+  exitedAt: string | null;
+  outcome: StageOutcome | null;
+  commits: string[];
+  commands: CommandRecord[];
+}
+
+/** Summary of one review round's verdict. `findingCounts` maps severity → count. */
+export interface ReviewRecord {
+  round: number;
+  sha: string;
+  verdict: string;
+  findingCounts: Record<string, number>;
+}
+
+/** An operator `--override` disposition applied during the run. */
+export interface OverrideRecord {
+  key: string;
+  reason: string;
+}
+
+/** One auto-recovery event. */
+export interface RecoveryRecord {
+  trigger: string;
+  round: number;
+  at: string;
+}
+
+/** The complete per-run evidence bundle written to `<stateDir>/<issue>/evidence.json`. */
+export interface EvidenceBundle {
+  schemaVersion: number;
+  runId: string;
+  issue: number;
+  pr: number | null;
+  branch: string | null;
+  harnesses: string[];
+  stages: StageRecord[];
+  reviews: ReviewRecord[];
+  overrides: OverrideRecord[];
+  recoveries: RecoveryRecord[];
+  finalState: string | null;
+  finalizedAt: string | null;
+  /** ISO timestamp set once the PR/issue path-notification comment is posted;
+   *  null until then. Guards against a duplicate comment on a re-finalize. */
+  notifiedAt: string | null;
+}
+
+/** Partial stage update accepted by `recordStage` — `stage` identifies the entry
+ *  to upsert; the other fields are merged in when present. */
+export interface StageUpdate {
+  stage: string;
+  enteredAt?: string;
+  exitedAt?: string;
+  outcome?: StageOutcome;
+  commits?: string[];
+}

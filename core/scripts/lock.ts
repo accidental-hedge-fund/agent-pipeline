@@ -129,6 +129,18 @@ export async function withLock<T>(
   }
 }
 
+/**
+ * Per-domain run/state directory (#147). Shares the `/tmp/pipeline-{domain}`
+ * namespace already owned by the lock + kill-switch files; the trailing path
+ * component is a directory (no extension), so it never collides with the
+ * `pipeline-{domain}.lock` / `pipeline-{domain}-{N}.lock` / `.disabled` files.
+ * Per-run, issue-scoped artifacts (e.g. the evidence bundle) live under
+ * `<runStateDir>/<issueNumber>/`.
+ */
+export function runStateDir(domain: string): string {
+  return `/tmp/pipeline-${domain}`;
+}
+
 /** Kill switch path. If this file exists, the pipeline refuses to run. */
 export function killSwitchPath(domain: string): string {
   return `/tmp/pipeline-${domain}.disabled`;

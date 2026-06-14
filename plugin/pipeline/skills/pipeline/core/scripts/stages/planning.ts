@@ -54,6 +54,9 @@ export interface AdvanceOpts {
   model?: string;
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
+  /** Evidence-bundle run/state dir (#147); when set, the test gate records its
+   *  command runs under the "planning" stage. Undefined → recording disabled. */
+  stateDir?: string;
 }
 
 export async function advance(
@@ -269,7 +272,7 @@ export async function advance(
   }
 
   // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, "planning", opts.stateDir);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
@@ -642,7 +645,7 @@ async function advanceOpenspec(
     }
   }
   // ---- test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, "planning", opts.stateDir);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };

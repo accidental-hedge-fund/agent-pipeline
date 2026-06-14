@@ -12,6 +12,7 @@ import {
   removeLabel,
 } from "../gh.ts";
 import { getForIssue, hasCommitsAhead, removeWorktree } from "../worktree.ts";
+import { recordRecovery } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 
 const RECOVERY_MARKER = "## Pipeline: Auto-Recovery";
@@ -19,6 +20,9 @@ const RECOVERY_MARKER = "## Pipeline: Auto-Recovery";
 export async function tryAutoRecover(
   cfg: PipelineConfig,
   issueNumber: number,
+  // Evidence-bundle run/state dir (#147); when set, each recovery event is
+  // recorded. Undefined → recording disabled (no fs side effects in tests).
+  stateDir?: string,
 ): Promise<Outcome> {
   const wt = await getForIssue(cfg, issueNumber);
   if (!wt) {
@@ -84,6 +88,16 @@ export async function tryAutoRecover(
       "*Automated by Claude Code Pipeline Skill*",
     ].join("\n"),
   );
+
+  // Evidence bundle (#147): record the recovery event. Best-effort + gated on
+  // stateDir, so unit tests have no filesystem side effects.
+  if (stateDir) {
+    await recordRecovery(stateDir, issueNumber, {
+      trigger: "no-commits",
+      round: recoveryCount + 1,
+      at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+    }).catch(() => {});
+  }
 
   return {
     advanced: true,
