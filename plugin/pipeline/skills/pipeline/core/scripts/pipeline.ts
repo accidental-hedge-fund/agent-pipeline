@@ -120,7 +120,11 @@ async function main(): Promise<void> {
       profile: opts.profile,
       // init must tolerate an invalid existing config: warn + fall back to defaults
       // so label-ensure still runs and the file is preserved rather than blocked.
-      tolerateInvalidConfig: isInit,
+      tolerateInvalidConfig: isInit || isDoctorCommand,
+      // doctor must tolerate a gh failure so it can run its own cli/auth/repo-access
+      // checks and print the required per-check summary instead of exiting with code 2
+      // before the doctor checks ever run.
+      tolerateGhFailure: isDoctorCommand,
     });
   } catch (err) {
     const e = err as Error;
@@ -171,9 +175,9 @@ async function main(): Promise<void> {
     await runStatus(cfg, issueNumber);
     return;
   }
-  if (!opts.dryRun && opts.unblock === undefined && opts.override === undefined) {
-    await ensurePipelineLabels(cfg);
-  }
+  // Recovery actions (unblock, override) bypass the run-start gate — they act on an
+  // already-running pipeline where the environment is assumed set up, and blocking
+  // them with a preflight failure would prevent recovery from a stuck run.
   if (opts.unblock !== undefined) {
     await runUnblock(cfg, issueNumber, opts.unblock);
     return;
@@ -184,11 +188,17 @@ async function main(): Promise<void> {
   }
 
   // Run-start preflight (#146): opt-in via `doctor.runOnStart` config or the
-  // `--doctor` flag. A failing preflight aborts the advance before planning, so
-  // no planning/implementation/review tokens are consumed.
+  // `--doctor` flag. Runs BEFORE label initialisation so a failing environment
+  // does not result in unnecessary GitHub label mutations. A failing preflight
+  // aborts the advance before planning; no planning/implementation/review tokens
+  // are consumed.
   const gate = await runStartPreflightGate(cfg, opts);
   if (!gate.proceed) {
     process.exit(1);
+  }
+
+  if (!opts.dryRun) {
+    await ensurePipelineLabels(cfg);
   }
 
   await runAdvance(cfg, issueNumber, opts);

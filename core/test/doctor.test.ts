@@ -354,6 +354,67 @@ test("check eval-command — fails (naming the command) when the binary is not f
   assert.match(r.remediation!, /pnpm evals/);
 });
 
+// Regression: env-prefixed eval commands must probe the real binary, not the VAR or `env`.
+test("check eval-command — env-prefixed command (NODE_ENV=test pnpm evals) probes `pnpm`", async () => {
+  const cfg = makeConfig({
+    eval_gate: { enabled: true, command: "NODE_ENV=test pnpm evals", mode: "gate", timeout: 300, max_attempts: 2 },
+  });
+  let seenBin: string | undefined;
+  const r = await getCheck(cfg, "eval-command").run(
+    fakeDeps({
+      execCheck: (_f, a) => {
+        seenBin = a[a.length - 1];
+        return true;
+      },
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.equal(seenBin, "pnpm", "must probe `pnpm`, not the env assignment token");
+});
+
+test("check eval-command — `env` wrapper (env NODE_ENV=test pnpm evals) probes `pnpm`", async () => {
+  const cfg = makeConfig({
+    eval_gate: { enabled: true, command: "env NODE_ENV=test pnpm evals", mode: "gate", timeout: 300, max_attempts: 2 },
+  });
+  let seenBin: string | undefined;
+  const r = await getCheck(cfg, "eval-command").run(
+    fakeDeps({
+      execCheck: (_f, a) => {
+        seenBin = a[a.length - 1];
+        return true;
+      },
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.equal(seenBin, "pnpm", "must probe `pnpm`, not `env`");
+});
+
+test("check eval-command — env-prefixed command fails when the real binary is missing", async () => {
+  const cfg = makeConfig({
+    eval_gate: { enabled: true, command: "NODE_ENV=prod my-eval-runner --ci", mode: "gate", timeout: 300, max_attempts: 2 },
+  });
+  let seenBin: string | undefined;
+  const r = await getCheck(cfg, "eval-command").run(
+    fakeDeps({
+      execCheck: (_f, a) => {
+        seenBin = a[a.length - 1];
+        return false;
+      },
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.equal(seenBin, "my-eval-runner", "must probe `my-eval-runner`, not the VAR assignment");
+});
+
+// Regression: repo-access check skips gracefully when config.repo is "" (gh unavailable
+// during config resolution — tolerateGhFailure path). cli:gh / github-auth check first.
+test("check repo-access — skips gracefully when config.repo is empty (gh unavailable)", async () => {
+  const cfg = makeConfig({ repo: "" });
+  const r = await getCheck(cfg, "repo-access").run(fakeDeps({ execCheck: () => false }));
+  assert.equal(r.status, "skip", "repo-access must skip, not fail, when repo name is unavailable");
+  assert.match(r.detail, /cli:gh|github-auth|unreachable/, "skip reason must mention earlier checks");
+});
+
 // ---------------------------------------------------------------------------
 // 6.2 / 6.3 / 6.4 — runPreflight runner
 // ---------------------------------------------------------------------------

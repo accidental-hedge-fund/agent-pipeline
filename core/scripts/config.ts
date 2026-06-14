@@ -94,6 +94,10 @@ export interface ResolveOptions {
   baseBranch?: string;      // --base
   profile?: string;         // shared-core profile name
   tolerateInvalidConfig?: boolean; // warn + fall back to defaults instead of throwing on invalid config (used by init)
+  /** When true, a `gh repo view` failure sets repo="" instead of throwing.
+   *  Used by `pipeline doctor` so the command can run its own cli/auth/repo-access
+   *  checks and report proper remediation even when gh is missing or auth is expired. */
+  tolerateGhFailure?: boolean;
 }
 
 /**
@@ -123,9 +127,14 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     });
     repo = out.trim();
   } catch (err) {
-    throw new Error(
-      `Failed to discover GitHub repo for ${repoDir} via 'gh repo view'. Make sure 'gh' is authenticated.`,
-    );
+    if (!opts.tolerateGhFailure) {
+      throw new Error(
+        `Failed to discover GitHub repo for ${repoDir} via 'gh repo view'. Make sure 'gh' is authenticated.`,
+      );
+    }
+    // gh unavailable or auth expired: set repo="" so the caller can still run
+    // doctor checks (cli:gh, github-auth, repo-access) which surface the real failure.
+    repo = "";
   }
 
   // Load file config if present.

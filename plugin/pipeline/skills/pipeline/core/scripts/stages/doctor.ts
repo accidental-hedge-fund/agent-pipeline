@@ -174,16 +174,27 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
   });
 
   // 3. Repo access — token can actually see the configured repo.
+  //    When config.repo is "" (gh was unavailable during config resolution —
+  //    tolerateGhFailure path), skip this check; cli:gh / github-auth (checks 1-2)
+  //    already surface the real failure with actionable remediation.
   checks.push({
     id: "repo-access",
-    description: `Authenticated token can access ${config.repo}`,
-    run: async (deps) =>
-      (await deps.execCheck("gh", ["repo", "view", config.repo]))
+    description: config.repo
+      ? `Authenticated token can access ${config.repo}`
+      : "Authenticated token can access the configured repo",
+    run: async (deps) => {
+      if (!config.repo) {
+        return skip(
+          "repo name not available (gh was unreachable during startup) — see cli:gh / github-auth checks",
+        );
+      }
+      return (await deps.execCheck("gh", ["repo", "view", config.repo]))
         ? pass(`can access ${config.repo}`)
         : fail(
             `\`gh repo view ${config.repo}\` failed — the token cannot access this repo`,
             `Verify your GitHub token has access to \`${config.repo}\` and the right scopes (run \`gh auth status\`, or \`gh auth refresh -s repo\` to add the repo scope).`,
-          ),
+          );
+    },
   });
 
   // 4. Worktree cleanliness — the active checkout must not have uncommitted
@@ -301,7 +312,17 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
         return skip("eval gate is not enabled / no command configured");
       }
       const command = config.eval_gate.command;
-      const bin = command.trim().split(/\s+/)[0] ?? "";
+      // Skip leading VAR=VALUE environment assignments (e.g. `NODE_ENV=test pnpm evals`)
+      // and the `env` wrapper (e.g. `env NODE_ENV=test pnpm evals`) to find the real binary.
+      const tokens = command.trim().split(/\s+/);
+      let bin = "";
+      for (const tok of tokens) {
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) continue; // skip VAR=value
+        if (tok === "env") continue;                          // skip env wrapper
+        bin = tok;
+        break;
+      }
+      if (!bin) bin = tokens[0] ?? "";
       // `command -v "$1"` resolves $1 from the positional arg, so the configured
       // command text is never interpolated into the shell line (no injection).
       const ok = await deps.execCheck("sh", ["-c", 'command -v "$1" >/dev/null 2>&1', "doctor", bin]);
