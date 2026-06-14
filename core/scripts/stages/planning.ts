@@ -21,6 +21,7 @@ import {
   transition,
 } from "../gh.ts";
 import { invoke, type HarnessResult } from "../harness.ts";
+import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
   branchName,
   createWorktree,
@@ -135,19 +136,26 @@ export async function advance(
     preImplStage = "plan-review";
 
     const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary, specContext });
-    const reviewResult = await invoke(reviewer, cfg.repo_dir, reviewPrompt, {
-      timeoutSec: cfg.review_timeout,
-      model: opts.model ?? cfg.models.review,
-    });
+    // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
+    // implementing harness reviews the plan, clearly labeled below.
+    const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
+      await invokeReviewer(reviewer, primary, cfg.repo_dir, reviewPrompt, {
+        timeoutSec: cfg.review_timeout,
+        model: opts.model ?? cfg.models.review,
+      });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
         : `Plan review failed (exit ${reviewResult.exit_code})`;
-      await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review", "harness-failure");
+      const blockMsg = planSelfReview
+        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}`
+        : `Plan-review harness (${reviewer}) failed: ${reason}`;
+      await setBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
     const planReview = reviewResult.stdout.trim();
-    await postComment(cfg, issueNumber, `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
+    const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
+    await postComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
 
     // #26: re-fetch comments so any human feedback left on the posted plan
     // during the reviewer run flows into the revision alongside the reviewer's.
@@ -526,24 +534,31 @@ async function advanceOpenspec(
       `OpenSpec proposal by ${primary}. ${reviewer} reviewing intent before implementation.`,
     );
     preImplStage = "plan-review";
-    const reviewResult = await invoke(
-      reviewer,
-      wt.path,
-      buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary, specContext }),
-      { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
-    );
+    // #39: same-harness fallback — see the freeform path above.
+    const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
+      await invokeReviewer(
+        reviewer,
+        primary,
+        wt.path,
+        buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary, specContext }),
+        { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
+      );
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `timed out after ${reviewResult.duration.toFixed(0)}s`
         : `exit ${reviewResult.exit_code}`;
-      await setBlocked(cfg, issueNumber, `Plan-review harness (${reviewer}) failed: ${reason}`, "plan-review", "harness-failure");
+      const blockMsg = planSelfReview
+        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}`
+        : `Plan-review harness (${reviewer}) failed: ${reason}`;
+      await setBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
     const planReview = reviewResult.stdout.trim();
+    const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
     await postComment(
       cfg,
       issueNumber,
-      `## Plan Review\n\n**Reviewer**: ${reviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`,
+      `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`,
     );
 
     // #26: pull in human comments left on the posted plan during the reviewer run.

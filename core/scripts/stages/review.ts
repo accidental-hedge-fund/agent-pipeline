@@ -20,7 +20,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { invoke, type HarnessResult } from "../harness.ts";
+import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
@@ -85,7 +85,8 @@ export interface AdvanceReviewDeps {
   postPrComment?: typeof postPrComment;
   transition?: typeof transition;
   setBlocked?: typeof setBlocked;
-  /** Runs one review round and returns the raw harness result. */
+  /** Runs one review round and returns the harness result plus which harness
+   *  actually reviewed (the same-harness fallback when the reviewer is missing, #39). */
   runReview?: RunReviewFn;
 }
 
@@ -100,7 +101,7 @@ type RunReviewFn = (
   round: 1 | 2,
   cwd: string,
   opts: AdvanceReviewOpts,
-) => Promise<HarnessResult>;
+) => Promise<ReviewerInvocation>;
 
 export async function advanceReview(
   cfg: PipelineConfig,
@@ -122,7 +123,11 @@ export async function advanceReview(
   const runReviewFn = deps.runReview ?? defaultRunReview;
 
   const stage: Stage = round === 1 ? "review-1" : "review-2";
-  const reviewer = cfg.harnesses.reviewer;
+  // The configured cross-harness reviewer (the one we attempt first). After the
+  // review runs, `reviewer` is reassigned to the harness that ACTUALLY reviewed,
+  // which differs from `configuredReviewer` only on the same-harness fallback (#39).
+  const configuredReviewer = cfg.harnesses.reviewer;
+  let reviewer = configuredReviewer;
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${reviewer}`);
 
@@ -205,7 +210,7 @@ export async function advanceReview(
   const wt = await getForIssueFn(cfg, issueNumber);
   const cwd = wt?.path ?? cfg.repo_dir;
 
-  const result = await runReviewFn(
+  const invocation = await runReviewFn(
     cfg,
     issueNumber,
     detail,
@@ -217,12 +222,30 @@ export async function advanceReview(
     cwd,
     opts,
   );
+  const result = invocation.result;
+  // From here on `reviewer` is the harness that actually reviewed. On the #39
+  // same-harness fallback that is the implementer, and `selfReview` is true.
+  reviewer = invocation.effectiveReviewer;
+  const selfReview = invocation.selfReview;
+  // Prepend the same-harness disclosure to every review comment this round posts
+  // (verdict, advisory, ceiling) so a self-review is never mistaken for an
+  // independent one. A no-op on a normal cross-harness review.
+  const reviewComment = (text: string) =>
+    selfReview ? `${selfReviewBanner(configuredReviewer, reviewer)}\n\n${text}` : text;
+  // Visibly distinct stage-transition label for a self-review.
+  const reviewerLabel = selfReview ? `${reviewer} (self-review)` : reviewer;
 
   if (!result.success) {
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    await setBlockedFn(cfg, issueNumber, `Review harness (${reviewer}) failed: ${reason}`, stage, "harness-failure");
+    // selfReview here means the reviewer was unspawnable AND the implementing
+    // harness fallback also failed — there is no harness left to review with (#39).
+    const detailMsg = selfReview
+      ? `Neither the cross-harness reviewer (${configuredReviewer}) nor the implementing ` +
+        `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}`
+      : `Review harness (${reviewer}) failed: ${reason}`;
+    await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
 
@@ -248,14 +271,14 @@ export async function advanceReview(
   }
 
   if (verdict.verdict === "approve") {
-    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer)));
     if (round === 1) {
       await transitionFn(
         cfg,
         issueNumber,
         "review-1",
         "review-2",
-        `Standard review by ${reviewer} — approved (${verdict.findings.length} findings).`,
+        `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`,
       );
       return {
         advanced: true,
@@ -269,7 +292,7 @@ export async function advanceReview(
         issueNumber,
         "review-2",
         "pre-merge",
-        `Adversarial review by ${reviewer} — approved (${verdict.findings.length} findings).`,
+        `Adversarial review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`,
       );
       return {
         advanced: true,
@@ -295,7 +318,7 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
-    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer)));
     const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
     await setBlockedFn(
       cfg,
@@ -330,8 +353,8 @@ export async function advanceReview(
     // empty marker (#133 fix 2): prevents extractBlockingKeysFromComment from
     // falling back to all override-key tokens on a re-review where an advisory
     // finding later crosses the policy threshold.
-    await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet));
-    const advisory = advisoryAdvanceComment(cfg, round, reviewer, partition);
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet)));
+    const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     // Also surface on the PR: review bookkeeping lives on the issue, but a human
     // merges the PR — advisory findings recorded only on the issue can slip the
@@ -351,7 +374,7 @@ export async function advanceReview(
       issueNumber,
       stage,
       toStage,
-      `Review ${round} by ${reviewer}: ${verdict.findings.length} finding(s), none above policy ` +
+      `Review ${round} by ${reviewerLabel}: ${verdict.findings.length} finding(s), none above policy ` +
         `(${partition.advisory.length} advisory, ${partition.overridden.length} overridden) — advancing.`,
     );
     return {
@@ -364,7 +387,7 @@ export async function advanceReview(
 
   // Post the verdict comment WITH the pipeline-blocking-keys marker so future
   // recurrence checks can distinguish prior blocking findings from advisory ones.
-  await postCommentFn(cfg, issueNumber, formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet));
+  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet)));
 
   // Prior verdict comments for THIS round, oldest → newest. `detail.comments`
   // was snapshotted before the current verdict was posted, so the last entry is
@@ -391,7 +414,7 @@ export async function advanceReview(
     await postCommentFn(
       cfg,
       issueNumber,
-      reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence"),
+      reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
     );
     await transitionFn(
       cfg,
@@ -421,7 +444,7 @@ export async function advanceReview(
     await postCommentFn(
       cfg,
       issueNumber,
-      reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments),
+      reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments)),
     );
     await transitionFn(
       cfg,
@@ -450,7 +473,7 @@ export async function advanceReview(
     issueNumber,
     stage,
     fixStage,
-    `Review ${round} by ${reviewer} requested changes (${partition.blocking.length} blocking ` +
+    `Review ${round} by ${reviewerLabel} requested changes (${partition.blocking.length} blocking ` +
       `of ${verdict.findings.length} findings${advisoryNote}).`,
   );
   return {
@@ -602,7 +625,7 @@ async function invokePromptHarnessReview(
   round: 1 | 2,
   cwd: string,
   opts: AdvanceReviewOpts,
-): Promise<HarnessResult> {
+): Promise<ReviewerInvocation> {
   const specContext = openspecContextFromDiff(cfg, cwd, diffFilePaths(diff));
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
@@ -615,7 +638,9 @@ async function invokePromptHarnessReview(
       makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", cfg.harnesses.reviewer, prompt),
     ).catch(() => {});
   }
-  return invoke(cfg.harnesses.reviewer, cwd, prompt, {
+  // #39: invoke through the same-harness fallback seam — if the configured
+  // reviewer CLI is not spawnable, the implementing harness reviews instead.
+  return invokeReviewer(cfg.harnesses.reviewer, cfg.harnesses.implementer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
     model: opts.model ?? cfg.models.review,
   });
