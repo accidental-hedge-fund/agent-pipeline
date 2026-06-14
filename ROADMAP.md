@@ -1,6 +1,6 @@
 # Roadmap
 
-Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-13.
+Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-14.
 
 **Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. Everything below v1.1.0 is the post-1.1.0 line.
 
@@ -101,8 +101,10 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
 | **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See **Shipped** above. |
 | **v1.1.0** ✅ shipped | minor | Review quality | #19, #25, #57, #85 | Shipped 2026-06-13 (tag `v1.1.0`) — first minor. New planning/review capability, no breaking change. See **Shipped** above for per-PR detail. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
+| **v1.1.1** | patch | Capability/evidence hardening | #143, #146, #147 | Tightens run reliability and inspectability after v1.1.0 without changing shipped behavior: fair context truncation, deterministic preflight, and local evidence bundles. |
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. #144 (override durability) is convergence-robustness hardening, no new surface. |
-| **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. |
+| **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21, #149 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. #149 adds bounded continuation budgets on top of existing `needs-human` semantics; no merge/deploy authority. |
+| **v1.4.0** | minor | Evidence gates & private evals | #148 | Adds an optional reviewer-owned private shipcheck gate before `ready-to-deploy`; advisory-first, no default behavior change. |
 | *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -126,12 +128,17 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #25 | minor | none | review quality | v1.1.0 | #19 (co-ship) |
 | #57 | minor | none | review quality | v1.1.0 | #56 ✓ / #83 ✓ / #86 ✓ |
 | #85 | patch | none | review quality | v1.1.0 | #83 ✓ |
+| #143 | patch | none | context truncation hardening | v1.1.1 | #19 ✓ |
+| #146 | patch | none | capability preflight | v1.1.1 | — |
+| #147 | patch | none | evidence bundle | v1.1.1 | — |
 | #39 | minor | none | reviewer pluggability | v1.2.0 | — |
 | #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
 | #70 | minor | adds key | per-step models | v1.2.0 | #91 ✓ |
 | #144 | patch | none | convergence robustness | v1.2.0 | — |
 | #23 | minor | adds key | graduated autonomy | v1.3.0 | — |
 | #21 | minor | adds key | execution isolation | v1.3.0 | #93 ✓ |
+| #149 | minor | adds key | bounded auto-loop | v1.3.0 | #23 / #21 / #133 ✓ |
+| #148 | minor | adds key | private eval / shipcheck gate | v1.4.0 | #12 / #147 |
 | #14 | none | — | research | *(none)* | — |
 | #27 | none | — | research | *(none)* | — |
 
@@ -151,6 +158,14 @@ As-built (see **Shipped** for PRs):
 - **#57** — Review prompts upgraded to world-class: confidence calibration (aligned to #17's `min_confidence`), few-shot examples, diff-scoping/blast-radius, false-positive-cost framing, risk-first standard-prompt structure, deterministic-ask removal, and round-1↔round-2 differentiation — on top of the rubric + enumerate-every-instance already shipped via #110.
 - **#85** — Verdict drift guard extended to value-types/nesting (every union arm validated; `| null` fails closed, `| undefined` normalizes), not just field names.
 
+### v1.1.1 — capability/evidence hardening (patch)
+
+SmallHarness-inspired hardening that makes runs cheaper to diagnose and less likely to waste harness time on setup defects:
+
+- **#143** — `readConventions`: principled, provably-fair multi-section truncation under large convention files. This is the already-filed patch follow-up from #19's truncation work.
+- **#146** — `doctor` / preflight capability checks before expensive autonomous work: GitHub auth/repo access, harness availability, worktree cleanliness, OpenSpec availability, plugin mirror state, dependency state, and declared eval command availability. Deterministic, no model invocation.
+- **#147** — Per-run evidence bundle: compact machine-readable artifact recording issue/PR, branch, commit SHAs, stage transitions, harness identity, prompts/context inputs, commands, test/eval outcomes, review verdicts, overrides, recovery events, and final handoff state. This is an audit/debug artifact, not a second state machine.
+
 ### v1.2.0 — reviewer pluggability & per-step models (minor)
 
 - **#39** — No-review-harness fallback: degrade to a clearly-labeled same-harness self-review when the reviewer CLI is unavailable (failure-triggered, at the invoke seam, **no new config key**).
@@ -161,7 +176,12 @@ As-built (see **Shipped** for PRs):
 ### v1.3.0 — graduated autonomy & isolation (minor)
 
 - **#23** — Optional human approval checkpoints. **Rescoped:** labels+comments-only (SHA-bound checkpoint comment + `waiting` + re-invoke); one config key, default empty; no durable approval-record store.
-- **#21** — Optional sandboxed execution. **Rescoped:** one opt-in key swapping to each harness's native sandbox mode (no container/E2B/Modal runtime). *Largest; last.*
+- **#21** — Optional sandboxed execution. **Rescoped:** one opt-in key swapping to each harness's native sandbox mode (no container/E2B/Modal runtime), plus the SmallHarness-inspired deterministic write-boundary guard: snapshot allowed paths before/after harness invocation and block unexpected writes outside the target worktree/generated-artifact allowlist. *Largest; last.*
+- **#149** — Bounded auto-loop mode: optional budgets for additional fix/review/test/eval continuations, respecting checkpoints, sandbox settings, override policy, and recurrence detection. When the budget is exhausted, park in `needs-human` with evidence instead of silently spinning. This borrows SmallHarness's auto-loop idea without adding merge/deploy authority.
+
+### v1.4.0 — evidence gates & private evals (minor)
+
+- **#148** — Private eval / shipcheck gate: optional reviewer-owned acceptance rubric before `ready-to-deploy`, separate from the implementing harness. It can inspect the issue, plan, acceptance criteria, changed files, test/eval summaries, OpenSpec deltas, and evidence bundle. Advisory-first; gate mode can block later when stable. This extends #12's repo-provided eval command gate with a private acceptance rubric and keeps the builder from grading itself.
 
 ### Trackers (no release)
 
