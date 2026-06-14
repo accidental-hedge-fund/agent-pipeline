@@ -174,6 +174,7 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 ```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
 /pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
+/pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
@@ -372,6 +373,23 @@ To print the current stage, any blocker, the linked PR, and the last review verd
 ```bash
 /pipeline N --status
 $pipeline N --status
+```
+
+### Evidence bundle
+
+Every run writes a compact, machine-readable **evidence bundle** — a single JSON file recording what the run actually did: run/PR/branch identity, the harnesses used, per-stage transitions (entered/exited/outcome), the commands it ran (with exit code, duration, and a 500-char output excerpt — never raw env values, tokens, or secrets), review verdict summaries (round, reviewed SHA, finding counts by severity), override dispositions, auto-recovery events, and the terminal state. It lives at:
+
+```text
+/tmp/pipeline-<domain>/<issue>/evidence.json
+```
+
+It is a **write-only audit supplement**, not a second state machine: GitHub labels and comments remain the authoritative state, and deleting or corrupting the bundle has zero effect on a run. When a run finalizes, the pipeline posts a single comment on the PR (or issue) recording the local bundle path so a maintainer can find it.
+
+Print a human-readable summary of a run at any time — this reads the local file only, so it works offline:
+
+```bash
+/pipeline N --summary
+$pipeline N --summary
 ```
 
 ---

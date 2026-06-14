@@ -28,13 +28,25 @@ import {
   isBlocked,
   pickStage,
   postComment,
+  postPrComment,
   silentTransition,
   transition,
 } from "./gh.ts";
-import { isKillSwitchActive, withLock } from "./lock.ts";
+import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
-import { sweepMergedWorktrees } from "./worktree.ts";
+import { branchName, getForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
+import {
+  bundlePath,
+  createBundle,
+  finalizeBundle,
+  markNotified,
+  patchBundleIdentity,
+  printSummary,
+  readBundle,
+  recordOverride,
+  recordStage,
+} from "./evidence-bundle.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -49,7 +61,14 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
-import { LABEL_PREFIX, reviewStageSkipTarget, type Outcome, type PipelineConfig, type Stage } from "./types.ts";
+import {
+  LABEL_PREFIX,
+  reviewStageSkipTarget,
+  type Outcome,
+  type PipelineConfig,
+  type Stage,
+  type StageOutcome,
+} from "./types.ts";
 
 const MAX_ITERATIONS = 12;
 
@@ -62,6 +81,7 @@ export const VERSION: string = (require("../package.json") as { version: string 
 
 export interface CliOpts {
   status?: boolean;
+  summary?: boolean;
   unblock?: string;
   override?: string;
   once?: boolean;
@@ -89,6 +109,7 @@ async function main(): Promise<void> {
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
     .option("--fail-fast", "doctor: stop at the first failing check instead of collecting all failures")
     .option("--status", "read-only status; print stage and exit")
+    .option("--summary", "print the human-readable evidence-bundle summary for <number> and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
       "--override <spec>",
@@ -171,6 +192,15 @@ async function main(): Promise<void> {
   if (!Number.isFinite(number) || number <= 0) {
     console.error(`pipeline: argument <number> is required (or use --cleanup, --init, 'pipeline init', or 'pipeline doctor')`);
     process.exit(2);
+  }
+
+  // --summary (#147) is a local, read-only dump of the issue's evidence bundle.
+  // It must work offline (handoff/debugging), so it runs before any gh call,
+  // kill-switch check, label-ensure, or lock — and treats <number> as the issue
+  // number the bundle is keyed by.
+  if (opts.summary) {
+    await runSummary(cfg, number);
+    return;
   }
 
   if (isKillSwitchActive(cfg.domain)) {
@@ -506,6 +536,28 @@ function ceilingFindingLines(body: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Summary mode (#147): print the evidence bundle for an issue and exit. Read-only;
+// never enters the dispatch loop or mutates GitHub.
+// ---------------------------------------------------------------------------
+
+export async function runSummary(cfg: PipelineConfig, issueNumber: number): Promise<void> {
+  const stateDir = runStateDir(cfg.domain);
+  // readBundle returns null when absent; a corrupt/unreadable file throws — treat
+  // both as "no usable bundle" and exit non-zero so the failure is visible.
+  const bundle = await readBundle(stateDir, issueNumber).catch(() => null);
+  if (!bundle) {
+    console.error(
+      `pipeline: no evidence bundle found for #${issueNumber} ` +
+        `(expected ${bundlePath(stateDir, issueNumber)}). ` +
+        `A bundle is written once the pipeline runs on this issue.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  printSummary(bundle);
+}
+
+// ---------------------------------------------------------------------------
 // Unblock mode
 // ---------------------------------------------------------------------------
 
@@ -670,6 +722,50 @@ async function runAdvance(
     const pipelineRunId = makePipelineRunId(issueNumber);
     console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
+    // Evidence bundle (#147): a write-only, per-run audit artifact. Skipped
+    // entirely under --dry-run (which writes nothing locally and posts nothing to
+    // GitHub) — `stateDir` is then undefined and every record/notify call below is
+    // guarded on it. Every call is also best-effort: a failed read/write never
+    // affects label transitions or the run outcome (the bundle is a supplement;
+    // GitHub labels/comments stay authoritative).
+    const stateDir = opts.dryRun ? undefined : runStateDir(cfg.domain);
+    if (stateDir) {
+      let bundlePr: number | null = null;
+      try {
+        bundlePr = await getPrForIssue(cfg, issueNumber);
+      } catch {
+        /* no PR yet, or lookup failed — record null */
+      }
+      const startWt = await getForIssue(cfg, issueNumber).catch(() => null);
+      const bundleBranch = startWt ? branchName(issueNumber, startWt.slug) : null;
+      const harnesses = Array.from(new Set([cfg.harnesses.implementer, cfg.harnesses.reviewer]));
+      await createBundle(stateDir, {
+        runId: pipelineRunId,
+        issue: issueNumber,
+        pr: bundlePr,
+        branch: bundleBranch,
+        harnesses,
+      }).catch(() => {});
+      // An override supplied on THIS invocation carries the full human reason. The
+      // review stage applies it deterministically; record it here, where the reason
+      // text is available, now that the bundle exists.
+      if (opts.override) {
+        const parsedOverride = parseOverrideArg(opts.override);
+        if (!("error" in parsedOverride)) {
+          await recordOverride(stateDir, issueNumber, {
+            key: parsedOverride.key,
+            reason: parsedOverride.reason,
+          }).catch(() => {});
+        }
+      }
+    }
+
+    // Tracks the stage the run ends at — recorded as the bundle's terminal state.
+    let finalStage: Stage = startStage;
+    // Tracks the most recently seen branch so the finally block can patch bundle
+    // identity even when deployReady.finalize() has already removed the worktree.
+    let lastKnownBranch: string | null = null;
+    try {
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       const detail = await getIssueDetail(cfg, issueNumber);
       const stage = pickStage(detail.labels);
@@ -677,6 +773,7 @@ async function runAdvance(
         console.log(`[pipeline] #${issueNumber}: pipeline label removed; stopping.`);
         break;
       }
+      finalStage = stage;
 
       if (stage === "ready-to-deploy") {
         const out = await deployReady.finalize(cfg, issueNumber);
@@ -702,7 +799,7 @@ async function runAdvance(
       if (isBlocked(detail.labels)) {
         if (stage === "implementing") {
           console.log(`[pipeline] #${issueNumber}: blocked at implementing — attempting auto-recovery`);
-          const out = await autoRecover.tryAutoRecover(cfg, issueNumber);
+          const out = await autoRecover.tryAutoRecover(cfg, issueNumber, stateDir);
           printOutcome(issueNumber, stage, out);
           if (out.advanced) {
             transitions++;
@@ -730,26 +827,125 @@ async function runAdvance(
         (stage === "review-2" && !cfg.steps.adversarial_review)
       ) {
         const to = reviewStageSkipTarget(cfg, stage);
+        const skipStage = evidenceStageName(stage);
+        const skipEnteredAt = evidenceTimestamp();
         await transition(cfg, issueNumber, stage, to, `${stage} step disabled in this repo's config; skipping.`);
         console.log(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
+        finalStage = to;
+        if (stateDir) {
+          await recordStage(stateDir, issueNumber, {
+            stage: skipStage,
+            enteredAt: skipEnteredAt,
+            exitedAt: evidenceTimestamp(),
+            outcome: "skipped",
+          }).catch(() => {});
+        }
         if (opts.once) break;
         continue;
       }
 
-      const out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId);
+      // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
+      let headBeforeDispatch = "";
+      if (stateDir) {
+        const wtBefore = await getForIssue(cfg, issueNumber).catch(() => null);
+        if (wtBefore) {
+          headBeforeDispatch = (
+            await gitInWorktree(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+          ).stdout.trim();
+        }
+      }
+
+      const auditStage = evidenceStageName(stage);
+      if (stateDir) {
+        await recordStage(stateDir, issueNumber, {
+          stage: auditStage,
+          enteredAt: evidenceTimestamp(),
+        }).catch(() => {});
+      }
+      let out: Outcome;
+      try {
+        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir);
+      } catch (err) {
+        // Stage threw — record an error outcome before rethrowing so the bundle
+        // never shows a perpetually in-progress stage.
+        if (stateDir) {
+          await recordStage(stateDir, issueNumber, {
+            stage: auditStage,
+            exitedAt: evidenceTimestamp(),
+            outcome: "error",
+            commits: [],
+          }).catch(() => {});
+        }
+        throw err;
+      }
+
+      // Post-dispatch: collect commits produced during this stage (before recording exit).
+      if (stateDir) {
+        let stageCommits: string[] = [];
+        const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
+        if (wtAfter) {
+          lastKnownBranch = branchName(issueNumber, wtAfter.slug);
+          // If no worktree existed before dispatch (e.g., planning creates it), fall
+          // back to origin/<base_branch> so all planning commits are captured.
+          const rangeStart = headBeforeDispatch || `origin/${cfg.base_branch}`;
+          const logResult = await gitInWorktree(
+            wtAfter.path,
+            ["log", "--pretty=format:%H", `${rangeStart}..HEAD`],
+            { ignoreFailure: true },
+          );
+          stageCommits = logResult.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+        }
+        await recordStage(stateDir, issueNumber, {
+          stage: auditStage,
+          exitedAt: evidenceTimestamp(),
+          outcome: evidenceOutcome(out),
+          commits: stageCommits,
+        }).catch(() => {});
+      }
       printOutcome(issueNumber, stage, out);
 
       if (out.advanced) {
         transitions++;
         lastStage = (out as { to: Stage }).to;
+        finalStage = lastStage; // keep final-state accurate when --once breaks after an advance
       } else {
         // No advance: blocked, waiting, no-op, finalized, error → stop.
         break;
       }
 
       if (opts.once) break;
+    }
+    } finally {
+      // Finalize + notify however the loop ended — normal, blocked, or thrown.
+      // Best-effort so audit I/O never masks the real run outcome. Skipped under
+      // --dry-run (stateDir undefined): no local write, no GitHub comment.
+      if (stateDir) {
+        try {
+          // Refresh PR/branch — may have been null at bundle creation if planning
+          // hadn't run yet. Only patch non-null values: deployReady removes the
+          // worktree before this block runs, so latestBranch is null on a successful
+          // ready-to-deploy run. Overwriting with null would erase the captured branch.
+          const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+          const latestWt = await getForIssue(cfg, issueNumber).catch(() => null);
+          // deployReady.finalize() removes the worktree before this block runs, so
+          // latestWt may be null on a successful run. Fall back to the last branch we
+          // observed during the dispatch loop so the bundle is never finalized with
+          // branch: null after a complete run.
+          const latestBranch = latestWt ? branchName(issueNumber, latestWt.slug) : lastKnownBranch;
+          const identityPatch: { pr?: number | null; branch?: string | null } = {};
+          if (latestPr !== null) identityPatch.pr = latestPr;
+          if (latestBranch !== null) identityPatch.branch = latestBranch;
+          if (identityPatch.pr !== undefined || identityPatch.branch !== undefined) {
+            await patchBundleIdentity(stateDir, issueNumber, identityPatch).catch(() => {});
+          }
+          const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
+          await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
+        } catch {
+          /* audit-only — ignore */
+        }
+      }
     }
 
     const elapsed = Math.round((Date.now() - t0) / 1000);
@@ -761,26 +957,85 @@ async function runAdvance(
   );
 }
 
+/** Map a stage {@link Outcome} to the evidence-bundle stage outcome enum. */
+function evidenceOutcome(out: Outcome): StageOutcome {
+  if (out.advanced) return "advanced";
+  switch (out.status) {
+    case "blocked":
+      return "blocked";
+    case "error":
+      return "error";
+    default:
+      return "skipped"; // waiting | no-op | finalized
+  }
+}
+
+/** Audit stage name for a dispatched label. The `ready` label drives the
+ *  planning+implementation arc, so record it under the clearer name "planning"
+ *  — the same name the test gate records its commands under, so they merge. */
+function evidenceStageName(stage: Stage): string {
+  return stage === "ready" ? "planning" : stage;
+}
+
+/** ISO 8601 timestamp at seconds precision (matches the CLI's other stamps). */
+function evidenceTimestamp(): string {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * Post a single comment recording the local evidence-bundle path so a maintainer
+ * can find it (#147). Targets the PR when one exists, else the issue. Skipped when
+ * a notification was already recorded for this run; marks the bundle notified
+ * after posting. Best-effort — wrapped by the caller.
+ */
+async function notifyBundlePath(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  stateDir: string,
+  alreadyNotifiedAt: string | null,
+): Promise<void> {
+  if (alreadyNotifiedAt) return;
+  const p = bundlePath(stateDir, issueNumber);
+  const body = [
+    "## Pipeline: Evidence bundle",
+    "",
+    `Run evidence written to: \`${p}\``,
+    "",
+    `Print a human-readable summary with \`${cfg.invocation} ${issueNumber} --summary\`.`,
+    "",
+    "---",
+    "*Automated by Claude Code Pipeline Skill*",
+  ].join("\n");
+  const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+  if (pr) {
+    await postPrComment(cfg, pr, body);
+  } else {
+    await postComment(cfg, issueNumber, body);
+  }
+  await markNotified(stateDir, issueNumber);
+}
+
 async function dispatch(
   cfg: PipelineConfig,
   issueNumber: number,
   stage: Stage,
   opts: CliOpts,
   pipelineRunId: string,
+  stateDir?: string,
 ): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
     case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId });
+      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
     case "review-1":
-      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model });
+      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir });
     case "review-2":
-      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model });
+      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir });
     case "fix-1":
-      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId });
+      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir });
     case "fix-2":
-      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId });
+      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir });
     case "pre-merge":
       // Use the polling wrapper, not bare advance(). Bare advance returns
       // "waiting" after docs push / on pending CI / after rebase — that
@@ -788,9 +1043,9 @@ async function dispatch(
       // exit the loop, requiring the user to re-invoke. Our skill is
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
-      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId });
+      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
     case "eval-gate":
-      return evalStage.advanceEval(cfg, issueNumber, { dryRun });
+      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":
       return deployReady.finalize(cfg, issueNumber);
     case "needs-human":

@@ -5,7 +5,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { advanceEval, type EvalDeps, type EvalRunResult } from "../scripts/stages/eval.ts";
+import { readBundle } from "../scripts/evidence-bundle.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -323,4 +327,37 @@ test("eval-gate: dry-run + enabled + command → no GitHub writes, no runEval", 
   assert.equal(log.transitions.length, 0);
   assert.equal(log.blocked.length, 0);
   assert.equal(log.comments.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 6 regression: each eval retry attempt produces its own command record
+// ---------------------------------------------------------------------------
+
+test("eval-gate: each retry attempt recorded separately in evidence bundle (finding 6)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "eval-evidence-test-"));
+  try {
+    const log = makeCallLog();
+    const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 3 });
+    let attempt = 0;
+    const deps = makeDeps(log, []);
+    deps.runEval = async () => {
+      attempt++;
+      return attempt < 3 ? failResult(`attempt ${attempt} failed`) : passResult("attempt 3 passed");
+    };
+
+    const out = await advanceEval(cfg, 555, { stateDir: dir }, deps);
+
+    assert.equal(out.advanced, true, "third attempt passes → should advance");
+
+    const bundle = await readBundle(dir, 555);
+    assert.ok(bundle, "evidence bundle must exist after eval run");
+    const evalEntry = bundle!.stages.find((s) => s.stage === "eval-gate");
+    assert.ok(evalEntry, "eval-gate stage entry must be created");
+    assert.equal(evalEntry!.commands.length, 3, "three attempts must produce three command records");
+    assert.equal(evalEntry!.commands[0].exitCode, 1, "attempt 1 must be recorded as failure");
+    assert.equal(evalEntry!.commands[1].exitCode, 1, "attempt 2 must be recorded as failure");
+    assert.equal(evalEntry!.commands[2].exitCode, 0, "attempt 3 must be recorded as success");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

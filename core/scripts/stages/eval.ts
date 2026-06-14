@@ -18,12 +18,16 @@ import {
   transition as defaultTransition,
 } from "../gh.ts";
 import { runCapped } from "../harness.ts";
+import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const MAX_COMMENT_OUTPUT = 2000;
 
 export interface AdvanceEvalOpts {
   dryRun?: boolean;
+  /** Evidence-bundle run/state dir (#147); when set, the eval command is recorded
+   *  under the "eval-gate" stage. Undefined → recording disabled. */
+  stateDir?: string;
 }
 
 export interface EvalRunResult {
@@ -150,6 +154,15 @@ export async function advanceEval(
         output: `[eval-gate stage timeout (${timeoutSec}s) exceeded before attempt ${attempt}]`,
         durationSec: timeoutSec,
       };
+      // Record the timeout as a failed attempt before breaking.
+      if (opts.stateDir) {
+        await recordCommand(
+          opts.stateDir,
+          issueNumber,
+          "eval-gate",
+          makeCommandRecord(cfg.eval_gate.command, 1, 0, lastResult.output),
+        ).catch(() => {});
+      }
       break;
     }
 
@@ -159,6 +172,22 @@ export async function advanceEval(
       console.log(`[pipeline] #${issueNumber}: eval-gate running \`${cfg.eval_gate.command}\``);
     }
     lastResult = await runFn(cfg.eval_gate.command, wt.path, remainingSec);
+
+    // Record each attempt immediately so retries are not collapsed into one record.
+    if (opts.stateDir) {
+      await recordCommand(
+        opts.stateDir,
+        issueNumber,
+        "eval-gate",
+        makeCommandRecord(
+          cfg.eval_gate.command,
+          lastResult.passed ? 0 : 1,
+          lastResult.durationSec * 1000,
+          lastResult.output,
+        ),
+      ).catch(() => {});
+    }
+
     if (lastResult.passed) break;
   }
 

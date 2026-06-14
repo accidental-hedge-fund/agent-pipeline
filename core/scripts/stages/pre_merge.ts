@@ -27,6 +27,7 @@ import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { extractReviewedSha } from "./review.ts";
 import { reviewCommentFlagsSpecDivergence } from "../review-policy.ts";
 import * as openspec from "../openspec.ts";
+import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
@@ -52,6 +53,10 @@ export interface AdvancePreMergeOpts {
   model?: string;
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
+  /** Evidence-bundle run/state dir (#147); when set, key pre-merge operations
+   *  (CI checks, OpenSpec archive push, rebase) are recorded under "pre-merge".
+   *  Undefined → recording disabled. */
+  stateDir?: string;
 }
 
 /**
@@ -122,7 +127,7 @@ export async function advance(
   if (shaGate) return shaGate;
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, deps);
+  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, deps, opts.stateDir);
   if (archiveOutcome) return archiveOutcome;
 
   // ---- Step 0.5: early conflict detection (#95) ----
@@ -142,7 +147,7 @@ export async function advance(
     (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY";
   if (isEarlyConflict) {
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
-    return recoverFromMergeConflict(cfg, issueNumber, deps);
+    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps);
   }
 
   // ---- Step 1: CI ----
@@ -155,6 +160,20 @@ export async function advance(
   }
 
   const agg = parseChecksAggregate(checks);
+
+  // Record CI check result evidence; skip when still pending (no result yet).
+  if (opts.stateDir && !agg.pending) {
+    const ciSummary = agg.failed.length > 0
+      ? agg.failed.map((c) => `${c.name}: ${c.bucket}`).join(", ")
+      : `all ${checks.length} check(s) passed`;
+    await recordCommand(
+      opts.stateDir,
+      issueNumber,
+      "pre-merge",
+      makeCommandRecord(`gh pr checks #${prNumber}`, agg.failed.length > 0 ? 1 : 0, 0, ciSummary),
+    ).catch(() => {});
+  }
+
   if (agg.pending) {
     return { advanced: false, status: "waiting", reason: "CI still running" };
   }
@@ -164,6 +183,19 @@ export async function advance(
     const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
     if (!alreadyRebased && wt) {
       const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+      if (opts.stateDir) {
+        await recordCommand(
+          opts.stateDir,
+          issueNumber,
+          "pre-merge",
+          makeCommandRecord(
+            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+            ok ? 0 : 1,
+            0,
+            ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
+          ),
+        ).catch(() => {});
+      }
       if (ok) {
         markRebaseAttemptedFn(wt.path);
         return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
@@ -194,7 +226,7 @@ export async function advance(
   const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
   const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
   if (isFreshConflict) {
-    return recoverFromMergeConflict(cfg, issueNumber, deps);
+    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps);
   }
   if (freshState === "BEHIND") {
     // BEHIND means the branch is out-of-date but has no code conflict.
@@ -206,6 +238,19 @@ export async function advance(
     const behindAlreadyRebased = behindWt ? rebaseAlreadyAttemptedFn(behindWt.path) : true;
     if (!behindAlreadyRebased && behindWt) {
       const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+      if (opts.stateDir) {
+        await recordCommand(
+          opts.stateDir,
+          issueNumber,
+          "pre-merge",
+          makeCommandRecord(
+            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+            ok ? 0 : 1,
+            0,
+            ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
+          ),
+        ).catch(() => {});
+      }
       if (ok) {
         markRebaseAttemptedFn(behindWt.path);
         return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
@@ -399,6 +444,7 @@ export async function maybeArchiveOpenspec(
   issueNumber: number,
   pipelineRunId: string,
   deps: AdvancePreMergeDeps = {},
+  stateDir?: string,
 ): Promise<Outcome | null> {
   const getForIssueFn = deps.getForIssue ?? getForIssue;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
@@ -461,9 +507,23 @@ export async function maybeArchiveOpenspec(
     ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
     { ignoreFailure: true },
   );
-  const push = await gitFn(wt.path, ["push", "origin", branchName(issueNumber, wt.slug)], {
+  const pushBranch = branchName(issueNumber, wt.slug);
+  const push = await gitFn(wt.path, ["push", "origin", pushBranch], {
     ignoreFailure: true,
   });
+  if (stateDir) {
+    await recordCommand(
+      stateDir,
+      issueNumber,
+      "pre-merge",
+      makeCommandRecord(
+        `git push origin ${pushBranch}`,
+        push.code,
+        0,
+        push.code !== 0 ? push.stderr.trim() : "OpenSpec archive pushed; CI will re-run",
+      ),
+    ).catch(() => {});
+  }
   if (push.code !== 0) {
     await setBlockedFn(
       cfg,
@@ -633,6 +693,7 @@ function staleSpecDeltaBlockReason(id: string): string {
 async function recoverFromMergeConflict(
   cfg: PipelineConfig,
   issueNumber: number,
+  stateDir?: string,
   deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome> {
   const getForIssueFn = deps.getForIssue ?? getForIssue;
@@ -645,6 +706,19 @@ async function recoverFromMergeConflict(
   const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
   if (!alreadyRebased && wt) {
     const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+    if (stateDir) {
+      await recordCommand(
+        stateDir,
+        issueNumber,
+        "pre-merge",
+        makeCommandRecord(
+          `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+          ok ? 0 : 1,
+          0,
+          ok ? "conflict-recovery rebase succeeded; CI re-running" : "conflict-recovery rebase failed",
+        ),
+      ).catch(() => {});
+    }
     if (ok) {
       markRebaseAttemptedFn(wt.path);
       return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
@@ -700,7 +774,8 @@ async function tryRebaseAndPush(
 /**
  * Polling loop: invoke `advance` repeatedly until it advances, blocks, or
  * exhausts the CI timeout. Used by the top-level orchestrator. Returns the
- * last outcome.
+ * last outcome. `opts.stateDir` is forwarded to each `advance` call so
+ * evidence recording works across all polling iterations.
  */
 export async function advancePolling(
   cfg: PipelineConfig,

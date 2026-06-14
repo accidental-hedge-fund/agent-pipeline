@@ -27,6 +27,7 @@ import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
+import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 export interface AdvanceFixOpts {
@@ -34,6 +35,9 @@ export interface AdvanceFixOpts {
   model?: string;
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
+  /** Evidence-bundle run/state dir (#147); when set, the test gate records its
+   *  command runs under this round's stage. Undefined → recording disabled. */
+  stateDir?: string;
 }
 
 /** Injectable seams for {@link advanceFix} — overridable in tests. */
@@ -110,6 +114,14 @@ export async function advanceFix(
     pipelineRunId,
     specContext,
   });
+  if (opts.stateDir) {
+    await recordPrompt(
+      opts.stateDir,
+      issueNumber,
+      stage,
+      makePromptRecord(`fix-${round}`, harness, prompt),
+    ).catch(() => {});
+  }
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
     model: opts.model ?? cfg.models.fix,
@@ -170,7 +182,7 @@ export async function advanceFix(
   }
 
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId);
+  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, stage, opts.stateDir);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage, "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };

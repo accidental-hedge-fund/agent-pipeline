@@ -22,6 +22,7 @@ import {
 } from "./verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import { trySalvageUncommittedWork } from "./salvage-harness-work.ts";
+import { makeCommandRecord, recordCommand } from "./evidence-bundle.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -156,6 +157,12 @@ export async function runTestGate(
   // don't thread it still produce valid trailers; production callers
   // (planning/fix) pass the dispatch-wide id so all commits in a run match.
   pipelineRunId: string = makePipelineRunId(issueNumber),
+  // Evidence-bundle stage label this gate's command runs are recorded under, and
+  // the run/state dir to record into (#147). `stateDir` is undefined when the
+  // orchestrator did not provide one (e.g. direct unit-test calls) — recording is
+  // then a no-op, so the gate has no filesystem side effects in tests.
+  stageLabel: string = "test-gate",
+  stateDir?: string,
 ): Promise<TestGateResult> {
   if (!cfg.test_gate.enabled) return { skipped: true };
 
@@ -176,6 +183,22 @@ export async function runTestGate(
   const label = formatCommand(command);
   console.log(`[pipeline] #${issueNumber}: test gate running \`${label}\``);
 
+  // Run the test/build command and record it in the evidence bundle (#147).
+  // `runTests` has no exit code (it reports pass/fail), so synthesize 0/1.
+  // Best-effort: recording never affects the gate outcome.
+  const runAndRecord = async (): Promise<RunTestsResult> => {
+    const res = await runTestsFn(wtPath, command, cfg.test_gate.timeout);
+    if (stateDir) {
+      await recordCommand(
+        stateDir,
+        issueNumber,
+        stageLabel,
+        makeCommandRecord(label, res.passed ? 0 : 1, res.durationSec * 1000, res.output),
+      ).catch(() => {});
+    }
+    return res;
+  };
+
   // Require a clean worktree before the first trusted test run. If uncommitted
   // changes exist, what's tested diverges from what's committed, so the gate
   // result can't be trusted.
@@ -190,7 +213,7 @@ export async function runTestGate(
     };
   }
 
-  let { passed, output } = await runTestsFn(wtPath, command, cfg.test_gate.timeout);
+  let { passed, output } = await runAndRecord();
   if (passed) {
     // A passing run can still generate uncommitted artifacts (tsbuildinfo,
     // snapshots, lock-file updates). If it does, the committed state diverges
@@ -284,7 +307,7 @@ export async function runTestGate(
       }
     }
 
-    ({ passed, output } = await runTestsFn(wtPath, command, cfg.test_gate.timeout));
+    ({ passed, output } = await runAndRecord());
     if (passed) {
       if (await gitDirtyFn(wtPath)) {
         return {
