@@ -9,6 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { needsHumanPunchlist, runStatus, type RunStatusDeps } from "../scripts/pipeline.ts";
+import type { PreflightResult } from "../scripts/stages/doctor.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 type Comment = { author: string; body: string; createdAt: string };
@@ -249,10 +250,17 @@ function detailAt(stage: string, comments: Comment[]) {
   };
 }
 
-async function captureStatus(stage: string, comments: Comment[]): Promise<string[]> {
+async function captureStatus(
+  stage: string,
+  comments: Comment[],
+  preflight: PreflightResult | null = null,
+): Promise<string[]> {
   const deps: RunStatusDeps = {
     getIssueDetail: async () => detailAt(stage, comments),
     getPrForIssue: async () => null,
+    // Default to "no stored preflight result" so the byte-identical regression
+    // guards stay deterministic regardless of any real /tmp state (#146).
+    loadLatestPreflightResult: async () => preflight,
   };
   const lines: string[] = [];
   const orig = console.log;
@@ -312,4 +320,32 @@ test("runStatus: a needs-human stage with NO ceiling comment prints a graceful f
   const text = lines.join("\n");
   assert.match(text, /no Pipeline: Review ceiling reached comment was found/, `fallback missing; got:\n${text}`);
   assert.match(text, /pipeline:needs-human` → `pipeline:review-<round>/, `fallback resume hint missing; got:\n${text}`);
+});
+
+// ---------------------------------------------------------------------------
+// #146: --status surfaces the latest preflight (doctor) result when present.
+// ---------------------------------------------------------------------------
+
+const PREFLIGHT_RESULT: PreflightResult = {
+  ok: false,
+  ranAt: "2026-06-14T20:00:00.000Z",
+  checks: [
+    { id: "cli:gh", description: "gh", status: "pass", detail: "`gh` is available" },
+    { id: "github-auth", description: "auth", status: "fail", detail: "no auth", remediation: "Run `gh auth login`." },
+  ],
+};
+
+test("runStatus: includes a preflight section when a stored result exists", async () => {
+  const lines = await captureStatus("ready", [], PREFLIGHT_RESULT);
+  const text = lines.join("\n");
+  assert.match(text, /Pipeline doctor — 2 checks/, `preflight summary missing; got:\n${text}`);
+  assert.match(text, /github-auth/, `per-check line missing; got:\n${text}`);
+  assert.match(text, /Run `gh auth login`\./, `remediation missing; got:\n${text}`);
+  assert.match(text, /2026-06-14T20:00:00\.000Z/, `timestamp missing; got:\n${text}`);
+});
+
+test("runStatus: omits the preflight section (no error) when no stored result exists", async () => {
+  const lines = await captureStatus("ready", [], null);
+  const text = lines.join("\n");
+  assert.doesNotMatch(text, /Pipeline doctor/, `preflight section must be absent; got:\n${text}`);
 });

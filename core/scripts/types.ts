@@ -227,6 +227,16 @@ export interface PipelineConfig {
     min_confidence: number; // 0..1; findings below this advise rather than block
     max_adversarial_rounds: number; // cap review-round re-runs before needs-human
   };
+  // Doctor / preflight (#146). Opt-in, deterministic capability check that runs
+  // before any autonomous work. `runOnStart` (default false) makes the checks run
+  // at the start of an advance run and block it on failure; `failFast` (default
+  // false) stops at the first failing check instead of collecting all failures.
+  // Both default off so existing runs are completely unchanged unless explicitly
+  // enabled (or `pipeline doctor` / `--doctor` is invoked).
+  doctor: {
+    runOnStart: boolean;
+    failFast: boolean;
+  };
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -264,6 +274,7 @@ export const DEFAULT_CONFIG: Omit<
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
+  doctor: { runOnStart: false, failFast: false },
 };
 
 // ---------------------------------------------------------------------------
