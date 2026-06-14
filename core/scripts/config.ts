@@ -76,6 +76,13 @@ const PartialConfigSchema = z.object({
     })
     .strict()
     .optional(),
+  doctor: z
+    .object({
+      runOnStart: z.boolean().optional(),
+      failFast: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -210,6 +217,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       max_adversarial_rounds:
         fileConfig.review_policy?.max_adversarial_rounds ??
         DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
+    },
+    doctor: {
+      runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
+      failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -441,5 +452,9 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
   min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
   max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
+
+doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
+  runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure
+  failFast: ${d.doctor.failFast} # if true, stop at the first failing check instead of collecting all failures
 `;
 }

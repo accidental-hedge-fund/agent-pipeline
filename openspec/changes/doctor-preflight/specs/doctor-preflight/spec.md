@@ -31,9 +31,9 @@ The set of preflight checks SHALL include, at minimum:
 3. **Repo access**: `gh repo view <configured-repo>` exits 0 (token has access to the target repo).
 4. **Worktree cleanliness**: the active working tree has no uncommitted changes on a protected branch (main/staging).
 5. **Harness availability**: each harness declared in config (e.g. `claude`, `codex`) is executable on `PATH`.
-6. **Package install state**: `node_modules` exists and `package-lock.json` is not newer than `node_modules` (mtime heuristic).
-7. **OpenSpec availability** (conditional): when `openspec.enabled: true` in config, the `openspec` CLI is present and executable.
-8. **Eval command availability** (conditional): when `evalCommand` is configured, the declared command is present and executable.
+6. **Package install state** (conditional): for repos with a `package-lock.json` at the repo root, `node_modules` exists and the lock file is not newer than `node_modules` (mtime heuristic). Repos without a root lock file skip this check.
+7. **OpenSpec availability** (conditional): when OpenSpec is active for the repo (`openspec.enabled: on`, or `auto` with an `openspec/` directory present), the `openspec` CLI is present and executable.
+8. **Eval command availability** (conditional): when the eval gate is enabled with a configured command (`eval_gate.enabled: true` and `eval_gate.command` set), the command's binary is present on `PATH`.
 
 #### Scenario: Required CLI missing
 
@@ -55,18 +55,18 @@ The set of preflight checks SHALL include, at minimum:
 
 #### Scenario: Package install state stale
 
-- **WHEN** `node_modules` does not exist or `package-lock.json` is newer than `node_modules`
+- **WHEN** a `package-lock.json` exists at the repo root and either `node_modules` does not exist or the lock file is newer than `node_modules`
 - **THEN** the package install check SHALL fail
 - **AND** the remediation text SHALL instruct the user to run `npm ci`
 
-#### Scenario: OpenSpec check skipped when not configured
+#### Scenario: OpenSpec check skipped when OpenSpec is not active
 
-- **WHEN** `openspec.enabled` is false or absent in config
+- **WHEN** OpenSpec is not active for the repo (`openspec.enabled: off`, or `auto` with no `openspec/` directory)
 - **THEN** the OpenSpec CLI check SHALL be skipped and SHALL NOT appear as a failure
 
 #### Scenario: Eval command check skipped when not configured
 
-- **WHEN** no `evalCommand` is configured
+- **WHEN** the eval gate is disabled or no `eval_gate.command` is configured
 - **THEN** the eval-command check SHALL be skipped and SHALL NOT appear as a failure
 
 ### Requirement: The pipeline SHALL support an opt-in run-start preflight that blocks the run on failure

@@ -42,6 +42,13 @@ import * as preMergeStage from "./stages/pre_merge.ts";
 import * as evalStage from "./stages/eval.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
+import {
+  formatDoctorSummary,
+  loadLatestPreflightResult,
+  runPreflight,
+  storePreflightResult,
+  type PreflightResult,
+} from "./stages/doctor.ts";
 import { LABEL_PREFIX, reviewStageSkipTarget, type Outcome, type PipelineConfig, type Stage } from "./types.ts";
 
 const MAX_ITERATIONS = 12;
@@ -66,6 +73,8 @@ export interface CliOpts {
   profile?: string;
   cleanup?: boolean;
   init?: boolean;
+  doctor?: boolean;
+  failFast?: boolean;
 }
 
 async function main(): Promise<void> {
@@ -77,6 +86,8 @@ async function main(): Promise<void> {
     .argument("[number]", "issue or PR number (required unless --cleanup)")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
+    .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
+    .option("--fail-fast", "doctor: stop at the first failing check instead of collecting all failures")
     .option("--status", "read-only status; print stage and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
@@ -95,6 +106,10 @@ async function main(): Promise<void> {
   const opts = cmd.opts<CliOpts>();
   const numArg = cmd.args[0];
   const isInit = opts.init || numArg === "init";
+  // `pipeline doctor` is a standalone command (like `init`): it runs the
+  // preflight checks and exits, with no issue number. Distinct from the
+  // `--doctor` flag, which gates a real advance run.
+  const isDoctorCommand = numArg === "doctor";
 
   let cfg: PipelineConfig;
   try {
@@ -123,9 +138,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (isDoctorCommand) {
+    await runDoctor(cfg, opts);
+    return;
+  }
+
   const number = Number.parseInt(numArg ?? "", 10);
   if (!Number.isFinite(number) || number <= 0) {
-    console.error(`pipeline: argument <number> is required (or use --cleanup, --init, or 'pipeline init')`);
+    console.error(`pipeline: argument <number> is required (or use --cleanup, --init, 'pipeline init', or 'pipeline doctor')`);
     process.exit(2);
   }
 
@@ -162,6 +182,15 @@ async function main(): Promise<void> {
     await runOverride(cfg, issueNumber, opts.override, opts);
     return;
   }
+
+  // Run-start preflight (#146): opt-in via `doctor.runOnStart` config or the
+  // `--doctor` flag. A failing preflight aborts the advance before planning, so
+  // no planning/implementation/review tokens are consumed.
+  const gate = await runStartPreflightGate(cfg, opts);
+  if (!gate.proceed) {
+    process.exit(1);
+  }
+
   await runAdvance(cfg, issueNumber, opts);
 }
 
@@ -205,6 +234,59 @@ export async function runInit(cfg: PipelineConfig): Promise<void> {
   console.log(`[pipeline] init: pipeline labels ensured in ${cfg.repo}.`);
 }
 
+// ---------------------------------------------------------------------------
+// Doctor / preflight (#146)
+// ---------------------------------------------------------------------------
+
+/** IO seam shared by `runDoctor` and `runStartPreflightGate` so unit tests inject
+ *  fakes — no real subprocess/fs/network. */
+export interface PreflightCliDeps {
+  runPreflight: typeof runPreflight;
+  storePreflightResult: typeof storePreflightResult;
+}
+
+const defaultPreflightCliDeps: PreflightCliDeps = { runPreflight, storePreflightResult };
+
+/** `pipeline doctor`: run every preflight check, print the summary, persist the
+ *  result for `--status`, and set the exit code (0 all-pass, 1 any failure). */
+export async function runDoctor(
+  cfg: PipelineConfig,
+  opts: CliOpts,
+  deps: PreflightCliDeps = defaultPreflightCliDeps,
+): Promise<void> {
+  const failFast = opts.failFast ?? cfg.doctor.failFast;
+  const result = await deps.runPreflight(cfg, undefined, { failFast });
+  await deps.storePreflightResult(cfg, result);
+  console.log(formatDoctorSummary(result));
+  process.exitCode = result.ok ? 0 : 1;
+}
+
+/** Run-start preflight gate: when enabled (`doctor.runOnStart` or `--doctor`),
+ *  run the checks before planning and report whether the advance may proceed.
+ *  Returns `{ proceed: true }` unchanged when the feature is not enabled, so an
+ *  ordinary run is byte-for-byte unaffected. */
+export async function runStartPreflightGate(
+  cfg: PipelineConfig,
+  opts: CliOpts,
+  deps: PreflightCliDeps = defaultPreflightCliDeps,
+): Promise<{ proceed: boolean; result: PreflightResult | null }> {
+  const enabled = cfg.doctor.runOnStart || !!opts.doctor;
+  if (!enabled) return { proceed: true, result: null };
+
+  console.log(`[pipeline] running preflight (doctor) before planning...`);
+  const failFast = opts.failFast ?? cfg.doctor.failFast;
+  const result = await deps.runPreflight(cfg, undefined, { failFast });
+  await deps.storePreflightResult(cfg, result);
+  console.log(formatDoctorSummary(result));
+  if (!result.ok) {
+    console.error(
+      `[pipeline] preflight failed — aborting before planning. Fix the issues above (or run \`pipeline doctor\`) and re-run.`,
+    );
+    return { proceed: false, result };
+  }
+  return { proceed: true, result };
+}
+
 async function resolveIssueNumber(cfg: PipelineConfig, number: number): Promise<number> {
   const kind = await getItemKind(cfg, number);
   if (kind === "issue") return number;
@@ -233,9 +315,11 @@ const REVIEW_CEILING_MARKER = "## Pipeline: Review ceiling reached";
 export interface RunStatusDeps {
   getIssueDetail: typeof getIssueDetail;
   getPrForIssue: typeof getPrForIssue;
+  /** Latest stored preflight result (#146); optional so existing callers are unaffected. */
+  loadLatestPreflightResult?: typeof loadLatestPreflightResult;
 }
 
-const defaultRunStatusDeps: RunStatusDeps = { getIssueDetail, getPrForIssue };
+const defaultRunStatusDeps: RunStatusDeps = { getIssueDetail, getPrForIssue, loadLatestPreflightResult };
 
 export async function runStatus(
   cfg: PipelineConfig,
@@ -287,6 +371,15 @@ export async function runStatus(
           `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
+  }
+
+  // #146: surface the latest preflight result if one was stored by a prior
+  // `pipeline doctor` run. Absent → omit the section silently (no error).
+  const loadPreflight = deps.loadLatestPreflightResult ?? loadLatestPreflightResult;
+  const preflight = await loadPreflight(cfg);
+  if (preflight) {
+    console.log("");
+    console.log(formatDoctorSummary(preflight));
   }
 }
 

@@ -27,7 +27,7 @@ The pipeline today has no pre-run validity check. Failures due to missing CLIs, 
 
 **Decision: checks declared as a typed array, not ad-hoc conditionals.** Each check is a `PreflightCheck` record `{ id, description, run: (deps) => CheckResult }`. The runner iterates them, collecting results. This makes it easy to add/remove checks, and the `--status` surface can report per-check results consistently.
 
-**Decision: `--status` reads the latest stored result from a local result file (`.pipeline-doctor-result.json` under `.claude/`) rather than re-running checks.** Re-running on every `--status` would be slow and surprising; a stored result with a timestamp lets the user see the last known state quickly.
+**Decision: `--status` reads the latest stored result from a result file rather than re-running checks.** Re-running on every `--status` would be slow and surprising; a stored result with a timestamp lets the user see the last known state quickly. The file lives at `/tmp/pipeline-{domain}-doctor-result.json`, keyed by domain — mirroring the existing `/tmp/pipeline-{domain}*` lock and kill-switch convention — **not** inside the repo (e.g. under `.claude/`). Storing it in the repo would create an untracked file that the doctor's own worktree-cleanliness check would then flag, and would risk being committed accidentally; `/tmp` avoids both.
 
 **Decision: lock-file freshness via mtime comparison.** `npm ci` guarantees `node_modules` is in sync; the cheapest proxy without running `npm install --dry-run` is comparing the `package-lock.json` mtime to the `node_modules` mtime. This is a heuristic, not a guarantee — the remediation text says "run `npm ci`", which is the correct fix regardless.
 

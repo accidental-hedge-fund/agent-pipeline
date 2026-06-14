@@ -56,6 +56,8 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline N --repo-path <path>           target a different repo working tree
 /pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
 /pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
+/pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
+/pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -76,6 +78,17 @@ pipeline labels via `ensurePipelineLabels` and scaffolds a commented
 notice, if the file already exists). It is idempotent and additive — a normal
 `/pipeline N` run still self-creates any missing labels, so `init` is a
 convenience, not a precondition.
+
+`doctor` takes no number either. It runs a **deterministic, model-free** preflight
+that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
+cleanliness on protected branches, configured harness availability, npm install
+freshness, and — when configured — the `openspec` CLI and the eval command's
+binary. It prints a per-check pass/fail summary with one-line remediation on each
+failure and exits `0`/`1`. Opt in to run it at the start of a real run with
+`doctor.runOnStart: true` or `--doctor`: a failing preflight aborts **before
+planning**, so no tokens are spent. `--fail-fast` (or `doctor.failFast: true`)
+stops at the first failure. The latest result is stored under `/tmp` and surfaced
+by `--status`.
 
 ## Setup (zero install after first run)
 
@@ -279,6 +292,7 @@ opened. Also send one final PushNotification with the terminal state.
 - `--dry-run` — logs what would happen, no harness calls
 - `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
 - `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
+- `doctor` — deterministic preflight, no model calls, completes in seconds
 
 Run those synchronously, no Monitor, no background, no Push.
 
