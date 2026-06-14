@@ -114,7 +114,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. #144 (override durability) is convergence-robustness hardening, no new surface. |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21, #149 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. #149 adds bounded continuation budgets on top of existing `needs-human` semantics; no merge/deploy authority. |
 | **v1.4.0** | minor | Evidence gates & private evals | #148 | Adds an optional reviewer-owned private shipcheck gate before `ready-to-deploy`; advisory-first, no default behavior change. |
-| **v1.5.0** | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156 | Adds machine-facing launch, status, event, log, and config-validation contracts so Pipeline Desk can supervise runs without scraping terminal prose. Keeps the current skill structure and human `/pipeline` / `$pipeline` flows intact. |
+| **v1.5.0** | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Adds machine-facing launch, status, event, log, config-validation, and run-artifact-convention contracts so Pipeline Desk can supervise runs without scraping terminal prose. Keeps the current skill structure and human `/pipeline` / `$pipeline` flows intact. Contract shapes sharpened against the 2026-06-14 compound-engineering-plugin / gstack evaluation (see detail). |
 | **v1.6.0** | minor | Intake & backlog automation | #158 | Adds an opt-in no-issue-number `/pipeline` sub-command that specs a short description into a decision-complete GitHub issue (`/pm`-style) and proposes a matching `ROADMAP.md` update via PR — one front door that keeps the backlog and roadmap in sync. Additive; existing flows unchanged. |
 | *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
@@ -154,6 +154,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #154 | minor | JSON output only | desktop status/preflight | v1.5.0 | #146 |
 | #155 | minor | artifact/event format | desktop run events/logs | v1.5.0 | #147 |
 | #156 | minor | schema output only | desktop config editor | v1.5.0 | — |
+| #161 | patch | none | run-artifact conventions | v1.5.0 | #147 ✓ |
 | #158 | minor | new sub-command | intake & roadmap sync | v1.6.0 | — |
 | #14 | none | — | research | *(none)* | — |
 | #27 | none | — | research | *(none)* | — |
@@ -187,7 +188,7 @@ SmallHarness-inspired hardening that makes runs cheaper to diagnose and less lik
 - **#39** — No-review-harness fallback: degrade to a clearly-labeled same-harness self-review when the reviewer CLI is unavailable (failure-triggered, at the invoke seam, **no new config key**).
 - **#40** — Configurable review harness: generalize `invoke()` and add a real, honored reviewer-selection key. *Note: #93 deleted the old ignored `harnesses` key, so this **adds a fresh key** (purely additive), not a revival of a dead one.* Sequence after #39.
 - **#70** — Per-step model config: add `models.implementing` only; drop `models.docs` (folds into impl under #91) and the identifier allowlist; warn when `models.*` is set on a codex step.
-- **#144** — Override durability: keep a recorded `--override` applying when the reviewer rewords a finding's title (stable finding identity, e.g. `severity | file | line` or normalized-title match instead of raw-title hash). Convergence-robustness item surfaced by #19's 5-round truncation churn — defer-via-override couldn't converge because each reworded title minted a new key. Same non-convergence family as #133.
+- **#144** — Override durability: keep a recorded `--override` applying when the reviewer rewords a finding's title (stable finding identity instead of raw-title hash). Convergence-robustness item surfaced by #19's 5-round truncation churn — defer-via-override couldn't converge because each reworded title minted a new key. Same non-convergence family as #133. *Recommended identity (from the 2026-06-14 evaluation; both upstreams converge on it):* `normalize(file) + line_bucket(line, ±3) + normalize(title)` — shift-tolerant, used by **both** `--override` matching and #133's RECURRING/NEW tagging (`compound-engineering/ce-code-review` + `tracker-defer.md`).
 
 ### v1.3.0 — graduated autonomy & isolation (minor)
 
@@ -203,12 +204,15 @@ SmallHarness-inspired hardening that makes runs cheaper to diagnose and less lik
 
 Pipeline Desk is a separate lightweight desktop cockpit over `agent-pipeline`. The engine should stay skill-first and CLI-first; this release adds the machine-facing contracts the desktop app needs so it can launch, observe, validate, and recover runs without reimplementing the state machine.
 
-- **#153** — Host-neutral launcher and install discovery for Pipeline Desk: stable desktop-safe subprocess entrypoint, version discovery, installed-host coverage, and Claude-first profile selection while preserving `/pipeline` and `$pipeline`.
-- **#154** — JSON status and preflight output: machine-readable issue/repo state plus deterministic `doctor --json`, composing with #146 rather than duplicating preflight logic.
-- **#155** — Stable run directory, JSON events, and log-follow: `.agent-pipeline/runs/<run-id>/` with `run.json`, `events.jsonl`, `terminal.log`, and `summary.json`; relationship to #147's evidence bundle must be explicit so there is one artifact family, not two.
-- **#156** — JSON Schema and validation command for `.github/pipeline.yml`: lets Pipeline Desk validate config edits through the engine-owned schema instead of copying the TypeScript/Zod contract.
+> **Contract shapes sharpened against the 2026-06-14 evaluation of `everyinc/compound-engineering-plugin` + `garrytan/gstack`** (read-only review). Neither upstream is a state-machine engine; both confirm agent-pipeline's architecture is ahead. What they provide is a proven *contract vocabulary* — append-only `events.jsonl` (`gstack/lib/jsonl-store.ts`), a detached launcher with a completion sentinel (`gstack/bin/gstack-detach`), `doctor --json` always-valid-even-on-failure (`gstack/bin/gstack-gbrain-detect`), severity-tiered config validation (`gstack/bin/gstack-config`), and a single unfenced `status`-discriminant envelope (`compound-engineering/ce-code-review`). The sharpened acceptance criteria live on each issue. Explicitly **not** adopted: prose state machines, silent-default config, a multi-harness converter platform, or any event bus/IPC daemon (filesystem-only artifacts).
 
-Compatibility rule: Pipeline Desk will support legacy PTY streaming until these contracts are available, but `agent-pipeline` should treat these contracts as the preferred M5+ integration path.
+- **#153** — Host-neutral launcher and install discovery: stable desktop-safe subprocess entrypoint, version discovery, installed-host coverage (missing / Claude-only / Codex-only / both), and Claude-first profile selection while preserving `/pipeline` and `$pipeline`. Sharpened with a detached-run launcher (`gstack-detach` semantics: process-group escape, advisory lock, timeout watchdog, completion sentinel).
+- **#154** — JSON status and preflight output: machine-readable issue/repo state plus deterministic `doctor --json`, composing with #146. Sharpened: one unfenced JSON object with a `status` discriminant, valid even when every check fails, a silent `--is-ok` exit gate, and a `schema_version` + backward-compat field promise.
+- **#155** *(keystone — #154 status and `logs --follow` layer on it)* — Stable run directory, JSON events, and log-follow: `.agent-pipeline/runs/<run-id>/` with `run.json`, `events.jsonl` (append-only), `terminal.log` (always written, preserving PTY fallback), and `summary.json`. Sharpened: **builds on #147's evidence bundle** (reshape its monolithic per-issue `evidence.json` into an append-only event log; one artifact family, not two).
+- **#156** — JSON Schema and validation command for `.github/pipeline.yml`. Sharpened: keep `.strict()` loudness; add severity-tiered validation that **rejects** typos in rigor/cost-gating keys (exit 1, value preserved) rather than coercing, with line-numbered diagnostics.
+- **#161** — Run-artifact conventions underpinning the above: non-fatal observability I/O (a write failure never breaks the run it records), a write-time prompt-injection denylist on appended records, `schema_version` on every machine record, and a `_`-prefix local-only-field convention.
+
+Compatibility rule: Pipeline Desk will support legacy PTY streaming until these contracts are available, but `agent-pipeline` should treat these contracts as the preferred M5+ integration path. `schema_version` enables graceful degradation: a desktop that finds no run dir / no `schema_version` falls back to PTY-streaming an older engine.
 
 ### v1.6.0 — intake & backlog automation (minor)
 
