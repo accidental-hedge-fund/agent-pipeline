@@ -614,6 +614,9 @@ async function runAdvance(
 
     // Tracks the stage the run ends at — recorded as the bundle's terminal state.
     let finalStage: Stage = startStage;
+    // Tracks the most recently seen branch so the finally block can patch bundle
+    // identity even when deployReady.finalize() has already removed the worktree.
+    let lastKnownBranch: string | null = null;
     try {
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       const detail = await getIssueDetail(cfg, issueNumber);
@@ -735,6 +738,7 @@ async function runAdvance(
         let stageCommits: string[] = [];
         const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
         if (wtAfter) {
+          lastKnownBranch = branchName(issueNumber, wtAfter.slug);
           // If no worktree existed before dispatch (e.g., planning creates it), fall
           // back to origin/<base_branch> so all planning commits are captured.
           const rangeStart = headBeforeDispatch || `origin/${cfg.base_branch}`;
@@ -777,7 +781,11 @@ async function runAdvance(
           // ready-to-deploy run. Overwriting with null would erase the captured branch.
           const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
           const latestWt = await getForIssue(cfg, issueNumber).catch(() => null);
-          const latestBranch = latestWt ? branchName(issueNumber, latestWt.slug) : null;
+          // deployReady.finalize() removes the worktree before this block runs, so
+          // latestWt may be null on a successful run. Fall back to the last branch we
+          // observed during the dispatch loop so the bundle is never finalized with
+          // branch: null after a complete run.
+          const latestBranch = latestWt ? branchName(issueNumber, latestWt.slug) : lastKnownBranch;
           const identityPatch: { pr?: number | null; branch?: string | null } = {};
           if (latestPr !== null) identityPatch.pr = latestPr;
           if (latestBranch !== null) identityPatch.branch = latestBranch;

@@ -235,7 +235,10 @@ export function makeCommandRecord(
 }
 
 /** Append a command to a stage entry (creating the entry if it does not exist).
- *  The record is re-sanitized through {@link makeCommandRecord} defensively. */
+ *  Uses the same last-open entry lookup as {@link recordPrompt}: on a re-entered
+ *  stage there are multiple entries with the same name; we target the last one
+ *  whose `exitedAt` is still null (the currently active visit). The record is
+ *  re-sanitized through {@link makeCommandRecord} defensively. */
 export async function recordCommand(
   stateDir: string,
   issue: number,
@@ -244,7 +247,13 @@ export async function recordCommand(
   deps: BundleDeps = defaultDeps,
 ): Promise<void> {
   const bundle = await loadForUpdate(stateDir, issue, deps);
-  let entry = bundle.stages.find((s) => s.stage === stageName);
+  let entry: StageRecord | undefined;
+  for (let i = bundle.stages.length - 1; i >= 0; i--) {
+    if (bundle.stages[i].stage === stageName && bundle.stages[i].exitedAt === null) {
+      entry = bundle.stages[i];
+      break;
+    }
+  }
   if (!entry) {
     entry = {
       stage: stageName,

@@ -266,6 +266,35 @@ test("recordCommand: output excerpt capped at 500 even when passed oversized", a
   assert.equal(cmd.outputExcerpt.length, 500);
 });
 
+// Finding 2 regression: recordCommand targets the current open entry on re-entered stages
+test("recordCommand: on re-entered stage, command appends to the currently open entry, not the first closed entry", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+
+  // First pre-merge visit: enter, record a command, then close
+  await recordStage(STATE, ISSUE, { stage: "pre-merge", enteredAt: "2026-06-14T20:00:00Z" }, deps);
+  await recordCommand(STATE, ISSUE, "pre-merge", makeCommandRecord("git push", 0, 100, "ok"), deps);
+  await recordStage(STATE, ISSUE, { stage: "pre-merge", exitedAt: "2026-06-14T20:05:00Z", outcome: "blocked" }, deps);
+
+  // Intervening review-2 visit (SHA gate bounced back)
+  await recordStage(STATE, ISSUE, { stage: "review-2", enteredAt: "2026-06-14T20:06:00Z" }, deps);
+  await recordStage(STATE, ISSUE, { stage: "review-2", exitedAt: "2026-06-14T20:10:00Z", outcome: "advanced" }, deps);
+
+  // Second pre-merge visit: re-enter, record another command
+  await recordStage(STATE, ISSUE, { stage: "pre-merge", enteredAt: "2026-06-14T20:11:00Z" }, deps);
+  await recordCommand(STATE, ISSUE, "pre-merge", makeCommandRecord("git push --force-with-lease", 0, 80, "pushed"), deps);
+
+  const b = readState(files);
+  const pm = b.stages.filter((s) => s.stage === "pre-merge");
+  assert.equal(pm.length, 2, "two pre-merge entries must exist");
+  // First entry (closed) must have only the first command
+  assert.equal(pm[0].commands.length, 1, "first closed entry must have its own command");
+  assert.equal(pm[0].commands[0].cmd, "git push");
+  // Second entry (open) must have the second command, not be empty
+  assert.equal(pm[1].commands.length, 1, "second open entry must receive the re-entry command");
+  assert.equal(pm[1].commands[0].cmd, "git push --force-with-lease");
+});
+
 // ---------------------------------------------------------------------------
 // recordReview
 // ---------------------------------------------------------------------------
