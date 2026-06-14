@@ -106,6 +106,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21, #149 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. #149 adds bounded continuation budgets on top of existing `needs-human` semantics; no merge/deploy authority. |
 | **v1.4.0** | minor | Evidence gates & private evals | #148 | Adds an optional reviewer-owned private shipcheck gate before `ready-to-deploy`; advisory-first, no default behavior change. |
 | **v1.5.0** | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156 | Adds machine-facing launch, status, event, log, and config-validation contracts so Pipeline Desk can supervise runs without scraping terminal prose. Keeps the current skill structure and human `/pipeline` / `$pipeline` flows intact. |
+| **v1.6.0** | minor | Intake & backlog automation | #158 | Adds an opt-in no-issue-number `/pipeline` sub-command that specs a short description into a decision-complete GitHub issue (`/pm`-style) and proposes a matching `ROADMAP.md` update via PR — one front door that keeps the backlog and roadmap in sync. Additive; existing flows unchanged. |
 | *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -144,6 +145,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #154 | minor | JSON output only | desktop status/preflight | v1.5.0 | #146 |
 | #155 | minor | artifact/event format | desktop run events/logs | v1.5.0 | #147 |
 | #156 | minor | schema output only | desktop config editor | v1.5.0 | — |
+| #158 | minor | new sub-command | intake & roadmap sync | v1.6.0 | — |
 | #14 | none | — | research | *(none)* | — |
 | #27 | none | — | research | *(none)* | — |
 
@@ -198,6 +200,10 @@ Pipeline Desk is a separate lightweight desktop cockpit over `agent-pipeline`. T
 - **#156** — JSON Schema and validation command for `.github/pipeline.yml`: lets Pipeline Desk validate config edits through the engine-owned schema instead of copying the TypeScript/Zod contract.
 
 Compatibility rule: Pipeline Desk will support legacy PTY streaming until these contracts are available, but `agent-pipeline` should treat these contracts as the preferred M5+ integration path.
+
+### v1.6.0 — intake & backlog automation (minor)
+
+- **#158** — Front-door intake sub-command. A new no-issue-number `/pipeline` mode (alongside `--init` / `--cleanup` / `--version`) takes a short description, expands it into a decision-complete spec using the same contract as the `/pm` issue-spec agent (Summary / User story / Acceptance criteria / Out of scope / Open questions; WHAT-not-HOW), **creates the GitHub issue** with the right `pipeline:*` + `release:*` labels, and **proposes a `ROADMAP.md` update** — release-plan row, per-issue sem-ver row, and detail section — as a branch + PR for human review. The model-invoking spec step is the only non-deterministic part; issue creation and roadmap editing are deterministic given the spec. A dry-run prints the proposed issue + roadmap diff with no writes. Keeps the "pipeline never merges" contract: a human owns the roadmap-PR and release-slot decisions. **Open design forks** (in the issue): reuse `/pm` vs. embed an equivalent prompt; how the version is chosen / whether a new lane may be proposed; structured vs. anchor-based roadmap editing.
 
 ### Trackers (no release)
 
