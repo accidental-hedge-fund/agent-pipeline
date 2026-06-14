@@ -181,6 +181,8 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
+/pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
@@ -244,9 +246,38 @@ review_policy:                       # which review findings block progression v
   block_threshold: medium            # critical|high|medium|low — findings below this advise, not block (default: medium; 'high' = more throughput, 'low' = block on everything)
   min_confidence: 0.7                # 0..1 — findings below this confidence advise, not block (default: 0.7)
   max_adversarial_rounds: 3          # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to pipeline:needs-human
+doctor:                              # deterministic preflight capability check — see "Preflight (doctor)"
+  runOnStart: false                  # default: false; if true, run the preflight before planning and abort the run on any failure
+  failFast: false                    # default: false; if true, stop at the first failing check instead of collecting all failures
 # Harness roles (implementer/reviewer) are owned by the install profile and cannot
 # be set here — a `harnesses:` key is rejected at config-parse time.
 ```
+
+## Preflight (doctor)
+
+`pipeline doctor` runs a fast, **deterministic, model-free** capability check and prints a per-check pass/fail summary — a "this repo is runnable" signal before any autonomous work begins. It exits `0` when everything passes and `1` when any check fails, so it drops cleanly into CI or an onboarding script. It invokes no language model and consumes no tokens.
+
+```bash
+/pipeline doctor    # Claude Code primary
+$pipeline doctor    # Codex primary
+```
+
+The checks (each emits one sentence of remediation text on failure):
+
+| Check | Passes when | Skipped when |
+| --- | --- | --- |
+| `cli:gh` / `cli:node` | `gh` and `node` are on `PATH` | — |
+| `github-auth` | `gh auth status` exits 0 | — |
+| `repo-access` | `gh repo view <repo>` succeeds | — |
+| `worktree-clean` | the checkout has no uncommitted changes **while on a protected branch** (`main`/`master`/`staging`/`base_branch`); feature branches always pass | — |
+| `harness:<bin>` | each configured harness (`claude`/`codex`) is on `PATH` | — |
+| `package-install` | `node_modules` exists and is not older than `package-lock.json` | the repo root has no `package-lock.json` |
+| `openspec-cli` | the `openspec` CLI is on `PATH` | OpenSpec is not active (`openspec.enabled: off`, or `auto` with no `openspec/` dir) |
+| `eval-command` | the configured eval command's binary resolves on `PATH` | the eval gate is off or has no `command` |
+
+**Run-start gating (opt-in).** Set `doctor.runOnStart: true` in `.github/pipeline.yml`, or pass `--doctor` on a normal run, to run the preflight **before planning**. A failing preflight prints the summary and aborts with a non-zero exit **before any planning, implementation, or review tokens are spent**. With neither set, a run is completely unaffected — no checks execute. `--fail-fast` (or `doctor.failFast: true`) stops at the first failing check instead of collecting all failures.
+
+The latest result is stored under `/tmp/pipeline-<domain>-doctor-result.json`; `/pipeline N --status` appends that preflight summary (with its timestamp) when one is present, and omits the section otherwise.
 
 ## Test/build gate (optional, default on)
 

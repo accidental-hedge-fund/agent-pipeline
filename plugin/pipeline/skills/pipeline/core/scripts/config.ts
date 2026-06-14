@@ -76,6 +76,13 @@ const PartialConfigSchema = z.object({
     })
     .strict()
     .optional(),
+  doctor: z
+    .object({
+      runOnStart: z.boolean().optional(),
+      failFast: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -87,6 +94,10 @@ export interface ResolveOptions {
   baseBranch?: string;      // --base
   profile?: string;         // shared-core profile name
   tolerateInvalidConfig?: boolean; // warn + fall back to defaults instead of throwing on invalid config (used by init)
+  /** When true, a `gh repo view` failure sets repo="" instead of throwing.
+   *  Used by `pipeline doctor` so the command can run its own cli/auth/repo-access
+   *  checks and report proper remediation even when gh is missing or auth is expired. */
+  tolerateGhFailure?: boolean;
 }
 
 /**
@@ -106,22 +117,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     );
   }
 
-  // Discover owner/name via gh.
-  let repo: string;
-  try {
-    const out = execFileSync("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], {
-      cwd: repoDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    repo = out.trim();
-  } catch (err) {
-    throw new Error(
-      `Failed to discover GitHub repo for ${repoDir} via 'gh repo view'. Make sure 'gh' is authenticated.`,
-    );
-  }
-
-  // Load file config if present.
+  // Load file config BEFORE gh repo discovery so doctor.runOnStart can be
+  // detected and incorporated into tolerateGhFailure. Without this ordering a
+  // repo with doctor.runOnStart: true would still exit via the generic config-
+  // error path when gh is missing/auth-expired — before the preflight gate ran.
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   let fileConfig: z.infer<typeof PartialConfigSchema> = {};
   if (fs.existsSync(configPath)) {
@@ -143,6 +142,32 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig = result.data;
       }
     }
+  }
+
+  // tolerateGhFailure: caller flag (standalone doctor / --doctor) OR
+  // doctor.runOnStart: true from the local config.  In both cases resolveConfig
+  // must not throw on a gh failure so that the preflight gate can run and report
+  // the real CLI/auth/repo-access failure with actionable remediation text.
+  const tolerateGhFailure = opts.tolerateGhFailure || (fileConfig.doctor?.runOnStart === true);
+
+  // Discover owner/name via gh.
+  let repo: string;
+  try {
+    const out = execFileSync("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], {
+      cwd: repoDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    repo = out.trim();
+  } catch (err) {
+    if (!tolerateGhFailure) {
+      throw new Error(
+        `Failed to discover GitHub repo for ${repoDir} via 'gh repo view'. Make sure 'gh' is authenticated.`,
+      );
+    }
+    // gh unavailable or auth expired: set repo="" so the caller can still run
+    // doctor checks (cli:gh, github-auth, repo-access) which surface the real failure.
+    repo = "";
   }
 
   const merged: PipelineConfig = {
@@ -210,6 +235,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       max_adversarial_rounds:
         fileConfig.review_policy?.max_adversarial_rounds ??
         DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
+    },
+    doctor: {
+      runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
+      failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -441,5 +470,9 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
   min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
   max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
+
+doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
+  runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure
+  failFast: ${d.doctor.failFast} # if true, stop at the first failing check instead of collecting all failures
 `;
 }

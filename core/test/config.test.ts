@@ -637,3 +637,105 @@ test("resolveConfig: partial known models block (single key) is still valid", as
     process.env.PATH = oldPath;
   }
 });
+
+// ---- doctor block (#146) ----
+
+test("resolveConfig: doctor defaults apply when block is absent", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/doc0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.doctor.runOnStart, DEFAULT_CONFIG.doctor.runOnStart);
+    assert.equal(cfg.doctor.runOnStart, false);
+    assert.equal(cfg.doctor.failFast, DEFAULT_CONFIG.doctor.failFast);
+    assert.equal(cfg.doctor.failFast, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: doctor block with valid keys is accepted", async () => {
+  const repo = makeFakeRepo(`doctor:\n  runOnStart: true\n  failFast: false\n`);
+  const binDir = makeFakeGh("acme/doc1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.doctor.runOnStart, true);
+    assert.equal(cfg.doctor.failFast, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: a partial doctor block keeps the other field at its default", async () => {
+  const repo = makeFakeRepo(`doctor:\n  failFast: true\n`);
+  const binDir = makeFakeGh("acme/doc2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.doctor.failFast, true);
+    assert.equal(cfg.doctor.runOnStart, false); // unspecified → default
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under doctor is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`doctor:\n  autoFix: true\n`);
+  const binDir = makeFakeGh("acme/doc3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("autoFix"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: non-boolean doctor.runOnStart is rejected", async () => {
+  const repo = makeFakeRepo(`doctor:\n  runOnStart: yes-please\n`);
+  const binDir = makeFakeGh("acme/doc4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// Regression (#146 review 2): when pipeline.yml sets doctor.runOnStart: true,
+// resolveConfig must tolerate a gh failure (return repo:"") so the run-start
+// preflight gate — not the generic config-error path — reports the failure.
+test("resolveConfig: doctor.runOnStart:true tolerates gh failure and returns repo:''", async () => {
+  const repo = makeFakeRepo(`doctor:\n  runOnStart: true\n`);
+  // Fake gh that always exits non-zero.
+  const binDir = fs.mkdtempSync(path.join(tmpRoot, "bin-"));
+  const ghPath = path.join(binDir, "gh");
+  fs.writeFileSync(ghPath, `#!/usr/bin/env bash\nexit 1\n`);
+  fs.chmodSync(ghPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // Must NOT throw — the preflight gate owns the failure, not resolveConfig.
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.repo, "", "repo must be '' when gh fails and runOnStart tolerates it");
+    assert.equal(cfg.doctor.runOnStart, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
