@@ -229,6 +229,35 @@ test("partition: ambiguous override (two distinct findings share the same key) �
   assert.equal(p.blocking.length, 2, "both findings remain blocking");
 });
 
+test("partition: exact-duplicate same-key findings — override applies (not ambiguous)", () => {
+  // If the reviewer emits the same finding twice (identical severity/file/line/title),
+  // the raw count is 2 but the distinct-title count is 1 — not ambiguous.
+  // The override must still apply; before the fix the count-only guard withheld it.
+  const f = finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46 });
+  const dup = { ...f };
+  const key = findingKey(f);
+  const overrides = new Map([[key, "rejected"]]);
+  const p = partitionFindings([f, dup], { block_threshold: "low", min_confidence: 0 }, overrides);
+  assert.equal(p.blocking.length, 0, "exact duplicate is not a distinct candidate — override must apply");
+  assert.equal(p.overridden.length, 2, "both copies go to overridden");
+});
+
+test("partition: advisory-confidence duplicate shares key with blocker — override still applies to blocker", () => {
+  // A high blocking finding (confidence 0.9) and a high low-confidence advisory (0.3)
+  // land in the same 5-line bucket → same key. The advisory finding is not a blocking
+  // candidate, so the distinct count is 1 and the override must not be withheld.
+  const policy: ReviewPolicy = { block_threshold: "low", min_confidence: 0.8 };
+  const blocker = finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46, confidence: 0.9 });
+  const advisory = finding({ severity: "high", file: "x.ts", title: "can still starve", line_start: 48, confidence: 0.3 });
+  assert.equal(findingKey(blocker), findingKey(advisory), "precondition: same bucket → same key");
+  const key = findingKey(blocker);
+  const overrides = new Map([[key, "rejected"]]);
+  const p = partitionFindings([blocker, advisory], policy, overrides);
+  assert.equal(p.blocking.length, 0, "override applies to the single blocking candidate");
+  assert.equal(p.overridden.length, 1, "blocker is overridden");
+  assert.equal(p.advisory.length, 1, "low-confidence finding remains advisory");
+});
+
 // ---------------------------------------------------------------------------
 // extractOverrides — sentinel round-trip
 // ---------------------------------------------------------------------------

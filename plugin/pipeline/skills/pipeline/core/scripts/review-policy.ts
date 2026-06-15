@@ -141,10 +141,12 @@ export interface PartitionResult {
  * Override takes precedence over the severity/confidence test so an explicit
  * human disposition always wins.
  *
- * Ambiguity guard (#144): an override is only applied when exactly one finding
- * in this verdict carries that key. If two distinct findings share the same
- * severity+file+5-line-bucket (and therefore the same key), the override is
- * ambiguous and is withheld — both findings remain blocking.
+ * Ambiguity guard (#144): an override is only applied when the current verdict
+ * has exactly one *distinct blocking candidate* for that key. A "blocking
+ * candidate" meets the severity threshold and confidence floor; "distinct"
+ * means unique after normalizeTitle (exact duplicate payloads collapse to one).
+ * Advisory findings and duplicate titles are excluded from the count so they
+ * cannot create false ambiguity and cause a valid override to lapse.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
@@ -154,16 +156,29 @@ export function partitionFindings(
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
 
-  // Count findings per key to detect ambiguous overrides.
-  const keyCounts = new Map<string, number>();
+  // Pre-classify: for each key, collect the set of distinct normalized titles
+  // among blocking candidates only. Advisory findings and exact-duplicate titles
+  // are not counted as distinct candidates and cannot trigger ambiguity.
+  const blockingTitlesByKey = new Map<string, Set<string>>();
   for (const f of findings) {
-    const k = findingKey(f);
-    keyCounts.set(k, (keyCounts.get(k) ?? 0) + 1);
+    const isAboveSeverity = severityRank(f.severity) >= threshold;
+    const isAboveConfidence = typeof f.confidence !== "number" || f.confidence >= policy.min_confidence;
+    if (isAboveSeverity && isAboveConfidence) {
+      const k = findingKey(f);
+      if (!blockingTitlesByKey.has(k)) blockingTitlesByKey.set(k, new Set());
+      blockingTitlesByKey.get(k)!.add(normalizeTitle(f.title));
+    }
   }
 
   for (const f of findings) {
     const key = findingKey(f);
-    if (overrides.has(key) && keyCounts.get(key) === 1) {
+    const isBlockingCandidate =
+      severityRank(f.severity) >= threshold &&
+      (typeof f.confidence !== "number" || f.confidence >= policy.min_confidence);
+    const distinctBlockers = blockingTitlesByKey.get(key)?.size ?? 0;
+    const isAmbiguous = distinctBlockers > 1;
+
+    if (overrides.has(key) && isBlockingCandidate && !isAmbiguous) {
       result.overridden.push({ finding: f, key, disposition: overrides.get(key)! });
       continue;
     }
