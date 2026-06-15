@@ -6,6 +6,9 @@ import {
   SEVERITY_ORDER,
   severityRank,
   findingKey,
+  lineBucket,
+  normalizeFile,
+  normalizeTitle,
   partitionFindings,
   extractOverrides,
   isValidFindingKey,
@@ -48,7 +51,7 @@ test("severityRank: unknown severity is treated as medium (never silently lowest
 });
 
 // ---------------------------------------------------------------------------
-// findingKey — stable, content-addressed
+// findingKey — stable finding identity (#144): location-addressed, title-stable
 // ---------------------------------------------------------------------------
 
 test("findingKey: 8 lowercase hex chars", () => {
@@ -56,17 +59,110 @@ test("findingKey: 8 lowercase hex chars", () => {
   assert.match(k, /^[0-9a-f]{8}$/);
 });
 
-test("findingKey: stable for identical severity|file|title (survives re-review)", () => {
-  const a = findingKey(finding({ severity: "medium", file: "x.ts", title: "T" }));
-  const b = findingKey(finding({ severity: "medium", file: "x.ts", title: "T", body: "different body", confidence: 0.1 }));
-  assert.equal(a, b, "key must not depend on body/confidence — only severity|file|title");
+test("findingKey: key ignores body/confidence (survives re-review)", () => {
+  const a = findingKey(finding({ severity: "medium", file: "x.ts", title: "T", line_start: 12 }));
+  const b = findingKey(finding({ severity: "medium", file: "x.ts", title: "T", line_start: 12, body: "different body", confidence: 0.1 }));
+  assert.equal(a, b, "key must not depend on body/confidence");
 });
 
-test("findingKey: differs when title, file, or severity differ", () => {
-  const base = finding({ severity: "high", file: "x.ts", title: "T" });
-  assert.notEqual(findingKey(base), findingKey({ ...base, title: "T2" }));
+// --- lineBucket / normalize helpers ---
+
+test("lineBucket: fixed 5-line partition; 0 when absent/falsy", () => {
+  assert.equal(lineBucket(1), 1);
+  assert.equal(lineBucket(5), 1);
+  assert.equal(lineBucket(6), 6);
+  assert.equal(lineBucket(10), 6);
+  assert.equal(lineBucket(46), 46);
+  assert.equal(lineBucket(50), 46);
+  assert.equal(lineBucket(undefined), 0);
+  assert.equal(lineBucket(0), 0);
+});
+
+test("normalizeFile: lowercases the path", () => {
+  assert.equal(normalizeFile("Core/Scripts/Review.ts"), "core/scripts/review.ts");
+  assert.equal(normalizeFile(undefined), "");
+});
+
+test("normalizeTitle: strips markdown emphasis, edge punctuation/ellipsis, collapses ws", () => {
+  assert.equal(normalizeTitle("**Can** still `starve`…"), "can still starve");
+  assert.equal(normalizeTitle("…can _starve_."), "can starve");
+  assert.equal(normalizeTitle("Later   sections  starve"), "later sections starve");
+  assert.equal(normalizeTitle(undefined), "");
+});
+
+// --- location-based primary key: stable under title rewording (the #144 fix) ---
+
+test("findingKey: same severity+file+line band, different titles → same key", () => {
+  // Lines 43 and 46 fall in the same 5-line band (41–45 vs 46–50)? 43→band 41, 46→band 46.
+  // Use 43 and 44 which share band 41–45, plus 46/48 which share 46–50.
+  const a = findingKey(finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46 }));
+  const b = findingKey(finding({ severity: "high", file: "x.ts", title: "can still starve", line_start: 48 }));
+  assert.equal(a, b, "title rewording within the same line band must not change the key");
+});
+
+test("findingKey: line drift within the same bucket → same key", () => {
+  // 46..50 all map to bucket 46.
+  const keys = [46, 47, 48, 49, 50].map((l) =>
+    findingKey(finding({ severity: "high", file: "x.ts", title: "T", line_start: l })),
+  );
+  assert.equal(new Set(keys).size, 1, "all lines in one 5-line band share a key");
+});
+
+test("findingKey: different 5-line bands → different keys (specificity)", () => {
+  const a = findingKey(finding({ severity: "high", file: "x.ts", title: "T", line_start: 5 }));
+  const b = findingKey(finding({ severity: "high", file: "x.ts", title: "T", line_start: 6 }));
+  assert.notEqual(a, b, "lines 5 and 6 straddle a band boundary → different keys");
+});
+
+test("findingKey: different severities at same location → different keys (specificity)", () => {
+  const base = finding({ severity: "high", file: "x.ts", title: "T", line_start: 12 });
+  assert.notEqual(findingKey(base), findingKey({ ...base, severity: "critical" }));
+});
+
+test("findingKey: different files at same line band → different keys (specificity)", () => {
+  const base = finding({ severity: "high", file: "x.ts", title: "T", line_start: 12 });
   assert.notEqual(findingKey(base), findingKey({ ...base, file: "y.ts" }));
-  assert.notEqual(findingKey(base), findingKey({ ...base, severity: "low" }));
+});
+
+// --- fallback when line_start is absent: normalized-title key ---
+
+test("findingKey: absent line_start → normalized-title fallback absorbs markdown/case", () => {
+  const a = findingKey(finding({ severity: "high", file: "x.ts", title: "**can** starve" }));
+  const b = findingKey(finding({ severity: "high", file: "x.ts", title: "can starve" }));
+  assert.equal(a, b, "without a line, markdown/case differences must normalize to the same key");
+});
+
+test("findingKey: absent line_start → semantically different titles → different keys", () => {
+  const a = findingKey(finding({ severity: "high", file: "x.ts", title: "missing auth check" }));
+  const b = findingKey(finding({ severity: "high", file: "x.ts", title: "slow loop" }));
+  assert.notEqual(a, b, "distinct normalized titles must produce distinct keys");
+});
+
+test("findingKey: line_start=0 falls back to the title path (not bucket 0)", () => {
+  const a = findingKey(finding({ severity: "high", file: "x.ts", title: "auth", line_start: 0 }));
+  const b = findingKey(finding({ severity: "high", file: "x.ts", title: "loop", line_start: 0 }));
+  assert.notEqual(a, b, "line_start=0 must use the title fallback, distinguishing titles");
+});
+
+// --- #144 regression: reworded title + small line shift keeps the override applying ---
+
+test("#144 regression: override survives a reworded title AND a ±2-line shift", () => {
+  // Round N: a high finding at line 46, title T1, gets an operator override.
+  const roundN = finding({ severity: "high", file: "core/scripts/profile.ts", title: "Later compact sections can starve", line_start: 46 });
+  const key = findingKey(roundN);
+  const overrides = new Map([[key, "deferred-#150"]]);
+
+  // Round N+1: the reviewer re-emits the same issue at line 48 (same 46–50 band)
+  // with a reworded title — under the OLD severity|file|title algorithm this minted
+  // a new key and the override lapsed; under #144 it keeps the same key.
+  const roundNPlus1 = finding({ severity: "high", file: "core/scripts/profile.ts", title: "Later compact sections can still starve", line_start: 48 });
+  assert.equal(findingKey(roundNPlus1), key, "reworded + shifted finding must keep the same key");
+
+  const p = partitionFindings([roundNPlus1], { block_threshold: "low", min_confidence: 0 }, overrides);
+  assert.equal(p.blocking.length, 0, "the override must still apply → not blocking");
+  assert.equal(p.overridden.length, 1);
+  assert.equal(p.overridden[0].key, key);
+  assert.equal(p.overridden[0].disposition, "deferred-#150");
 });
 
 // ---------------------------------------------------------------------------

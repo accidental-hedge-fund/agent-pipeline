@@ -39,13 +39,68 @@ export interface ReviewPolicy {
 }
 
 /**
- * Stable short key for a finding so an operator can reference one specific
- * finding in an override. Content-addressed (severity|file|title) so it is
- * stable across review rounds: a reviewer that re-emits the same finding on a
- * later commit produces the same key, and a prior override keeps applying.
+ * Fixed-partition line band for a finding's `line_start` (#144). Lines 1–5 map to
+ * bucket 1, 6–10 to bucket 6, etc. — `Math.floor((L - 1) / 5) * 5 + 1` for `L >= 1`.
+ * Returns 0 when `line_start` is absent or falsy, which routes `findingKey` to the
+ * normalized-title fallback. A fixed partition (vs. a moving ±window centered on
+ * `line_start`) is reproducible from the bucket alone: the bucket is a pure function
+ * of the line number, so a finding that drifts ±a few lines within the same band
+ * keeps the same key without needing to know where the override was first recorded.
  */
-export function findingKey(f: Pick<ReviewFinding, "severity" | "file" | "title">): string {
-  const basis = `${f.severity ?? "medium"}|${f.file ?? ""}|${f.title ?? ""}`;
+export function lineBucket(lineStart: number | undefined): number {
+  if (!lineStart || lineStart < 1) return 0;
+  return Math.floor((lineStart - 1) / 5) * 5 + 1;
+}
+
+/** Normalize a file path for the finding key: lowercase only (#144). */
+export function normalizeFile(file: string | undefined): string {
+  return (file ?? "").toLowerCase();
+}
+
+/**
+ * Normalize a finding title for the fallback key (#144): lowercase, strip markdown
+ * emphasis (`*`, `_`, backtick, `~`), strip leading/trailing punctuation and
+ * ellipsis (`…`, `...`), collapse internal whitespace, trim. Absorbs the common
+ * formatting/capitalization drift between rounds; it does NOT absorb word
+ * insertion ("can starve" vs "can still starve"), which is why the location-based
+ * key is preferred whenever `line_start` is available.
+ */
+export function normalizeTitle(title: string | undefined): string {
+  return (title ?? "")
+    .toLowerCase()
+    .replace(/[*_`~]/g, "")
+    .replace(/^[\s\p{P}…]+/u, "")
+    .replace(/[\s\p{P}…]+$/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Stable short key for a finding so an operator can reference one specific
+ * finding in an override, and so recurrence detection (#133) recognizes the same
+ * issue across rounds. Location-addressed: `sha1(severity | normalizeFile(file) |
+ * lineBucket(line_start))` when `line_start` is present, falling back to
+ * `sha1(severity | normalizeFile(file) | normalizeTitle(title))` when it is not.
+ *
+ * Stable under title rewording (#144): because the primary key excludes the title,
+ * a reviewer that re-words a finding ("can starve" → "can still starve") at the
+ * same file + line band + severity produces the SAME key, so a recorded override
+ * keeps applying instead of silently lapsing and re-parking the item at
+ * `needs-human` (the #19 five-round failure). Title is the reviewer's natural-
+ * language description of an issue, not the issue's identity.
+ *
+ * MIGRATION (ships ~2026-06, #144): this replaces the prior `severity|file|title`
+ * algorithm. `pipeline-override` sentinels recorded before this change carry
+ * old-algorithm keys and will no longer match any finding's new key — any
+ * in-flight overrides must be re-recorded after deploy. One-time cost.
+ */
+export function findingKey(
+  f: Pick<ReviewFinding, "severity" | "file" | "title" | "line_start">,
+): string {
+  const severity = f.severity ?? "medium";
+  const file = normalizeFile(f.file);
+  const bucket = lineBucket(f.line_start);
+  const basis = bucket > 0 ? `${severity}|${file}|${bucket}` : `${severity}|${file}|${normalizeTitle(f.title)}`;
   return createHash("sha1").update(basis).digest("hex").slice(0, 8);
 }
 

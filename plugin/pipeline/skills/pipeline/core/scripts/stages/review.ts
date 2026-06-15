@@ -403,14 +403,16 @@ export async function advanceReview(
   const priorRoundComments = detail.comments.filter((c) => c.body.startsWith(roundPrefix));
   const roundCap = cfg.review_policy.max_adversarial_rounds;
 
-  // Recurrence-aware early park (#133): a blocking finding whose content-addressed
-  // key (`findingKey`: severity|file|title) already appeared in the immediately-
-  // prior round survived a fix attempt unchanged — a proven non-convergence
-  // signal that a human is needed NOW, not after the remaining round budget.
-  // Pure set-comparison of controlled strings the pipeline itself emits; a
-  // reworded or re-severitied finding carries a different key and is treated as
-  // new (no early park). Parks at the same safe `needs-human` terminal as the
-  // ceiling — this can only END the loop earlier, never advance or override.
+  // Recurrence-aware early park (#133): a blocking finding whose stable key
+  // (`findingKey`: severity|file|line-band, title-stable per #144) already
+  // appeared in the immediately-prior round survived a fix attempt unchanged — a
+  // proven non-convergence signal that a human is needed NOW, not after the
+  // remaining round budget. Pure set-comparison of controlled strings the pipeline
+  // itself emits; a finding that changes severity, file, or line band carries a
+  // different key and is treated as new (no early park), but a title rewording
+  // alone keeps the same key and is correctly seen as recurring (#144). Parks at
+  // the same safe `needs-human` terminal as the ceiling — this can only END the
+  // loop earlier, never advance or override.
   const lastPriorRound = priorRoundComments[priorRoundComments.length - 1];
   const priorKeys = lastPriorRound
     ? extractBlockingKeysFromComment(lastPriorRound.body)
