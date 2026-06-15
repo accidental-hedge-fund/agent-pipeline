@@ -25,6 +25,7 @@ const PartialConfigSchema = z.object({
   models: z
     .object({
       planning: z.string().optional(),
+      implementing: z.string().optional(),
       review: z.string().optional(),
       fix: z.string().optional(),
     })
@@ -211,6 +212,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     },
     models: {
       planning: fileConfig.models?.planning ?? DEFAULT_CONFIG.models.planning,
+      implementing: fileConfig.models?.implementing ?? DEFAULT_CONFIG.models.implementing,
       review: fileConfig.models?.review ?? DEFAULT_CONFIG.models.review,
       fix: fileConfig.models?.fix ?? DEFAULT_CONFIG.models.fix,
     },
@@ -263,10 +265,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
 }
 
 // Each `models.*` alias is honored by exactly one harness role. `models.review`
-// drives the reviewer; `models.planning`/`models.fix` drive the implementer.
+// drives the reviewer; `models.planning`/`models.implementing`/`models.fix` drive
+// the implementer.
 const MODEL_ALIAS_ROLES = [
   { key: "review", role: "reviewer" },
   { key: "planning", role: "implementer" },
+  { key: "implementing", role: "implementer" },
   { key: "fix", role: "implementer" },
 ] as const;
 
@@ -450,6 +454,7 @@ ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
 
 # models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Uncomment to override.
 #   planning: ${d.models.planning} # implementer harness
+#   implementing: ${d.models.implementing} # implementer harness
 #   review: ${d.models.review} # reviewer harness
 #   fix: ${d.models.fix} # implementer harness
 

@@ -232,10 +232,7 @@ export async function advance(
   const implHeadBefore = (
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
-  const result = await invoke(primary, wt.path, implPrompt, {
-    timeoutSec: cfg.implementation_timeout,
-    model: opts.model,
-  });
+  const result = await invokeImplementer(primary, wt.path, implPrompt, cfg, opts);
 
   if (!result.success) {
     const reason = result.timed_out
@@ -635,11 +632,12 @@ async function advanceOpenspec(
   const osImplHeadBefore = (
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
-  const result = await invoke(
+  const result = await invokeImplementer(
     primary,
     wt.path,
     buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext }),
-    { timeoutSec: cfg.implementation_timeout, model: opts.model },
+    cfg,
+    opts,
   );
   if (!result.success) {
     const reason = result.timed_out ? `timed out after ${result.duration.toFixed(0)}s` : `exit ${result.exit_code}`;
@@ -769,6 +767,38 @@ async function salvageIfNoNewCommit(
   if (headAfter && headAfter === headBefore) {
     await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Implementer harness invocation (#70) — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/** Injectable seam for unit-testing {@link invokeImplementer} without a real harness. */
+export interface ImplementerInvokeDeps {
+  invoke?: typeof invoke;
+}
+
+/**
+ * Invoke the implementer harness for the implementation step. The model is
+ * resolved as `opts.model ?? cfg.models.implementing` — the per-repo
+ * `models.implementing` slot, with a one-off CLI `--model` override winning (#70).
+ * Both the standard and OpenSpec implementing paths route through here so the slot
+ * is wired identically; a bare `opts.model` at either call site was the gap #70
+ * closed (every other harness call already followed `opts.model ?? cfg.models.<slot>`).
+ */
+export async function invokeImplementer(
+  harness: Harness,
+  wtPath: string,
+  prompt: string,
+  cfg: PipelineConfig,
+  opts: AdvanceOpts,
+  deps: ImplementerInvokeDeps = {},
+): Promise<HarnessResult> {
+  const inv = deps.invoke ?? invoke;
+  return inv(harness, wtPath, prompt, {
+    timeoutSec: cfg.implementation_timeout,
+    model: opts.model ?? cfg.models.implementing,
+  });
 }
 
 // ---------------------------------------------------------------------------
