@@ -1,20 +1,75 @@
-# Pipeline config for agent-pipeline itself.
+# Pipeline config for agent-pipeline itself — kept current with the latest
+# accepted `.github/pipeline.yml` schema (mirrors `pipeline init` / config.ts).
 #
-# OpenSpec auto-activates because an `openspec/` workspace exists in this repo;
-# this file just makes that explicit and gives the planning prompts some domain
-# context. `harnesses:` is intentionally omitted — the invoking install profile
-# owns the implementer/reviewer split.
+# Only the keys this repo actually overrides are set below; every other accepted
+# key is shown commented at its built-in default for reference (delete or
+# uncomment to change behavior). `harnesses:` is intentionally omitted and is
+# rejected at config-parse time if present — the invoking install profile owns
+# the implementer/reviewer split. OpenSpec auto-activates because an `openspec/`
+# workspace exists in this repo; this file just makes that explicit and gives the
+# planning prompts some domain context.
+
+# --- Repo context (embedded in planning/review prompts) ---
 domain_name: agent-pipeline
 domain_description: a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex)
+
+# --- Active overrides ---
 openspec:
-  enabled: auto
+  enabled: auto # auto | on | off  (auto already activates when openspec/ exists)
+  # bootstrap: false # if true, run `openspec init` on repos lacking openspec/
+
 test_gate:
-  # Run the repo's full CI surface, not just `npm test`.
-  # Auto-detection only finds the `test` script; this repo's CI also runs
-  # `node scripts/build.mjs --check` (plugin-mirror sync) and an install smoke
-  # test. Wrapping all of them in `npm run ci` keeps the command a single token —
-  # test_gate.command is parsed without a shell, so compound operators like `&&`
-  # must live inside the script.
-  # If your repo's CI does more than the auto-detected test script, set this field
-  # to a single command (or script) that covers all CI steps.
+  # Run the repo's full CI surface, not just the auto-detected `npm test`: this
+  # repo's CI also runs `node scripts/build.mjs --check` (plugin-mirror sync) and
+  # an install smoke test. `command` is parsed without a shell, so compound
+  # operators like `&&` must live inside the npm script — hence a single token.
   command: "npm run ci"
+  # enabled: true # set false to disable the pre-PR test gate entirely
+  # max_attempts: 3 # fix-harness invocations before blocking
+  # timeout: 300 # seconds per test/build run
+
+# --- Everything below is at its built-in default; shown for reference. ---
+
+# base_branch: main # branch PRs target and worktrees branch from
+# worktree_root: .worktrees # dir (relative to repo) holding pipeline worktrees
+# max_concurrent_worktrees: 5 # cap on simultaneous in-flight worktrees
+# auto_recovery_max_retries: 2 # auto-recovery attempts when implementation blocks
+# implementation_timeout: 2400 # seconds for the implementation harness
+# review_timeout: 1500 # seconds per review stage
+# fix_timeout: 2400 # seconds per fix stage
+# ci_timeout: 900 # seconds to wait for CI at pre-merge
+# ci_poll_interval: 30 # seconds between CI status polls
+
+# models: # per-phase model alias — honored only when the role's harness is claude (codex ignores it; setting an inert one prints a warning)
+#   planning: sonnet # implementer harness
+#   implementing: sonnet # implementer harness (#70)
+#   review: opus # reviewer harness
+#   fix: sonnet # implementer harness
+
+# review_harness: my-reviewer # (#40) override the reviewer CLI for the review step; default = the install profile's reviewer. The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
+
+# last30days: # opt-in pre-planning public-activity brief for the issue topic
+#   enabled: false
+#   timeout: 600 # seconds
+
+# steps: # turn optional steps off for speed/preference (default: all on)
+#   plan_review: true # cross-harness review of the plan before coding
+#   standard_review: true # review-1 (and its fix round)
+#   adversarial_review: true # review-2 (and its fix round)
+#   docs: true # include the docs-update instruction in the implementing prompt
+
+# eval_gate: # run the repo's eval harness after pre-merge (one-time opt-in)
+#   enabled: false
+#   command: npm run evals # shell command to run; required when enabled
+#   mode: gate # gate: block on fail | advisory: record and advance
+#   timeout: 300 # stage-level budget in seconds (shared across attempts)
+#   max_attempts: 2 # total attempts before giving up (1 = no retry)
+
+# review_policy: # which review findings block progression vs. merely advise (#17)
+#   block_threshold: medium # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
+#   min_confidence: 0.7 # 0..1 — findings below this confidence advise, not block
+#   max_adversarial_rounds: 3 # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
+
+# doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here
+#   runOnStart: false # if true, run the preflight checks before planning and abort the run on any failure
+#   failFast: false # if true, stop at the first failing check instead of collecting all failures
