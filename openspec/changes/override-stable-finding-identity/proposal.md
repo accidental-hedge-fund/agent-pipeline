@@ -22,7 +22,7 @@ Audited `--override` dispositions are content-addressed by a finding key derived
 
 ## Acceptance Criteria
 
-- [ ] A recorded `--override` continues to apply across review rounds when the reviewer rewords the finding title, provided the finding's file, line location (within ±4 lines), and severity are unchanged.
+- [ ] A recorded `--override` continues to apply across review rounds when the reviewer rewords the finding title, provided the finding's file, line location (within the same 5-line band), and severity are unchanged. A drift that crosses a band boundary produces a different key and the override does not carry over.
 - [ ] The finding identity key is stable under all title rewording — derived from severity + normalize(file) + line_bucket(line_start) when `line_start` is available.
 - [ ] Two findings at different severities, or different files, or different 5-line bands, produce different keys even if their titles are identical (adequate specificity).
 - [ ] Recurrence detection (#133 RECURRING/NEW tagging) uses the same stable key: a finding re-emitted with a reworded title but same location+severity is tagged RECURRING, not NEW.

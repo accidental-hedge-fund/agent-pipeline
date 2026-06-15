@@ -30,3 +30,12 @@
 ## 6. CI
 
 - [x] 6.1 Run `npm run ci` from repo root — 793 tests pass, mirror in sync, install-smoke green, exit 0
+
+## 7. Review-2 Findings (fix round 2)
+
+- [x] 7.1 [HIGH] Ambiguous-key guard: update `partitionFindings` to count key occurrences; withhold override when two or more findings share the same key in the current verdict — leave all of them blocking
+- [x] 7.2 [HIGH] Ambiguous-key test: add `partition: ambiguous override (two distinct findings share the same key)` test to `review-policy.test.ts`
+- [x] 7.3 [HIGH] Spec update: add "Ambiguous override" scenario to `specs/review-severity-policy/spec.md`; clarify "Overridden finding stops blocking" scenario to say "exactly one finding"
+- [x] 7.4 [HIGH] Design update: revise D1 consequence — collision now withholds the override from both findings (not "overrides both")
+- [x] 7.5 [MEDIUM] Proposal update: replace misleading "within ±4 lines" with "within the same 5-line band" in acceptance criterion
+- [x] 7.6 [MEDIUM] Design update D2: clarify that cross-bucket drift does not survive the override (intentional; not a promise of ±4 unconditional tolerance)

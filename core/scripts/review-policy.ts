@@ -140,6 +140,11 @@ export interface PartitionResult {
  * given policy and the set of active operator overrides (key → disposition).
  * Override takes precedence over the severity/confidence test so an explicit
  * human disposition always wins.
+ *
+ * Ambiguity guard (#144): an override is only applied when exactly one finding
+ * in this verdict carries that key. If two distinct findings share the same
+ * severity+file+5-line-bucket (and therefore the same key), the override is
+ * ambiguous and is withheld — both findings remain blocking.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
@@ -149,9 +154,16 @@ export function partitionFindings(
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
 
+  // Count findings per key to detect ambiguous overrides.
+  const keyCounts = new Map<string, number>();
+  for (const f of findings) {
+    const k = findingKey(f);
+    keyCounts.set(k, (keyCounts.get(k) ?? 0) + 1);
+  }
+
   for (const f of findings) {
     const key = findingKey(f);
-    if (overrides.has(key)) {
+    if (overrides.has(key) && keyCounts.get(key) === 1) {
       result.overridden.push({ finding: f, key, disposition: overrides.get(key)! });
       continue;
     }

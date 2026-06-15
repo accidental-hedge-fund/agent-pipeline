@@ -215,6 +215,20 @@ test("partition: an override moves a blocking finding to overridden regardless o
   assert.equal(p.overridden[0].key, findingKey(f));
 });
 
+test("partition: ambiguous override (two distinct findings share the same key) — neither is suppressed (#144)", () => {
+  // Two HIGH findings in the same 5-line bucket (46–50) produce the same key.
+  // An override recorded against that key cannot safely disposition both
+  // distinct issues, so the override is withheld and both findings remain blocking.
+  const f1 = finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46 });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "missing null check", line_start: 48 });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same bucket → same key");
+  const sharedKey = findingKey(f1);
+  const overrides = new Map([[sharedKey, "rejected"]]);
+  const p = partitionFindings([f1, f2], { block_threshold: "low", min_confidence: 0 }, overrides);
+  assert.equal(p.overridden.length, 0, "ambiguous override must not suppress any finding");
+  assert.equal(p.blocking.length, 2, "both findings remain blocking");
+});
+
 // ---------------------------------------------------------------------------
 // extractOverrides — sentinel round-trip
 // ---------------------------------------------------------------------------

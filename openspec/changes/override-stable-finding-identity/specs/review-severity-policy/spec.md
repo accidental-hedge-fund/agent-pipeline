@@ -11,8 +11,15 @@ Each review finding SHALL be assigned a stable key computed by `findingKey()` (s
 #### Scenario: Overridden finding stops blocking
 
 - **WHEN** an operator records an override for a finding's key
-- **AND** a subsequent review re-emits a finding with that same key
+- **AND** a subsequent review re-emits exactly one finding with that same key
 - **THEN** that finding SHALL NOT block, and if no other finding blocks the item SHALL advance
+
+#### Scenario: Ambiguous override — two distinct findings share the same key
+
+- **WHEN** an operator records an override for a finding's key
+- **AND** a subsequent review emits two or more distinct findings that all resolve to that same key (same severity, file, and 5-line band but different titles)
+- **THEN** the override SHALL NOT be applied to any of those findings
+- **AND** all findings sharing that key SHALL remain in the blocking set
 
 #### Scenario: Override applies despite title rewording
 
