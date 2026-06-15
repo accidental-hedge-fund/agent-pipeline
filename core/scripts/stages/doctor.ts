@@ -235,13 +235,21 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
   });
 
   // 5. Harness availability — every distinct harness binary declared in config.
+  //
+  // Built-in harnesses (claude, codex) are probed with --version, which validates
+  // both presence and basic invocability. Custom reviewer CLIs (review_harness, #40)
+  // only guarantee `<bin> "<prompt>"` as their contract — they are NOT required to
+  // support --version, and running them could invoke a model. For those we do a
+  // PATH-only check via `which` to stay model-free and avoid unintended execution.
+  const BUILT_IN_HARNESSES = new Set(["claude", "codex"]);
   const harnessBins = [...new Set([config.harnesses.implementer, config.harnesses.reviewer])];
   for (const bin of harnessBins) {
+    const isBuiltIn = BUILT_IN_HARNESSES.has(bin);
     checks.push({
       id: `harness:${bin}`,
       description: `Configured harness \`${bin}\` is installed and on PATH`,
       run: async (deps) =>
-        (await deps.execCheck(bin, ["--version"]))
+        (isBuiltIn ? await deps.execCheck(bin, ["--version"]) : await deps.execCheck("which", [bin]))
           ? pass(`\`${bin}\` is available`)
           : fail(
               `configured harness \`${bin}\` was not found on PATH`,

@@ -239,6 +239,35 @@ test("check harness:codex — passes when present; fails naming the binary when 
   assert.match(failR.remediation!, /codex/);
 });
 
+test("check harness:codex — uses --version probe, not which", async () => {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  await getCheck(makeConfig(), "harness:codex").run(
+    fakeDeps({ execCheck: (f, a) => { calls.push({ file: f, args: a }); return true; } }),
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "codex");
+  assert.deepEqual(calls[0].args, ["--version"]);
+});
+
+test("check harness:my-reviewer (custom) — uses `which` probe, not --version", async () => {
+  const cfg = makeConfig({ harnesses: { implementer: "claude", reviewer: "my-reviewer" } });
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const pass = await getCheck(cfg, "harness:my-reviewer").run(
+    fakeDeps({ execCheck: (f, a) => { calls.push({ file: f, args: a }); return true; } }),
+  );
+  assert.equal(pass.status, "pass");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "which");
+  assert.deepEqual(calls[0].args, ["my-reviewer"]);
+});
+
+test("check harness:my-reviewer (custom) — fails with remediation when not on PATH", async () => {
+  const cfg = makeConfig({ harnesses: { implementer: "claude", reviewer: "my-reviewer" } });
+  const failR = await getCheck(cfg, "harness:my-reviewer").run(fakeDeps({ execCheck: () => false }));
+  assertFailWithRemediation(failR);
+  assert.match(failR.remediation!, /my-reviewer/);
+});
+
 // ---------------------------------------------------------------------------
 // 6.1 — package install state
 // ---------------------------------------------------------------------------

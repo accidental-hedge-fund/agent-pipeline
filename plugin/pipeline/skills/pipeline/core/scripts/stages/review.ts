@@ -239,12 +239,20 @@ export async function advanceReview(
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
+    // Include a bounded stderr excerpt so blocked items surface the actionable CLI
+    // error (e.g. "reviewer CLI 'my-reviewer' not found…" from harness.ts, or auth
+    // failure output) rather than just an exit code.
+    const MAX_STDERR = 500;
+    const stderrExcerpt =
+      result.stderr.trim().length > 0
+        ? `\n\nCLI output:\n\`\`\`\n${result.stderr.trim().slice(0, MAX_STDERR)}${result.stderr.trim().length > MAX_STDERR ? "\n…(truncated)" : ""}\n\`\`\``
+        : "";
     // selfReview here means the reviewer was unspawnable AND the implementing
     // harness fallback also failed — there is no harness left to review with (#39).
     const detailMsg = selfReview
       ? `Neither the cross-harness reviewer (${configuredReviewer}) nor the implementing ` +
-        `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}`
-      : `Review harness (${reviewer}) failed: ${reason}`;
+        `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
+      : `Review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
     await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
