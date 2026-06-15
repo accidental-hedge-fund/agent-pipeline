@@ -168,7 +168,7 @@ export interface PipelineConfig {
   // Harness roles (always taken from the active profile — repo config cannot
   // set them) + models
   harnesses: { implementer: Harness; reviewer: Harness };
-  models: { planning: string; review: string; fix: string };
+  models: { planning: string; implementing: string; review: string; fix: string };
   // OpenSpec (spec-driven development) integration. "auto" activates only when
   // the target repo has an `openspec/` directory; "on"/"off" force it. When
   // `bootstrap` is true, planning runs `openspec init` on repos that lack it.
@@ -267,7 +267,7 @@ export const DEFAULT_CONFIG: Omit<
   fix_timeout: 2400,
   ci_timeout: 900,
   ci_poll_interval: 30,
-  models: { planning: "sonnet", review: "opus", fix: "sonnet" },
+  models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet" },
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },

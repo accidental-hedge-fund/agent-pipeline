@@ -56,7 +56,7 @@ function cfgWith(testGate: Partial<PipelineConfig["test_gate"]>): PipelineConfig
     ci_timeout: 900,
     ci_poll_interval: 30,
     harnesses: { implementer: "codex", reviewer: "claude" },
-    models: { planning: "sonnet", review: "opus", fix: "sonnet" },
+    models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet" },
     openspec: { enabled: "auto", bootstrap: false },
     last30days: { enabled: false, timeout: 600 },
     steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
