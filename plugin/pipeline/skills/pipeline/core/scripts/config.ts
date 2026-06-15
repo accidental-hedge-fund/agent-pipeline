@@ -83,6 +83,14 @@ const PartialConfigSchema = z.object({
     })
     .strict()
     .optional(),
+  // Optional override for the reviewer-role harness (#40). When set, the review
+  // step invokes this CLI instead of the profile's default reviewer. An arbitrary
+  // string (not an enum) because a custom reviewer CLI name is unconstrained;
+  // whether it actually exists is a runtime check (like test_gate/eval_gate
+  // `command`). The implementer harness remains profile-only — there is no
+  // companion `implementer`/`harnesses` key, and the deleted `harnesses:` block
+  // stays rejected by the strict schema.
+  review_harness: z.string().optional(),
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
@@ -192,9 +200,15 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     fix_timeout: fileConfig.fix_timeout ?? DEFAULT_CONFIG.fix_timeout,
     ci_timeout: fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout,
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
-    // Harness roles are profile-relative; repo config cannot set them (the
-    // strict schema rejects a `harnesses:` key outright).
-    harnesses: profile.harnesses,
+    // Harness roles are profile-relative; the implementer can never be set by
+    // repo config (the strict schema rejects a `harnesses:` key outright). The
+    // reviewer defaults to the profile's value but is overridden here by the
+    // optional `review_harness` key (#40) when present, so all stage code can
+    // keep reading only `cfg.harnesses.reviewer`.
+    harnesses: {
+      implementer: profile.harnesses.implementer,
+      reviewer: fileConfig.review_harness ?? profile.harnesses.reviewer,
+    },
     models: {
       planning: fileConfig.models?.planning ?? DEFAULT_CONFIG.models.planning,
       review: fileConfig.models?.review ?? DEFAULT_CONFIG.models.review,
@@ -438,6 +452,8 @@ ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
 #   planning: ${d.models.planning} # implementer harness
 #   review: ${d.models.review} # reviewer harness
 #   fix: ${d.models.fix} # implementer harness
+
+# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
 
 openspec:
   enabled: ${d.openspec.enabled} # auto | on | off

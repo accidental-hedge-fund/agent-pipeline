@@ -74,7 +74,9 @@ export async function advance(
   const body = detail.body;
 
   const primary: Harness = cfg.harnesses.implementer;
-  const reviewer: Harness = cfg.harnesses.reviewer;
+  // `reviewer` may be a custom reviewer CLI (`review_harness`, #40), so it is a
+  // `string`; the implementer fallback (`primary`) is always a built-in Harness.
+  const reviewer: string = cfg.harnesses.reviewer;
   const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(`[pipeline] #${issueNumber}: planning (impl=${primary}, plan-review=${reviewer})`);
@@ -371,7 +373,9 @@ async function advanceOpenspec(
   const detail = await getIssueDetail(cfg, issueNumber);
   const { title, body } = detail;
   const primary: Harness = cfg.harnesses.implementer;
-  const reviewer: Harness = cfg.harnesses.reviewer;
+  // `reviewer` may be a custom reviewer CLI (`review_harness`, #40), so it is a
+  // `string`; the implementer fallback (`primary`) is always a built-in Harness.
+  const reviewer: string = cfg.harnesses.reviewer;
   const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   console.log(

@@ -118,6 +118,42 @@ test("invokeReviewer: both harnesses unspawnable → fallback attempted, then bl
   assert.deepEqual(calls, ["codex", "claude"]);
 });
 
+// ---- custom reviewer CLI (#40) ----
+//
+// `review_harness` lets the reviewer be an arbitrary CLI string, not just a
+// built-in harness. invokeReviewer must route that string through the generalized
+// invoke() seam, and the #39 fallback still applies when the custom CLI is missing.
+
+/** Fake `invoke` keyed by an arbitrary CLI name (custom reviewers aren't `Harness`). */
+function fakeInvokeByName(byName: Record<string, HarnessResult>) {
+  const calls: string[] = [];
+  const inv = async (harness: string): Promise<HarnessResult> => {
+    calls.push(harness);
+    const r = byName[harness];
+    if (!r) throw new Error(`test fake has no result for harness ${harness}`);
+    return r;
+  };
+  return { inv: inv as unknown as typeof import("../scripts/harness.ts").invoke, calls };
+}
+
+test("invokeReviewer: a custom reviewer CLI that succeeds → no fallback, effectiveReviewer is the custom CLI (#40)", async () => {
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": ok() });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, false);
+  assert.equal(out.effectiveReviewer, "my-reviewer");
+  assert.equal(out.result.success, true);
+  assert.deepEqual(calls, ["my-reviewer"], "only the custom reviewer is invoked when it succeeds");
+});
+
+test("invokeReviewer: a custom reviewer CLI that is unspawnable → same-harness fallback to the implementer (#40)", async () => {
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": spawnErr(), claude: ok() });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "a missing custom reviewer CLI triggers the #39 fallback");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.success, true, "the returned result is the implementer's successful self-review");
+  assert.deepEqual(calls, ["my-reviewer", "claude"], "custom reviewer attempted first, then the implementer fallback");
+});
+
 test("selfReviewBanner: names the missing reviewer and the effective reviewer, marks it weaker", () => {
   const banner = selfReviewBanner("codex", "claude");
   assert.match(banner, /self-review/i);

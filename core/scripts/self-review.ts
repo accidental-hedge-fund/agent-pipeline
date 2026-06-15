@@ -18,8 +18,10 @@ import type { Harness } from "./types.ts";
 export interface ReviewerInvocation {
   /** The harness result to gate on (from the effective reviewer). */
   result: HarnessResult;
-  /** The harness that actually produced this review — the fallback when selfReview. */
-  effectiveReviewer: Harness;
+  /** The harness that actually produced this review — the fallback when selfReview.
+   *  A `string` because the configured reviewer may be a custom CLI (#40); on a
+   *  self-review it is the implementing harness (always a built-in `Harness`). */
+  effectiveReviewer: string;
   /** True when the configured cross-harness reviewer was unavailable and the
    *  implementing harness reviewed its own work instead. */
   selfReview: boolean;
@@ -41,10 +43,13 @@ export interface ReviewerInvocation {
  * `spawn_error`, so the caller's existing `!result.success` branch blocks with a
  * specific reason — there is no harness left to review with.
  *
- * `inv` is injectable so unit tests exercise every branch without spawning.
+ * `reviewer` may be a custom reviewer CLI (`review_harness`, #40) or a built-in
+ * harness; `implementer` is always a built-in `Harness` (the self-review
+ * fallback target). `inv` is injectable so unit tests exercise every branch
+ * without spawning.
  */
 export async function invokeReviewer(
-  reviewer: Harness,
+  reviewer: string,
   implementer: Harness,
   worktreeDir: string,
   prompt: string,
@@ -64,7 +69,7 @@ export async function invokeReviewer(
  * source of wording so plan-review and the standard/adversarial rounds read
  * identically. Visibly distinct from a normal cross-harness review.
  */
-export function selfReviewBanner(configuredReviewer: Harness, effectiveReviewer: Harness): string {
+export function selfReviewBanner(configuredReviewer: string, effectiveReviewer: string): string {
   return (
     `> ⚠️ **Same-harness self-review (#39).** The cross-harness reviewer ` +
     `\`${configuredReviewer}\` is not installed / not spawnable, so this review was ` +

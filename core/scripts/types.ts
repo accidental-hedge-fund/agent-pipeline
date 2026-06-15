@@ -165,9 +165,11 @@ export interface PipelineConfig {
   fix_timeout: number;
   ci_timeout: number;
   ci_poll_interval: number;
-  // Harness roles (always taken from the active profile — repo config cannot
-  // set them) + models
-  harnesses: { implementer: Harness; reviewer: Harness };
+  // Harness roles + models. The implementer is always taken from the active
+  // profile (repo config cannot set it). The reviewer defaults to the profile's
+  // value but MAY be overridden per-repo by the `review_harness` config key
+  // (#40) to an arbitrary reviewer CLI — hence `string`, not `Harness`.
+  harnesses: { implementer: Harness; reviewer: string };
   models: { planning: string; review: string; fix: string };
   // OpenSpec (spec-driven development) integration. "auto" activates only when
   // the target repo has an `openspec/` directory; "on"/"off" force it. When
