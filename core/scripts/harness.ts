@@ -18,6 +18,20 @@ import type { Harness } from "./types.ts";
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
 
+/**
+ * Format a bounded CLI stderr excerpt for inclusion in a blocked-item message.
+ * Returns an empty string when there is no stderr to show.
+ * Single-sourced so plan-review and review-1/review-2 cannot drift (#40).
+ */
+export function formatStderrExcerpt(stderr: string, max = 500): string {
+  const trimmed = stderr.trim();
+  if (!trimmed) return "";
+  return (
+    `\n\nCLI output:\n\`\`\`\n${trimmed.slice(0, max)}` +
+    `${trimmed.length > max ? "\n…(truncated)" : ""}\n\`\`\``
+  );
+}
+
 export interface HarnessResult {
   success: boolean;
   stdout: string;

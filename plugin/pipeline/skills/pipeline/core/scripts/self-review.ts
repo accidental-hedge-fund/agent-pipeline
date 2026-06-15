@@ -58,8 +58,16 @@ export async function invokeReviewer(
 ): Promise<ReviewerInvocation> {
   const result = await inv(reviewer, worktreeDir, prompt, opts);
   if (result.spawn_error && reviewer !== implementer) {
+    const configuredReviewerStderr = result.stderr;
     const fallback = await inv(implementer, worktreeDir, prompt, opts);
-    return { result: fallback, effectiveReviewer: implementer, selfReview: true };
+    // When the fallback also spawn-fails, merge the configured reviewer's stderr
+    // into the fallback result so callers surface both errors in the blocked message
+    // (#40 finding 1). On a successful fallback the configured stderr is irrelevant.
+    const mergedFallback =
+      fallback.spawn_error && configuredReviewerStderr.trim()
+        ? { ...fallback, stderr: `${configuredReviewerStderr}\n${fallback.stderr}`.trim() }
+        : fallback;
+    return { result: mergedFallback, effectiveReviewer: implementer, selfReview: true };
   }
   return { result, effectiveReviewer: reviewer, selfReview: false };
 }

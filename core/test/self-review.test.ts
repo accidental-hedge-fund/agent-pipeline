@@ -154,6 +154,28 @@ test("invokeReviewer: a custom reviewer CLI that is unspawnable → same-harness
   assert.deepEqual(calls, ["my-reviewer", "claude"], "custom reviewer attempted first, then the implementer fallback");
 });
 
+test("invokeReviewer: custom reviewer + fallback both fail → result.stderr contains both errors (#40 finding 1)", async () => {
+  // Simulate the real harness.ts behaviour: custom reviewer's spawn error gets the
+  // actionable CLI message prepended; the implementer fallback gets its own message.
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackErr = {
+    ...spawnErr(),
+    stderr: "[harness claude] spawn error: ENOENT",
+  };
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackErr });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.spawn_error, true, "double-failure: no harness left to review with");
+  // Both error messages must appear so callers can surface them in the blocked message.
+  assert.match(out.result.stderr, /my-reviewer/, "configured reviewer error present in merged stderr");
+  assert.match(out.result.stderr, /claude/, "fallback error present in merged stderr");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
 test("selfReviewBanner: names the missing reviewer and the effective reviewer, marks it weaker", () => {
   const banner = selfReviewBanner("codex", "claude");
   assert.match(banner, /self-review/i);

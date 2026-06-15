@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { invoke } from "../scripts/harness.ts";
+import { invoke, formatStderrExcerpt } from "../scripts/harness.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
 
@@ -75,4 +75,33 @@ test("invoke(): a custom CLI that exits nonzero is a genuine failure (not a spaw
   assert.equal(result.spawn_error ?? false, false);
   // The named-CLI message is reserved for spawn failures; a real exit keeps its stderr.
   assert.doesNotMatch(result.stderr, /not found or not executable/);
+});
+
+// ---------------------------------------------------------------------------
+// formatStderrExcerpt — shared helper used by review and plan-review (#40)
+// ---------------------------------------------------------------------------
+
+test("formatStderrExcerpt: non-empty stderr → fenced block with header", () => {
+  const out = formatStderrExcerpt("error: not found");
+  assert.match(out, /CLI output:/);
+  assert.match(out, /```/);
+  assert.match(out, /error: not found/);
+});
+
+test("formatStderrExcerpt: empty stderr → empty string", () => {
+  assert.equal(formatStderrExcerpt(""), "");
+  assert.equal(formatStderrExcerpt("   "), "");
+});
+
+test("formatStderrExcerpt: stderr exceeding max is truncated with marker", () => {
+  const long = "x".repeat(600);
+  const out = formatStderrExcerpt(long, 500);
+  assert.match(out, /…\(truncated\)/);
+  assert.ok(!out.includes("x".repeat(501)), "must not exceed max in the excerpt");
+});
+
+test("formatStderrExcerpt: stderr at exactly max is not truncated", () => {
+  const exact = "y".repeat(500);
+  const out = formatStderrExcerpt(exact, 500);
+  assert.ok(!out.includes("…(truncated)"), "no truncation marker when length equals max");
 });

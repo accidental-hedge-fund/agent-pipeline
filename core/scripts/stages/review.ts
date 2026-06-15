@@ -21,6 +21,7 @@ import {
   transition,
 } from "../gh.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
+import { formatStderrExcerpt } from "../harness.ts";
 import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
@@ -241,12 +242,9 @@ export async function advanceReview(
       : `exit ${result.exit_code}`;
     // Include a bounded stderr excerpt so blocked items surface the actionable CLI
     // error (e.g. "reviewer CLI 'my-reviewer' not found…" from harness.ts, or auth
-    // failure output) rather than just an exit code.
-    const MAX_STDERR = 500;
-    const stderrExcerpt =
-      result.stderr.trim().length > 0
-        ? `\n\nCLI output:\n\`\`\`\n${result.stderr.trim().slice(0, MAX_STDERR)}${result.stderr.trim().length > MAX_STDERR ? "\n…(truncated)" : ""}\n\`\`\``
-        : "";
+    // failure output) rather than just an exit code. Single-sourced via
+    // formatStderrExcerpt so plan-review failures share the same format (#40).
+    const stderrExcerpt = formatStderrExcerpt(result.stderr);
     // selfReview here means the reviewer was unspawnable AND the implementing
     // harness fallback also failed — there is no harness left to review with (#39).
     const detailMsg = selfReview

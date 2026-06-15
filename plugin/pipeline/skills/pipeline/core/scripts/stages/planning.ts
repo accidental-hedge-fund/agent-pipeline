@@ -20,7 +20,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { invoke, type HarnessResult } from "../harness.ts";
+import { invoke, formatStderrExcerpt, type HarnessResult } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
   branchName,
@@ -149,9 +149,10 @@ export async function advance(
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
         : `Plan review failed (exit ${reviewResult.exit_code})`;
+      const stderrExcerpt = formatStderrExcerpt(reviewResult.stderr);
       const blockMsg = planSelfReview
-        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}`
-        : `Plan-review harness (${reviewer}) failed: ${reason}`;
+        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
+        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
       await setBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
@@ -551,9 +552,10 @@ async function advanceOpenspec(
       const reason = reviewResult.timed_out
         ? `timed out after ${reviewResult.duration.toFixed(0)}s`
         : `exit ${reviewResult.exit_code}`;
+      const stderrExcerpt = formatStderrExcerpt(reviewResult.stderr);
       const blockMsg = planSelfReview
-        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}`
-        : `Plan-review harness (${reviewer}) failed: ${reason}`;
+        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
+        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
       await setBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
