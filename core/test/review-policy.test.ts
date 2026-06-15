@@ -9,6 +9,7 @@ import {
   lineBucket,
   normalizeFile,
   normalizeTitle,
+  findingPayloadFingerprint,
   partitionFindings,
   extractOverrides,
   isValidFindingKey,
@@ -256,6 +257,31 @@ test("partition: advisory-confidence duplicate shares key with blocker — overr
   assert.equal(p.blocking.length, 0, "override applies to the single blocking candidate");
   assert.equal(p.overridden.length, 1, "blocker is overridden");
   assert.equal(p.advisory.length, 1, "low-confidence finding remains advisory");
+});
+
+test("partition: same key + same normalized title but materially different bodies — override withheld, both stay blocking (#144 round-3)", () => {
+  // The review-ceiling finding: title-only distinctness collapsed two genuinely
+  // different findings (same severity/file/5-line band → same key; titles equal
+  // after normalize — "Missing guard" vs "**Missing guard**") into one override,
+  // letting a real blocker advance. Distinctness must use the full payload, so two
+  // findings that differ only in body/recommendation/line are NOT collapsed.
+  const f1 = finding({ severity: "high", file: "x.ts", title: "Missing guard", line_start: 46, body: "the foo path lacks a null check", recommendation: "guard foo" });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "**Missing guard**", line_start: 48, body: "the bar path lacks a bounds check", recommendation: "guard bar" });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same bucket → same key");
+  assert.equal(normalizeTitle(f1.title), normalizeTitle(f2.title), "precondition: same normalized title");
+  const overrides = new Map([[findingKey(f1), "rejected"]]);
+  const p = partitionFindings([f1, f2], { block_threshold: "low", min_confidence: 0 }, overrides);
+  assert.equal(p.overridden.length, 0, "materially different findings must not collapse under one override");
+  assert.equal(p.blocking.length, 2, "both genuinely distinct blockers remain blocking");
+});
+
+test("findingPayloadFingerprint: collapses exact-duplicate payloads, distinguishes different body/recommendation/line", () => {
+  const base = finding({ severity: "high", file: "x.ts", title: "Missing guard", line_start: 46, body: "foo", recommendation: "fix foo" });
+  assert.equal(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base }), "exact duplicate → same fingerprint");
+  assert.equal(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, title: "**Missing guard**" }), "title markdown/case normalized away");
+  assert.notEqual(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, body: "bar" }), "different body → different fingerprint");
+  assert.notEqual(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, recommendation: "fix bar" }), "different recommendation → different fingerprint");
+  assert.notEqual(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, line_start: 48 }), "different line → different fingerprint");
 });
 
 // ---------------------------------------------------------------------------

@@ -136,6 +136,26 @@ export interface PartitionResult {
 }
 
 /**
+ * A fingerprint of the fields that make two same-key findings *materially*
+ * different: normalized title + normalized body + normalized recommendation +
+ * line range. The ambiguity guard counts distinct fingerprints — not the raw
+ * finding count (which an exact duplicate or an advisory duplicate could inflate)
+ * and not the title alone (which collapses genuinely different findings that
+ * happen to share a key + title). Exact-duplicate payloads share a fingerprint
+ * and collapse; materially different findings do not. Exported for tests.
+ */
+export function findingPayloadFingerprint(f: ReviewFinding): string {
+  const norm = (s: string | undefined): string =>
+    (s ?? "").toLowerCase().replace(/[*_`~]/g, "").replace(/\s+/g, " ").trim();
+  return [
+    normalizeTitle(f.title),
+    norm(f.body),
+    norm(f.recommendation),
+    `${f.line_start ?? ""}-${f.line_end ?? ""}`,
+  ].join("␟"); // unit separator — won't appear in finding text
+}
+
+/**
  * Partition review findings into blocking / advisory / overridden under the
  * given policy and the set of active operator overrides (key → disposition).
  * Override takes precedence over the severity/confidence test so an explicit
@@ -143,10 +163,11 @@ export interface PartitionResult {
  *
  * Ambiguity guard (#144): an override is only applied when the current verdict
  * has exactly one *distinct blocking candidate* for that key. A "blocking
- * candidate" meets the severity threshold and confidence floor; "distinct"
- * means unique after normalizeTitle (exact duplicate payloads collapse to one).
- * Advisory findings and duplicate titles are excluded from the count so they
- * cannot create false ambiguity and cause a valid override to lapse.
+ * candidate" meets the severity threshold and confidence floor; "distinct" is
+ * measured by findingPayloadFingerprint — so exact-duplicate payloads (and
+ * same-key advisory duplicates, which are never counted) collapse to one, but
+ * two materially different findings that share a key + normalized title do NOT,
+ * and correctly withhold the override so a real blocker cannot advance under it.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
@@ -156,17 +177,18 @@ export function partitionFindings(
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
 
-  // Pre-classify: for each key, collect the set of distinct normalized titles
-  // among blocking candidates only. Advisory findings and exact-duplicate titles
-  // are not counted as distinct candidates and cannot trigger ambiguity.
-  const blockingTitlesByKey = new Map<string, Set<string>>();
+  // Pre-classify: for each key, collect the set of distinct *payload fingerprints*
+  // among blocking candidates only. Advisory findings are not counted, and
+  // exact-duplicate payloads collapse to one — but two materially different
+  // findings that share a key stay distinct, so they correctly trigger ambiguity.
+  const blockingFingerprintsByKey = new Map<string, Set<string>>();
   for (const f of findings) {
     const isAboveSeverity = severityRank(f.severity) >= threshold;
     const isAboveConfidence = typeof f.confidence !== "number" || f.confidence >= policy.min_confidence;
     if (isAboveSeverity && isAboveConfidence) {
       const k = findingKey(f);
-      if (!blockingTitlesByKey.has(k)) blockingTitlesByKey.set(k, new Set());
-      blockingTitlesByKey.get(k)!.add(normalizeTitle(f.title));
+      if (!blockingFingerprintsByKey.has(k)) blockingFingerprintsByKey.set(k, new Set());
+      blockingFingerprintsByKey.get(k)!.add(findingPayloadFingerprint(f));
     }
   }
 
@@ -175,7 +197,7 @@ export function partitionFindings(
     const isBlockingCandidate =
       severityRank(f.severity) >= threshold &&
       (typeof f.confidence !== "number" || f.confidence >= policy.min_confidence);
-    const distinctBlockers = blockingTitlesByKey.get(key)?.size ?? 0;
+    const distinctBlockers = blockingFingerprintsByKey.get(key)?.size ?? 0;
     const isAmbiguous = distinctBlockers > 1;
 
     if (overrides.has(key) && isBlockingCandidate && !isAmbiguous) {
