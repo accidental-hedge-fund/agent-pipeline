@@ -6,7 +6,7 @@ TBD - created by archiving change review-loop-recurrence-aware-convergence. Upda
 ### Requirement: Early park when a blocking finding recurs after a fix round
 When a review round returns blocking findings and at least one finding's `findingKey` matches a blocking key present in the immediately-prior Review-N comment for the same round number, the pipeline SHALL transition to `needs-human` immediately — without consuming additional round budget — and SHALL post the ceiling punch-list comment with RECURRING/NEW tags.
 
-A finding whose `severity` or `title` changes carries a different `findingKey` and SHALL be treated as a new finding (no early park on its account alone).
+A finding whose `severity`, `file`, or line band changes carries a different `findingKey` and SHALL be treated as a new finding (no early park on its account alone). A finding whose title changes but whose severity, file, and line location (within the same 5-line band) are unchanged SHALL carry the same `findingKey` and SHALL be treated as a recurring finding.
 
 #### Scenario: Exact key re-appear after a fix — early park
 - **WHEN** a review round (round N) returns a `needs-attention` verdict with blocking findings
@@ -28,8 +28,15 @@ A finding whose `severity` or `title` changes carries a different `findingKey` a
 - **THEN** the pipeline SHALL continue normally without recurrence checking
 - **AND** SHALL NOT early-park
 
-#### Scenario: Severity or title change — new key, no early park
-- **WHEN** a finding from a prior round is re-emitted with a changed `severity` or `title` (producing a different `findingKey`)
+#### Scenario: Title rewording at same location — treated as recurring
+- **WHEN** a blocking finding from round N is re-emitted in round N+1 with a reworded title
+- **AND** the finding's severity, file, and line location (within the same 5-line band) are unchanged
+- **THEN** `findingKey` SHALL return the same key for both emissions
+- **AND** the pipeline SHALL treat the round N+1 finding as a recurrence (not a new finding)
+- **AND** SHALL early-park at `needs-human` if the prior round's blocking keys include this key
+
+#### Scenario: Severity or file/location change — new key, no early park
+- **WHEN** a finding from a prior round is re-emitted with a changed `severity`, a different `file`, or a `line_start` that falls in a different 5-line band (producing a different `findingKey`)
 - **THEN** the pipeline SHALL treat it as a new finding
 - **AND** SHALL NOT count it as a recurrence for the early-park trigger
 
