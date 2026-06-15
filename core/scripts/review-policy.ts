@@ -147,11 +147,15 @@ export interface PartitionResult {
 export function findingPayloadFingerprint(f: ReviewFinding): string {
   const norm = (s: string | undefined): string =>
     (s ?? "").toLowerCase().replace(/[*_`~]/g, "").replace(/\s+/g, " ").trim();
+  // Normalize the range: an omitted line_end means the single line `line_start`,
+  // so `{46}` and `{46, line_end: 46}` must produce the same range (else an exact
+  // duplicate with one form omitted falsely reads as a distinct candidate).
+  const effectiveEnd = f.line_end ?? f.line_start;
   return [
     normalizeTitle(f.title),
     norm(f.body),
     norm(f.recommendation),
-    `${f.line_start ?? ""}-${f.line_end ?? ""}`,
+    `${f.line_start ?? ""}-${effectiveEnd ?? ""}`,
   ].join("␟"); // unit separator — won't appear in finding text
 }
 

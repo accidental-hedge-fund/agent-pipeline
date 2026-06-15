@@ -282,6 +282,26 @@ test("findingPayloadFingerprint: collapses exact-duplicate payloads, distinguish
   assert.notEqual(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, body: "bar" }), "different body → different fingerprint");
   assert.notEqual(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, recommendation: "fix bar" }), "different recommendation → different fingerprint");
   assert.notEqual(findingPayloadFingerprint(base), findingPayloadFingerprint({ ...base, line_start: 48 }), "different line → different fingerprint");
+  // Omitted line_end means the single line line_start — must not diverge from explicit.
+  assert.equal(
+    findingPayloadFingerprint({ ...base, line_end: undefined }),
+    findingPayloadFingerprint({ ...base, line_end: base.line_start }),
+    "omitted line_end equals explicit single-line line_end",
+  );
+});
+
+test("partition: exact-duplicate differing only by omitted vs explicit single-line line_end — override applies (#144 round-4)", () => {
+  // The review-ceiling finding: the raw range fingerprint made `{46}` ("46-") and
+  // `{46, line_end: 46}` ("46-46") distinct, so a verdict that merely duplicated the
+  // same single-line finding read as ambiguous and withheld the override. With the
+  // normalized range they collapse and the override applies.
+  const f = finding({ severity: "high", file: "x.ts", title: "boom", line_start: 46 });
+  const dup = { ...f, line_end: 46 };
+  assert.equal(findingKey(f), findingKey(dup), "precondition: same key");
+  const overrides = new Map([[findingKey(f), "rejected"]]);
+  const p = partitionFindings([f, dup], { block_threshold: "low", min_confidence: 0 }, overrides);
+  assert.equal(p.blocking.length, 0, "duplicate single-line finding is not a distinct candidate — override applies");
+  assert.equal(p.overridden.length, 2, "both copies go to overridden");
 });
 
 // ---------------------------------------------------------------------------
