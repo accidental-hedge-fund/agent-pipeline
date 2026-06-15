@@ -5,9 +5,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { enforceImplCommitRef, enforceOpenspecChangeSingular } from "../scripts/stages/planning.ts";
+import {
+  enforceImplCommitRef,
+  enforceOpenspecChangeSingular,
+  invokeImplementer,
+} from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
+import type { HarnessResult } from "../scripts/harness.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 function msgsDeps(messages: string[]): VerifyDeps {
   return {
@@ -16,6 +22,57 @@ function msgsDeps(messages: string[]): VerifyDeps {
     gitDirtyFiles: async () => [],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Implementer harness invocation — models.implementing slot (#70)
+//
+// Both the standard and OpenSpec implementing paths route through
+// `invokeImplementer`, so exercising the wrapper with an injected `invoke` seam
+// covers both call sites: the per-repo `models.implementing` alias reaches the
+// harness when no CLI override is given, and a CLI `--model` override wins.
+// ---------------------------------------------------------------------------
+
+function okResult(): HarnessResult {
+  return { success: true, stdout: "", stderr: "", exit_code: 0, duration: 1, timed_out: false };
+}
+
+function cfgWithImplementing(alias: string): PipelineConfig {
+  return {
+    implementation_timeout: 2400,
+    models: { planning: "sonnet", implementing: alias, review: "opus", fix: "sonnet" },
+  } as unknown as PipelineConfig;
+}
+
+test("invokeImplementer: passes cfg.models.implementing to the harness when no CLI override (#70)", async () => {
+  let captured: { harness: string; wt: string; prompt: string; model?: string; timeoutSec?: number } | undefined;
+  const deps = {
+    invoke: async (harness: any, wt: string, prompt: string, opts: any): Promise<HarnessResult> => {
+      captured = { harness, wt, prompt, model: opts.model, timeoutSec: opts.timeoutSec };
+      return okResult();
+    },
+  };
+  const cfg = cfgWithImplementing("haiku");
+  const res = await invokeImplementer("claude", "/wt", "impl prompt", cfg, {}, deps);
+  assert.equal(res.success, true);
+  // The slot reaches the harness — the gap #70 closed (call sites passed bare opts.model).
+  assert.equal(captured?.model, "haiku");
+  assert.equal(captured?.timeoutSec, cfg.implementation_timeout);
+  assert.equal(captured?.harness, "claude");
+  assert.equal(captured?.wt, "/wt");
+  assert.equal(captured?.prompt, "impl prompt");
+});
+
+test("invokeImplementer: CLI --model override wins over cfg.models.implementing (#70)", async () => {
+  let capturedModel: string | undefined;
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedModel = opts.model;
+      return okResult();
+    },
+  };
+  await invokeImplementer("claude", "/wt", "p", cfgWithImplementing("haiku"), { model: "opus" }, deps);
+  assert.equal(capturedModel, "opus");
+});
 
 // ---------------------------------------------------------------------------
 // Implementation step — issue reference (4.1 / 4.2)

@@ -638,6 +638,113 @@ test("resolveConfig: partial known models block (single key) is still valid", as
   }
 });
 
+// ---- models.implementing slot (#70) ----
+//
+// The implementing step gained a dedicated `models.implementing` slot. It
+// resolves like every other slot (file value ?? default), defaults to "sonnet"
+// (the prior implicit alias, so existing repos are unchanged), and warns when set
+// while the implementer harness is codex — the same advisory the other slots get.
+
+test("resolveConfig: models.implementing is accepted and resolves (#70)", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: opus\n`);
+  const binDir = makeFakeGh("acme/impl-slot1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // claude profile → implementer=claude, so the alias is honored (no warning).
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.models.implementing, "opus");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing defaults to sonnet when absent (#70)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/impl-slot2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.models.implementing, "sonnet");
+    assert.equal(cfg.models.implementing, DEFAULT_CONFIG.models.implementing);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: a models block omitting implementing keeps the default + no inert warning (#70)", async () => {
+  // Another slot set, implementing absent, under the codex profile
+  // (implementer=codex). review→reviewer=claude → no review warning; an absent
+  // (default-valued) implementing key must never warn even though implementer=codex.
+  const repo = makeFakeRepo(`models:\n  review: opus\n`);
+  const binDir = makeFakeGh("acme/impl-slot3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.equal(
+      warnings.find((w) => w.includes("models.implementing")),
+      undefined,
+      `unexpected implementing warning: ${JSON.stringify(warnings)}`,
+    );
+    assert.equal(cfg.models.implementing, DEFAULT_CONFIG.models.implementing);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing set + implementer=codex warns it is inert (#70)", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: haiku\n`);
+  const binDir = makeFakeGh("acme/impl-slot4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      // codex profile (default) → implementer=codex
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    const hit = warnings.find((w) => w.includes("models.implementing"));
+    assert.ok(hit, `expected a warning for models.implementing, got: ${JSON.stringify(warnings)}`);
+    assert.match(hit!, /haiku/);
+    assert.match(hit!, /codex/);
+    assert.match(hit!, /ignored/);
+    // Non-blocking: the inert alias is still preserved in the resolved config.
+    assert.equal(cfg.models.implementing, "haiku");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing set + implementer=claude does NOT warn (#70)", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: opus\n`);
+  const binDir = makeFakeGh("acme/impl-slot5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      // claude profile → implementer=claude
+      cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    });
+    assert.equal(
+      warnings.find((w) => w.includes("models.implementing")),
+      undefined,
+      `unexpected warning: ${JSON.stringify(warnings)}`,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- doctor block (#146) ----
 
 test("resolveConfig: doctor defaults apply when block is absent", async () => {
