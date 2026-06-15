@@ -1,0 +1,52 @@
+name: release
+
+# Publish a GitHub Release whenever a version tag is pushed. The maintainer still
+# owns the version bump (release PR), the merge, and the annotated tag push — this
+# only automates the mechanical "tag → GitHub Release" step so `releases/latest`
+# and the Releases list (which Pipeline Desk reads) can never lag behind the tags.
+# Release notes come from the annotated tag message, keeping them hand-curated.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create GitHub Releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so the annotation is available
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Guard — tag must match package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${pkg}"
+            exit 1
+          fi
+
+      - name: Publish GitHub Release from the annotated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A pre-release tag (e.g. v1.2.0-rc.1) is marked prerelease and must NOT
+          # take the Latest badge; a normal vX.Y.Z tag becomes Latest.
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            flag="--prerelease"
+          else
+            flag="--latest"
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --notes-from-tag \
+            --title "${GITHUB_REF_NAME}" \
+            $flag
