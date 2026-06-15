@@ -2,7 +2,7 @@
 
 Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-06-14.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. **v1.1.1 shipped 2026-06-14** (tag `v1.1.1`) — capability/evidence hardening: deterministic `doctor` preflight and per-run evidence bundles; see Shipped. Everything below v1.1.1 is the post-1.1.1 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. **v1.1.1 shipped 2026-06-14** (tag `v1.1.1`) — capability/evidence hardening: deterministic `doctor` preflight and per-run evidence bundles; see Shipped. **v1.2.0 shipped 2026-06-15** (tag `v1.2.0`) — reviewer pluggability & per-step models: configurable review harness, self-review fallback, `models.implementing`, and override durability; see Shipped. Everything below v1.2.0 is the post-1.2.0 line.
 
 **Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
 
@@ -35,6 +35,17 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #64 | tighten SKILL.md monitor-filter guidance | #69 |
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
+
+**v1.2.0 — reviewer pluggability & per-step models (shipped 2026-06-15, tag `v1.2.0`) — second minor:**
+
+| # | What | PR |
+|---|------|-----|
+| #39 | same-harness self-review fallback when the cross-harness reviewer CLI is unavailable — clearly labeled, failure-triggered at the invoke seam, no new config key | #163 |
+| #40 | configurable review harness: a real, honored `review_harness` key to point the review step at an arbitrary reviewer CLI (implementer stays profile-owned) | #164 |
+| #70 | per-step model config: adds the `models.implementing` slot (planning/implementing/review/fix); honored on claude, warns when inert on codex | #165 |
+| #144 | override durability: stable shift-tolerant finding identity (`severity\|file\|line_bucket` + payload fingerprint) so a reworded/line-shifted re-emit keeps its `--override`; closes the override-key churn that made #19 take 5 rounds | #166 |
+
+Tooling shipped alongside: config dogfooding — `.github/pipeline.yml` refreshed to the latest accepted format (PR #167); release automation — `release.yml` auto-publishes a GitHub Release on `v*` tag push (PR #169).
 
 **v1.1.1 — capability/evidence hardening (shipped 2026-06-14, tag `v1.1.1`):**
 
@@ -111,7 +122,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See **Shipped** above. |
 | **v1.1.0** ✅ shipped | minor | Review quality | #19, #25, #57, #85 | Shipped 2026-06-13 (tag `v1.1.0`) — first minor. New planning/review capability, no breaking change. See **Shipped** above for per-PR detail. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
 | **v1.1.1** ✅ shipped | patch | Capability/evidence hardening | #146, #147 | Shipped 2026-06-14 (tag `v1.1.1`). Deterministic `doctor` preflight + per-run evidence bundles; no change to shipped run behavior. (#143 folded into v1.1.0.) See **Shipped** above. |
-| **v1.2.0** | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Adds opt-in keys (reviewer selection, `models.implementing`) that default to identical behavior. Order: #39 → #40 → #70. #144 (override durability) is convergence-robustness hardening, no new surface. Config dogfooding: the repo's own `.github/pipeline.yml` refreshed to the latest accepted format (PR #167). |
+| **v1.2.0** ✅ shipped | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Shipped 2026-06-15 (tag `v1.2.0`) — second minor. Opt-in keys (reviewer selection, `models.implementing`) defaulting to identical behavior + override-durability hardening. See **Shipped** above. (Tooling: config dogfooding PR #167, release automation PR #169.) |
 | **v1.3.0** | minor | Graduated autonomy & isolation | #23, #21, #149 | Adds opt-in keys defaulting empty/off — the trust/isolation layer on a stable, configurable base. #149 adds bounded continuation budgets on top of existing `needs-human` semantics; no merge/deploy authority. |
 | **v1.4.0** | minor | Evidence gates & private evals | #148 | Adds an optional reviewer-owned private shipcheck gate before `ready-to-deploy`; advisory-first, no default behavior change. |
 | **v1.5.0** | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Adds machine-facing launch, status, event, log, config-validation, and run-artifact-convention contracts so Pipeline Desk can supervise runs without scraping terminal prose. Keeps the current skill structure and human `/pipeline` / `$pipeline` flows intact. Contract shapes sharpened against the 2026-06-14 compound-engineering-plugin / gstack evaluation (see detail). |
@@ -183,7 +194,7 @@ SmallHarness-inspired hardening that makes runs cheaper to diagnose and less lik
 - **#147** — Per-run evidence bundle: compact machine-readable artifact recording issue/PR, branch, commit SHAs, stage transitions, harness identity, prompts/context inputs, commands, test/eval outcomes, review verdicts, overrides, recovery events, and final handoff state, plus a printable human-readable summary. An audit/debug artifact, not a second state machine.
 - **#143** — folded into #19's reserve-aware water-filling truncation fix and shipped in v1.1.0; closed as done (not a separate v1.1.1 deliverable).
 
-### v1.2.0 — reviewer pluggability & per-step models (minor)
+### v1.2.0 — reviewer pluggability & per-step models (shipped 2026-06-15, tag `v1.2.0`)
 
 - **#39** — No-review-harness fallback: degrade to a clearly-labeled same-harness self-review when the reviewer CLI is unavailable (failure-triggered, at the invoke seam, **no new config key**).
 - **#40** — Configurable review harness: generalize `invoke()` and add a real, honored reviewer-selection key. *Note: #93 deleted the old ignored `harnesses` key, so this **adds a fresh key** (purely additive), not a revival of a dead one.* Sequence after #39.
