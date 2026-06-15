@@ -1242,6 +1242,84 @@ test("recurrence (#133 fix 2): advisory-only prior round emits empty marker — 
 // change, not changes[0] (which may be an unrelated pre-existing change).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Harness failure with stderr excerpt (#40)
+// ---------------------------------------------------------------------------
+
+test("advanceReview (#40): harness failure with stderr includes excerpt in blocked comment", async (t) => {
+  const { deps, rec } = makeDeps([""]);
+  // Override runReview to return a spawn failure with actionable stderr.
+  deps.runReview = async () => ({
+    result: {
+      success: false,
+      stdout: "",
+      stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH",
+      exit_code: -1,
+      duration: 0.01,
+      timed_out: false,
+      spawn_error: true,
+    },
+    effectiveReviewer: "my-reviewer",
+    selfReview: false,
+  });
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /my-reviewer/, "blocked comment must mention the reviewer CLI");
+  assert.match(rec.blocked[0], /not found/, "blocked comment must include the actionable stderr");
+  assert.equal(outcome!.advanced, false);
+});
+
+test("advanceReview (#40): harness failure without stderr omits CLI output section", async (t) => {
+  const { deps, rec } = makeDeps([""]);
+  deps.runReview = async () => ({
+    result: {
+      success: false,
+      stdout: "",
+      stderr: "",
+      exit_code: 1,
+      duration: 0.5,
+      timed_out: false,
+    },
+    effectiveReviewer: "codex",
+    selfReview: false,
+  });
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(rec.blocked.length, 1);
+  assert.ok(!rec.blocked[0].includes("CLI output"), "no stderr → no CLI output section in blocked comment");
+  assert.equal(outcome!.advanced, false);
+});
+
+test("advanceReview (#40): double-failure (self-review) with stderr includes excerpt in blocked comment", async (t) => {
+  const { deps, rec } = makeDeps([""]);
+  // selfReview=true means both the configured reviewer and the fallback failed.
+  deps.runReview = async () => ({
+    result: {
+      success: false,
+      stdout: "",
+      stderr: "Error: ENOENT my-reviewer",
+      exit_code: -1,
+      duration: 0.01,
+      timed_out: false,
+      spawn_error: true,
+    },
+    effectiveReviewer: "claude",
+    selfReview: true,
+  });
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /ENOENT/, "stderr excerpt must appear in the double-failure blocked comment");
+  assert.equal(outcome!.advanced, false);
+});
+
 test("diffFilePaths: extracts file paths from a unified diff", () => {
   const diff = [
     "diff --git a/src/index.ts b/src/index.ts",

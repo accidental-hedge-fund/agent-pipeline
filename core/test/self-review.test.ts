@@ -118,6 +118,144 @@ test("invokeReviewer: both harnesses unspawnable → fallback attempted, then bl
   assert.deepEqual(calls, ["codex", "claude"]);
 });
 
+// ---- custom reviewer CLI (#40) ----
+//
+// `review_harness` lets the reviewer be an arbitrary CLI string, not just a
+// built-in harness. invokeReviewer must route that string through the generalized
+// invoke() seam, and the #39 fallback still applies when the custom CLI is missing.
+
+/** Fake `invoke` keyed by an arbitrary CLI name (custom reviewers aren't `Harness`). */
+function fakeInvokeByName(byName: Record<string, HarnessResult>) {
+  const calls: string[] = [];
+  const inv = async (harness: string): Promise<HarnessResult> => {
+    calls.push(harness);
+    const r = byName[harness];
+    if (!r) throw new Error(`test fake has no result for harness ${harness}`);
+    return r;
+  };
+  return { inv: inv as unknown as typeof import("../scripts/harness.ts").invoke, calls };
+}
+
+test("invokeReviewer: a custom reviewer CLI that succeeds → no fallback, effectiveReviewer is the custom CLI (#40)", async () => {
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": ok() });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, false);
+  assert.equal(out.effectiveReviewer, "my-reviewer");
+  assert.equal(out.result.success, true);
+  assert.deepEqual(calls, ["my-reviewer"], "only the custom reviewer is invoked when it succeeds");
+});
+
+test("invokeReviewer: a custom reviewer CLI that is unspawnable → same-harness fallback to the implementer (#40)", async () => {
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": spawnErr(), claude: ok() });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "a missing custom reviewer CLI triggers the #39 fallback");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.success, true, "the returned result is the implementer's successful self-review");
+  assert.deepEqual(calls, ["my-reviewer", "claude"], "custom reviewer attempted first, then the implementer fallback");
+});
+
+test("invokeReviewer: custom reviewer + fallback both fail → result.stderr contains both errors (#40 finding 1)", async () => {
+  // Simulate the real harness.ts behaviour: custom reviewer's spawn error gets the
+  // actionable CLI message prepended; the implementer fallback gets its own message.
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackErr = {
+    ...spawnErr(),
+    stderr: "[harness claude] spawn error: ENOENT",
+  };
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackErr });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.spawn_error, true, "double-failure: no harness left to review with");
+  // Both error messages must appear so callers can surface them in the blocked message.
+  assert.match(out.result.stderr, /my-reviewer/, "configured reviewer error present in merged stderr");
+  assert.match(out.result.stderr, /claude/, "fallback error present in merged stderr");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+test("invokeReviewer: custom reviewer spawn_error + fallback exit 1 → both errors merged (#40 finding 2)", async () => {
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackExitOne = {
+    ...nonzero(),
+    stderr: "claude: authentication failed",
+  };
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackExitOne });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.success, false, "double-failure: item should block");
+  assert.match(out.result.stderr, /my-reviewer/, "configured reviewer error present in merged stderr");
+  assert.match(out.result.stderr, /claude/, "fallback error present in merged stderr");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+test("invokeReviewer: custom reviewer spawn_error + fallback timeout → both errors merged (#40 finding 2)", async () => {
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackTimedOut = {
+    ...timeout(),
+    stderr: "timed out waiting for claude",
+  };
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackTimedOut });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.success, false, "double-failure: item should block");
+  assert.equal(out.result.timed_out, true, "timed_out preserved from fallback");
+  assert.match(out.result.stderr, /my-reviewer/, "configured reviewer error present in merged stderr");
+  assert.match(out.result.stderr, /claude/, "fallback error present in merged stderr");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+test("invokeReviewer: custom reviewer spawn_error + fallback exits 0 with blank stdout → unusable, preserves configured error (#40 finding 61f38f28)", async () => {
+  // The double-failure the prior fix missed: the configured reviewer is missing, and
+  // the implementer fallback exits 0 but produces NO usable review output. The old
+  // code merged stderr only on `!fallback.success`, so it returned the empty fallback
+  // verbatim (success:true, configured error dropped) and the review-round block path
+  // degraded to "no reviewer output captured" without ever naming the missing reviewer.
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackEmpty = { ...ok(""), stderr: "" }; // success:true, exit 0, but blank stdout
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackEmpty });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(
+    out.result.success,
+    false,
+    "an exit-0 self-review with no usable output is NOT a usable review → must route to the !success block",
+  );
+  assert.match(
+    out.result.stderr,
+    /my-reviewer/,
+    "configured reviewer error preserved even though the fallback exited 0 (was dropped before the fix)",
+  );
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+test("invokeReviewer: custom reviewer spawn_error + fallback succeeds with real output → usable, no override (#40)", async () => {
+  // Guard the happy path: a genuinely successful self-review (non-empty stdout) must
+  // stay success:true and is NOT marked failed by the empty-output guard.
+  const { inv, calls } = fakeInvokeByName({
+    "my-reviewer": spawnErr(),
+    claude: ok('{"verdict":"approve"}'),
+  });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true);
+  assert.equal(out.result.success, true, "a self-review with real output remains usable");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
 test("selfReviewBanner: names the missing reviewer and the effective reviewer, marks it weaker", () => {
   const banner = selfReviewBanner("codex", "claude");
   assert.match(banner, /self-review/i);

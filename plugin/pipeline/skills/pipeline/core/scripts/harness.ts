@@ -1,8 +1,15 @@
-// Run claude or codex inside a worktree directory, streaming output to the
+// Run a harness CLI inside a worktree directory, streaming output to the
 // console while also capturing it for return.
 //
 // claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] <prompt>
 // codex:   codex exec --full-auto -C <worktreeDir> <prompt>
+// custom:  <name> <prompt>   (#40 — a user-configured reviewer CLI)
+//
+// The two built-in harnesses keep their exact invocation shapes. Any other
+// string is treated as a configured reviewer CLI (`review_harness`, #40): it is
+// spawned with the prompt as a single positional argument and its stdout is the
+// harness output. A custom CLI that cannot be spawned yields a specific, named
+// failure in the returned `HarnessResult` — never a thrown "Unknown harness".
 //
 // Captured stdout/stderr is capped at MAX_OUTPUT to bound memory.
 
@@ -10,6 +17,20 @@ import { spawn } from "node:child_process";
 import type { Harness } from "./types.ts";
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
+
+/**
+ * Format a bounded CLI stderr excerpt for inclusion in a blocked-item message.
+ * Returns an empty string when there is no stderr to show.
+ * Single-sourced so plan-review and review-1/review-2 cannot drift (#40).
+ */
+export function formatStderrExcerpt(stderr: string, max = 500): string {
+  const trimmed = stderr.trim();
+  if (!trimmed) return "";
+  return (
+    `\n\nCLI output:\n\`\`\`\n${trimmed.slice(0, max)}` +
+    `${trimmed.length > max ? "\n…(truncated)" : ""}\n\`\`\``
+  );
+}
 
 export interface HarnessResult {
   success: boolean;
@@ -31,7 +52,7 @@ export interface InvokeOptions {
 }
 
 export async function invoke(
-  harness: Harness,
+  harness: string,
   worktreeDir: string,
   prompt: string,
   opts: InvokeOptions = {},
@@ -41,6 +62,7 @@ export async function invoke(
 
   let cmd: string;
   let args: string[];
+  let custom = false;
   if (harness === "claude") {
     cmd = "claude";
     args = ["--print", "--permission-mode", "bypassPermissions", "--output-format", "text"];
@@ -50,10 +72,28 @@ export async function invoke(
     cmd = "codex";
     args = ["exec", "--full-auto", "-C", worktreeDir, prompt];
   } else {
-    throw new Error(`Unknown harness: ${harness}`);
+    // A user-configured reviewer CLI (`review_harness`, #40). Invoke it with the
+    // prompt as a single positional argument; its stdout is the verdict output
+    // (parsed by parseStructuredVerdict, exactly like a built-in reviewer).
+    cmd = harness;
+    args = [prompt];
+    custom = true;
   }
 
-  return runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness);
+  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness);
+  // When a configured reviewer CLI cannot be spawned at all (ENOENT / not
+  // executable), surface a specific, actionable message that names the CLI —
+  // never a bare "Unknown harness". The `spawn_error` flag is preserved so the
+  // #39 self-review fallback still triggers in invokeReviewer.
+  if (custom && result.spawn_error) {
+    return {
+      ...result,
+      stderr:
+        `reviewer CLI '${harness}' not found or not executable — ensure it is installed and on PATH\n` +
+        result.stderr,
+    };
+  }
+  return result;
 }
 
 export async function runCapped(

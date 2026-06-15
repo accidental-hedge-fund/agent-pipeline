@@ -410,6 +410,98 @@ test("resolveConfig: unknown review_policy key is rejected (strict schema)", asy
   }
 });
 
+// ---- review_harness override (#40) ----
+//
+// `review_harness` overrides only the reviewer role; the implementer is always
+// profile-owned. The override is applied at merge time, so all stage code keeps
+// reading `cfg.harnesses.reviewer`. When absent, the profile's reviewer is used
+// unchanged with no warning.
+
+test("resolveConfig: review_harness overrides the reviewer harness; implementer unaffected (codex profile)", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\n`);
+  const binDir = makeFakeGh("acme/rh1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // codex profile (default): implementer=codex, reviewer=claude → reviewer overridden
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "my-reviewer");
+    assert.equal(cfg.harnesses.implementer, "codex"); // unchanged by file config
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness does not override the implementer (claude profile)", async () => {
+  // Spec scenario: implementer cannot be overridden by file config — only the
+  // reviewer is. Under the claude profile (implementer=claude, reviewer=codex),
+  // setting review_harness changes only the reviewer.
+  const repo = makeFakeRepo(`review_harness: my-reviewer\n`);
+  const binDir = makeFakeGh("acme/rh2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "my-reviewer");
+    assert.equal(cfg.harnesses.implementer, "claude"); // profile implementer, unchanged
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness absent → reviewer is the profile default, no warning (codex profile)", async () => {
+  const repo = makeFakeRepo(null); // no config file at all
+  const binDir = makeFakeGh("acme/rh0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      // codex profile (default) → reviewer=claude
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.equal(cfg.harnesses.reviewer, "claude");
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness absent under claude profile → reviewer is codex", async () => {
+  const repo = makeFakeRepo(`base_branch: main\n`); // a config file, but no review_harness
+  const binDir = makeFakeGh("acme/rh3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "codex"); // profile cross-harness default
+    assert.equal(cfg.harnesses.implementer, "claude");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: a non-string review_harness is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`review_harness: 42\n`);
+  const binDir = makeFakeGh("acme/rh4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("review_harness"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- inert models.* alias warning (#116) ----
 //
 // Model selection is claude-only (harness.ts passes --model only on the claude

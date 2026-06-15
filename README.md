@@ -250,9 +250,27 @@ review_policy:                       # which review findings block progression v
 doctor:                              # deterministic preflight capability check — see "Preflight (doctor)"
   runOnStart: false                  # default: false; if true, run the preflight before planning and abort the run on any failure
   failFast: false                    # default: false; if true, stop at the first failing check instead of collecting all failures
-# Harness roles (implementer/reviewer) are owned by the install profile and cannot
-# be set here — a `harnesses:` key is rejected at config-parse time.
+review_harness: my-reviewer          # optional: override the reviewer CLI for the review step — see "Custom reviewer harness" (default: the profile's reviewer)
+# The implementer harness is owned by the install profile and cannot be set here.
+# Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
+# rejected at config-parse time.
 ```
+
+### Custom reviewer harness (`review_harness`)
+
+By default the review step runs on the profile's cross-harness reviewer (`codex` under `/pipeline`, `claude` under `$pipeline`). Set `review_harness` to point review at a different reviewer CLI instead — the implementer harness is unaffected and stays profile-owned:
+
+```yaml
+review_harness: my-reviewer          # any CLI on your PATH
+```
+
+When set, every review round (plan-review, review-1, review-2) invokes `my-reviewer` in place of the profile reviewer. The pipeline calls it as `my-reviewer "<prompt>"` — the JSON-returning verdict prompt is passed as a single positional argument — and reads the CLI's **stdout** as the review output. A custom reviewer must therefore:
+
+- **Read the prompt from its first positional argument** and run the requested review.
+- **Print a fenced JSON verdict block on stdout** matching the schema the pipeline gates on — `{"verdict": "approve" | "needs-attention", "summary": …, "findings": […], "next_steps": […]}` (the same `{{schema_block}}` a built-in reviewer returns; see `core/scripts/review-schema.ts`). Findings drive the severity policy exactly as with a built-in reviewer.
+- **Be an installed/authenticated CLI** — no API key is introduced; like `claude`/`codex`, the reviewer brings its own auth.
+
+If the configured CLI is **not installed or not executable**, the review step fails with a specific, named reason (`reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH`) and the [same-harness fallback](#prerequisites) applies — the implementing harness reviews instead, prominently labeled. When `review_harness` is absent, the profile's reviewer is used unchanged.
 
 ## Preflight (doctor)
 

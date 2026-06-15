@@ -21,6 +21,7 @@ import {
   transition,
 } from "../gh.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
+import { formatStderrExcerpt } from "../harness.ts";
 import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
@@ -239,12 +240,17 @@ export async function advanceReview(
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
+    // Include a bounded stderr excerpt so blocked items surface the actionable CLI
+    // error (e.g. "reviewer CLI 'my-reviewer' not found…" from harness.ts, or auth
+    // failure output) rather than just an exit code. Single-sourced via
+    // formatStderrExcerpt so plan-review failures share the same format (#40).
+    const stderrExcerpt = formatStderrExcerpt(result.stderr);
     // selfReview here means the reviewer was unspawnable AND the implementing
     // harness fallback also failed — there is no harness left to review with (#39).
     const detailMsg = selfReview
       ? `Neither the cross-harness reviewer (${configuredReviewer}) nor the implementing ` +
-        `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}`
-      : `Review harness (${reviewer}) failed: ${reason}`;
+        `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
+      : `Review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
     await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
