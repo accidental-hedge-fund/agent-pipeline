@@ -1074,8 +1074,8 @@ test("recurrence (#133): all-new blocking keys → no early park, routes to fix 
 });
 
 test("recurrence (#133): severity change → different key → treated as new, no early park", async (t) => {
-  // Same title/file, but the prior round emitted it at medium severity. The key
-  // hashes severity|file|title, so it differs → no recurrence.
+  // Same title/file, but the prior round emitted it at medium severity. The stable
+  // key (#144) includes severity, so it differs → no recurrence.
   const prior = priorVerdictComment(2, [{ ...FINDING_BUG, severity: "medium" }]);
   const { deps, rec } = makeDeps([NA_WITH_FINDING]);
   deps.getIssueDetail = async () => detailWithComments([prior]);
@@ -1083,6 +1083,44 @@ test("recurrence (#133): severity change → different key → treated as new, n
     await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
   });
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+});
+
+test("recurrence (#144): reworded title at same location is RECURRING, not NEW → early park", async (t) => {
+  // Round N flagged a high finding at profile.ts:46. Round N+1 re-emits the same
+  // issue at line 48 (same 46–50 band) with a REWORDED title. Under the old
+  // severity|file|title key this looked NEW (no early park, a wasted round); the
+  // stable key (#144) keys on file+line band, so it is correctly RECURRING and
+  // the loop early-parks instead of churning to the ceiling.
+  const original: ReviewFinding = {
+    severity: "high",
+    title: "Later compact sections can starve",
+    body: "b",
+    file: "core/scripts/profile.ts",
+    line_start: 46,
+    confidence: 0.9,
+    recommendation: "r",
+  };
+  const reworded: ReviewFinding = { ...original, title: "Later compact sections can still starve", line_start: 48 };
+  assert.equal(findingKey(reworded), findingKey(original), "precondition: stable key under rewording + ±2-line shift");
+
+  const naReworded = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "still here",
+    findings: [reworded],
+    next_steps: [],
+  });
+  const { deps, rec } = makeDeps([naReworded]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [original])]);
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }], "reworded recurrence must early-park, not route to fix-2");
+  const punch = rec.comments.find((c) => c.startsWith("## Pipeline: Review ceiling reached"));
+  assert.ok(punch, "the tagged punch-list comment must be posted");
+  assert.match(punch!, /RECURRING \(1 rounds\)/, "the reworded finding must be tagged RECURRING");
+  assert.doesNotMatch(punch!, /\*\*NEW\*\*/, "it must NOT be tagged NEW");
+  assert.match(outcome.summary, /recurrence/);
 });
 
 test("recurrence (#133): no prior Review-N comment → no recurrence check, normal routing", async (t) => {

@@ -39,13 +39,68 @@ export interface ReviewPolicy {
 }
 
 /**
- * Stable short key for a finding so an operator can reference one specific
- * finding in an override. Content-addressed (severity|file|title) so it is
- * stable across review rounds: a reviewer that re-emits the same finding on a
- * later commit produces the same key, and a prior override keeps applying.
+ * Fixed-partition line band for a finding's `line_start` (#144). Lines 1–5 map to
+ * bucket 1, 6–10 to bucket 6, etc. — `Math.floor((L - 1) / 5) * 5 + 1` for `L >= 1`.
+ * Returns 0 when `line_start` is absent or falsy, which routes `findingKey` to the
+ * normalized-title fallback. A fixed partition (vs. a moving ±window centered on
+ * `line_start`) is reproducible from the bucket alone: the bucket is a pure function
+ * of the line number, so a finding that drifts ±a few lines within the same band
+ * keeps the same key without needing to know where the override was first recorded.
  */
-export function findingKey(f: Pick<ReviewFinding, "severity" | "file" | "title">): string {
-  const basis = `${f.severity ?? "medium"}|${f.file ?? ""}|${f.title ?? ""}`;
+export function lineBucket(lineStart: number | undefined): number {
+  if (!lineStart || lineStart < 1) return 0;
+  return Math.floor((lineStart - 1) / 5) * 5 + 1;
+}
+
+/** Normalize a file path for the finding key: lowercase only (#144). */
+export function normalizeFile(file: string | undefined): string {
+  return (file ?? "").toLowerCase();
+}
+
+/**
+ * Normalize a finding title for the fallback key (#144): lowercase, strip markdown
+ * emphasis (`*`, `_`, backtick, `~`), strip leading/trailing punctuation and
+ * ellipsis (`…`, `...`), collapse internal whitespace, trim. Absorbs the common
+ * formatting/capitalization drift between rounds; it does NOT absorb word
+ * insertion ("can starve" vs "can still starve"), which is why the location-based
+ * key is preferred whenever `line_start` is available.
+ */
+export function normalizeTitle(title: string | undefined): string {
+  return (title ?? "")
+    .toLowerCase()
+    .replace(/[*_`~]/g, "")
+    .replace(/^[\s\p{P}…]+/u, "")
+    .replace(/[\s\p{P}…]+$/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Stable short key for a finding so an operator can reference one specific
+ * finding in an override, and so recurrence detection (#133) recognizes the same
+ * issue across rounds. Location-addressed: `sha1(severity | normalizeFile(file) |
+ * lineBucket(line_start))` when `line_start` is present, falling back to
+ * `sha1(severity | normalizeFile(file) | normalizeTitle(title))` when it is not.
+ *
+ * Stable under title rewording (#144): because the primary key excludes the title,
+ * a reviewer that re-words a finding ("can starve" → "can still starve") at the
+ * same file + line band + severity produces the SAME key, so a recorded override
+ * keeps applying instead of silently lapsing and re-parking the item at
+ * `needs-human` (the #19 five-round failure). Title is the reviewer's natural-
+ * language description of an issue, not the issue's identity.
+ *
+ * MIGRATION (ships ~2026-06, #144): this replaces the prior `severity|file|title`
+ * algorithm. `pipeline-override` sentinels recorded before this change carry
+ * old-algorithm keys and will no longer match any finding's new key — any
+ * in-flight overrides must be re-recorded after deploy. One-time cost.
+ */
+export function findingKey(
+  f: Pick<ReviewFinding, "severity" | "file" | "title" | "line_start">,
+): string {
+  const severity = f.severity ?? "medium";
+  const file = normalizeFile(f.file);
+  const bucket = lineBucket(f.line_start);
+  const basis = bucket > 0 ? `${severity}|${file}|${bucket}` : `${severity}|${file}|${normalizeTitle(f.title)}`;
   return createHash("sha1").update(basis).digest("hex").slice(0, 8);
 }
 
@@ -81,10 +136,42 @@ export interface PartitionResult {
 }
 
 /**
+ * A fingerprint of the fields that make two same-key findings *materially*
+ * different: normalized title + normalized body + normalized recommendation +
+ * line range. The ambiguity guard counts distinct fingerprints — not the raw
+ * finding count (which an exact duplicate or an advisory duplicate could inflate)
+ * and not the title alone (which collapses genuinely different findings that
+ * happen to share a key + title). Exact-duplicate payloads share a fingerprint
+ * and collapse; materially different findings do not. Exported for tests.
+ */
+export function findingPayloadFingerprint(f: ReviewFinding): string {
+  const norm = (s: string | undefined): string =>
+    (s ?? "").toLowerCase().replace(/[*_`~]/g, "").replace(/\s+/g, " ").trim();
+  // Normalize the range: an omitted line_end means the single line `line_start`,
+  // so `{46}` and `{46, line_end: 46}` must produce the same range (else an exact
+  // duplicate with one form omitted falsely reads as a distinct candidate).
+  const effectiveEnd = f.line_end ?? f.line_start;
+  return [
+    normalizeTitle(f.title),
+    norm(f.body),
+    norm(f.recommendation),
+    `${f.line_start ?? ""}-${effectiveEnd ?? ""}`,
+  ].join("␟"); // unit separator — won't appear in finding text
+}
+
+/**
  * Partition review findings into blocking / advisory / overridden under the
  * given policy and the set of active operator overrides (key → disposition).
  * Override takes precedence over the severity/confidence test so an explicit
  * human disposition always wins.
+ *
+ * Ambiguity guard (#144): an override is only applied when the current verdict
+ * has exactly one *distinct blocking candidate* for that key. A "blocking
+ * candidate" meets the severity threshold and confidence floor; "distinct" is
+ * measured by findingPayloadFingerprint — so exact-duplicate payloads (and
+ * same-key advisory duplicates, which are never counted) collapse to one, but
+ * two materially different findings that share a key + normalized title do NOT,
+ * and correctly withhold the override so a real blocker cannot advance under it.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
@@ -94,9 +181,30 @@ export function partitionFindings(
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
 
+  // Pre-classify: for each key, collect the set of distinct *payload fingerprints*
+  // among blocking candidates only. Advisory findings are not counted, and
+  // exact-duplicate payloads collapse to one — but two materially different
+  // findings that share a key stay distinct, so they correctly trigger ambiguity.
+  const blockingFingerprintsByKey = new Map<string, Set<string>>();
+  for (const f of findings) {
+    const isAboveSeverity = severityRank(f.severity) >= threshold;
+    const isAboveConfidence = typeof f.confidence !== "number" || f.confidence >= policy.min_confidence;
+    if (isAboveSeverity && isAboveConfidence) {
+      const k = findingKey(f);
+      if (!blockingFingerprintsByKey.has(k)) blockingFingerprintsByKey.set(k, new Set());
+      blockingFingerprintsByKey.get(k)!.add(findingPayloadFingerprint(f));
+    }
+  }
+
   for (const f of findings) {
     const key = findingKey(f);
-    if (overrides.has(key)) {
+    const isBlockingCandidate =
+      severityRank(f.severity) >= threshold &&
+      (typeof f.confidence !== "number" || f.confidence >= policy.min_confidence);
+    const distinctBlockers = blockingFingerprintsByKey.get(key)?.size ?? 0;
+    const isAmbiguous = distinctBlockers > 1;
+
+    if (overrides.has(key) && isBlockingCandidate && !isAmbiguous) {
       result.overridden.push({ finding: f, key, disposition: overrides.get(key)! });
       continue;
     }
