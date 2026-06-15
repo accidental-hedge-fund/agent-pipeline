@@ -215,6 +215,47 @@ test("invokeReviewer: custom reviewer spawn_error + fallback timeout → both er
   assert.deepEqual(calls, ["my-reviewer", "claude"]);
 });
 
+test("invokeReviewer: custom reviewer spawn_error + fallback exits 0 with blank stdout → unusable, preserves configured error (#40 finding 61f38f28)", async () => {
+  // The double-failure the prior fix missed: the configured reviewer is missing, and
+  // the implementer fallback exits 0 but produces NO usable review output. The old
+  // code merged stderr only on `!fallback.success`, so it returned the empty fallback
+  // verbatim (success:true, configured error dropped) and the review-round block path
+  // degraded to "no reviewer output captured" without ever naming the missing reviewer.
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackEmpty = { ...ok(""), stderr: "" }; // success:true, exit 0, but blank stdout
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackEmpty });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(
+    out.result.success,
+    false,
+    "an exit-0 self-review with no usable output is NOT a usable review → must route to the !success block",
+  );
+  assert.match(
+    out.result.stderr,
+    /my-reviewer/,
+    "configured reviewer error preserved even though the fallback exited 0 (was dropped before the fix)",
+  );
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+test("invokeReviewer: custom reviewer spawn_error + fallback succeeds with real output → usable, no override (#40)", async () => {
+  // Guard the happy path: a genuinely successful self-review (non-empty stdout) must
+  // stay success:true and is NOT marked failed by the empty-output guard.
+  const { inv, calls } = fakeInvokeByName({
+    "my-reviewer": spawnErr(),
+    claude: ok('{"verdict":"approve"}'),
+  });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true);
+  assert.equal(out.result.success, true, "a self-review with real output remains usable");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
 test("selfReviewBanner: names the missing reviewer and the effective reviewer, marks it weaker", () => {
   const banner = selfReviewBanner("codex", "claude");
   assert.match(banner, /self-review/i);

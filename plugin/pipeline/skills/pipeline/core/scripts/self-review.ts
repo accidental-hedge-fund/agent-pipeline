@@ -39,9 +39,10 @@ export interface ReviewerInvocation {
  *    spawn-fails, the caller blocks — a self-review by the same missing CLI is
  *    impossible and pointless).
  *
- * When the fallback also fails (spawn_error, nonzero exit, or timeout), the
- * configured reviewer's stderr is merged into the fallback result so the caller's
- * existing `!result.success` branch can surface both failures in the blocked message.
+ * When the fallback is also unusable — it failed (spawn_error, nonzero exit, or
+ * timeout) OR it exited 0 with no usable review output — the result is marked
+ * unsuccessful with both harnesses' stderr merged, so the caller's existing
+ * `!result.success` branch surfaces both failures and names the missing reviewer.
  *
  * `reviewer` may be a custom reviewer CLI (`review_harness`, #40) or a built-in
  * harness; `implementer` is always a built-in `Harness` (the self-review
@@ -60,15 +61,25 @@ export async function invokeReviewer(
   if (result.spawn_error && reviewer !== implementer) {
     const configuredReviewerStderr = result.stderr;
     const fallback = await inv(implementer, worktreeDir, prompt, opts);
-    // When the fallback fails for any reason (spawn_error, nonzero exit, or timeout),
-    // merge the configured reviewer's stderr so callers surface both failures in the
-    // blocked message (#40 finding 2). On a successful fallback the configured stderr
-    // is irrelevant.
-    const mergedFallback =
-      !fallback.success && configuredReviewerStderr.trim()
-        ? { ...fallback, stderr: `${configuredReviewerStderr}\n${fallback.stderr}`.trim() }
-        : fallback;
-    return { result: mergedFallback, effectiveReviewer: implementer, selfReview: true };
+    // A self-review that produces no usable review output is not a usable review.
+    // Treat an exit-0-but-empty fallback as unusable too — alongside spawn_error,
+    // nonzero exit, and timeout — so callers' `!result.success` branch blocks with a
+    // message that names BOTH harnesses and surfaces the configured reviewer's error,
+    // instead of the review-round path degrading to a generic "no reviewer output"
+    // block that never mentions the missing configured reviewer (#40 finding 61f38f28).
+    const fallbackUsable = fallback.success && fallback.stdout.trim() !== "";
+    if (!fallbackUsable) {
+      const mergedStderr = [configuredReviewerStderr, fallback.stderr]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join("\n");
+      return {
+        result: { ...fallback, success: false, stderr: mergedStderr },
+        effectiveReviewer: implementer,
+        selfReview: true,
+      };
+    }
+    return { result: fallback, effectiveReviewer: implementer, selfReview: true };
   }
   return { result, effectiveReviewer: reviewer, selfReview: false };
 }
