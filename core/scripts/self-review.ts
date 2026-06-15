@@ -39,9 +39,9 @@ export interface ReviewerInvocation {
  *    spawn-fails, the caller blocks — a self-review by the same missing CLI is
  *    impossible and pointless).
  *
- * When both harnesses are unspawnable the fallback result still carries
- * `spawn_error`, so the caller's existing `!result.success` branch blocks with a
- * specific reason — there is no harness left to review with.
+ * When the fallback also fails (spawn_error, nonzero exit, or timeout), the
+ * configured reviewer's stderr is merged into the fallback result so the caller's
+ * existing `!result.success` branch can surface both failures in the blocked message.
  *
  * `reviewer` may be a custom reviewer CLI (`review_harness`, #40) or a built-in
  * harness; `implementer` is always a built-in `Harness` (the self-review
@@ -60,11 +60,12 @@ export async function invokeReviewer(
   if (result.spawn_error && reviewer !== implementer) {
     const configuredReviewerStderr = result.stderr;
     const fallback = await inv(implementer, worktreeDir, prompt, opts);
-    // When the fallback also spawn-fails, merge the configured reviewer's stderr
-    // into the fallback result so callers surface both errors in the blocked message
-    // (#40 finding 1). On a successful fallback the configured stderr is irrelevant.
+    // When the fallback fails for any reason (spawn_error, nonzero exit, or timeout),
+    // merge the configured reviewer's stderr so callers surface both failures in the
+    // blocked message (#40 finding 2). On a successful fallback the configured stderr
+    // is irrelevant.
     const mergedFallback =
-      fallback.spawn_error && configuredReviewerStderr.trim()
+      !fallback.success && configuredReviewerStderr.trim()
         ? { ...fallback, stderr: `${configuredReviewerStderr}\n${fallback.stderr}`.trim() }
         : fallback;
     return { result: mergedFallback, effectiveReviewer: implementer, selfReview: true };

@@ -176,6 +176,45 @@ test("invokeReviewer: custom reviewer + fallback both fail → result.stderr con
   assert.deepEqual(calls, ["my-reviewer", "claude"]);
 });
 
+test("invokeReviewer: custom reviewer spawn_error + fallback exit 1 → both errors merged (#40 finding 2)", async () => {
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackExitOne = {
+    ...nonzero(),
+    stderr: "claude: authentication failed",
+  };
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackExitOne });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.success, false, "double-failure: item should block");
+  assert.match(out.result.stderr, /my-reviewer/, "configured reviewer error present in merged stderr");
+  assert.match(out.result.stderr, /claude/, "fallback error present in merged stderr");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+test("invokeReviewer: custom reviewer spawn_error + fallback timeout → both errors merged (#40 finding 2)", async () => {
+  const configuredErr = {
+    ...spawnErr(),
+    stderr: "reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH\nspawn error: ENOENT",
+  };
+  const fallbackTimedOut = {
+    ...timeout(),
+    stderr: "timed out waiting for claude",
+  };
+  const { inv, calls } = fakeInvokeByName({ "my-reviewer": configuredErr, claude: fallbackTimedOut });
+  const out = await invokeReviewer("my-reviewer", "claude", "/wt", "prompt", {}, inv);
+  assert.equal(out.selfReview, true, "fallback was attempted");
+  assert.equal(out.effectiveReviewer, "claude");
+  assert.equal(out.result.success, false, "double-failure: item should block");
+  assert.equal(out.result.timed_out, true, "timed_out preserved from fallback");
+  assert.match(out.result.stderr, /my-reviewer/, "configured reviewer error present in merged stderr");
+  assert.match(out.result.stderr, /claude/, "fallback error present in merged stderr");
+  assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
 test("selfReviewBanner: names the missing reviewer and the effective reviewer, marks it weaker", () => {
   const banner = selfReviewBanner("codex", "claude");
   assert.match(banner, /self-review/i);
