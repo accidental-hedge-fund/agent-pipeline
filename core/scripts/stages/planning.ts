@@ -53,7 +53,7 @@ import {
   type VerifyResult,
 } from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
-import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
+import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -119,6 +119,9 @@ export interface AdvanceOpts {
   stateDir?: string;
   /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
   runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
+   *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
+  runStoreDeps?: RunStoreDeps;
 }
 
 export async function advance(
@@ -170,7 +173,7 @@ export async function advance(
   const wt = bootstrap.wt;
   if (opts.runDir) {
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }).catch(() => {});
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
   }
 
   // ---- Step 0: optional carry-forward context (last30days) ----
@@ -430,7 +433,7 @@ async function advanceOpenspec(
   const wt = bootstrap.wt;
   if (opts.runDir) {
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }).catch(() => {});
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
   }
 
   // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
@@ -795,6 +798,9 @@ export async function resumeFromImplementing(
     stateDir?: string;
     /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
     runDir?: string;
+    /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
+     *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
+    runStoreDeps?: RunStoreDeps;
   },
   deps: ResumeFromImplementingDeps = {},
 ): Promise<Outcome> {
@@ -865,7 +871,7 @@ export async function resumeFromImplementing(
   if (opts.runDir) {
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
     const evType = prIsNew ? "pr_created" : "pr_updated";
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }).catch(() => {});
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }, opts.runStoreDeps).catch(() => {});
   }
 
   // ---- implementing → review-1 ----
@@ -951,6 +957,8 @@ export async function dispatchResume(
       `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}. (Resumed at implementing stage.)`,
     pipelineRunId,
     stateDir: opts.stateDir,
+    runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
   });
 }
 

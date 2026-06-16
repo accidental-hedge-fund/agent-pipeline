@@ -173,6 +173,16 @@ test("initRunDir: creates run dir, writes run.json with all required fields, eve
   assert.equal(events.repo, "owner/repo");
 });
 
+test("initRunDir: creates an empty terminal.log up front so `logs --follow` has a file to tail (#155)", async () => {
+  const { deps, appends } = memRunStore();
+  const TERMINAL_LOG = path.join(RUN_DIR, "terminal.log");
+  await initRunDir(
+    { runDir: RUN_DIR, runId: `${ISSUE}-${STARTED_AT}`, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO },
+    deps,
+  );
+  assert.ok(appends.has(TERMINAL_LOG), "initRunDir must create terminal.log up front (closes the --follow ENOENT window)");
+});
+
 test("initRunDir: non-fatal on I/O error (no throw)", async () => {
   const deps: RunStoreDeps = {
     readFile: async () => { throw new Error("nope"); },

@@ -206,6 +206,11 @@ export async function initRunDir(
       `${JSON.stringify(meta, null, 2)}\n`,
     );
 
+    // Create terminal.log up front (empty, append-mode so an existing file is not
+    // truncated) so a `pipeline logs <id> --follow` started in the window between
+    // run_start and the terminal tee attaching does not fail on a missing file (#155).
+    await deps.appendFile(path.join(opts.runDir, "terminal.log"), "");
+
     // Append the run_start event (appendFile creates events.jsonl on first use)
     const event: RunStartEvent = {
       schema_version: RUN_SCHEMA_VERSION,

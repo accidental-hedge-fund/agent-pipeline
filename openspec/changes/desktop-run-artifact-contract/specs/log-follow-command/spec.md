@@ -23,6 +23,11 @@ The CLI SHALL support a `logs` subcommand with the signature `pipeline logs <run
 - **WHEN** `pipeline logs <unknown-run-id>` is invoked
 - **AND** no run directory exists for that run-id
 - **THEN** the process SHALL exit with a non-zero code
+
+#### Scenario: logs --follow does not hang when the follow cannot start
+- **WHEN** `pipeline logs <run-id> --follow` is invoked but the follow cannot be established (e.g. `terminal.log` is absent or the tail child exits/errors)
+- **THEN** the command SHALL return with a non-zero exit code rather than awaiting forever
+- **AND** the run directory SHALL contain `terminal.log` from run-directory initialization so this case does not arise during a normal in-progress run
 - **AND** SHALL print an error message naming the unknown run-id
 
 ---

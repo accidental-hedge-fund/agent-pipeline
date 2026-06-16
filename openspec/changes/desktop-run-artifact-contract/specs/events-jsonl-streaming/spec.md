@@ -40,6 +40,10 @@ The orchestrator SHALL append a `stage_start` event when a stage handler is ente
 - **THEN** a `stage_complete` event SHALL be appended to `events.jsonl`
 - **AND** the event SHALL contain `schema_version`, `type: "stage_complete"`, `at`, `stage`, and `outcome`
 
+#### Scenario: terminal ready-to-deploy stage emits lifecycle events
+- **WHEN** the run reaches the terminal `ready-to-deploy` stage (handled outside the common dispatch block)
+- **THEN** a `stage_start` and a `stage_complete` event SHALL still be appended for it, so the timeline is complete through the terminal stage
+
 #### Scenario: Pipeline Desk renders stage timeline from events.jsonl without prose
 - **WHEN** a consumer reads `events.jsonl` and filters for `stage_start` and `stage_complete` events
 - **THEN** it SHALL be able to reconstruct the full ordered stage timeline (entry times, exit times, outcomes)
@@ -79,6 +83,10 @@ When the pipeline CLI is invoked with `--json-events`, each event appended to `e
 #### Scenario: event appears on stdout in --json-events mode
 - **WHEN** the pipeline runs with `--json-events` and a stage is entered
 - **THEN** the `stage_start` JSON line SHALL appear on stdout at the same time it is appended to `events.jsonl`
+
+#### Scenario: stage-owned lifecycle events also stream to stdout
+- **WHEN** the pipeline runs with `--json-events` and a stage handler emits a lifecycle event from inside the handler (`worktree_created`, `pr_created`/`pr_updated`, or `review_verdict`)
+- **THEN** that event's JSON line SHALL also appear on stdout — not only `events.jsonl` — so a desktop consumer reconstructing the run from stdout does not miss it
 
 #### Scenario: terminal.log unaffected by --json-events
 - **WHEN** the pipeline runs with `--json-events`

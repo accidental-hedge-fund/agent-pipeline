@@ -648,17 +648,22 @@ export async function runLogs(
     return;
   }
 
-  // --follow: tail -f, independent of the original pipeline process.
-  const tail = spawn("tail", ["-f", logFile], { stdio: "inherit" });
-  tail.on("error", (err) => {
-    console.error(`pipeline logs: failed to start tail: ${err.message}`);
-    process.exitCode = 1;
+  // --follow: tail -f, independent of the original pipeline process. Resolve when
+  // the tail child exits or errors — including the case where terminal.log does
+  // not exist yet — so a failed follow exits non-zero and releases the caller
+  // instead of awaiting an unresolvable promise forever (#155).
+  await new Promise<void>((resolve) => {
+    const tail = spawn("tail", ["-f", logFile], { stdio: "inherit" });
+    tail.on("error", (err) => {
+      console.error(`pipeline logs: failed to start tail: ${err.message}`);
+      process.exitCode = 1;
+      resolve();
+    });
+    tail.on("exit", (code) => {
+      if (code !== null && code !== 0) process.exitCode = code;
+      resolve();
+    });
   });
-  tail.on("exit", (code) => {
-    if (code !== null && code !== 0) process.exitCode = code;
-  });
-  // Remain open until the user sends SIGINT/SIGTERM.
-  await new Promise<void>(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -937,7 +942,26 @@ async function runAdvance(
       finalStage = stage;
 
       if (stage === "ready-to-deploy") {
-        const out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
+        // The terminal stage is handled outside the common dispatch block, so emit
+        // its stage_start / stage_complete lifecycle events explicitly — otherwise a
+        // consumer cannot reconstruct the full ordered timeline from events.jsonl (#155).
+        const rtdStage = evidenceStageName(stage);
+        const rtdEnteredAt = evidenceTimestamp();
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: rtdEnteredAt, stage: rtdStage }, runStoreDeps).catch(() => {});
+        }
+        let out: Outcome;
+        try {
+          out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
+        } catch (err) {
+          if (runDir) {
+            await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
+          }
+          throw err;
+        }
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
+        }
         printOutcome(issueNumber, stage, out);
         break;
       }
@@ -1225,11 +1249,11 @@ async function dispatch(
   const model = opts.model;
   switch (stage) {
     case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir });
+      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "review-1":
-      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir, runDir });
+      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "review-2":
-      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir, runDir });
+      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "fix-1":
       return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir });
     case "fix-2":
@@ -1273,7 +1297,7 @@ async function dispatch(
       // Re-entry: if a worktree with commits exists, resume the post-implementation
       // steps (gate → push → PR → review-1) without re-planning or re-implementing.
       // Falls back to "waiting" when no such worktree exists (mid-flight guard).
-      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
+      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     default:
       return { advanced: false, status: "error", reason: `unknown stage ${stage}` };
   }

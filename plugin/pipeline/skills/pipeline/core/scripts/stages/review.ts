@@ -37,7 +37,7 @@ import {
   type PartitionResult,
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
-import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
+import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import type {
   BlockerKind,
   Outcome,
@@ -71,6 +71,9 @@ export interface AdvanceReviewOpts {
   stateDir?: string;
   /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
   runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
+   *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
+  runStoreDeps?: RunStoreDeps;
 }
 
 /**
@@ -289,7 +292,7 @@ export async function advanceReview(
       sha: commitSha,
       verdict: verdict.verdict,
       finding_counts: findingCounts,
-    }).catch(() => {});
+    }, opts.runStoreDeps).catch(() => {});
   }
 
   if (verdict.verdict === "approve") {
