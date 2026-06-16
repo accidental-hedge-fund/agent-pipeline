@@ -22,17 +22,30 @@ import type { EvidenceBundle } from "../scripts/types.ts";
 const REPO_DIR = "/tmp/test-repo";
 const STATE_DIR = "/tmp/test-state";
 const ISSUE = 155;
-const STARTED_AT = "2026-06-16T21-11-35Z"; // filesystem-safe (hyphens)
-const STARTED_AT_ISO = "2026-06-16T21:11:35Z"; // ISO for Date parsing
+const STARTED_AT = "2026-06-16T21-11-35-000Z"; // filesystem-safe (hyphens + ms)
+const STARTED_AT_ISO = "2026-06-16T21:11:35.000Z"; // ISO for Date parsing
 
 // ---------------------------------------------------------------------------
 // runIdFor / runsDir / runDirPath
 // ---------------------------------------------------------------------------
 
-test("runIdFor: produces <issue>-<YYYY-MM-DDTHH-MM-SSZ>", () => {
+test("runIdFor: produces <issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ> with milliseconds", () => {
   const d = new Date("2026-06-16T21:11:35.000Z");
   const id = runIdFor(ISSUE, d);
-  assert.equal(id, "155-2026-06-16T21-11-35Z");
+  assert.equal(id, "155-2026-06-16T21-11-35-000Z");
+});
+
+// Regression: two dispatches starting in the same second must produce different run directories.
+// Prior to the ms-precision fix, runIdFor dropped milliseconds and both runs would share
+// the same directory, causing mixed events and summary overwrites.
+test("runIdFor: two dates in the same second with different ms produce distinct run-ids", () => {
+  const d1 = new Date("2026-06-16T21:11:35.000Z");
+  const d2 = new Date("2026-06-16T21:11:35.123Z");
+  const id1 = runIdFor(ISSUE, d1);
+  const id2 = runIdFor(ISSUE, d2);
+  assert.notEqual(id1, id2, "same-second dispatches must get separate run directories");
+  assert.equal(id1, "155-2026-06-16T21-11-35-000Z");
+  assert.equal(id2, "155-2026-06-16T21-11-35-123Z");
 });
 
 test("runsDir: resolves to <repoDir>/.agent-pipeline/runs", () => {
@@ -249,6 +262,30 @@ test("appendEvent: does NOT write to stdout when stdoutWrite is unset", async ()
   const event: RunEvent = { schema_version: 1, type: "run_start", at: STARTED_AT_ISO, run_id: "x", issue: 1, repo: "r" };
   await appendEvent(RUN_DIR, event, deps);
   assert.equal(captured.length, 0);
+});
+
+// Regression: worktree_removed must appear in both events.jsonl and stdout in --json-events mode.
+// Prior to fixing deploy_ready.finalize, it used defaultRunStoreDeps (no stdoutWrite), so the
+// event was written to disk but never streamed to stdout, violating the --json-events contract.
+test("appendEvent: worktree_removed event appears in both events.jsonl and stdout when stdoutWrite is set", async () => {
+  const { deps, stdoutLines, readFile } = memRunStore();
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "worktree_removed",
+    at: STARTED_AT_ISO,
+    _localPath: "/tmp/wt/155",
+  };
+  await appendEvent(RUN_DIR, event, deps);
+
+  // Must be written to events.jsonl
+  const fileContent = readFile(EVENTS_JSONL).trim();
+  const parsed = JSON.parse(fileContent);
+  assert.equal(parsed.type, "worktree_removed");
+  assert.equal(parsed._localPath, "/tmp/wt/155");
+
+  // Must also appear on stdout (--json-events mode)
+  assert.equal(stdoutLines.length, 1, "worktree_removed must be streamed to stdout");
+  assert.deepEqual(JSON.parse(stdoutLines[0]), parsed, "stdout line must be identical to file line");
 });
 
 // ---------------------------------------------------------------------------

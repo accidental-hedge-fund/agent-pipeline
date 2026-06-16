@@ -20,9 +20,11 @@ export const RUN_SCHEMA_VERSION = 1;
 export type RunId = string;
 
 /** Produce the run-id from issue number and dispatch start time.
- *  Format: `<issue>-<YYYY-MM-DDTHH-MM-SSZ>` (filesystem-safe; colons replaced with hyphens). */
+ *  Format: `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>` (filesystem-safe; colons and the
+ *  decimal point replaced with hyphens). Milliseconds are preserved so that two
+ *  dispatches starting in the same second produce distinct directories. */
 export function runIdFor(issue: number, startedAt: Date): RunId {
-  const iso = startedAt.toISOString().replace(/\.\d+Z$/, "Z").replace(/:/g, "-");
+  const iso = startedAt.toISOString().replace(/:/g, "-").replace(/\.(\d+)Z$/, "-$1Z");
   return `${issue}-${iso}`;
 }
 

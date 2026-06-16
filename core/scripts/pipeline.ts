@@ -937,7 +937,7 @@ async function runAdvance(
       finalStage = stage;
 
       if (stage === "ready-to-deploy") {
-        const out = await deployReady.finalize(cfg, issueNumber, runDir);
+        const out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
         printOutcome(issueNumber, stage, out);
         break;
       }
@@ -1035,7 +1035,7 @@ async function runAdvance(
       }
       let out: Outcome;
       try {
-        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir, runDir);
+        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir, runDir, runStoreDeps);
       } catch (err) {
         // Stage threw — record an error outcome before rethrowing so the bundle
         // never shows a perpetually in-progress stage.
@@ -1219,6 +1219,7 @@ async function dispatch(
   pipelineRunId: string,
   stateDir?: string,
   runDir?: string,
+  runStoreDeps?: RunStoreDeps,
 ): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
@@ -1246,7 +1247,7 @@ async function dispatch(
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":
-      return deployReady.finalize(cfg, issueNumber, runDir);
+      return deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
     case "needs-human":
       // Terminal off-ramp; the loop breaks before reaching dispatch, but keep the
       // switch exhaustive so it never falls through to the unknown-stage error.

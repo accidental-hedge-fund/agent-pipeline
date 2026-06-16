@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Pipeline creates a stable, crash-safe run directory before the first stage
-The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/<run-id>/` before any stage handler is called for a dispatch cycle. The `<run-id>` SHALL be a deterministic, filesystem-safe string formed from the issue number and the UTC dispatch start timestamp (e.g. `<issue>-<YYYY-MM-DDTHH-MM-SSZ>`). The run-id SHALL remain constant across all stages within a single dispatch cycle.
+The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/<run-id>/` before any stage handler is called for a dispatch cycle. The `<run-id>` SHALL be a deterministic, filesystem-safe string formed from the issue number and the UTC dispatch start timestamp including milliseconds (e.g. `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>`). Millisecond precision is required so that two dispatches for the same issue starting in the same second produce distinct run directories. The run-id SHALL remain constant across all stages within a single dispatch cycle.
 
 #### Scenario: run directory created before first stage
 - **WHEN** the pipeline orchestrator begins dispatching for issue N
