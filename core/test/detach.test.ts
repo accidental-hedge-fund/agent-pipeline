@@ -19,6 +19,9 @@ import {
   issueRunsDir,
   lockFilePath,
   makeRunDir,
+  parseProcTable,
+  descendantProcessGroups,
+  killProcessTree,
   type SpawnDetachedDeps,
   type SentinelData,
 } from "../scripts/detach.ts";
@@ -429,6 +432,49 @@ test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetach
   assert.ok(capturedArgs.includes("main"), "missing base value");
 });
 
+// Review-2 finding (#153): detached launch must not drop no-write / lifecycle
+// flags. `pipeline run <N> --detach --dry-run` previously started a REAL advance
+// (mutating GitHub/worktree) because --dry-run/--once/--doctor/--fail-fast were
+// omitted from the forwarded args.
+test("handleRunSubcommand: detach forwards --dry-run so a detached dry-run stays read-only", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  await handleRunSubcommand("99", { detach: true, dryRun: true }, deps);
+  assert.ok(capturedArgs.includes("--dry-run"), `--dry-run must reach the inner process; got ${JSON.stringify(capturedArgs)}`);
+});
+
+test("handleRunSubcommand: detach forwards --once / --doctor / --fail-fast lifecycle flags", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  await handleRunSubcommand("99", { detach: true, once: true, doctor: true, failFast: true }, deps);
+  assert.ok(capturedArgs.includes("--once"), "missing --once");
+  assert.ok(capturedArgs.includes("--doctor"), "missing --doctor");
+  assert.ok(capturedArgs.includes("--fail-fast"), "missing --fail-fast");
+});
+
+test("handleRunSubcommand: detach omits no-write flags when the caller did not set them", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  await handleRunSubcommand("99", { detach: true, profile: "codex" }, deps);
+  assert.ok(!capturedArgs.includes("--dry-run"), "must not inject --dry-run when not requested");
+  assert.ok(!capturedArgs.includes("--once"), "must not inject --once when not requested");
+});
+
 // ---------------------------------------------------------------------------
 // 7. CLI parser: 'pipeline run 153 --detach' is accepted (Finding: too-many-args)
 // ---------------------------------------------------------------------------
@@ -488,4 +534,55 @@ test("spawnDetached: throws when run dir already has sentinel.json (collision gu
   } finally {
     cleanup(home);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 9. Timeout watchdog kills the full process TREE, not just the wrapper group
+//    (Review-2 finding #153): pipeline steps spawn detached child groups
+//    (worktree-setup.ts, harness.ts), which a bare kill(-wrapperPid) leaves
+//    running after the timeout sentinel. The watchdog must cover those groups.
+// ---------------------------------------------------------------------------
+
+test("parseProcTable: parses `ps` pid/ppid/pgid rows, ignoring junk", () => {
+  const out = "  100   1   100\n 200 100 200\nheader junk\n 201 200 200\n";
+  const rows = parseProcTable(out);
+  assert.deepEqual(rows, [
+    { pid: 100, ppid: 1, pgid: 100 },
+    { pid: 200, ppid: 100, pgid: 200 },
+    { pid: 201, ppid: 200, pgid: 200 },
+  ]);
+});
+
+test("descendantProcessGroups: includes detached child groups, not just the root group", () => {
+  // wrapper(pid100,pgid100) → inner(pid200,pgid100) → detached harness(pid300,pgid300)
+  //                                                  → detached setup (pid400,pgid400)
+  // An unrelated process (pid500,pgid500) must NOT be included.
+  const table = [
+    { pid: 100, ppid: 1, pgid: 100 },
+    { pid: 200, ppid: 100, pgid: 100 },
+    { pid: 300, ppid: 200, pgid: 300 },
+    { pid: 400, ppid: 200, pgid: 400 },
+    { pid: 500, ppid: 1, pgid: 500 },
+  ];
+  const groups = descendantProcessGroups(table, 100).sort((a, b) => a - b);
+  assert.deepEqual(groups, [100, 300, 400], "must cover wrapper + both detached child groups, exclude unrelated");
+});
+
+test("killProcessTree: signals every descendant group, ending with the wrapper's own group", () => {
+  const table =
+    " 100 1 100\n 200 100 100\n 300 200 300\n 400 200 400\n";
+  const killed: number[] = [];
+  const order = killProcessTree(100, "SIGKILL", {
+    snapshot: () => table,
+    killGroup: (pgid) => killed.push(pgid),
+  });
+  assert.deepEqual([...killed].sort((a, b) => a - b), [100, 300, 400]);
+  // The wrapper's own group (100) must be signalled LAST (killing it ends self).
+  assert.equal(order[order.length - 1], 100, "wrapper group must be killed last");
+});
+
+test("killProcessTree: falls back to the root group when the ps snapshot is empty", () => {
+  const killed: number[] = [];
+  killProcessTree(777, "SIGKILL", { snapshot: () => "", killGroup: (pgid) => killed.push(pgid) });
+  assert.deepEqual(killed, [777], "empty snapshot must still terminate the wrapper group");
 });

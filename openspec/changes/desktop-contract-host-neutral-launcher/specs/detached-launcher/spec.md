@@ -15,6 +15,11 @@ The CLI SHALL support a `--detach` flag on `pipeline run <issue>` that spawns th
 - **WHEN** `pipeline run <issue>` is invoked without `--detach`
 - **THEN** the run lifecycle SHALL be unchanged from the current behavior
 
+#### Scenario: Detached run preserves no-write and lifecycle flags
+- **WHEN** `pipeline run <issue> --detach` is invoked together with a no-write or lifecycle flag (`--dry-run`, `--once`, `--doctor`, or `--fail-fast`)
+- **THEN** the detached pipeline process SHALL receive that flag
+- **AND** `--detach --dry-run` SHALL NOT create labels, comments, worktrees, commits, or PRs
+
 ### Requirement: Completion sentinel written atomically on every exit path
 The detached run process SHALL write a `sentinel.json` file to its run directory via an atomic rename on every exit path — normal completion, unhandled exception, SIGTERM from a watchdog, and watchdog-initiated SIGKILL — so that a poller can distinguish running / done / crashed without parsing prose output.
 
@@ -52,13 +57,18 @@ The detached launcher SHALL acquire an advisory flock on a per-issue lock file b
 - **THEN** a subsequent `pipeline run <N> --detach` invocation SHALL be able to acquire the lock and start a new run
 
 ### Requirement: Timeout watchdog terminates hung runs
-When invoked with `--timeout <seconds>`, the detached process SHALL start a watchdog timer. If the run has not completed before the timer expires, the watchdog SHALL terminate the run process group with SIGKILL and write a sentinel with a non-zero exit code and `"timedOut": true`.
+When invoked with `--timeout <seconds>`, the detached process SHALL start a watchdog timer. If the run has not completed before the timer expires, the watchdog SHALL terminate the run's full process tree — every process group created by the run, including descendants that placed themselves in their own process group — with SIGKILL, and write a sentinel with a non-zero exit code and `"timedOut": true`.
 
 #### Scenario: Watchdog fires on timeout
 - **WHEN** `pipeline run <issue> --detach --timeout 300` is invoked
 - **AND** the run has not completed after 300 seconds
 - **THEN** the run SHALL be terminated
 - **AND** `sentinel.json` SHALL contain `{ "exitCode": -1, "timedOut": true, "durationMs": <number>, "completedAt": <ISO-8601> }`
+
+#### Scenario: Watchdog terminates detached descendant process groups
+- **WHEN** the watchdog fires while a run step has spawned shell/setup/harness work in its own process group
+- **THEN** the watchdog SHALL terminate those descendant process groups, not only the wrapper's own group
+- **AND** no descendant process belonging to the run SHALL remain alive after the timeout sentinel is written
 
 #### Scenario: No watchdog without --timeout
 - **WHEN** `pipeline run <issue> --detach` is invoked without `--timeout`

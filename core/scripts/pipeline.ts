@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
-import { discoverHosts } from "./discovery.ts";
+import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
   addLabel,
   clearBlocked,
@@ -641,6 +641,15 @@ export async function handleRunSubcommand(
     if (opts.base) passArgs.push("--base", opts.base);
     if (opts.domain) passArgs.push("--domain", opts.domain);
     if (opts.model) passArgs.push("--model", opts.model);
+    // Forward lifecycle / no-write semantics too. Omitting these silently broke
+    // the contract for the highest-risk mode: `pipeline run <N> --detach --dry-run`
+    // would otherwise start a REAL background advance that mutates GitHub/worktree
+    // after the launcher exits. These boolean flags must reach the inner process
+    // (or be rejected) so detached runs preserve dry-run/once/doctor semantics (#153).
+    if (opts.dryRun) passArgs.push("--dry-run");
+    if (opts.once) passArgs.push("--once");
+    if (opts.doctor) passArgs.push("--doctor");
+    if (opts.failFast) passArgs.push("--fail-fast");
 
     let result: Awaited<ReturnType<typeof spawnDetached>>;
     try {
@@ -702,17 +711,7 @@ export async function handlePathSubcommand(
     return;
   }
 
-  if (opts.json) {
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
-
-  // Human-readable output.
-  console.log(`core path: ${result.corePath ?? "(not found)"}`);
-  console.log(`version:   ${result.version ?? "(unknown)"}`);
-  console.log(`coverage:  ${result.hostCoverage}`);
-  console.log(`  claude:  ${result.hosts.claude.available ? `yes (${result.hosts.claude.cliBin})` : "no"}`);
-  console.log(`  codex:   ${result.hosts.codex.available ? `yes (${result.hosts.codex.cliBin})` : "no"}`);
+  console.log(formatDiscovery(result, !!opts.json));
 }
 
 // ---------------------------------------------------------------------------

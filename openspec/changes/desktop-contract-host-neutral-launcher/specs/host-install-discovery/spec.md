@@ -26,6 +26,11 @@ The CLI SHALL expose a `pipeline path` subcommand that probes known install loca
 - **WHEN** the install-location probe itself fails (e.g., `npm root -g` is unavailable)
 - **THEN** the command SHALL exit with a non-zero exit code and print a diagnostic to stderr
 
+#### Scenario: Discovery works without provisioned runtime dependencies
+- **WHEN** `pipeline path --json` is invoked but the package's runtime dependencies (`core/node_modules`) are absent because best-effort install-time provisioning could not complete (e.g. offline, transient registry failure, or a read-only global package directory)
+- **THEN** the command SHALL still print valid discovery JSON and exit 0 (it SHALL NOT require provisioned dependencies and SHALL NOT attempt to write into the package directory)
+- **AND** a command that requires the engine (e.g. `pipeline run`) MAY instead exit non-zero with a re-install hint
+
 ### Requirement: JSON output schema for pipeline path --json
 The `--json` output SHALL conform to a stable schema so that callers need not parse prose. The schema SHALL include `corePath` (string | null), `version` (string | null), `hostCoverage` (one of `"missing"` | `"claude-only"` | `"codex-only"` | `"both"`), and `hosts` (an object with `claude` and `codex` keys, each containing `available` (boolean) and `cliBin` (string | null)).
 

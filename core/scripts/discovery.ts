@@ -181,3 +181,19 @@ export async function discoverHosts(
     },
   };
 }
+
+/** Render a {@link DiscoveryResult} for the `pipeline path` subcommand. Pure and
+ *  dependency-free so it can be shared by the full CLI (`handlePathSubcommand`)
+ *  and the minimal dep-free discovery entry (`path-cli.ts`) the launcher runs
+ *  when `core/node_modules` is absent — keeping a single source for the output
+ *  shape so the two paths cannot drift (#153). */
+export function formatDiscovery(result: DiscoveryResult, asJson: boolean): string {
+  if (asJson) return JSON.stringify(result, null, 2);
+  return [
+    `core path: ${result.corePath ?? "(not found)"}`,
+    `version:   ${result.version ?? "(unknown)"}`,
+    `coverage:  ${result.hostCoverage}`,
+    `  claude:  ${result.hosts.claude.available ? `yes (${result.hosts.claude.cliBin})` : "no"}`,
+    `  codex:   ${result.hosts.codex.available ? `yes (${result.hosts.codex.cliBin})` : "no"}`,
+  ].join("\n");
+}

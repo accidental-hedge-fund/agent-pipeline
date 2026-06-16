@@ -69,33 +69,51 @@ check("path --json exits 0 and emits valid JSON", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. launcher exits non-zero with a diagnostic when core/node_modules is absent
+// 3. core/node_modules absent (e.g. best-effort postinstall failed):
+//    `pipeline path --json` MUST still return machine-readable discovery JSON
+//    (dep-free entry), while commands that need the engine (`run`) error with a
+//    re-install hint. Regression for the "successful-but-unusable install" finding.
 // ---------------------------------------------------------------------------
 {
   const tmp = mkdtempSync(join(tmpdir(), "pipeline-launcher-no-deps-"));
   try {
     mkdirSync(join(tmp, "scripts"), { recursive: true });
     copyFileSync(LAUNCHER, join(tmp, "scripts", "pipeline-launcher.mjs"));
-    // symlink core WITHOUT node_modules so the check fires
     mkdirSync(join(tmp, "core", "scripts"), { recursive: true });
-    // write a minimal core/package.json so the entry-file check doesn't fire first
     const { writeFileSync } = await import("node:fs");
     writeFileSync(
       join(tmp, "core", "package.json"),
       JSON.stringify({ name: "agent-pipeline-core", version: "0.0.0" }),
     );
-    // create a stub pipeline.ts so the core-not-found check passes
+    // stub the full entry (it needs commander, which is absent), but copy the REAL
+    // dependency-free discovery modules so `path` resolves without node_modules.
     writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "// stub\n");
+    copyFileSync(join(REPO_ROOT, "core", "scripts", "discovery.ts"), join(tmp, "core", "scripts", "discovery.ts"));
+    copyFileSync(join(REPO_ROOT, "core", "scripts", "path-cli.ts"), join(tmp, "core", "scripts", "path-cli.ts"));
     // deliberately do NOT create core/node_modules
 
-    check("missing core/node_modules → exits non-zero with diagnostic", () => {
+    check("no node_modules: path --json still exits 0 with valid discovery JSON", () => {
       const r = spawnSync(NODE, [join(tmp, "scripts", "pipeline-launcher.mjs"), "path", "--json"], {
         stdio: "pipe",
       });
-      if (r.status === 0) throw new Error("expected non-zero exit when node_modules absent");
-      const stderr = r.stderr.toString();
-      if (!stderr.includes("npm install -g agent-pipeline")) {
-        throw new Error(`expected re-install hint in stderr; got: ${stderr.slice(0, 300)}`);
+      if (r.status !== 0) {
+        throw new Error(
+          `expected exit 0 for path --json without deps; got ${r.status}\nstderr: ${r.stderr.toString().slice(0, 300)}`,
+        );
+      }
+      const json = JSON.parse(r.stdout.toString());
+      if (!["missing", "claude-only", "codex-only", "both"].includes(json.hostCoverage)) {
+        throw new Error(`unexpected hostCoverage: ${json.hostCoverage}`);
+      }
+    });
+
+    check("no node_modules: a run command still errors with a re-install hint", () => {
+      const r = spawnSync(NODE, [join(tmp, "scripts", "pipeline-launcher.mjs"), "run", "1", "--detach"], {
+        stdio: "pipe",
+      });
+      if (r.status === 0) throw new Error("expected non-zero exit for `run` when node_modules absent");
+      if (!r.stderr.toString().includes("npm install -g agent-pipeline")) {
+        throw new Error(`expected re-install hint in stderr; got: ${r.stderr.toString().slice(0, 300)}`);
       }
     });
   } finally {

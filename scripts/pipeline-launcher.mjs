@@ -52,14 +52,31 @@ if (!existsSync(entry)) {
   process.exit(1);
 }
 
-// Dependencies are installed by the package's postinstall script at install
-// time. If node_modules is absent the package was installed in an unusual way;
-// direct the user to re-install rather than attempting a write that may fail
-// due to file-system permissions on a globally-installed (e.g. root-owned) package.
+// Dependencies are provisioned by the package's best-effort postinstall script
+// at install time. They may be absent if that provisioning could not complete
+// (transient registry/cache failure, offline, or a read-only global package
+// dir). We must NOT attempt a write here — the installed package directory may
+// be root-owned/read-only — so command-time provisioning is never attempted.
 if (!existsSync(join(coreDir, "node_modules"))) {
+  // `pipeline path` only needs Node built-ins (discovery.ts has no third-party
+  // imports), so the desktop discovery contract stays read-only-safe even when
+  // provisioning failed: route it through the dependency-free discovery entry
+  // rather than failing with a reinstall hint.
+  if (rawArgs[0] === "path") {
+    const pathCli = join(coreDir, "scripts", "path-cli.ts");
+    const run = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", pathCli, ...rawArgs.slice(1)],
+      { stdio: "inherit" },
+    );
+    process.exit(run.status ?? 1);
+  }
+  // Commands that need the full engine (e.g. `run`) genuinely require the
+  // dependencies; direct the user to re-install rather than writing here.
   console.error(
     `pipeline: runtime dependencies not found at ${join(coreDir, "node_modules")}.\n` +
-      "         Re-install the package so the postinstall script can provision them:\n" +
+      "         `pipeline --version` and `pipeline path` still work; for runs, re-install\n" +
+      "         the package so the postinstall script can provision them:\n" +
       "           npm install -g agent-pipeline",
   );
   process.exit(1);

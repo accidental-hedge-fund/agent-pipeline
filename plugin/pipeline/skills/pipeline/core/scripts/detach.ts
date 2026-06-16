@@ -10,8 +10,108 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+// ---------------------------------------------------------------------------
+// Process-tree termination (#153)
+//
+// The watchdog originally killed only the wrapper's own process group
+// (`process.kill(-process.pid, ...)`). But pipeline steps intentionally spawn
+// shell-backed setup/test/harness work in their OWN process groups
+// (`detached: true` in worktree-setup.ts / harness.ts), so those descendants
+// survive a wrapper-group kill — they keep mutating the worktree after the run
+// is classified `timedOut`. To honor the sentinel contract, the watchdog must
+// terminate the full process tree: every process group covering the wrapper and
+// all of its descendants. The parsing and group-collection are pure so they can
+// be unit-tested with a synthetic process table.
+// ---------------------------------------------------------------------------
+
+/** One row of a `ps` snapshot used for tree termination. */
+export type ProcInfo = { pid: number; ppid: number; pgid: number };
+
+/** Parse `ps -A -o pid=,ppid=,pgid=` output into rows. Tolerant of leading
+ *  whitespace and blank lines; ignores malformed rows. Pure. */
+export function parseProcTable(stdout: string): ProcInfo[] {
+  const rows: ProcInfo[] = [];
+  for (const line of stdout.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(-?\d+)$/);
+    if (!m) continue;
+    rows.push({ pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]) });
+  }
+  return rows;
+}
+
+/** Given a process table and a root pid, return the distinct process-group ids
+ *  covering the root process and ALL of its descendants. Detached children that
+ *  created their own group are therefore included. Pure. */
+export function descendantProcessGroups(table: ProcInfo[], rootPid: number): number[] {
+  const byParent = new Map<number, ProcInfo[]>();
+  for (const p of table) {
+    const list = byParent.get(p.ppid) ?? [];
+    list.push(p);
+    byParent.set(p.ppid, list);
+  }
+  const pgids = new Set<number>();
+  const self = table.find((p) => p.pid === rootPid);
+  if (self) pgids.add(self.pgid);
+  // BFS over descendants.
+  const queue = [rootPid];
+  const seen = new Set<number>([rootPid]);
+  while (queue.length > 0) {
+    const pid = queue.shift()!;
+    for (const child of byParent.get(pid) ?? []) {
+      if (seen.has(child.pid)) continue;
+      seen.add(child.pid);
+      pgids.add(child.pgid);
+      queue.push(child.pid);
+    }
+  }
+  return [...pgids];
+}
+
+/** IO seam for {@link killProcessTree} — tests inject a fake snapshot/killer. */
+export type KillTreeDeps = {
+  snapshot: () => string;
+  killGroup: (pgid: number, signal: NodeJS.Signals) => void;
+};
+
+const defaultKillTreeDeps: KillTreeDeps = {
+  snapshot: () => {
+    try {
+      const r = spawnSync("ps", ["-A", "-o", "pid=,ppid=,pgid="], { encoding: "utf8" });
+      return r.stdout ?? "";
+    } catch {
+      return "";
+    }
+  },
+  killGroup: (pgid, signal) => {
+    try {
+      process.kill(-pgid, signal);
+    } catch {
+      /* group already gone */
+    }
+  },
+};
+
+/** Kill the full process tree rooted at `rootPid` with `signal`, including
+ *  descendants that placed themselves in their own process groups. Best-effort:
+ *  always falls back to killing the root's own group so a snapshot failure still
+ *  terminates the wrapper group. Returns the group ids it attempted to kill. */
+export function killProcessTree(
+  rootPid: number,
+  signal: NodeJS.Signals,
+  deps: KillTreeDeps = defaultKillTreeDeps,
+): number[] {
+  const table = parseProcTable(deps.snapshot());
+  const groups = descendantProcessGroups(table, rootPid);
+  if (groups.length === 0) groups.push(rootPid); // fallback: at least our own group
+  // Kill descendant groups first, the wrapper's own group last (killing our own
+  // group with SIGKILL terminates this process immediately).
+  const ordered = [...groups.filter((g) => g !== rootPid), ...groups.filter((g) => g === rootPid)];
+  for (const pgid of ordered) deps.killGroup(pgid, signal);
+  return ordered;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -347,10 +447,10 @@ export async function runWrapper(argv: string[]): Promise<void> {
       // Write sentinel BEFORE sending SIGKILL (SIGKILL cannot be caught).
       doWriteSentinel(-1, true);
       removeStaleLock(lp);
-      try {
-        // Kill the entire process group (wrapper + inner pipeline).
-        process.kill(-process.pid, "SIGKILL");
-      } catch {}
+      // Kill the entire process TREE, not just the wrapper's own group: pipeline
+      // steps spawn shell/setup/harness work in their own process groups, which a
+      // bare `kill(-process.pid)` would leave running after the timeout sentinel.
+      killProcessTree(process.pid, "SIGKILL");
       process.exit(-1);
     }, timeout * 1000);
     // Don't keep the event loop alive solely for the watchdog.
