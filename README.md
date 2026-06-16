@@ -20,6 +20,8 @@ backlog → ready → planning → plan-review → implementing
 - [Per-repo config](#per-repo-config-optional)
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Troubleshooting](#troubleshooting)
+  - [Evidence bundle](#evidence-bundle)
+  - [Machine-readable artifact conventions](#machine-readable-artifact-conventions)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
   - [Human plan feedback](#human-plan-feedback)
@@ -189,6 +191,7 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 ```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
 /pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
+/pipeline N --status --json                   machine-readable JSON status envelope (stable contract)
 /pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 $pipeline N --unblock "<answer>"              (same for Codex)
@@ -197,6 +200,8 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
 /pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
+/pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
+/pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
 /pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
@@ -323,6 +328,13 @@ The checks (each emits one sentence of remediation text on failure):
 **Run-start gating (opt-in).** Set `doctor.runOnStart: true` in `.github/pipeline.yml`, or pass `--doctor` on a normal run, to run the preflight **before planning**. A failing preflight prints the summary and aborts with a non-zero exit **before any planning, implementation, or review tokens are spent**. With neither set, a run is completely unaffected — no checks execute. `--fail-fast` (or `doctor.failFast: true`) stops at the first failing check instead of collecting all failures.
 
 The latest result is stored under `/tmp/pipeline-<domain>-doctor-result.json`; `/pipeline N --status` appends that preflight summary (with its timestamp) when one is present, and omits the section otherwise.
+
+**Machine-readable output (#154).** Two flags expose the doctor result as a stable JSON contract for tooling (e.g. Pipeline Desk):
+
+- `pipeline doctor --json` — emits a single unfenced JSON object with `schema_version`, `status` (`"ok"` or `"error"`), and a `checks` array where each entry is `{name, ok, reason, fix}`. Exit code mirrors the prose path (0 = all pass, 1 = any fail). Human output is suppressed.
+- `pipeline doctor --is-ok` — runs all checks, emits **zero bytes of output**, and exits 0 (all pass) or 1 (any fail). Use for cheap polling. Mutually exclusive with `--json`.
+
+Similarly, `pipeline N --status --json` emits a single unfenced JSON object describing the issue's pipeline state (`schema_version`, `status`, `issue`, `stage`, `pr`, `branch`, `worktree`, `last_event`, `review_summary`, `next_action`, `config`). The human `--status` output is unchanged when `--json` is absent.
 
 ## Worktree dependency install (`setup_command`)
 
@@ -518,6 +530,24 @@ Print a human-readable summary of a run at any time — this reads the local fil
 $pipeline N --summary
 ```
 
+### Machine-readable artifact conventions
+
+Every machine-readable artifact written by the pipeline engine follows these cross-cutting conventions (#161):
+
+**`schema_version` integer.** Every JSON object or JSONL record carries a top-level `schema_version` integer field (currently `1`). Backward-compat promise: field names and types are stable across minor versions; key order is not load-bearing; new optional fields may be added without bumping; removed or renamed fields are major-version bumps. Consumers that ignore unknown fields are forward-compatible. Absent `schema_version` should be treated as `0` (pre-convention).
+
+> **Transitional note (evidence bundle):** The evidence bundle carries both `schema_version` (integer, new) and `schemaVersion` (camelCase, legacy) at the same value during the transitional period. Both are equivalent; new consumers should read `schema_version`.
+
+**Non-fatal I/O.** Every artifact write is wrapped in a non-fatal try/catch. If writing fails (disk full, permissions, etc.) a warning is logged and the error does not propagate — a broken telemetry sink never blocks a stage. The pipeline stage that triggered the write continues and completes normally.
+
+**Write-time injection denylist.** Before persisting any artifact record, the serialized JSON content is passed through a denylist of prompt-injection patterns (e.g. `ignore previous instructions`, `you are now`, `system:`, `disregard`). Matching spans are replaced with `[REDACTED-INJECTION]`. The record is written with the substitution in place; it is never silently dropped. This prevents a replayed artifact line from injecting instructions into a later agent's context.
+
+**Value redaction.** Sensitive values — GitHub tokens, API keys, and env vars whose name matches a secret pattern — are replaced with `[REDACTED]` before any record is written (see `makeCommandRecord` in `evidence-bundle.ts`).
+
+**`_`-prefix local-only fields.** Fields that must not be surfaced to any remote or sync target (e.g. absolute workspace paths, machine-local identifiers) use a leading-underscore name (e.g. `_localPath`). No such fields exist in the current schema (no absolute path fields are stored in machine-readable records), but any future addition of local-only fields must use this convention. The README documents any current `_`-prefixed fields here when they are added.
+
+**Filesystem-only data sharing.** Artifacts share data exclusively through the filesystem. No event bus, IPC daemon, or in-process event emitter is used as a cross-artifact communication channel.
+
 ---
 
 ## Advanced topics
@@ -652,6 +682,136 @@ The contract is deliberately **one-directional — the pipeline only ever reads 
 | conventions file | `CLAUDE.md` | `AGENTS.md` |
 
 Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one shared implementation. Inverting behavior is a JSON edit, not a code change.
+
+## Desktop Integration
+
+Pipeline Desk (or any desktop app) can launch and supervise `agent-pipeline` runs as subprocesses using two stable, host-neutral entry points.
+
+The `pipeline` command is provided by the `agent-pipeline` npm package. Install it globally to make the command available system-wide:
+
+```bash
+npm install -g agent-pipeline
+pipeline --version   # verify the install
+```
+
+If you prefer not to install globally, you can also invoke it via `npx` with an explicit bin selection:
+
+```bash
+npx --package agent-pipeline pipeline path --json
+```
+
+> **Note:** `npx agent-pipeline` invokes the installer (`scripts/install.mjs`), not the pipeline CLI. Always use `npx --package agent-pipeline pipeline <subcommand>` to reach the `pipeline` bin directly.
+
+### Discover installed hosts — `pipeline path --json`
+
+Before launching a run, probe which hosts are installed:
+
+```bash
+pipeline path --json
+```
+
+Output (always exits 0; check `hostCoverage` to decide what to do):
+
+```jsonc
+// both hosts installed
+{
+  "corePath": "/Users/alice/.claude/skills/pipeline/core",
+  "version": "1.4.0",
+  "hostCoverage": "both",          // "missing" | "claude-only" | "codex-only" | "both"
+  "hosts": {
+    "claude": { "available": true,  "cliBin": "/usr/local/bin/claude" },
+    "codex":  { "available": true,  "cliBin": "/usr/local/bin/codex"  }
+  }
+}
+
+// no install
+{
+  "corePath": null, "version": null, "hostCoverage": "missing",
+  "hosts": {
+    "claude": { "available": false, "cliBin": null },
+    "codex":  { "available": false, "cliBin": null }
+  }
+}
+```
+
+| `hostCoverage` | Meaning |
+|---|---|
+| `"missing"` | `pipeline` core not found at any probe location — prompt user to install |
+| `"claude-only"` | Core found; only the `claude` CLI is reachable |
+| `"codex-only"` | Core found; only the `codex` CLI is reachable |
+| `"both"` | Core found; both CLIs are reachable |
+
+Exit code 0 for all resolved states (including `missing`); non-zero only on a probe error (e.g., `npm` not on PATH).
+
+### Launch a detached run — `pipeline run <N> --detach`
+
+Launches the pipeline as a detached background process that **survives the launcher's exit** (SIGTERM-proof via process-group escape):
+
+```bash
+pipeline run 153 --detach [--timeout <seconds>] [--flock-timeout <ms>]
+```
+
+The command prints the **run directory path** to stdout and exits immediately. The pipeline run continues in the background.
+
+```bash
+RUN_DIR=$(pipeline run 153 --detach --timeout 3600)
+echo "Run dir: $RUN_DIR"
+# /Users/alice/.pipeline/runs/153/2026-06-16_19-49-00
+```
+
+**Options:**
+- `--timeout <seconds>` — watchdog: kills the run after this many seconds and writes a non-zero sentinel. Recommended for production use.
+- `--flock-timeout <ms>` — max ms to wait for the per-issue advisory lock (default: 5000). A second launch for the same issue waits up to this long, then exits non-zero.
+
+### Run directory layout
+
+```
+~/.pipeline/runs/<issue>/<timestamp>/
+  pipeline.log      stdout + stderr of the pipeline run (appended continuously)
+  sentinel.json     written atomically when the run completes (absent while running)
+  ../
+    .lock           advisory lock file (present while a run is active)
+```
+
+### Poll for completion — `sentinel.json`
+
+A poller can classify the run state without parsing prose:
+
+```
+sentinel.json absent  → run is still in progress
+sentinel.json present → run is done (read exitCode to classify)
+```
+
+**`sentinel.json` schema:**
+
+```jsonc
+{
+  "exitCode": 0,                         // 0 = success; non-zero = failed; -1 = watchdog kill
+  "durationMs": 142000,
+  "completedAt": "2026-06-16T20:11:22Z",
+  "timedOut": true                        // only present when --timeout watchdog fired
+}
+```
+
+```javascript
+// Minimal Node.js poller
+const sentinelPath = path.join(runDir, "sentinel.json");
+while (!fs.existsSync(sentinelPath)) await sleep(5000);
+const { exitCode, timedOut } = JSON.parse(fs.readFileSync(sentinelPath, "utf8"));
+// exitCode === 0 → success; timedOut === true → watchdog; else → failure
+```
+
+### Pipeline Desk integration checklist
+
+1. Call `pipeline path --json` on startup; prompt install if `hostCoverage === "missing"`.
+2. Launch: `RUN_DIR=$(pipeline run <N> --detach --timeout 3600)`.
+3. Watch `$RUN_DIR/sentinel.json` for completion (poll or `fs.watch`).
+4. Stream `$RUN_DIR/pipeline.log` to the UI while the run is in progress.
+5. For a concurrent launch attempt on the same issue, `pipeline run` exits non-zero — handle the error (poll until the prior run finishes, then retry).
+
+### Human interfaces are unchanged
+
+`/pipeline` (Claude) and `$pipeline` (Codex) remain the first-class human entry points. The detached launcher is additive — it does not move any state-machine logic to the desktop side.
 
 ## Repository layout
 

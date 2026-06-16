@@ -145,6 +145,11 @@ export interface ResolveOptions {
    *  Used by `pipeline doctor` so the command can run its own cli/auth/repo-access
    *  checks and report proper remediation even when gh is missing or auth is expired. */
   tolerateGhFailure?: boolean;
+  /** When true, suppress non-fatal config-resolution warnings (`console.warn`).
+   *  Used by `pipeline doctor --is-ok`, whose documented contract is a zero-output
+   *  0/1 polling gate — a valid config that merely emits a warning (e.g. an inert
+   *  `models.*` alias) must not write to stderr (#154). */
+  quiet?: boolean;
 }
 
 /**
@@ -180,7 +185,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
           .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
           .join("; ");
         if (opts.tolerateInvalidConfig) {
-          console.warn(`[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${errors}`);
+          if (!opts.quiet) {
+            console.warn(`[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${errors}`);
+          }
           // fileConfig stays as {} — all defaults apply
         } else {
           throw new Error(`Invalid ${configPath}: ${errors}`);
@@ -308,7 +315,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
   };
-  warnInertModelAliases(fileConfig.models, merged.harnesses);
+  if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
 }
 
