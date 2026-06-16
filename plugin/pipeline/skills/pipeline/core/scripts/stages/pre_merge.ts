@@ -83,8 +83,6 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
-  /** Idempotency guard: true when an archive commit for this issue already exists (#181). */
-  archiveAlreadyDone?: typeof archiveAlreadyDone;
 }
 
 export async function advance(
@@ -483,16 +481,11 @@ export async function maybeArchiveOpenspec(
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
-  const archiveAlreadyDoneFn = deps.archiveAlreadyDone ?? archiveAlreadyDone;
   const branchDeveloperCommitsFn =
     deps.branchDeveloperCommits ?? ((wtPath, base) => computeBranchDeveloperCommits(gitFn, wtPath, base));
 
   const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt || !isActiveFn(cfg, wt.path)) return null;
-
-  // Idempotency guard (#181): if the archive commit already exists on the branch,
-  // skip the archive step entirely on all subsequent polling iterations.
-  if (await archiveAlreadyDoneFn(gitFn, wt.path, cfg.base_branch, issueNumber)) return null;
 
   // Changes this PR branch introduced, still active (not yet archived).
   const diff = await gitFn(
@@ -503,7 +496,11 @@ export async function maybeArchiveOpenspec(
   const candidates = openspec
     .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
     .filter((id) => changeDirExistsFn(wt.path, id));
-  if (candidates.length === 0) return null; // already archived, or none
+
+  // Idempotency guard (#181, fix 2): evaluate candidates *before* consulting commit
+  // history so a prior archive commit cannot mask re-introduced active change
+  // directories. If no candidates remain, there is nothing to archive.
+  if (candidates.length === 0) return null;
 
   // ---- Consistency guard (#106): never archive a delta the code outgrew ----
   // OpenSpec deltas are frozen at planning; fix rounds only edit code. If a

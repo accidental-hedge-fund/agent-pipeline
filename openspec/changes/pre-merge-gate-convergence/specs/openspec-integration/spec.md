@@ -2,15 +2,23 @@
 
 ### Requirement: Archive step is idempotent across polling iterations
 
-The pre-merge archive step SHALL detect whether a pipeline-internal archive commit already exists on the PR branch for this issue before invoking `openspec archive`. If such a commit is found, the archive step SHALL be skipped and the gate SHALL proceed to the next check without pushing a new commit or returning `waiting`. The detection SHALL read the branch's commit history (commits between `origin/<base_branch>` and `HEAD`), not the local filesystem state.
+The pre-merge archive step SHALL compute the current active OpenSpec candidates from the branch diff before consulting commit history. If no active change directories remain in the diff, the archive step SHALL be skipped and the gate SHALL proceed to the next check without pushing a new commit or returning `waiting`. If active candidates exist, the gate SHALL invoke `openspec archive` regardless of whether a prior archive commit is found in the branch history.
 
-#### Scenario: archive already committed — step skipped
+#### Scenario: no active candidates — step skipped
 
 - **WHEN** `maybeArchiveOpenspec` is called
-- **AND** the branch commit history contains a commit whose headline starts with `"chore: archive OpenSpec change(s) for #<issueNumber>"`
+- **AND** the branch diff contains no active change directories (either already archived and removed, or none ever existed)
 - **THEN** the gate SHALL skip `openspec archive` entirely
 - **AND** SHALL NOT push a new archive commit
 - **AND** SHALL return `null` (continue to the next pre-merge check)
+
+#### Scenario: prior archive commit exists but active candidates remain — re-archive
+
+- **WHEN** `maybeArchiveOpenspec` is called
+- **AND** the branch diff contains one or more active change directories
+- **AND** a prior archive commit for this issue exists in the branch history (e.g., a revert re-introduced a change)
+- **THEN** the gate SHALL invoke `openspec archive` for each active candidate
+- **AND** SHALL NOT skip based on the prior archive commit alone
 
 #### Scenario: no prior archive commit — archive proceeds normally
 

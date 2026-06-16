@@ -78,19 +78,53 @@ test("archiveAlreadyDone: does not match when this issue number is a prefix of t
 });
 
 // ---------------------------------------------------------------------------
-// 2. maybeArchiveOpenspec skips when archiveAlreadyDone returns true (3.2)
+// 2. maybeArchiveOpenspec skips when no active candidates exist (3.2)
 // ---------------------------------------------------------------------------
 
-test("maybeArchiveOpenspec: returns null without calling archive when archiveAlreadyDone=true", async () => {
+test("maybeArchiveOpenspec: returns null without calling archive when diff is empty (no active candidates)", async () => {
   const archiveCalls: string[] = [];
   const gitCalls: string[][] = [];
 
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
-    archiveAlreadyDone: async () => true,
     gitInWorktree: (async (_p: string, args: string[]) => {
       gitCalls.push(args);
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => false,
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    setBlocked: async () => {},
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    branchDeveloperCommits: async () => [],
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+
+  assert.equal(out, null, "must return null (continue) when no active candidates");
+  assert.deepEqual(archiveCalls, [], "openspecArchive must NOT be called");
+  // git add/commit/push must not be called (only diff is called, not write ops)
+  const nonDiffCalls = gitCalls.filter((a) => a[0] !== "diff");
+  assert.deepEqual(nonDiffCalls, [], "git add/commit/push must NOT be called");
+});
+
+test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists but active candidates remain (#181 fix 2)", async (t) => {
+  // Regression: old code returned null at archiveAlreadyDone check before computing
+  // candidates, masking re-introduced change directories. New code checks candidates
+  // first and only skips when there are no active candidates to archive.
+  const archiveCalls: string[] = [];
+  const CHANGE_ID = "pre-merge-gate-convergence";
+  const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+      if (args[0] === "status") return { stdout: " M openspec/specs/x/spec.md", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
@@ -103,13 +137,11 @@ test("maybeArchiveOpenspec: returns null without calling archive when archiveAlr
     branchDeveloperCommits: async () => [],
   };
 
-  const out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+  await quiet(t, async () => {
+    await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+  });
 
-  assert.equal(out, null, "must return null (continue) when archive already done");
-  assert.deepEqual(archiveCalls, [], "openspecArchive must NOT be called");
-  // git must not be called for add/commit/push (the short-circuit fires before those)
-  const nonLogCalls = gitCalls.filter((a) => a[0] !== "log");
-  assert.deepEqual(nonLogCalls, [], "git add/commit/push must NOT be called");
+  assert.deepEqual(archiveCalls, [CHANGE_ID], "openspecArchive must be called for the active candidate despite prior archive commit");
 });
 
 // ---------------------------------------------------------------------------
