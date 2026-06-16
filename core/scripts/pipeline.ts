@@ -125,6 +125,7 @@ async function main(): Promise<void> {
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json", "output structured JSON (used with 'pipeline config validate')")
+    .allowExcessArguments(true)
     .parse(process.argv);
 
   const opts = cmd.opts<CliOpts>();
@@ -349,7 +350,7 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
 
   if (subcmd === "validate") {
     const repoPath = opts.repoPath ?? process.cwd();
-    const result = validateConfig(repoPath);
+    const result = validateConfig(repoPath, { profile: opts.profile });
 
     if (opts.json) {
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");

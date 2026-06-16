@@ -352,3 +352,128 @@ test("validateConfig: validateConfig independent of resolveConfig — resolveCon
   // would cause resolveConfig to throw.
   assert.doesNotThrow(() => validateConfig("/fake-repo", deps));
 });
+
+// ---------------------------------------------------------------------------
+// 5.10 validateConfig: scalar YAML root (finding 4)
+// ---------------------------------------------------------------------------
+
+test("validateConfig: scalar string YAML is an error, not valid", () => {
+  const deps = makeDeps("just-a-string");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  assert.ok(result.diagnostics.length > 0);
+  assert.equal(result.diagnostics[0]!.severity, "error");
+  assert.equal(result.diagnostics[0]!.path, "");
+  assert.ok(result.diagnostics[0]!.message.includes("string"));
+});
+
+test("validateConfig: boolean YAML root (false) is an error, not valid", () => {
+  const deps = makeDeps("false");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  assert.equal(result.diagnostics[0]!.severity, "error");
+});
+
+test("validateConfig: numeric YAML root (0) is an error, not valid", () => {
+  const deps = makeDeps("0");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  assert.equal(result.diagnostics[0]!.severity, "error");
+});
+
+// ---------------------------------------------------------------------------
+// 5.11 validateConfig: unknown nested key in eval_gate (finding 2)
+// ---------------------------------------------------------------------------
+
+test("validateConfig: misspelled eval_gate.enabled (enabeld) is an error, not silently accepted", () => {
+  const deps = makeDeps("eval_gate:\n  enabeld: true\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path.startsWith("eval_gate"));
+  assert.ok(d, `expected diagnostic for eval_gate unknown key, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: misspelled eval_gate.mode (mdoe) is an error, not silently accepted", () => {
+  const deps = makeDeps("eval_gate:\n  mdoe: advisory\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path.startsWith("eval_gate"));
+  assert.ok(d, `expected diagnostic for eval_gate unknown key, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+// ---------------------------------------------------------------------------
+// 5.12 validateConfig: review_harness override applies to inert-model detection (finding 3)
+// ---------------------------------------------------------------------------
+
+test("validateConfig: review_harness overrides profile reviewer for inert-model check — no warning when review_harness=claude", () => {
+  // Profile says reviewer=codex, but file overrides it to claude → models.review IS honored → no warning
+  const deps = makeDeps(
+    "review_harness: claude\nmodels:\n  review: \"claude-opus-4-8\"\n",
+    { implementer: "codex", reviewer: "codex" },
+  );
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+  const d = result.diagnostics.find((x) => x.path === "models.review");
+  assert.equal(d, undefined, "no inert warning when review_harness overrides reviewer to claude");
+});
+
+test("validateConfig: review_harness overrides profile reviewer — warning when review_harness=codex", () => {
+  // Profile says reviewer=claude, but file overrides it to codex → models.review is inert → warning
+  const deps = makeDeps(
+    "review_harness: codex\nmodels:\n  review: \"claude-opus-4-8\"\n",
+    { implementer: "codex", reviewer: "claude" },
+  );
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true, "warning-only should still be valid");
+  const d = result.diagnostics.find((x) => x.path === "models.review");
+  assert.ok(d, `expected inert warning when review_harness=codex, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "warning");
+});
+
+// ---------------------------------------------------------------------------
+// 5.13 runConfigCommand CLI dispatch (finding 1)
+// ---------------------------------------------------------------------------
+
+import { runConfigCommand, type CliOpts } from "../scripts/pipeline.ts";
+
+test("runConfigCommand: 'schema' subcommand writes valid JSON Schema to stdout", async () => {
+  const chunks: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  // @ts-ignore — narrowing to string for test capture
+  process.stdout.write = (chunk: string | Uint8Array): boolean => { chunks.push(String(chunk)); return true; };
+  const prevExitCode = process.exitCode;
+  try {
+    await runConfigCommand(["schema"], { profile: "codex" } as CliOpts);
+  } finally {
+    process.stdout.write = originalWrite;
+    process.exitCode = prevExitCode;
+  }
+  const output = chunks.join("");
+  const parsed = JSON.parse(output) as Record<string, unknown>;
+  assert.ok(parsed["properties"], "schema output must have a properties key");
+});
+
+test("runConfigCommand: 'validate' subcommand with --json on non-existent repo writes JSON and does not throw", async () => {
+  const chunks: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  // @ts-ignore — narrowing to string for test capture
+  process.stdout.write = (chunk: string | Uint8Array): boolean => { chunks.push(String(chunk)); return true; };
+  const prevExitCode = process.exitCode;
+  let threw = false;
+  try {
+    await runConfigCommand(["validate"], { profile: "codex", json: true, repoPath: "/tmp/no-such-pipeline-repo-xyz" } as CliOpts);
+  } catch {
+    threw = true;
+  } finally {
+    process.stdout.write = originalWrite;
+    process.exitCode = prevExitCode;
+  }
+  assert.equal(threw, false, "runConfigCommand must not throw");
+  const output = chunks.join("");
+  const parsed = JSON.parse(output) as Record<string, unknown>;
+  assert.ok("valid" in parsed, "output must have a 'valid' key");
+  assert.ok("diagnostics" in parsed, "output must have a 'diagnostics' key");
+  assert.equal(parsed["valid"], false); // no git root at /tmp/no-such-pipeline-repo-xyz
+});

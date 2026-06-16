@@ -37,6 +37,7 @@ const PartialConfigSchema = z.object({
       enabled: z.enum(["auto", "on", "off"]).optional().describe("Whether to require OpenSpec: auto=only when openspec/ exists, on=always, off=never."),
       bootstrap: z.boolean().optional().describe("Run 'openspec init' on repos that lack an openspec/ directory."),
     })
+    .strict()
     .optional()
     .describe("OpenSpec spec-driven-development integration settings."),
   last30days: z
@@ -44,6 +45,7 @@ const PartialConfigSchema = z.object({
       enabled: z.boolean().optional().describe("Enable the pre-planning activity brief (opt-in)."),
       timeout: z.number().int().positive().optional().describe("Timeout in seconds for the last-30-days step."),
     })
+    .strict()
     .optional()
     .describe("Pre-planning activity brief from the last 30 days of git history."),
   steps: z
@@ -63,6 +65,7 @@ const PartialConfigSchema = z.object({
       max_attempts: z.number().int().positive().optional().describe("Maximum fix-harness invocations before blocking."),
       timeout: z.number().int().positive().optional().describe("Seconds per test/build run."),
     })
+    .strict()
     .optional()
     .describe("Run the repo's tests/build before opening a PR."),
   eval_gate: z
@@ -73,6 +76,7 @@ const PartialConfigSchema = z.object({
       timeout: z.number().int().positive().optional().describe("Stage-level budget in seconds (shared across attempts)."),
       max_attempts: z.number().int().positive().optional().describe("Total attempts before giving up (1 = no retry)."),
     })
+    .strict()
     .optional()
     .describe("Run the repo's eval harness after pre-merge."),
   shipcheck_gate: z
@@ -510,8 +514,10 @@ export interface ValidateConfigDeps {
   readFile?: (filePath: string) => string | null;
   /** Find the git root above startDir; return null if none found. Defaults to the internal findGitRoot. */
   findGitRoot?: (startDir: string) => string | null;
-  /** Harnesses used for inert-model detection. When absent, loaded from the active profile. */
+  /** Harnesses used for inert-model detection. When absent, loaded from `profile` (or PIPELINE_PROFILE env var). */
   harnesses?: { implementer: string; reviewer: string };
+  /** Profile name to load harnesses from when `harnesses` is not injected. Defaults to PIPELINE_PROFILE env var or "codex". */
+  profile?: string;
 }
 
 const defaultReadFile = (fp: string): string | null => {
@@ -578,9 +584,18 @@ export function validateConfig(
     return { valid: false, diagnostics };
   }
 
-  // 4. Empty/null YAML (e.g. empty file) is valid (no overrides applied)
-  if (!parsed || typeof parsed !== "object") {
+  // 4. Null YAML (empty file, "---", "~", "null") is valid (no overrides applied).
+  // Any other non-object root (scalar, boolean, number, sequence) is an error.
+  if (parsed == null) {
     return { valid: true, diagnostics: [] };
+  }
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    diagnostics.push({
+      severity: "error",
+      path: "",
+      message: `Config must be a YAML mapping (object), got ${Array.isArray(parsed) ? "sequence" : typeof parsed}.`,
+    });
+    return { valid: false, diagnostics };
   }
 
   // 5. Zod validation
@@ -620,11 +635,17 @@ export function validateConfig(
     let harnesses = deps.harnesses;
     if (!harnesses) {
       try {
-        harnesses = loadProfile(process.env.PIPELINE_PROFILE ?? "codex").harnesses;
+        const profileName = deps.profile ?? process.env.PIPELINE_PROFILE ?? "codex";
+        harnesses = loadProfile(profileName).harnesses;
       } catch {
         // Profile unavailable — skip inert warnings rather than failing
         harnesses = undefined;
       }
+    }
+    // Apply review_harness from the file config (same override resolveConfig applies),
+    // so inert-model detection reflects the actual effective reviewer at runtime.
+    if (harnesses && fileConfig.review_harness) {
+      harnesses = { ...harnesses, reviewer: fileConfig.review_harness };
     }
     if (harnesses) {
       for (const { key, role } of MODEL_ALIAS_ROLES) {
