@@ -257,6 +257,32 @@ test("runTests: failing command → passed false with output", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Shell-operator regression tests (#173): configured command runs via sh -c
+// ---------------------------------------------------------------------------
+
+test("gate (#173 regression): configured command with && passes when both steps succeed", async () => {
+  // Proves `&&` is interpreted by the shell, not passed as a literal arg to the
+  // first program. Uses real process spawn (no runTests stub).
+  const out = await runTestGate(cfgWith({ command: "true && true" }), 173, tmpRoot, {
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 0);
+});
+
+test("gate (#173 regression): configured command with && fails when first step fails", async () => {
+  // Proves shell short-circuit: false exits non-zero, && stops, gate reports failure.
+  const out = await runTestGate(
+    cfgWith({ command: "false && true", max_attempts: 0 }),
+    173,
+    tmpRoot,
+    { ...cleanGitDeps() },
+  );
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+});
+
+// ---------------------------------------------------------------------------
 // runTestGate — the bounded loop (injected stubs)
 // ---------------------------------------------------------------------------
 
@@ -511,8 +537,8 @@ test("gate (regression / #48, CI parity): explicit CI command fails on second st
     invoke: async () => okInvoke(),
     ...cleanGitDeps(),
   });
-  // Gate must use the configured command (not auto-detect)
-  assert.deepEqual(seenCommand, { cmd: "npm", args: ["run", "ci"] });
+  // Gate must use the configured command wrapped in sh -c (not auto-detect, not tokenized)
+  assert.deepEqual(seenCommand, { cmd: "sh", args: ["-c", "npm run ci"] });
   // Gate blocks: full CI command failed
   assert.equal(out.passed, false);
   assert.match(out.blockReason ?? "", /plugin mirror/i);
@@ -533,7 +559,7 @@ test("gate: explicit command override bypasses detection", async () => {
     ...cleanGitDeps(),
   });
   assert.equal(detectCalled, false);
-  assert.deepEqual(seen, { cmd: "pnpm", args: ["run", "test:ci"] });
+  assert.deepEqual(seen, { cmd: "sh", args: ["-c", "pnpm run test:ci"] });
   assert.equal(out.passed, true);
 });
 

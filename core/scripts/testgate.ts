@@ -177,10 +177,15 @@ export async function runTestGate(
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
   const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
 
-  const command = cfg.test_gate.command ? shellSplit(cfg.test_gate.command) : detectFn(wtPath);
+  // Operator-configured commands run through `sh -c` so shell operators
+  // (&&, ||, ;, pipes) work. Auto-detected commands spawn directly.
+  const configuredCmd = cfg.test_gate.command;
+  const command: ParsedCommand | null = configuredCmd
+    ? { cmd: "sh", args: ["-c", configuredCmd] }
+    : detectFn(wtPath);
   if (!command) return { skipped: true };
 
-  const label = formatCommand(command);
+  const label = configuredCmd ?? formatCommand(command);
   console.log(`[pipeline] #${issueNumber}: test gate running \`${label}\``);
 
   // Run the test/build command and record it in the evidence bundle (#147).
