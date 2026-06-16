@@ -374,6 +374,7 @@ export async function advance(
     pipelineRunId,
     stateDir: opts.stateDir,
     runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
   });
 }
 
@@ -723,6 +724,7 @@ async function advanceOpenspec(
     pipelineRunId,
     stateDir: opts.stateDir,
     runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
   });
 }
 
