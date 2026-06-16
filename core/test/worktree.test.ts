@@ -5,8 +5,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree } from "../scripts/worktree.ts";
-import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex } from "../scripts/worktree.ts";
+import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -345,6 +345,14 @@ function makeCreateCfg(): PipelineConfig {
   } as unknown as PipelineConfig;
 }
 
+// No-op mutex/sleep deps shared by createWorktree unit tests that don't
+// exercise the mutex or retry logic (avoids real fs lock files in CI).
+const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep"> = {
+  acquireMutex: (_p) => {},
+  releaseMutex: (_p) => {},
+  sleep: async (_ms) => {},
+};
+
 test("createWorktree: this issue's stale worktree is reclaimed before the capacity check", async () => {
   const cfg = makeCreateCfg();
   let removedIssue: number | null = null;
@@ -355,6 +363,7 @@ test("createWorktree: this issue's stale worktree is reclaimed before the capaci
     removeWorktree: async (_cfg, issueNumber) => { removedIssue = issueNumber; },
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -373,6 +382,7 @@ test("createWorktree: no stale worktree → does not call removeWorktree", async
     removeWorktree: async () => { removeCalled = true; },
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -392,6 +402,7 @@ test("createWorktree: capacity check still fires when OTHER issues fill the pool
     removeWorktree: async () => {},
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
   };
 
   await assert.rejects(
@@ -420,6 +431,7 @@ test("createWorktree: a full pool of THIS issue's own stale worktrees never bloc
     removeWorktree: async (_cfg, _issueNumber, slug) => { removed.push(slug); },
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
   };
 
   const result = await createWorktree(cfg, 42, "new-title", deps);
@@ -433,5 +445,197 @@ test("createWorktree: a full pool of THIS issue's own stale worktrees never bloc
     removed.sort(),
     ["old-a", "old-b"],
     "every stale worktree for the issue must be reclaimed, not just the first",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// acquireWorktreeMutex — stale-PID recovery and live-PID failure (#183)
+// ---------------------------------------------------------------------------
+
+function makeMutexDeps(
+  overrides: Partial<AcquireWorktreeMutexDeps>,
+): AcquireWorktreeMutexDeps {
+  return {
+    atomicCreate: (_p, _c) => true,
+    readContent: (_p) => null,
+    unlink: (_p) => {},
+    isPidAlive: (_pid) => false,
+    currentPid: () => 42,
+    ...overrides,
+  };
+}
+
+test("acquireWorktreeMutex: clean path → writes current PID and returns", () => {
+  let writtenContent = "";
+  acquireWorktreeMutex("/tmp/test-wt.lock", makeMutexDeps({
+    atomicCreate: (_p, c) => { writtenContent = c; return true; },
+    currentPid: () => 99,
+  }));
+  assert.equal(writtenContent, "99", "current PID must be written to the lock file");
+});
+
+test("acquireWorktreeMutex: stale file (dead PID) → reclaimed and acquired", () => {
+  let unlinked = false;
+  let createCount = 0;
+  acquireWorktreeMutex("/tmp/test-wt.lock", makeMutexDeps({
+    atomicCreate: (_p, _c) => {
+      createCount++;
+      return createCount === 1 ? false : true; // first: EEXIST, second: acquired
+    },
+    readContent: (_p) => "99999",
+    unlink: (_p) => { unlinked = true; },
+    isPidAlive: (_pid) => false, // dead process
+  }));
+  assert.ok(unlinked, "stale lock file must be removed");
+  assert.equal(createCount, 2, "must re-try acquisition after reclaim");
+});
+
+test("acquireWorktreeMutex: live PID → throws", () => {
+  let createCount = 0;
+  assert.throws(
+    () => acquireWorktreeMutex("/tmp/test-wt.lock", makeMutexDeps({
+      atomicCreate: (_p, _c) => { createCount++; return false; }, // always EEXIST
+      readContent: (_p) => "55555",
+      isPidAlive: (_pid) => true, // live process
+    })),
+    /Worktree mutex held by process 55555/,
+  );
+});
+
+test("acquireWorktreeMutex: garbage lock content → treated as stale, reclaimed", () => {
+  let unlinked = false;
+  let createCount = 0;
+  acquireWorktreeMutex("/tmp/test-wt.lock", makeMutexDeps({
+    atomicCreate: (_p, _c) => { createCount++; return createCount > 1; },
+    readContent: (_p) => "not-a-pid",
+    unlink: (_p) => { unlinked = true; },
+  }));
+  assert.ok(unlinked, "garbage-content lock must be removed");
+});
+
+// ---------------------------------------------------------------------------
+// createWorktree retry logic on .git/config.lock contention (#183)
+// ---------------------------------------------------------------------------
+
+const CONFIG_LOCK_STDERR =
+  "Preparing worktree (new branch 'pipeline/42-slug')\n" +
+  "error: could not lock config file .git/config: File exists\n" +
+  "error: unable to write upstream branch configuration";
+
+test("createWorktree: first git worktree add fails with config.lock, second succeeds → returns normally", async () => {
+  const cfg = makeCreateCfg();
+  let worktreeAddCalls = 0;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args, _opts) => {
+      if (args[0] === "worktree" && args[1] === "add") {
+        worktreeAddCalls++;
+        if (worktreeAddCalls === 1) {
+          return { code: 1, stdout: "", stderr: CONFIG_LOCK_STDERR };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    acquireMutex: (_p) => {},
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => {},
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(worktreeAddCalls, 2, "must retry once and succeed on second attempt");
+  assert.ok(result.path.includes("pipeline-42-slug"));
+});
+
+test("createWorktree: all 3 git worktree add attempts fail with config.lock → throws with final stderr", async () => {
+  const cfg = makeCreateCfg();
+  let worktreeAddCalls = 0;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args, _opts) => {
+      if (args[0] === "worktree" && args[1] === "add") {
+        worktreeAddCalls++;
+        return { code: 1, stdout: "", stderr: CONFIG_LOCK_STDERR };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    acquireMutex: (_p) => {},
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => {},
+  };
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /git worktree add failed/,
+  );
+  assert.equal(worktreeAddCalls, 3, "must attempt exactly 3 times before giving up");
+});
+
+test("createWorktree: non-lock git error → throws immediately without retrying", async () => {
+  const cfg = makeCreateCfg();
+  let worktreeAddCalls = 0;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args, _opts) => {
+      if (args[0] === "worktree" && args[1] === "add") {
+        worktreeAddCalls++;
+        return { code: 128, stdout: "", stderr: "fatal: '...' is already checked out" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    acquireMutex: (_p) => {},
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => {},
+  };
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /git worktree add failed/,
+  );
+  assert.equal(worktreeAddCalls, 1, "must not retry on non-lock errors");
+});
+
+// ---------------------------------------------------------------------------
+// createWorktree mutex wiring: acquire before gitCmd, release in finally (#183)
+// ---------------------------------------------------------------------------
+
+test("createWorktree: mutex acquired before git worktree add, released after even when git fails", async () => {
+  const cfg = makeCreateCfg();
+  const events: string[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args, _opts) => {
+      if (args[0] === "worktree" && args[1] === "add") {
+        events.push("git");
+        return { code: 128, stdout: "", stderr: "fatal: branch already exists" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    acquireMutex: (_p) => { events.push("acquire"); },
+    releaseMutex: (_p) => { events.push("release"); },
+    sleep: async (_ms) => {},
+  };
+
+  await assert.rejects(() => createWorktree(cfg, 42, "slug", deps));
+  assert.deepEqual(
+    events,
+    ["acquire", "git", "release"],
+    "mutex must be acquired before git call and released in finally",
   );
 });
