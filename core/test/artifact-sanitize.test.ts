@@ -137,6 +137,34 @@ test("redactSecrets: non-secret env assignment is left unchanged", () => {
   assert.equal(result, text, "non-secret env assignments must not be touched");
 });
 
+// Finding 1 regression: double-quoted and single-quoted env assignments must be redacted
+test("redactSecrets: double-quoted env assignment is redacted", () => {
+  const text = 'Running: OPENAI_API_KEY="supersecretvalue" missing-bin';
+  const result = redactSecrets(text);
+  assert.ok(!result.includes("supersecretvalue"), "double-quoted value must not survive");
+  assert.ok(result.includes("[REDACTED]"), "redaction marker must be present");
+  assert.ok(result.includes("OPENAI_API_KEY="), "var name must be preserved");
+});
+
+test("redactSecrets: single-quoted env assignment is redacted", () => {
+  const text = "Running: OPENAI_API_KEY='supersecretvalue' missing-bin";
+  const result = redactSecrets(text);
+  assert.ok(!result.includes("supersecretvalue"), "single-quoted value must not survive");
+  assert.ok(result.includes("[REDACTED]"), "redaction marker must be present");
+  assert.ok(result.includes("OPENAI_API_KEY="), "var name must be preserved");
+});
+
+test("redactSecrets: double-quoted value matches storePreflightResult eval-command remediation pattern", () => {
+  // storePreflightResult serializes the PreflightResult via JSON.stringify then redactSecrets.
+  // The eval-command check embeds eval_gate.command in its remediation string, so a configured
+  // command like OPENAI_API_KEY="secret" missing-bin would be written raw without this fix.
+  const remediationText =
+    'Install `missing-bin` or fix `eval_gate.command` (`OPENAI_API_KEY="supersecret" missing-bin`) so its binary resolves on PATH.';
+  const result = redactSecrets(remediationText);
+  assert.ok(!result.includes("supersecret"), "double-quoted value in remediation must not survive");
+  assert.ok(result.includes("[REDACTED]"), "redaction marker must be present");
+});
+
 // ---------------------------------------------------------------------------
 // Finding 3 regression: control tokens and line-start role markers redacted
 // ---------------------------------------------------------------------------

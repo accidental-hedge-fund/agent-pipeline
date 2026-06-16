@@ -46,9 +46,11 @@ export function redactSecrets(text: string): string {
   }
   // Redact inline env-var assignments whose name matches the secret pattern,
   // even when the value is not present in process.env (e.g. OPENAI_API_KEY=xyz cmd).
+  // Handles unquoted, double-quoted, and single-quoted values so that
+  // OPENAI_API_KEY="secret" cmd and OPENAI_API_KEY='secret' cmd are also redacted.
   result = result.replace(
-    /\b([A-Z][A-Z0-9_]*)\s*=\s*([^\s"'`,;)\\]+)/g,
-    (full, name, _val) => (SECRET_NAME_RE.test(name) ? `${name}=[REDACTED]` : full),
+    /\b([A-Z][A-Z0-9_]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'`,;)\\]+)/g,
+    (full, name) => (SECRET_NAME_RE.test(name) ? `${name}=[REDACTED]` : full),
   );
   return result;
 }

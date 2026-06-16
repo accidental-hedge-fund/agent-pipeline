@@ -211,7 +211,10 @@ export async function recordStage(
 }
 
 /** Build a sanitized `CommandRecord` — the single chokepoint that enforces the
- *  four-field shape and the 500-char output cap (sensitive-value exclusion). */
+ *  four-field shape and the 500-char output cap (sensitive-value exclusion).
+ *  sanitize() is applied at the field level (before serialization) so that
+ *  role-marker patterns like `assistant:` are caught even when the value appears
+ *  embedded inside a JSON string after JSON.stringify (#161). */
 export function makeCommandRecord(
   cmd: string,
   exitCode: number,
@@ -219,10 +222,10 @@ export function makeCommandRecord(
   output: string,
 ): CommandRecord {
   return {
-    cmd: redactSecrets(cmd),
+    cmd: sanitize(redactSecrets(cmd)),
     exitCode,
     durationMs: Math.round(durationMs),
-    outputExcerpt: redactSecrets(output ?? "").slice(0, OUTPUT_EXCERPT_CAP),
+    outputExcerpt: sanitize(redactSecrets(output ?? "")).slice(0, OUTPUT_EXCERPT_CAP),
   };
 }
 
@@ -265,15 +268,16 @@ export async function recordCommand(
 }
 
 /** Build a sanitized `PromptRecord`. The prompt content is passed through the
- *  same secret-redaction path as `CommandRecord`, and then hashed (SHA-1 prefix)
- *  and excerpted so no raw secret can survive in the bundle. */
+ *  same secret-redaction and injection-denylist path as `CommandRecord`, applied
+ *  at the field level (before serialization) so role-marker patterns are caught
+ *  even when the value appears embedded in a JSON string (#161). */
 export function makePromptRecord(kind: string, harness: string, prompt: string): PromptRecord {
-  const redacted = redactSecrets(prompt);
+  const cleaned = sanitize(redactSecrets(prompt));
   return {
     kind,
     harness,
-    hash: createHash("sha1").update(redacted).digest("hex").slice(0, 8),
-    excerpt: redacted.slice(0, OUTPUT_EXCERPT_CAP),
+    hash: createHash("sha1").update(cleaned).digest("hex").slice(0, 8),
+    excerpt: cleaned.slice(0, OUTPUT_EXCERPT_CAP),
   };
 }
 
