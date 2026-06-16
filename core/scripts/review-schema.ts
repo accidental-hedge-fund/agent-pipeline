@@ -14,7 +14,7 @@
 // unfilled placeholder, so a missing substitution is a hard error rather than a
 // prompt that reaches the reviewer with a literal `{{schema_block}}` token.
 
-import type { ReviewFinding, ReviewVerdict } from "./types.ts";
+import type { ReviewFinding, ReviewVerdict, ShipcheckVerdict, ShipcheckCriterion } from "./types.ts";
 
 // The JSON body the reviewer is told to return. Field names and nesting order
 // MUST match `ReviewFinding` / `ReviewVerdict`; the drift guard test fails if
@@ -71,4 +71,38 @@ const VERDICT_FIELD_GUARD: Record<Exclude<keyof ReviewVerdict, "commitSha">, tru
 export const REVIEW_SCHEMA_FIELDS = {
   verdict: Object.keys(VERDICT_FIELD_GUARD),
   finding: Object.keys(FINDING_FIELD_GUARD),
+};
+
+// ---------------------------------------------------------------------------
+// Shipcheck verdict schema (#148) — single source of truth for the shipcheck-gate
+// reviewer prompt. Mirrors the pattern above: schema block + typed guard +
+// field manifest, all three kept in sync.
+// ---------------------------------------------------------------------------
+
+export const SHIPCHECK_VERDICT_SCHEMA_BLOCK = `{
+    "verdict": "pass" | "partial" | "fail",
+    "summary": "<one-line acceptance assessment>",
+    "criteria": [
+        {
+            "criterion": "<rubric criterion name>",
+            "result": "pass" | "fail" | "na",
+            "note": "<brief explanation>"
+        }
+    ]
+}`;
+
+const SHIPCHECK_CRITERION_FIELD_GUARD: Record<keyof ShipcheckCriterion, true> = {
+  criterion: true,
+  result: true,
+  note: true,
+};
+const SHIPCHECK_VERDICT_FIELD_GUARD: Record<keyof ShipcheckVerdict, true> = {
+  verdict: true,
+  summary: true,
+  criteria: true,
+};
+
+export const SHIPCHECK_SCHEMA_FIELDS = {
+  verdict: Object.keys(SHIPCHECK_VERDICT_FIELD_GUARD),
+  criterion: Object.keys(SHIPCHECK_CRITERION_FIELD_GUARD),
 };

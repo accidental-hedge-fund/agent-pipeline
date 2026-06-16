@@ -69,6 +69,16 @@ const PartialConfigSchema = z.object({
       max_attempts: z.number().int().positive().optional(),
     })
     .optional(),
+  shipcheck_gate: z
+    .object({
+      enabled: z.boolean().optional(),
+      mode: z.enum(["advisory", "gate"]).optional(),
+      max_rounds: z.number().int().min(1).optional(),
+      rubric_path: z.string().optional(),
+      block_on_partial: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
   review_policy: z
     .object({
       block_threshold: z.enum(["critical", "high", "medium", "low"]).optional(),
@@ -256,6 +266,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       mode: fileConfig.eval_gate?.mode ?? DEFAULT_CONFIG.eval_gate.mode,
       timeout: fileConfig.eval_gate?.timeout ?? DEFAULT_CONFIG.eval_gate.timeout,
       max_attempts: fileConfig.eval_gate?.max_attempts ?? DEFAULT_CONFIG.eval_gate.max_attempts,
+    },
+    shipcheck_gate: {
+      enabled: fileConfig.shipcheck_gate?.enabled ?? DEFAULT_CONFIG.shipcheck_gate.enabled,
+      mode: fileConfig.shipcheck_gate?.mode ?? DEFAULT_CONFIG.shipcheck_gate.mode,
+      max_rounds: fileConfig.shipcheck_gate?.max_rounds ?? DEFAULT_CONFIG.shipcheck_gate.max_rounds,
+      rubric_path: fileConfig.shipcheck_gate?.rubric_path ?? DEFAULT_CONFIG.shipcheck_gate.rubric_path,
+      block_on_partial: fileConfig.shipcheck_gate?.block_on_partial ?? DEFAULT_CONFIG.shipcheck_gate.block_on_partial,
     },
     review_policy: {
       block_threshold:
@@ -503,6 +520,13 @@ eval_gate: # run the repo's eval harness after pre-merge
   mode: ${d.eval_gate.mode} # gate: block on fail | advisory: record and advance
   timeout: ${d.eval_gate.timeout} # stage-level budget in seconds (shared across attempts)
   max_attempts: ${d.eval_gate.max_attempts} # total attempts before giving up (1 = no retry)
+
+# shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148). Disabled by default.
+#   enabled: ${d.shipcheck_gate.enabled} # set true to enable
+#   mode: ${d.shipcheck_gate.mode} # advisory: record findings without blocking | gate: block on fail
+#   max_rounds: ${d.shipcheck_gate.max_rounds} # max reviewer invocations before needs-human
+#   rubric_path: ${d.shipcheck_gate.rubric_path} # repo-root-relative path to Markdown rubric file
+#   block_on_partial: ${d.shipcheck_gate.block_on_partial} # when true and mode=gate, partial verdict also blocks
 
 review_policy: # which review findings block progression vs. merely advise (#17)
   block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)

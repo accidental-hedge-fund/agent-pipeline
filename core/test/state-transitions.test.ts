@@ -22,7 +22,8 @@ const TABLE: ExpectedTransition[] = [
   { from: "review-2",      outcome: "ceiling",        to: "needs-human" },     // max_adversarial_rounds reached with findings still blocking
   { from: "fix-2",         outcome: "advance",        to: "pre-merge" },
   { from: "pre-merge",     outcome: "advance",        to: "eval-gate" },
-  { from: "eval-gate",     outcome: "advance",        to: "ready-to-deploy" },
+  { from: "eval-gate",     outcome: "advance",        to: "shipcheck-gate" },
+  { from: "shipcheck-gate", outcome: "advance",       to: "ready-to-deploy" },
 ];
 
 test("state machine: every documented stage exists in STAGES", () => {
@@ -81,6 +82,7 @@ test("state machine: STAGES order is forward", () => {
     "fix-2",
     "pre-merge",
     "eval-gate",
+    "shipcheck-gate",
     "ready-to-deploy",
     "needs-human",
   ];
@@ -94,6 +96,15 @@ test("state machine: eval-gate sits between pre-merge and ready-to-deploy", () =
   const readyToDeployIdx = stages.indexOf("ready-to-deploy");
   assert.ok(evalGateIdx > preMergeIdx, "eval-gate must come after pre-merge");
   assert.ok(evalGateIdx < readyToDeployIdx, "eval-gate must come before ready-to-deploy");
+});
+
+test("state machine: shipcheck-gate sits between eval-gate and ready-to-deploy (#148)", () => {
+  const stages = [...STAGES];
+  const evalGateIdx = stages.indexOf("eval-gate");
+  const shipchecKIdx = stages.indexOf("shipcheck-gate");
+  const readyToDeployIdx = stages.indexOf("ready-to-deploy");
+  assert.ok(shipchecKIdx > evalGateIdx, "shipcheck-gate must come after eval-gate");
+  assert.ok(shipchecKIdx < readyToDeployIdx, "shipcheck-gate must come before ready-to-deploy");
 });
 
 test("step config (#13): review skip targets keep a valid forward path", () => {
