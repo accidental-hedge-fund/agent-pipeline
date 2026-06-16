@@ -2,9 +2,7 @@
 
 ## Purpose
 The test/build gate runs the target repo's own test/build command in the worktree and self-heals failures through a bounded generate→test→fix loop before the item advances. It auto-detects the command, stays non-blocking when none is found, and treats a dirty tree as untrustworthy. (The full-CI-command surface for this repo is refined by `test-gate-ci-parity`; the trailer/commit-message invariants on fix-harness commits are refined by `harness-step-verification`.)
-
 ## Requirements
-
 ### Requirement: Disabled gate is skipped
 When `cfg.test_gate.enabled` is `false`, the gate SHALL return a skipped result immediately without detecting or running any command.
 
@@ -62,3 +60,16 @@ Each command run SHALL be bounded by `cfg.test_gate.timeout` seconds; a timeout 
 #### Scenario: run exceeds the timeout
 - **WHEN** a command run exceeds `cfg.test_gate.timeout`
 - **THEN** it SHALL be killed and treated as a failed attempt
+
+### Requirement: Test gate assumes worktree is dependency-installed
+The test/build gate SHALL assume that the worktree's dependency install step has already completed (as guaranteed by the `worktree-dependency-install` bootstrap). The gate SHALL NOT attempt to detect or run a package manager install itself; if binaries are absent, it SHALL report the failing command output and block — not silently retry with an install.
+
+#### Scenario: binaries available after bootstrap
+- **WHEN** the worktree-dependency-install step has run successfully before the test gate executes
+- **THEN** the test gate SHALL be able to invoke auto-detected or configured binaries (e.g., `pnpm run test`, `vitest`) without a "command not found" error
+
+#### Scenario: gate does not install dependencies itself
+- **WHEN** the test gate detects and runs a command
+- **THEN** it SHALL NOT run any package manager install step before invoking the command
+- **AND** install responsibility SHALL remain entirely with the worktree bootstrap phase
+
