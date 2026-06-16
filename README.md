@@ -31,6 +31,7 @@ backlog → ready → planning → plan-review → implementing
   - [Conventions & carry-forward lessons](#conventions--carry-forward-lessons)
 - [How the two hosts share one core](#how-the-two-hosts-share-one-core)
 - [Repository layout](#repository-layout)
+- [Editor / Desktop integration](#editor--desktop-integration)
 - [Uninstall](#uninstall)
 - [Development](#development)
 - [License](#license)
@@ -671,6 +672,55 @@ scripts/
   build.mjs           regenerate plugin/ from core + hosts/claude
   install.sh          clone-and-install convenience wrapper
 ```
+
+## Editor / Desktop integration
+
+Pipeline Desk and other editor integrations can delegate all schema and validation knowledge back to the engine via two commands, avoiding any duplication of Zod schema logic.
+
+### `pipeline config schema`
+
+Prints the JSON Schema (draft-2020-12) for `.github/pipeline.yml` to stdout and exits 0. The schema is derived directly from the engine's `PartialConfigSchema`, so it is always in sync with what the engine actually validates.
+
+```bash
+pipeline config schema
+# → JSON Schema object to stdout
+```
+
+Use this to power autocomplete and hover tooltips in your editor integration.
+
+### `pipeline config validate [--repo-path <path>] [--json]`
+
+Validates the `.github/pipeline.yml` at the git root of `--repo-path` (defaults to the current working directory). Exits 0 if valid; exits 1 if any `severity: "error"` diagnostic is present.
+
+```bash
+pipeline config validate --repo-path /path/to/repo --json
+```
+
+With `--json`, prints a structured JSON object:
+
+```json
+{
+  "valid": true,
+  "diagnostics": []
+}
+```
+
+Each `Diagnostic` object has the shape:
+
+```json
+{
+  "severity": "error" | "warning",
+  "path": "dotted.field.path (empty string for file-level errors)",
+  "message": "Human-readable description",
+  "line": 5
+}
+```
+
+- `line` is present for YAML syntax errors (1-indexed); absent for field-level Zod errors.
+- For rigor/cost-gating fields (`review_policy.block_threshold`, `review_policy.min_confidence`, `review_policy.max_adversarial_rounds`, `steps.*`, `eval_gate.enabled/mode`, `shipcheck_gate.enabled/mode`), an invalid value produces a diagnostic with an additional `"rigorGating": true` marker. These are always `severity: "error"` (exit 1) — a typo must never silently flip a rigor switch.
+- Inert-model alias warnings (`models.*` set while the backing harness is `codex`) are `severity: "warning"` and do not affect the exit code when they are the only findings.
+
+Without `--json`, a human-readable summary is printed (one line per diagnostic). The same exit-code rules apply.
 
 ## Uninstall
 

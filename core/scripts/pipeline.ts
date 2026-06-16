@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
+import { resolveConfig, scaffoldDefaultConfig, generateConfigSchema, validateConfig } from "./config.ts";
 import {
   addLabel,
   clearBlocked,
@@ -96,6 +96,7 @@ export interface CliOpts {
   init?: boolean;
   doctor?: boolean;
   failFast?: boolean;
+  json?: boolean;
 }
 
 async function main(): Promise<void> {
@@ -123,6 +124,7 @@ async function main(): Promise<void> {
     .option("--base <branch>", "override the base branch (default: from .github/pipeline.yml or 'main')")
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
+    .option("--json", "output structured JSON (used with 'pipeline config validate')")
     .parse(process.argv);
 
   const opts = cmd.opts<CliOpts>();
@@ -132,6 +134,13 @@ async function main(): Promise<void> {
   // preflight checks and exits, with no issue number. Distinct from the
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
+
+  // `pipeline config schema` and `pipeline config validate` — dispatch before
+  // resolveConfig() so they work without gh auth or a fully resolvable repo.
+  if (numArg === "config") {
+    await runConfigCommand(cmd.args.slice(1), opts);
+    return;
+  }
 
   let cfg: PipelineConfig;
   try {
@@ -318,6 +327,58 @@ export async function runInit(cfg: PipelineConfig): Promise<void> {
     console.log(`[pipeline] init: .github/pipeline.yml already exists — skipping scaffold.`);
   }
   console.log(`[pipeline] init: pipeline labels ensured in ${cfg.repo}.`);
+}
+
+// ---------------------------------------------------------------------------
+// Config subcommands (#156)
+// ---------------------------------------------------------------------------
+
+/**
+ * `pipeline config schema`  — print JSON Schema for .github/pipeline.yml
+ * `pipeline config validate` — validate config and print structured diagnostics
+ */
+export async function runConfigCommand(args: string[], opts: CliOpts): Promise<void> {
+  const subcmd = args[0];
+
+  if (subcmd === "schema") {
+    const schema = generateConfigSchema();
+    process.stdout.write(JSON.stringify(schema, null, 2) + "\n");
+    process.exitCode = 0;
+    return;
+  }
+
+  if (subcmd === "validate") {
+    const repoPath = opts.repoPath ?? process.cwd();
+    const result = validateConfig(repoPath);
+
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else {
+      if (result.diagnostics.length === 0) {
+        console.log("pipeline config: valid (no diagnostics)");
+      } else {
+        for (const d of result.diagnostics) {
+          const prefix = d.severity === "error" ? "ERROR" : "WARN ";
+          const loc = d.path ? ` [${d.path}]` : "";
+          const lineStr = d.line != null ? ` (line ${d.line})` : "";
+          console.log(`  ${prefix}${loc}${lineStr}: ${d.message}`);
+        }
+        if (result.valid) {
+          console.log("pipeline config: valid (warnings only)");
+        } else {
+          console.log("pipeline config: invalid");
+        }
+      }
+    }
+
+    const hasError = result.diagnostics.some((d) => d.severity === "error");
+    process.exitCode = hasError ? 1 : 0;
+    return;
+  }
+
+  const sub = subcmd ? `"${subcmd}"` : "(none)";
+  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate`);
+  process.exitCode = 2;
 }
 
 // ---------------------------------------------------------------------------
