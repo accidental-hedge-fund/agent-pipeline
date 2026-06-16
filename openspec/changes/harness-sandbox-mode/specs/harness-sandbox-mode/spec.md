@@ -33,3 +33,20 @@ Each stage that calls `invoke()` SHALL read `cfg.harness_sandbox` from the resol
 #### Scenario: review stage is unaffected
 - **WHEN** the reviewer harness (cross-harness or configured) is invoked
 - **THEN** `sandbox` SHALL default to `false` — only implementer/fix runs are sandboxed
+
+### Requirement: Sandboxed planning and plan-revision invocations run from the issue worktree
+When `cfg.harness_sandbox` is `true`, the non-OpenSpec planning stage SHALL pass the issue worktree path as the process cwd to `invoke()` for both plan-generation and plan-revision calls. Passing the shared repo root (`cfg.repo_dir`) as cwd when the sandbox is enabled would allow the sandboxed process to access sibling worktrees and the repo root rather than being confined to the issue's own worktree.
+
+#### Scenario: non-OpenSpec plan-gen uses issue worktree as cwd when sandboxed
+- **WHEN** `cfg.harness_sandbox` is `true` and the non-OpenSpec planning stage generates a plan
+- **THEN** `invoke()` SHALL receive the issue worktree path as `worktreeDir`
+- **AND** SHALL NOT receive `cfg.repo_dir` as `worktreeDir`
+
+#### Scenario: non-OpenSpec plan-revision uses issue worktree as cwd when sandboxed
+- **WHEN** `cfg.harness_sandbox` is `true` and the non-OpenSpec planning stage revises a plan
+- **THEN** `invoke()` SHALL receive the issue worktree path as `worktreeDir`
+- **AND** SHALL NOT receive `cfg.repo_dir` as `worktreeDir`
+
+#### Scenario: unsandboxed plan-gen preserves original cwd behavior
+- **WHEN** `cfg.harness_sandbox` is `false` and the non-OpenSpec planning stage generates a plan
+- **THEN** `invoke()` SHALL receive `cfg.repo_dir` as `worktreeDir` (preserving pre-change behavior)

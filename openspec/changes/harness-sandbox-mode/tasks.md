@@ -11,6 +11,7 @@
 ## 3. Call-site wiring
 
 - [ ] 3.1 Audit every `invoke()` call in `core/scripts/stages/` and `core/scripts/harness.ts`; pass `sandbox: cfg.harness_sandbox` for implementer/fix invocations (review invocations are unaffected — leave `sandbox` absent/false there)
+- [ ] 3.2 Fix non-OpenSpec planning stage: plan-gen and plan-revision calls to `invoke()` must use the issue worktree path as cwd when `harness_sandbox` is true (not `cfg.repo_dir`); extract `invokePlanStep` helper with injectable seam
 
 ## 4. Tests
 
@@ -20,6 +21,7 @@
 - [ ] 4.4 Config test: `resolveConfig()` with `harness_sandbox: true` parses without error and returns `harness_sandbox === true`
 - [ ] 4.5 Config test: `resolveConfig()` with `harness_sandbox` absent returns `harness_sandbox === false`
 - [ ] 4.6 Config test: `resolveConfig()` with `harness_sandbox: "yes"` throws a validation error
+- [ ] 4.7 Unit test: `invokePlanStep()` with `harness_sandbox: true` passes issue worktree path (not `cfg.repo_dir`) as cwd to `invoke()`; covers both plan-gen and plan-revision call sites
 
 ## 5. Mirror & CI
 

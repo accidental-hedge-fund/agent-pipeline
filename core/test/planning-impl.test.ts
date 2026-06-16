@@ -10,7 +10,9 @@ import {
   enforceImplCommitRef,
   enforceOpenspecChangeSingular,
   invokeImplementer,
+  invokePlanStep,
   type BootstrapWorktreeDeps,
+  type PlanStepDeps,
 } from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
@@ -100,6 +102,75 @@ test("invokeImplementer: harness_sandbox:false forwards sandbox:false to invoke 
   const cfg = { ...cfgWithImplementing("sonnet"), harness_sandbox: false } as unknown as PipelineConfig;
   await invokeImplementer("claude", "/wt", "p", cfg, {}, deps);
   assert.equal(capturedSandbox, false, "sandbox:false must be forwarded (default unchanged)");
+});
+
+// ---------------------------------------------------------------------------
+// Planning-step harness invocation — cwd confinement (#21, review-2 finding 1)
+//
+// Regression for: non-OpenSpec plan-gen and plan-revision invocations used
+// cfg.repo_dir as the process cwd even when harness_sandbox was enabled, allowing
+// the sandboxed process to access the shared repo root instead of being confined
+// to the issue worktree.
+// ---------------------------------------------------------------------------
+
+function cfgWithSandbox(sandbox: boolean): PipelineConfig {
+  return {
+    implementation_timeout: 1200,
+    repo_dir: "/repo",
+    harness_sandbox: sandbox,
+    models: { planning: "haiku", implementing: "sonnet", review: "opus", fix: "sonnet" },
+  } as unknown as PipelineConfig;
+}
+
+test("invokePlanStep: sandbox:true uses wtPath as cwd, not cfg.repo_dir (review-2 finding 1 regression)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue-42", "plan prompt", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedDir, "/wt/issue-42", "sandbox:true must use the issue worktree path as cwd");
+  assert.notEqual(capturedDir, "/repo", "sandbox:true must NOT pass cfg.repo_dir as cwd");
+});
+
+test("invokePlanStep: sandbox:false uses cfg.repo_dir as cwd (default unchanged)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue-42", "plan prompt", cfgWithSandbox(false), {}, deps);
+  assert.equal(capturedDir, "/repo", "sandbox:false must use cfg.repo_dir as cwd");
+});
+
+test("invokePlanStep: plan-revision call also uses wtPath when sandbox:true (covers both call sites)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue-99", "revision prompt", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedDir, "/wt/issue-99");
+});
+
+test("invokePlanStep: forwards cfg.models.planning and sandbox flag to invoke options", async () => {
+  let capturedOpts: { model?: string; sandbox?: boolean; timeoutSec?: number } | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, _dir, _p, opts) => {
+      capturedOpts = opts;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue", "p", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedOpts?.model, "haiku");
+  assert.equal(capturedOpts?.sandbox, true);
+  assert.equal(capturedOpts?.timeoutSec, 1200);
 });
 
 // ---------------------------------------------------------------------------
