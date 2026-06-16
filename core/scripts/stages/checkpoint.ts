@@ -25,6 +25,17 @@ export function findCheckpointComment(comments: Comment[]): Comment | null {
 }
 
 /**
+ * Extracts the stage name from a `**Stage**: <stage>` line in a checkpoint comment.
+ * Returns null when the line is absent or does not contain a recognisable stage name.
+ * Used to scope approval detection so a comment posted for stage A is never treated
+ * as an approval for a later stage B (Finding 3).
+ */
+export function extractCheckpointStage(comment: { body: string }): string | null {
+  const m = comment.body.match(/\*\*Stage\*\*:\s*([a-z][a-z-]*)/);
+  return m ? m[1] : null;
+}
+
+/**
  * Extracts the full SHA from a `<!-- checkpoint-sha: <sha> -->` sentinel.
  * Returns null when the sentinel is absent or does not contain a hex SHA.
  */
@@ -102,13 +113,21 @@ export async function checkApprovalCheckpoint(
 
   if (!hasAwaitingLabel) {
     if (checkpointComment !== null) {
-      // (c) Human removed the label (approved) — dispatch normally.
-      return null;
+      const commentStage = extractCheckpointStage(checkpointComment);
+      if (commentStage === stage) {
+        // (c) Human removed the label for THIS stage (approved) — dispatch normally.
+        return null;
+      }
+      // Comment belongs to a different stage — not an approval for this stage.
+      // Fall through to (b) and fire the checkpoint for the current stage.
     }
-    // (b) First encounter — fire the checkpoint.
+    // (b) First encounter (or comment is for a different stage) — fire the checkpoint.
+    // Apply the label BEFORE posting the comment so a partial failure (comment posted
+    // but label application throws) leaves the system in a "still pending" state rather
+    // than looking approved on the next run (Finding 4).
     const body = buildCheckpointComment(stage, headSha);
-    await deps.postCheckpointComment(issueNumber, body);
     await deps.applyAwaitingApprovalLabel(issueNumber);
+    await deps.postCheckpointComment(issueNumber, body);
     return { advanced: false, status: "waiting", reason: `checkpoint awaiting approval at stage ${stage}` };
   }
 

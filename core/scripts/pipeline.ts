@@ -869,10 +869,22 @@ async function runAdvance(
         } catch {
           /* PR not found or transient error — keep NULL_SHA */
         }
-        const checkpointDeps: CheckpointDeps = {
-          postCheckpointComment: (n, body) => postComment(cfg, n, body),
-          applyAwaitingApprovalLabel: (n) => addLabel(cfg, n, AWAITING_APPROVAL_LABEL),
-        };
+        // Guard mutations against dry-run: checkpoint discovery is still
+        // performed (so the caller sees a "waiting" status), but no GitHub
+        // comment or label is written (#23, Finding 2).
+        const checkpointDeps: CheckpointDeps = opts.dryRun
+          ? {
+              postCheckpointComment: async (n) => {
+                console.log(`[pipeline] #${n}: [dry-run] would post checkpoint comment`);
+              },
+              applyAwaitingApprovalLabel: async (n) => {
+                console.log(`[pipeline] #${n}: [dry-run] would apply ${AWAITING_APPROVAL_LABEL}`);
+              },
+            }
+          : {
+              postCheckpointComment: (n, body) => postComment(cfg, n, body),
+              applyAwaitingApprovalLabel: (n) => addLabel(cfg, n, AWAITING_APPROVAL_LABEL),
+            };
         const checkpointOut = await checkApprovalCheckpoint(
           stage,
           cfg,
@@ -1069,8 +1081,43 @@ async function dispatch(
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
-    case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
+    case "ready": {
+      // Build a beforeImplementing hook so the planning stage can pause at the
+      // implementing boundary when "implementing" is in approvalCheckpoints (#23,
+      // Finding 1). The hook re-fetches the issue state at the moment the
+      // implementing step is about to run (after planning/plan-review complete).
+      let beforeImplementing: (() => Promise<Outcome | null>) | undefined;
+      if (cfg.approvalCheckpoints.includes("implementing")) {
+        const cpDeps: CheckpointDeps = dryRun
+          ? {
+              postCheckpointComment: async (n) => {
+                console.log(`[pipeline] #${n}: [dry-run] would post implementing checkpoint comment`);
+              },
+              applyAwaitingApprovalLabel: async (n) => {
+                console.log(`[pipeline] #${n}: [dry-run] would apply ${AWAITING_APPROVAL_LABEL}`);
+              },
+            }
+          : {
+              postCheckpointComment: (n, body) => postComment(cfg, n, body),
+              applyAwaitingApprovalLabel: (n) => addLabel(cfg, n, AWAITING_APPROVAL_LABEL),
+            };
+        beforeImplementing = async (): Promise<Outcome | null> => {
+          const d = await getIssueDetail(cfg, issueNumber);
+          let headSha = NULL_SHA;
+          try {
+            const prNum = await getPrForIssue(cfg, issueNumber);
+            if (prNum !== null) {
+              const prD = await getPrDetail(cfg, prNum);
+              headSha = prD.head_sha;
+            }
+          } catch {
+            /* PR not found or transient error — keep NULL_SHA */
+          }
+          return checkApprovalCheckpoint("implementing", cfg, d.labels, issueNumber, headSha, d.comments, cpDeps);
+        };
+      }
+      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, beforeImplementing });
+    }
     case "review-1":
       return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir });
     case "review-2":

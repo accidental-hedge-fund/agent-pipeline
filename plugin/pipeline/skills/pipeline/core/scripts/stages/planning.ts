@@ -51,6 +51,8 @@ import {
   type VerifyDeps,
   type VerifyResult,
 } from "../verify-harness-commits.ts";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -106,6 +108,33 @@ export async function bootstrapWorktree(
   }
 }
 
+// Relative path inside the worktree where the implementing prompt is persisted
+// when an approval checkpoint pauses before the implementer runs (#23).
+const PENDING_IMPL_RELPATH = ".pipeline/pending-impl.txt";
+
+/**
+ * Write the implementing prompt to the worktree so dispatchResume can execute
+ * it after the human approves the checkpoint (#23, Finding 1).
+ */
+async function storePendingImpl(wtPath: string, prompt: string): Promise<void> {
+  const dir = join(wtPath, ".pipeline");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(wtPath, PENDING_IMPL_RELPATH), prompt, "utf8");
+}
+
+/**
+ * Read a pending implementing prompt written by storePendingImpl. Returns null
+ * when no such file exists (i.e. the implementing step was not paused by a
+ * checkpoint, or a previous run already consumed it).
+ */
+async function readPendingImpl(wtPath: string): Promise<string | null> {
+  try {
+    return await readFile(join(wtPath, PENDING_IMPL_RELPATH), "utf8");
+  } catch {
+    return null;
+  }
+}
+
 export interface AdvanceOpts {
   dryRun?: boolean;
   /** Optional model override forwarded to harnesses that support it. */
@@ -115,6 +144,16 @@ export interface AdvanceOpts {
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
    *  command runs under the "planning" stage. Undefined → recording disabled. */
   stateDir?: string;
+  /**
+   * Approval checkpoint hook injected by the outer advance loop (#23, Finding 1).
+   * Called after the issue has been transitioned to `implementing` but BEFORE the
+   * implementer harness is invoked. If it returns a non-null Outcome (i.e. the
+   * checkpoint fires and the human hasn't yet approved), `advance()` persists the
+   * implementing prompt to the worktree and returns that outcome immediately — the
+   * implementer is NOT invoked. On the next invocation (after label removal),
+   * `dispatchResume` picks up the persisted prompt and runs the implementer.
+   */
+  beforeImplementing?: () => Promise<Outcome | null>;
 }
 
 export async function advance(
@@ -294,8 +333,22 @@ export async function advance(
       : `Plan-review step disabled. Implementation starting with ${primary} from the original plan.`,
   );
 
-  // ---- Step 7: primary implementer harness ----
+  // Build the implementing prompt here so it can be persisted if a checkpoint fires
+  // and consumed by dispatchResume after the human approves (#23, Finding 1).
   const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext });
+
+  // ---- Approval checkpoint gate (#23): fires after transitioning to `implementing`
+  //      but before the implementer runs. The issue label is now `implementing` so
+  //      the outer loop will observe the correct stage on the next invocation.
+  if (opts.beforeImplementing) {
+    const cpOut = await opts.beforeImplementing();
+    if (cpOut !== null) {
+      await storePendingImpl(wt.path, implPrompt);
+      return cpOut;
+    }
+  }
+
+  // ---- Step 7: primary implementer harness ----
   const implHeadBefore = (
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
@@ -653,13 +706,24 @@ async function advanceOpenspec(
     `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
     `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
     `${revisedProposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`;
+  const osFullImplPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext });
+
+  // ---- Approval checkpoint gate (#23, Finding 1): same as the standard flow. ----
+  if (opts.beforeImplementing) {
+    const cpOut = await opts.beforeImplementing();
+    if (cpOut !== null) {
+      await storePendingImpl(wt.path, osFullImplPrompt);
+      return cpOut;
+    }
+  }
+
   const osImplHeadBefore = (
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   const result = await invokeImplementer(
     primary,
     wt.path,
-    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext }),
+    osFullImplPrompt,
     cfg,
     opts,
   );
@@ -847,9 +911,13 @@ export async function resumeFromImplementing(
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch resume path (#175): re-entry at `implementing` when a worktree with
-// commits exists. Called from `dispatch()` in pipeline.ts for the implementing
-// case instead of returning the previous "nothing to do" waiting response.
+// Dispatch resume path (#175 + #23): re-entry at `implementing` when a worktree
+// exists. Two sub-cases:
+//   A. Pending-impl file present (from a paused approval checkpoint): run the
+//      implementer with the stored prompt, then push + PR + review-1.
+//   B. Worktree has commits ahead (previous run completed implement but crashed
+//      before PR creation): skip to push + PR + review-1.
+//   C. No pending file and no commits: mid-flight guard, return waiting.
 // ---------------------------------------------------------------------------
 
 /** Injectable seams for {@link dispatchResume} — unit tests inject fakes. */
@@ -858,14 +926,24 @@ export interface DispatchResumeDeps {
   hasCommitsAhead?: typeof hasCommitsAhead;
   getIssueDetail?: typeof getIssueDetail;
   resumeFromImplementing?: typeof resumeFromImplementing;
+  /** Read the pending-impl prompt written by storePendingImpl (#23). Injected for unit tests. */
+  readPendingImpl?: (wtPath: string) => Promise<string | null>;
+  /** Run the implementer harness (#23). Injected for unit tests. */
+  invokeImplementer?: typeof invokeImplementer;
+  /** Post a blocked comment and apply the blocked label (#23). Injected for unit tests. */
+  setBlocked?: typeof setBlocked;
+  /** Run a git command in the worktree (#23). Injected for unit tests. */
+  gitInWorktree?: typeof gitInWorktree;
 }
 
 /**
- * Dispatch resume for the `implementing` stage: check whether the issue has an
- * existing worktree with commits ahead of the base branch. If so, run the
- * post-implementation steps (test gate → push → PR → review-1) without
- * re-planning or re-implementing. If not, return the existing "nothing to do"
- * waiting response (no regression for mid-flight runs).
+ * Dispatch resume for the `implementing` stage: handle re-entry after an approval
+ * checkpoint (#23) or after a mid-flight crash.
+ *
+ * If `.pipeline/pending-impl.txt` exists in the worktree (written when a checkpoint
+ * paused before the implementer), run the implementer with that prompt and continue
+ * to push + PR + review-1.  Otherwise fall back to the pre-existing commit-ahead
+ * check (crash-recovery resume) or return "waiting, nothing to do" (mid-flight).
  */
 export async function dispatchResume(
   cfg: PipelineConfig,
@@ -874,9 +952,13 @@ export async function dispatchResume(
   deps: DispatchResumeDeps = {},
 ): Promise<Outcome> {
   const getWt = deps.getForIssue ?? getForIssue;
-  const commitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
+  const commitsAheadFn = deps.hasCommitsAhead ?? hasCommitsAhead;
   const fetchIssue = deps.getIssueDetail ?? getIssueDetail;
   const doResume = deps.resumeFromImplementing ?? resumeFromImplementing;
+  const readPendingFn = deps.readPendingImpl ?? readPendingImpl;
+  const runImpl = deps.invokeImplementer ?? invokeImplementer;
+  const markBlocked = deps.setBlocked ?? setBlocked;
+  const gitOp = deps.gitInWorktree ?? gitInWorktree;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
@@ -884,7 +966,69 @@ export async function dispatchResume(
   }
 
   const wt = await getWt(cfg, issueNumber);
-  if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
+  if (!wt) {
+    return {
+      advanced: false,
+      status: "waiting",
+      reason: "implementing is set mid-flight by the planning/plan-review handler; nothing to do at this point.",
+    };
+  }
+
+  // Sub-case A (#23, Finding 1): checkpoint was approved — run the stored prompt.
+  const pendingPrompt = await readPendingFn(wt.path);
+  if (pendingPrompt !== null) {
+    console.log(`[pipeline] #${issueNumber}: checkpoint approved — running implementer with stored prompt`);
+    const primary: Harness = cfg.harnesses.implementer;
+    const reviewer: string = cfg.harnesses.reviewer;
+    const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+    const implHeadBefore = (
+      await gitOp(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+    ).stdout.trim();
+    const implResult = await runImpl(primary, wt.path, pendingPrompt, cfg, opts);
+    if (!implResult.success) {
+      const reason = implResult.timed_out
+        ? `timed out after ${implResult.duration.toFixed(0)}s`
+        : `exit ${implResult.exit_code}`;
+      await markBlocked(cfg, issueNumber, `Implementation harness (${primary}) failed: ${reason}`, "implementing", "harness-failure");
+      return { advanced: false, status: "blocked", reason };
+    }
+    console.log(`[pipeline] #${issueNumber}: implementation done (${implResult.duration.toFixed(0)}s, harness=${primary})`);
+    await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
+    if (!(await commitsAheadFn(wt.path, cfg.base_branch))) {
+      await markBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing", "no-commits");
+      return { advanced: false, status: "blocked", reason: "no commits produced" };
+    }
+    if (implHeadBefore) {
+      const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
+      if (!implCheck.ok) {
+        await markBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
+        return { advanced: false, status: "blocked", reason: implCheck.reason };
+      }
+    }
+    const detailA = await fetchIssue(cfg, issueNumber);
+    const { title: titleA } = detailA;
+    const prBodyA = [
+      `Closes #${issueNumber}`,
+      "",
+      "## Summary",
+      `Automated implementation of [${titleA}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
+      "",
+      `**Implemented by**: ${primary}`,
+      `**Plan reviewed by**: ${reviewer}`,
+    ].join("\n") + footer(cfg);
+    const resumeWtA = { path: wt.path, branch: branchName(issueNumber, wt.slug) };
+    return doResume(cfg, issueNumber, resumeWtA, {
+      prTitle: `[Pipeline] ${titleA} (#${issueNumber})`,
+      prBody: prBodyA,
+      transitionMessage: (prNumber) =>
+        `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}. (Resumed after checkpoint approval.)`,
+      pipelineRunId,
+      stateDir: opts.stateDir,
+    });
+  }
+
+  // Sub-case B (pre-existing): commits from implementer exist — skip to post-impl steps.
+  if (!(await commitsAheadFn(wt.path, cfg.base_branch))) {
     return {
       advanced: false,
       status: "waiting",

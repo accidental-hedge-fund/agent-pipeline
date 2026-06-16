@@ -7,10 +7,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   bootstrapWorktree,
+  dispatchResume,
   enforceImplCommitRef,
   enforceOpenspecChangeSingular,
   invokeImplementer,
+  type AdvanceOpts,
   type BootstrapWorktreeDeps,
+  type DispatchResumeDeps,
 } from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
@@ -355,4 +358,92 @@ test("bootstrapWorktree: unblock-and-rerun at max_concurrent_worktrees: 1 — ca
   assert.equal(r2.ok, true, "second run must succeed after cleanup freed capacity");
   assert.equal(createCallCount, 2, "createWorktree must be callable again after cleanup");
   assert.equal(removeCallCount, 1, "removeWorktree must not be called on the successful run");
+});
+
+// ---------------------------------------------------------------------------
+// dispatchResume — pending-impl path (#23, Finding 1 regression)
+//
+// Verifies that dispatchResume runs the implementer when a pending-impl.txt
+// file is present (written when advance() paused at an approval checkpoint),
+// and that the implementer is NOT called when no pending file exists.
+// ---------------------------------------------------------------------------
+
+function okHarnessResult(): HarnessResult {
+  return { success: true, stdout: "", stderr: "", exit_code: 0, duration: 1, timed_out: false };
+}
+
+const resumeCfg = {
+  harnesses: { implementer: "claude" as const, reviewer: "codex" },
+  base_branch: "main",
+  repo: "org/repo",
+  models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet" },
+  implementation_timeout: 120,
+  implementation_ready_message: "Implementation ready.",
+  marker_footer: "*Automated by Claude Code Pipeline Skill*",
+} as unknown as PipelineConfig;
+
+const resumeOpts: AdvanceOpts = { dryRun: false };
+
+test("dispatchResume: pending-impl file present → runs implementer then resumes (Finding 1 regression)", async () => {
+  let implementerCalled = false;
+  let resumeCalled = false;
+
+  const deps: DispatchResumeDeps = {
+    getForIssue: async () => ({ path: "/wt/42-slug", slug: "42-slug" } as any),
+    // hasCommitsAhead is called after the implementer runs; return true so the
+    // "no commits produced" block is not triggered.
+    hasCommitsAhead: async () => true,
+    getIssueDetail: async () => ({ title: "Fix thing", body: "", labels: [], comments: [], state: "open" } as any),
+    readPendingImpl: async () => "stored implementing prompt",
+    // Return empty HEAD so enforceImplCommitRef is skipped (implHeadBefore = "")
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    invokeImplementer: async (_harness, _wt, prompt) => {
+      implementerCalled = true;
+      assert.equal(prompt, "stored implementing prompt");
+      return okHarnessResult();
+    },
+    resumeFromImplementing: async (_cfg, _n, _wt, _opts) => {
+      resumeCalled = true;
+      return { advanced: true, from: "implementing" as const, to: "review-1" as const, summary: "PR opened" };
+    },
+  };
+
+  const result = await dispatchResume(resumeCfg, 42, resumeOpts, deps);
+  assert.ok(implementerCalled, "implementer MUST be invoked when pending-impl.txt exists");
+  assert.ok(resumeCalled, "resumeFromImplementing MUST be called after implementer succeeds");
+  assert.equal(result.advanced, true);
+});
+
+test("dispatchResume: no pending-impl file, no commits → waiting (mid-flight guard not broken, Finding 1)", async () => {
+  let implementerCalled = false;
+
+  const deps: DispatchResumeDeps = {
+    getForIssue: async () => ({ path: "/wt/42-slug", slug: "42-slug" } as any),
+    hasCommitsAhead: async () => false,
+    getIssueDetail: async () => ({ title: "Fix thing", body: "", labels: [], comments: [], state: "open" } as any),
+    readPendingImpl: async () => null,
+    invokeImplementer: async () => { implementerCalled = true; return okHarnessResult(); },
+    resumeFromImplementing: async () => ({ advanced: false, status: "waiting", reason: "no commits" } as any),
+  };
+
+  const result = await dispatchResume(resumeCfg, 42, resumeOpts, deps);
+  assert.equal(implementerCalled, false, "implementer must NOT be called when pending-impl.txt is absent");
+  assert.equal(result.advanced, false);
+  assert.equal((result as any).status, "waiting");
+});
+
+test("dispatchResume: pending-impl file present, implementer fails → blocked (Finding 1)", async () => {
+  const deps: DispatchResumeDeps = {
+    getForIssue: async () => ({ path: "/wt/42-slug", slug: "42-slug" } as any),
+    hasCommitsAhead: async () => false,
+    getIssueDetail: async () => ({ title: "Fix thing", body: "", labels: [], comments: [], state: "open" } as any),
+    readPendingImpl: async () => "stored implementing prompt",
+    invokeImplementer: async () => ({ success: false, stdout: "", stderr: "harness error", exit_code: 1, duration: 5, timed_out: false }),
+    setBlocked: async () => { /* no-op in unit tests */ },
+    resumeFromImplementing: async () => { throw new Error("should not reach resume"); },
+  };
+
+  const result = await dispatchResume(resumeCfg, 42, resumeOpts, deps);
+  assert.equal(result.advanced, false);
+  assert.equal((result as any).status, "blocked");
 });
