@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "postinstall": "(cd core && npm ci --omit=dev --no-audit --no-fund)",
+    "postinstall": "node scripts/postinstall.mjs",
     "build": "node scripts/build.mjs",
     "build:check": "node scripts/build.mjs --check",
     "setup-hooks": "node scripts/setup-hooks.mjs",
