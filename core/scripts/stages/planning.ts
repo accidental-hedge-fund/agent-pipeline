@@ -172,10 +172,7 @@ export async function advance(
   const planPrompt = buildPlanningPrompt({ cfg, issueNumber, title, body, carryForward });
   let planResult: HarnessResult;
   try {
-    planResult = await invoke(primary, cfg.repo_dir, planPrompt, {
-      timeoutSec: cfg.implementation_timeout,
-      model: opts.model ?? cfg.models.planning,
-    });
+    planResult = await invokePlanStep(primary, wt.path, planPrompt, cfg, opts);
   } catch (err) {
     const e = err as Error;
     await setBlocked(cfg, issueNumber, `Plan generation failed: ${e.message}`, "ready", "plan-gen-failed");
@@ -247,10 +244,7 @@ export async function advance(
     );
 
     const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
-    const revisionResult = await invoke(primary, cfg.repo_dir, revisionPrompt, {
-      timeoutSec: cfg.implementation_timeout,
-      model: opts.model ?? cfg.models.planning,
-    });
+    const revisionResult = await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts);
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
@@ -471,9 +465,9 @@ async function advanceOpenspec(
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward, pipelineRunId }), {
-
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
+    sandbox: cfg.harness_sandbox,
   });
   if (!planResult.success) {
     const reason = planResult.timed_out
@@ -597,7 +591,7 @@ async function advanceOpenspec(
       primary,
       wt.path,
       buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext }),
-      { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
+      { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning, sandbox: cfg.harness_sandbox },
     );
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
       const reason = revisionResult.timed_out
@@ -976,6 +970,43 @@ export async function invokeImplementer(
   return inv(harness, wtPath, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.implementing,
+    sandbox: cfg.harness_sandbox,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Planning-step harness invocation (#21) — exported for unit testing
+// ---------------------------------------------------------------------------
+
+/** Injectable seam for unit-testing {@link invokePlanStep} without a real harness. */
+export interface PlanStepDeps {
+  invoke?: typeof invoke;
+}
+
+/**
+ * Invoke the implementer harness for a plan-generation or plan-revision step.
+ * When `cfg.harness_sandbox` is true AND the harness is "claude", the process
+ * cwd is the issue worktree (`wtPath`), confining the sandbox to that tree.
+ * For codex, `cfg.repo_dir` is always used regardless of the sandbox flag —
+ * codex's `-C` arg must be identical whether sandbox is on or off (spec:
+ * "sandboxed flag does not affect codex invocation"). When sandbox is false the
+ * repo root is used for both harnesses, preserving the pre-change default.
+ * The model uses the `models.planning` slot (same as the pre-change inline calls).
+ */
+export async function invokePlanStep(
+  harness: Harness,
+  wtPath: string,
+  prompt: string,
+  cfg: PipelineConfig,
+  opts: AdvanceOpts,
+  deps: PlanStepDeps = {},
+): Promise<HarnessResult> {
+  const inv = deps.invoke ?? invoke;
+  const dir = (cfg.harness_sandbox && harness === "claude") ? wtPath : cfg.repo_dir;
+  return inv(harness, dir, prompt, {
+    timeoutSec: cfg.implementation_timeout,
+    model: opts.model ?? cfg.models.planning,
+    sandbox: cfg.harness_sandbox,
   });
 }
 

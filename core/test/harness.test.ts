@@ -78,6 +78,78 @@ test("invoke(): a custom CLI that exits nonzero is a genuine failure (not a spaw
 });
 
 // ---------------------------------------------------------------------------
+// sandbox flag (#21) — permission-mode routing for the claude built-in harness
+//
+// We cannot spawn the real claude/codex CLIs in tests, but we can verify the
+// argument routing by putting a fake "claude"/"codex" script on PATH that echoes
+// all received arguments to stdout. Each arg is printed on its own line so
+// assertions can grep for --permission-mode values without positional fragility.
+// ---------------------------------------------------------------------------
+
+test("invoke(): claude with sandbox:true passes --permission-mode default, not bypassPermissions (#21)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "test-prompt", { stream: false, sandbox: true });
+    assert.match(result.stdout, /--permission-mode/, "must pass --permission-mode flag");
+    assert.match(result.stdout, /\bdefault\b/, "sandbox:true → permission mode must be 'default'");
+    assert.doesNotMatch(
+      result.stdout,
+      /bypassPermissions/,
+      "sandbox:true must NOT pass bypassPermissions",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): claude with sandbox:false passes --permission-mode bypassPermissions (#21)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "test-prompt", { stream: false, sandbox: false });
+    assert.match(result.stdout, /bypassPermissions/, "sandbox:false → permission mode must be bypassPermissions");
+    assert.doesNotMatch(
+      result.stdout,
+      /(?<!\w)default(?!\w)/,
+      "sandbox:false must NOT pass --permission-mode default",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): claude with sandbox absent (undefined) defaults to bypassPermissions (#21)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    // No sandbox option passed — must be byte-identical to the pre-change default.
+    const result = await invoke("claude", tmpRoot, "test-prompt", { stream: false });
+    assert.match(result.stdout, /bypassPermissions/, "sandbox absent → permission mode must be bypassPermissions");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): codex with sandbox:true produces args identical to sandbox:false (#21)", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const [withSandbox, withoutSandbox] = await Promise.all([
+      invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: true }),
+      invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: false }),
+    ]);
+    assert.equal(withSandbox.stdout, withoutSandbox.stdout, "codex args must be identical regardless of sandbox flag");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // formatStderrExcerpt — shared helper used by review and plan-review (#40)
 // ---------------------------------------------------------------------------
 

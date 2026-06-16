@@ -98,6 +98,9 @@ const PartialConfigSchema = z.object({
   // Worktree bootstrap: dependency install step (#174). Non-empty string →
   // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
   setup_command: z.string().optional(),
+  // Opt-in sandboxed harness execution (#21). When true, the claude implementer
+  // uses --permission-mode default instead of bypassPermissions.
+  harness_sandbox: z.boolean().optional(),
 }).strict();
 
 export interface ResolveOptions {
@@ -263,6 +266,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
     setup_command: fileConfig.setup_command,
+    harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
   };
   warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
@@ -506,5 +510,9 @@ doctor: # deterministic preflight capability check (#146) — run \`pipeline doc
 #     setup_command: ""                                       # opt-out
 #     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
 #     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
+
+# harness_sandbox: false # set true to run the claude implementer with --permission-mode default
+#   instead of bypassPermissions (#21). The codex harness is already sandboxed
+#   via --full-auto and is unaffected. Default false → current invocation unchanged.
 `;
 }

@@ -252,6 +252,12 @@ export interface PipelineConfig {
   // instead of auto-detection. When set to "" the install step is skipped
   // entirely. When absent (undefined), auto-detection runs from lockfile.
   setup_command?: string;
+  // Opt-in sandboxed harness execution (#21). When true, the claude implementer
+  // is invoked with --permission-mode default (claude's native sandboxed mode)
+  // instead of --permission-mode bypassPermissions. The codex harness is
+  // already workspace-sandboxed via --full-auto and is unaffected. Default false
+  // preserves the current byte-identical invocation.
+  harness_sandbox: boolean;
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
@@ -290,6 +296,7 @@ export const DEFAULT_CONFIG: Omit<
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
+  harness_sandbox: false,
 };
 
 // ---------------------------------------------------------------------------
