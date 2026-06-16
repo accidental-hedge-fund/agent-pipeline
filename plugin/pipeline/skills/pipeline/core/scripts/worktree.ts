@@ -158,12 +158,43 @@ export async function branchExists(
   return code === 0;
 }
 
+export interface CreateWorktreeDeps {
+  countActive?: (cfg: PipelineConfig) => Promise<number>;
+  existsSync?: (p: string) => boolean;
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
+  mkdirSync?: (p: string, opts: { recursive: boolean }) => void;
+  gitCmd?: (
+    cfg: PipelineConfig,
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; timeoutMs?: number },
+  ) => Promise<{ stdout: string; stderr: string; code: number }>;
+}
+
 export async function createWorktree(
   cfg: PipelineConfig,
   issueNumber: number,
   slug: string,
+  deps: CreateWorktreeDeps = {},
 ): Promise<{ path: string; branch: string }> {
-  const active = await countActive(cfg);
+  const existsFn = deps.existsSync ?? fs.existsSync;
+  const removeFn = deps.removeWorktree ?? removeWorktree;
+  const countFn = deps.countActive ?? countActive;
+  const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
+  const gitFn = deps.gitCmd ?? git;
+
+  const wtPath = worktreePath(cfg, issueNumber, slug);
+  const branch = branchName(issueNumber, slug);
+
+  // Reclaim this issue's stale worktree BEFORE the capacity check so it does
+  // not count against max_concurrent_worktrees on retry. This covers the case
+  // where setup succeeded but a later ready-stage step blocked, leaving the
+  // worktree alive (review-2 finding 1: setup-success strands capacity).
+  if (existsFn(wtPath)) {
+    await removeFn(cfg, issueNumber, slug);
+  }
+
+  const active = await countFn(cfg);
   if (active >= cfg.max_concurrent_worktrees) {
     throw new Error(
       `At worktree capacity (${active}/${cfg.max_concurrent_worktrees}). ` +
@@ -171,25 +202,17 @@ export async function createWorktree(
     );
   }
 
-  const wtPath = worktreePath(cfg, issueNumber, slug);
-  const branch = branchName(issueNumber, slug);
-
-  // If a worktree already exists at the path, remove it (stale).
-  if (fs.existsSync(wtPath)) {
-    await removeWorktree(cfg, issueNumber, slug);
-  }
-
   // Ensure the worktree root exists.
-  fs.mkdirSync(worktreeRoot(cfg), { recursive: true });
+  mkdirFn(worktreeRoot(cfg), { recursive: true });
 
   // Fetch the latest base branch.
-  await git(cfg, cfg.repo_dir, ["fetch", "origin", cfg.base_branch], { ignoreFailure: false });
+  await gitFn(cfg, cfg.repo_dir, ["fetch", "origin", cfg.base_branch], { ignoreFailure: false });
 
   // If the branch exists from a prior failed attempt, delete it.
-  await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+  await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
 
   // Create the worktree.
-  const { code, stderr } = await git(
+  const { code, stderr } = await gitFn(
     cfg,
     cfg.repo_dir,
     ["worktree", "add", wtPath, "-b", branch, `origin/${cfg.base_branch}`],

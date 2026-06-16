@@ -5,8 +5,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees } from "../scripts/worktree.ts";
-import type { WorktreeRecord, SweepDeps } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree } from "../scripts/worktree.ts";
+import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -324,4 +324,88 @@ test("sweep: stale-reg + unrelated worktree present → only pipeline worktree r
   assert.equal(removedIssues[0], 10);
   assert.equal(result.removed.length, 1);
   assert.equal(result.skipped.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// createWorktree — stale-path reclaim before capacity check (review-2 finding 1)
+//
+// Regression: setup succeeded but a later ready-stage step blocked, leaving the
+// worktree alive. On the next run, countActive() counted that stale worktree
+// against max_concurrent_worktrees, so the retry was permanently stuck at
+// "At worktree capacity" before the stale-path removal could fire.
+// Fix: reclaim the target issue's stale path BEFORE the capacity check.
+// ---------------------------------------------------------------------------
+
+function makeCreateCfg(): PipelineConfig {
+  return {
+    repo_dir: "/repo",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    max_concurrent_worktrees: 1,
+  } as unknown as PipelineConfig;
+}
+
+test("createWorktree: stale path for same issue is reclaimed before capacity check (review-2 finding 1)", async () => {
+  const cfg = makeCreateCfg();
+  let callOrder = 0;
+  let removeCallOrder = -1;
+  let countCallOrder = -1;
+  let removedIssue: number | null = null;
+
+  const deps: CreateWorktreeDeps = {
+    existsSync: (p) => p.includes("pipeline-42"),
+    removeWorktree: async (_cfg, issueNumber) => {
+      removedIssue = issueNumber;
+      removeCallOrder = callOrder++;
+    },
+    countActive: async () => {
+      countCallOrder = callOrder++;
+      return 0;
+    },
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+
+  assert.equal(result.path.includes("pipeline-42"), true);
+  assert.equal(removedIssue, 42, "stale path must be reclaimed");
+  assert.ok(removeCallOrder < countCallOrder, "removeWorktree must fire before countActive");
+});
+
+test("createWorktree: no stale path → does not call removeWorktree before capacity check", async () => {
+  const cfg = makeCreateCfg();
+  let removeCalled = false;
+
+  const deps: CreateWorktreeDeps = {
+    existsSync: () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    countActive: async () => 0,
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(result.path.includes("pipeline-42"), true);
+  assert.equal(removeCalled, false, "removeWorktree must not be called when no stale path exists");
+});
+
+test("createWorktree: stale path reclaimed, then capacity check fires for other issues", async () => {
+  // After reclaiming this issue's stale slot, if OTHER issues still fill the pool,
+  // the capacity error must still fire.
+  const cfg = makeCreateCfg();
+
+  const deps: CreateWorktreeDeps = {
+    existsSync: (p) => p.includes("pipeline-42"),
+    removeWorktree: async () => {},
+    countActive: async () => 1, // another issue occupies the remaining slot
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+  };
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /At worktree capacity/,
+    "capacity error must fire when other issues fill the pool after stale reclaim",
+  );
 });
