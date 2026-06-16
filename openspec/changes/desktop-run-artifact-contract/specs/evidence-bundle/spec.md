@@ -26,7 +26,7 @@ The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/
 ---
 
 ### Requirement: Bundle records stage transitions incrementally
-For each pipeline stage, the orchestrator SHALL append a `stage_start` event to `events.jsonl` when the stage handler is entered and a `stage_complete` event when the stage handler exits. The `stage_complete` event SHALL contain: `stage` (stage name string), `at` (ISO 8601 timestamp), `outcome` (one of `"advanced"`, `"blocked"`, `"skipped"`, or `"error"`), `commits` (array of commit SHA strings produced during the stage), `commands` (array of `CommandRecord` objects), and `prompts` (array of `PromptRecord` objects). The full accumulated stage history SHALL also appear in `summary.json` at finalization.
+For each pipeline stage, the orchestrator SHALL append a `stage_start` event to `events.jsonl` when the stage handler is entered and a `stage_complete` event when the stage handler exits. The `stage_complete` event SHALL contain: `stage` (stage name string), `at` (ISO 8601 timestamp), `outcome` (one of `"advanced"`, `"blocked"`, `"skipped"`, or `"error"`), and `commits` (array of commit SHA strings produced during the stage). `commands` (array of `CommandRecord`) and `prompts` (array of `PromptRecord`) are accumulated per-stage during execution and appear only in `summary.json` at finalization — they are not included in individual `stage_complete` events because they are collected deep inside stage handlers and are not available at the orchestrator level where events are appended. The full accumulated stage history (including commands and prompts) SHALL appear in `summary.json` at finalization.
 
 #### Scenario: stage entry recorded as stage_start event
 - **WHEN** a stage handler is entered
@@ -34,7 +34,7 @@ For each pipeline stage, the orchestrator SHALL append a `stage_start` event to 
 
 #### Scenario: stage exit recorded as stage_complete event
 - **WHEN** a stage handler exits
-- **THEN** a `stage_complete` event SHALL be appended to `events.jsonl` with `stage`, `at`, `outcome`, `commits`, `commands`, and `prompts`
+- **THEN** a `stage_complete` event SHALL be appended to `events.jsonl` with `stage`, `at`, `outcome`, and `commits`
 
 #### Scenario: multiple stages recorded in order in events.jsonl
 - **WHEN** stages `planning` → `review` → `pre-merge` each complete

@@ -65,6 +65,7 @@ export interface StageCompleteEvent extends RunEventBase {
   type: "stage_complete";
   stage: string;
   outcome: string;
+  commits?: string[];
 }
 export interface PrCreatedEvent extends RunEventBase {
   type: "pr_created";
@@ -293,8 +294,12 @@ export async function finalizeRun(
   };
   await appendEvent(runDir, completeEvent, deps);
 
-  // Serialize bundle — same sanitization as evidence-bundle.ts writeBundle
-  const summaryWithVersion = { ...bundle, schema_version: RUN_SCHEMA_VERSION };
+  // Serialize bundle — same sanitization as evidence-bundle.ts writeBundle.
+  // run_id is the filesystem-safe directory name so consumers can join summary.json
+  // to the run directory by a single stable identifier (the bundle's runId field
+  // uses the commit-trailer format 155/..., which differs from the dir name 155-...).
+  const fileRunId = path.basename(runDir);
+  const summaryWithVersion = { ...bundle, schema_version: RUN_SCHEMA_VERSION, run_id: fileRunId };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
 
@@ -383,16 +388,31 @@ export function startTerminalLogTee(logPath: string): TerminalLogTee {
   const origStdoutWrite = process.stdout.write.bind(process.stdout) as typeof process.stdout.write;
   const origStderrWrite = process.stderr.write.bind(process.stderr) as typeof process.stderr.write;
 
+  // teeActive gates every write to logStream. The error handler flips it to false
+  // and restores the original writes so a log-stream failure is non-fatal and does
+  // not crash the pipeline via an unhandled 'error' event on the WriteStream.
+  let teeActive = true;
+
+  logStream.on("error", (err) => {
+    if (!teeActive) return;
+    teeActive = false;
+    console.warn(`[pipeline] run-store: terminal.log stream error (non-fatal): ${err.message}`);
+    (process.stdout as { write: typeof origStdoutWrite }).write = origStdoutWrite;
+    (process.stderr as { write: typeof origStderrWrite }).write = origStderrWrite;
+  });
+
   function makePatch(
     orig: typeof origStdoutWrite,
   ): typeof origStdoutWrite {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return function (...args: any[]): boolean {
       const [chunk, enc] = args;
-      if (typeof chunk === "string") {
-        logStream.write(chunk, typeof enc === "string" ? (enc as BufferEncoding) : "utf8");
-      } else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
-        logStream.write(chunk as Buffer);
+      if (teeActive) {
+        if (typeof chunk === "string") {
+          logStream.write(chunk, typeof enc === "string" ? (enc as BufferEncoding) : "utf8");
+        } else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+          logStream.write(chunk as Buffer);
+        }
       }
       // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       return (orig as (...a: any[]) => boolean)(...args);
@@ -407,6 +427,7 @@ export function startTerminalLogTee(logPath: string): TerminalLogTee {
       origStdoutWrite(chunk);
     },
     stop(): Promise<void> {
+      teeActive = false;
       (process.stdout as { write: typeof origStdoutWrite }).write = origStdoutWrite;
       (process.stderr as { write: typeof origStderrWrite }).write = origStderrWrite;
       return new Promise<void>((resolve) => {

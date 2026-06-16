@@ -168,6 +168,10 @@ export async function advance(
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
   const wt = bootstrap.wt;
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }).catch(() => {});
+  }
 
   // ---- Step 0: optional carry-forward context (last30days) ----
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
@@ -424,6 +428,10 @@ async function advanceOpenspec(
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
   const wt = bootstrap.wt;
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }).catch(() => {});
+  }
 
   // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
   if (!openspec.isInitialized(wt.path)) {
@@ -826,6 +834,8 @@ export async function resumeFromImplementing(
 
   // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----
   let prNumber: number;
+  // Track whether the PR is newly created this run so we emit pr_created vs pr_updated.
+  let prIsNew = false;
   const existing = await prLookup(cfg, branch);
   if (existing) {
     prNumber = existing;
@@ -833,6 +843,7 @@ export async function resumeFromImplementing(
   } else {
     try {
       prNumber = await prCreator(cfg, { branch, title: opts.prTitle, body: opts.prBody });
+      prIsNew = true;
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
     } catch (err) {
       // Race: another actor may have created the PR between our pre-check and
@@ -849,10 +860,12 @@ export async function resumeFromImplementing(
     }
   }
 
-  // ---- Emit pr_created event (#155) ----
+  // ---- Emit pr_created or pr_updated event (#155) ----
+  // Only pr_created when the PR was opened during this run; pr_updated for resume/reuse.
   if (opts.runDir) {
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "pr_created", at, pr: prNumber }).catch(() => {});
+    const evType = prIsNew ? "pr_created" : "pr_updated";
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }).catch(() => {});
   }
 
   // ---- implementing → review-1 ----
