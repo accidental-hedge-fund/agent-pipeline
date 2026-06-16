@@ -24,6 +24,7 @@ export const TERMINAL_STAGES = new Set<Stage>(["ready-to-deploy", "needs-human"]
 export const LABEL_PREFIX = "pipeline:";
 export const BLOCKED_LABEL = "blocked";
 export const HARNESS_LABEL_PREFIX = "harness:";
+export const AWAITING_APPROVAL_LABEL = "pipeline:awaiting-approval";
 
 export type Harness = "claude" | "codex";
 
@@ -256,6 +257,11 @@ export interface PipelineConfig {
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
   domain_description?: string;
+  // Optional human approval checkpoints (#23). Array of stage names at which
+  // the pipeline pauses and waits for a human to approve (by removing the
+  // `pipeline:awaiting-approval` label) before dispatching the stage. Default
+  // empty array = fully autonomous end-to-end.
+  approvalCheckpoints: string[];
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -290,6 +296,7 @@ export const DEFAULT_CONFIG: Omit<
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
+  approvalCheckpoints: [],
 };
 
 // ---------------------------------------------------------------------------

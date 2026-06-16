@@ -995,3 +995,98 @@ test("resolveConfig: doctor.runOnStart:true tolerates gh failure and returns rep
     process.env.PATH = oldPath;
   }
 });
+
+// ---- approval_checkpoints (#23) ----
+
+test("resolveConfig: approval_checkpoints absent → defaults to empty array", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/ac0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.approvalCheckpoints, []);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: approval_checkpoints with valid stage names accepted", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: [implementing, pre-merge]\n`);
+  const binDir = makeFakeGh("acme/ac1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.approvalCheckpoints, ["implementing", "pre-merge"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: approval_checkpoints with unknown stage name is rejected", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: [implmenting]\n`); // typo
+  const binDir = makeFakeGh("acme/ac2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("implmenting"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: approval_checkpoints with ready-to-deploy is rejected", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: [ready-to-deploy]\n`);
+  const binDir = makeFakeGh("acme/ac3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("ready-to-deploy"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: approval_checkpoints with backlog is rejected", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: [backlog]\n`);
+  const binDir = makeFakeGh("acme/ac4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("backlog"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: approval_checkpoints empty array is accepted", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: []\n`);
+  const binDir = makeFakeGh("acme/ac5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.approvalCheckpoints, []);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

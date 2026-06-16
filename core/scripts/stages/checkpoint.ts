@@ -1,0 +1,138 @@
+// Human approval checkpoint helpers (#23).
+//
+// Pure helpers (no network/git calls) for building, parsing, and posting
+// checkpoint comments. The advance loop in pipeline.ts uses these alongside
+// the label helpers in gh.ts to implement the checkpoint gate.
+
+import { AWAITING_APPROVAL_LABEL } from "../types.ts";
+import type { Outcome, PipelineConfig, Stage } from "../types.ts";
+
+export const CHECKPOINT_COMMENT_HEADER = "## Pipeline: Awaiting Approval";
+
+// A 40-char all-zero SHA used as a sentinel when no real branch HEAD exists
+// (e.g. before the implementing stage has run). Comparing null-SHA to null-SHA
+// is equal (no re-issue); comparing null-SHA to a real SHA triggers re-issue.
+const NULL_SHA = "0000000000000000000000000000000000000000";
+
+type Comment = { author: string; body: string; createdAt: string };
+
+/** Returns the most recent checkpoint comment, or null if none exists. */
+export function findCheckpointComment(comments: Comment[]): Comment | null {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    if (comments[i].body.startsWith(CHECKPOINT_COMMENT_HEADER)) return comments[i];
+  }
+  return null;
+}
+
+/**
+ * Extracts the full SHA from a `<!-- checkpoint-sha: <sha> -->` sentinel.
+ * Returns null when the sentinel is absent or does not contain a hex SHA.
+ */
+export function extractCheckpointSha(comment: { body: string }): string | null {
+  const m = comment.body.match(/<!--\s*checkpoint-sha:\s*([a-f0-9]{40})\s*-->/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Builds the full checkpoint comment body including the HTML sentinel and
+ * "### How to approve" instructions. `headSha` is the full 40-char SHA (or the
+ * null-SHA sentinel when no branch exists yet). An optional `notice` line is
+ * inserted after the SHA to explain why the comment was re-issued (e.g. branch
+ * advanced).
+ */
+export function buildCheckpointComment(stage: string, headSha: string, notice?: string): string {
+  const displaySha = headSha === NULL_SHA ? "(no branch yet)" : headSha.slice(0, 7);
+  const lines = [
+    CHECKPOINT_COMMENT_HEADER,
+    "",
+    `The pipeline has paused before dispatching the **${stage}** stage and is awaiting human approval.`,
+    "",
+    `**Stage**: ${stage}`,
+    `**HEAD**: ${displaySha}`,
+  ];
+  if (notice) {
+    lines.push("", `> ${notice}`);
+  }
+  lines.push(
+    "",
+    `<!-- checkpoint-sha: ${headSha} -->`,
+    "",
+    "### How to approve",
+    "",
+    "1. Remove the `pipeline:awaiting-approval` label from this issue.",
+    "2. Re-invoke the pipeline.",
+    "",
+    "---",
+    "*Automated by Claude Code Pipeline Skill*",
+  );
+  return lines.join("\n");
+}
+
+/** IO seam for {@link checkApprovalCheckpoint} — no real GH/git calls in tests. */
+export interface CheckpointDeps {
+  postCheckpointComment: (issueNumber: number, body: string) => Promise<void>;
+  applyAwaitingApprovalLabel: (issueNumber: number) => Promise<void>;
+}
+
+/**
+ * Evaluate the approval checkpoint for `stage` and return a `waiting` Outcome
+ * when the loop should pause, or null when the stage may be dispatched normally.
+ *
+ * Branches:
+ *  (a) stage not in approvalCheckpoints → null (dispatch normally)
+ *  (b) label absent + no prior checkpoint comment → fire: post comment + apply label + return waiting
+ *  (c) label absent + prior checkpoint comment exists → null (human approved, dispatch normally)
+ *  (d) label present + SHA matches → return waiting (unchanged, still pending)
+ *  (e) label present + SHA stale or no comment found → re-issue comment + return waiting
+ */
+export async function checkApprovalCheckpoint(
+  stage: Stage,
+  cfg: Pick<PipelineConfig, "approvalCheckpoints">,
+  issueLabels: string[],
+  issueNumber: number,
+  headSha: string,
+  comments: Comment[],
+  deps: CheckpointDeps,
+): Promise<Outcome | null> {
+  // (a) Not a checkpoint stage — dispatch normally.
+  if (!cfg.approvalCheckpoints.includes(stage)) return null;
+
+  const hasAwaitingLabel = issueLabels.includes(AWAITING_APPROVAL_LABEL);
+  const checkpointComment = findCheckpointComment(comments);
+
+  if (!hasAwaitingLabel) {
+    if (checkpointComment !== null) {
+      // (c) Human removed the label (approved) — dispatch normally.
+      return null;
+    }
+    // (b) First encounter — fire the checkpoint.
+    const body = buildCheckpointComment(stage, headSha);
+    await deps.postCheckpointComment(issueNumber, body);
+    await deps.applyAwaitingApprovalLabel(issueNumber);
+    return { advanced: false, status: "waiting", reason: `checkpoint awaiting approval at stage ${stage}` };
+  }
+
+  // Label is present: still waiting. Check if SHA changed.
+  if (checkpointComment === null) {
+    // (e) Label present but comment was deleted — re-issue.
+    const body = buildCheckpointComment(stage, headSha);
+    await deps.postCheckpointComment(issueNumber, body);
+    return { advanced: false, status: "waiting", reason: `checkpoint awaiting approval at stage ${stage}` };
+  }
+
+  const storedSha = extractCheckpointSha(checkpointComment);
+  if (storedSha !== null && storedSha === headSha) {
+    // (d) SHA unchanged — still waiting, don't re-post.
+    return { advanced: false, status: "waiting", reason: `checkpoint awaiting approval at stage ${stage}` };
+  }
+
+  // (e) SHA changed (or sentinel could not be parsed) — re-issue with notice.
+  const oldShort = storedSha ? storedSha.slice(0, 7) : "unknown";
+  const newShort = headSha === NULL_SHA ? "(no branch)" : headSha.slice(0, 7);
+  const notice = `Branch advanced from ${oldShort} to ${newShort}; checkpoint re-issued.`;
+  const body = buildCheckpointComment(stage, headSha, notice);
+  await deps.postCheckpointComment(issueNumber, body);
+  return { advanced: false, status: "waiting", reason: `checkpoint awaiting approval at stage ${stage}` };
+}
+
+export { NULL_SHA };

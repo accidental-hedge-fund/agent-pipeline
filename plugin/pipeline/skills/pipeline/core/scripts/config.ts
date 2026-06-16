@@ -5,7 +5,7 @@ import yaml from "js-yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DEFAULT_CONFIG, type Harness, type PipelineConfig } from "./types.ts";
+import { DEFAULT_CONFIG, STAGES, type Harness, type PipelineConfig } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 
 const PartialConfigSchema = z.object({
@@ -98,6 +98,21 @@ const PartialConfigSchema = z.object({
   // Worktree bootstrap: dependency install step (#174). Non-empty string →
   // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
   setup_command: z.string().optional(),
+  // Optional human approval checkpoints (#23). Each entry must be a valid
+  // stage name, but "backlog" and "ready-to-deploy" are excluded (you can't
+  // checkpoint the initial triage stage or the terminal deploy stage).
+  approval_checkpoints: z.array(z.string())
+    .superRefine((entries, ctx) => {
+      const valid = new Set(STAGES.filter((s) => s !== "backlog" && s !== "ready-to-deploy"));
+      const bad = entries.filter((e) => !valid.has(e as any));
+      if (bad.length > 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `invalid approval_checkpoints ${bad.length === 1 ? "entry" : "entries"}: ${bad.join(", ")}. Valid stages are: ${[...valid].join(", ")}`,
+        });
+      }
+    })
+    .optional(),
 }).strict();
 
 export interface ResolveOptions {
@@ -263,6 +278,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
     setup_command: fileConfig.setup_command,
+    approvalCheckpoints: fileConfig.approval_checkpoints ?? DEFAULT_CONFIG.approvalCheckpoints,
   };
   warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
@@ -506,5 +522,12 @@ doctor: # deterministic preflight capability check (#146) — run \`pipeline doc
 #     setup_command: ""                                       # opt-out
 #     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
 #     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
+
+# approval_checkpoints: [] # optional human approval gates (#23). List stage names where the pipeline should
+#   pause and wait for a human to approve before dispatching the stage. Approval = removing the
+#   pipeline:awaiting-approval label, then re-invoking the pipeline.
+#   Valid stages: ready, planning, plan-review, implementing, review-1, fix-1, review-2, fix-2, pre-merge, eval-gate
+#   Example — require approval before implementation begins:
+#     approval_checkpoints: ["implementing"]
 `;
 }

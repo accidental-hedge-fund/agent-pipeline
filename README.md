@@ -22,6 +22,7 @@ backlog → ready → planning → plan-review → implementing
 - [Troubleshooting](#troubleshooting)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
+  - [Human approval checkpoints](#human-approval-checkpoints)
   - [Human plan feedback](#human-plan-feedback)
   - [Commit traceability trailers](#commit-traceability-trailers-always-on)
   - [Eval gate](#eval-gate)
@@ -266,6 +267,10 @@ review_harness: my-reviewer          # optional: override the reviewer CLI for t
 # The implementer harness is owned by the install profile and cannot be set here.
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
 # rejected at config-parse time.
+# approval_checkpoints: []            # optional human approval gates — see "Human approval checkpoints"
+#   List stage names where the pipeline pauses and waits for a human to remove the
+#   pipeline:awaiting-approval label before dispatching. Example:
+#   approval_checkpoints: [implementing]
 ```
 
 ### Custom reviewer harness (`review_harness`)
@@ -467,6 +472,30 @@ The `steps` block turns the optional "thoroughness" steps on or off per repo, to
 The structural and safety steps — planning, implementing, and the pre-merge **CI** and **mergeability** gates — are **not** configurable: they have no toggle, and an unknown key under `steps` (e.g. `mergeability: false`) is rejected at config-parse time rather than silently dropping a safety gate.
 
 Review verdicts are also pinned to the commit they evaluated. Every review comment records the reviewed commit SHA — surfaced in the header (e.g. `— approve (commit a1b2c3d)`) and embedded as a machine-readable footer sentinel. Before pre-merge acts on a prior approval it re-checks that SHA against current HEAD: if any commit has landed since the review, the stale verdict is discarded and the item returns to its review round for a fresh review (posting a `## Pipeline: Re-running review` comment) rather than advancing. This is always-on — there is no toggle.
+
+### Human approval checkpoints
+
+`approval_checkpoints` lets a repo pause the pipeline at configurable stage boundaries and wait for a human to explicitly approve before the next stage runs. Teams that want to start with narrower autonomy — e.g. requiring human sign-off before any implementation begins — can declare this once in config and widen it as trust grows.
+
+```yaml
+# Pause before implementation; human must approve before the implementing stage runs.
+approval_checkpoints: [implementing]
+
+# Multiple checkpoints — pause before implementing AND before pre-merge:
+approval_checkpoints: [implementing, pre-merge]
+```
+
+**How it works:**
+
+1. When the pipeline is about to dispatch a stage listed in `approval_checkpoints` *and* the issue does not carry `pipeline:awaiting-approval`, it posts a `## Pipeline: Awaiting Approval` comment on the issue, applies `pipeline:awaiting-approval`, and stops with `status: waiting`.
+2. A human reviews the situation, decides to approve, and **removes the `pipeline:awaiting-approval` label** from the issue.
+3. The next `/pipeline N` re-invocation finds the label absent (and sees the prior checkpoint comment in the history), so it dispatches the stage normally.
+
+**Staleness detection.** The checkpoint comment embeds the current PR branch HEAD SHA as an HTML sentinel (`<!-- checkpoint-sha: <sha> -->`). If a developer pushes new commits while the pipeline is waiting, the next invocation detects the SHA change and re-issues the checkpoint comment noting the branch advanced — the label stays on so the human re-reviews the updated state before approving.
+
+**Valid checkpoint stages.** Any stage except `backlog` and `ready-to-deploy`: `ready`, `planning`, `plan-review`, `implementing`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `eval-gate`. An invalid stage name is rejected at config-load time.
+
+**Default: empty (fully autonomous).** With `approval_checkpoints: []` (the default when the key is absent), behavior is byte-for-byte identical to the pre-1.2.3 pipeline — no checkpoints, no pauses, no new labels.
 
 ### Human plan feedback
 

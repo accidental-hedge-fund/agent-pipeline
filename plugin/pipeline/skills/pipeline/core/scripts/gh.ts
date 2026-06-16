@@ -9,6 +9,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  AWAITING_APPROVAL_LABEL,
   BLOCKED_LABEL,
   BLOCKER_RECIPES,
   DEFAULT_BLOCKER_KIND,
@@ -324,6 +325,7 @@ export function getHarnessLabel(labels: string[]): "claude" | "codex" | null {
 export async function ensurePipelineLabels(cfg: PipelineConfig): Promise<void> {
   const desired: { name: string; color: string; description: string }[] = [
     { name: BLOCKED_LABEL, color: "D73A4A", description: "Pipeline blocked awaiting human or external action" },
+    { name: AWAITING_APPROVAL_LABEL, color: "FBCA04", description: "Pipeline paused awaiting human approval at a declared checkpoint" },
     { name: "harness:claude", color: "6F42C1", description: "Pipeline item owned by Claude primary harness" },
     { name: "harness:codex", color: "0052CC", description: "Pipeline item owned by Codex primary harness" },
     ...STAGES.map((stage) => ({
@@ -598,6 +600,20 @@ export async function clearBlocked(
     "-R",
     cfg.repo,
   ]);
+}
+
+export async function applyAwaitingApprovalLabel(
+  cfg: PipelineConfig,
+  issueNumber: number,
+): Promise<void> {
+  await addLabel(cfg, issueNumber, AWAITING_APPROVAL_LABEL);
+}
+
+export async function removeAwaitingApprovalLabel(
+  cfg: PipelineConfig,
+  issueNumber: number,
+): Promise<void> {
+  await removeLabel(cfg, issueNumber, AWAITING_APPROVAL_LABEL);
 }
 
 // ---------------------------------------------------------------------------

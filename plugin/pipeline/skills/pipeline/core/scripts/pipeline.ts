@@ -22,6 +22,7 @@ import {
   clearBlocked,
   getIssueDetail,
   getItemKind,
+  getPrDetail,
   getPrForIssue,
   getPrLinkedIssue,
   ensurePipelineLabels,
@@ -32,6 +33,11 @@ import {
   silentTransition,
   transition,
 } from "./gh.ts";
+import {
+  checkApprovalCheckpoint,
+  NULL_SHA,
+  type CheckpointDeps,
+} from "./stages/checkpoint.ts";
 import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
@@ -62,6 +68,7 @@ import {
   type PreflightResult,
 } from "./stages/doctor.ts";
 import {
+  AWAITING_APPROVAL_LABEL,
   LABEL_PREFIX,
   reviewStageSkipTarget,
   type Outcome,
@@ -844,6 +851,42 @@ async function runAdvance(
         }
         if (opts.once) break;
         continue;
+      }
+
+      // Approval checkpoint gate (#23): fire before dispatch when the stage is
+      // declared in approvalCheckpoints, unless the human already cleared the
+      // label (approved) in a prior run.
+      if (cfg.approvalCheckpoints.length > 0) {
+        // Get PR HEAD SHA for staleness detection (falls back to NULL_SHA when
+        // no PR exists yet, e.g. at the implementing stage on first run).
+        let headShaForCheckpoint = NULL_SHA;
+        try {
+          const prNumber = await getPrForIssue(cfg, issueNumber);
+          if (prNumber !== null) {
+            const prDetail = await getPrDetail(cfg, prNumber);
+            headShaForCheckpoint = prDetail.head_sha;
+          }
+        } catch {
+          /* PR not found or transient error — keep NULL_SHA */
+        }
+        const checkpointDeps: CheckpointDeps = {
+          postCheckpointComment: (n, body) => postComment(cfg, n, body),
+          applyAwaitingApprovalLabel: (n) => addLabel(cfg, n, AWAITING_APPROVAL_LABEL),
+        };
+        const checkpointOut = await checkApprovalCheckpoint(
+          stage,
+          cfg,
+          detail.labels,
+          issueNumber,
+          headShaForCheckpoint,
+          detail.comments,
+          checkpointDeps,
+        );
+        if (checkpointOut !== null) {
+          console.log(`[pipeline] #${issueNumber}: checkpoint awaiting approval at stage ${stage}`);
+          printOutcome(issueNumber, stage, checkpointOut);
+          break;
+        }
       }
 
       // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
