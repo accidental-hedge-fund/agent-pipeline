@@ -117,7 +117,7 @@ test("resumeFromImplementing: gate passes + push ok + no existing PR → creates
 
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
-    getPrForIssue: async () => null,
+    getPrForBranch: async () => null,
     createPr: async () => { createPrCalled = true; return 77; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedCalls.push(reason); },
@@ -161,7 +161,7 @@ test("resumeFromImplementing: gate passes + push ok + PR already exists → reus
 
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
-    getPrForIssue: async () => 55, // existing PR #55
+    getPrForBranch: async () => 55, // existing PR #55
     createPr: async () => { createPrCalled = true; return 0; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -197,7 +197,7 @@ test("resumeFromImplementing: gate fails → calls setBlocked and returns blocke
 
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => failedGate(),
-    getPrForIssue: async () => null,
+    getPrForBranch: async () => null,
     createPr: async () => { createPrCalled = true; return 0; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedArgs.push(reason); },
@@ -223,6 +223,57 @@ test("resumeFromImplementing: gate fails → calls setBlocked and returns blocke
   assert.equal(result.advanced, false);
   if (!result.advanced) {
     assert.equal(result.status, "blocked");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3.5b: Regression — PR creation race: createPr throws but PR now exists →
+//        transition succeeds (finding 2 fix)
+// ---------------------------------------------------------------------------
+
+test("resumeFromImplementing: createPr throws but PR appeared concurrently → reuses it and transitions to review-1", async () => {
+  let transitionCalled = false;
+  const setBlockedCalls: string[] = [];
+
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    // First call: null (pre-check); second call (catch retry): PR 66 exists
+    getPrForBranch: (() => {
+      let calls = 0;
+      return async () => {
+        calls++;
+        return calls === 1 ? null : 66;
+      };
+    })(),
+    createPr: async () => { throw new Error("PR already exists"); },
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async (_cfg, _n, reason) => { setBlockedCalls.push(reason); },
+    transition: async (_cfg, _n, from, to, msg) => {
+      assert.equal(from, "implementing");
+      assert.equal(to, "review-1");
+      assert.ok(msg?.includes("66"), "transition comment should reference PR #66");
+      transitionCalled = true;
+    },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    42,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] Fix the bug (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (prNumber) => `PR #${prNumber} ready.`,
+      pipelineRunId: "run-1",
+    },
+    deps,
+  );
+
+  assert.ok(transitionCalled, "transition should be called after catching the race-created PR");
+  assert.equal(setBlockedCalls.length, 0, "setBlocked must NOT be called when PR appeared concurrently");
+  assert.equal(result.advanced, true);
+  if (result.advanced) {
+    assert.equal(result.to, "review-1");
   }
 });
 
@@ -268,7 +319,7 @@ test("3.6 bite-proof: resumeFromImplementing — calling createPr when PR exists
 
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
-    getPrForIssue: async () => 55, // existing PR
+    getPrForBranch: async () => 55, // existing PR
     createPr: brokenCreatePr, // broken: would create even when PR exists
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -303,7 +354,7 @@ test("resumeFromImplementing: skipped gate → advances to review-1 (gate-less r
 
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => skippedGate(),
-    getPrForIssue: async () => null,
+    getPrForBranch: async () => null,
     createPr: async () => { createPrCalled = true; return 88; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -340,7 +391,7 @@ test("resumeFromImplementing: fresh-flow worktree shape (no slug, branch from cr
 
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
-    getPrForIssue: async () => null,
+    getPrForBranch: async () => null,
     createPr: async () => 99,
     gitInWorktree: async (_path, args) => {
       if (args[0] === "push") pushedBranch.push(args[args.length - 1]);

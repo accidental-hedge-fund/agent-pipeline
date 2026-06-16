@@ -15,6 +15,7 @@ import {
   createPr,
   extractHumanPlanComments,
   getIssueDetail,
+  getPrForBranch,
   getPrForIssue,
   postComment,
   setBlocked,
@@ -681,7 +682,8 @@ export function enforceOpenspecChangeSingular(
 /** Injectable seams for {@link resumeFromImplementing} — unit tests inject fakes. */
 export interface ResumeFromImplementingDeps {
   runTestGate?: typeof runTestGate;
-  getPrForIssue?: typeof getPrForIssue;
+  /** Exact-branch PR lookup — scoped to wt.branch so stale same-issue PRs are never reused. */
+  getPrForBranch?: typeof getPrForBranch;
   createPr?: typeof createPr;
   gitInWorktree?: typeof gitInWorktree;
   setBlocked?: typeof setBlocked;
@@ -694,8 +696,10 @@ export interface ResumeFromImplementingDeps {
  * OpenSpec flows, and from the dispatch resume path when re-entering at
  * `implementing` with an existing worktree that has commits ahead of base.
  *
- * When a PR already exists (found via `getPrForIssue` before attempting creation)
- * it is reused so resume runs never attempt to open a duplicate.
+ * PR lookup uses exact head-branch matching (getPrForBranch) so a stale PR
+ * from a prior slug (pipeline/N-old-slug) is never mistaken for this run's PR.
+ * If createPr throws due to a race (another actor created the PR between our
+ * pre-check and the create call), the catch block re-checks before blocking.
  */
 export async function resumeFromImplementing(
   cfg: PipelineConfig,
@@ -712,7 +716,7 @@ export async function resumeFromImplementing(
   deps: ResumeFromImplementingDeps = {},
 ): Promise<Outcome> {
   const gateRunner = deps.runTestGate ?? runTestGate;
-  const prLookup = deps.getPrForIssue ?? getPrForIssue;
+  const prLookup = deps.getPrForBranch ?? getPrForBranch;
   const prCreator = deps.createPr ?? createPr;
   const gitOp = deps.gitInWorktree ?? gitInWorktree;
   const blocker = deps.setBlocked ?? setBlocked;
@@ -734,20 +738,28 @@ export async function resumeFromImplementing(
     return { advanced: false, status: "blocked", reason: "push failed" };
   }
 
-  // ---- Create or find PR (check first to avoid duplicates on resume) ----
+  // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----
   let prNumber: number;
-  const existing = await prLookup(cfg, issueNumber);
+  const existing = await prLookup(cfg, branch);
   if (existing) {
     prNumber = existing;
-    console.log(`[pipeline] #${issueNumber}: PR #${prNumber} already exists — reusing`);
+    console.log(`[pipeline] #${issueNumber}: PR #${prNumber} already exists for branch ${branch} — reusing`);
   } else {
     try {
       prNumber = await prCreator(cfg, { branch, title: opts.prTitle, body: opts.prBody });
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
     } catch (err) {
-      const e = err as Error;
-      await blocker(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
-      return { advanced: false, status: "blocked", reason: e.message };
+      // Race: another actor may have created the PR between our pre-check and
+      // the create call. Re-check before blocking so an existing PR is reused.
+      const raceWinner = await prLookup(cfg, branch);
+      if (raceWinner) {
+        prNumber = raceWinner;
+        console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created concurrently — reusing`);
+      } else {
+        const e = err as Error;
+        await blocker(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
+        return { advanced: false, status: "blocked", reason: e.message };
+      }
     }
   }
 

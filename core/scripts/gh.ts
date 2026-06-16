@@ -787,6 +787,30 @@ export async function getPrForIssue(
   return resolvePrForIssue(parsePrList(stdout), issueNumber, cfg.repo);
 }
 
+/** Look up the open PR whose head branch exactly equals {@link branch}.
+ *  Unlike getPrForIssue, this is scoped to one specific branch so stale PRs
+ *  from prior slugs (pipeline/N-old-slug) are never returned. */
+export async function getPrForBranch(
+  cfg: PipelineConfig,
+  branch: string,
+): Promise<number | null> {
+  const stdout = await ghRun([
+    "pr",
+    "list",
+    "--json",
+    "number,headRefName",
+    "--state",
+    "open",
+    "-L",
+    "100",
+    "-R",
+    cfg.repo,
+  ]);
+  const data = JSON.parse(stdout) as { number: number; headRefName: string }[];
+  const match = data.find((pr) => pr.headRefName === branch);
+  return match ? match.number : null;
+}
+
 // ---------------------------------------------------------------------------
 // Comment search helpers (used to recover the latest review for fix.ts)
 // ---------------------------------------------------------------------------
