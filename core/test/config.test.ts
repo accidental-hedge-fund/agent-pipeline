@@ -1209,3 +1209,35 @@ test("findGitRoot: returns null when no .git ancestor exists", () => {
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "no-git-"));
   assert.equal(findGitRoot(isolated), null);
 });
+
+// #154 regression: `doctor --is-ok` is a zero-output 0/1 polling gate, but config
+// resolution runs first and can emit non-fatal warnings (e.g. an inert models.*
+// alias under the default codex implementer). resolveConfig({ quiet: true }) must
+// suppress those warnings so the gate stays silent.
+test("resolveConfig: quiet suppresses inert-model-alias config warnings (#154)", async () => {
+  const repo = makeFakeRepo("models:\n  planning: sonnet\n");
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  const origWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    // Default profile → implementer is codex, so models.planning is an inert alias
+    // that normally warns. Without quiet the warning fires (proves the bite)…
+    warnings.length = 0;
+    resolveConfig({ repoPath: repo });
+    assert.ok(
+      warnings.some((w) => w.includes("models.planning")),
+      `expected an inert-alias warning without quiet; got: ${JSON.stringify(warnings)}`,
+    );
+    // …with quiet:true (the doctor --is-ok path), no warning may reach stderr.
+    warnings.length = 0;
+    resolveConfig({ repoPath: repo, quiet: true });
+    assert.equal(warnings.length, 0, `quiet must suppress config warnings; got: ${JSON.stringify(warnings)}`);
+  } finally {
+    console.warn = origWarn;
+    process.env.PATH = oldPath;
+  }
+});

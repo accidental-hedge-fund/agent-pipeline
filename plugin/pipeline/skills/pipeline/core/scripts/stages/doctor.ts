@@ -433,6 +433,38 @@ export function formatDoctorSummary(result: PreflightResult): string {
 }
 
 // ---------------------------------------------------------------------------
+// JSON formatter (#154)
+// ---------------------------------------------------------------------------
+
+export interface DoctorJsonCheck {
+  name: string;
+  ok: boolean;
+  reason: string;
+  fix: string;
+}
+
+export interface DoctorJsonEnvelope {
+  schema_version: "1";
+  status: "ok" | "warnings" | "error";
+  checks: DoctorJsonCheck[];
+}
+
+/** Map a PreflightResult to the stable JSON envelope for `pipeline doctor --json`.
+ *  Reuses the same runPreflight result as the prose path — no duplicate check logic. */
+export function formatDoctorJson(result: PreflightResult): DoctorJsonEnvelope {
+  return {
+    schema_version: "1",
+    status: result.ok ? "ok" : "error",
+    checks: result.checks.map((c) => ({
+      name: c.id,
+      ok: c.status !== "fail",
+      reason: c.detail,
+      fix: c.status === "fail" ? (c.remediation ?? "") : "",
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Result persistence — stored under /tmp (NOT in the repo), so the result file
 // never shows up as an untracked change that the worktree-clean check would
 // itself flag, and never risks being committed. Keyed by domain, mirroring the

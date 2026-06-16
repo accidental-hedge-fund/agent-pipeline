@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   extractHumanPlanComments,
   getHarnessLabel,
+  getIssueLabelEvents,
   isBlocked,
   normalizeClosingRefs,
   parseChecksAggregate,
@@ -14,8 +15,10 @@ import {
   pickStage,
   resolvePrForIssue,
   selectPrForBranch,
+  type GhApiRunner,
   type PrCandidate,
 } from "../scripts/gh.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 import {
   formatReviewComment,
   parseStructuredVerdict,
@@ -465,4 +468,56 @@ test("extractHumanPlanComments: empty when no plan comment exists at all", () =>
     { author: "bob", body: "another one", createdAt: "2026-06-02T00:00:00Z" },
   ];
   assert.deepEqual(extractHumanPlanComments(comments, PLAN_BODY), []);
+});
+
+// ---------------------------------------------------------------------------
+// getIssueLabelEvents — latest-window fetch (#154 review-2 regression)
+//
+// The bug: the previous implementation read REST `issues/{n}/events?per_page=100`,
+// which returns the OLDEST 100 events. On an issue with >100 events the current
+// `pipeline:*` transition is excluded, so `last_event` goes stale/null. The fix
+// fetches the LATEST window via GraphQL `timelineItems(last:100, LABELED_EVENT)`.
+// ---------------------------------------------------------------------------
+
+const LABEL_CFG = { repo: "accidental-hedge-fund/agent-pipeline" } as PipelineConfig;
+
+test("getIssueLabelEvents: queries the LATEST bounded window, not page-1 REST events", async () => {
+  let captured: string[] = [];
+  const run: GhApiRunner = async (args) => {
+    captured = args;
+    return "";
+  };
+  await getIssueLabelEvents(LABEL_CFG, 154, run);
+  const joined = captured.join(" ");
+  // Must use the GraphQL latest-window query…
+  assert.ok(captured.includes("graphql"), "must call the GraphQL endpoint");
+  assert.ok(/timelineItems\(last:\s*100/.test(joined), "must request the LATEST 100 (last:100) window");
+  assert.ok(joined.includes("LABELED_EVENT"), "must filter to labeled events");
+  // …and must NOT use the old oldest-first page-1 REST scan.
+  assert.ok(!/issues\/\d+\/events/.test(joined), "must not read the page-1 REST events endpoint");
+  assert.ok(!joined.includes("per_page=100"), "must not use the page-1 per_page scan");
+});
+
+test("getIssueLabelEvents: newer pipeline label in the latest window is returned even when older events exceed the page size", async () => {
+  // Simulate an issue whose total events exceed 100: the GraphQL last:100 window
+  // returns only the most-recent labeled events, including the current transition.
+  // (The old page-1 scan would have returned the oldest events and missed this.)
+  const run: GhApiRunner = async () =>
+    [
+      JSON.stringify({ label: "pipeline:review-2", createdAt: "2026-06-16T20:55:42Z" }),
+      JSON.stringify({ label: "pipeline:needs-human", createdAt: "2026-06-16T21:02:11Z" }),
+    ].join("\n");
+  const events = await getIssueLabelEvents(LABEL_CFG, 154, run);
+  assert.equal(events.length, 2);
+  // The newest pipeline label must be present so deriveLastEvent can surface it.
+  const newest = events.reduce((a, b) => (b.createdAt > a.createdAt ? b : a));
+  assert.equal(newest.label, "pipeline:needs-human");
+  assert.equal(newest.createdAt, "2026-06-16T21:02:11Z");
+});
+
+test("getIssueLabelEvents: a GitHub failure propagates (so the status JSON error envelope captures it)", async () => {
+  const run: GhApiRunner = async () => {
+    throw new Error("GraphQL: rate limited");
+  };
+  await assert.rejects(() => getIssueLabelEvents(LABEL_CFG, 154, run), /rate limited/);
 });
