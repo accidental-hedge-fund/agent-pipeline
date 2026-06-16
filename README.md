@@ -54,10 +54,14 @@ The installer prints a prerequisite checklist during install (warnings do not bl
 **Step 1 — Install**
 
 ```bash
+# Pinned to a released version (reproducible — recommended):
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install
+
+# Or track the latest default branch:
 npx github:accidental-hedge-fund/agent-pipeline install
 ```
 
-This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill.
+This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a tag (`#v1.2.1`) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
 
 **Step 2 — Label an issue and run**
 
@@ -97,6 +101,14 @@ npx github:accidental-hedge-fund/agent-pipeline install
 npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
+
+For a reproducible, non-interactive install — pin the released tag (`#v1.2.1`) and auto-accept the optional-dependency prompts with `--yes-deps`:
+
+```bash
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude --yes-deps
+```
+
+The bare commands above always track the **latest** default branch; add `#<tag>` to pin a release (see [Install a specific version](#install-a-specific-version)). The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI (`codex`) is still required for review.
 
 Or clone and run directly:
 
@@ -154,15 +166,15 @@ This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeli
 The bare `npx github:…` commands above install the **latest** code (the default branch). To install a specific released version instead, pin the git ref with `#<tag>` — released versions are tagged `vMAJOR.MINOR.PATCH` (see the [tags](https://github.com/accidental-hedge-fund/agent-pipeline/tags)):
 
 ```bash
-# Install exactly v1.0.1 (any host flag works the same way)
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.0.1 install --host claude
+# Install exactly v1.2.1 (any host flag works the same way)
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude
 ```
 
-Everything else is identical to the latest-version commands — `#v1.0.1` just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
+Everything else is identical to the latest-version commands — `#v1.2.1` just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-cd agent-pipeline && git checkout v1.0.1
+cd agent-pipeline && git checkout v1.2.1
 node scripts/install.mjs install --host claude
 ```
 
