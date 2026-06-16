@@ -186,6 +186,13 @@ async function main(): Promise<void> {
       console.log(formatDoctorSummary(result));
       process.exit(1);
     }
+    // JSON status mode must emit a machine-readable error envelope even when config
+    // resolution fails (e.g. outside a git checkout, invalid pipeline.yml, gh unreachable).
+    // Pipeline Desk polls this path and would fail to parse a prose error on stderr.
+    if (opts.status && opts.json) {
+      console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+      process.exit(1);
+    }
     console.error(`pipeline: ${e.message}`);
     process.exit(2);
   }
@@ -235,7 +242,7 @@ async function main(): Promise<void> {
   if (opts.status) {
     let issueNumber: number;
     try {
-      issueNumber = await resolveIssueNumber(cfg, number);
+      issueNumber = await resolveIssueNumber(cfg, number, { quiet: !!opts.json });
     } catch (err) {
       const e = err as Error;
       if (opts.json) {
@@ -423,18 +430,41 @@ export async function runStartPreflightGate(
   return { proceed: true, result };
 }
 
-async function resolveIssueNumber(cfg: PipelineConfig, number: number): Promise<number> {
-  const kind = await getItemKind(cfg, number);
+/** IO seam for {@link resolveIssueNumber} so unit tests inject fakes — no real gh. */
+export interface ResolveIssueNumberDeps {
+  getItemKind: typeof getItemKind;
+  getPrLinkedIssue: typeof getPrLinkedIssue;
+}
+
+const defaultResolveIssueNumberDeps: ResolveIssueNumberDeps = { getItemKind, getPrLinkedIssue };
+
+/**
+ * Resolve `number` to an issue number. If `number` is already an issue it is
+ * returned as-is. If it is a PR the linked closing issue is returned.
+ *
+ * Pass `quiet: true` (e.g. for JSON status mode) to suppress the prose
+ * `[pipeline] #N is a PR → resolved to issue #M` line — that line would
+ * precede and corrupt the JSON envelope on stdout.
+ */
+export async function resolveIssueNumber(
+  cfg: PipelineConfig,
+  number: number,
+  opts: { quiet?: boolean } = {},
+  deps: ResolveIssueNumberDeps = defaultResolveIssueNumberDeps,
+): Promise<number> {
+  const kind = await deps.getItemKind(cfg, number);
   if (kind === "issue") return number;
   // PR → look up linked closing issue.
-  const linked = await getPrLinkedIssue(cfg, number);
+  const linked = await deps.getPrLinkedIssue(cfg, number);
   if (linked === null) {
     throw new Error(
       `#${number} is a PR with no closing-issue reference. The pipeline is issue-centric. ` +
         `${cfg.invocation}: either add "Closes #<n>" to the PR body, or run against the issue directly.`,
     );
   }
-  console.log(`[pipeline] #${number} is a PR → resolved to issue #${linked}`);
+  if (!opts.quiet) {
+    console.log(`[pipeline] #${number} is a PR → resolved to issue #${linked}`);
+  }
   return linked;
 }
 

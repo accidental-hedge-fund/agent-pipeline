@@ -8,7 +8,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { needsHumanPunchlist, runStatus, type RunStatusDeps } from "../scripts/pipeline.ts";
+import {
+  needsHumanPunchlist,
+  resolveIssueNumber,
+  runStatus,
+  type ResolveIssueNumberDeps,
+  type RunStatusDeps,
+} from "../scripts/pipeline.ts";
 import type { PreflightResult } from "../scripts/stages/doctor.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -497,4 +503,81 @@ test("runStatus without --json: existing prose output is byte-identical (regress
     "URL: https://github.com/acme/repo/issues/115",
     "Last pipeline event: ## Pipeline: Review ceiling reached — human decision required  (2026-06-10T00:00:00Z)",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// #154 fix-1: resolveIssueNumber quiet mode — PR-number status JSON must not
+// emit prose before the JSON envelope (finding 2 regression).
+// ---------------------------------------------------------------------------
+
+const RESOLVE_CFG = {
+  repo: "acme/repo",
+  invocation: "pipeline",
+} as unknown as import("../scripts/types.ts").PipelineConfig;
+
+/** Fake deps that simulate a PR → issue resolution. */
+function prResolveDeps(linkedIssue: number): ResolveIssueNumberDeps {
+  return {
+    getItemKind: async () => "pr",
+    getPrLinkedIssue: async () => linkedIssue,
+  };
+}
+
+/** Fake deps that simulate an issue (no resolution needed). */
+function issueResolveDeps(): ResolveIssueNumberDeps {
+  return {
+    getItemKind: async () => "issue",
+    getPrLinkedIssue: async () => { throw new Error("should not be called"); },
+  };
+}
+
+test("resolveIssueNumber quiet:true (PR→issue): emits NO prose to stdout", async () => {
+  const logged: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    const result = await resolveIssueNumber(RESOLVE_CFG, 42, { quiet: true }, prResolveDeps(10));
+    assert.equal(result, 10, "should resolve PR 42 → issue 10");
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(logged.length, 0, `quiet mode must not write to stdout; got: ${logged.join("|")}`);
+});
+
+test("resolveIssueNumber quiet:false (default, PR→issue): emits the prose resolution line", async () => {
+  const logged: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    const result = await resolveIssueNumber(RESOLVE_CFG, 42, { quiet: false }, prResolveDeps(10));
+    assert.equal(result, 10);
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(logged.length, 1, `non-quiet mode must emit the prose line; got nothing`);
+  assert.match(logged[0], /\[pipeline\] #42 is a PR → resolved to issue #10/);
+});
+
+test("resolveIssueNumber quiet:true (issue input): returns issue number with no stdout", async () => {
+  const logged: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    const result = await resolveIssueNumber(RESOLVE_CFG, 10, { quiet: true }, issueResolveDeps());
+    assert.equal(result, 10, "issue input is returned as-is");
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(logged.length, 0, "issue input emits no output regardless of quiet flag");
+});
+
+test("resolveIssueNumber: throws when PR has no linked issue", async () => {
+  const deps: ResolveIssueNumberDeps = {
+    getItemKind: async () => "pr",
+    getPrLinkedIssue: async () => null,
+  };
+  await assert.rejects(
+    () => resolveIssueNumber(RESOLVE_CFG, 42, {}, deps),
+    /no closing-issue reference/,
+  );
 });
