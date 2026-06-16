@@ -354,7 +354,7 @@ function warnInertModelAliases(
   }
 }
 
-function findGitRoot(start: string): string | null {
+export function findGitRoot(start: string): string | null {
   let dir = start;
   while (true) {
     if (fs.existsSync(path.join(dir, ".git"))) return dir;

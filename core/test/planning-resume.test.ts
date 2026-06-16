@@ -475,3 +475,53 @@ test("resumeFromImplementing: format gate blocks first (before the test gate) â†
   assert.ok(!createPrCalled, "PR must NOT be opened when format gate blocks");
   assert.ok(setBlockedArgs.length > 0, "setBlocked must be called");
 });
+
+// ---------------------------------------------------------------------------
+// 3.7: #155 â€” run events stream to stdout when runStoreDeps.stdoutWrite is set
+// (the --json-events contract). Without threading runStoreDeps through to the
+// event producer, pr_created reaches events.jsonl but not stdout.
+// ---------------------------------------------------------------------------
+
+function streamCapturingDeps(stdout: string[], jsonl: string[]) {
+  return {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async (_p: string, data: string) => { jsonl.push(data); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+    stdoutWrite: (line: string) => { stdout.push(line); },
+  };
+}
+
+test("resumeFromImplementing: pr_created event streams to stdout via runStoreDeps (#155)", async () => {
+  const stdout: string[] = [];
+  const jsonl: string[] = [];
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    getPrForBranch: async () => null,
+    createPr: async () => 77,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    transition: async () => {},
+  };
+  await resumeFromImplementing(
+    makeCfg(),
+    42,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] Fix the bug (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (n) => `PR #${n} ready.`,
+      pipelineRunId: "run-1",
+      runDir: "/fake/run",
+      runStoreDeps: streamCapturingDeps(stdout, jsonl),
+    },
+    deps,
+  );
+  // pr_created must reach BOTH events.jsonl and stdout (the --json-events contract).
+  assert.ok(jsonl.some((l) => l.includes('"pr_created"')), "pr_created must be written to events.jsonl");
+  assert.ok(stdout.some((l) => l.includes('"pr_created"')), `pr_created must stream to stdout; got ${JSON.stringify(stdout)}`);
+  assert.ok(stdout.some((l) => l.includes('"pr":77')), "the streamed event must carry the PR number");
+});

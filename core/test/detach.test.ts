@@ -450,6 +450,86 @@ test("handleRunSubcommand: detach forwards --profile, --domain, --model to spawn
   assert.ok(capturedArgs.includes("claude-opus-4-8"), "missing model value");
 });
 
+// #155: a detached launch must pin the #155 run-store run id (so the caller can
+// find the same .agent-pipeline/runs/<run-id>/events.jsonl) and forward --json-events.
+test("handleRunSubcommand: detach forwards --run-id (always) so the inner run shares the caller's run dir", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  await handleRunSubcommand("99", { detach: true }, deps);
+  const idx = capturedArgs.indexOf("--run-id");
+  assert.ok(idx >= 0, `--run-id must be forwarded; got ${JSON.stringify(capturedArgs)}`);
+  const runId = capturedArgs[idx + 1];
+  assert.match(runId ?? "", /^99-/, "the pinned run id must be for issue 99");
+});
+
+test("handleRunSubcommand: detach forwards --json-events only when requested", async () => {
+  const capture = async (opts: CliOpts) => {
+    let captured: string[] = [];
+    await handleRunSubcommand("99", opts, {
+      spawnDetached: async (_issue, pipelineArgs) => {
+        captured = pipelineArgs;
+        return { runDir: "/tmp/fake-run", pid: 42 };
+      },
+    });
+    return captured;
+  };
+  assert.ok((await capture({ detach: true, jsonEvents: true })).includes("--json-events"), "must forward --json-events when set");
+  assert.ok(!(await capture({ detach: true })).includes("--json-events"), "must not inject --json-events when unset");
+});
+
+test("handleRunSubcommand: detach writes a machine-readable run-store.json pointer in the wrapper dir (#155)", async () => {
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-"));
+  try {
+    await handleRunSubcommand("99", { detach: true }, {
+      spawnDetached: async () => ({ runDir: wrapperDir, pid: 42 }),
+    });
+    // A caller captures the wrapper dir from stdout, then reads the pointer — no
+    // prose parsing — to find the #155 run store and its events.jsonl/terminal.log.
+    const pointerPath = path.join(wrapperDir, "run-store.json");
+    assert.ok(fs.existsSync(pointerPath), "wrapper dir must contain run-store.json");
+    const pointer = JSON.parse(fs.readFileSync(pointerPath, "utf8"));
+    assert.match(pointer.run_store_run_id, /^99-/, "pointer must carry the #155 run id for issue 99");
+    assert.ok(String(pointer.run_store_dir).includes(".agent-pipeline"), "run_store_dir must be the .agent-pipeline run store");
+    assert.ok(String(pointer.events).endsWith("events.jsonl"), "pointer must link to events.jsonl");
+    assert.ok(String(pointer.terminal_log).endsWith("terminal.log"), "pointer must link to terminal.log");
+  } finally {
+    fs.rmSync(wrapperDir, { recursive: true, force: true });
+  }
+});
+
+test("handleRunSubcommand: detach pointer resolves a nested --repo-path to the repo ROOT (#155)", async () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "repo-"));
+  fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+  const nested = path.join(repoRoot, "pkgs", "sub");
+  fs.mkdirSync(nested, { recursive: true });
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-"));
+  try {
+    // Pass a checkout SUBDIRECTORY as --repo-path. The inner run resolves it to the
+    // git root via findGitRoot, so the pointer must too — else it points at
+    // <subdir>/.agent-pipeline while the run writes <root>/.agent-pipeline.
+    await handleRunSubcommand("99", { detach: true, repoPath: nested }, {
+      spawnDetached: async () => ({ runDir: wrapperDir, pid: 42 }),
+    });
+    const pointer = JSON.parse(fs.readFileSync(path.join(wrapperDir, "run-store.json"), "utf8"));
+    assert.ok(
+      String(pointer.run_store_dir).startsWith(path.join(repoRoot, ".agent-pipeline")),
+      `pointer must resolve to <repoRoot>/.agent-pipeline; got ${pointer.run_store_dir}`,
+    );
+    assert.ok(
+      !String(pointer.run_store_dir).includes(path.join("pkgs", "sub")),
+      `pointer must not use the nested subdir; got ${pointer.run_store_dir}`,
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(wrapperDir, { recursive: true, force: true });
+  }
+});
+
 test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetached", async () => {
   let capturedArgs: string[] = [];
   const deps: RunSubcommandDeps = {

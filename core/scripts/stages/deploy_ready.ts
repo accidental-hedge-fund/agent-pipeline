@@ -5,12 +5,15 @@ import { addLabelToPr, getIssueDetail, getPrForIssue, postComment, postPrComment
 import { LABEL_PREFIX } from "../types.ts";
 import { getForIssue, removeWorktree } from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
+import { RUN_SCHEMA_VERSION, appendEvent, defaultRunStoreDeps, type RunStoreDeps } from "../run-store.ts";
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
 
 export async function finalize(
   cfg: PipelineConfig,
   issueNumber: number,
+  runDir?: string,
+  runStoreDeps?: RunStoreDeps,
 ): Promise<Outcome> {
   const detail = await getIssueDetail(cfg, issueNumber);
   const prNumber = await getPrForIssue(cfg, issueNumber);
@@ -86,6 +89,10 @@ export async function finalize(
   if (wt) {
     await removeWorktree(cfg, issueNumber, wt.slug);
     console.log(`[pipeline] #${issueNumber}: worktree removed`);
+    if (runDir) {
+      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_removed", at, _localPath: wt.path }, runStoreDeps ?? defaultRunStoreDeps).catch(() => {});
+    }
   }
 
   return {

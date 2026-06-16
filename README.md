@@ -513,15 +513,22 @@ To print the current stage, any blocker, the linked PR, and the last review verd
 $pipeline N --status
 ```
 
-### Evidence bundle
+### Evidence bundle (run directory)
 
-Every run writes a compact, machine-readable **evidence bundle** — a single JSON file recording what the run actually did: run/PR/branch identity, the harnesses used, per-stage transitions (entered/exited/outcome), the commands it ran (with exit code, duration, and a 500-char output excerpt — never raw env values, tokens, or secrets), review verdict summaries (round, reviewed SHA, finding counts by severity), override dispositions, auto-recovery events, and the terminal state. It lives at:
+Every run writes a **run directory** under `.agent-pipeline/runs/<run-id>/` in the repo root, created before the first stage so it survives a mid-run crash. The run id is filesystem-safe (`<issue>-<YYYY-MM-DDTHH-MM-SSZ>`). The directory contains four files:
 
-```text
-/tmp/pipeline-<domain>/<issue>/evidence.json
-```
+| File | Written | Contents |
+|------|---------|----------|
+| `run.json` | At startup | Immutable identity: `schema_version`, `run_id`, `issue`, `repo`, `profile`, `started_at` |
+| `events.jsonl` | Incrementally | Append-only event log — one JSON object per line; each has `schema_version`, `type`, `at`. Event types: `run_start`, `run_complete`, `stage_start`, `stage_complete` (with `outcome` and `commits`), `pr_created`, `pr_updated`, `worktree_created`, `review_verdict` (with `round`, `sha`, `verdict`, `finding_counts`). |
+| `terminal.log` | Incrementally | Raw combined stdout/stderr of the pipeline run, identical to what appears in the terminal. |
+| `summary.json` | At finalization | Full evidence bundle: all stage records, review verdicts, overrides, recovery events, and `final_state`. Absent for crashed runs; treat a missing `summary.json` as in-progress or crashed. |
+
+The `run_id` field in `summary.json` matches the directory name so the two can be joined by a single stable identifier.
 
 It is a **write-only audit supplement**, not a second state machine: GitHub labels and comments remain the authoritative state, and deleting or corrupting the bundle has zero effect on a run. When a run finalizes, the pipeline posts a single comment on the PR (or issue) recording the local bundle path so a maintainer can find it.
+
+**Legacy path.** For backward compatibility, `summary.json` content is also written to `<stateDir>/<issue>/evidence.json` (typically `/tmp/pipeline-<domain>/<issue>/evidence.json`) so existing consumers experience no breakage.
 
 Print a human-readable summary of a run at any time — this reads the local file only, so it works offline:
 
@@ -529,6 +536,27 @@ Print a human-readable summary of a run at any time — this reads the local fil
 /pipeline N --summary
 $pipeline N --summary
 ```
+
+Print or follow the terminal output of a run (works after the process exits, or from another terminal while it runs):
+
+```bash
+# print full terminal.log for a run
+$pipeline logs <run-id>
+
+# stream new output as it is written (like tail -f)
+$pipeline logs <run-id> --follow
+
+# list available run-ids (most recent first)
+$pipeline logs
+```
+
+Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):
+
+```bash
+$pipeline N --json-events
+```
+
+Each event emitted to `events.jsonl` is also written to stdout. Human-readable output continues to go to `terminal.log` and the terminal unchanged.
 
 ### Machine-readable artifact conventions
 
@@ -769,9 +797,20 @@ echo "Run dir: $RUN_DIR"
 ~/.pipeline/runs/<issue>/<timestamp>/
   pipeline.log      stdout + stderr of the pipeline run (appended continuously)
   sentinel.json     written atomically when the run completes (absent while running)
+  run-store.json    machine-readable pointer to the .agent-pipeline run store (run_store_dir, events, terminal_log)
   ../
     .lock           advisory lock file (present while a run is active)
 ```
+
+The wrapper directory above is for **process supervision** (is the run alive? what
+exit code?). For **structured run data**, a detached launch pins and prints the
+same `.agent-pipeline/runs/<run-id>/` run store a foreground run uses — the
+launch logs `structured run artifacts at <repo>/.agent-pipeline/runs/<run-id>/`.
+That directory's **`events.jsonl` and `terminal.log` are the Pipeline Desk
+contract** (not `pipeline.log`): render the stage timeline from `events.jsonl`
+with zero prose parsing, and follow live output with
+`pipeline logs <run-id> --follow`. Pass `--json-events` to also stream the event
+lines to the detached run's stdout (captured in `pipeline.log`).
 
 ### Poll for completion — `sentinel.json`
 

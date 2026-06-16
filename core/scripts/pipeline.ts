@@ -15,8 +15,11 @@
 
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import * as path from "node:path";
+import { writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, scaffoldDefaultConfig, generateConfigSchema, validateConfig } from "./config.ts";
+import { resolveConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -50,6 +53,20 @@ import {
   recordOverride,
   recordStage,
 } from "./evidence-bundle.ts";
+import {
+  RUN_SCHEMA_VERSION,
+  appendEvent,
+  defaultRunStoreDeps,
+  finalizeRun,
+  initRunDir,
+  listRunIds,
+  runDirPath,
+  runIdFor,
+  runsDir,
+  startTerminalLogTee,
+  type RunStoreDeps,
+  type TerminalLogTee,
+} from "./run-store.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -101,10 +118,17 @@ export interface CliOpts {
   init?: boolean;
   doctor?: boolean;
   failFast?: boolean;
+  /** Stream lifecycle events to stdout as JSON lines (--json-events). */
+  jsonEvents?: boolean;
+  /** Follow mode for `pipeline logs <run-id> --follow` (-f). */
+  follow?: boolean;
   // `pipeline run <N> --detach` options
   detach?: boolean;
   timeout?: number;
   flockTimeout?: number;
+  /** Internal: pre-allocated #155 run-store run id, set by the detached launcher so
+   *  the inner run uses the same `.agent-pipeline/runs/<run-id>` the caller was told. */
+  runId?: string;
   /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate`). */
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
@@ -121,10 +145,10 @@ export function buildCmd(): Command {
     .name("pipeline")
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
     .version(VERSION, "-V, --version", "print version and exit")
-    // Allow 'pipeline run <N> ...' and 'pipeline path' — they pass a second
-    // positional that Commander would otherwise reject as too many arguments.
+    // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
+    // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup)")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -145,14 +169,17 @@ export function buildCmd(): Command {
     .option("--base <branch>", "override the base branch (default: from .github/pipeline.yml or 'main')")
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
+    .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
+    .option("-f, --follow", "follow mode for 'pipeline logs <run-id> --follow': stream new output as appended")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
-    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number);
+    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
+    .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
-  // second positional of `run <N>`, `path`, and `config <verb>`.
+  // second positional of `run <N>`, `path`, `config <verb>`, and `logs <id>`.
   return cmd;
 }
 
@@ -167,6 +194,24 @@ async function main(): Promise<void> {
   // preflight checks and exits, with no issue number. Distinct from the
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
+
+  // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
+  // and must work even when gh is missing, unauthenticated, or the remote is
+  // unavailable. Handle it before config/gh resolution (and before the flag
+  // validation below) using only the repo directory (derived from --repo-path or cwd).
+  if (numArg === "logs") {
+    // Resolve to the git root (same semantics as resolveConfig) so a nested
+    // --repo-path still finds the run store under the repository root (#155).
+    const logsStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(logsStart) ?? logsStart;
+    const logsArg = cmd.args[1];
+    const logsRunId =
+      typeof logsArg === "string" && logsArg.length > 0 && !logsArg.startsWith("-")
+        ? logsArg
+        : undefined;
+    await runLogs(repoDir, logsRunId, !!opts.follow);
+    return;
+  }
 
   // Validate machine-mode flags immediately after parsing — before config
   // resolution or any dispatch — so a typo/construction bug can't silently
@@ -323,7 +368,9 @@ async function main(): Promise<void> {
 
   const number = Number.parseInt(numArg ?? "", 10);
   if (!Number.isFinite(number) || number <= 0) {
-    console.error(`pipeline: argument <number> is required (or use --cleanup, --init, 'pipeline init', or 'pipeline doctor')`);
+    console.error(
+      `pipeline: argument <number> is required (or use --cleanup, --init, 'pipeline init', 'pipeline doctor', or 'pipeline logs')`,
+    );
     process.exit(2);
   }
 
@@ -851,6 +898,74 @@ export async function runSummary(cfg: PipelineConfig, issueNumber: number): Prom
 }
 
 // ---------------------------------------------------------------------------
+// Logs mode (#155): print or follow a run's terminal.log independent of the
+// original pipeline process. Reads from .agent-pipeline/runs/<run-id>/.
+// ---------------------------------------------------------------------------
+
+export async function runLogs(
+  repoDir: string,
+  runId: string | undefined,
+  follow: boolean,
+): Promise<void> {
+  // No run-id: list available runs, most recent first, then exit 0.
+  if (runId === undefined) {
+    const ids = await listRunIds(repoDir);
+    if (ids.length === 0) {
+      console.log(`No pipeline runs found in ${runsDir(repoDir)}.`);
+      return;
+    }
+    for (const id of ids) console.log(id);
+    return;
+  }
+
+  const dir = runDirPath(repoDir, runId);
+  const logFile = path.join(dir, "terminal.log");
+
+  // Check that the run directory exists.
+  try {
+    await defaultRunStoreDeps.stat(dir);
+  } catch {
+    console.error(`pipeline logs: unknown run-id '${runId}' (no directory at ${dir})`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!follow) {
+    // Print terminal.log and exit.
+    let content: string;
+    try {
+      content = await defaultRunStoreDeps.readFile(logFile);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        console.error(`pipeline logs: terminal.log not yet written for run '${runId}'`);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
+    process.stdout.write(content);
+    return;
+  }
+
+  // --follow: tail -f, independent of the original pipeline process. Resolve when
+  // the tail child exits or errors — including the case where terminal.log does
+  // not exist yet — so a failed follow exits non-zero and releases the caller
+  // instead of awaiting an unresolvable promise forever (#155).
+  await new Promise<void>((resolve) => {
+    const tail = spawn("tail", ["-f", logFile], { stdio: "inherit" });
+    tail.on("error", (err) => {
+      console.error(`pipeline logs: failed to start tail: ${err.message}`);
+      process.exitCode = 1;
+      resolve();
+    });
+    tail.on("exit", (code) => {
+      if (code !== null && code !== 0) process.exitCode = code;
+      resolve();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // `pipeline run <N>` subcommand handler
 // ---------------------------------------------------------------------------
 
@@ -873,6 +988,19 @@ export async function handleRunSubcommand(
   }
 
   if (opts.detach) {
+    // Pre-allocate the #155 run-store run id here so the detached caller is given the
+    // SAME `.agent-pipeline/runs/<run-id>` the inner run will use. Without this the
+    // detached launch exposed only the wrapper dir (pipeline.log/sentinel.json), and a
+    // desktop consumer could not find the structured event log without guessing —
+    // reintroducing the competing artifact format the #155 contract avoids (#155).
+    const runStoreRunId = runIdFor(number, new Date());
+    // Resolve the repo dir with the SAME git-root semantics resolveConfig uses for the
+    // inner run (findGitRoot of the start path), so a nested --repo-path still points the
+    // pointer at <repo-root>/.agent-pipeline/runs/... and not a checkout subdirectory (#155).
+    const runStoreStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(runStoreStart) ?? runStoreStart;
+    const runStoreDir = runDirPath(repoDir, runStoreRunId);
+
     // Forward all launch-shaping options so the inner pipeline process respects
     // the same profile / repo / model the caller specified (e.g. --profile claude).
     const passArgs: string[] = [];
@@ -890,6 +1018,11 @@ export async function handleRunSubcommand(
     if (opts.once) passArgs.push("--once");
     if (opts.doctor) passArgs.push("--doctor");
     if (opts.failFast) passArgs.push("--fail-fast");
+    // Pin the inner run to the pre-allocated #155 run-store id, and forward
+    // --json-events so the detached run's event stream and run directory are
+    // discoverable via the documented contract rather than the wrapper artifacts (#155).
+    passArgs.push("--run-id", runStoreRunId);
+    if (opts.jsonEvents) passArgs.push("--json-events");
 
     let result: Awaited<ReturnType<typeof spawnDetached>>;
     try {
@@ -902,10 +1035,32 @@ export async function handleRunSubcommand(
       process.exitCode = 1;
       return;
     }
+    // Machine-readable link from the wrapper dir (which the caller captures from
+    // stdout below) to the #155 run store, so a Pipeline Desk caller can discover
+    // events.jsonl/terminal.log without parsing any prose (#155). Best-effort.
+    try {
+      writeFileSync(
+        path.join(result.runDir, "run-store.json"),
+        JSON.stringify(
+          {
+            schema_version: 1,
+            run_store_run_id: runStoreRunId,
+            run_store_dir: runStoreDir,
+            events: path.join(runStoreDir, "events.jsonl"),
+            terminal_log: path.join(runStoreDir, "terminal.log"),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    } catch {
+      /* best-effort pointer — the run store still exists at runStoreDir */
+    }
     console.log(result.runDir);
     console.error(`[pipeline] #${number}: detached run started (PID ${result.pid})`);
-    console.error(`[pipeline] #${number}: log at ${result.runDir}/pipeline.log`);
-    console.error(`[pipeline] #${number}: poll ${result.runDir}/sentinel.json for completion`);
+    console.error(`[pipeline] #${number}: wrapper supervision: poll ${result.runDir}/sentinel.json (log: ${result.runDir}/pipeline.log)`);
+    console.error(`[pipeline] #${number}: structured run artifacts at ${runStoreDir}/ — events.jsonl + terminal.log are the Pipeline Desk contract`);
+    console.error(`[pipeline] #${number}: machine-readable link: ${result.runDir}/run-store.json; follow with: pipeline logs ${runStoreRunId} --follow`);
     return;
   }
 
@@ -958,6 +1113,19 @@ export async function handlePathSubcommand(
 // Unblock mode
 // ---------------------------------------------------------------------------
 
+/** Append a blocker_cleared event to the most recent run directory for issueNumber.
+ *  Best-effort: silently skips if no run directory is found. */
+async function appendBlockerCleared(repoDir: string, issueNumber: number): Promise<void> {
+  const allIds = await listRunIds(repoDir).catch(() => [] as string[]);
+  const id = allIds.find((runId) => runId.startsWith(`${issueNumber}-`));
+  if (!id) return;
+  await appendEvent(
+    runDirPath(repoDir, id),
+    { schema_version: RUN_SCHEMA_VERSION, type: "blocker_cleared", at: evidenceTimestamp() },
+    defaultRunStoreDeps,
+  ).catch(() => {});
+}
+
 async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
@@ -980,6 +1148,7 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   ].join("\n");
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
+  await appendBlockerCleared(cfg.repo_dir, issueNumber);
   console.log(`[pipeline] #${issueNumber}: unblocked at ${stage}`);
 }
 
@@ -1044,6 +1213,7 @@ export async function runOverride(
   // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
     await deps.clearBlocked(cfg, issueNumber);
+    await appendBlockerCleared(cfg.repo_dir, issueNumber);
   }
   console.log(
     `[pipeline] #${issueNumber}: recorded override for finding ${parsed.key} (${parsed.disposition}).`,
@@ -1108,16 +1278,13 @@ async function runAdvance(
       return;
     }
 
-    console.log(`[pipeline] #${issueNumber}: starting at stage=${startStage}`);
+    // Compute timing and init the run directory + terminal.log tee BEFORE the first
+    // console.log so that terminal.log captures the full run output (finding #6).
     let lastStage: Stage = startStage;
     let transitions = 0;
     const t0 = Date.now();
-
-    // One run id per dispatch (#20): generated before any stage runs and threaded
-    // into every commit operation, so all commits this invocation produces — across
-    // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
-    const pipelineRunId = makePipelineRunId(issueNumber);
-    console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
+    const runStartedAt = new Date(t0);
+    const runStartedAtIso = runStartedAt.toISOString().replace(/\.\d+Z$/, "Z");
 
     // Evidence bundle (#147): a write-only, per-run audit artifact. Skipped
     // entirely under --dry-run (which writes nothing locally and posts nothing to
@@ -1126,6 +1293,53 @@ async function runAdvance(
     // affects label transitions or the run outcome (the bundle is a supplement;
     // GitHub labels/comments stay authoritative).
     const stateDir = opts.dryRun ? undefined : runStateDir(cfg.domain);
+
+    // Run directory (#155): stable artifact directory per dispatch. Initialized
+    // before the first stage so it survives a mid-run crash. Also starts the
+    // terminal.log tee here so it captures all subsequent output including the
+    // 'starting' and 'run id' lines below. Skipped under --dry-run.
+    // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
+    let runDir: string | undefined;
+    let terminalTee: TerminalLogTee | undefined;
+    const runStoreDeps: RunStoreDeps = { ...defaultRunStoreDeps };
+    if (stateDir) {
+      // Use the run id pinned by a detached launcher when present, so the detached
+      // caller and the inner run share one `.agent-pipeline/runs/<run-id>` (#155).
+      const runId = opts.runId ?? runIdFor(issueNumber, runStartedAt);
+      runDir = runDirPath(cfg.repo_dir, runId);
+      // stdoutWrite for initRunDir uses the original stdout (before tee starts);
+      // this ensures run_start appears on stdout without going to terminal.log.
+      if (opts.jsonEvents) {
+        runStoreDeps.stdoutWrite = process.stdout.write.bind(process.stdout) as (s: string) => void;
+      }
+      await initRunDir(
+        { runDir, runId, issue: issueNumber, repo: cfg.repo, profile: opts.profile ?? null, startedAt: runStartedAtIso },
+        runStoreDeps,
+      ).catch(() => {});
+      // Start the terminal.log tee (directory exists after initRunDir).
+      try {
+        terminalTee = startTerminalLogTee(path.join(runDir, "terminal.log"));
+        // Switch subsequent appendEvent calls to rawWrite so JSON lines bypass terminal.log.
+        if (opts.jsonEvents) {
+          runStoreDeps.stdoutWrite = terminalTee.rawWrite;
+        }
+      } catch {
+        /* non-fatal — run continues without tee */
+      }
+    }
+
+    // Outer try/finally: stop tee only AFTER the final 'done' line is printed so
+    // that line is captured in terminal.log (the inner finally runs first).
+    try {
+
+    console.log(`[pipeline] #${issueNumber}: starting at stage=${startStage}`);
+
+    // One run id per dispatch (#20): generated before any stage runs and threaded
+    // into every commit operation, so all commits this invocation produces — across
+    // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
+    const pipelineRunId = makePipelineRunId(issueNumber, runStartedAt);
+    console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
+
     if (stateDir) {
       let bundlePr: number | null = null;
       try {
@@ -1173,7 +1387,26 @@ async function runAdvance(
       finalStage = stage;
 
       if (stage === "ready-to-deploy") {
-        const out = await deployReady.finalize(cfg, issueNumber);
+        // The terminal stage is handled outside the common dispatch block, so emit
+        // its stage_start / stage_complete lifecycle events explicitly — otherwise a
+        // consumer cannot reconstruct the full ordered timeline from events.jsonl (#155).
+        const rtdStage = evidenceStageName(stage);
+        const rtdEnteredAt = evidenceTimestamp();
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: rtdEnteredAt, stage: rtdStage }, runStoreDeps).catch(() => {});
+        }
+        let out: Outcome;
+        try {
+          out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
+        } catch (err) {
+          if (runDir) {
+            await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
+          }
+          throw err;
+        }
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
+        }
         printOutcome(issueNumber, stage, out);
         break;
       }
@@ -1239,6 +1472,10 @@ async function runAdvance(
             outcome: "skipped",
           }).catch(() => {});
         }
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: skipEnteredAt, stage: skipStage }, runStoreDeps).catch(() => {});
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: skipStage, outcome: "skipped", commits: [] }, runStoreDeps).catch(() => {});
+        }
         if (opts.once) break;
         continue;
       }
@@ -1255,32 +1492,43 @@ async function runAdvance(
       }
 
       const auditStage = evidenceStageName(stage);
+      const stageEnteredAt = evidenceTimestamp();
       if (stateDir) {
         await recordStage(stateDir, issueNumber, {
           stage: auditStage,
-          enteredAt: evidenceTimestamp(),
+          enteredAt: stageEnteredAt,
         }).catch(() => {});
+      }
+      if (runDir) {
+        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: stageEnteredAt, stage: auditStage }, runStoreDeps).catch(() => {});
       }
       let out: Outcome;
       try {
-        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir);
+        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir, runDir, runStoreDeps);
       } catch (err) {
         // Stage threw — record an error outcome before rethrowing so the bundle
         // never shows a perpetually in-progress stage.
+        const errAt = evidenceTimestamp();
         if (stateDir) {
           await recordStage(stateDir, issueNumber, {
             stage: auditStage,
-            exitedAt: evidenceTimestamp(),
+            exitedAt: errAt,
             outcome: "error",
             commits: [],
           }).catch(() => {});
+        }
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: errAt, stage: auditStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
         }
         throw err;
       }
 
       // Post-dispatch: collect commits produced during this stage (before recording exit).
+      // stageCommits is declared outside the stateDir block so it is also available
+      // for the stage_complete event appended to events.jsonl below.
+      const stageExitedAt = evidenceTimestamp();
+      let stageCommits: string[] = [];
       if (stateDir) {
-        let stageCommits: string[] = [];
         const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
         if (wtAfter) {
           lastKnownBranch = branchName(issueNumber, wtAfter.slug);
@@ -1296,10 +1544,13 @@ async function runAdvance(
         }
         await recordStage(stateDir, issueNumber, {
           stage: auditStage,
-          exitedAt: evidenceTimestamp(),
+          exitedAt: stageExitedAt,
           outcome: evidenceOutcome(out),
           commits: stageCommits,
         }).catch(() => {});
+      }
+      if (runDir) {
+        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: stageExitedAt, stage: auditStage, outcome: evidenceOutcome(out), commits: stageCommits }, runStoreDeps).catch(() => {});
       }
       printOutcome(issueNumber, stage, out);
 
@@ -1308,7 +1559,10 @@ async function runAdvance(
         lastStage = (out as { to: Stage }).to;
         finalStage = lastStage; // keep final-state accurate when --once breaks after an advance
       } else {
-        // No advance: blocked, waiting, no-op, finalized, error → stop.
+        // Blocked: emit blocker_set so consumers can reconstruct blocking state.
+        if (out.status === "blocked" && runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+        }
         break;
       }
 
@@ -1338,6 +1592,12 @@ async function runAdvance(
             await patchBundleIdentity(stateDir, issueNumber, identityPatch).catch(() => {});
           }
           const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
+          // Run-store finalization (#155): write summary.json + run_complete event before
+          // notifyBundlePath so that finalizeRun does not overwrite the notifiedAt stamp
+          // that markNotified writes to evidence.json (finding #5).
+          if (runDir) {
+            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
+          }
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
         } catch {
           /* audit-only — ignore */
@@ -1349,6 +1609,14 @@ async function runAdvance(
     console.log(
       `\n[pipeline] #${issueNumber}: done — ${startStage} → ${lastStage} (${transitions} transitions, ${elapsed}s)`,
     );
+
+    } finally {
+      // Stop the terminal.log tee AFTER the final 'done' line above is written so
+      // that line is captured in terminal.log (the inner finally runs first).
+      if (terminalTee) {
+        await terminalTee.stop().catch(() => {});
+      }
+    }
     },
     issueNumber,
   );
@@ -1419,16 +1687,18 @@ async function dispatch(
   opts: CliOpts,
   pipelineRunId: string,
   stateDir?: string,
+  runDir?: string,
+  runStoreDeps?: RunStoreDeps,
 ): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
     case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
+      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "review-1":
-      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir });
+      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "review-2":
-      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir });
+      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "fix-1":
       return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir });
     case "fix-2":
@@ -1446,7 +1716,7 @@ async function dispatch(
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":
-      return deployReady.finalize(cfg, issueNumber);
+      return deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
     case "needs-human":
       // Terminal off-ramp; the loop breaks before reaching dispatch, but keep the
       // switch exhaustive so it never falls through to the unknown-stage error.
@@ -1472,7 +1742,7 @@ async function dispatch(
       // Re-entry: if a worktree with commits exists, resume the post-implementation
       // steps (gate → push → PR → review-1) without re-planning or re-implementing.
       // Falls back to "waiting" when no such worktree exists (mid-flight guard).
-      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
+      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     default:
       return { advanced: false, status: "error", reason: `unknown stage ${stage}` };
   }

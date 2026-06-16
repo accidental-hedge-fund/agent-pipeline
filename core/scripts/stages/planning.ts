@@ -53,6 +53,7 @@ import {
   type VerifyResult,
 } from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
+import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -116,6 +117,11 @@ export interface AdvanceOpts {
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
    *  command runs under the "planning" stage. Undefined → recording disabled. */
   stateDir?: string;
+  /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
+  runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
+   *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
+  runStoreDeps?: RunStoreDeps;
 }
 
 export async function advance(
@@ -165,6 +171,10 @@ export async function advance(
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
   const wt = bootstrap.wt;
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
+  }
 
   // ---- Step 0: optional carry-forward context (last30days) ----
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
@@ -363,6 +373,8 @@ export async function advance(
       `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`,
     pipelineRunId,
     stateDir: opts.stateDir,
+    runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
   });
 }
 
@@ -420,6 +432,10 @@ async function advanceOpenspec(
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
   const wt = bootstrap.wt;
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
+  }
 
   // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
   if (!openspec.isInitialized(wt.path)) {
@@ -707,6 +723,8 @@ async function advanceOpenspec(
       `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
     pipelineRunId,
     stateDir: opts.stateDir,
+    runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
   });
 }
 
@@ -780,6 +798,11 @@ export async function resumeFromImplementing(
     transitionMessage: (prNumber: number) => string;
     pipelineRunId: string;
     stateDir?: string;
+    /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
+    runDir?: string;
+    /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
+     *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
+    runStoreDeps?: RunStoreDeps;
   },
   deps: ResumeFromImplementingDeps = {},
 ): Promise<Outcome> {
@@ -819,6 +842,8 @@ export async function resumeFromImplementing(
 
   // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----
   let prNumber: number;
+  // Track whether the PR is newly created this run so we emit pr_created vs pr_updated.
+  let prIsNew = false;
   const existing = await prLookup(cfg, branch);
   if (existing) {
     prNumber = existing;
@@ -826,6 +851,7 @@ export async function resumeFromImplementing(
   } else {
     try {
       prNumber = await prCreator(cfg, { branch, title: opts.prTitle, body: opts.prBody });
+      prIsNew = true;
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
     } catch (err) {
       // Race: another actor may have created the PR between our pre-check and
@@ -840,6 +866,14 @@ export async function resumeFromImplementing(
         return { advanced: false, status: "blocked", reason: e.message };
       }
     }
+  }
+
+  // ---- Emit pr_created or pr_updated event (#155) ----
+  // Only pr_created when the PR was opened during this run; pr_updated for resume/reuse.
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    const evType = prIsNew ? "pr_created" : "pr_updated";
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }, opts.runStoreDeps).catch(() => {});
   }
 
   // ---- implementing → review-1 ----
@@ -925,6 +959,8 @@ export async function dispatchResume(
       `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}. (Resumed at implementing stage.)`,
     pipelineRunId,
     stateDir: opts.stateDir,
+    runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
   });
 }
 

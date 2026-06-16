@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { findGitRoot } from "../scripts/config.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-cfg-test-"));
 
@@ -1187,6 +1188,26 @@ test("resolveConfig: unknown key under shipcheck_gate rejected at parse time", a
   } finally {
     process.env.PATH = oldPath;
   }
+});
+
+// ---------------------------------------------------------------------------
+// findGitRoot — walk up to the nearest .git dir (#155 fix-3)
+// ---------------------------------------------------------------------------
+
+test("findGitRoot: resolves from a nested subdirectory to the repo root", () => {
+  const root = fs.mkdtempSync(path.join(tmpRoot, "git-root-"));
+  fs.mkdirSync(path.join(root, ".git"), { recursive: true });
+  const nested = path.join(root, "a", "b", "c");
+  fs.mkdirSync(nested, { recursive: true });
+
+  assert.equal(findGitRoot(nested), root, "must walk up from nested dir to the root containing .git");
+  assert.equal(findGitRoot(root), root, "must return root itself when started there");
+});
+
+test("findGitRoot: returns null when no .git ancestor exists", () => {
+  // Use a temp dir that is NOT under any git repo
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "no-git-"));
+  assert.equal(findGitRoot(isolated), null);
 });
 
 // #154 regression: `doctor --is-ok` is a zero-output 0/1 polling gate, but config
