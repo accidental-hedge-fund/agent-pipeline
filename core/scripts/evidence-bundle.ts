@@ -26,7 +26,7 @@ import {
   type StageRecord,
   type StageUpdate,
 } from "./types.ts";
-import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
+import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 
 /** Bundle filename written under `<stateDir>/<issue>/`. */
 export const EVIDENCE_FILE = "evidence.json";
@@ -84,8 +84,16 @@ function emptyBundle(issue: number): EvidenceBundle {
 }
 
 /** Atomic write: ensure the issue dir exists, write a `.tmp` sibling, rename.
- *  Non-fatal: I/O errors are caught, logged, and do not propagate (#161). The
- *  serialized content is passed through the injection denylist before writing. */
+ *  Non-fatal: I/O errors are caught, logged, and do not propagate (#161).
+ *
+ *  Sanitization is applied at the FIELD level (`sanitizeDeep`) BEFORE
+ *  serialization. This is the correct chokepoint for a `JSON.stringify` artifact:
+ *  records appended through paths other than `makeCommandRecord` /
+ *  `makePromptRecord` (e.g. an operator-supplied `OverrideRecord.reason`, review
+ *  or recovery strings) would otherwise reach disk relying only on a
+ *  post-serialize pass, which `JSON.stringify` escaping defeats (`KEY="x"` →
+ *  `KEY=\"x\"`, an embedded `\nassistant:` collapses to mid-line). A trailing
+ *  post-serialize pass is kept as defense-in-depth (#161). */
 async function writeBundle(
   stateDir: string,
   issue: number,
@@ -96,7 +104,8 @@ async function writeBundle(
     const finalPath = bundlePath(stateDir, issue);
     await deps.mkdir(path.dirname(finalPath), { recursive: true });
     const tmp = `${finalPath}.tmp`;
-    const serialized = sanitize(redactSecrets(`${JSON.stringify(bundle, null, 2)}\n`));
+    const cleaned = sanitizeDeep(bundle);
+    const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
     await deps.writeFile(tmp, serialized);
     await deps.rename(tmp, finalPath);
   } catch (err) {

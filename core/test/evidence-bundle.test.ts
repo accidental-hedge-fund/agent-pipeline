@@ -23,6 +23,7 @@ import {
   type BundleDeps,
 } from "../scripts/evidence-bundle.ts";
 import { EVIDENCE_SCHEMA_VERSION, type CommandRecord, type EvidenceBundle } from "../scripts/types.ts";
+import { redactSecrets, sanitize } from "../scripts/artifact-sanitize.ts";
 
 const STATE = "/tmp/test-evidence-state";
 const ISSUE = 147;
@@ -739,6 +740,29 @@ test("writeBundle: recordOverride with GitHub token in reason persists [REDACTED
   const raw = files.get(bundlePath(STATE, ISSUE))!;
   assert.ok(!raw.includes(fakeToken), "token in override reason must not appear in the bundle");
   assert.ok(raw.includes("[REDACTED]"), "redaction marker must be present in persisted bundle");
+});
+
+// review-2 regression (#161): a JSON-escaped *quoted* env-secret in a non-CommandRecord
+// field (here an operator-supplied OverrideRecord.reason) must be redacted via field-level
+// sanitizeDeep in writeBundle. The post-serialize-only pass misses it: JSON.stringify escapes
+// the quotes (KEY="x" → KEY=\"x\"), defeating the env-assignment regex. The value below is
+// deliberately NOT a token format (no ghp_/sk- prefix matching SECRET_VALUE_RE), so the ONLY
+// redaction path is the env-name match — exactly the path JSON escaping breaks.
+test("writeBundle: JSON-escaped quoted env-secret in override reason is redacted (field-level)", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  const reason = 'eval_gate.command was OPENAI_API_KEY="supersecretvalue123" missing-bin';
+  await recordOverride(STATE, ISSUE, { key: "abc12345", reason }, deps);
+  const raw = files.get(bundlePath(STATE, ISSUE))!;
+  assert.ok(!raw.includes("supersecretvalue123"), "quoted env-secret value must not survive in the persisted bundle");
+  assert.ok(raw.includes("[REDACTED]"), "redaction marker must be present in the persisted bundle");
+
+  // Prove the bite: the old post-serialize-only path leaks this exact value.
+  const postSerializeOnly = sanitize(redactSecrets(JSON.stringify({ reason })));
+  assert.ok(
+    postSerializeOnly.includes("supersecretvalue123"),
+    "post-serialize-only path leaks the JSON-escaped quoted secret (this is the bug the fix closes)",
+  );
 });
 
 // Finding 2 regression: role-marker in outputExcerpt is sanitized at the field level (pre-serialization)

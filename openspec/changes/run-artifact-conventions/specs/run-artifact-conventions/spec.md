@@ -35,6 +35,12 @@ serialized-text-only pass.
 - **THEN** the persisted artifact SHALL contain `[REDACTED]` in place of the value
 - **AND** the raw secret value SHALL NOT appear, even though `JSON.stringify` escapes the surrounding quotes
 
+#### Scenario: secret in an evidence-bundle record field is redacted before serialization
+- **WHEN** an evidence-bundle record appended through any path (including an operator-supplied `OverrideRecord.reason`, a review summary, or a recovery record) contains a quoted env-secret assignment like `OPENAI_API_KEY="<value>"`
+- **THEN** the engine SHALL apply field-level redaction before `JSON.stringify`
+- **AND** the persisted `evidence.json` SHALL contain `[REDACTED]` in place of the value
+- **AND** the raw secret value SHALL NOT appear, even though `JSON.stringify` escapes the surrounding quotes
+
 #### Scenario: denylist match causes redaction, not rejection
 - **WHEN** a field value in a record contains an injection-pattern match (e.g., "ignore previous instructions")
 - **THEN** the matching span SHALL be replaced with `[REDACTED-INJECTION]` in the persisted record
