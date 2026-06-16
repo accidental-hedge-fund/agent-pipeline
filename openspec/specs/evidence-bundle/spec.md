@@ -4,16 +4,27 @@
 TBD - created by archiving change evidence-bundle. Update Purpose after archive.
 ## Requirements
 ### Requirement: Pipeline run writes a JSON evidence bundle to a stable, issue-scoped path
-The pipeline orchestrator SHALL create a JSON evidence bundle at `<stateDir>/<issueNumber>/evidence.json` at the start of each dispatch cycle. The path SHALL be deterministic and issue-scoped so the same file is updated across stages within a single run.
+The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/<run-id>/` before any stage handler is called (see `run-directory-layout` spec). The evidence bundle is now composed of two files within that directory: `events.jsonl` (incremental append-only event log, see `events-jsonl-streaming` spec) and `summary.json` (the finalized bundle written at `finalizeRun()`). For backward compatibility, `summary.json` content SHALL also be written to `<stateDir>/<issueNumber>/evidence.json` at finalization. The legacy `evidence.json` at `<stateDir>/<issueNumber>/evidence.json` SHALL remain readable after finalization so that existing consumers experience no breakage.
 
-#### Scenario: bundle created at dispatch entry
+#### Scenario: run directory and event log created at dispatch entry
 - **WHEN** the pipeline orchestrator begins dispatching for issue N
-- **THEN** a JSON file SHALL exist at `<stateDir>/N/evidence.json` before any stage handler is called
-- **AND** the file SHALL be valid JSON with `"schemaVersion": 1`
+- **THEN** the run directory SHALL exist at `.agent-pipeline/runs/<run-id>/` before any stage handler is called
+- **AND** `events.jsonl` SHALL be present in that directory (empty or containing a `run_start` event)
+- **AND** the run directory SHALL contain `run.json` with `schema_version: 1` and `run_id`
 
 #### Scenario: bundle directory created if absent
-- **WHEN** `<stateDir>/N/` does not exist at dispatch entry
-- **THEN** the orchestrator SHALL create the directory before writing the bundle
+- **WHEN** `.agent-pipeline/runs/` does not exist at dispatch entry
+- **THEN** the orchestrator SHALL create the full directory path before writing any files
+
+#### Scenario: summary.json written at finalization with full bundle content
+- **WHEN** `finalizeRun(...)` is called
+- **THEN** `summary.json` SHALL be written to the run directory
+- **AND** SHALL contain `schema_version`, `run_id`, `finalState`, `finalizedAt`, and all accumulated stage, review, override, and recovery records
+
+#### Scenario: legacy evidence.json remains readable after finalization
+- **WHEN** finalization writes `summary.json`
+- **THEN** `<stateDir>/<issueNumber>/evidence.json` SHALL also be written with the same content
+- **AND** existing consumers that read the legacy path SHALL receive the finalized bundle without modification
 
 ---
 
@@ -29,22 +40,19 @@ The evidence bundle SHALL contain the following identity fields, set at creation
 ---
 
 ### Requirement: Bundle records stage transitions incrementally
-For each pipeline stage, the bundle SHALL record: `stage` (the stage name string), `enteredAt` (ISO 8601 timestamp when the stage handler was entered), `exitedAt` (ISO 8601 timestamp when the stage handler returned), `outcome` (one of `"advanced"`, `"blocked"`, `"skipped"`, or `"error"`), `commits` (array of commit SHA strings produced during the stage), `commands` (array of `CommandRecord` objects), and `prompts` (array of `PromptRecord` objects recorded at each harness invocation).
+For each pipeline stage, the orchestrator SHALL append a `stage_start` event to `events.jsonl` when the stage handler is entered and a `stage_complete` event when the stage handler exits. The `stage_complete` event SHALL contain: `stage` (stage name string), `at` (ISO 8601 timestamp), `outcome` (one of `"advanced"`, `"blocked"`, `"skipped"`, or `"error"`), and `commits` (array of commit SHA strings produced during the stage). `commands` (array of `CommandRecord`) and `prompts` (array of `PromptRecord`) are accumulated per-stage during execution and appear only in `summary.json` at finalization — they are not included in individual `stage_complete` events because they are collected deep inside stage handlers and are not available at the orchestrator level where events are appended. The full accumulated stage history (including commands and prompts) SHALL appear in `summary.json` at finalization.
 
-#### Scenario: stage entry recorded
-- **WHEN** a stage handler calls `recordStage()` with `{ stage, enteredAt }`
-- **THEN** the bundle SHALL contain a stage entry with the given `stage` name and `enteredAt` value
+#### Scenario: stage entry recorded as stage_start event
+- **WHEN** a stage handler is entered
+- **THEN** a `stage_start` event SHALL be appended to `events.jsonl` with `stage` and `at`
 
-#### Scenario: stage exit recorded on same entry
-- **WHEN** the same stage handler calls `recordStage()` again with `{ exitedAt, outcome }` for the same stage name
-- **THEN** the existing stage entry SHALL be updated with `exitedAt` and `outcome`
-- **AND** no duplicate stage entry SHALL be created
+#### Scenario: stage exit recorded as stage_complete event
+- **WHEN** a stage handler exits
+- **THEN** a `stage_complete` event SHALL be appended to `events.jsonl` with `stage`, `at`, `outcome`, and `commits`
 
-#### Scenario: multiple stages recorded in order
-- **WHEN** stages `planning` → `review` → `pre-merge` each call `recordStage()`
-- **THEN** the bundle `stages` array SHALL contain entries for all three stages in insertion order
-
----
+#### Scenario: multiple stages recorded in order in events.jsonl
+- **WHEN** stages `planning` → `review` → `pre-merge` each complete
+- **THEN** `events.jsonl` SHALL contain `stage_start`/`stage_complete` pairs for all three in the order they executed
 
 ### Requirement: Bundle records compact prompt/context metadata per harness invocation
 Each harness prompt sent during a review or fix stage SHALL be recorded as a `PromptRecord` appended to that stage's `prompts` array. A `PromptRecord` SHALL contain: `kind` (short label for what the prompt does, e.g. `"review-standard"`), `harness` (the harness name), `hash` (8-character hex prefix of SHA-1 of the redacted prompt content), and `excerpt` (first 500 characters of the redacted prompt). The same secret-redaction rules that apply to `CommandRecord` SHALL apply to `PromptRecord`. Every `StageRecord` SHALL initialize with an empty `prompts` array.
