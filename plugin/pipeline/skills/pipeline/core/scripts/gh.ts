@@ -115,6 +115,48 @@ export async function getIssueDetail(
   };
 }
 
+/** I/O seam for {@link getIssueLabelEvents}: defaults to the module `gh` runner;
+ *  unit tests inject a fake to assert the request shape and simulate responses
+ *  without touching the network. */
+export type GhApiRunner = (args: string[]) => Promise<string>;
+
+/** Fetch pipeline-label additions for `last_event` (#154).
+ *  Uses the GraphQL timeline bounded to the **latest** 100 labeled events
+ *  (`timelineItems(last: 100, itemTypes: [LABELED_EVENT])`). A page-1 REST
+ *  `issues/{n}/events` scan returns the *oldest* 100 events, so on an issue with
+ *  more than 100 events it can exclude the current `pipeline:*` transition and
+ *  yield a stale or null `last_event`; the `last: 100` window always includes the
+ *  most recent label change. Throws on any GitHub failure so the caller's JSON
+ *  error envelope captures the real cause rather than silently returning stale data. */
+export async function getIssueLabelEvents(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<{ label: string; createdAt: string }[]> {
+  const [owner, repo] = cfg.repo.split("/");
+  const stdout = await run([
+    "api",
+    "graphql",
+    "-f",
+    "query=query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo)" +
+      "{issue(number:$num){timelineItems(last:100,itemTypes:[LABELED_EVENT])" +
+      "{nodes{__typename ... on LabeledEvent{createdAt label{name}}}}}}}",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `repo=${repo}`,
+    "-F",
+    `num=${issueNumber}`,
+    "--jq",
+    '.data.repository.issue.timelineItems.nodes[] | select(.label.name | startswith("pipeline:")) | {label: .label.name, createdAt: .createdAt}',
+  ]);
+  return stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { label: string; createdAt: string });
+}
+
 /** Lightweight state + label fetch (no comments). Used for worktree-cap
  *  filtering, where we just need to know "is this issue still in-flight?" */
 export async function getIssueStateAndLabels(

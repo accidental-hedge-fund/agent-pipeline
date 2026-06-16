@@ -23,6 +23,7 @@ import {
   addLabel,
   clearBlocked,
   getIssueDetail,
+  getIssueLabelEvents,
   getItemKind,
   getPrForIssue,
   getPrLinkedIssue,
@@ -58,12 +59,14 @@ import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
+  formatDoctorJson,
   formatDoctorSummary,
   loadLatestPreflightResult,
   runPreflight,
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
+import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
   reviewStageSkipTarget,
@@ -102,8 +105,10 @@ export interface CliOpts {
   detach?: boolean;
   timeout?: number;
   flockTimeout?: number;
-  // `pipeline path` options
+  /** Emit machine-readable JSON (for --status, the doctor command, and `pipeline path`). */
   json?: boolean;
+  /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
+  isOk?: boolean;
 }
 
 /**
@@ -124,7 +129,9 @@ export function buildCmd(): Command {
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
     .option("--fail-fast", "doctor: stop at the first failing check instead of collecting all failures")
+    .option("--is-ok", "doctor: silent exit-0/1 gate (no output); mutually exclusive with --json")
     .option("--status", "read-only status; print stage and exit")
+    .option("--json", "emit machine-readable JSON (for --status or the doctor command)")
     .option("--summary", "print the human-readable evidence-bundle summary for <number> and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
@@ -141,9 +148,9 @@ export function buildCmd(): Command {
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
-    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
-    // `pipeline path` options
-    .option("--json", "output machine-readable JSON (for `pipeline path`)");
+    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number);
+  // Note: `--json` is defined once above; it serves --status, the doctor command,
+  // and `pipeline path` (the path subcommand is exempted from the --status-only check).
   return cmd;
 }
 
@@ -158,6 +165,34 @@ async function main(): Promise<void> {
   // preflight checks and exits, with no issue number. Distinct from the
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
+
+  // Validate machine-mode flags immediately after parsing — before config
+  // resolution or any dispatch — so a typo/construction bug can't silently
+  // fall through to the mutating advance path.
+  if (opts.isOk && !isDoctorCommand) {
+    console.error("pipeline: --is-ok is only valid for the doctor command. Usage: pipeline doctor --is-ok");
+    process.exit(2);
+  }
+  // --json and --is-ok are mutually exclusive; reject BEFORE config resolution so
+  // the rejection cannot be preceded by config-resolution warnings on stderr (#154).
+  if (opts.json && opts.isOk) {
+    console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
+    process.exit(2);
+  }
+  // `pipeline path --json` legitimately emits discovery JSON, so exempt the path
+  // subcommand from the status/doctor-only --json requirement (#153 + #154).
+  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path") {
+    console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
+    process.exit(2);
+  }
+  // Reject 'pipeline doctor' combined with side-effecting modes. cleanup and init
+  // are separate standalone operations; running either when doctor was intended
+  // would silently ignore the doctor intent and mutate state.
+  if (isDoctorCommand && (opts.cleanup || isInit)) {
+    const flag = opts.cleanup ? "--cleanup" : "--init (or 'pipeline init')";
+    console.error(`pipeline: 'pipeline doctor' cannot be combined with ${flag}. These are separate commands.`);
+    process.exit(2);
+  }
 
   // `pipeline run <N> [--detach ...]` — subcommand dispatch.
   if (numArg === "run") {
@@ -199,6 +234,9 @@ async function main(): Promise<void> {
       // so it can run its own cli/auth/repo-access checks and print the required
       // per-check summary instead of exiting with code 2 before the doctor checks run.
       tolerateGhFailure: isDoctorCommand || !!opts.doctor,
+      // `doctor --is-ok` is a zero-output 0/1 polling gate: suppress non-fatal
+      // config-resolution warnings so a valid-but-warning config stays silent (#154).
+      quiet: isDoctorCommand && !!opts.isOk,
     });
   } catch (err) {
     const e = err as Error;
@@ -219,7 +257,22 @@ async function main(): Promise<void> {
         ],
         ranAt: new Date().toISOString(),
       };
+      if (opts.isOk) {
+        // --is-ok: zero bytes of output; exit 1 on any failure.
+        process.exit(1);
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(formatDoctorJson(result)));
+        process.exit(1);
+      }
       console.log(formatDoctorSummary(result));
+      process.exit(1);
+    }
+    // JSON status mode must emit a machine-readable error envelope even when config
+    // resolution fails (e.g. outside a git checkout, invalid pipeline.yml, gh unreachable).
+    // Pipeline Desk polls this path and would fail to parse a prose error on stderr.
+    if (opts.status && opts.json) {
+      console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
       process.exit(1);
     }
     console.error(`pipeline: ${e.message}`);
@@ -256,6 +309,31 @@ async function main(): Promise<void> {
     return;
   }
 
+  // ---- Mode dispatch (bypass paths) ----
+  // Status is read-only and must run BEFORE the kill-switch check so that
+  // `pipeline N --status --json` always emits a parseable JSON envelope even
+  // when the kill switch is active.  Unblock and override are recovery actions
+  // for a stuck run; blocking them with a kill-switch check would prevent
+  // recovery, so they also bypass it (below).
+  if (opts.status) {
+    let issueNumber: number;
+    try {
+      issueNumber = await resolveIssueNumber(cfg, number, { quiet: !!opts.json });
+    } catch (err) {
+      const e = err as Error;
+      if (opts.json) {
+        console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+        process.exitCode = 1;
+      } else {
+        console.error(`pipeline: ${e.message}`);
+        process.exit(1);
+      }
+      return;
+    }
+    await runStatus(cfg, issueNumber, defaultRunStatusDeps, { json: opts.json });
+    return;
+  }
+
   if (isKillSwitchActive(cfg.domain)) {
     console.error(
       `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
@@ -263,23 +341,6 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // ---- Mode dispatch (bypass paths) ----
-  // Status, unblock, and override resolve their own issue number and bypass the
-  // run-start preflight gate: status is read-only, and unblock/override are recovery
-  // actions for a stuck run (blocking them with a preflight failure would prevent
-  // recovery).
-  if (opts.status) {
-    let issueNumber: number;
-    try {
-      issueNumber = await resolveIssueNumber(cfg, number);
-    } catch (err) {
-      const e = err as Error;
-      console.error(`pipeline: ${e.message}`);
-      process.exit(1);
-    }
-    await runStatus(cfg, issueNumber);
-    return;
-  }
   if (opts.unblock !== undefined) {
     let issueNumber: number;
     try {
@@ -386,16 +447,44 @@ export interface PreflightCliDeps {
 const defaultPreflightCliDeps: PreflightCliDeps = { runPreflight, storePreflightResult };
 
 /** `pipeline doctor`: run every preflight check, print the summary, persist the
- *  result for `--status`, and set the exit code (0 all-pass, 1 any failure). */
+ *  result for `--status`, and set the exit code (0 all-pass, 1 any failure).
+ *  With `--json`: emit a single unfenced JSON object instead of prose.
+ *  With `--is-ok`: emit zero output; exit 0/1 only (cheap polling gate).
+ *  `--json` and `--is-ok` are mutually exclusive. */
 export async function runDoctor(
   cfg: PipelineConfig,
   opts: CliOpts,
   deps: PreflightCliDeps = defaultPreflightCliDeps,
 ): Promise<void> {
+  if (opts.json && opts.isOk) {
+    console.error(
+      "pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  if (opts.isOk) {
+    // Silent polling gate: run checks, set exit code, zero bytes of output.
+    try {
+      const failFast = opts.failFast ?? cfg.doctor.failFast;
+      const result = await deps.runPreflight(cfg, undefined, { failFast });
+      process.exitCode = result.ok ? 0 : 1;
+    } catch {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const failFast = opts.failFast ?? cfg.doctor.failFast;
   const result = await deps.runPreflight(cfg, undefined, { failFast });
   await deps.storePreflightResult(cfg, result);
-  console.log(formatDoctorSummary(result));
+
+  if (opts.json) {
+    console.log(JSON.stringify(formatDoctorJson(result)));
+  } else {
+    console.log(formatDoctorSummary(result));
+  }
   process.exitCode = result.ok ? 0 : 1;
 }
 
@@ -425,18 +514,41 @@ export async function runStartPreflightGate(
   return { proceed: true, result };
 }
 
-async function resolveIssueNumber(cfg: PipelineConfig, number: number): Promise<number> {
-  const kind = await getItemKind(cfg, number);
+/** IO seam for {@link resolveIssueNumber} so unit tests inject fakes — no real gh. */
+export interface ResolveIssueNumberDeps {
+  getItemKind: typeof getItemKind;
+  getPrLinkedIssue: typeof getPrLinkedIssue;
+}
+
+const defaultResolveIssueNumberDeps: ResolveIssueNumberDeps = { getItemKind, getPrLinkedIssue };
+
+/**
+ * Resolve `number` to an issue number. If `number` is already an issue it is
+ * returned as-is. If it is a PR the linked closing issue is returned.
+ *
+ * Pass `quiet: true` (e.g. for JSON status mode) to suppress the prose
+ * `[pipeline] #N is a PR → resolved to issue #M` line — that line would
+ * precede and corrupt the JSON envelope on stdout.
+ */
+export async function resolveIssueNumber(
+  cfg: PipelineConfig,
+  number: number,
+  opts: { quiet?: boolean } = {},
+  deps: ResolveIssueNumberDeps = defaultResolveIssueNumberDeps,
+): Promise<number> {
+  const kind = await deps.getItemKind(cfg, number);
   if (kind === "issue") return number;
   // PR → look up linked closing issue.
-  const linked = await getPrLinkedIssue(cfg, number);
+  const linked = await deps.getPrLinkedIssue(cfg, number);
   if (linked === null) {
     throw new Error(
       `#${number} is a PR with no closing-issue reference. The pipeline is issue-centric. ` +
         `${cfg.invocation}: either add "Closes #<n>" to the PR body, or run against the issue directly.`,
     );
   }
-  console.log(`[pipeline] #${number} is a PR → resolved to issue #${linked}`);
+  if (!opts.quiet) {
+    console.log(`[pipeline] #${number} is a PR → resolved to issue #${linked}`);
+  }
   return linked;
 }
 
@@ -455,15 +567,54 @@ export interface RunStatusDeps {
   getPrForIssue: typeof getPrForIssue;
   /** Latest stored preflight result (#146); optional so existing callers are unaffected. */
   loadLatestPreflightResult?: typeof loadLatestPreflightResult;
+  /** For JSON mode (#154): look up the active worktree for an issue. */
+  getForIssue?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ path: string; slug: string } | null>;
+  /** For JSON mode (#154): fetch pipeline-label addition events for `last_event`. */
+  getLabelEvents?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ label: string; createdAt: string }[]>;
 }
 
-const defaultRunStatusDeps: RunStatusDeps = { getIssueDetail, getPrForIssue, loadLatestPreflightResult };
+const defaultRunStatusDeps: RunStatusDeps = {
+  getIssueDetail,
+  getPrForIssue,
+  loadLatestPreflightResult,
+  getForIssue,
+  getLabelEvents: getIssueLabelEvents,
+};
 
 export async function runStatus(
   cfg: PipelineConfig,
   issueNumber: number,
   deps: RunStatusDeps = defaultRunStatusDeps,
+  statusOpts: { json?: boolean } = {},
 ): Promise<void> {
+  // JSON mode (#154): assemble a stable envelope and emit it; skip all prose.
+  if (statusOpts.json) {
+    try {
+      const detail = await deps.getIssueDetail(cfg, issueNumber);
+      const prNumber = await deps.getPrForIssue(cfg, issueNumber);
+      const worktreeInfo = deps.getForIssue
+        ? await deps.getForIssue(cfg, issueNumber).catch(() => null)
+        : null;
+      // In JSON mode, label-event failures must propagate to the outer error handler
+      // so the envelope reports status:"error" rather than silently returning stale data.
+      const labelEvents = deps.getLabelEvents
+        ? await deps.getLabelEvents(cfg, issueNumber)
+        : [];
+      const payload: StatusPayload = buildStatusPayload(
+        { ...detail, labelEvents },
+        prNumber,
+        worktreeInfo,
+        cfg,
+      );
+      console.log(JSON.stringify(payload));
+    } catch (err) {
+      const e = err as Error;
+      console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   const stage = pickStage(detail.labels);
   const blocked = isBlocked(detail.labels);

@@ -20,6 +20,8 @@ backlog → ready → planning → plan-review → implementing
 - [Per-repo config](#per-repo-config-optional)
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Troubleshooting](#troubleshooting)
+  - [Evidence bundle](#evidence-bundle)
+  - [Machine-readable artifact conventions](#machine-readable-artifact-conventions)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
   - [Human plan feedback](#human-plan-feedback)
@@ -188,6 +190,7 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 ```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
 /pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
+/pipeline N --status --json                   machine-readable JSON status envelope (stable contract)
 /pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 $pipeline N --unblock "<answer>"              (same for Codex)
@@ -196,6 +199,8 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
 /pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
+/pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
+/pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
 /pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
@@ -322,6 +327,13 @@ The checks (each emits one sentence of remediation text on failure):
 **Run-start gating (opt-in).** Set `doctor.runOnStart: true` in `.github/pipeline.yml`, or pass `--doctor` on a normal run, to run the preflight **before planning**. A failing preflight prints the summary and aborts with a non-zero exit **before any planning, implementation, or review tokens are spent**. With neither set, a run is completely unaffected — no checks execute. `--fail-fast` (or `doctor.failFast: true`) stops at the first failing check instead of collecting all failures.
 
 The latest result is stored under `/tmp/pipeline-<domain>-doctor-result.json`; `/pipeline N --status` appends that preflight summary (with its timestamp) when one is present, and omits the section otherwise.
+
+**Machine-readable output (#154).** Two flags expose the doctor result as a stable JSON contract for tooling (e.g. Pipeline Desk):
+
+- `pipeline doctor --json` — emits a single unfenced JSON object with `schema_version`, `status` (`"ok"` or `"error"`), and a `checks` array where each entry is `{name, ok, reason, fix}`. Exit code mirrors the prose path (0 = all pass, 1 = any fail). Human output is suppressed.
+- `pipeline doctor --is-ok` — runs all checks, emits **zero bytes of output**, and exits 0 (all pass) or 1 (any fail). Use for cheap polling. Mutually exclusive with `--json`.
+
+Similarly, `pipeline N --status --json` emits a single unfenced JSON object describing the issue's pipeline state (`schema_version`, `status`, `issue`, `stage`, `pr`, `branch`, `worktree`, `last_event`, `review_summary`, `next_action`, `config`). The human `--status` output is unchanged when `--json` is absent.
 
 ## Worktree dependency install (`setup_command`)
 
@@ -516,6 +528,24 @@ Print a human-readable summary of a run at any time — this reads the local fil
 /pipeline N --summary
 $pipeline N --summary
 ```
+
+### Machine-readable artifact conventions
+
+Every machine-readable artifact written by the pipeline engine follows these cross-cutting conventions (#161):
+
+**`schema_version` integer.** Every JSON object or JSONL record carries a top-level `schema_version` integer field (currently `1`). Backward-compat promise: field names and types are stable across minor versions; key order is not load-bearing; new optional fields may be added without bumping; removed or renamed fields are major-version bumps. Consumers that ignore unknown fields are forward-compatible. Absent `schema_version` should be treated as `0` (pre-convention).
+
+> **Transitional note (evidence bundle):** The evidence bundle carries both `schema_version` (integer, new) and `schemaVersion` (camelCase, legacy) at the same value during the transitional period. Both are equivalent; new consumers should read `schema_version`.
+
+**Non-fatal I/O.** Every artifact write is wrapped in a non-fatal try/catch. If writing fails (disk full, permissions, etc.) a warning is logged and the error does not propagate — a broken telemetry sink never blocks a stage. The pipeline stage that triggered the write continues and completes normally.
+
+**Write-time injection denylist.** Before persisting any artifact record, the serialized JSON content is passed through a denylist of prompt-injection patterns (e.g. `ignore previous instructions`, `you are now`, `system:`, `disregard`). Matching spans are replaced with `[REDACTED-INJECTION]`. The record is written with the substitution in place; it is never silently dropped. This prevents a replayed artifact line from injecting instructions into a later agent's context.
+
+**Value redaction.** Sensitive values — GitHub tokens, API keys, and env vars whose name matches a secret pattern — are replaced with `[REDACTED]` before any record is written (see `makeCommandRecord` in `evidence-bundle.ts`).
+
+**`_`-prefix local-only fields.** Fields that must not be surfaced to any remote or sync target (e.g. absolute workspace paths, machine-local identifiers) use a leading-underscore name (e.g. `_localPath`). No such fields exist in the current schema (no absolute path fields are stored in machine-readable records), but any future addition of local-only fields must use this convention. The README documents any current `_`-prefixed fields here when they are added.
+
+**Filesystem-only data sharing.** Artifacts share data exclusively through the filesystem. No event bus, IPC daemon, or in-process event emitter is used as a cross-artifact communication channel.
 
 ---
 
