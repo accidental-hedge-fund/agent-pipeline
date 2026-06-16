@@ -20,7 +20,7 @@ import {
   transition as defaultTransition,
 } from "../gh.ts";
 import { getForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
-import { openspecContextFromDiff, isActive, changeIdsFromPaths, readSpecDeltas } from "../openspec.ts";
+import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
 import { substitute } from "../prompts/index.ts";
@@ -174,10 +174,14 @@ export interface ShipcheckDeps {
   setBlocked?: typeof defaultSetBlocked;
   /** Read a file at the given absolute path. Returns null when not found. */
   readFile?: (filePath: string) => string | null;
+  /** Resolve a canonical path following symlinks. Default: fs.realpathSync. Throws on ENOENT. */
+  realpathFn?: (filePath: string) => string;
   /** Read the evidence bundle for an issue. Returns null when not found. */
   readEvidenceBundle?: (stateDir: string, issue: number) => Promise<EvidenceBundle | null>;
   /** Run git diff --name-only in a worktree. Returns path list. */
   gitDiffNames?: (wtPath: string, base: string) => Promise<string[]>;
+  /** Read OpenSpec spec deltas for a change dir name. Default: openspec.readSpecDeltas. */
+  readSpecDeltasFn?: (wtPath: string, name: string) => string;
   /** Invoke the reviewer harness with a prompt. Returns stdout string or null on failure. */
   invokeReviewer?: (prompt: string, worktreeDir: string, timeoutSec: number) => Promise<{ stdout: string; success: boolean; timed_out?: boolean; stderr?: string }>;
 }
@@ -211,6 +215,7 @@ export async function advance(
   const getPrDiffFn = deps.getPrDiff ?? defaultGetPrDiff;
   const readEvidenceBundleFn = deps.readEvidenceBundle ?? defaultReadBundle;
   const gitDiffNamesFn = deps.gitDiffNames ?? defaultGitDiffNames;
+  const readSpecDeltasFnBound = deps.readSpecDeltasFn ?? readSpecDeltas;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would run shipcheck`);
@@ -249,7 +254,7 @@ export async function advance(
 
   // Derive OpenSpec deltas from the worktree branch diff when applicable.
   const openspecDeltas = wt
-    ? await gatherOpenspecDeltas(cfg, wt.path, gitDiffNamesFn)
+    ? await gatherOpenspecDeltas(cfg, wt.path, gitDiffNamesFn, readSpecDeltasFnBound)
     : undefined;
 
   // Assemble prompt context.
@@ -413,6 +418,8 @@ export async function advance(
  *
  * Rejects absolute rubric_path values and paths that normalize outside the repo
  * root to prevent local file disclosure via a malicious .github/pipeline.yml.
+ * Also resolves symlinks (via realpathFn) and rejects rubric files whose real
+ * path exits the repo boundary — closing the symlink-escape class.
  */
 function loadRubric(cfg: PipelineConfig, deps: ShipcheckDeps, fallback: string): string {
   const repoDir = path.resolve(cfg.repo_dir);
@@ -428,6 +435,25 @@ function loadRubric(cfg: PipelineConfig, deps: ShipcheckDeps, fallback: string):
       `[pipeline] shipcheck: rubric_path "${cfg.shipcheck_gate.rubric_path}" resolves outside the repo root; using issue acceptance criteria as rubric.`,
     );
     return fallback;
+  }
+
+  // Resolve symlinks: a repo-local path could be a symlink whose target exits
+  // the repo (e.g. .github/shipcheck-rubric.md → /etc/passwd). Call realpathFn
+  // on both repo and rubric to get canonical paths, then recheck the boundary.
+  // When realpathFn throws (file not found, dir not found) we fall through to
+  // readFileFn which returns null for missing files — no change in that path.
+  const realpathFn = deps.realpathFn ?? ((p: string) => fs.realpathSync(p) as string);
+  try {
+    const realRepo = realpathFn(repoDir);
+    const realRubric = realpathFn(rubricPath);
+    if (!realRubric.startsWith(realRepo + path.sep) && realRubric !== realRepo) {
+      console.warn(
+        `[pipeline] shipcheck: rubric_path "${cfg.shipcheck_gate.rubric_path}" resolves via symlink to a path outside the repo; using issue acceptance criteria as rubric.`,
+      );
+      return fallback;
+    }
+  } catch {
+    // realpathFn threw (file or dir does not exist) — fall through to readFileFn.
   }
 
   const readFileFn = deps.readFile ?? defaultReadFile;
@@ -547,18 +573,40 @@ async function gatherEvalSummary(
 }
 
 /**
+ * Archive change dir names referenced by a list of repo-relative diff paths.
+ * Matches `openspec/changes/archive/<name>/…` and returns the full dir name
+ * (which is date-prefixed in this repo, e.g. "2026-06-08-add-eval-gate").
+ * Pure; exported for tests.
+ */
+export function archiveNamesFromPaths(paths: string[]): string[] {
+  const names = new Set<string>();
+  for (const p of paths) {
+    const m = p.replace(/\\/g, "/").match(/(?:^|\/)openspec\/changes\/archive\/([^/]+)\//);
+    if (m) names.add(m[1]);
+  }
+  return [...names];
+}
+
+/**
  * Derive OpenSpec spec deltas from the worktree's branch diff.
  *
  * Pre-merge archives active change dirs before routing to shipcheck, so the
  * normal active-path check inside openspecContextFromDiff returns nothing for
- * those changes. After the active-path attempt returns empty we also check the
- * archive location (openspec/changes/archive/<id>/specs/) so the spec deltas
- * that were the acceptance source of truth still reach the reviewer.
+ * those changes. The diff then shows `openspec/changes/archive/<date>-<id>/…`
+ * paths instead — we extract the full (date-prefixed) archive dir name from
+ * those paths and read the spec deltas directly from the archive location.
+ *
+ * Two bugs in the prior implementation:
+ *   1. changeIdsFromPaths explicitly ignores archive paths (m[1] !== "archive").
+ *   2. Even if IDs were found, "archive/<id>" skipped the date prefix so the
+ *      lookup dir didn't exist (real path is "archive/<date>-<id>").
+ * archiveNamesFromPaths fixes both by extracting the full archive dir name.
  */
 async function gatherOpenspecDeltas(
   cfg: PipelineConfig,
   wtPath: string,
   gitDiffNamesFn: (wtPath: string, base: string) => Promise<string[]>,
+  readSpecDeltasFn: (wtPath: string, name: string) => string,
 ): Promise<string | undefined> {
   try {
     const diffPaths = await gitDiffNamesFn(wtPath, cfg.base_branch);
@@ -567,13 +615,15 @@ async function gatherOpenspecDeltas(
     const activeDeltas = openspecContextFromDiff(cfg, wtPath, diffPaths);
     if (activeDeltas) return activeDeltas;
 
-    // After pre-merge archives the change, active dirs are gone. Check the
-    // archive subdirectory. readSpecDeltas(dir, "archive/<id>") resolves to
-    // openspec/changes/archive/<id>/specs/ which is where archive places them.
-    if (!isActive(cfg, wtPath)) return undefined;
-    const ids = changeIdsFromPaths(diffPaths);
-    const archivedParts = ids
-      .map((id) => readSpecDeltas(wtPath, `archive/${id}`))
+    // After pre-merge archives the change, active dirs are gone and the diff
+    // shows `openspec/changes/archive/<date>-<id>/…` paths. Respect explicit
+    // opt-out; presence of archive paths in the diff implies the integration
+    // is otherwise active for this repo.
+    if (cfg.openspec?.enabled === "off") return undefined;
+    const archiveNames = archiveNamesFromPaths(diffPaths);
+    if (!archiveNames.length) return undefined;
+    const archivedParts = archiveNames
+      .map((name) => readSpecDeltasFn(wtPath, `archive/${name}`))
       .filter(Boolean);
     return archivedParts.length ? archivedParts.join("\n\n") : undefined;
   } catch {

@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   advance,
+  archiveNamesFromPaths,
   buildShipcheckPrompt,
   extractAcceptanceCriteria,
   formatShipcheckComment,
@@ -846,4 +847,132 @@ test("shipcheck-gate: reviewer invoked with cfg.review_timeout, not hardcoded 30
   await advance(cfg, 77, {}, deps);
 
   assert.equal(capturedTimeout, 900, "reviewer must receive cfg.review_timeout, not hardcoded 300");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 (review-2): symlink escape must be rejected via realpath check
+// ---------------------------------------------------------------------------
+
+test("archiveNamesFromPaths: extracts full date-prefixed archive dir names from diff paths", () => {
+  const paths = [
+    "openspec/changes/archive/2026-06-08-my-feature/specs/my-feature/spec.md",
+    "openspec/changes/archive/2026-06-10-other/specs/other/spec.md",
+    "openspec/specs/my-feature/spec.md",            // living spec — not an archive path
+    "openspec/changes/active-change/specs/x.md",    // active change — must be excluded
+  ];
+  const names = archiveNamesFromPaths(paths);
+  assert.deepEqual(
+    names.sort(),
+    ["2026-06-08-my-feature", "2026-06-10-other"].sort(),
+    "must extract full date-prefixed archive names and exclude non-archive paths",
+  );
+});
+
+test("archiveNamesFromPaths: returns empty array when no archive paths present", () => {
+  const paths = ["src/foo.ts", "openspec/specs/x.md", "openspec/changes/active/tasks.md"];
+  assert.deepEqual(archiveNamesFromPaths(paths), []);
+});
+
+test("shipcheck-gate: symlink rubric_path that resolves outside repo → rejected, fallback used", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", rubric_path: ".github/shipcheck-rubric.md" });
+  // Simulate a repo rooted at /some/repo where the rubric symlinks to /etc/passwd.
+  cfg.repo_dir = "/some/repo";
+
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT), "should not be read via readFile"),
+    realpathFn: (p: string) => {
+      if (p === "/some/repo") return "/some/repo";
+      // The rubric file is a symlink whose real path exits the repo.
+      if (p.endsWith("shipcheck-rubric.md")) return "/etc/passwd";
+      return p;
+    },
+    readFile: (_p) => { throw new Error("readFile must not be called when symlink escapes repo"); },
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T",
+      body: "## Acceptance Criteria\n- Symlink AC must appear in prompt",
+      state: "open", url: "u", labels: [], comments: [],
+    }),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  try {
+    const out = await advance(cfg, 80, {}, deps);
+    assert.equal(out.advanced, true);
+    assert.ok(
+      warnings.some((w) => w.includes("symlink")),
+      "must warn about symlink escape",
+    );
+    assert.ok(capturedPrompt.includes("Symlink AC must appear in prompt"), "prompt must use AC fallback, not symlink target");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 (review-2): archived OpenSpec deltas recovered after pre-merge
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: OpenSpec deltas recovered from date-prefixed archive dir after pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  // Simulate a git diff that shows archived OpenSpec paths (post-pre-merge).
+  // The active change dir was moved to the date-prefixed archive location.
+  const archiveDiffPaths = [
+    "openspec/changes/archive/2026-06-08-my-feature/specs/my-feature/spec.md",
+    "openspec/specs/my-feature/spec.md",
+  ];
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getForIssue: async () => ({ path: "/tmp/fake-worktree", slug: "1-test" }),
+    gitDiffNames: async () => archiveDiffPaths,
+    readSpecDeltasFn: (_wtPath: string, name: string) => {
+      // Verify the lookup uses the full date-prefixed name, not a bare id.
+      if (name === "archive/2026-06-08-my-feature") {
+        return "## my-feature/spec.md\n\nShipcheck SHALL evaluate archived spec deltas.";
+      }
+      return "";
+    },
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 81, {}, deps);
+
+  assert.ok(
+    capturedPrompt.includes("Shipcheck SHALL evaluate archived spec deltas"),
+    "prompt must include spec deltas recovered from date-prefixed archive dir",
+  );
+});
+
+test("shipcheck-gate: OpenSpec disabled (enabled:off) → archive lookup skipped", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+  cfg.openspec = { enabled: "off", bootstrap: false };
+
+  let readSpecDeltasCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getForIssue: async () => ({ path: "/tmp/fake-worktree", slug: "1-test" }),
+    gitDiffNames: async () => ["openspec/changes/archive/2026-06-08-x/specs/x.md"],
+    readSpecDeltasFn: () => { readSpecDeltasCalled = true; return "should not be read"; },
+    invokeReviewer: async () => ({ stdout: fencedJson(PASS_VERDICT), success: true }),
+  };
+
+  await advance(cfg, 82, {}, deps);
+
+  assert.equal(readSpecDeltasCalled, false, "archive lookup must be skipped when openspec is disabled");
 });
