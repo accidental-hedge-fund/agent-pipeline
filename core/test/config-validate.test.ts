@@ -614,3 +614,33 @@ test("validateConfig: block-scalar config-like text does not mislocate the real 
   assert.ok(diag, "expected a diagnostic for the real key");
   assert.equal(diag!.line, 5, `must locate the real key at line 5, not the block-scalar text; got ${diag!.line}`);
 });
+
+// #156 review-2 round-3: the locator must report the offending KEY line, not the
+// (possibly multiline) value line.
+
+test("validateConfig: invalid rigor key with a mapping value reports the KEY line, not the value (#156)", () => {
+  const yaml = [
+    "review_policy:",        // line 1
+    "  block_threshold:",    // line 2 — the offending key
+    "    typo: true",        // line 3 — nested mapping value (wrong type)
+  ].join("\n");
+  const result = validateConfig("/repo", makeDeps(yaml));
+  assert.equal(result.valid, false);
+  const diag = result.diagnostics.find((d: Diagnostic) => d.path === "review_policy.block_threshold");
+  assert.ok(diag, "expected a diagnostic for review_policy.block_threshold");
+  assert.equal(diag!.rigorGating, true);
+  assert.equal(diag!.line, 2, `must report the key line (2), not the value line; got ${diag!.line}`);
+});
+
+test("validateConfig: unknown key with a mapping value reports the KEY line (#156)", () => {
+  const yaml = [
+    "eval_gate:",       // line 1
+    "  mdoe:",          // line 2 — misspelled (unknown) key
+    "    foo: bar",     // line 3 — nested mapping value
+  ].join("\n");
+  const result = validateConfig("/repo", makeDeps(yaml));
+  assert.equal(result.valid, false);
+  const diag = result.diagnostics.find((d: Diagnostic) => d.path === "eval_gate.mdoe");
+  assert.ok(diag, "expected a diagnostic for the unknown key eval_gate.mdoe");
+  assert.equal(diag!.line, 2, `must report the misspelled key line (2); got ${diag!.line}`);
+});

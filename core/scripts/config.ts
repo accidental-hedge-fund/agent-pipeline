@@ -564,10 +564,30 @@ export function buildLineLookup(text: string): (dotPath: string) => number | und
   } catch {
     return () => undefined;
   }
+  type RangedNode = { range?: [number, number, number] };
+  type Pair = { key?: ({ value?: unknown } & RangedNode) };
   return (dotPath: string): number | undefined => {
     if (!dotPath) return undefined;
+    const segments = dotPath.split(".");
+    const last = segments[segments.length - 1];
+    const parentPath = segments.slice(0, -1);
     try {
-      const node = doc!.getIn(dotPath.split("."), true) as { range?: [number, number, number] } | undefined;
+      // Prefer the offending KEY's source range over the value's, so a multiline
+      // mapping value (`block_threshold:\n    typo: true`) still points at the key
+      // line, not the nested value line.
+      const parent = parentPath.length === 0 ? doc!.contents : doc!.getIn(parentPath, true);
+      const items = (parent as { items?: Pair[] } | undefined)?.items;
+      if (Array.isArray(items)) {
+        for (const pair of items) {
+          if (pair?.key && String(pair.key.value) === last) {
+            const keyOffset = pair.key.range?.[0];
+            if (typeof keyOffset === "number") return lineFromOffset(text, keyOffset);
+          }
+        }
+      }
+      // Fallback to the value node range (e.g. sequence indices, or when the key
+      // range is unavailable).
+      const node = doc!.getIn(segments, true) as RangedNode | undefined;
       const offset = node?.range?.[0];
       return typeof offset === "number" ? lineFromOffset(text, offset) : undefined;
     } catch {
