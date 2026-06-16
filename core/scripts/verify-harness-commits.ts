@@ -50,6 +50,10 @@ export interface VerifyDeps {
   gitDiffFiles?: (wtPath: string, headBefore: string) => Promise<string[]>;
   /** Returns names of uncommitted (dirty) files in the worktree. */
   gitDirtyFiles?: (wtPath: string) => Promise<string[]>;
+  /** Returns commit SHAs in `headBefore..HEAD` (newest-first). Empty array if none. */
+  gitCommitShas?: (wtPath: string, headBefore: string) => Promise<string[]>;
+  /** Returns paths of files changed in a single commit SHA via `git diff-tree`. */
+  gitDiffTreeFiles?: (wtPath: string, sha: string) => Promise<string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +81,26 @@ async function defaultGitDiffFiles(wtPath: string, headBefore: string): Promise<
 async function defaultGitDirtyFiles(wtPath: string): Promise<string[]> {
   const res = await gitInWorktree(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
   return parseDirtyFiles(res.stdout);
+}
+
+async function defaultGitCommitShas(wtPath: string, headBefore: string): Promise<string[]> {
+  const res = await gitInWorktree(
+    wtPath,
+    ["log", `${headBefore}..HEAD`, "--format=%H"],
+    { ignoreFailure: true },
+  );
+  return res.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+async function defaultGitDiffTreeFiles(wtPath: string, sha: string): Promise<string[]> {
+  // --diff-filter=d (lowercase) excludes deleted paths so a cleanup commit that
+  // removes a previously committed node_modules entry is not blocked by the scan.
+  const res = await gitInWorktree(
+    wtPath,
+    ["diff-tree", "--no-commit-id", "-r", "--name-only", "--diff-filter=d", sha],
+    { ignoreFailure: true },
+  );
+  return res.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
 }
 
 /** Parse `git status --porcelain` output into a list of affected file paths. Exported for tests. */
@@ -136,6 +160,25 @@ export async function verifyHarnessCommits(
   const getMessages = deps.gitMessages ?? defaultGitMessages;
   const getDiffFiles = deps.gitDiffFiles ?? defaultGitDiffFiles;
   const getDirtyFiles = deps.gitDirtyFiles ?? defaultGitDirtyFiles;
+  const getCommitShas = deps.gitCommitShas ?? defaultGitCommitShas;
+  const getDiffTreeFiles = deps.gitDiffTreeFiles ?? defaultGitDiffTreeFiles;
+
+  // Node-modules scan runs FIRST on every non-empty range, before any other
+  // check that could return early.  This guarantees the diagnostic is surfaced
+  // even when commit-message, trailer, docsOnly, or pathConstraint checks would
+  // also block on a different violation in the same range.
+  const shas = await getCommitShas(wtPath, headBefore);
+  for (const sha of shas) {
+    const files = await getDiffTreeFiles(wtPath, sha);
+    for (const file of files) {
+      if (file.split("/")[0] === "node_modules") {
+        return {
+          ok: false,
+          reason: `Commit ${sha} adds a node_modules entry (${file}); node_modules must not be committed`,
+        };
+      }
+    }
+  }
 
   // Commit-based checks
   const requiresCommits =

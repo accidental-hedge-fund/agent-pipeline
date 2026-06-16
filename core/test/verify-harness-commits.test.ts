@@ -504,3 +504,99 @@ test("verifyPlanRevisionOutput: with feedback — no detectable items in feedbac
   ].join("\n");
   assert.deepEqual(verifyPlanRevisionOutput(stdout, feedback), { ok: true });
 });
+
+// ---------------------------------------------------------------------------
+// verifyHarnessCommits — node_modules commit scan (#180)
+// ---------------------------------------------------------------------------
+
+test("node_modules scan: commit containing node_modules entry → step blocks (regression #180)", async () => {
+  const sha = "abc1234deadbeef";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["implement feature (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async (_wt, s) => s === sha ? ["node_modules", "src/foo.ts"] : [],
+  });
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("node_modules"), `reason: ${JSON.stringify(result)}`);
+  assert.ok("reason" in result && result.reason.includes(sha), `sha in reason: ${JSON.stringify(result)}`);
+  assert.ok("reason" in result && result.reason.includes("must not be committed"), `diagnostic text: ${JSON.stringify(result)}`);
+});
+
+test("node_modules scan: commit with no node_modules entries → scan passes (regression #180)", async () => {
+  const sha = "def5678cafebabe";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["implement feature (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => ["src/foo.ts", "core/scripts/bar.ts"],
+  });
+  assert.equal(result.ok, true);
+});
+
+test("node_modules scan: nested path under node_modules also blocks (e.g. node_modules/foo)", async () => {
+  const sha = "aabbccdd11223344";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["implement feature (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => ["node_modules/some-pkg/index.js", "src/foo.ts"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("node_modules/some-pkg/index.js"));
+});
+
+test("node_modules scan: empty commit range → scan is no-op, no block (#180)", async () => {
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180, allowEmpty: true }, {
+    gitMessages: async () => [],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [],
+    gitDiffTreeFiles: async () => [],
+  });
+  assert.equal(result.ok, true);
+});
+
+test("node_modules scan: commit that only deletes a node_modules entry → scan passes (#180 finding 2)", async () => {
+  // A remediation commit that removes a previously committed node_modules symlink
+  // must NOT be blocked.  The injectable gitDiffTreeFiles returns only what the
+  // default implementation returns (non-deleted paths), so the scan never sees
+  // the deleted node_modules path.
+  const sha = "cleanup1234567890";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["fix: remove node_modules symlink (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    // Simulate what defaultGitDiffTreeFiles returns after --diff-filter=d:
+    // the deleted node_modules path is excluded, only other changes are returned.
+    gitDiffTreeFiles: async () => ["core/scripts/worktree.ts"],
+  });
+  assert.equal(result.ok, true, "cleanup commit removing node_modules must not be blocked");
+});
+
+test("node_modules scan: node_modules diagnostic is returned even when commit-message check would also block (#180 review-2 finding 2)", async () => {
+  // Regression: the scan used to run AFTER commit-message / trailer checks and
+  // could be skipped by an early return.  A commit that both adds node_modules
+  // AND has a bad message must surface the node_modules diagnostic directly.
+  const sha = "deadbeef12345678";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["bad message without issue reference"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => ["node_modules", "src/foo.ts"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    "reason" in result && result.reason.includes("node_modules"),
+    `node_modules diagnostic must be returned even when message check also fails; got: ${JSON.stringify(result)}`,
+  );
+  assert.ok(
+    "reason" in result && result.reason.includes(sha),
+    `sha must appear in diagnostic; got: ${JSON.stringify(result)}`,
+  );
+});

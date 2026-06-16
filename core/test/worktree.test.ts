@@ -5,7 +5,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex } from "../scripts/worktree.ts";
+import * as os from "node:os";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -345,14 +352,18 @@ function makeCreateCfg(): PipelineConfig {
   } as unknown as PipelineConfig;
 }
 
-// No-op mutex/sleep deps shared by createWorktree unit tests that don't
-// exercise the mutex or retry logic (avoids real fs lock files in CI).
-const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep" | "resolveGitCommonDir"> = {
+// No-op mutex/sleep/bootstrap deps shared by createWorktree unit tests that
+// don't exercise mutex, retry, or bootstrap logic (avoids real fs operations).
+const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep" | "resolveGitCommonDir" | "writeNodeModulesExclude" | "lstatPath" | "unlinkPath"> = {
   acquireMutex: (_p) => {},
   releaseMutex: (_p) => {},
   sleep: async (_ms) => {},
   // Identity: no real git call; all tests use a fake cfg.repo_dir anyway.
   resolveGitCommonDir: async (repoDir) => repoDir,
+  // Bootstrap no-ops: avoids real fs calls on non-existent test worktrees.
+  writeNodeModulesExclude: async () => {},
+  lstatPath: async () => null,
+  unlinkPath: async () => {},
 };
 
 test("createWorktree: this issue's stale worktree is reclaimed before the capacity check", async () => {
@@ -699,6 +710,9 @@ test("createWorktree: waits for live mutex holder to release before proceeding",
     },
     releaseMutex: (_p) => {},
     sleep: async (_ms) => { slept = true; },
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -837,6 +851,9 @@ test("createWorktree: two runs from different linked worktrees of the same repo 
     acquireMutex: (p) => { capturedMutexPaths.push(p); },
     releaseMutex: (_p) => {},
     sleep: async (_ms) => {},
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
   });
 
   await createWorktree(cfg1, 1, "issue-one", makeDeps());
@@ -886,6 +903,9 @@ test("createWorktree: mutex wait succeeds after more than 30s of simulated waiti
     },
     releaseMutex: (_p) => {},
     sleep: async (ms) => { totalSleepMs += ms; },
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -1020,4 +1040,204 @@ test("acquireWorktreeMutex: two reclaimers with same invalid content — second 
   );
 
   assert.equal(mainUnlinked, false, "second reclaimer must NOT unlink the main lock");
+});
+
+// ---------------------------------------------------------------------------
+// createWorktree bootstrap: node_modules exclude + symlink removal (#180)
+//
+// Regression: the worktree bootstrap must write node_modules to
+// .git/info/exclude and remove any pre-existing node_modules symlink before
+// any harness runs. Without this, `git add -A` stages the symlink, which
+// breaks CI (`pnpm install` ENOTDIR) on the PR branch.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: node_modules symlink at worktree root is removed and exclude is written during bootstrap (#180)", async () => {
+  const cfg = makeCreateCfg();
+  const wtPath = "/repo/.worktrees/pipeline-42-slug";
+  const nmPath = `${wtPath}/node_modules`;
+  let excludeWrittenFor: string | null = null;
+  let unlinkCalledWith: string | null = null;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+    // Override the no-ops from noopMutexDeps with recording fakes.
+    writeNodeModulesExclude: async (wt) => { excludeWrittenFor = wt; },
+    lstatPath: async (p) => {
+      if (p === nmPath) return { isSymbolicLink: () => true };
+      return null;
+    },
+    unlinkPath: async (p) => { unlinkCalledWith = p; },
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.ok(result.path.includes("pipeline-42-slug"));
+  assert.equal(excludeWrittenFor, wtPath, "writeNodeModulesExclude must be called with the worktree path");
+  assert.equal(unlinkCalledWith, nmPath, "node_modules symlink must be passed to unlinkPath");
+});
+
+test("createWorktree: node_modules directory (not symlink) is NOT removed during bootstrap (#180)", async () => {
+  const cfg = makeCreateCfg();
+  let unlinkCalled = false;
+  let excludeWritten = false;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+    // Override the no-ops from noopMutexDeps with recording fakes.
+    writeNodeModulesExclude: async () => { excludeWritten = true; },
+    lstatPath: async () => ({ isSymbolicLink: () => false }), // directory, not a symlink
+    unlinkPath: async () => { unlinkCalled = true; },
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(excludeWritten, true, "exclude must always be written during bootstrap");
+  assert.equal(unlinkCalled, false, "non-symlink node_modules must not be removed");
+});
+
+test("createWorktree: no node_modules at worktree root → exclude written, unlink not called (#180)", async () => {
+  const cfg = makeCreateCfg();
+  let unlinkCalled = false;
+  let excludeWritten = false;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+    // Override the no-ops from noopMutexDeps with recording fakes.
+    writeNodeModulesExclude: async () => { excludeWritten = true; },
+    lstatPath: async () => null, // ENOENT — no node_modules at all
+    unlinkPath: async () => { unlinkCalled = true; },
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(excludeWritten, true, "exclude must be written even when node_modules is absent");
+  assert.equal(unlinkCalled, false, "unlink must not be called when there is no node_modules");
+});
+
+// ---------------------------------------------------------------------------
+// realWriteNodeModulesExclude — linked worktree regression (#180 finding 1)
+// ---------------------------------------------------------------------------
+
+test("realWriteNodeModulesExclude: linked worktree (.git file) writes to COMMON gitdir info/exclude, not per-worktree gitdir (#180 review-2 finding 1)", async () => {
+  // In a real `git worktree add` linked worktree:
+  //   - .git is a FILE containing "gitdir: <per-worktree-dir>"
+  //   - <per-worktree-dir> is e.g. <main-repo>/.git/worktrees/<name>
+  //   - <per-worktree-dir>/commondir contains the relative path to the common git dir
+  //   - git resolves info/exclude through the COMMON git dir, not the per-worktree dir
+  // The old implementation wrote to <per-worktree-dir>/info/exclude, which git
+  // never reads for this worktree — so `git add` still staged node_modules entries.
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
+  try {
+    const worktreeRoot = path.join(tmp, "wt");
+    const commonGitDir = path.join(tmp, "common-gitdir");   // analogous to main-repo/.git
+    const perWorktreeGitDir = path.join(tmp, "per-wt-gitdir"); // analogous to .git/worktrees/<name>
+    await fs.promises.mkdir(worktreeRoot);
+    await fs.promises.mkdir(commonGitDir);
+    await fs.promises.mkdir(perWorktreeGitDir);
+
+    // Simulate the 'commondir' file Git writes in the per-worktree dir.
+    const relCommonDir = path.relative(perWorktreeGitDir, commonGitDir);
+    await fs.promises.writeFile(path.join(perWorktreeGitDir, "commondir"), `${relCommonDir}\n`);
+
+    // Simulate a linked worktree: .git is a file pointing at the per-worktree gitdir.
+    await fs.promises.writeFile(path.join(worktreeRoot, ".git"), `gitdir: ${perWorktreeGitDir}\n`);
+
+    await realWriteNodeModulesExclude(worktreeRoot);
+
+    // Must write to the COMMON gitdir's info/exclude.
+    const excludeFile = path.join(commonGitDir, "info", "exclude");
+    const content = await fs.promises.readFile(excludeFile, "utf8");
+    assert.ok(
+      content.split("\n").some((l) => l.trim() === "node_modules"),
+      `node_modules must appear in common gitdir ${excludeFile}; got: ${content}`,
+    );
+
+    // Must NOT write to the per-worktree gitdir's info/exclude.
+    const perWtExclude = path.join(perWorktreeGitDir, "info", "exclude");
+    const perWtExists = await fs.promises.access(perWtExclude).then(() => true).catch(() => false);
+    assert.equal(perWtExists, false, "must not write to per-worktree gitdir's info/exclude");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("realWriteNodeModulesExclude: real linked worktree — node_modules symlink not staged after exclude written (#180 review-2 integration)", async () => {
+  // Integration regression: creates a real git repo + linked worktree, calls the
+  // helper, creates a node_modules symlink, and asserts `git add -A` does not stage it.
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-integration-"));
+  try {
+    const mainRepo = path.join(tmp, "main-repo");
+    const linkedWt = path.join(tmp, "linked-wt");
+
+    await execFileAsync("git", ["init", mainRepo]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.email", "test@pipeline.test"]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.name", "Pipeline Test"]);
+    await fs.promises.writeFile(path.join(mainRepo, "README.md"), "test\n");
+    await execFileAsync("git", ["-C", mainRepo, "add", "README.md"]);
+    await execFileAsync("git", ["-C", mainRepo, "commit", "-m", "initial"]);
+    await execFileAsync("git", ["-C", mainRepo, "worktree", "add", linkedWt]);
+
+    await realWriteNodeModulesExclude(linkedWt);
+
+    // Create a node_modules symlink inside the linked worktree (simulates what
+    // `pnpm install` or a harness does when it creates the node_modules link).
+    await fs.promises.symlink(mainRepo, path.join(linkedWt, "node_modules"));
+
+    await execFileAsync("git", ["-C", linkedWt, "add", "-A"]);
+
+    const { stdout } = await execFileAsync("git", ["-C", linkedWt, "status", "--porcelain"]);
+    assert.ok(
+      !stdout.includes("node_modules"),
+      `node_modules must not be staged after exclude is written; git status:\n${stdout}`,
+    );
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("realWriteNodeModulesExclude: regular worktree (.git directory) writes to .git/info/exclude (#180)", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
+  try {
+    const gitInfoDir = path.join(tmp, ".git", "info");
+    await fs.promises.mkdir(gitInfoDir, { recursive: true });
+
+    await realWriteNodeModulesExclude(tmp);
+
+    const content = await fs.promises.readFile(path.join(gitInfoDir, "exclude"), "utf8");
+    assert.ok(
+      content.split("\n").some((l) => l.trim() === "node_modules"),
+      `node_modules must appear in exclude; got: ${content}`,
+    );
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("realWriteNodeModulesExclude: idempotent — duplicate entry not added (#180)", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
+  try {
+    const gitInfoDir = path.join(tmp, ".git", "info");
+    await fs.promises.mkdir(gitInfoDir, { recursive: true });
+
+    await realWriteNodeModulesExclude(tmp);
+    await realWriteNodeModulesExclude(tmp);
+
+    const content = await fs.promises.readFile(path.join(gitInfoDir, "exclude"), "utf8");
+    const lines = content.split("\n").filter((l) => l.trim() === "node_modules");
+    assert.equal(lines.length, 1, "node_modules must appear exactly once");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
 });

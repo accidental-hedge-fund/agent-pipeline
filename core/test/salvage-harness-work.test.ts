@@ -31,7 +31,7 @@ function fakeGit(status: string) {
   };
   const deps: SalvageDeps = {
     gitStatus: async () => status,
-    gitAddAll: async (wt) => {
+    gitAddAll: async (wt, _args) => {
       calls.order.push(`add:${wt}`);
     },
     gitCommit: async (wt, message) => {
@@ -184,4 +184,30 @@ test("contract: salvage message satisfies the traceability-trailer validation (b
 
   // A different run id must still be caught — salvage gets no trailer bypass.
   assert.notEqual(validateCommitTrailers([msg], 131, "131/other-run"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Regression #180: salvage gitAddAll must exclude node_modules
+// ---------------------------------------------------------------------------
+
+test("salvage: gitAddAll receives :(exclude)node_modules pathspec when worktree contains node_modules (#180)", async () => {
+  // Simulates: harness exits with a node_modules symlink AND a real modified file.
+  // The salvage path must pass :(exclude)node_modules in the args so the symlink
+  // is never staged even if .git/info/exclude was not yet written.
+  const status = "?? node_modules\n M core/scripts/foo.ts\n";
+  let capturedArgs: string[] | null = null;
+  let commitCreated = false;
+  const deps: SalvageDeps = {
+    gitStatus: async () => status,
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
+    gitCommit: async () => { commitCreated = true; },
+  };
+  const res = await salvageUncommittedWork("/wt", 131, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true, "worktree is dirty so salvage must run");
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  assert.ok(
+    (capturedArgs as string[]).includes(":(exclude)node_modules"),
+    `gitAddAll args must include :(exclude)node_modules; got ${JSON.stringify(capturedArgs)}`,
+  );
+  assert.equal(commitCreated, true, "commit must be created after staging");
 });
