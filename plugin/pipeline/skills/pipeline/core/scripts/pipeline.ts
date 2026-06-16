@@ -143,6 +143,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Guard: extra positional arguments after the first are always a mistake for
+  // non-config commands (e.g. "pipeline 123 config validate" would otherwise run
+  // the advance loop for issue 123 instead of failing fast).
+  if (cmd.args.length > 1) {
+    const extra = cmd.args.slice(1).join(", ");
+    console.error(`pipeline: unexpected argument(s): ${extra}`);
+    process.exit(2);
+  }
+
   let cfg: PipelineConfig;
   try {
     cfg = resolveConfig({
@@ -342,6 +351,11 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
   const subcmd = args[0];
 
   if (subcmd === "schema") {
+    if (args.length > 1) {
+      console.error(`pipeline config schema: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
     const schema = generateConfigSchema();
     process.stdout.write(JSON.stringify(schema, null, 2) + "\n");
     process.exitCode = 0;
@@ -349,6 +363,11 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
   }
 
   if (subcmd === "validate") {
+    if (args.length > 1) {
+      console.error(`pipeline config validate: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
     const repoPath = opts.repoPath ?? process.cwd();
     const result = validateConfig(repoPath, { profile: opts.profile });
 

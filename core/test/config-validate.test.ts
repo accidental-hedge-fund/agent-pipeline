@@ -477,3 +477,77 @@ test("runConfigCommand: 'validate' subcommand with --json on non-existent repo w
   assert.ok("diagnostics" in parsed, "output must have a 'diagnostics' key");
   assert.equal(parsed["valid"], false); // no git root at /tmp/no-such-pipeline-repo-xyz
 });
+
+// ---------------------------------------------------------------------------
+// 5.14 runConfigCommand: extra-arg rejection (review 2, finding 1)
+// ---------------------------------------------------------------------------
+
+test("runConfigCommand: extra args after 'schema' set exitCode=2 and do not write schema", async () => {
+  const chunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  const originalError = process.stderr.write.bind(process.stderr);
+  // @ts-ignore
+  process.stdout.write = (chunk: string | Uint8Array): boolean => { chunks.push(String(chunk)); return true; };
+  // @ts-ignore
+  process.stderr.write = (chunk: string | Uint8Array): boolean => { stderrChunks.push(String(chunk)); return true; };
+  const prevExitCode = process.exitCode;
+  try {
+    await runConfigCommand(["schema", "extra"], { profile: "codex" } as CliOpts);
+  } finally {
+    process.stdout.write = originalWrite;
+    process.stderr.write = originalError;
+    const savedCode = process.exitCode;
+    process.exitCode = prevExitCode;
+    assert.equal(savedCode, 2, "exitCode must be 2 on extra args");
+  }
+  assert.equal(chunks.length, 0, "schema must not be written to stdout on extra args");
+});
+
+test("runConfigCommand: extra args after 'validate' set exitCode=2 and do not write JSON", async () => {
+  const chunks: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  // @ts-ignore
+  process.stdout.write = (chunk: string | Uint8Array): boolean => { chunks.push(String(chunk)); return true; };
+  const prevExitCode = process.exitCode;
+  try {
+    await runConfigCommand(["validate", "extra"], { profile: "codex", json: true } as CliOpts);
+  } finally {
+    process.stdout.write = originalWrite;
+    const savedCode = process.exitCode;
+    process.exitCode = prevExitCode;
+    assert.equal(savedCode, 2, "exitCode must be 2 on extra args");
+  }
+  assert.equal(chunks.length, 0, "no JSON must be written to stdout on extra args");
+});
+
+// ---------------------------------------------------------------------------
+// 5.15 RIGOR_GATING_PATHS: shipcheck cost/rigor fields (review 2, finding 2)
+// ---------------------------------------------------------------------------
+
+test("validateConfig: bad shipcheck_gate.max_rounds type → error with rigorGating:true", () => {
+  const deps = makeDeps('shipcheck_gate:\n  max_rounds: "many"\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "shipcheck_gate.max_rounds");
+  assert.ok(d, `expected diagnostic for shipcheck_gate.max_rounds, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("validateConfig: bad shipcheck_gate.block_on_partial type → error with rigorGating:true", () => {
+  const deps = makeDeps('shipcheck_gate:\n  block_on_partial: "yes"\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "shipcheck_gate.block_on_partial");
+  assert.ok(d, `expected diagnostic for shipcheck_gate.block_on_partial, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("RIGOR_GATING_PATHS: includes shipcheck_gate.max_rounds and shipcheck_gate.block_on_partial", () => {
+  assert.ok(RIGOR_GATING_PATHS.includes("shipcheck_gate.max_rounds"),
+    "RIGOR_GATING_PATHS must include shipcheck_gate.max_rounds");
+  assert.ok(RIGOR_GATING_PATHS.includes("shipcheck_gate.block_on_partial"),
+    "RIGOR_GATING_PATHS must include shipcheck_gate.block_on_partial");
+});

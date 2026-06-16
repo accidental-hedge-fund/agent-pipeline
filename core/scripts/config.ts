@@ -492,6 +492,8 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "eval_gate.mode",
   "shipcheck_gate.enabled",
   "shipcheck_gate.mode",
+  "shipcheck_gate.max_rounds",
+  "shipcheck_gate.block_on_partial",
 ];
 
 const RIGOR_GATING_SET = new Set(RIGOR_GATING_PATHS);
