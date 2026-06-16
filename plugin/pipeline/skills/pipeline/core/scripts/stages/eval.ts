@@ -21,6 +21,11 @@ import { runCapped } from "../harness.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
 
+/** Next stage after eval-gate: shipcheck-gate when opted in, else ready-to-deploy. */
+function nextAfterEval(cfg: PipelineConfig): Stage {
+  return cfg.shipcheck_gate?.enabled ? "shipcheck-gate" : "ready-to-deploy";
+}
+
 const MAX_COMMENT_OUTPUT = 2000;
 
 export interface AdvanceEvalOpts {
@@ -101,7 +106,8 @@ export async function advanceEval(
       ? cfg.eval_gate.command
       : "(eval-gate disabled or no command configured)";
     console.log(`[pipeline] #${issueNumber}: [dry-run] would run eval: ${cmdNote}`);
-    return { advanced: true, from: "eval-gate", to: "ready-to-deploy", summary: "[dry-run]" };
+    const dryTo = nextAfterEval(cfg);
+    return { advanced: true, from: "eval-gate", to: dryTo, summary: "[dry-run]" };
   }
 
   // Skip path — enabled=false → swap labels silently, no comment posted.
@@ -109,8 +115,9 @@ export async function advanceEval(
   // safety net for issues that somehow arrive here with an eval-gate label.
   if (!cfg.eval_gate.enabled) {
     console.log(`[pipeline] #${issueNumber}: eval-gate step disabled; skipping.`);
-    await silentTransitionFn(cfg, issueNumber, "eval-gate", "ready-to-deploy");
-    return { advanced: true, from: "eval-gate", to: "ready-to-deploy", summary: "eval-gate disabled" };
+    const skipTo = nextAfterEval(cfg);
+    await silentTransitionFn(cfg, issueNumber, "eval-gate", skipTo);
+    return { advanced: true, from: "eval-gate", to: skipTo, summary: "eval-gate disabled" };
   }
 
   if (!cfg.eval_gate.command) {
@@ -206,11 +213,12 @@ export async function advanceEval(
 
   if (result.passed) {
     console.log(`[pipeline] #${issueNumber}: eval-gate passed in ${result.durationSec.toFixed(1)}s`);
-    await transitionFn(cfg, issueNumber, "eval-gate", "ready-to-deploy", "Eval gate passed.");
+    const passTo = nextAfterEval(cfg);
+    await transitionFn(cfg, issueNumber, "eval-gate", passTo, `Eval gate passed. Advancing to ${passTo}.`);
     return {
       advanced: true,
       from: "eval-gate",
-      to: "ready-to-deploy",
+      to: passTo,
       summary: `eval passed in ${result.durationSec.toFixed(1)}s`,
     };
   }
@@ -246,8 +254,9 @@ export async function advanceEval(
   // Ordinary harness-owned failure (non-zero exit). Advisory mode records and advances.
   if (cfg.eval_gate.mode === "advisory") {
     console.log(`[pipeline] #${issueNumber}: eval-gate failed${attempts} (advisory mode); advancing`);
-    await transitionFn(cfg, issueNumber, "eval-gate", "ready-to-deploy", `Eval gate failed${attempts} (advisory mode); advancing.`);
-    return { advanced: true, from: "eval-gate", to: "ready-to-deploy", summary: `eval failed (advisory)` };
+    const advisoryTo = nextAfterEval(cfg);
+    await transitionFn(cfg, issueNumber, "eval-gate", advisoryTo, `Eval gate failed${attempts} (advisory mode); advancing to ${advisoryTo}.`);
+    return { advanced: true, from: "eval-gate", to: advisoryTo, summary: `eval failed (advisory)` };
   }
 
   console.log(`[pipeline] #${issueNumber}: eval-gate failed${attempts} (gate mode); blocking`);

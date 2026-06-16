@@ -1129,3 +1129,62 @@ test("resolveConfig: format_gate entry with unknown key → rejected", async () 
     process.env.PATH = oldPath;
   }
 });
+
+// ---------------------------------------------------------------------------
+// shipcheck_gate (#148)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: shipcheck_gate block absent → enabled:false, all defaults applied", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/sc-g0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.shipcheck_gate.enabled, false);
+    assert.equal(cfg.shipcheck_gate.mode, "advisory");
+    assert.equal(cfg.shipcheck_gate.max_rounds, 1);
+    assert.equal(cfg.shipcheck_gate.rubric_path, ".github/shipcheck-rubric.md");
+    assert.equal(cfg.shipcheck_gate.block_on_partial, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: shipcheck_gate with valid keys accepted, values propagated", async () => {
+  const repo = makeFakeRepo(
+    `shipcheck_gate:\n  enabled: true\n  mode: gate\n  max_rounds: 3\n  rubric_path: ".github/my-rubric.md"\n  block_on_partial: true\n`,
+  );
+  const binDir = makeFakeGh("acme/sc-g1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.shipcheck_gate.enabled, true);
+    assert.equal(cfg.shipcheck_gate.mode, "gate");
+    assert.equal(cfg.shipcheck_gate.max_rounds, 3);
+    assert.equal(cfg.shipcheck_gate.rubric_path, ".github/my-rubric.md");
+    assert.equal(cfg.shipcheck_gate.block_on_partial, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under shipcheck_gate rejected at parse time", async () => {
+  const repo = makeFakeRepo(`shipcheck_gate:\n  enabled: true\n  bogus_key: hello\n`);
+  const binDir = makeFakeGh("acme/sc-g2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("bogus_key"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

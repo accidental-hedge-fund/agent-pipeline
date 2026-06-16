@@ -8,8 +8,19 @@ The pipeline SHALL define its stages as an ordered constant `STAGES` in `core/sc
 
 #### Scenario: STAGES order
 - **WHEN** the `STAGES` constant is inspected
-- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `implementing`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `eval-gate`, `ready-to-deploy`
-- **AND** `eval-gate` SHALL appear at an index greater than `pre-merge` and less than `ready-to-deploy`
+- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `implementing`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`
+- **AND** `eval-gate` SHALL appear at an index greater than `pre-merge` and less than `shipcheck-gate`
+- **AND** `shipcheck-gate` SHALL appear at an index greater than `eval-gate` and less than `ready-to-deploy`
+
+#### Scenario: dispatch routes eval-gate
+- **WHEN** the current stage label is `pipeline:eval-gate`
+- **THEN** the orchestrator SHALL call the eval stage handler
+- **AND** SHALL NOT call `deployReady.finalize()` directly
+
+#### Scenario: dispatch routes shipcheck-gate
+- **WHEN** the current stage label is `pipeline:shipcheck-gate`
+- **THEN** the orchestrator SHALL call the shipcheck stage handler
+- **AND** SHALL NOT call `deployReady.finalize()` directly
 
 ### Requirement: Terminal stage is ready-to-deploy
 `TERMINAL_STAGES` SHALL contain exactly `ready-to-deploy`. When an issue reaches it, the run finalizes and the advance loop stops; no stage follows it.

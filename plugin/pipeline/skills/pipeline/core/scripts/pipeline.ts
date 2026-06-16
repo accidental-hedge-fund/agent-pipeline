@@ -52,6 +52,7 @@ import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
 import * as preMergeStage from "./stages/pre_merge.ts";
 import * as evalStage from "./stages/eval.ts";
+import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
@@ -1046,6 +1047,8 @@ async function dispatch(
       return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
     case "eval-gate":
       return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir });
+    case "shipcheck-gate":
+      return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":
       return deployReady.finalize(cfg, issueNumber);
     case "needs-human":

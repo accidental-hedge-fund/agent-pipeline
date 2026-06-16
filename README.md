@@ -1,13 +1,13 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 12-stage state machine — planning → plan-review → implementing → review → fix → pre-merge → eval-gate. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 13-stage state machine — planning → plan-review → implementing → review → fix → pre-merge → eval-gate → shipcheck-gate. It does **not** auto-merge; you own the merge button.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
 ```text
 backlog → ready → planning → plan-review → implementing
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → eval-gate → ready-to-deploy
+              → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
 ```
 
 ## Contents
@@ -25,6 +25,7 @@ backlog → ready → planning → plan-review → implementing
   - [Human plan feedback](#human-plan-feedback)
   - [Commit traceability trailers](#commit-traceability-trailers-always-on)
   - [Eval gate](#eval-gate)
+  - [Shipcheck gate](#shipcheck-gate)
   - [OpenSpec integration](#openspec-integration)
   - [last30days context](#last30days-context)
   - [Conventions & carry-forward lessons](#conventions--carry-forward-lessons)
@@ -255,6 +256,12 @@ eval_gate:                           # run the repo's eval harness after pre-mer
   mode: gate                         # gate (default): block on fail | advisory: record result and always advance
   timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
   max_attempts: 2                    # total attempts before giving up (1 = no retry)
+shipcheck_gate:                      # reviewer-owned acceptance rubric after eval-gate, before ready-to-deploy (#148)
+  enabled: false                     # default: false; set true to enable
+  mode: advisory                     # advisory (default): record without blocking | gate: block on fail verdict
+  max_rounds: 1                      # reviewer invocations before surfacing parse-failure (default: 1)
+  rubric_path: .github/shipcheck-rubric.md   # repo-root-relative path to the private rubric file
+  block_on_partial: false            # gate mode only: when true, a "partial" verdict also blocks (default: false)
 format_gate:                         # run formatter/linter commands after each implementing/fix harness (#182)
   - command: cargo fmt               # shell command to run in the worktree root
     auto_fix: true                   # true: commit any changes and re-run; false: block on non-zero exit
@@ -552,6 +559,31 @@ When `eval_gate.enabled` (default **off**), the target repo's eval harness runs 
 - **Tooling failures always block, regardless of mode** — if the command times out or can't be spawned the item is blocked even in advisory mode.
 
 When disabled (the default), pre-merge advances straight to `ready-to-deploy` and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
+
+### Shipcheck gate
+
+When `shipcheck_gate.enabled` (default **off**), the **reviewer harness** (not the implementer) evaluates a repo-local acceptance rubric **after eval-gate, before `ready-to-deploy`**. This ensures the builder cannot self-certify: the same cross-harness reviewer that caught review findings applies your rubric to the finished change.
+
+**Enable it** in `.github/pipeline.yml`:
+
+```yaml
+shipcheck_gate:
+  enabled: true
+  mode: advisory      # advisory (default) | gate
+```
+
+**Rubric file.** Commit a private Markdown rubric at `.github/shipcheck-rubric.md` (override with `rubric_path`). When the file is absent, the pipeline falls back to the issue's acceptance-criteria section (or full issue body) and logs a warning. The rubric text is embedded in the shipcheck prompt, giving the reviewer explicit criteria to evaluate.
+
+**What the reviewer receives.** The shipcheck prompt assembles: the rubric text, the issue body, the implementation plan (from the planning stage comment), a summary of changed files (from the PR diff), the eval-gate outcome (when available), and any OpenSpec spec deltas on the branch. The reviewer returns a structured verdict: `pass`, `partial`, or `fail`, with per-criterion breakdown.
+
+**Modes.**
+
+- **`advisory`** (default) — records the verdict as an issue and PR comment (`## Shipcheck (advisory)`) and always advances to `ready-to-deploy`, regardless of the verdict.
+- **`gate`** — posts the verdict comment and **blocks `ready-to-deploy` on a `fail` verdict**. A `partial` verdict also blocks when `block_on_partial: true` (default `false`).
+
+**Parse failures.** If the reviewer output is unparseable after `max_rounds` attempts (default 1): in gate mode, the item is blocked with a `needs-human` blocker; in advisory mode, a warning is logged and the item advances. A reviewer that exits non-zero is always treated as a failed round, even if it printed parseable JSON — a timed-out process must not silently pass the gate.
+
+When disabled (the default), pre-merge and eval-gate skip straight to `ready-to-deploy` and the `shipcheck-gate` label is never applied. **Rollback** is `shipcheck_gate: { enabled: false }`.
 
 ### Review severity policy & audited overrides
 

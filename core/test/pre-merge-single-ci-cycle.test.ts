@@ -181,6 +181,78 @@ test("pre-merge: CI check result recorded in evidence bundle when stateDir provi
 });
 
 // ---------------------------------------------------------------------------
+// Finding 1 regression: eval_gate:false + shipcheck_gate:true → shipcheck-gate
+// ---------------------------------------------------------------------------
+
+test("pre-merge: eval_gate disabled + shipcheck_gate enabled → transitions to shipcheck-gate", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const SHA = "4444444444444444444444444444444444444444";
+  const PR = 99;
+  const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA} -->`;
+
+  const deps: AdvancePreMergeDeps = {
+    getPrForIssue: async () => PR,
+    getIssueDetail: async () =>
+      ({ comments: [{ body: reviewComment }] }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>>,
+    getPrDetail: async () =>
+      ({ head_sha: SHA, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>,
+    getPrCommits: async () => [],
+    getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
+    getForIssue: async () => null,
+    postComment: async () => {},
+    transition: async () => {},
+    setBlocked: async () => {},
+  };
+
+  const cfg = {
+    steps: { docs: false },
+    eval_gate: { enabled: false },
+    shipcheck_gate: { enabled: true },
+  } as unknown as import("../scripts/types.ts").PipelineConfig;
+
+  const out = await advance(cfg, 148, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "shipcheck-gate",
+    "when eval disabled but shipcheck enabled, pre-merge must route to shipcheck-gate");
+});
+
+test("pre-merge: eval_gate disabled + shipcheck_gate disabled → transitions to ready-to-deploy (unchanged behavior)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const SHA = "5555555555555555555555555555555555555555";
+  const PR = 99;
+  const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA} -->`;
+
+  const deps: AdvancePreMergeDeps = {
+    getPrForIssue: async () => PR,
+    getIssueDetail: async () =>
+      ({ comments: [{ body: reviewComment }] }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>>,
+    getPrDetail: async () =>
+      ({ head_sha: SHA, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>,
+    getPrCommits: async () => [],
+    getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
+    getForIssue: async () => null,
+    postComment: async () => {},
+    transition: async () => {},
+    setBlocked: async () => {},
+  };
+
+  const cfg = {
+    steps: { docs: false },
+    eval_gate: { enabled: false },
+    shipcheck_gate: { enabled: false },
+  } as unknown as import("../scripts/types.ts").PipelineConfig;
+
+  const out = await advance(cfg, 149, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy",
+    "when both gates disabled, pre-merge must route to ready-to-deploy");
+});
+
+// ---------------------------------------------------------------------------
 // isPipelineInternalCommit — only the OpenSpec archive prefix survives (#91)
 // ---------------------------------------------------------------------------
 

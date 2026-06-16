@@ -12,6 +12,7 @@ export const STAGES = [
   "fix-2",
   "pre-merge",
   "eval-gate",
+  "shipcheck-gate",
   "ready-to-deploy",
   // Terminal off-ramp: a review round hit `max_adversarial_rounds` with findings
   // still blocking. The item stops here with an advisory punch-list for a human
@@ -262,6 +263,16 @@ export interface PipelineConfig {
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
   domain_description?: string;
+  // Shipcheck gate (#148). When enabled, runs a reviewer-harness acceptance
+  // rubric after eval-gate and before ready-to-deploy. advisory mode (default)
+  // records findings without blocking; gate mode blocks on a fail verdict.
+  shipcheck_gate: {
+    enabled: boolean;
+    mode: "advisory" | "gate";
+    max_rounds: number;
+    rubric_path: string;
+    block_on_partial: boolean;
+  };
   // Format/lint normalization gate (#182). When non-empty, each entry's
   // command runs inside the worktree after the implementing and fix-round
   // harnesses exit. auto_fix: true → commit any produced changes and re-run;
@@ -299,6 +310,13 @@ export const DEFAULT_CONFIG: Omit<
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
+  shipcheck_gate: {
+    enabled: false,
+    mode: "advisory" as const,
+    max_rounds: 1,
+    rubric_path: ".github/shipcheck-rubric.md",
+    block_on_partial: false,
+  },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
   format_gate: [] as { command: string; auto_fix: boolean }[],
@@ -362,6 +380,19 @@ export interface CheckRun {
   state: string;
   description?: string;
   link?: string;
+}
+
+/** Structured verdict returned by the shipcheck-gate reviewer harness (#148). */
+export interface ShipcheckCriterion {
+  criterion: string;
+  result: "pass" | "fail" | "na";
+  note: string;
+}
+
+export interface ShipcheckVerdict {
+  verdict: "pass" | "partial" | "fail";
+  summary: string;
+  criteria: ShipcheckCriterion[];
 }
 
 export interface ReviewFinding {
