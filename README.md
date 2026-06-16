@@ -797,6 +797,7 @@ echo "Run dir: $RUN_DIR"
 ~/.pipeline/runs/<issue>/<timestamp>/
   pipeline.log      stdout + stderr of the pipeline run (appended continuously)
   sentinel.json     written atomically when the run completes (absent while running)
+  run-store.json    machine-readable pointer to the .agent-pipeline run store (run_store_dir, events, terminal_log)
   ../
     .lock           advisory lock file (present while a run is active)
 ```

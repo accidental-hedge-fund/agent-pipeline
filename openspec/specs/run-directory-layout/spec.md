@@ -31,6 +31,11 @@ When `pipeline run <N> --detach` is used, the launcher SHALL pin a `.agent-pipel
 - **AND** the inner run SHALL use that same `.agent-pipeline/runs/<run-id>` directory
 - **AND** the launcher SHALL report the run-store path so a desktop consumer can read `events.jsonl`/`terminal.log` without parsing the wrapper's `pipeline.log`
 
+#### Scenario: detached run exposes the run store through a machine-readable pointer
+- **WHEN** `pipeline run <N> --detach` is invoked
+- **THEN** the launcher SHALL write a machine-readable `run-store.json` into the wrapper directory (which the caller captures from stdout) containing the run-store run id and the absolute `events.jsonl`/`terminal.log` paths
+- **AND** a caller SHALL be able to discover `events.jsonl` from that pointer alone, without parsing any human-readable prose
+
 #### Scenario: --json-events is forwarded to a detached run
 - **WHEN** `pipeline run <N> --detach --json-events` is invoked
 - **THEN** the inner detached run SHALL receive `--json-events`

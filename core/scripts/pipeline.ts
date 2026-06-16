@@ -16,6 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
+import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { resolveConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
@@ -1027,11 +1028,32 @@ export async function handleRunSubcommand(
       process.exitCode = 1;
       return;
     }
+    // Machine-readable link from the wrapper dir (which the caller captures from
+    // stdout below) to the #155 run store, so a Pipeline Desk caller can discover
+    // events.jsonl/terminal.log without parsing any prose (#155). Best-effort.
+    try {
+      writeFileSync(
+        path.join(result.runDir, "run-store.json"),
+        JSON.stringify(
+          {
+            schema_version: 1,
+            run_store_run_id: runStoreRunId,
+            run_store_dir: runStoreDir,
+            events: path.join(runStoreDir, "events.jsonl"),
+            terminal_log: path.join(runStoreDir, "terminal.log"),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    } catch {
+      /* best-effort pointer — the run store still exists at runStoreDir */
+    }
     console.log(result.runDir);
     console.error(`[pipeline] #${number}: detached run started (PID ${result.pid})`);
     console.error(`[pipeline] #${number}: wrapper supervision: poll ${result.runDir}/sentinel.json (log: ${result.runDir}/pipeline.log)`);
     console.error(`[pipeline] #${number}: structured run artifacts at ${runStoreDir}/ — events.jsonl + terminal.log are the Pipeline Desk contract`);
-    console.error(`[pipeline] #${number}: follow with: pipeline logs ${runStoreRunId} --follow`);
+    console.error(`[pipeline] #${number}: machine-readable link: ${result.runDir}/run-store.json; follow with: pipeline logs ${runStoreRunId} --follow`);
     return;
   }
 

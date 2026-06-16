@@ -482,6 +482,26 @@ test("handleRunSubcommand: detach forwards --json-events only when requested", a
   assert.ok(!(await capture({ detach: true })).includes("--json-events"), "must not inject --json-events when unset");
 });
 
+test("handleRunSubcommand: detach writes a machine-readable run-store.json pointer in the wrapper dir (#155)", async () => {
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-"));
+  try {
+    await handleRunSubcommand("99", { detach: true }, {
+      spawnDetached: async () => ({ runDir: wrapperDir, pid: 42 }),
+    });
+    // A caller captures the wrapper dir from stdout, then reads the pointer — no
+    // prose parsing — to find the #155 run store and its events.jsonl/terminal.log.
+    const pointerPath = path.join(wrapperDir, "run-store.json");
+    assert.ok(fs.existsSync(pointerPath), "wrapper dir must contain run-store.json");
+    const pointer = JSON.parse(fs.readFileSync(pointerPath, "utf8"));
+    assert.match(pointer.run_store_run_id, /^99-/, "pointer must carry the #155 run id for issue 99");
+    assert.ok(String(pointer.run_store_dir).includes(".agent-pipeline"), "run_store_dir must be the .agent-pipeline run store");
+    assert.ok(String(pointer.events).endsWith("events.jsonl"), "pointer must link to events.jsonl");
+    assert.ok(String(pointer.terminal_log).endsWith("terminal.log"), "pointer must link to terminal.log");
+  } finally {
+    fs.rmSync(wrapperDir, { recursive: true, force: true });
+  }
+});
+
 test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetached", async () => {
   let capturedArgs: string[] = [];
   const deps: RunSubcommandDeps = {
