@@ -151,55 +151,55 @@ export function acquireWorktreeMutex(
   }
 
   const holderPid = Number.parseInt(content, 10);
-  if (!Number.isFinite(holderPid) || holderPid <= 0) {
-    // Garbage content — treat as stale.
-    unlink(mutexPath);
-    return acquireWorktreeMutex(mutexPath, deps);
+  const isValidPid = Number.isFinite(holderPid) && holderPid > 0;
+
+  if (isValidPid && isPidAlive(holderPid)) {
+    // Live process holds the mutex — signal the caller to wait.
+    throw new Error(
+      `Worktree mutex held by process ${holderPid}: ${mutexPath}. ` +
+      "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
+    );
   }
 
-  if (!isPidAlive(holderPid)) {
-    // Dead process — serialize the reclaim sequence with a short-lived
-    // reclaimer lock.  Without it, two concurrent reclaimers can both read
-    // the same dead PID, both pass the re-verify, and both call unlink: the
-    // second's unlink deletes the first's freshly-acquired main lock.
-    // By holding the reclaimer lock for the entire read/unlink/reacquire
-    // sequence, only one process can reclaim at a time.  The second reclaimer
-    // sees the reacquired main lock (live PID) after it gets the reclaimer
-    // lock and falls through to the normal live-holder wait.
-    const reclaimPath = mutexPath + ".reclaim";
-    const reclaimCreated = atomicCreate(reclaimPath, String(currentPid()));
-    if (!reclaimCreated) {
-      // Another reclaimer holds the reclaim lock.
-      const reclaimContent = readContent(reclaimPath);
-      if (reclaimContent !== null) {
-        const reclaimPid = Number.parseInt(reclaimContent, 10);
-        if (Number.isFinite(reclaimPid) && reclaimPid > 0 && isPidAlive(reclaimPid)) {
-          // Live reclaimer in progress — restart and let it finish.
-          return acquireWorktreeMutex(mutexPath, deps);
-        }
+  // PID is dead OR invalid/garbage — serialize the reclaim sequence with a
+  // short-lived reclaimer lock.  Routing BOTH cases through the reclaim lock
+  // prevents two concurrent reclaimers (whether they read a dead PID or
+  // garbage content) from both unlinking and racing to reacquire: the second
+  // unlink would delete the first's freshly-acquired lock.
+  const reclaimPath = mutexPath + ".reclaim";
+  const reclaimCreated = atomicCreate(reclaimPath, String(currentPid()));
+  if (!reclaimCreated) {
+    // Another reclaimer holds the reclaim lock.
+    const reclaimContent = readContent(reclaimPath);
+    if (reclaimContent !== null) {
+      const reclaimPid = Number.parseInt(reclaimContent, 10);
+      if (Number.isFinite(reclaimPid) && reclaimPid > 0 && isPidAlive(reclaimPid)) {
+        // Live reclaimer in progress.  Throw so createWorktree's bounded
+        // sleep loop handles the wait — synchronous recursion here would
+        // overflow the stack if the reclaimer holds the lock for a long time.
+        throw new Error(
+          `Worktree mutex held by process ${reclaimPid} (reclaimer): ${mutexPath}. ` +
+          "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
+        );
       }
-      // Stale or unreadable reclaim lock — remove and restart from scratch.
-      unlink(reclaimPath);
+    }
+    // Stale or unreadable reclaim lock — remove and restart from scratch.
+    unlink(reclaimPath);
+    return acquireWorktreeMutex(mutexPath, deps);
+  }
+  try {
+    // Re-verify content while holding the reclaimer lock.  If another
+    // reclaimer already won the race and reacquired, restart without
+    // unlinking the (now-live) main lock.
+    const current = readContent(mutexPath);
+    if (current !== content) {
       return acquireWorktreeMutex(mutexPath, deps);
     }
-    try {
-      // Re-verify content while holding the reclaimer lock.  If another
-      // reclaimer already won the race and reacquired, restart.
-      const current = readContent(mutexPath);
-      if (current !== content) {
-        return acquireWorktreeMutex(mutexPath, deps);
-      }
-      unlink(mutexPath);
-    } finally {
-      unlink(reclaimPath);
-    }
-    return acquireWorktreeMutex(mutexPath, deps);
+    unlink(mutexPath);
+  } finally {
+    unlink(reclaimPath);
   }
-
-  throw new Error(
-    `Worktree mutex held by process ${holderPid}: ${mutexPath}. ` +
-    "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
-  );
+  return acquireWorktreeMutex(mutexPath, deps);
 }
 
 /** Release the per-repo worktree-creation mutex. */

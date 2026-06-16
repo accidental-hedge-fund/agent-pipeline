@@ -907,40 +907,117 @@ test("createWorktree: mutex wait succeeds after more than 30s of simulated waiti
 // sequence so only one process can unlink-and-reacquire at a time.
 // ---------------------------------------------------------------------------
 
-test("acquireWorktreeMutex: live reclaim-lock holder blocks concurrent reclaimer from unlinking main lock", () => {
+// After fix for Finding 2 (#183 review 2): a live reclaimer now causes
+// acquireWorktreeMutex to THROW instead of recursing, so createWorktree's
+// bounded sleep loop handles the wait without unbounded stack growth.
+test("acquireWorktreeMutex: live reclaim-lock holder → throws, main lock not unlinked", () => {
   let mainUnlinked = false;
   let atomicCreateCount = 0;
 
   // Scenario: Process A holds the reclaim lock (live PID 9999) while reclaiming
   // the stale main lock (dead PID 1234).  Process B (this test) also sees the
-  // dead PID, tries to get the reclaim lock, sees A is alive, and restarts —
-  // without ever touching the main lock.  On restart, B acquires the main lock
-  // cleanly (A already reacquired it under the reclaim lock).
-  acquireWorktreeMutex("/tmp/test-wt.lock", {
-    atomicCreate: (p, _c) => {
-      atomicCreateCount++;
-      if (p.endsWith(".reclaim")) {
-        // Reclaim lock is held by process A (PID 9999).
+  // dead PID, tries to get the reclaim lock, sees A is alive, and throws —
+  // without ever touching the main lock.  The caller (createWorktree) retries
+  // with bounded sleep until A finishes and releases the lock.
+  assert.throws(
+    () => acquireWorktreeMutex("/tmp/test-wt.lock", {
+      atomicCreate: (p, _c) => {
+        atomicCreateCount++;
+        if (p.endsWith(".reclaim")) {
+          // Reclaim lock is held by process A (PID 9999).
+          return false;
+        }
+        // Main lock always EEXIST for this test (we only check the throw path).
         return false;
-      }
-      // Main lock: first call EEXIST (dead PID 1234), second call acquired
-      // cleanly (A released and B acquires after restarting).
-      return atomicCreateCount >= 3;
-    },
-    readContent: (p) => {
-      if (p.endsWith(".reclaim")) return "9999"; // A is alive in the reclaim lock
-      return "1234";                              // dead PID in the main lock
-    },
-    unlink: (p) => {
-      if (!p.endsWith(".reclaim")) mainUnlinked = true;
-    },
-    isPidAlive: (pid) => pid === 9999, // 9999 (reclaimer A) alive, 1234 (main holder) dead
-    currentPid: () => 42,
-  });
+      },
+      readContent: (p) => {
+        if (p.endsWith(".reclaim")) return "9999"; // A is alive in the reclaim lock
+        return "1234";                              // dead PID in the main lock
+      },
+      unlink: (p) => {
+        if (!p.endsWith(".reclaim")) mainUnlinked = true;
+      },
+      isPidAlive: (pid) => pid === 9999, // 9999 (reclaimer A) alive, 1234 (main holder) dead
+      currentPid: () => 42,
+    }),
+    /Worktree mutex held by process 9999/,
+    "must throw with the reclaimer PID when a live reclaimer holds the reclaim lock",
+  );
 
   assert.equal(
     mainUnlinked,
     false,
     "main lock must NOT be unlinked when a live reclaimer already holds the reclaim lock",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 (#183 review 2): invalid/garbage lock content must route through
+// the reclaimer lock, not unlink directly.
+//
+// Regression: two concurrent callers both read the same garbage/empty lock
+// content, both pass the invalid-PID check, both call unlink — the second
+// unlink deletes the first's freshly-acquired lock, reopening the race.
+// Fix: invalid content is treated identically to a dead PID and goes through
+// the reclaim-lock protocol.
+// ---------------------------------------------------------------------------
+
+test("acquireWorktreeMutex: invalid/garbage lock content routes through reclaimer lock before unlinking", () => {
+  // Verify that the reclaim lock IS acquired even for garbage content, and
+  // that the main lock is unlinked exactly once (serialized by the reclaim lock).
+  let reclaimAcquired = false;
+  let mainUnlinkCount = 0;
+  let createCount = 0;
+
+  acquireWorktreeMutex("/tmp/test-wt.lock", {
+    atomicCreate: (p, _c) => {
+      createCount++;
+      if (p.endsWith(".reclaim")) {
+        reclaimAcquired = true;
+        return true; // we win the reclaim lock
+      }
+      return createCount >= 3; // main lock: EEXIST first, acquired after reclaim
+    },
+    readContent: (p) => {
+      if (p.endsWith(".reclaim")) return null;
+      return "not-a-pid"; // garbage content
+    },
+    unlink: (p) => {
+      if (!p.endsWith(".reclaim")) mainUnlinkCount++;
+    },
+    isPidAlive: () => false,
+    currentPid: () => 42,
+  });
+
+  assert.ok(reclaimAcquired, "reclaim lock must be acquired even for invalid/garbage lock content");
+  assert.equal(mainUnlinkCount, 1, "main lock must be unlinked exactly once via the serialized reclaim path");
+});
+
+test("acquireWorktreeMutex: two reclaimers with same invalid content — second restarts after first wins reclaim lock", () => {
+  // Simulates process B (this test): sees garbage content, tries reclaim lock
+  // → fails (process A holds it), reads A's live PID from reclaim lock → throws.
+  // Proves the second reclaimer cannot sneak past to unlink the main lock.
+  let mainUnlinked = false;
+
+  assert.throws(
+    () => acquireWorktreeMutex("/tmp/test-wt.lock", {
+      atomicCreate: (p, _c) => {
+        if (p.endsWith(".reclaim")) return false; // A holds the reclaim lock
+        return false;                              // main lock EEXIST
+      },
+      readContent: (p) => {
+        if (p.endsWith(".reclaim")) return "8888"; // A is alive
+        return "not-a-pid";                        // garbage main lock content
+      },
+      unlink: (p) => {
+        if (!p.endsWith(".reclaim")) mainUnlinked = true;
+      },
+      isPidAlive: (pid) => pid === 8888,
+      currentPid: () => 42,
+    }),
+    /Worktree mutex held by process 8888/,
+    "must throw when a live process holds the reclaim lock during invalid-content reclaim",
+  );
+
+  assert.equal(mainUnlinked, false, "second reclaimer must NOT unlink the main lock");
 });
