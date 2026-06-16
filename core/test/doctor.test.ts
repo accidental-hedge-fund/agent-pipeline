@@ -13,11 +13,13 @@ import * as fs from "node:fs";
 import {
   buildPreflightChecks,
   doctorResultPath,
+  formatDoctorJson,
   formatDoctorSummary,
   loadLatestPreflightResult,
   runPreflight,
   storePreflightResult,
   type DoctorDeps,
+  type DoctorJsonEnvelope,
   type ExecResult,
   type PreflightCheck,
   type PreflightResult,
@@ -807,6 +809,250 @@ test("runStartPreflightGate — the --doctor flag enables the gate even when con
     assert.equal(gate.proceed, true);
   });
   assert.equal(preflightCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// #154: formatDoctorJson — stable JSON envelope
+// ---------------------------------------------------------------------------
+
+test("formatDoctorJson: all-pass → schema_version \"1\", status \"ok\", all checks ok:true", () => {
+  const result: PreflightResult = {
+    ok: true,
+    ranAt: "2026-06-14T12:00:00Z",
+    checks: [
+      { id: "cli:gh", description: "gh", status: "pass", detail: "`gh` is available" },
+      { id: "cli:node", description: "node", status: "pass", detail: "`node` is available" },
+    ],
+  };
+  const env: DoctorJsonEnvelope = formatDoctorJson(result);
+  assert.equal(env.schema_version, "1");
+  assert.equal(env.status, "ok");
+  assert.equal(env.checks.length, 2);
+  assert.ok(env.checks.every((c) => c.ok === true), "all checks must be ok:true on all-pass");
+});
+
+test("formatDoctorJson: one-fail → status \"error\", failing check ok:false with non-empty fix", () => {
+  const result: PreflightResult = {
+    ok: false,
+    ranAt: "2026-06-14T12:00:00Z",
+    checks: [
+      { id: "cli:gh", description: "gh", status: "pass", detail: "`gh` is available" },
+      {
+        id: "github-auth",
+        description: "auth",
+        status: "fail",
+        detail: "no auth",
+        remediation: "Run `gh auth login`.",
+      },
+    ],
+  };
+  const env = formatDoctorJson(result);
+  assert.equal(env.schema_version, "1");
+  assert.equal(env.status, "error");
+  const failing = env.checks.find((c) => c.name === "github-auth");
+  assert.ok(failing, "failing check must appear in output");
+  assert.equal(failing.ok, false);
+  assert.ok(failing.fix.length > 0, "fix must be non-empty for a failing check");
+  assert.match(failing.fix, /gh auth login/);
+});
+
+test("formatDoctorJson: each check has name, ok, reason, fix fields", () => {
+  const result: PreflightResult = {
+    ok: true,
+    ranAt: "t",
+    checks: [{ id: "cli:gh", description: "gh", status: "pass", detail: "ok" }],
+  };
+  const c = formatDoctorJson(result).checks[0];
+  assert.ok("name" in c, "must have name");
+  assert.ok("ok" in c, "must have ok");
+  assert.ok("reason" in c, "must have reason");
+  assert.ok("fix" in c, "must have fix");
+  assert.equal(c.name, "cli:gh");
+  assert.equal(c.reason, "ok");
+  assert.equal(c.fix, ""); // empty for passing check
+});
+
+test("formatDoctorJson: skipped check is ok:true (skips are not failures)", () => {
+  const result: PreflightResult = {
+    ok: true,
+    ranAt: "t",
+    checks: [{ id: "eval-command", description: "eval", status: "skip", detail: "not configured" }],
+  };
+  assert.equal(formatDoctorJson(result).checks[0].ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// #154: runDoctor --is-ok mode via PreflightCliDeps seam
+// ---------------------------------------------------------------------------
+
+test("runDoctor --is-ok: exit 0 and zero output on all-pass", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => passingResult(),
+    storePreflightResult: async () => {},
+  };
+  const outputLines: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = (...a: unknown[]) => outputLines.push(a.map(String).join(" "));
+  console.error = (...a: unknown[]) => outputLines.push(a.map(String).join(" "));
+  try {
+    await runDoctor(makeConfig(), { isOk: true } as CliOpts, deps);
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+  assert.equal(process.exitCode, 0, "exit 0 on all-pass");
+  assert.equal(outputLines.length, 0, "zero bytes of output on --is-ok");
+  process.exitCode = prev;
+});
+
+test("runDoctor --is-ok: exit 1 and zero output on any-fail", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => failingResult(),
+    storePreflightResult: async () => {},
+  };
+  const outputLines: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = (...a: unknown[]) => outputLines.push(a.map(String).join(" "));
+  console.error = (...a: unknown[]) => outputLines.push(a.map(String).join(" "));
+  try {
+    await runDoctor(makeConfig(), { isOk: true } as CliOpts, deps);
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+  assert.equal(process.exitCode, 1, "exit 1 on any-fail");
+  assert.equal(outputLines.length, 0, "zero bytes of output on --is-ok");
+  process.exitCode = prev;
+});
+
+// ---------------------------------------------------------------------------
+// #154: runDoctor --json + --is-ok mutual exclusivity
+// ---------------------------------------------------------------------------
+
+test("runDoctor --json + --is-ok: exits non-zero with stderr message; runs no checks", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  let preflightCalled = false;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => {
+      preflightCalled = true;
+      return passingResult();
+    },
+    storePreflightResult: async () => {},
+  };
+  const errLines: string[] = [];
+  const origErr = console.error;
+  console.error = (...a: unknown[]) => errLines.push(a.map(String).join(" "));
+  try {
+    await runDoctor(makeConfig(), { json: true, isOk: true } as CliOpts, deps);
+  } finally {
+    console.error = origErr;
+  }
+  assert.ok(process.exitCode !== 0, "must exit non-zero when flags conflict");
+  assert.equal(preflightCalled, false, "checks must NOT run when flags are mutually exclusive");
+  assert.ok(
+    errLines.some((l) => /mutually exclusive/i.test(l)),
+    `expected mutual-exclusivity error on stderr; got:\n${errLines.join("\n")}`,
+  );
+  process.exitCode = prev;
+});
+
+// ---------------------------------------------------------------------------
+// #154: runDoctor --json mode emits valid JSON
+// ---------------------------------------------------------------------------
+
+test("runDoctor --json: emits parseable JSON to stdout (via console.log) on all-pass", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => passingResult(),
+    storePreflightResult: async () => {},
+  };
+  let capturedJson = "";
+  const origLog = console.log;
+  console.log = (...a: unknown[]) => { capturedJson += a.map(String).join(" "); };
+  try {
+    await runDoctor(makeConfig(), { json: true } as CliOpts, deps);
+  } finally {
+    console.log = origLog;
+  }
+  const parsed = JSON.parse(capturedJson) as { schema_version: string; status: string; checks: unknown[] };
+  assert.equal(parsed.schema_version, "1");
+  assert.equal(parsed.status, "ok");
+  assert.ok(Array.isArray(parsed.checks));
+  assert.equal(process.exitCode, 0, "exit 0 on all-pass");
+  process.exitCode = prev;
+});
+
+test("runDoctor --json: exits 1 and emits status:error JSON on failing checks", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => failingResult(),
+    storePreflightResult: async () => {},
+  };
+  let capturedJson = "";
+  const origLog = console.log;
+  console.log = (...a: unknown[]) => { capturedJson += a.map(String).join(" "); };
+  try {
+    await runDoctor(makeConfig(), { json: true } as CliOpts, deps);
+  } finally {
+    console.log = origLog;
+  }
+  const parsed = JSON.parse(capturedJson) as { status: string };
+  assert.equal(parsed.status, "error");
+  assert.equal(process.exitCode, 1, "exit 1 on failing checks");
+  process.exitCode = prev;
+});
+
+test("runDoctor --json: no prose is emitted (only JSON)", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => passingResult(),
+    storePreflightResult: async () => {},
+  };
+  let capturedOutput = "";
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = (...a: unknown[]) => { capturedOutput += a.map(String).join(" ") + "\n"; };
+  console.error = (...a: unknown[]) => { capturedOutput += a.map(String).join(" ") + "\n"; };
+  try {
+    await runDoctor(makeConfig(), { json: true } as CliOpts, deps);
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+  // Must parse without error (no prose mixed in)
+  assert.doesNotThrow(() => JSON.parse(capturedOutput.trim()));
+  // Prose markers must be absent
+  assert.doesNotMatch(capturedOutput, /Pipeline doctor —/);
+  assert.doesNotMatch(capturedOutput, /Result: (PASS|FAIL)/);
+  process.exitCode = prev;
+});
+
+// ---------------------------------------------------------------------------
+// #154: Prose output regression guard for doctor human path
+// ---------------------------------------------------------------------------
+
+test("runDoctor without --json: prose output is unchanged (regression guard #154)", async () => {
+  const prev = process.exitCode;
+  process.exitCode = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => passingResult(),
+    storePreflightResult: async () => {},
+  };
+  const out = await captureConsole(() => runDoctor(makeConfig(), {} as CliOpts, deps));
+  // The prose path must still emit the summary header and Result: PASS.
+  assert.match(out, /Pipeline doctor —/);
+  assert.match(out, /Result: PASS/);
+  process.exitCode = prev;
 });
 
 // ---------------------------------------------------------------------------

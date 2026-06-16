@@ -190,6 +190,7 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 ```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
 /pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
+/pipeline N --status --json                   machine-readable JSON status envelope (stable contract)
 /pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 $pipeline N --unblock "<answer>"              (same for Codex)
@@ -198,6 +199,8 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
 /pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
+/pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
+/pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
 /pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
@@ -324,6 +327,13 @@ The checks (each emits one sentence of remediation text on failure):
 **Run-start gating (opt-in).** Set `doctor.runOnStart: true` in `.github/pipeline.yml`, or pass `--doctor` on a normal run, to run the preflight **before planning**. A failing preflight prints the summary and aborts with a non-zero exit **before any planning, implementation, or review tokens are spent**. With neither set, a run is completely unaffected — no checks execute. `--fail-fast` (or `doctor.failFast: true`) stops at the first failing check instead of collecting all failures.
 
 The latest result is stored under `/tmp/pipeline-<domain>-doctor-result.json`; `/pipeline N --status` appends that preflight summary (with its timestamp) when one is present, and omits the section otherwise.
+
+**Machine-readable output (#154).** Two flags expose the doctor result as a stable JSON contract for tooling (e.g. Pipeline Desk):
+
+- `pipeline doctor --json` — emits a single unfenced JSON object with `schema_version`, `status` (`"ok"` or `"error"`), and a `checks` array where each entry is `{name, ok, reason, fix}`. Exit code mirrors the prose path (0 = all pass, 1 = any fail). Human output is suppressed.
+- `pipeline doctor --is-ok` — runs all checks, emits **zero bytes of output**, and exits 0 (all pass) or 1 (any fail). Use for cheap polling. Mutually exclusive with `--json`.
+
+Similarly, `pipeline N --status --json` emits a single unfenced JSON object describing the issue's pipeline state (`schema_version`, `status`, `issue`, `stage`, `pr`, `branch`, `worktree`, `last_event`, `review_summary`, `next_action`, `config`). The human `--status` output is unchanged when `--json` is absent.
 
 ## Worktree dependency install (`setup_command`)
 
