@@ -663,11 +663,13 @@ npm install -g agent-pipeline
 pipeline --version   # verify the install
 ```
 
-If you prefer not to install globally, you can also invoke it via `npx`:
+If you prefer not to install globally, you can also invoke it via `npx` with an explicit bin selection:
 
 ```bash
-npx agent-pipeline path --json
+npx --package agent-pipeline pipeline path --json
 ```
+
+> **Note:** `npx agent-pipeline` invokes the installer (`scripts/install.mjs`), not the pipeline CLI. Always use `npx --package agent-pipeline pipeline <subcommand>` to reach the `pipeline` bin directly.
 
 ### Discover installed hosts — `pipeline path --json`
 

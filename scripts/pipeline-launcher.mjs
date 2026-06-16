@@ -7,6 +7,10 @@
 // this launcher does not bake in a profile: callers that need a specific profile
 // pass --profile claude or --profile codex explicitly.
 //
+// Runtime dependencies (core/node_modules) are provisioned by the package's
+// postinstall script at install time, not at command time, so this launcher
+// never writes to the installed package directory after installation.
+//
 // Usage after `npm install -g agent-pipeline`:
 //   pipeline --version
 //   pipeline path --json
@@ -48,17 +52,17 @@ if (!existsSync(entry)) {
   process.exit(1);
 }
 
-// First-run dependency provisioning. No-op once core/node_modules exists.
+// Dependencies are installed by the package's postinstall script at install
+// time. If node_modules is absent the package was installed in an unusual way;
+// direct the user to re-install rather than attempting a write that may fail
+// due to file-system permissions on a globally-installed (e.g. root-owned) package.
 if (!existsSync(join(coreDir, "node_modules"))) {
-  console.error("[pipeline] first run: installing dependencies (npm ci)…");
-  const ci = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], {
-    cwd: coreDir,
-    stdio: "inherit",
-  });
-  if ((ci.status ?? 1) !== 0) {
-    console.error(`[pipeline] dependency install failed. Run \`npm ci\` in ${coreDir} and retry.`);
-    process.exit(1);
-  }
+  console.error(
+    `pipeline: runtime dependencies not found at ${join(coreDir, "node_modules")}.\n` +
+      "         Re-install the package so the postinstall script can provision them:\n" +
+      "           npm install -g agent-pipeline",
+  );
+  process.exit(1);
 }
 
 const args = ["--experimental-strip-types", entry, ...rawArgs];
