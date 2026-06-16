@@ -1,20 +1,4 @@
-# blocked-recovery-recipes Specification
-
-## Purpose
-TBD - created by archiving change blocked-ux-stage-aware-recovery-recipe. Update Purpose after archive.
-## Requirements
-### Requirement: BlockerKind enum defines a closed set of blocker classes
-The pipeline SHALL define a `BlockerKind` string-enum in `core/scripts/types.ts` covering every structurally-distinct failure class that can result in a blocked issue. The enum SHALL include at minimum: `needs-human`, `test-gate-exhausted`, `no-commits`, `harness-failure`, `openspec-invalid`, `openspec-stale-delta`, `merge-conflict`, `worktree-missing`, `worktree-creation-failed`, `pr-creation-failed`, `plan-gen-failed`, `push-failed`.
-
-#### Scenario: BlockerKind enum is exhaustive for all call sites
-- **WHEN** every `setBlocked(...)` call in `planning.ts`, `fix.ts`, and `pre_merge.ts` is inspected
-- **THEN** each call SHALL pass a `kind` value drawn from `BlockerKind`
-- **AND** no call SHALL be added without a corresponding `BlockerKind` member
-
-#### Scenario: BLOCKER_RECIPES map covers every kind
-- **WHEN** the `BLOCKER_RECIPES` map is inspected at runtime
-- **THEN** it SHALL contain a non-empty string entry for every value in the `BlockerKind` enum
-- **AND** no `BlockerKind` value SHALL be absent from the map
+## MODIFIED Requirements
 
 ### Requirement: setBlocked renders a kind-specific recovery recipe
 The `setBlocked` function SHALL accept an optional `kind?: BlockerKind` parameter. When `kind` is provided, the "### How to unblock" section of the blocked comment SHALL render the static recipe string associated with that kind from `BLOCKER_RECIPES`. When `kind` is omitted, the function SHALL default to `needs-human` behavior for backward compatibility.
@@ -54,17 +38,3 @@ The `worktree-creation-failed` recipe SHALL include the following specific clean
 #### Scenario: worktree-creation-failed kind renders config-lock cleanup recipe
 - **WHEN** `setBlocked(cfg, N, reason, stage, "worktree-creation-failed")` is called
 - **THEN** the "### How to unblock" section SHALL include `rm -f .git/config.lock`, `git branch -D pipeline/<N>-<slug>`, removing the `blocked` label, and re-running the pipeline
-
-### Requirement: Recovery recipes are pinned by snapshot tests
-The pipeline test suite SHALL include a snapshot or string-assertion test that verifies the rendered comment text for every `BlockerKind` value. A recipe string that changes or goes missing SHALL cause the test to fail.
-
-#### Scenario: snapshot test fails when a recipe string is changed
-- **WHEN** the `BLOCKER_RECIPES` entry for any kind is edited
-- **THEN** the corresponding snapshot assertion SHALL fail at `npm test`
-- **AND** the failure message SHALL identify which kind's recipe changed
-
-#### Scenario: snapshot test covers all kinds
-- **WHEN** a new value is added to `BlockerKind`
-- **THEN** there SHALL be a test asserting that `BLOCKER_RECIPES` contains a non-empty entry for that value
-- **AND** the test SHALL fail if the entry is absent
-

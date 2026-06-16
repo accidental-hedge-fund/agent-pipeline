@@ -102,9 +102,10 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "from the issue's branch (`git worktree add`), remove the `blocked` label, " +
     "then re-run `$pipeline 7`.",
   "worktree-creation-failed":
-    "Creating the worktree failed (see the error above). Check disk space and " +
-    "git state (stale worktrees, lock files), remove the `blocked` " +
-    "label, then re-run `$pipeline 7`.",
+    "Creating the worktree failed (see the error above). If a `.git/config.lock` " +
+    "file is present, remove it: `rm -f .git/config.lock`. Delete the dangling " +
+    "branch: `git branch -D pipeline/7-<slug>`. Remove the `blocked` label, " +
+    "then re-run `$pipeline 7`.",
   "pr-creation-failed":
     "Opening the pull request failed (see the error above). Check GitHub " +
     "permissions and rate limits, remove the `blocked` label, then " +
@@ -376,6 +377,20 @@ test("worktree-setup-failed directs to fix root cause or opt out via setup_comma
   const body = comment("worktree-setup-failed");
   assert.ok(body.includes("dependency install"), "must mention the install step");
   assert.ok(body.includes("setup_command"), "must mention the setup_command opt-out");
+  assert.ok(body.includes("`blocked`"), "must mention clearing the blocked label");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "must direct to re-run");
+  assert.ok(!body.includes("--unblock"), "must not direct to --unblock");
+});
+
+// ---------------------------------------------------------------------------
+// worktree-creation-failed: recipe must include the four .git/config.lock
+// cleanup steps introduced in #183.
+// ---------------------------------------------------------------------------
+
+test("worktree-creation-failed directs to remove config lock, delete dangling branch, clear label, re-run", () => {
+  const body = comment("worktree-creation-failed");
+  assert.ok(body.includes("rm -f .git/config.lock"), "must include git config lock removal command");
+  assert.ok(body.includes("git branch -D pipeline/"), "must include dangling branch deletion command");
   assert.ok(body.includes("`blocked`"), "must mention clearing the blocked label");
   assert.ok(body.includes("re-run `$pipeline 7`"), "must direct to re-run");
   assert.ok(!body.includes("--unblock"), "must not direct to --unblock");

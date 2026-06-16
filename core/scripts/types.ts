@@ -114,9 +114,10 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "from the issue's branch (`git worktree add`), remove the `blocked` label, " +
     "then re-run `$pipeline {{N}}`.",
   "worktree-creation-failed":
-    "Creating the worktree failed (see the error above). Check disk space and " +
-    "git state (stale worktrees, lock files), remove the `blocked` " +
-    "label, then re-run `$pipeline {{N}}`.",
+    "Creating the worktree failed (see the error above). If a `.git/config.lock` " +
+    "file is present, remove it: `rm -f .git/config.lock`. Delete the dangling " +
+    "branch: `git branch -D pipeline/{{N}}-<slug>`. Remove the `blocked` label, " +
+    "then re-run `$pipeline {{N}}`.",
   "pr-creation-failed":
     "Opening the pull request failed (see the error above). Check GitHub " +
     "permissions and rate limits, remove the `blocked` label, then " +

@@ -6,6 +6,7 @@
 //
 // All paths are absolute. Shells out to `git` via execFile.
 
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -24,6 +25,191 @@ export function slugify(text: string): string {
     .replace(/-+/g, "-")
     .slice(0, 40)
     .replace(/-+$/g, "");
+}
+
+// ---------------------------------------------------------------------------
+// Per-repo worktree-creation mutex (#183)
+//
+// Serializes `git worktree add` across concurrent pipeline instances in the
+// same repo. `git worktree add` writes upstream config to the shared
+// .git/config, which two concurrent writers race on .git/config.lock.
+// The mutex path is /tmp/pipeline-wt-<hash>.lock where <hash> is an 8-char
+// SHA-1 prefix of the repo path — unique per repo, stable across processes.
+// ---------------------------------------------------------------------------
+
+/** 8-char hex prefix of SHA-1 of the given path. Used to namespace mutex files. */
+export function repoHash(dir: string): string {
+  return createHash("sha1").update(dir).digest("hex").slice(0, 8);
+}
+
+/** Mutex lock file path for worktree creation, keyed on the canonical Git
+ *  common directory so that two linked worktrees of the same repo share the
+ *  same mutex even when their `repo_dir` paths differ. */
+export function worktreeMutexPath(commonDir: string): string {
+  return `/tmp/pipeline-wt-${repoHash(commonDir)}.lock`;
+}
+
+/** Resolve the canonical Git common directory (shared across all linked
+ *  worktrees).  This is the directory that owns `.git/config`, so two runs
+ *  starting from different linked worktrees of the same repo return the same
+ *  path and thus the same mutex file. */
+async function realResolveGitCommonDir(repoDir: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", repoDir, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { timeout: 5_000 },
+  );
+  return stdout.trim();
+}
+
+/** Injectable deps for acquireWorktreeMutex — allows unit tests to bypass
+ *  real filesystem and PID operations. */
+export interface AcquireWorktreeMutexDeps {
+  /** Atomically create the lock file with the given content. Returns true if
+   *  created, false if the file already exists (EEXIST). Throws on other errors. */
+  atomicCreate?: (path: string, content: string) => boolean;
+  /** Read the lock file content. Returns null if the file does not exist. */
+  readContent?: (path: string) => string | null;
+  /** Remove the lock file, ignoring ENOENT. */
+  unlink?: (path: string) => void;
+  /** Returns true if the process with the given PID is still running. */
+  isPidAlive?: (pid: number) => boolean;
+  /** Returns the PID to write into the lock file (defaults to process.pid). */
+  currentPid?: () => number;
+}
+
+function realAtomicCreate(p: string, content: string): boolean {
+  try {
+    const fd = fs.openSync(p, "wx");
+    try {
+      fs.writeSync(fd, content);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "EEXIST") return false;
+    throw err;
+  }
+}
+
+function realReadContent(p: string): string | null {
+  try {
+    return fs.readFileSync(p, "utf8").trim();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+function realUnlink(p: string): void {
+  try {
+    fs.unlinkSync(p);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") throw err;
+  }
+}
+
+function realIsPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    if (e.code === "EPERM") return true; // process exists but can't signal it
+    throw err;
+  }
+}
+
+/** Acquire the per-repo worktree-creation mutex.
+ *
+ *  - Clean path → write current PID and return.
+ *  - Lock file with dead/invalid PID → reclaim (remove + re-acquire).
+ *  - Lock file with live PID → throw; the caller should retry with backoff. */
+export function acquireWorktreeMutex(
+  mutexPath: string,
+  deps: AcquireWorktreeMutexDeps = {},
+): void {
+  const atomicCreate = deps.atomicCreate ?? realAtomicCreate;
+  const readContent = deps.readContent ?? realReadContent;
+  const unlink = deps.unlink ?? realUnlink;
+  const isPidAlive = deps.isPidAlive ?? realIsPidAlive;
+  const currentPid = deps.currentPid ?? (() => process.pid);
+
+  const created = atomicCreate(mutexPath, String(currentPid()));
+  if (created) return; // acquired cleanly
+
+  // File exists — check whether the holder is still alive.
+  const content = readContent(mutexPath);
+  if (content === null) {
+    // File disappeared between the EEXIST and the read (rare race). Retry.
+    return acquireWorktreeMutex(mutexPath, deps);
+  }
+
+  const holderPid = Number.parseInt(content, 10);
+  const isValidPid = Number.isFinite(holderPid) && holderPid > 0;
+
+  if (isValidPid && isPidAlive(holderPid)) {
+    // Live process holds the mutex — signal the caller to wait.
+    throw new Error(
+      `Worktree mutex held by process ${holderPid}: ${mutexPath}. ` +
+      "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
+    );
+  }
+
+  // PID is dead OR invalid/garbage — serialize the reclaim sequence with a
+  // short-lived reclaimer lock.  Routing BOTH cases through the reclaim lock
+  // prevents two concurrent reclaimers (whether they read a dead PID or
+  // garbage content) from both unlinking and racing to reacquire: the second
+  // unlink would delete the first's freshly-acquired lock.
+  const reclaimPath = mutexPath + ".reclaim";
+  const reclaimCreated = atomicCreate(reclaimPath, String(currentPid()));
+  if (!reclaimCreated) {
+    // Another reclaimer holds the reclaim lock.
+    const reclaimContent = readContent(reclaimPath);
+    if (reclaimContent !== null) {
+      const reclaimPid = Number.parseInt(reclaimContent, 10);
+      if (Number.isFinite(reclaimPid) && reclaimPid > 0 && isPidAlive(reclaimPid)) {
+        // Live reclaimer in progress.  Throw so createWorktree's bounded
+        // sleep loop handles the wait — synchronous recursion here would
+        // overflow the stack if the reclaimer holds the lock for a long time.
+        throw new Error(
+          `Worktree mutex held by process ${reclaimPid} (reclaimer): ${mutexPath}. ` +
+          "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
+        );
+      }
+    }
+    // Stale or unreadable reclaim lock — remove and restart from scratch.
+    unlink(reclaimPath);
+    return acquireWorktreeMutex(mutexPath, deps);
+  }
+  try {
+    // Re-verify content while holding the reclaimer lock.  If another
+    // reclaimer already won the race and reacquired, restart without
+    // unlinking the (now-live) main lock.
+    const current = readContent(mutexPath);
+    if (current !== content) {
+      return acquireWorktreeMutex(mutexPath, deps);
+    }
+    unlink(mutexPath);
+  } finally {
+    unlink(reclaimPath);
+  }
+  return acquireWorktreeMutex(mutexPath, deps);
+}
+
+/** Release the per-repo worktree-creation mutex. */
+export function releaseWorktreeMutex(mutexPath: string): void {
+  try {
+    fs.unlinkSync(mutexPath);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") throw err;
+  }
 }
 
 function worktreeRoot(cfg: PipelineConfig): string {
@@ -169,6 +355,16 @@ export interface CreateWorktreeDeps {
     args: string[],
     opts?: { ignoreFailure?: boolean; timeoutMs?: number },
   ) => Promise<{ stdout: string; stderr: string; code: number }>;
+  /** Resolve the canonical Git common directory shared by all linked worktrees.
+   *  Two runs from different linked worktrees of the same repo must return the
+   *  same path so they share the same per-repo mutex file. */
+  resolveGitCommonDir?: (repoDir: string) => Promise<string>;
+  /** Acquire the per-repo worktree-creation mutex; throws if a live process holds it. */
+  acquireMutex?: (path: string) => void;
+  /** Release the per-repo worktree-creation mutex. */
+  releaseMutex?: (path: string) => void;
+  /** Sleep for the given number of milliseconds (injectable for tests). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export async function createWorktree(
@@ -182,6 +378,10 @@ export async function createWorktree(
   const listActiveFn = deps.listActive ?? listActive;
   const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
   const gitFn = deps.gitCmd ?? git;
+  const resolveGitCommonDirFn = deps.resolveGitCommonDir ?? realResolveGitCommonDir;
+  const acquireMutexFn = deps.acquireMutex ?? ((p: string) => acquireWorktreeMutex(p));
+  const releaseMutexFn = deps.releaseMutex ?? releaseWorktreeMutex;
+  const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
@@ -232,17 +432,66 @@ export async function createWorktree(
   // If the branch exists from a prior failed attempt, delete it.
   await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
 
-  // Create the worktree.
-  const { code, stderr } = await gitFn(
-    cfg,
-    cfg.repo_dir,
-    ["worktree", "add", wtPath, "-b", branch, `origin/${cfg.base_branch}`],
-    { ignoreFailure: true },
-  );
-  if (code !== 0) {
-    throw new Error(`git worktree add failed: ${stderr.trim()}`);
+  // Serialize git worktree add across concurrent pipeline instances in the
+  // same repo. The mutex is held only for the duration of the subprocess call
+  // so it never blocks unrelated pipeline work. A retry loop handles transient
+  // .git/config.lock contention (belt-and-suspenders for cases the mutex
+  // cannot prevent, e.g. a stale lock left by a crashed git process).
+  //
+  // The mutex is keyed on the canonical Git common directory (not cfg.repo_dir)
+  // so two runs from different linked worktrees of the same repo share one
+  // mutex even though their cfg.repo_dir paths differ.
+  const commonDir = await resolveGitCommonDirFn(cfg.repo_dir);
+  const mutexPath = worktreeMutexPath(commonDir);
+
+  // Wait up to 90 s (the git subprocess timeout of 60 s plus 30 s margin)
+  // so a live holder that is mid-git-worktree-add cannot outlast the wait.
+  const MUTEX_POLL_MS = 200;
+  const MUTEX_TIMEOUT_MS = 90_000;
+  let mutexWaited = 0;
+  for (;;) {
+    try {
+      acquireMutexFn(mutexPath);
+      break;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes("Worktree mutex held by process") || mutexWaited >= MUTEX_TIMEOUT_MS) {
+        throw err;
+      }
+      await sleepFn(MUTEX_POLL_MS);
+      mutexWaited += MUTEX_POLL_MS;
+    }
   }
-  return { path: wtPath, branch };
+
+  try {
+    // 1 initial attempt + 3 retries = 4 total, matching the spec.
+    const MAX_ATTEMPTS = 4;
+    let lastStderr = "";
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        await sleepFn(200 * 2 ** (attempt - 1)); // 200ms, 400ms, 800ms
+        // A failed `git worktree add -b <branch>` creates the branch before
+        // it tries to write the config, so a config-lock failure leaves a
+        // dangling branch.  Delete it before retrying so `-b <branch>` does
+        // not immediately fail with "branch already exists".
+        await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+      }
+      const { code, stderr } = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["worktree", "add", wtPath, "-b", branch, `origin/${cfg.base_branch}`],
+        { ignoreFailure: true },
+      );
+      if (code === 0) return { path: wtPath, branch };
+      lastStderr = stderr;
+      if (!stderr.includes("could not lock config file")) {
+        throw new Error(`git worktree add failed: ${lastStderr.trim()}`);
+      }
+    }
+    throw new Error(`git worktree add failed: ${lastStderr.trim()}`);
+  } finally {
+    releaseMutexFn(mutexPath);
+  }
 }
 
 export async function removeWorktree(
