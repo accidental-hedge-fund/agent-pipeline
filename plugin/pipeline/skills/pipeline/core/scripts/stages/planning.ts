@@ -700,7 +700,7 @@ export interface ResumeFromImplementingDeps {
 export async function resumeFromImplementing(
   cfg: PipelineConfig,
   issueNumber: number,
-  wt: { path: string; slug: string },
+  wt: { path: string; branch: string },
   opts: {
     prTitle: string;
     prBody: string;
@@ -718,7 +718,7 @@ export async function resumeFromImplementing(
   const blocker = deps.setBlocked ?? setBlocked;
   const trans = deps.transition ?? transition;
 
-  const branch = branchName(issueNumber, wt.slug);
+  const branch = wt.branch;
 
   // ---- Test/build gate ----
   const gate = await gateRunner(cfg, issueNumber, wt.path, {}, opts.pipelineRunId, "planning", opts.stateDir);
@@ -825,7 +825,9 @@ export async function dispatchResume(
     `**Plan reviewed by**: ${reviewer}`,
   ].join("\n") + footer(cfg);
 
-  return doResume(cfg, issueNumber, wt, {
+  const resumeWt = { path: wt.path, branch: branchName(issueNumber, wt.slug) };
+
+  return doResume(cfg, issueNumber, resumeWt, {
     prTitle: `[Pipeline] ${title} (#${issueNumber})`,
     prBody,
     transitionMessage: (prNumber) =>

@@ -34,8 +34,8 @@ function makeCfg(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
   } as unknown as PipelineConfig;
 }
 
-function makeWt(path = "/fake/wt", slug = "fake-slug"): { path: string; slug: string } {
-  return { path, slug };
+function makeWt(path = "/fake/wt", branch = "pipeline/42-fake-slug"): { path: string; branch: string } {
+  return { path, branch };
 }
 
 function passedGate(): TestGateResult {
@@ -325,4 +325,45 @@ test("resumeFromImplementing: skipped gate → advances to review-1 (gate-less r
 
   assert.ok(createPrCalled, "PR should be created when gate is skipped");
   assert.equal(result.advanced, true);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: fresh-flow worktree shape ({ path, branch } — no slug)
+// createWorktree() returns { path, branch }; before the fix, wt.slug was
+// undefined so the push used "pipeline/<issue>-undefined".
+// ---------------------------------------------------------------------------
+
+test("resumeFromImplementing: fresh-flow worktree shape (no slug, branch from createWorktree) — pushes the actual branch", async () => {
+  const pushedBranch: string[] = [];
+
+  const freshWt = { path: "/fake/wt", branch: "pipeline/42-fix-the-bug" };
+
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    getPrForIssue: async () => null,
+    createPr: async () => 99,
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "push") pushedBranch.push(args[args.length - 1]);
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    setBlocked: async () => {},
+    transition: async () => {},
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    42,
+    freshWt,
+    {
+      prTitle: "[Pipeline] Fix the bug (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (n) => `PR #${n} ready.`,
+      pipelineRunId: "run-1",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.equal(pushedBranch.length, 1, "push should be called once");
+  assert.equal(pushedBranch[0], "pipeline/42-fix-the-bug", "pushed branch must match the worktree branch, not pipeline/42-undefined");
 });
