@@ -65,6 +65,18 @@ test("archiveAlreadyDone: does not match archive commit for a different issue nu
   assert.equal(await archiveAlreadyDone(gitFn, "/wt", "main", ISSUE), false);
 });
 
+test("archiveAlreadyDone: does not match archive commit for an issue whose number is a prefix of this issue (#18 vs #181)", async () => {
+  // #18 is a numeric prefix of #181; startsWith would falsely match without the boundary check.
+  const gitFn = makeGitFn([`chore: archive OpenSpec change(s) for #18`]);
+  assert.equal(await archiveAlreadyDone(gitFn, "/wt", "main", ISSUE), false);
+});
+
+test("archiveAlreadyDone: does not match when this issue number is a prefix of the commit's issue (#181 log commit does not match #18 check)", async () => {
+  // Checking for issue #18 must not be satisfied by a #181 archive commit.
+  const gitFn = makeGitFn([`chore: archive OpenSpec change(s) for #181`]);
+  assert.equal(await archiveAlreadyDone(gitFn, "/wt", "main", 18), false);
+});
+
 // ---------------------------------------------------------------------------
 // 2. maybeArchiveOpenspec skips when archiveAlreadyDone returns true (3.2)
 // ---------------------------------------------------------------------------

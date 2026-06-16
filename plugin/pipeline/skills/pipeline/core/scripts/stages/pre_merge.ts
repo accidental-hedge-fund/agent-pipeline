@@ -452,7 +452,14 @@ export async function archiveAlreadyDone(
     { ignoreFailure: true },
   );
   const prefix = `${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`;
-  return log.stdout.split("\n").some((line) => line.trim().startsWith(prefix));
+  return log.stdout.split("\n").some((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith(prefix)) return false;
+    // Require a non-digit (or end of string) after the issue number so that
+    // #18 does not match a commit intended for #181 or any other prefixed number.
+    const charAfter = trimmed[prefix.length];
+    return charAfter === undefined || !/\d/.test(charAfter);
+  });
 }
 
 /**
