@@ -1048,7 +1048,7 @@ async function dispatch(
     case "eval-gate":
       return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir });
     case "shipcheck-gate":
-      return shipchecKStage.advance(cfg, issueNumber, { dryRun });
+      return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":
       return deployReady.finalize(cfg, issueNumber);
     case "needs-human":

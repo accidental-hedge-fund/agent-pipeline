@@ -15,7 +15,7 @@ This skill keeps the old `/pipeline` workflow as Codex skill `$pipeline`.
 Treat the text after `$pipeline`, `/pipeline`, or the natural-language request as the argument string.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through an 11-stage label-driven state machine, ending at
+issue) through a 13-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
 the merge button.
 
@@ -33,7 +33,7 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 ```
 backlog → ready → planning → implementing
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → eval-gate → ready-to-deploy
+              → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
 ```
 
 Each item carries one `pipeline:<stage>` label and at most one `blocked`

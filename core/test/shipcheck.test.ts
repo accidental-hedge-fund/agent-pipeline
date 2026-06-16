@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   advance,
   buildShipcheckPrompt,
+  extractAcceptanceCriteria,
   formatShipcheckComment,
   parseShipcheckVerdict,
   type ShipcheckDeps,
@@ -115,6 +116,10 @@ function makeDeps(
       comments: [],
     }),
     getPrForIssue: async () => null,
+    getPrDiff: async () => "",
+    getForIssue: async () => null,
+    gitDiffNames: async () => [],
+    readEvidenceBundle: async () => null,
     postComment: async (_c, _n, body) => { log.comments.push(body); },
     postPrComment: async (_c, _n, body) => { log.prComments.push(body); },
     transition: async (_c, _n, from, to, reason) => { log.transitions.push({ from, to, reason }); },
@@ -375,4 +380,230 @@ test("formatShipcheckComment: per-criterion table present when criteria non-empt
   assert.ok(comment.includes("| Criterion |"), "comment must include criterion table");
   assert.ok(comment.includes("Tests pass"), "comment must list criterion names");
   assert.ok(comment.includes("Docs updated"), "comment must list all criteria");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4: non-zero/timeout reviewer exit must not silently pass (regression)
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: reviewer non-zero exit with valid JSON stdout → treated as failed round, not parsed", async () => {
+  // When invokeReviewer returns success:false, the gate must NOT parse stdout
+  // even if it contains valid JSON. In gate mode with max_rounds:1 this must block.
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_rounds: 1 });
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => ({
+      stdout: fencedJson(PASS_VERDICT), // valid JSON, but process failed
+      success: false,
+    }),
+  };
+
+  const out = await advance(cfg, 60, {}, deps);
+
+  assert.equal(out.advanced, false, "non-zero exit must not advance even with valid-looking stdout");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal(log.blocked.length, 1);
+  assert.ok(log.blocked[0].kind === "needs-human");
+  assert.equal(log.transitions.length, 0);
+});
+
+test("shipcheck-gate: reviewer non-zero exit in advisory mode → warn and advance (parse failure path)", async () => {
+  // Advisory mode still advances after a failed reviewer invocation.
+  const log = makeCallLog();
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_rounds: 1 });
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => ({ stdout: "", success: false }),
+  };
+
+  try {
+    const out = await advance(cfg, 61, {}, deps);
+    assert.equal(out.advanced, true, "advisory mode must advance even after non-zero exit");
+    assert.equal((out as { to: string }).to, "ready-to-deploy");
+    assert.equal(log.blocked.length, 0);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 5: malformed criteria array must be rejected (regression)
+// ---------------------------------------------------------------------------
+
+test("parseShipcheckVerdict: criteria entries missing required fields → parse failure fallback", () => {
+  const warnings: string[] = [];
+  // Top-level shape valid, but criteria entries lack required fields.
+  const malformed = JSON.stringify({ verdict: "pass", summary: "ok", criteria: [{}] });
+  const result = parseShipcheckVerdict(malformed, (w) => warnings.push(w));
+  assert.equal(result.verdict, "fail", "malformed criterion must fall back to fail");
+  assert.ok(warnings.length > 0, "must warn on malformed criteria");
+});
+
+test("parseShipcheckVerdict: criteria entry with wrong result value → parse failure fallback", () => {
+  const warnings: string[] = [];
+  const malformed = JSON.stringify({
+    verdict: "pass",
+    summary: "ok",
+    criteria: [{ criterion: "c", result: "unknown", note: "n" }],
+  });
+  const result = parseShipcheckVerdict(malformed, (w) => warnings.push(w));
+  assert.equal(result.verdict, "fail", "invalid criterion result must fall back to fail");
+  assert.ok(warnings.length > 0);
+});
+
+test("parseShipcheckVerdict: fully valid criteria entries → parsed without fallback", () => {
+  const warnings: string[] = [];
+  const valid = JSON.stringify({
+    verdict: "pass",
+    summary: "all good",
+    criteria: [
+      { criterion: "Tests pass", result: "pass", note: "CI green" },
+      { criterion: "Docs updated", result: "na", note: "no docs needed" },
+    ],
+  });
+  const result = parseShipcheckVerdict(valid, (w) => warnings.push(w));
+  assert.equal(result.verdict, "pass");
+  assert.equal(result.criteria.length, 2);
+  assert.deepEqual(warnings, []);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 6: rubric fallback must use issue acceptance criteria (regression)
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: rubric absent → fallback uses issue body acceptance-criteria section", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT), null /* rubric file absent */),
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n,
+      type: "issue",
+      title: "Test issue",
+      body: "Some preamble.\n\n## Acceptance Criteria\n- Criterion A must pass\n- Criterion B must pass",
+      state: "open",
+      url: "https://github.com/acme/widget/issues/1",
+      labels: ["pipeline:shipcheck-gate"],
+      comments: [],
+    }),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  try {
+    await advance(cfg, 62, {}, deps);
+    assert.ok(warnings.some((w) => w.includes("rubric file not found")), "must warn about missing rubric");
+    assert.ok(capturedPrompt.includes("Criterion A must pass"), "prompt must include issue ACs as rubric");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3: prompt context assembly (regression)
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: PR diff assembled into changed-files prompt section", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getPrDiff: async () =>
+      "diff --git a/src/foo.ts b/src/foo.ts\n+some change\ndiff --git a/src/bar.ts b/src/bar.ts\n+another change\n",
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 63, {}, deps);
+
+  assert.ok(capturedPrompt.includes("src/foo.ts"), "prompt must list changed file foo.ts");
+  assert.ok(capturedPrompt.includes("src/bar.ts"), "prompt must list changed file bar.ts");
+});
+
+test("shipcheck-gate: plan extracted from issue comments included in prompt", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n,
+      type: "issue",
+      title: "Test issue",
+      body: "Issue body",
+      state: "open",
+      url: "https://github.com/acme/widget/issues/1",
+      labels: ["pipeline:shipcheck-gate"],
+      comments: [
+        {
+          author: "pipeline-bot",
+          body: "## Implementation Plan\n\n### Steps\n1. Do the thing\n2. Test it",
+          createdAt: "2024-01-01T00:00:00Z",
+        },
+      ],
+    }),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 64, {}, deps);
+
+  assert.ok(capturedPrompt.includes("Do the thing"), "prompt must include plan content from issue comments");
+});
+
+test("shipcheck-gate: worktree path used for reviewer invocation when worktree present", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  let capturedWorktreeDir = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getForIssue: async () => ({ path: "/tmp/test-worktree", slug: "1-test" }),
+    gitDiffNames: async () => [],
+    invokeReviewer: async (_prompt, worktreeDir) => {
+      capturedWorktreeDir = worktreeDir;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 65, {}, deps);
+
+  assert.equal(capturedWorktreeDir, "/tmp/test-worktree", "reviewer must run in the issue worktree");
+});
+
+// ---------------------------------------------------------------------------
+// extractAcceptanceCriteria unit tests
+// ---------------------------------------------------------------------------
+
+test("extractAcceptanceCriteria: section present → returns section text", () => {
+  const body = "Intro.\n\n## Acceptance Criteria\n- Must pass tests\n- Must update docs\n\n## Other Section\nOther content.";
+  const result = extractAcceptanceCriteria(body);
+  assert.ok(result.includes("Must pass tests"), "must include AC content");
+  assert.ok(!result.includes("Other content"), "must not include content after the AC section");
+});
+
+test("extractAcceptanceCriteria: section absent → returns empty string", () => {
+  const body = "Just an issue description with no AC section.";
+  const result = extractAcceptanceCriteria(body);
+  assert.equal(result, "");
 });

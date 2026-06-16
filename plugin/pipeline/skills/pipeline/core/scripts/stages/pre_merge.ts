@@ -116,7 +116,9 @@ export async function advance(
   }
 
   if (opts.dryRun) {
-    const dryNextStage = cfg.eval_gate.enabled ? "eval-gate" : "ready-to-deploy";
+    const dryNextStage = cfg.eval_gate.enabled
+      ? "eval-gate"
+      : cfg.shipcheck_gate?.enabled ? "shipcheck-gate" : "ready-to-deploy";
     console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+CI+merge for PR #${prNumber}`);
     return { advanced: true, from: "pre-merge", to: dryNextStage, summary: "[dry-run]" };
   }
@@ -305,9 +307,11 @@ export async function advance(
   }
 
   // ---- Step 3: advance ----
-  // Skip the eval-gate label entirely when evals are disabled to avoid spurious
-  // label churn and pipeline comments on repos that did not opt in.
-  const nextStage = cfg.eval_gate.enabled ? "eval-gate" : "ready-to-deploy";
+  // Route to the first enabled late-stage gate. Skip eval-gate when disabled to
+  // avoid spurious label churn; similarly skip shipcheck-gate when disabled.
+  const nextStage = cfg.eval_gate.enabled
+    ? "eval-gate"
+    : cfg.shipcheck_gate?.enabled ? "shipcheck-gate" : "ready-to-deploy";
   await transitionFn(
     cfg,
     issueNumber,

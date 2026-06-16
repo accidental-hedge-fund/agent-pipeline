@@ -13,16 +13,21 @@ import {
   postComment as defaultPostComment,
   postPrComment as defaultPostPrComment,
   getPrForIssue as defaultGetPrForIssue,
+  getPrDiff as defaultGetPrDiff,
   getIssueDetail as defaultGetIssueDetail,
   setBlocked as defaultSetBlocked,
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
+import { getForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
+import { openspecContextFromDiff } from "../openspec.ts";
+import { readBundle as defaultReadBundle } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
 import { substitute } from "../prompts/index.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
 import type {
   BlockerKind,
+  EvidenceBundle,
   Outcome,
   PipelineConfig,
   ShipcheckVerdict,
@@ -96,13 +101,23 @@ export function parseShipcheckVerdict(
   };
 }
 
+function isShipcheckCriterion(c: unknown): boolean {
+  if (!c || typeof c !== "object") return false;
+  const o = c as Record<string, unknown>;
+  return (
+    typeof o.criterion === "string" &&
+    ["pass", "fail", "na"].includes(o.result as string) &&
+    typeof o.note === "string"
+  );
+}
+
 function isShipcheckVerdict(v: unknown): v is ShipcheckVerdict {
   if (!v || typeof v !== "object") return false;
   const o = v as Record<string, unknown>;
   if (!["pass", "partial", "fail"].includes(o.verdict as string)) return false;
   if (typeof o.summary !== "string") return false;
   if (!Array.isArray(o.criteria)) return false;
-  return true;
+  return o.criteria.every(isShipcheckCriterion);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +161,8 @@ export function formatShipcheckComment(
 export interface ShipcheckDeps {
   getIssueDetail?: typeof defaultGetIssueDetail;
   getPrForIssue?: typeof defaultGetPrForIssue;
+  getPrDiff?: typeof defaultGetPrDiff;
+  getForIssue?: typeof defaultGetForIssue;
   postComment?: typeof defaultPostComment;
   postPrComment?: typeof defaultPostPrComment;
   transition?: typeof defaultTransition;
@@ -153,6 +170,10 @@ export interface ShipcheckDeps {
   setBlocked?: typeof defaultSetBlocked;
   /** Read a file at the given absolute path. Returns null when not found. */
   readFile?: (filePath: string) => string | null;
+  /** Read the evidence bundle for an issue. Returns null when not found. */
+  readEvidenceBundle?: (stateDir: string, issue: number) => Promise<EvidenceBundle | null>;
+  /** Run git diff --name-only in a worktree. Returns path list. */
+  gitDiffNames?: (wtPath: string, base: string) => Promise<string[]>;
   /** Invoke the reviewer harness with a prompt. Returns stdout string or null on failure. */
   invokeReviewer?: (prompt: string, worktreeDir: string, timeoutSec: number) => Promise<{ stdout: string; success: boolean }>;
 }
@@ -163,6 +184,8 @@ export interface ShipcheckDeps {
 
 export interface AdvanceShipcheckOpts {
   dryRun?: boolean;
+  /** Evidence-bundle run/state dir; when set, eval results are read from it. */
+  stateDir?: string;
 }
 
 export async function advance(
@@ -180,6 +203,10 @@ export async function advance(
   const postPrCommentFn = deps.postPrComment ?? defaultPostPrComment;
   const getPrForIssueFn = deps.getPrForIssue ?? defaultGetPrForIssue;
   const getIssueDetailFn = deps.getIssueDetail ?? defaultGetIssueDetail;
+  const getForIssueFn = deps.getForIssue ?? defaultGetForIssue;
+  const getPrDiffFn = deps.getPrDiff ?? defaultGetPrDiff;
+  const readEvidenceBundleFn = deps.readEvidenceBundle ?? defaultReadBundle;
+  const gitDiffNamesFn = deps.gitDiffNames ?? defaultGitDiffNames;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would run shipcheck`);
@@ -197,20 +224,38 @@ export async function advance(
   const detail = await getIssueDetailFn(cfg, issueNumber);
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
 
-  // Load rubric.
-  const rubric = loadRubric(cfg, deps);
+  // Resolve the issue worktree; reviewer runs inside it when present.
+  const wt = await getForIssueFn(cfg, issueNumber);
+  const worktreeDir = wt?.path ?? cfg.repo_dir;
 
-  // Build a basic changed-files summary from the PR.
-  const changedFilesSummary = "(changed files: see PR diff)";
+  // Compute rubric fallback from issue body before loading the configured file.
+  const rubricFallback = extractAcceptanceCriteria(detail.body) || detail.body || "(no rubric available)";
+  const rubric = loadRubric(cfg, deps, rubricFallback);
+
+  // Gather changed-files summary from the PR diff.
+  const changedFilesSummary = await gatherChangedFiles(cfg, prNumber, getPrDiffFn);
+
+  // Extract plan and acceptance criteria from issue comments.
+  const planAndAcs = extractPlanFromComments(detail.comments);
+
+  // Extract eval summary from the evidence bundle when available.
+  const evalSummary = opts.stateDir
+    ? await gatherEvalSummary(opts.stateDir, issueNumber, readEvidenceBundleFn)
+    : undefined;
+
+  // Derive OpenSpec deltas from the worktree branch diff when applicable.
+  const openspecDeltas = wt
+    ? await gatherOpenspecDeltas(cfg, wt.path, gitDiffNamesFn)
+    : undefined;
 
   // Assemble prompt context.
   const prompt = buildShipcheckPrompt({
     rubric,
     issueBody: detail.body,
-    planAndAcs: "(plan: see issue and PR comments)",
+    planAndAcs,
     changedFiles: changedFilesSummary,
-    evalSummary: undefined,
-    openspecDeltas: undefined,
+    evalSummary,
+    openspecDeltas,
   });
 
   // Run reviewer harness up to max_rounds.
@@ -228,31 +273,43 @@ export async function advance(
       console.log(`[pipeline] #${issueNumber}: shipcheck-gate invoking reviewer (${reviewerHarness})`);
     }
 
-    let stdout: string;
+    let result: { stdout: string; success: boolean };
     if (deps.invokeReviewer) {
-      const result = await deps.invokeReviewer(prompt, cfg.repo_dir, timeoutSec);
-      if (!result.success && !result.stdout.trim()) {
-        continue;
-      }
-      stdout = result.stdout;
+      result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
     } else {
-      const result = await defaultInvoke(reviewerHarness, cfg.repo_dir, prompt, {
+      const harnessResult = await defaultInvoke(reviewerHarness, worktreeDir, prompt, {
         timeoutSec,
       });
-      if (!result.success && !result.stdout.trim()) {
-        continue;
+      result = { stdout: harnessResult.stdout, success: harnessResult.success };
+    }
+
+    // Finding 4: only parse stdout from successful invocations. A non-zero exit,
+    // spawn error, or timeout must be treated as a failed round regardless of any
+    // output on stdout — a timed-out process that happened to print parseable JSON
+    // must not silently pass the gate.
+    if (!result.success) {
+      parseFailure = true;
+      if (!verdict) {
+        verdict = {
+          verdict: "fail",
+          summary: result.stdout.trim()
+            ? `[reviewer exited non-zero]: ${result.stdout.slice(0, 500)}`
+            : "[reviewer exited non-zero with no output]",
+          criteria: [],
+        };
       }
-      stdout = result.stdout;
+      continue;
     }
 
     let warnCalled = false;
-    const parsed = parseShipcheckVerdict(stdout, (msg) => {
+    const parsed = parseShipcheckVerdict(result.stdout, (msg) => {
       console.warn(msg);
       warnCalled = true;
     });
     if (!warnCalled) {
       // Clean parse.
       verdict = parsed;
+      parseFailure = false;
       break;
     }
     // Warn was called → parse failure, keep the fallback verdict for now but try again.
@@ -331,16 +388,21 @@ export async function advance(
 // Rubric loading
 // ---------------------------------------------------------------------------
 
-function loadRubric(cfg: PipelineConfig, deps: ShipcheckDeps): string {
+/**
+ * Load the rubric from the configured file path. When absent, logs a warning
+ * and returns the provided fallback text (typically the issue's acceptance
+ * criteria section or full body).
+ */
+function loadRubric(cfg: PipelineConfig, deps: ShipcheckDeps, fallback: string): string {
   const rubricPath = path.resolve(cfg.repo_dir, cfg.shipcheck_gate.rubric_path);
   const readFileFn = deps.readFile ?? defaultReadFile;
   const contents = readFileFn(rubricPath);
   if (contents !== null) return contents;
 
   console.warn(
-    `[pipeline] shipcheck: rubric file not found at ${rubricPath}; falling back to issue body as rubric.`,
+    `[pipeline] shipcheck: rubric file not found at ${rubricPath}; using issue acceptance criteria as rubric.`,
   );
-  return "(rubric file not found — evaluating against issue acceptance criteria)";
+  return fallback;
 }
 
 function defaultReadFile(filePath: string): string | null {
@@ -349,4 +411,109 @@ function defaultReadFile(filePath: string): string | null {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Context assembly helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract an acceptance-criteria section from an issue body, or return "".
+ * Looks for a heading matching /acceptance crit/i or /^## ac$/i.
+ */
+export function extractAcceptanceCriteria(body: string): string {
+  const m = body.match(
+    /(?:^|\n)(#{1,3} (?:[Aa]cceptance [Cc]riteria|AC)\b[\s\S]*?)(?=\n#{1,3} |\n---|\n\*{3}|$)/,
+  );
+  return m ? m[1].trim() : "";
+}
+
+/**
+ * Extract the implementation plan + ACs from the issue's comment history.
+ * Returns the first comment whose body starts with "## Implementation Plan".
+ */
+function extractPlanFromComments(
+  comments: { author: string; body: string; createdAt: string }[],
+): string {
+  for (const c of comments) {
+    if (c.body.startsWith("## Implementation Plan")) {
+      return c.body.slice(0, 4000); // cap to avoid oversized prompts
+    }
+  }
+  return "(not available)";
+}
+
+/**
+ * Build a changed-files summary from the PR diff.
+ * Parses `diff --git a/<path> b/<path>` header lines to list changed files.
+ * Falls back gracefully when no PR is linked or the diff fetch fails.
+ */
+async function gatherChangedFiles(
+  cfg: PipelineConfig,
+  prNumber: number | null,
+  getPrDiffFn: typeof defaultGetPrDiff,
+): Promise<string> {
+  if (!prNumber) return "(no PR linked)";
+  try {
+    const diff = await getPrDiffFn(cfg, prNumber);
+    const files: string[] = [];
+    for (const line of diff.split("\n")) {
+      const m = line.match(/^diff --git a\/(.*) b\//);
+      if (m) files.push(m[1]);
+    }
+    return files.length ? files.join("\n") : "(no files changed)";
+  } catch {
+    return "(changed files: see PR diff)";
+  }
+}
+
+/**
+ * Extract an eval summary from the evidence bundle at stateDir.
+ * Returns a short human-readable string or undefined when unavailable.
+ */
+async function gatherEvalSummary(
+  stateDir: string,
+  issueNumber: number,
+  readBundleFn: (stateDir: string, issue: number) => Promise<EvidenceBundle | null>,
+): Promise<string | undefined> {
+  try {
+    const bundle = await readBundleFn(stateDir, issueNumber);
+    if (!bundle) return undefined;
+    const evalStage = bundle.stages.find((s) => s.stage === "eval-gate");
+    if (!evalStage) return undefined;
+    const lastCmd = evalStage.commands[evalStage.commands.length - 1];
+    if (!lastCmd) return undefined;
+    const outcome = lastCmd.exitCode === 0 ? "PASS" : "FAIL";
+    return `eval-gate: ${outcome}\n${lastCmd.outputExcerpt}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Derive OpenSpec spec deltas from the worktree's branch diff.
+ * Returns the delta text or undefined when not applicable.
+ */
+async function gatherOpenspecDeltas(
+  cfg: PipelineConfig,
+  wtPath: string,
+  gitDiffNamesFn: (wtPath: string, base: string) => Promise<string[]>,
+): Promise<string | undefined> {
+  try {
+    const diffPaths = await gitDiffNamesFn(wtPath, cfg.base_branch);
+    const deltas = openspecContextFromDiff(cfg, wtPath, diffPaths);
+    return deltas || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Default git diff --name-only implementation. */
+async function defaultGitDiffNames(wtPath: string, base: string): Promise<string[]> {
+  const result = await defaultGitInWorktree(
+    wtPath,
+    ["diff", "--name-only", `origin/${base}...HEAD`],
+    { ignoreFailure: true },
+  );
+  return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
 }

@@ -27,7 +27,7 @@ function makeCallLog(): CallLog {
   return { transitions: [], silentTransitions: [], blocked: [], comments: [] };
 }
 
-function baseCfg(overrides: Partial<PipelineConfig["eval_gate"]> = {}): PipelineConfig {
+function baseCfg(overrides: Partial<PipelineConfig["eval_gate"]> = {}, shipchecKEnabled = false): PipelineConfig {
   return {
     profile_name: "codex",
     invocation: "$pipeline",
@@ -54,6 +54,17 @@ function baseCfg(overrides: Partial<PipelineConfig["eval_gate"]> = {}): Pipeline
     steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
     test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
     eval_gate: { enabled: true, command: "pnpm evals", mode: "gate", timeout: 300, max_attempts: 1, ...overrides },
+    shipcheck_gate: {
+      enabled: shipchecKEnabled,
+      mode: "advisory",
+      max_rounds: 1,
+      rubric_path: ".github/shipcheck-rubric.md",
+      block_on_partial: false,
+    },
+    review_policy: { block_threshold: "medium", min_confidence: 0.7, max_adversarial_rounds: 3 },
+    doctor: { runOnStart: false, failFast: false },
+    format_gate: [],
+    harness_sandbox: false,
   };
 }
 
@@ -360,4 +371,56 @@ test("eval-gate: each retry attempt recorded separately in evidence bundle (find
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 regression: eval-gate must route to shipcheck-gate when enabled
+// ---------------------------------------------------------------------------
+
+test("eval-gate: pass + shipcheck_gate.enabled:true → transitions to shipcheck-gate not ready-to-deploy", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 }, /* shipchecKEnabled */ true);
+  const deps = makeDeps(log, [passResult("evals passed")]);
+
+  const out = await advanceEval(cfg, 600, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "shipcheck-gate", "must route to shipcheck-gate when enabled");
+  assert.equal(log.blocked.length, 0);
+});
+
+test("eval-gate: advisory fail + shipcheck_gate.enabled:true → transitions to shipcheck-gate", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 }, /* shipchecKEnabled */ true);
+  const deps = makeDeps(log, [failResult("1 eval failed")]);
+
+  const out = await advanceEval(cfg, 601, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "shipcheck-gate", "advisory fail must route to shipcheck-gate when enabled");
+  assert.equal(log.blocked.length, 0);
+});
+
+test("eval-gate: disabled + shipcheck_gate.enabled:true → silent transition to shipcheck-gate", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: false }, /* shipchecKEnabled */ true);
+  const deps = makeDeps(log, []);
+
+  const out = await advanceEval(cfg, 602, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "shipcheck-gate", "disabled eval must route to shipcheck-gate when enabled");
+  assert.equal(log.silentTransitions[0].to, "shipcheck-gate");
+  assert.equal(log.transitions.length, 0);
+});
+
+test("eval-gate: pass + shipcheck_gate.enabled:false → transitions to ready-to-deploy (unchanged behavior)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 }, /* shipchecKEnabled */ false);
+  const deps = makeDeps(log, [passResult("evals passed")]);
+
+  const out = await advanceEval(cfg, 603, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "must route to ready-to-deploy when shipcheck disabled");
 });
