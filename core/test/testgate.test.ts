@@ -282,6 +282,36 @@ test("gate (#173 regression): configured command with && fails when first step f
   assert.equal(out.attempts, 0);
 });
 
+test("gate (#173 regression): shell-backed configured command passes killProcessGroup=true to runTests", async () => {
+  // Shell-wrapped commands spawn descendants (npm, pnpm, test runners). On timeout,
+  // only the shell PID is killed unless killProcessGroup is true. Verify the gate
+  // threads killProcessGroup=true through to runTests when test_gate.command is set.
+  let capturedKillProcessGroup: boolean | undefined;
+  await runTestGate(cfgWith({ command: "true" }), 173, "/wt", {
+    runTests: async (_cwd, _command, _timeout, killProcessGroup) => {
+      capturedKillProcessGroup = killProcessGroup;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(capturedKillProcessGroup, true, "shell-backed command must use killProcessGroup");
+});
+
+test("gate (#173 regression): auto-detected command passes killProcessGroup=false to runTests", async () => {
+  // Auto-detected commands spawn the binary directly (no shell); descendants are
+  // not an issue, so killProcessGroup must remain false.
+  let capturedKillProcessGroup: boolean | undefined;
+  await runTestGate(cfgWith({}), 173, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async (_cwd, _command, _timeout, killProcessGroup) => {
+      capturedKillProcessGroup = killProcessGroup;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(capturedKillProcessGroup, false, "auto-detected command must not use killProcessGroup");
+});
+
 // ---------------------------------------------------------------------------
 // runTestGate — the bounded loop (injected stubs)
 // ---------------------------------------------------------------------------
