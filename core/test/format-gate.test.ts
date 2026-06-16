@@ -28,11 +28,17 @@ function dirty(isDirty: boolean): FormatGateDeps["gitIsDirty"] {
   return async () => isDirty;
 }
 
+/** Returns isDirty values in sequence (last value repeats after exhaustion). */
+function dirtySeq(values: boolean[]): FormatGateDeps["gitIsDirty"] {
+  let i = 0;
+  return async () => values[i < values.length ? i++ : values.length - 1];
+}
+
 function commitTracker(): { commits: string[]; gitCommit: FormatGateDeps["gitCommit"] } {
   const commits: string[] = [];
   return {
     commits,
-    gitCommit: async (_path, message) => { commits.push(message); },
+    gitCommit: async (_path, message) => { commits.push(message); return { ok: true }; },
   };
 }
 
@@ -62,9 +68,10 @@ test("format gate: no-op when format_gate is absent (undefined cast to empty)", 
 test("format gate: auto-fix produces changes, commit created, re-run passes → ok", async () => {
   const tracker = commitTracker();
   // First exec exits 0 (auto-fix ran successfully). Second exec (re-run) exits 0.
+  // dirtySeq: pre-flight call → false (clean), post-command call → true (dirty).
   const result = await runFormatGate("/wt", cfg([{ command: "cargo fmt", auto_fix: true }]), 42, {
     execInWorktree: execSeq([{ code: 0 }, { code: 0 }]),
-    gitIsDirty: dirty(true),
+    gitIsDirty: dirtySeq([false, true]),
     gitCommit: tracker.gitCommit,
   });
   assert.equal(result.status, "ok");
@@ -77,9 +84,10 @@ test("format gate: auto-fix produces changes, commit created, re-run passes → 
 
 test("format gate: auto-fix re-run exits non-zero → blocked", async () => {
   const tracker = commitTracker();
+  // dirtySeq: pre-flight → false (clean), post-command → true (dirty).
   const result = await runFormatGate("/wt", cfg([{ command: "cargo fmt", auto_fix: true }]), 99, {
     execInWorktree: execSeq([{ code: 0 }, { code: 1, combined: "still dirty after fmt" }]),
-    gitIsDirty: dirty(true),
+    gitIsDirty: dirtySeq([false, true]),
     gitCommit: tracker.gitCommit,
   });
   assert.equal(result.status, "blocked");
@@ -205,4 +213,52 @@ test("format gate: auto-fix first run exits non-zero → blocked, no commit", as
   assert.equal(result.status, "blocked");
   assert.ok("reason" in result && result.reason.includes("cargo fmt"));
   assert.equal(tracker.commits.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: pre-existing dirty worktree blocks before any command runs (#182 finding 1)
+// ---------------------------------------------------------------------------
+
+test("format gate: pre-existing dirty worktree blocks before any command runs", async () => {
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    42,
+    {
+      execInWorktree: async () => { throw new Error("should not be called"); },
+      gitIsDirty: dirty(true),
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Regression: auto-format commit failure returns blocked (#182 finding 2)
+// ---------------------------------------------------------------------------
+
+test("format gate: auto-format commit failure → blocked with error", async () => {
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    77,
+    {
+      execInWorktree: exec(0),
+      // pre-flight clean, post-command dirty
+      gitIsDirty: dirtySeq([false, true]),
+      gitCommit: async () => ({ ok: false, error: "git commit failed (exit 1): index locked" }),
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("auto-format commit failed"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+  assert.ok(
+    "reason" in result && result.reason.includes("index locked"),
+    `expected error detail in reason: ${JSON.stringify(result)}`,
+  );
 });

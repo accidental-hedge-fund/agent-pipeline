@@ -19,8 +19,8 @@ export interface FormatGateDeps {
   execInWorktree?: (wtPath: string, cmd: string) => Promise<{ code: number; combined: string }>;
   /** Returns true when the worktree has uncommitted changes. */
   gitIsDirty?: (wtPath: string) => Promise<boolean>;
-  /** Stage all changes and create a commit with the given message. */
-  gitCommit?: (wtPath: string, message: string) => Promise<void>;
+  /** Stage all changes and create a commit with the given message. Returns ok/error. */
+  gitCommit?: (wtPath: string, message: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
 /**
@@ -41,6 +41,18 @@ export async function runFormatGate(
   const isDirty = deps.gitIsDirty ?? defaultGitIsDirty;
   const commitFn = deps.gitCommit ?? defaultGitCommit;
 
+  // Pre-flight: block if the worktree is already dirty before any auto-fix command
+  // runs — we cannot distinguish pre-existing harness leftovers from command output,
+  // so sweeping them into an auto-format commit is incorrect.
+  const hasAutoFix = entries.some((e) => e.auto_fix);
+  if (hasAutoFix && (await isDirty(wtPath))) {
+    return {
+      status: "blocked",
+      reason:
+        "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran",
+    };
+  }
+
   for (const entry of entries) {
     const { command, auto_fix } = entry;
 
@@ -55,7 +67,13 @@ export async function runFormatGate(
       }
       // Commit any changes the command produced, then re-run to verify stability.
       if (await isDirty(wtPath)) {
-        await commitFn(wtPath, `chore: auto-format (#${issueNumber})`);
+        const commitResult = await commitFn(wtPath, `chore: auto-format (#${issueNumber})`);
+        if (!commitResult.ok) {
+          return {
+            status: "blocked",
+            reason: `Format gate auto-format commit failed: ${commitResult.error}`,
+          };
+        }
         const r2 = await exec(wtPath, command);
         if (r2.code !== 0) {
           return {
@@ -109,7 +127,19 @@ async function defaultGitIsDirty(wtPath: string): Promise<boolean> {
   return r.stdout.trim().length > 0;
 }
 
-async function defaultGitCommit(wtPath: string, message: string): Promise<void> {
-  await gitInWorktree(wtPath, ["add", "-A"], { ignoreFailure: true });
-  await gitInWorktree(wtPath, ["commit", "-m", message], { ignoreFailure: true });
+async function defaultGitCommit(
+  wtPath: string,
+  message: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const addResult = await gitInWorktree(wtPath, ["add", "-A"], { ignoreFailure: true });
+  if (addResult.code !== 0) {
+    const detail = (addResult.stderr.trim() || addResult.stdout.trim());
+    return { ok: false, error: `git add -A failed (exit ${addResult.code}): ${detail}` };
+  }
+  const commitResult = await gitInWorktree(wtPath, ["commit", "-m", message], { ignoreFailure: true });
+  if (commitResult.code !== 0) {
+    const detail = (commitResult.stderr.trim() || commitResult.stdout.trim());
+    return { ok: false, error: `git commit failed (exit ${commitResult.code}): ${detail}` };
+  }
+  return { ok: true };
 }

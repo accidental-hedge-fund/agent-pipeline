@@ -30,6 +30,8 @@
 - [ ] 5.5 Test: check-only path — exits 0 → success
 - [ ] 5.6 Test: check-only path — exits non-zero → `{ status: "blocked", reason: ... }`
 - [ ] 5.7 Test: multiple entries run in order, second entry failure blocks even after first passes
+- [ ] 5.8 Test: pre-existing dirty worktree blocks before any command runs (regression for finding 1)
+- [ ] 5.9 Test: auto-format commit failure returns blocked with error detail (regression for finding 2)
 
 ## 6. This Repo's Pipeline Config
 
