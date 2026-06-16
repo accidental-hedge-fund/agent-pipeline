@@ -257,6 +257,104 @@ test("runTests: failing command → passed false with output", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Shell-operator regression tests (#173): configured command runs via sh -c
+// ---------------------------------------------------------------------------
+
+test("gate (#173 regression): configured command with && passes when both steps succeed", async () => {
+  // Proves `&&` is interpreted by the shell, not passed as a literal arg to the
+  // first program. Uses real process spawn (no runTests stub).
+  const out = await runTestGate(cfgWith({ command: "true && true" }), 173, tmpRoot, {
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 0);
+});
+
+test("gate (#173 regression): configured command with && fails when first step fails", async () => {
+  // Proves shell short-circuit: false exits non-zero, && stops, gate reports failure.
+  const out = await runTestGate(
+    cfgWith({ command: "false && true", max_attempts: 0 }),
+    173,
+    tmpRoot,
+    { ...cleanGitDeps() },
+  );
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+});
+
+test("gate (#173 regression): shell-backed configured command passes killProcessGroup=true to runTests", async () => {
+  // Shell-wrapped commands spawn descendants (npm, pnpm, test runners). On timeout,
+  // only the shell PID is killed unless killProcessGroup is true. Verify the gate
+  // threads killProcessGroup=true through to runTests when test_gate.command is set.
+  let capturedKillProcessGroup: boolean | undefined;
+  await runTestGate(cfgWith({ command: "true" }), 173, "/wt", {
+    runTests: async (_cwd, _command, _timeout, killProcessGroup) => {
+      capturedKillProcessGroup = killProcessGroup;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(capturedKillProcessGroup, true, "shell-backed command must use killProcessGroup");
+});
+
+test("gate (#173 regression): auto-detected command passes killProcessGroup=false to runTests", async () => {
+  // Auto-detected commands spawn the binary directly (no shell); descendants are
+  // not an issue, so killProcessGroup must remain false.
+  let capturedKillProcessGroup: boolean | undefined;
+  await runTestGate(cfgWith({}), 173, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async (_cwd, _command, _timeout, killProcessGroup) => {
+      capturedKillProcessGroup = killProcessGroup;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(capturedKillProcessGroup, false, "auto-detected command must not use killProcessGroup");
+});
+
+test("gate (#173 regression): whitespace-only configured command blocks immediately, never runs sh -c", async () => {
+  // Regression for review-2 finding: `sh -c "   "` exits 0 (empty shell script).
+  // A whitespace-only command must be caught before spawn and block the gate.
+  let ran = false;
+  const out = await runTestGate(cfgWith({ command: "   " }), 173, "/wt", {
+    runTests: async () => {
+      ran = true;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(ran, false, "runTests must not be called for whitespace-only command");
+  assert.equal(out.skipped, false);
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.match(out.blockReason ?? "", /empty or whitespace-only/);
+});
+
+test("gate (#173 regression): empty-string configured command blocks immediately, never falls back to auto-detect", async () => {
+  // Regression for review-2 finding: `command: ""` is an explicit misconfiguration;
+  // it must block rather than silently fall back to auto-detection with an empty label.
+  let detectCalled = false;
+  let ran = false;
+  const out = await runTestGate(cfgWith({ command: "" }), 173, "/wt", {
+    detectTestCommand: () => {
+      detectCalled = true;
+      return { cmd: "npm", args: ["test"] };
+    },
+    runTests: async () => {
+      ran = true;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(detectCalled, false, "auto-detection must not run for explicitly-set empty command");
+  assert.equal(ran, false, "runTests must not be called for empty command");
+  assert.equal(out.skipped, false);
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.match(out.blockReason ?? "", /empty or whitespace-only/);
+});
+
+// ---------------------------------------------------------------------------
 // runTestGate — the bounded loop (injected stubs)
 // ---------------------------------------------------------------------------
 
@@ -511,8 +609,8 @@ test("gate (regression / #48, CI parity): explicit CI command fails on second st
     invoke: async () => okInvoke(),
     ...cleanGitDeps(),
   });
-  // Gate must use the configured command (not auto-detect)
-  assert.deepEqual(seenCommand, { cmd: "npm", args: ["run", "ci"] });
+  // Gate must use the configured command wrapped in sh -c (not auto-detect, not tokenized)
+  assert.deepEqual(seenCommand, { cmd: "sh", args: ["-c", "npm run ci"] });
   // Gate blocks: full CI command failed
   assert.equal(out.passed, false);
   assert.match(out.blockReason ?? "", /plugin mirror/i);
@@ -533,7 +631,7 @@ test("gate: explicit command override bypasses detection", async () => {
     ...cleanGitDeps(),
   });
   assert.equal(detectCalled, false);
-  assert.deepEqual(seen, { cmd: "pnpm", args: ["run", "test:ci"] });
+  assert.deepEqual(seen, { cmd: "sh", args: ["-c", "pnpm run test:ci"] });
   assert.equal(out.passed, true);
 });
 

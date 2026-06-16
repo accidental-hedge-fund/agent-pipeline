@@ -335,7 +335,7 @@ When `test_gate.enabled` (the default), the target repo's **own** test/build com
 
 The command is **auto-detected** (first match wins):
 
-1. Explicit `test_gate.command` override (parsed without a shell)
+1. Explicit `test_gate.command` override (run through `sh -c` so POSIX shell operators like `&&`, `||`, `;`, and `|` work)
 2. `package.json` — a real `test` script (npm placeholder/`echo` stubs skipped), else a `build:check` / `typecheck` / `type-check` / `build` script; the package manager follows the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm)
 3. `go.mod` → `go test ./...`
 4. `Cargo.toml` → `cargo test`
@@ -366,7 +366,7 @@ test_gate:
 }
 ```
 
-`test_gate.command` is parsed **without a shell** (whitespace-tokenized, then spawned directly). Compound operators like `&&` must live inside the script body (where npm/shell handles them), not raw in the config value.
+`test_gate.command` is run through a POSIX shell (`sh -c`), so compound operators like `&&` work directly in the config value. Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
 
 ## Troubleshooting
 
