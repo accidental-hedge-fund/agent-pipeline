@@ -368,3 +368,56 @@ test("timeout(#174-f2): setup_command timeout → throws naming the command and 
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// Output truncation (#174 finding 4): verbose install failures must not produce
+// blocker comments that exceed GitHub's body limit. detectAndInstall truncates
+// large combined output so setBlocked receives a comment-safe string.
+// ---------------------------------------------------------------------------
+
+test("truncation(#174-f4): pnpm install with large output → error message truncated to ~8 KB", async () => {
+  // Generate output well above the 8 KB cap (100 KB each stream).
+  const bigOutput = "x".repeat(100_000);
+  const deps = spawnResult(["/wt/pnpm-lock.yaml"], 1, bigOutput, bigOutput);
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg(undefined), deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("pnpm install"), `must name command: ${err.message.slice(0, 100)}`);
+      // The combined output after truncation must not dominate the message length.
+      // 8 KB cap + truncation marker + header lines ≤ ~9 KB.
+      assert.ok(err.message.length < 9_500, `message too long: ${err.message.length} bytes`);
+      assert.ok(err.message.includes("[…output truncated]"), "must contain truncation marker");
+      return true;
+    },
+  );
+});
+
+test("truncation(#174-f4): setup_command with large output → error message truncated to ~8 KB", async () => {
+  const bigOutput = "y".repeat(100_000);
+  const deps: SetupDeps = {
+    existsSync: () => false,
+    spawnCommand: async () => ({ code: 1, stdout: bigOutput, stderr: bigOutput }),
+  };
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg("my-install-script"), deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("setup_command"), `must mention setup_command: ${err.message.slice(0, 100)}`);
+      assert.ok(err.message.length < 9_500, `message too long: ${err.message.length} bytes`);
+      assert.ok(err.message.includes("[…output truncated]"), "must contain truncation marker");
+      return true;
+    },
+  );
+});
+
+test("truncation(#174-f4): small output is not truncated", async () => {
+  const smallOutput = "ERR_PNPM_PEER_DEP_ISSUES: peer deps conflict";
+  const deps = spawnResult(["/wt/pnpm-lock.yaml"], 1, "", smallOutput);
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg(undefined), deps),
+    (err: Error) => {
+      assert.ok(!err.message.includes("[…output truncated]"), "small output must not be truncated");
+      assert.ok(err.message.includes(smallOutput), "small output must appear verbatim");
+      return true;
+    },
+  );
+});

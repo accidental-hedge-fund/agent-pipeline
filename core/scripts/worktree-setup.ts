@@ -51,6 +51,15 @@ const MAX_CAPTURED = 100_000;
 // Wall-clock cap for a single install/setup run. A hung `pnpm install` would
 // otherwise hold the pipeline process and lock alive indefinitely.
 const SETUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+// Maximum output included in a thrown error message. GitHub comments have a
+// ~65 KB body limit; 8 KB keeps the blocker comment well within bounds
+// while still giving operators enough context to diagnose the failure.
+const MAX_ERROR_OUTPUT = 8_000;
+
+function truncateOutput(s: string): string {
+  if (s.length <= MAX_ERROR_OUTPUT) return s;
+  return s.slice(0, MAX_ERROR_OUTPUT) + "\n\n[…output truncated]";
+}
 
 async function defaultSpawnCommand(
   cmd: string,
@@ -59,28 +68,47 @@ async function defaultSpawnCommand(
   useShell: boolean,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
+    // detached: true puts the child in its own process group so that a timeout
+    // can kill the entire tree (shell + subprocesses) via process.kill(-pgid).
     const child = useShell
-      ? spawn(cmd, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] })
-      : spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+      ? spawn(cmd, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"], detached: true })
+      : spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
 
     let stdoutBuf = "";
     let stderrBuf = "";
     let done = false;
+    let timedOut = false;
 
     const label = useShell ? cmd : [cmd, ...args].join(" ");
 
-    const timer = setTimeout(() => {
+    // Hard deadline: fires after SIGTERM + 2 s SIGKILL grace, giving the
+    // process group ~7 s total to exit before we give up waiting for close.
+    const hardDeadlineMs = SETUP_TIMEOUT_MS + 7_000;
+    const hardDeadlineTimer = setTimeout(() => {
       if (done) return;
       done = true;
-      try { child.kill("SIGTERM"); } catch { /* already gone */ }
-      // Escalate to SIGKILL if the process hasn't exited after a short grace period.
-      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 2000);
+      clearTimeout(timer);
       const timeoutMsg = `[setup-timeout: \`${label}\` did not complete within ${SETUP_TIMEOUT_MS / 1000}s]`;
       resolve({
         code: -1,
         stdout: stdoutBuf,
         stderr: [stderrBuf, timeoutMsg].map((s) => s.trim()).filter(Boolean).join("\n"),
       });
+    }, hardDeadlineMs);
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      timedOut = true;
+      // Kill the entire process group so subprocesses spawned by a shell
+      // setup_command don't outlive the timeout and race against retries.
+      try { if (child.pid !== undefined) process.kill(-child.pid, "SIGTERM"); } catch { /* already gone */ }
+      setTimeout(() => {
+        if (!done) {
+          try { if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL"); } catch { /* ignore */ }
+        }
+      }, 2_000);
+      // Do NOT resolve here — let the close event resolve after the process
+      // group exits. The hard deadline above is the fallback if close never fires.
     }, SETUP_TIMEOUT_MS);
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -97,13 +125,24 @@ async function defaultSpawnCommand(
       if (done) return;
       done = true;
       clearTimeout(timer);
+      clearTimeout(hardDeadlineTimer);
       resolve({ code: -1, stdout: stdoutBuf, stderr: `spawn error: ${err.message}\n${stderrBuf}` });
     });
     child.on("close", (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout: stdoutBuf, stderr: stderrBuf });
+      clearTimeout(hardDeadlineTimer);
+      if (timedOut) {
+        const timeoutMsg = `[setup-timeout: \`${label}\` did not complete within ${SETUP_TIMEOUT_MS / 1000}s]`;
+        resolve({
+          code: -1,
+          stdout: stdoutBuf,
+          stderr: [stderrBuf, timeoutMsg].map((s) => s.trim()).filter(Boolean).join("\n"),
+        });
+      } else {
+        resolve({ code: code ?? -1, stdout: stdoutBuf, stderr: stderrBuf });
+      }
     });
   });
 }
@@ -147,7 +186,7 @@ export async function detectAndInstall(
       const combined = [res.stdout, res.stderr].map((s) => s.trim()).filter(Boolean).join("\n");
       throw new Error(
         `setup_command exited with code ${res.code}\nCommand: ${label}` +
-          (combined ? `\nOutput:\n${combined}` : ""),
+          (combined ? `\nOutput:\n${truncateOutput(combined)}` : ""),
       );
     }
     return { skipped: false, command: label, stdout: res.stdout, stderr: res.stderr };
@@ -171,7 +210,7 @@ export async function detectAndInstall(
     const combined = [res.stdout, res.stderr].map((s) => s.trim()).filter(Boolean).join("\n");
     throw new Error(
       `\`${label}\` exited with code ${res.code}` +
-        (combined ? `\nOutput:\n${combined}` : ""),
+        (combined ? `\nOutput:\n${truncateOutput(combined)}` : ""),
     );
   }
   return { skipped: false, command: label, stdout: res.stdout, stderr: res.stderr };
