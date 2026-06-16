@@ -2,9 +2,7 @@
 
 ## Purpose
 The opt-in OpenSpec flow: auto-detect a repo's `openspec/` workspace, plan spec-first (author a change — proposal, tasks, spec deltas — instead of a freeform plan), validate it structurally, and at finalize archive the change into the living specs. The integration must leave the freeform (non-OpenSpec) path unchanged on repos that don't use it. (Propagation of spec deltas into the planning/implement/fix/review prompts is refined by `openspec-context-propagation`; the standalone `init` command is `init-command`.)
-
 ## Requirements
-
 ### Requirement: Activation is auto-detected and overridable
 Whether the OpenSpec flow runs SHALL be governed by `cfg.openspec.enabled` (`auto` | `on` | `off`): `on` always active, `off` never, `auto` active only when an `openspec/` workspace exists (`isInitialized`). `shouldPlanWithOpenspec` and `isActive` encode this.
 
@@ -51,3 +49,31 @@ When the flow is active on a repo lacking an `openspec/` workspace, planning SHA
 #### Scenario: missing workspace without bootstrap
 - **WHEN** `openspec.enabled` is `on`, the repo has no `openspec/`, and `bootstrap` is `false`
 - **THEN** the stage SHALL block with guidance to enable bootstrap or run `openspec init`
+
+### Requirement: Archive step is idempotent across polling iterations
+
+The pre-merge archive step SHALL compute the current active OpenSpec candidates from the branch diff before consulting commit history. If no active change directories remain in the diff, the archive step SHALL be skipped and the gate SHALL proceed to the next check without pushing a new commit or returning `waiting`. If active candidates exist, the gate SHALL invoke `openspec archive` regardless of whether a prior archive commit is found in the branch history.
+
+#### Scenario: no active candidates — step skipped
+
+- **WHEN** `maybeArchiveOpenspec` is called
+- **AND** the branch diff contains no active change directories (either already archived and removed, or none ever existed)
+- **THEN** the gate SHALL skip `openspec archive` entirely
+- **AND** SHALL NOT push a new archive commit
+- **AND** SHALL return `null` (continue to the next pre-merge check)
+
+#### Scenario: prior archive commit exists but active candidates remain — re-archive
+
+- **WHEN** `maybeArchiveOpenspec` is called
+- **AND** the branch diff contains one or more active change directories
+- **AND** a prior archive commit for this issue exists in the branch history (e.g., a revert re-introduced a change)
+- **THEN** the gate SHALL invoke `openspec archive` for each active candidate
+- **AND** SHALL NOT skip based on the prior archive commit alone
+
+#### Scenario: no prior archive commit — archive proceeds normally
+
+- **WHEN** `maybeArchiveOpenspec` is called
+- **AND** no archive commit for this issue exists in the branch commit history
+- **AND** active change directories are found in the diff
+- **THEN** the gate SHALL invoke `openspec archive` for each active change as before
+
