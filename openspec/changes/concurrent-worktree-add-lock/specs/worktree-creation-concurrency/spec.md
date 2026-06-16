@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Concurrent worktree creation is serialized by a per-repo mutex
-`createWorktree` SHALL acquire a cross-process per-repo mutex at `/tmp/pipeline-wt-<hash>.lock` (where `<hash>` is an 8-character hex prefix of the SHA-1 of `cfg.repo_dir`) before invoking `git worktree add`, and SHALL release it immediately after the subprocess completes. If the mutex file exists and its recorded PID is dead or invalid, the mutex SHALL be treated as stale, removed, and re-acquired without error.
+`createWorktree` SHALL acquire a cross-process per-repo mutex at `/tmp/pipeline-wt-<hash>.lock` (where `<hash>` is an 8-character hex prefix of the SHA-1 of the canonical Git common directory, resolved via `git -C cfg.repo_dir rev-parse --path-format=absolute --git-common-dir`) before invoking `git worktree add`, and SHALL release it immediately after the subprocess completes. Using the common directory (rather than `cfg.repo_dir`) ensures that two pipeline runs started from different linked worktrees of the same repository share the same mutex file. If the mutex file exists and its recorded PID is dead or invalid, the mutex SHALL be treated as stale, removed, and re-acquired without error. The stale-reclaim sequence (read PID, unlink, re-acquire) SHALL be serialized by a short-lived reclaimer lock (`<mutex-path>.reclaim`) so that two concurrent reclaimers cannot both unlink and race to reacquire.
 
 #### Scenario: two concurrent calls serialize
 - **WHEN** two pipeline runs call `createWorktree` for different issues at the same moment
@@ -32,7 +32,7 @@ When `git worktree add` exits non-zero and the stderr output contains `"could no
 - **THEN** `createWorktree` SHALL throw immediately without retrying
 
 ### Requirement: Mutex and retry logic are injectable for testing
-The mutex acquire, mutex release, and sleep functions used in `createWorktree` SHALL be injectable via the existing `CreateWorktreeDeps` interface so that unit tests can simulate lock contention, stale files, and retry sequencing without spawning real processes or waiting on real timers.
+The mutex acquire, mutex release, sleep, and Git common directory resolution functions used in `createWorktree` SHALL be injectable via the existing `CreateWorktreeDeps` interface so that unit tests can simulate lock contention, stale files, and retry sequencing without spawning real processes or waiting on real timers.
 
 #### Scenario: unit test simulates retry success
 - **WHEN** injected deps make the first `gitCmd` return a `.git/config.lock` error and the second return success

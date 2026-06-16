@@ -37,14 +37,29 @@ export function slugify(text: string): string {
 // SHA-1 prefix of the repo path — unique per repo, stable across processes.
 // ---------------------------------------------------------------------------
 
-/** 8-char hex prefix of SHA-1 of the repo directory path. Unique per repo. */
-export function repoHash(repoDir: string): string {
-  return createHash("sha1").update(repoDir).digest("hex").slice(0, 8);
+/** 8-char hex prefix of SHA-1 of the given path. Used to namespace mutex files. */
+export function repoHash(dir: string): string {
+  return createHash("sha1").update(dir).digest("hex").slice(0, 8);
 }
 
-/** Mutex lock file path for worktree creation in the given repo. */
-export function worktreeMutexPath(cfg: PipelineConfig): string {
-  return `/tmp/pipeline-wt-${repoHash(cfg.repo_dir)}.lock`;
+/** Mutex lock file path for worktree creation, keyed on the canonical Git
+ *  common directory so that two linked worktrees of the same repo share the
+ *  same mutex even when their `repo_dir` paths differ. */
+export function worktreeMutexPath(commonDir: string): string {
+  return `/tmp/pipeline-wt-${repoHash(commonDir)}.lock`;
+}
+
+/** Resolve the canonical Git common directory (shared across all linked
+ *  worktrees).  This is the directory that owns `.git/config`, so two runs
+ *  starting from different linked worktrees of the same repo return the same
+ *  path and thus the same mutex file. */
+async function realResolveGitCommonDir(repoDir: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", repoDir, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { timeout: 5_000 },
+  );
+  return stdout.trim();
 }
 
 /** Injectable deps for acquireWorktreeMutex — allows unit tests to bypass
@@ -143,16 +158,41 @@ export function acquireWorktreeMutex(
   }
 
   if (!isPidAlive(holderPid)) {
-    // Dead process — re-verify content before unlinking.  Two concurrent
-    // reclaimers can both read the same dead PID; if the first already
-    // removed and reacquired, the second's unlink would delete the fresh
-    // lock.  Re-reading closes most of that window: if content changed,
-    // restart rather than blindly unlinking.
-    const current = readContent(mutexPath);
-    if (current !== content) {
+    // Dead process — serialize the reclaim sequence with a short-lived
+    // reclaimer lock.  Without it, two concurrent reclaimers can both read
+    // the same dead PID, both pass the re-verify, and both call unlink: the
+    // second's unlink deletes the first's freshly-acquired main lock.
+    // By holding the reclaimer lock for the entire read/unlink/reacquire
+    // sequence, only one process can reclaim at a time.  The second reclaimer
+    // sees the reacquired main lock (live PID) after it gets the reclaimer
+    // lock and falls through to the normal live-holder wait.
+    const reclaimPath = mutexPath + ".reclaim";
+    const reclaimCreated = atomicCreate(reclaimPath, String(currentPid()));
+    if (!reclaimCreated) {
+      // Another reclaimer holds the reclaim lock.
+      const reclaimContent = readContent(reclaimPath);
+      if (reclaimContent !== null) {
+        const reclaimPid = Number.parseInt(reclaimContent, 10);
+        if (Number.isFinite(reclaimPid) && reclaimPid > 0 && isPidAlive(reclaimPid)) {
+          // Live reclaimer in progress — restart and let it finish.
+          return acquireWorktreeMutex(mutexPath, deps);
+        }
+      }
+      // Stale or unreadable reclaim lock — remove and restart from scratch.
+      unlink(reclaimPath);
       return acquireWorktreeMutex(mutexPath, deps);
     }
-    unlink(mutexPath);
+    try {
+      // Re-verify content while holding the reclaimer lock.  If another
+      // reclaimer already won the race and reacquired, restart.
+      const current = readContent(mutexPath);
+      if (current !== content) {
+        return acquireWorktreeMutex(mutexPath, deps);
+      }
+      unlink(mutexPath);
+    } finally {
+      unlink(reclaimPath);
+    }
     return acquireWorktreeMutex(mutexPath, deps);
   }
 
@@ -315,6 +355,10 @@ export interface CreateWorktreeDeps {
     args: string[],
     opts?: { ignoreFailure?: boolean; timeoutMs?: number },
   ) => Promise<{ stdout: string; stderr: string; code: number }>;
+  /** Resolve the canonical Git common directory shared by all linked worktrees.
+   *  Two runs from different linked worktrees of the same repo must return the
+   *  same path so they share the same per-repo mutex file. */
+  resolveGitCommonDir?: (repoDir: string) => Promise<string>;
   /** Acquire the per-repo worktree-creation mutex; throws if a live process holds it. */
   acquireMutex?: (path: string) => void;
   /** Release the per-repo worktree-creation mutex. */
@@ -334,6 +378,7 @@ export async function createWorktree(
   const listActiveFn = deps.listActive ?? listActive;
   const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
   const gitFn = deps.gitCmd ?? git;
+  const resolveGitCommonDirFn = deps.resolveGitCommonDir ?? realResolveGitCommonDir;
   const acquireMutexFn = deps.acquireMutex ?? ((p: string) => acquireWorktreeMutex(p));
   const releaseMutexFn = deps.releaseMutex ?? releaseWorktreeMutex;
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -392,11 +437,17 @@ export async function createWorktree(
   // so it never blocks unrelated pipeline work. A retry loop handles transient
   // .git/config.lock contention (belt-and-suspenders for cases the mutex
   // cannot prevent, e.g. a stale lock left by a crashed git process).
-  const mutexPath = worktreeMutexPath(cfg);
+  //
+  // The mutex is keyed on the canonical Git common directory (not cfg.repo_dir)
+  // so two runs from different linked worktrees of the same repo share one
+  // mutex even though their cfg.repo_dir paths differ.
+  const commonDir = await resolveGitCommonDirFn(cfg.repo_dir);
+  const mutexPath = worktreeMutexPath(commonDir);
 
-  // Wait up to 30 s for a live holder to finish before giving up.
+  // Wait up to 90 s (the git subprocess timeout of 60 s plus 30 s margin)
+  // so a live holder that is mid-git-worktree-add cannot outlast the wait.
   const MUTEX_POLL_MS = 200;
-  const MUTEX_TIMEOUT_MS = 30_000;
+  const MUTEX_TIMEOUT_MS = 90_000;
   let mutexWaited = 0;
   for (;;) {
     try {
@@ -413,11 +464,12 @@ export async function createWorktree(
   }
 
   try {
-    const MAX_RETRIES = 3;
+    // 1 initial attempt + 3 retries = 4 total, matching the spec.
+    const MAX_ATTEMPTS = 4;
     let lastStderr = "";
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       if (attempt > 0) {
-        await sleepFn(200 * 2 ** (attempt - 1)); // 200ms, 400ms
+        await sleepFn(200 * 2 ** (attempt - 1)); // 200ms, 400ms, 800ms
         // A failed `git worktree add -b <branch>` creates the branch before
         // it tries to write the config, so a config-lock failure leaves a
         // dangling branch.  Delete it before retrying so `-b <branch>` does

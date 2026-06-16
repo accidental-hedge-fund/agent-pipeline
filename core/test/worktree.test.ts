@@ -347,10 +347,12 @@ function makeCreateCfg(): PipelineConfig {
 
 // No-op mutex/sleep deps shared by createWorktree unit tests that don't
 // exercise the mutex or retry logic (avoids real fs lock files in CI).
-const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep"> = {
+const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep" | "resolveGitCommonDir"> = {
   acquireMutex: (_p) => {},
   releaseMutex: (_p) => {},
   sleep: async (_ms) => {},
+  // Identity: no real git call; all tests use a fake cfg.repo_dir anyway.
+  resolveGitCommonDir: async (repoDir) => repoDir,
 };
 
 test("createWorktree: this issue's stale worktree is reclaimed before the capacity check", async () => {
@@ -475,19 +477,26 @@ test("acquireWorktreeMutex: clean path → writes current PID and returns", () =
 });
 
 test("acquireWorktreeMutex: stale file (dead PID) → reclaimed and acquired", () => {
-  let unlinked = false;
+  let mainUnlinked = false;
   let createCount = 0;
   acquireWorktreeMutex("/tmp/test-wt.lock", makeMutexDeps({
-    atomicCreate: (_p, _c) => {
+    atomicCreate: (p, _c) => {
       createCount++;
-      return createCount === 1 ? false : true; // first: EEXIST, second: acquired
+      if (p.endsWith(".reclaim")) return true; // reclaim lock acquired
+      // Main lock: first EEXIST, third acquired after reclaim.
+      return createCount >= 3;
     },
-    readContent: (_p) => "99999",
-    unlink: (_p) => { unlinked = true; },
+    readContent: (p) => {
+      if (p.endsWith(".reclaim")) return null;
+      return "99999";
+    },
+    unlink: (p) => {
+      if (!p.endsWith(".reclaim")) mainUnlinked = true;
+    },
     isPidAlive: (_pid) => false, // dead process
   }));
-  assert.ok(unlinked, "stale lock file must be removed");
-  assert.equal(createCount, 2, "must re-try acquisition after reclaim");
+  assert.ok(mainUnlinked, "stale main lock file must be removed");
+  assert.equal(createCount, 3, "must attempt: main(fail), reclaim(acquire), main(acquire after reclaim)");
 });
 
 test("acquireWorktreeMutex: live PID → throws", () => {
@@ -541,9 +550,7 @@ test("createWorktree: first git worktree add fails with config.lock, second succ
       }
       return { code: 0, stdout: "", stderr: "" };
     },
-    acquireMutex: (_p) => {},
-    releaseMutex: (_p) => {},
-    sleep: async (_ms) => {},
+    ...noopMutexDeps,
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -551,7 +558,7 @@ test("createWorktree: first git worktree add fails with config.lock, second succ
   assert.ok(result.path.includes("pipeline-42-slug"));
 });
 
-test("createWorktree: all 3 git worktree add attempts fail with config.lock → throws with final stderr", async () => {
+test("createWorktree: all 4 git worktree add attempts fail with config.lock → throws with final stderr", async () => {
   const cfg = makeCreateCfg();
   let worktreeAddCalls = 0;
 
@@ -567,16 +574,14 @@ test("createWorktree: all 3 git worktree add attempts fail with config.lock → 
       }
       return { code: 0, stdout: "", stderr: "" };
     },
-    acquireMutex: (_p) => {},
-    releaseMutex: (_p) => {},
-    sleep: async (_ms) => {},
+    ...noopMutexDeps,
   };
 
   await assert.rejects(
     () => createWorktree(cfg, 42, "slug", deps),
     /git worktree add failed/,
   );
-  assert.equal(worktreeAddCalls, 3, "must attempt exactly 3 times before giving up");
+  assert.equal(worktreeAddCalls, 4, "must attempt 4 times (1 initial + 3 retries) before giving up");
 });
 
 test("createWorktree: non-lock git error → throws immediately without retrying", async () => {
@@ -595,9 +600,7 @@ test("createWorktree: non-lock git error → throws immediately without retrying
       }
       return { code: 0, stdout: "", stderr: "" };
     },
-    acquireMutex: (_p) => {},
-    releaseMutex: (_p) => {},
-    sleep: async (_ms) => {},
+    ...noopMutexDeps,
   };
 
   await assert.rejects(
@@ -643,9 +646,7 @@ test("createWorktree: dangling branch from config-lock failure is deleted before
       }
       return { code: 0, stdout: "", stderr: "" };
     },
-    acquireMutex: (_p) => {},
-    releaseMutex: (_p) => {},
-    sleep: async (_ms) => {},
+    ...noopMutexDeps,
   };
 
   await createWorktree(cfg, 42, "slug", deps);
@@ -684,12 +685,8 @@ test("createWorktree: waits for live mutex holder to release before proceeding",
     existsSync: () => false,
     removeWorktree: async () => {},
     mkdirSync: () => {},
-    gitCmd: async (_cfg, _cwd, args) => {
-      if (args[0] === "worktree" && args[1] === "add") {
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    },
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    resolveGitCommonDir: async (d) => d,
     acquireMutex: (_p) => {
       acquireAttempts++;
       if (acquireAttempts === 1) {
@@ -719,6 +716,7 @@ test("createWorktree: non-mutex errors during acquire are not retried", async ()
     removeWorktree: async () => {},
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    resolveGitCommonDir: async (d) => d,
     acquireMutex: (_p) => { throw new Error("EACCES: permission denied"); },
     releaseMutex: (_p) => {},
     sleep: async (_ms) => {},
@@ -740,33 +738,41 @@ test("createWorktree: non-mutex errors during acquire are not retried", async ()
 // of unlinking.
 // ---------------------------------------------------------------------------
 
-test("acquireWorktreeMutex: does not unlink when content changed before unlink (concurrent stale reclaim guard)", () => {
-  let unlinked = false;
+test("acquireWorktreeMutex: does not unlink main lock when content changed before unlink (concurrent stale reclaim guard)", () => {
+  let mainUnlinked = false;
+  let reclaimUnlinked = false;
   let readCount = 0;
   let createCount = 0;
 
-  // Simulates: two processes both see the dead PID "1234".  Before this
-  // process can unlink, the other already removed and reacquired (content
-  // changed to "9999").  The guard must skip the unlink and restart.
+  // Simulates: two processes both see the dead PID "1234".  This process
+  // acquires the reclaimer lock, then re-reads the main lock content — it has
+  // changed to "9999" (another process already won the race and reacquired).
+  // The guard must restart without unlinking the main lock.
   acquireWorktreeMutex("/tmp/test-wt.lock", {
-    atomicCreate: (_p, _c) => {
+    atomicCreate: (p, _c) => {
       createCount++;
-      // First: EEXIST (dead-PID lock). Second: acquired cleanly after restart.
-      return createCount >= 2;
+      if (p.endsWith(".reclaim")) return true; // reclaim lock acquired
+      // Main lock: first EEXIST (dead-PID lock), third acquired after restart.
+      return createCount >= 3;
     },
-    readContent: (_p) => {
+    readContent: (p) => {
       readCount++;
+      if (p.endsWith(".reclaim")) return null; // not called in this path
       if (readCount === 1) return "1234"; // initial read: dead PID
-      if (readCount === 2) return "9999"; // guard re-read: content changed
+      if (readCount === 2) return "9999"; // re-verify inside reclaim lock: content changed
       return null;
     },
-    unlink: (_p) => { unlinked = true; },
+    unlink: (p) => {
+      if (p.endsWith(".reclaim")) reclaimUnlinked = true;
+      else mainUnlinked = true;
+    },
     isPidAlive: (pid) => pid !== 1234,
     currentPid: () => 42,
   });
 
-  assert.equal(unlinked, false, "must not unlink when content changed — prevents removing a freshly acquired lock");
-  assert.equal(createCount, 2, "must retry atomicCreate after content-changed restart");
+  assert.equal(mainUnlinked, false, "must not unlink main lock when content changed — prevents removing a freshly acquired lock");
+  assert.ok(reclaimUnlinked, "reclaim lock must be released in finally even when content changed");
+  assert.equal(createCount, 3, "must retry atomicCreate on main lock after content-changed restart");
 });
 
 // ---------------------------------------------------------------------------
@@ -789,6 +795,7 @@ test("createWorktree: mutex acquired before git worktree add, released after eve
       }
       return { code: 0, stdout: "", stderr: "" };
     },
+    resolveGitCommonDir: async (d) => d,
     acquireMutex: (_p) => { events.push("acquire"); },
     releaseMutex: (_p) => { events.push("release"); },
     sleep: async (_ms) => {},
@@ -799,5 +806,141 @@ test("createWorktree: mutex acquired before git worktree add, released after eve
     events,
     ["acquire", "git", "release"],
     "mutex must be acquired before git call and released in finally",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 (#183 review 2): mutex key must use git common dir, not repo_dir
+//
+// Regression: two linked worktrees of the same repo have different repo_dir
+// paths but share a single .git/config (via the common dir).  Keying the
+// mutex on repo_dir would produce different lock files, leaving the config.lock
+// race intact.  Both runs must resolve to the same mutex path.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: two runs from different linked worktrees of the same repo use the same mutex path", async () => {
+  // Simulate two pipeline instances: one started from the repo root, one from
+  // a linked worktree (different repo_dir, same underlying .git directory).
+  const cfg1 = { ...makeCreateCfg(), repo_dir: "/repo" };
+  const cfg2 = { ...makeCreateCfg(), repo_dir: "/repo/.worktrees/pipeline-999-other" };
+
+  const capturedMutexPaths: string[] = [];
+
+  const makeDeps = (): CreateWorktreeDeps => ({
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    // Both worktrees share the same common dir regardless of their repo_dir.
+    resolveGitCommonDir: async (_repoDir) => "/repo/.git",
+    acquireMutex: (p) => { capturedMutexPaths.push(p); },
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => {},
+  });
+
+  await createWorktree(cfg1, 1, "issue-one", makeDeps());
+  await createWorktree(cfg2, 2, "issue-two", makeDeps());
+
+  assert.equal(capturedMutexPaths.length, 2, "each call must acquire the mutex once");
+  assert.equal(
+    capturedMutexPaths[0],
+    capturedMutexPaths[1],
+    "two runs from different linked worktrees must acquire the same per-repo mutex",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 (#183 review 2): mutex wait timeout must cover the git subprocess
+//
+// Regression: MUTEX_TIMEOUT_MS was 30 s but the git subprocess can run up to
+// 60 s.  A holder mid-checkout would cause the waiter to give up too early.
+// The timeout must be at least 90 s (60 s git timeout + 30 s margin).
+// ---------------------------------------------------------------------------
+
+test("createWorktree: mutex wait succeeds after more than 30s of simulated waiting (timeout is ≥ 90s)", async () => {
+  const cfg = makeCreateCfg();
+  let acquireAttempts = 0;
+  let totalSleepMs = 0;
+
+  // 151 failed attempts × 200ms poll = 30,200ms simulated time.
+  // The old 30,000ms timeout would fire before attempt 152.
+  const FAIL_COUNT = 151;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    resolveGitCommonDir: async (d) => d,
+    acquireMutex: (_p) => {
+      acquireAttempts++;
+      if (acquireAttempts <= FAIL_COUNT) {
+        throw new Error(
+          "Worktree mutex held by process 99999: /tmp/test.lock. " +
+          "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
+        );
+      }
+      // Attempt 152: holder released, acquire succeeds.
+    },
+    releaseMutex: (_p) => {},
+    sleep: async (ms) => { totalSleepMs += ms; },
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(acquireAttempts, FAIL_COUNT + 1, "must retry until the mutex is released");
+  assert.ok(
+    totalSleepMs > 30_000,
+    `simulated wait was ${totalSleepMs}ms but must exceed the old 30,000ms timeout`,
+  );
+  assert.ok(result.path.includes("pipeline-42-slug"));
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 (#183 review 2): reclaim lock blocks concurrent reclaimer from
+// unlinking the fresh main lock
+//
+// Regression: two processes both see the dead PID; the first reclaims and
+// reacquires; the second's unlink fires after the reacquire, deleting the
+// fresh lock.  Fix: a short-lived reclaimer lock serializes the reclaim
+// sequence so only one process can unlink-and-reacquire at a time.
+// ---------------------------------------------------------------------------
+
+test("acquireWorktreeMutex: live reclaim-lock holder blocks concurrent reclaimer from unlinking main lock", () => {
+  let mainUnlinked = false;
+  let atomicCreateCount = 0;
+
+  // Scenario: Process A holds the reclaim lock (live PID 9999) while reclaiming
+  // the stale main lock (dead PID 1234).  Process B (this test) also sees the
+  // dead PID, tries to get the reclaim lock, sees A is alive, and restarts —
+  // without ever touching the main lock.  On restart, B acquires the main lock
+  // cleanly (A already reacquired it under the reclaim lock).
+  acquireWorktreeMutex("/tmp/test-wt.lock", {
+    atomicCreate: (p, _c) => {
+      atomicCreateCount++;
+      if (p.endsWith(".reclaim")) {
+        // Reclaim lock is held by process A (PID 9999).
+        return false;
+      }
+      // Main lock: first call EEXIST (dead PID 1234), second call acquired
+      // cleanly (A released and B acquires after restarting).
+      return atomicCreateCount >= 3;
+    },
+    readContent: (p) => {
+      if (p.endsWith(".reclaim")) return "9999"; // A is alive in the reclaim lock
+      return "1234";                              // dead PID in the main lock
+    },
+    unlink: (p) => {
+      if (!p.endsWith(".reclaim")) mainUnlinked = true;
+    },
+    isPidAlive: (pid) => pid === 9999, // 9999 (reclaimer A) alive, 1234 (main holder) dead
+    currentPid: () => 42,
+  });
+
+  assert.equal(
+    mainUnlinked,
+    false,
+    "main lock must NOT be unlinked when a live reclaimer already holds the reclaim lock",
   );
 });
