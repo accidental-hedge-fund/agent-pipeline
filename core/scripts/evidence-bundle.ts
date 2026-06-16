@@ -26,6 +26,7 @@ import {
   type StageRecord,
   type StageUpdate,
 } from "./types.ts";
+import { sanitize } from "./artifact-sanitize.ts";
 
 /** Bundle filename written under `<stateDir>/<issue>/`. */
 export const EVIDENCE_FILE = "evidence.json";
@@ -65,6 +66,7 @@ function nowIso(): string {
  *  a deleted/corrupt bundle must never break the pipeline). */
 function emptyBundle(issue: number): EvidenceBundle {
   return {
+    schema_version: EVIDENCE_SCHEMA_VERSION,
     schemaVersion: EVIDENCE_SCHEMA_VERSION,
     runId: "",
     issue,
@@ -81,18 +83,27 @@ function emptyBundle(issue: number): EvidenceBundle {
   };
 }
 
-/** Atomic write: ensure the issue dir exists, write a `.tmp` sibling, rename. */
+/** Atomic write: ensure the issue dir exists, write a `.tmp` sibling, rename.
+ *  Non-fatal: I/O errors are caught, logged, and do not propagate (#161). The
+ *  serialized content is passed through the injection denylist before writing. */
 async function writeBundle(
   stateDir: string,
   issue: number,
   bundle: EvidenceBundle,
   deps: BundleDeps,
 ): Promise<void> {
-  const finalPath = bundlePath(stateDir, issue);
-  await deps.mkdir(path.dirname(finalPath), { recursive: true });
-  const tmp = `${finalPath}.tmp`;
-  await deps.writeFile(tmp, `${JSON.stringify(bundle, null, 2)}\n`);
-  await deps.rename(tmp, finalPath);
+  try {
+    const finalPath = bundlePath(stateDir, issue);
+    await deps.mkdir(path.dirname(finalPath), { recursive: true });
+    const tmp = `${finalPath}.tmp`;
+    const serialized = sanitize(`${JSON.stringify(bundle, null, 2)}\n`);
+    await deps.writeFile(tmp, serialized);
+    await deps.rename(tmp, finalPath);
+  } catch (err) {
+    console.warn(
+      `[pipeline] evidence-bundle: write failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
 }
 
 /** Read + parse the bundle. Returns `null` when the file is absent (ENOENT);
@@ -140,6 +151,7 @@ export async function createBundle(
   deps: BundleDeps = defaultDeps,
 ): Promise<EvidenceBundle> {
   const bundle: EvidenceBundle = {
+    schema_version: EVIDENCE_SCHEMA_VERSION,
     schemaVersion: EVIDENCE_SCHEMA_VERSION,
     runId: args.runId,
     issue: args.issue,

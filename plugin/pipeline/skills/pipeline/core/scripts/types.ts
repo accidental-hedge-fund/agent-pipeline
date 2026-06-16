@@ -502,6 +502,8 @@ export interface RecoveryRecord {
 
 /** The complete per-run evidence bundle written to `<stateDir>/<issue>/evidence.json`. */
 export interface EvidenceBundle {
+  schema_version: number;
+  /** @deprecated Use `schema_version`. Kept for the transitional period per #161. */
   schemaVersion: number;
   runId: string;
   issue: number;
