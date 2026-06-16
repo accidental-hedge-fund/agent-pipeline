@@ -37,6 +37,7 @@ import {
   type PartitionResult,
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
+import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 import type {
   BlockerKind,
   Outcome,
@@ -68,6 +69,8 @@ export interface AdvanceReviewOpts {
   /** Evidence-bundle run/state dir (#147); when set, each round's verdict is
    *  recorded. Undefined → recording disabled (no fs side effects in tests). */
   stateDir?: string;
+  /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
+  runDir?: string;
 }
 
 /**
@@ -263,16 +266,29 @@ export async function advanceReview(
   // Evidence bundle (#147): record this round's verdict summary (round, reviewed
   // SHA, verdict, per-severity finding counts) — no raw reviewer prose. Best-effort
   // + gated on opts.stateDir, so unit tests have no filesystem side effects.
+  const findingCounts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const f of verdict.findings) {
+    findingCounts[f.severity] = (findingCounts[f.severity] ?? 0) + 1;
+  }
   if (opts.stateDir) {
-    const findingCounts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
-    for (const f of verdict.findings) {
-      findingCounts[f.severity] = (findingCounts[f.severity] ?? 0) + 1;
-    }
     await recordReview(opts.stateDir, issueNumber, {
       round,
       sha: commitSha,
       verdict: verdict.verdict,
       findingCounts,
+    }).catch(() => {});
+  }
+  // JSONL event log (#155): emit review_verdict for Pipeline Desk stage timeline.
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "review_verdict",
+      at,
+      round,
+      sha: commitSha,
+      verdict: verdict.verdict,
+      finding_counts: findingCounts,
     }).catch(() => {});
   }
 

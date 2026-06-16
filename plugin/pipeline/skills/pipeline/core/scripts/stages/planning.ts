@@ -53,6 +53,7 @@ import {
   type VerifyResult,
 } from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
+import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -116,6 +117,8 @@ export interface AdvanceOpts {
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
    *  command runs under the "planning" stage. Undefined → recording disabled. */
   stateDir?: string;
+  /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
+  runDir?: string;
 }
 
 export async function advance(
@@ -363,6 +366,7 @@ export async function advance(
       `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`,
     pipelineRunId,
     stateDir: opts.stateDir,
+    runDir: opts.runDir,
   });
 }
 
@@ -707,6 +711,7 @@ async function advanceOpenspec(
       `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
     pipelineRunId,
     stateDir: opts.stateDir,
+    runDir: opts.runDir,
   });
 }
 
@@ -780,6 +785,8 @@ export async function resumeFromImplementing(
     transitionMessage: (prNumber: number) => string;
     pipelineRunId: string;
     stateDir?: string;
+    /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
+    runDir?: string;
   },
   deps: ResumeFromImplementingDeps = {},
 ): Promise<Outcome> {
@@ -840,6 +847,12 @@ export async function resumeFromImplementing(
         return { advanced: false, status: "blocked", reason: e.message };
       }
     }
+  }
+
+  // ---- Emit pr_created event (#155) ----
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "pr_created", at, pr: prNumber }).catch(() => {});
   }
 
   // ---- implementing → review-1 ----
