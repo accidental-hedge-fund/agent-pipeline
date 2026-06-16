@@ -995,3 +995,75 @@ test("resolveConfig: doctor.runOnStart:true tolerates gh failure and returns rep
     process.env.PATH = oldPath;
   }
 });
+
+// ---------------------------------------------------------------------------
+// format_gate (#182)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: format_gate absent → defaults to empty array", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/fg0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.format_gate, []);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: format_gate with valid entries is accepted", async () => {
+  const repo = makeFakeRepo(
+    `format_gate:\n  - command: cargo fmt\n    auto_fix: true\n  - command: cargo clippy -D warnings\n    auto_fix: false\n`,
+  );
+  const binDir = makeFakeGh("acme/fg1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.format_gate, [
+      { command: "cargo fmt", auto_fix: true },
+      { command: "cargo clippy -D warnings", auto_fix: false },
+    ]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: format_gate entry missing auto_fix → rejected", async () => {
+  const repo = makeFakeRepo(`format_gate:\n  - command: cargo fmt\n`);
+  const binDir = makeFakeGh("acme/fg2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("auto_fix"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: format_gate entry with unknown key → rejected", async () => {
+  const repo = makeFakeRepo(
+    `format_gate:\n  - command: cargo fmt\n    auto_fix: true\n    working_dir: src/\n`,
+  );
+  const binDir = makeFakeGh("acme/fg3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

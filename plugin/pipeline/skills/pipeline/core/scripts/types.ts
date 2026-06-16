@@ -256,6 +256,11 @@ export interface PipelineConfig {
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
   domain_description?: string;
+  // Format/lint normalization gate (#182). When non-empty, each entry's
+  // command runs inside the worktree after the implementing and fix-round
+  // harnesses exit. auto_fix: true → commit any produced changes and re-run;
+  // auto_fix: false → block immediately on non-zero exit. Default: [].
+  format_gate: { command: string; auto_fix: boolean }[];
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -290,6 +295,7 @@ export const DEFAULT_CONFIG: Omit<
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
+  format_gate: [] as { command: string; auto_fix: boolean }[],
 };
 
 // ---------------------------------------------------------------------------

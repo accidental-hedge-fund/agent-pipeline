@@ -17,6 +17,7 @@ import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { runFormatGate } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
   type VerifyDeps,
@@ -46,6 +47,8 @@ export interface AdvanceFixDeps {
   gitDiffFiles?: (wtPath: string, from: string, to: string) => Promise<string[]>;
   /** Validate one OpenSpec change (defaults to `openspec.validateItem`). */
   openspecValidateItem?: (wtPath: string, id: string) => Promise<ValidateResult>;
+  /** Format/lint gate runner (#182); defaults to runFormatGate. */
+  runFormatGate?: typeof runFormatGate;
 }
 
 export async function advanceFix(
@@ -179,6 +182,14 @@ export async function advanceFix(
       await setBlocked(cfg, issueNumber, specCheck.reason, stage, "openspec-invalid");
       return { advanced: false, status: "blocked", reason: specCheck.reason };
     }
+  }
+
+  // ---- Format/lint gate (#182): runs before the test gate ----
+  const fmtGateFn = deps.runFormatGate ?? runFormatGate;
+  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
+  if (fmtResult.status === "blocked") {
+    await setBlocked(cfg, issueNumber, fmtResult.reason, stage, "needs-human");
+    return { advanced: false, status: "blocked", reason: fmtResult.reason };
   }
 
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----

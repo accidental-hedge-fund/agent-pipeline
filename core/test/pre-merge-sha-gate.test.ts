@@ -38,6 +38,19 @@ test("isPipelineInternalCommit: recognizes archive commits only, not developer c
 });
 
 // ---------------------------------------------------------------------------
+// isPipelineInternalCommit — auto-format commits (#182)
+// ---------------------------------------------------------------------------
+
+test("isPipelineInternalCommit: auto-format commit is pipeline-internal", () => {
+  assert.equal(isPipelineInternalCommit("chore: auto-format (#182)"), true);
+  assert.equal(isPipelineInternalCommit("chore: auto-format (#1)"), true);
+  // Must be an exact prefix — a developer's own chore with different text must NOT match.
+  assert.equal(isPipelineInternalCommit("chore: auto-format dependencies"), false);
+  assert.equal(isPipelineInternalCommit("chore: auto-format"), false);
+  assert.equal(isPipelineInternalCommit("fix: address review 1 findings (#182)"), false);
+});
+
+// ---------------------------------------------------------------------------
 // staleReviewNotice — pure
 // ---------------------------------------------------------------------------
 

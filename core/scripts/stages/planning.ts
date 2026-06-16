@@ -41,6 +41,7 @@ import {
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { runFormatGate } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
@@ -760,6 +761,7 @@ export interface ResumeFromImplementingDeps {
   gitInWorktree?: typeof gitInWorktree;
   setBlocked?: typeof setBlocked;
   transition?: typeof transition;
+  runFormatGate?: typeof runFormatGate;
 }
 
 /**
@@ -793,8 +795,17 @@ export async function resumeFromImplementing(
   const gitOp = deps.gitInWorktree ?? gitInWorktree;
   const blocker = deps.setBlocked ?? setBlocked;
   const trans = deps.transition ?? transition;
+  const fmtGateFn = deps.runFormatGate ?? runFormatGate;
 
   const branch = wt.branch;
+
+  // ---- Format/lint gate (#182): runs before the test gate so auto-formatted
+  //      code is what the test gate validates ----
+  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
+  if (fmtResult.status === "blocked") {
+    await blocker(cfg, issueNumber, fmtResult.reason, "implementing", "needs-human");
+    return { advanced: false, status: "blocked", reason: fmtResult.reason };
+  }
 
   // ---- Test/build gate ----
   const gate = await gateRunner(cfg, issueNumber, wt.path, {}, opts.pipelineRunId, "planning", opts.stateDir);

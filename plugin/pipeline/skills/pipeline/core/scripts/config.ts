@@ -98,6 +98,14 @@ const PartialConfigSchema = z.object({
   // Worktree bootstrap: dependency install step (#174). Non-empty string →
   // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
   setup_command: z.string().optional(),
+  // Format/lint normalization gate (#182). Each entry runs after implementing
+  // and fix-round harnesses exit. auto_fix: true commits changes and re-runs;
+  // auto_fix: false blocks on non-zero exit without committing.
+  format_gate: z
+    .array(
+      z.object({ command: z.string(), auto_fix: z.boolean() }).strict(),
+    )
+    .optional(),
 }).strict();
 
 export interface ResolveOptions {
@@ -263,6 +271,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
     setup_command: fileConfig.setup_command,
+    format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
   };
   warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
@@ -506,5 +515,17 @@ doctor: # deterministic preflight capability check (#146) — run \`pipeline doc
 #     setup_command: ""                                       # opt-out
 #     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
 #     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
+
+# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)
+#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;
+#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).
+#   Examples (Rust repo):
+#     - command: cargo fmt
+#       auto_fix: true
+#     - command: cargo clippy -D warnings
+#       auto_fix: false
+#   Examples (JS/TS repo):
+#     - command: eslint --fix src/
+#       auto_fix: true
 `;
 }

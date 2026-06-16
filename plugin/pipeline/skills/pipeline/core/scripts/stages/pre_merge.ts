@@ -31,6 +31,7 @@ import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
+const AUTO_FORMAT_PREFIX = "chore: auto-format (#";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
@@ -45,7 +46,10 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
  * come from a developer. Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+  return (
+    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
+    messageHeadline.startsWith(AUTO_FORMAT_PREFIX)
+  );
 }
 
 export interface AdvancePreMergeOpts {
