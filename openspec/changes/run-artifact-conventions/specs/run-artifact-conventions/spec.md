@@ -24,7 +24,16 @@ Before persisting any event or record to a machine-readable artifact, the engine
 apply a write-time injection denylist to the serialized content. Any span matching a
 denylist pattern SHALL be replaced with the placeholder `[REDACTED-INJECTION]`. The
 original field values SHALL NOT be logged. Records with redacted content SHALL be
-written as modified; they SHALL NOT be silently dropped.
+written as modified; they SHALL NOT be silently dropped. For artifacts produced by
+`JSON.stringify`, redaction and injection screening SHALL be applied to the string
+fields BEFORE serialization (field-level), so that JSON escaping (e.g. `KEY="x"` →
+`KEY=\"x\"`, embedded newlines) cannot let a secret or role-marker survive a
+serialized-text-only pass.
+
+#### Scenario: secret in a JSON-serialized artifact field is redacted despite escaping
+- **WHEN** a string field of a `JSON.stringify`-serialized artifact (e.g. the doctor preflight result) contains a secret env assignment like `OPENAI_API_KEY="<value>"`
+- **THEN** the persisted artifact SHALL contain `[REDACTED]` in place of the value
+- **AND** the raw secret value SHALL NOT appear, even though `JSON.stringify` escapes the surrounding quotes
 
 #### Scenario: denylist match causes redaction, not rejection
 - **WHEN** a field value in a record contains an injection-pattern match (e.g., "ignore previous instructions")

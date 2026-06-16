@@ -67,3 +67,31 @@ export function sanitize(content: string): string {
   }
   return result;
 }
+
+/**
+ * Recursively sanitize every string leaf of a JSON-serializable value, applying
+ * `sanitize(redactSecrets(...))` at the FIELD level (before serialization). This
+ * is the correct chokepoint for artifacts built by `JSON.stringify`: a secret or
+ * role-marker inside a string field is escaped by stringify (`KEY="x"` →
+ * `KEY=\"x\"`, a leading `assistant:` line → `...\nassistant:` on one JSON line),
+ * which defeats the raw-text patterns when they only run on the serialized
+ * output. Sanitizing the values first lets the patterns see the unescaped
+ * content (#161). Returns a structurally-identical copy; arrays and plain
+ * objects are recursed, every other value passes through unchanged.
+ */
+export function sanitizeDeep<T>(value: T): T {
+  if (typeof value === "string") {
+    return sanitize(redactSecrets(value)) as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => sanitizeDeep(v)) as unknown as T;
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = sanitizeDeep(v);
+    }
+    return out as T;
+  }
+  return value;
+}

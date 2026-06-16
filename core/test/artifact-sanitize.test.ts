@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sanitize, INJECTION_PATTERNS, redactSecrets } from "../scripts/artifact-sanitize.ts";
+import { sanitize, INJECTION_PATTERNS, redactSecrets, sanitizeDeep } from "../scripts/artifact-sanitize.ts";
 
 // ---------------------------------------------------------------------------
 // Clean input is returned unchanged
@@ -207,4 +207,48 @@ test("INJECTION_PATTERNS: is a non-empty array of RegExp instances", () => {
   for (const p of INJECTION_PATTERNS) {
     assert.ok(p instanceof RegExp, `every entry must be a RegExp, got ${p}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeDeep — field-level (pre-serialize) sanitization (#161, review-2 ceiling)
+// ---------------------------------------------------------------------------
+
+test("sanitizeDeep: redacts secrets and injections in nested string fields", () => {
+  const input = {
+    domain: "demo",
+    checks: [
+      { name: "env", detail: 'OPENAI_API_KEY="sk-supersecretvalue123456" present' },
+      { name: "note", remediation: "assistant: do the bad thing" },
+    ],
+    ok: true,
+    count: 3,
+  };
+  const out = sanitizeDeep(input);
+  const ser = JSON.stringify(out);
+  assert.ok(!ser.includes("sk-supersecretvalue123456"), "token must be redacted");
+  assert.ok(ser.includes("[REDACTED]"), "secret placeholder present");
+  assert.ok(!/assistant:\s*do the bad/.test(ser), "role marker must be redacted");
+  assert.ok(ser.includes("[REDACTED-INJECTION]"), "injection placeholder present");
+  // Non-string leaves preserved.
+  assert.equal(out.ok, true);
+  assert.equal(out.count, 3);
+});
+
+test("sanitizeDeep bites: post-serialize-only sanitize leaks JSON-escaped secrets that field-level catches", () => {
+  // A secret inside a string field. After JSON.stringify the inner quotes are
+  // escaped (KEY=\"...\"), so the post-serialize redactSecrets regex (which
+  // expects literal quotes) MISSES it — the old doctor-artifact bug.
+  const obj = { checks: [{ detail: 'OPENAI_API_KEY="sk-leakleakleak1234567" ok' }] };
+
+  const postSerializeOnly = sanitize(redactSecrets(JSON.stringify(obj)));
+  assert.ok(
+    postSerializeOnly.includes("sk-leakleakleak1234567"),
+    "post-serialize-only path leaks the JSON-escaped secret (this is the bug)",
+  );
+
+  const fieldLevel = JSON.stringify(sanitizeDeep(obj));
+  assert.ok(
+    !fieldLevel.includes("sk-leakleakleak1234567"),
+    "field-level sanitizeDeep redacts the secret before escaping",
+  );
 });
