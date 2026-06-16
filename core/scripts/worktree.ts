@@ -143,7 +143,15 @@ export function acquireWorktreeMutex(
   }
 
   if (!isPidAlive(holderPid)) {
-    // Dead process — reclaim the stale lock.
+    // Dead process — re-verify content before unlinking.  Two concurrent
+    // reclaimers can both read the same dead PID; if the first already
+    // removed and reacquired, the second's unlink would delete the fresh
+    // lock.  Re-reading closes most of that window: if content changed,
+    // restart rather than blindly unlinking.
+    const current = readContent(mutexPath);
+    if (current !== content) {
+      return acquireWorktreeMutex(mutexPath, deps);
+    }
     unlink(mutexPath);
     return acquireWorktreeMutex(mutexPath, deps);
   }
@@ -385,13 +393,36 @@ export async function createWorktree(
   // .git/config.lock contention (belt-and-suspenders for cases the mutex
   // cannot prevent, e.g. a stale lock left by a crashed git process).
   const mutexPath = worktreeMutexPath(cfg);
-  acquireMutexFn(mutexPath);
+
+  // Wait up to 30 s for a live holder to finish before giving up.
+  const MUTEX_POLL_MS = 200;
+  const MUTEX_TIMEOUT_MS = 30_000;
+  let mutexWaited = 0;
+  for (;;) {
+    try {
+      acquireMutexFn(mutexPath);
+      break;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes("Worktree mutex held by process") || mutexWaited >= MUTEX_TIMEOUT_MS) {
+        throw err;
+      }
+      await sleepFn(MUTEX_POLL_MS);
+      mutexWaited += MUTEX_POLL_MS;
+    }
+  }
+
   try {
     const MAX_RETRIES = 3;
     let lastStderr = "";
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       if (attempt > 0) {
         await sleepFn(200 * 2 ** (attempt - 1)); // 200ms, 400ms
+        // A failed `git worktree add -b <branch>` creates the branch before
+        // it tries to write the config, so a config-lock failure leaves a
+        // dangling branch.  Delete it before retrying so `-b <branch>` does
+        // not immediately fail with "branch already exists".
+        await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
       }
       const { code, stderr } = await gitFn(
         cfg,

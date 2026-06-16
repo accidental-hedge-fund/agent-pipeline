@@ -608,6 +608,168 @@ test("createWorktree: non-lock git error → throws immediately without retrying
 });
 
 // ---------------------------------------------------------------------------
+// createWorktree: dangling branch from failed attempt cleaned up before retry
+// (#183 finding 1)
+//
+// Regression: `git worktree add -b <branch>` creates the branch before
+// writing .git/config. A config-lock failure leaves the branch behind. The
+// next retry would then fail with "branch already exists" (a non-lock error)
+// and throw immediately instead of retrying. Fix: delete the branch before
+// each retry attempt inside the lock.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: dangling branch from config-lock failure is deleted before each retry", async () => {
+  const cfg = makeCreateCfg();
+  const callOrder: string[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "branch" && args[1] === "-D") {
+        callOrder.push(`branch-D:${args[2]}`);
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        const n = callOrder.filter((c) => c === "worktree-add").length;
+        callOrder.push("worktree-add");
+        if (n === 0) {
+          // First attempt: config.lock failure; branch was already created
+          return { code: 1, stdout: "", stderr: CONFIG_LOCK_STDERR };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    acquireMutex: (_p) => {},
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => {},
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+
+  const firstAddIdx = callOrder.indexOf("worktree-add");
+  const branchDeleteAfterFirstAdd = callOrder
+    .slice(firstAddIdx + 1)
+    .includes("branch-D:pipeline/42-slug");
+  assert.ok(
+    branchDeleteAfterFirstAdd,
+    `expected 'git branch -D pipeline/42-slug' after first failed worktree add; ` +
+    `call order was: ${callOrder.join(", ")}`,
+  );
+  assert.equal(
+    callOrder.filter((c) => c === "worktree-add").length,
+    2,
+    "must attempt worktree add exactly twice",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// createWorktree: mutex wait/retry for live holders (#183 finding 2)
+//
+// Regression: acquireMutexFn was called once and threw immediately when a
+// live process held the lock. Fix: retry with backoff until the holder
+// releases or a timeout is reached.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: waits for live mutex holder to release before proceeding", async () => {
+  const cfg = makeCreateCfg();
+  let acquireAttempts = 0;
+  let slept = false;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "worktree" && args[1] === "add") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    acquireMutex: (_p) => {
+      acquireAttempts++;
+      if (acquireAttempts === 1) {
+        throw new Error(
+          "Worktree mutex held by process 99999: /tmp/test.lock. " +
+          "Wait for the concurrent worktree creation to finish, or remove the file if you are sure it is stale.",
+        );
+      }
+      // Second call: holder released, acquire succeeds.
+    },
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => { slept = true; },
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(acquireAttempts, 2, "must retry mutex acquisition after first failure");
+  assert.ok(slept, "must sleep between mutex acquisition attempts");
+  assert.ok(result.path.includes("pipeline-42-slug"));
+});
+
+test("createWorktree: non-mutex errors during acquire are not retried", async () => {
+  const cfg = makeCreateCfg();
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    acquireMutex: (_p) => { throw new Error("EACCES: permission denied"); },
+    releaseMutex: (_p) => {},
+    sleep: async (_ms) => {},
+  };
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /EACCES: permission denied/,
+    "non-mutex errors must propagate immediately without retrying",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// acquireWorktreeMutex: stale-reclaim race guard (#183 finding 3)
+//
+// Regression: two concurrent processes both read the same dead PID, one
+// reclaims and reacquires, then the second's blind unlink removes the fresh
+// lock. Fix: re-read content before unlinking; if it changed, restart instead
+// of unlinking.
+// ---------------------------------------------------------------------------
+
+test("acquireWorktreeMutex: does not unlink when content changed before unlink (concurrent stale reclaim guard)", () => {
+  let unlinked = false;
+  let readCount = 0;
+  let createCount = 0;
+
+  // Simulates: two processes both see the dead PID "1234".  Before this
+  // process can unlink, the other already removed and reacquired (content
+  // changed to "9999").  The guard must skip the unlink and restart.
+  acquireWorktreeMutex("/tmp/test-wt.lock", {
+    atomicCreate: (_p, _c) => {
+      createCount++;
+      // First: EEXIST (dead-PID lock). Second: acquired cleanly after restart.
+      return createCount >= 2;
+    },
+    readContent: (_p) => {
+      readCount++;
+      if (readCount === 1) return "1234"; // initial read: dead PID
+      if (readCount === 2) return "9999"; // guard re-read: content changed
+      return null;
+    },
+    unlink: (_p) => { unlinked = true; },
+    isPidAlive: (pid) => pid !== 1234,
+    currentPid: () => 42,
+  });
+
+  assert.equal(unlinked, false, "must not unlink when content changed — prevents removing a freshly acquired lock");
+  assert.equal(createCount, 2, "must retry atomicCreate after content-changed restart");
+});
+
+// ---------------------------------------------------------------------------
 // createWorktree mutex wiring: acquire before gitCmd, release in finally (#183)
 // ---------------------------------------------------------------------------
 
