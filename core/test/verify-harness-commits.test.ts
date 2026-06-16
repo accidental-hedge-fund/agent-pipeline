@@ -504,3 +504,58 @@ test("verifyPlanRevisionOutput: with feedback — no detectable items in feedbac
   ].join("\n");
   assert.deepEqual(verifyPlanRevisionOutput(stdout, feedback), { ok: true });
 });
+
+// ---------------------------------------------------------------------------
+// verifyHarnessCommits — node_modules commit scan (#180)
+// ---------------------------------------------------------------------------
+
+test("node_modules scan: commit containing node_modules entry → step blocks (regression #180)", async () => {
+  const sha = "abc1234deadbeef";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["implement feature (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async (_wt, s) => s === sha ? ["node_modules", "src/foo.ts"] : [],
+  });
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("node_modules"), `reason: ${JSON.stringify(result)}`);
+  assert.ok("reason" in result && result.reason.includes(sha), `sha in reason: ${JSON.stringify(result)}`);
+  assert.ok("reason" in result && result.reason.includes("must not be committed"), `diagnostic text: ${JSON.stringify(result)}`);
+});
+
+test("node_modules scan: commit with no node_modules entries → scan passes (regression #180)", async () => {
+  const sha = "def5678cafebabe";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["implement feature (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => ["src/foo.ts", "core/scripts/bar.ts"],
+  });
+  assert.equal(result.ok, true);
+});
+
+test("node_modules scan: nested path under node_modules also blocks (e.g. node_modules/foo)", async () => {
+  const sha = "aabbccdd11223344";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["implement feature (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => ["node_modules/some-pkg/index.js", "src/foo.ts"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("node_modules/some-pkg/index.js"));
+});
+
+test("node_modules scan: empty commit range → scan is no-op, no block (#180)", async () => {
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180, allowEmpty: true }, {
+    gitMessages: async () => [],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [],
+    gitDiffTreeFiles: async () => [],
+  });
+  assert.equal(result.ok, true);
+});

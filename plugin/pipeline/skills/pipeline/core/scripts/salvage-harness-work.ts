@@ -16,7 +16,12 @@ import { withTrailers } from "./traceability.ts";
 export interface SalvageDeps {
   /** `git status --porcelain` output for the worktree ("" when clean). */
   gitStatus?: (wtPath: string) => Promise<string>;
-  /** `git add -A` in the worktree. */
+  /**
+   * Stage all changes in the worktree, excluding `node_modules` entries.
+   * The default implementation uses `git add -A -- :(exclude)node_modules`
+   * so that a node_modules symlink or directory is never staged even if
+   * `.git/info/exclude` is absent or stale.
+   */
   gitAddAll?: (wtPath: string) => Promise<void>;
   /** `git commit -m <message>` in the worktree. */
   gitCommit?: (wtPath: string, message: string) => Promise<void>;
@@ -36,7 +41,7 @@ async function defaultGitStatus(wtPath: string): Promise<string> {
 }
 
 async function defaultGitAddAll(wtPath: string): Promise<void> {
-  await gitInWorktree(wtPath, ["add", "-A"]);
+  await gitInWorktree(wtPath, ["add", "-A", "--", ":(exclude)node_modules"]);
 }
 
 async function defaultGitCommit(wtPath: string, message: string): Promise<void> {

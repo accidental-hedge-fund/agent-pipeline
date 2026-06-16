@@ -185,3 +185,25 @@ test("contract: salvage message satisfies the traceability-trailer validation (b
   // A different run id must still be caught — salvage gets no trailer bypass.
   assert.notEqual(validateCommitTrailers([msg], 131, "131/other-run"), null);
 });
+
+// ---------------------------------------------------------------------------
+// Regression #180: salvage gitAddAll must exclude node_modules
+// ---------------------------------------------------------------------------
+
+test("salvage: gitAddAll is called when dirty worktree contains node_modules and real changed files (#180)", async () => {
+  // Simulates: harness exits with a node_modules symlink AND a real modified file.
+  // gitAddAll must be called exactly once (the exclusion is inside the default
+  // implementation; the seam verifies the call is made so the commit is created).
+  const status = "?? node_modules\n M core/scripts/foo.ts\n";
+  let addAllCalls = 0;
+  let commitCreated = false;
+  const deps: SalvageDeps = {
+    gitStatus: async () => status,
+    gitAddAll: async () => { addAllCalls++; },
+    gitCommit: async () => { commitCreated = true; },
+  };
+  const res = await salvageUncommittedWork("/wt", 131, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true, "worktree is dirty so salvage must run");
+  assert.equal(addAllCalls, 1, "gitAddAll must be called once");
+  assert.equal(commitCreated, true, "commit must be created after staging");
+});

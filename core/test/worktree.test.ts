@@ -345,14 +345,18 @@ function makeCreateCfg(): PipelineConfig {
   } as unknown as PipelineConfig;
 }
 
-// No-op mutex/sleep deps shared by createWorktree unit tests that don't
-// exercise the mutex or retry logic (avoids real fs lock files in CI).
-const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep" | "resolveGitCommonDir"> = {
+// No-op mutex/sleep/bootstrap deps shared by createWorktree unit tests that
+// don't exercise mutex, retry, or bootstrap logic (avoids real fs operations).
+const noopMutexDeps: Pick<CreateWorktreeDeps, "acquireMutex" | "releaseMutex" | "sleep" | "resolveGitCommonDir" | "writeNodeModulesExclude" | "lstatPath" | "unlinkPath"> = {
   acquireMutex: (_p) => {},
   releaseMutex: (_p) => {},
   sleep: async (_ms) => {},
   // Identity: no real git call; all tests use a fake cfg.repo_dir anyway.
   resolveGitCommonDir: async (repoDir) => repoDir,
+  // Bootstrap no-ops: avoids real fs calls on non-existent test worktrees.
+  writeNodeModulesExclude: async () => {},
+  lstatPath: async () => null,
+  unlinkPath: async () => {},
 };
 
 test("createWorktree: this issue's stale worktree is reclaimed before the capacity check", async () => {
@@ -699,6 +703,9 @@ test("createWorktree: waits for live mutex holder to release before proceeding",
     },
     releaseMutex: (_p) => {},
     sleep: async (_ms) => { slept = true; },
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -837,6 +844,9 @@ test("createWorktree: two runs from different linked worktrees of the same repo 
     acquireMutex: (p) => { capturedMutexPaths.push(p); },
     releaseMutex: (_p) => {},
     sleep: async (_ms) => {},
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
   });
 
   await createWorktree(cfg1, 1, "issue-one", makeDeps());
@@ -886,6 +896,9 @@ test("createWorktree: mutex wait succeeds after more than 30s of simulated waiti
     },
     releaseMutex: (_p) => {},
     sleep: async (ms) => { totalSleepMs += ms; },
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
@@ -1020,4 +1033,88 @@ test("acquireWorktreeMutex: two reclaimers with same invalid content — second 
   );
 
   assert.equal(mainUnlinked, false, "second reclaimer must NOT unlink the main lock");
+});
+
+// ---------------------------------------------------------------------------
+// createWorktree bootstrap: node_modules exclude + symlink removal (#180)
+//
+// Regression: the worktree bootstrap must write node_modules to
+// .git/info/exclude and remove any pre-existing node_modules symlink before
+// any harness runs. Without this, `git add -A` stages the symlink, which
+// breaks CI (`pnpm install` ENOTDIR) on the PR branch.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: node_modules symlink at worktree root is removed and exclude is written during bootstrap (#180)", async () => {
+  const cfg = makeCreateCfg();
+  const wtPath = "/repo/.worktrees/pipeline-42-slug";
+  const nmPath = `${wtPath}/node_modules`;
+  let excludeWrittenFor: string | null = null;
+  let unlinkCalledWith: string | null = null;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+    // Override the no-ops from noopMutexDeps with recording fakes.
+    writeNodeModulesExclude: async (wt) => { excludeWrittenFor = wt; },
+    lstatPath: async (p) => {
+      if (p === nmPath) return { isSymbolicLink: () => true };
+      return null;
+    },
+    unlinkPath: async (p) => { unlinkCalledWith = p; },
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.ok(result.path.includes("pipeline-42-slug"));
+  assert.equal(excludeWrittenFor, wtPath, "writeNodeModulesExclude must be called with the worktree path");
+  assert.equal(unlinkCalledWith, nmPath, "node_modules symlink must be passed to unlinkPath");
+});
+
+test("createWorktree: node_modules directory (not symlink) is NOT removed during bootstrap (#180)", async () => {
+  const cfg = makeCreateCfg();
+  let unlinkCalled = false;
+  let excludeWritten = false;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+    // Override the no-ops from noopMutexDeps with recording fakes.
+    writeNodeModulesExclude: async () => { excludeWritten = true; },
+    lstatPath: async () => ({ isSymbolicLink: () => false }), // directory, not a symlink
+    unlinkPath: async () => { unlinkCalled = true; },
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(excludeWritten, true, "exclude must always be written during bootstrap");
+  assert.equal(unlinkCalled, false, "non-symlink node_modules must not be removed");
+});
+
+test("createWorktree: no node_modules at worktree root → exclude written, unlink not called (#180)", async () => {
+  const cfg = makeCreateCfg();
+  let unlinkCalled = false;
+  let excludeWritten = false;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+    // Override the no-ops from noopMutexDeps with recording fakes.
+    writeNodeModulesExclude: async () => { excludeWritten = true; },
+    lstatPath: async () => null, // ENOENT — no node_modules at all
+    unlinkPath: async () => { unlinkCalled = true; },
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(excludeWritten, true, "exclude must be written even when node_modules is absent");
+  assert.equal(unlinkCalled, false, "unlink must not be called when there is no node_modules");
 });

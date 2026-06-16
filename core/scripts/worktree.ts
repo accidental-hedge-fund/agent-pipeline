@@ -365,6 +365,42 @@ export interface CreateWorktreeDeps {
   releaseMutex?: (path: string) => void;
   /** Sleep for the given number of milliseconds (injectable for tests). */
   sleep?: (ms: number) => Promise<void>;
+  /** Write `node_modules` to `.git/info/exclude` inside the worktree (idempotent). */
+  writeNodeModulesExclude?: (worktreePath: string) => Promise<void>;
+  /** Return lstat of the given path, or null if ENOENT. */
+  lstatPath?: (p: string) => Promise<{ isSymbolicLink(): boolean } | null>;
+  /** Remove the file or symlink at the given path. */
+  unlinkPath?: (p: string) => Promise<void>;
+}
+
+async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
+  const excludeDir = path.join(worktreePath, ".git", "info");
+  const excludeFile = path.join(excludeDir, "exclude");
+  await fs.promises.mkdir(excludeDir, { recursive: true });
+  let existing = "";
+  try {
+    existing = await fs.promises.readFile(excludeFile, "utf8");
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") throw err;
+  }
+  if (!existing.split("\n").some((line) => line.trim() === "node_modules")) {
+    await fs.promises.appendFile(excludeFile, "node_modules\n");
+  }
+}
+
+async function realLstatPath(p: string): Promise<{ isSymbolicLink(): boolean } | null> {
+  try {
+    return await fs.promises.lstat(p);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+async function realUnlinkPath(p: string): Promise<void> {
+  await fs.promises.unlink(p);
 }
 
 export async function createWorktree(
@@ -382,6 +418,9 @@ export async function createWorktree(
   const acquireMutexFn = deps.acquireMutex ?? ((p: string) => acquireWorktreeMutex(p));
   const releaseMutexFn = deps.releaseMutex ?? releaseWorktreeMutex;
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const writeNodeModulesExcludeFn = deps.writeNodeModulesExclude ?? realWriteNodeModulesExclude;
+  const lstatPathFn = deps.lstatPath ?? realLstatPath;
+  const unlinkPathFn = deps.unlinkPath ?? realUnlinkPath;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
@@ -482,7 +521,20 @@ export async function createWorktree(
         ["worktree", "add", wtPath, "-b", branch, `origin/${cfg.base_branch}`],
         { ignoreFailure: true },
       );
-      if (code === 0) return { path: wtPath, branch };
+      if (code === 0) {
+        // Bootstrap: write node_modules to .git/info/exclude so `git add` never
+        // stages a node_modules entry regardless of type (dir, symlink, file).
+        await writeNodeModulesExcludeFn(wtPath);
+        // Remove a pre-existing node_modules symlink — left by a prior aborted run
+        // that symlinked the primary checkout's deps without committing the exclude.
+        const nmPath = path.join(wtPath, "node_modules");
+        const stat = await lstatPathFn(nmPath);
+        if (stat !== null && stat.isSymbolicLink()) {
+          console.log(`[pipeline] #${issueNumber}: removing node_modules symlink: ${nmPath}`);
+          await unlinkPathFn(nmPath);
+        }
+        return { path: wtPath, branch };
+      }
       lastStderr = stderr;
       if (!stderr.includes("could not lock config file")) {
         throw new Error(`git worktree add failed: ${lastStderr.trim()}`);

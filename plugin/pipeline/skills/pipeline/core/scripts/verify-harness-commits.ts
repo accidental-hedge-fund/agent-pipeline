@@ -50,6 +50,10 @@ export interface VerifyDeps {
   gitDiffFiles?: (wtPath: string, headBefore: string) => Promise<string[]>;
   /** Returns names of uncommitted (dirty) files in the worktree. */
   gitDirtyFiles?: (wtPath: string) => Promise<string[]>;
+  /** Returns commit SHAs in `headBefore..HEAD` (newest-first). Empty array if none. */
+  gitCommitShas?: (wtPath: string, headBefore: string) => Promise<string[]>;
+  /** Returns paths of files changed in a single commit SHA via `git diff-tree`. */
+  gitDiffTreeFiles?: (wtPath: string, sha: string) => Promise<string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +81,24 @@ async function defaultGitDiffFiles(wtPath: string, headBefore: string): Promise<
 async function defaultGitDirtyFiles(wtPath: string): Promise<string[]> {
   const res = await gitInWorktree(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
   return parseDirtyFiles(res.stdout);
+}
+
+async function defaultGitCommitShas(wtPath: string, headBefore: string): Promise<string[]> {
+  const res = await gitInWorktree(
+    wtPath,
+    ["log", `${headBefore}..HEAD`, "--format=%H"],
+    { ignoreFailure: true },
+  );
+  return res.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+async function defaultGitDiffTreeFiles(wtPath: string, sha: string): Promise<string[]> {
+  const res = await gitInWorktree(
+    wtPath,
+    ["diff-tree", "--no-commit-id", "-r", "--name-only", sha],
+    { ignoreFailure: true },
+  );
+  return res.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
 }
 
 /** Parse `git status --porcelain` output into a list of affected file paths. Exported for tests. */
@@ -136,6 +158,8 @@ export async function verifyHarnessCommits(
   const getMessages = deps.gitMessages ?? defaultGitMessages;
   const getDiffFiles = deps.gitDiffFiles ?? defaultGitDiffFiles;
   const getDirtyFiles = deps.gitDirtyFiles ?? defaultGitDirtyFiles;
+  const getCommitShas = deps.gitCommitShas ?? defaultGitCommitShas;
+  const getDiffTreeFiles = deps.gitDiffTreeFiles ?? defaultGitDiffTreeFiles;
 
   // Commit-based checks
   const requiresCommits =
@@ -213,6 +237,23 @@ export async function verifyHarnessCommits(
     const denied = allFiles.filter((f) => !config.pathConstraint!.allowPattern.test(f));
     if (denied.length > 0) {
       return { ok: false, reason: config.pathConstraint.description };
+    }
+  }
+
+  // Node-modules scan — run on every non-empty range regardless of other checks.
+  // A harness must never commit a node_modules entry of any type; the exclude
+  // written at worktree bootstrap is the first line of defence, this scan is
+  // the second.
+  const shas = await getCommitShas(wtPath, headBefore);
+  for (const sha of shas) {
+    const files = await getDiffTreeFiles(wtPath, sha);
+    for (const file of files) {
+      if (file.split("/")[0] === "node_modules") {
+        return {
+          ok: false,
+          reason: `Commit ${sha} adds a node_modules entry (${file}); node_modules must not be committed`,
+        };
+      }
     }
   }
 
