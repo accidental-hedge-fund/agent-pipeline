@@ -59,7 +59,7 @@ export type InvokeFn = (
 /** Seams overridable in tests; default to the real implementations in prod. */
 export interface TestGateDeps {
   invoke?: InvokeFn;
-  runTests?: (cwd: string, command: ParsedCommand, timeoutSec: number) => Promise<RunTestsResult>;
+  runTests?: (cwd: string, command: ParsedCommand, timeoutSec: number, killProcessGroup?: boolean) => Promise<RunTestsResult>;
   detectTestCommand?: (repoDir: string) => ParsedCommand | null;
   gitHead?: (cwd: string) => Promise<string>;
   gitDirty?: (cwd: string) => Promise<boolean>;
@@ -177,17 +177,41 @@ export async function runTestGate(
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
   const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
 
-  const command = cfg.test_gate.command ? shellSplit(cfg.test_gate.command) : detectFn(wtPath);
+  // Operator-configured commands run through `sh -c` so shell operators
+  // (&&, ||, ;, pipes) work. Auto-detected commands spawn directly.
+  const rawConfiguredCmd = cfg.test_gate.command;
+  // Trim whitespace so `command: "   "` doesn't silently pass as a no-op shell
+  // script (sh exits 0 on an empty body). Undefined stays undefined.
+  const configuredCmd = rawConfiguredCmd?.trim() || undefined;
+
+  // Block early on explicitly-set but empty/whitespace-only commands rather than
+  // silently falling back to auto-detection (which would hide the misconfiguration).
+  if (rawConfiguredCmd !== undefined && !configuredCmd) {
+    return {
+      skipped: false,
+      passed: false,
+      attempts: 0,
+      blockReason: `test_gate.command is set but empty or whitespace-only ("${rawConfiguredCmd}"). Configure a valid command or remove the setting to use auto-detection.`,
+    };
+  }
+
+  const command: ParsedCommand | null = configuredCmd
+    ? { cmd: "sh", args: ["-c", configuredCmd] }
+    : detectFn(wtPath);
   if (!command) return { skipped: true };
 
-  const label = formatCommand(command);
+  // Shell-backed commands require killProcessGroup so all descendants (e.g.
+  // npm, pnpm, a test runner in an && chain) are terminated on timeout.
+  const killProcessGroup = !!configuredCmd;
+
+  const label = configuredCmd ?? formatCommand(command);
   console.log(`[pipeline] #${issueNumber}: test gate running \`${label}\``);
 
   // Run the test/build command and record it in the evidence bundle (#147).
   // `runTests` has no exit code (it reports pass/fail), so synthesize 0/1.
   // Best-effort: recording never affects the gate outcome.
   const runAndRecord = async (): Promise<RunTestsResult> => {
-    const res = await runTestsFn(wtPath, command, cfg.test_gate.timeout);
+    const res = await runTestsFn(wtPath, command, cfg.test_gate.timeout, killProcessGroup);
     if (stateDir) {
       await recordCommand(
         stateDir,
@@ -350,14 +374,17 @@ export function testGateBlockReason(gate: TestGateResult): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Spawn the test/build command with NO shell involvement (mirrors
- * harness.runCapped), capping output and enforcing a wall-clock timeout. A
- * non-zero exit, a timeout, or a spawn error all count as a failure.
+ * Spawn the test/build command, capping output and enforcing a wall-clock
+ * timeout. A non-zero exit, a timeout, or a spawn error all count as a
+ * failure. When `killProcessGroup` is true (required for shell-backed `sh -c`
+ * commands) the entire spawned process group is killed on timeout so shell
+ * descendants do not outlive the gate.
  */
 export async function runTests(
   cwd: string,
   command: ParsedCommand,
   timeoutSec: number,
+  killProcessGroup = false,
 ): Promise<RunTestsResult> {
   const res = await runCapped(
     command.cmd,
@@ -366,6 +393,7 @@ export async function runTests(
     timeoutSec,
     true,
     `test-gate:${command.cmd}`,
+    { killProcessGroup },
   );
   let output = combineOutput(res);
   if (res.timed_out) {
