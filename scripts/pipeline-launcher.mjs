@@ -44,6 +44,30 @@ if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
   process.exit(0);
 }
 
+// `pipeline path` discovery only needs Node built-ins (discovery.ts has no
+// third-party imports), so it is routed through the dependency-free entry
+// UNCONDITIONALLY — before the node_modules check. This keeps the desktop
+// discovery contract read-only-safe not just when core/node_modules is absent,
+// but also when a failed best-effort postinstall left it present-but-incomplete
+// (e.g. missing commander): the full CLI entry would die on its commander import
+// with ERR_MODULE_NOT_FOUND, so `path` must never depend on it.
+if (rawArgs[0] === "path") {
+  const pathCli = join(coreDir, "scripts", "path-cli.ts");
+  if (!existsSync(pathCli)) {
+    console.error(
+      `pipeline: core not found at ${pathCli}.\n` +
+        "         Re-install with: npm install -g agent-pipeline",
+    );
+    process.exit(1);
+  }
+  const run = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", pathCli, ...rawArgs.slice(1)],
+    { stdio: "inherit" },
+  );
+  process.exit(run.status ?? 1);
+}
+
 if (!existsSync(entry)) {
   console.error(
     `pipeline: core not found at ${entry}.\n` +
@@ -53,26 +77,13 @@ if (!existsSync(entry)) {
 }
 
 // Dependencies are provisioned by the package's best-effort postinstall script
-// at install time. They may be absent if that provisioning could not complete
-// (transient registry/cache failure, offline, or a read-only global package
-// dir). We must NOT attempt a write here — the installed package directory may
-// be root-owned/read-only — so command-time provisioning is never attempted.
+// at install time. They may be absent (or incomplete) if that provisioning could
+// not complete (transient registry/cache failure, offline, or a read-only global
+// package dir). We must NOT attempt a write here — the installed package directory
+// may be root-owned/read-only — so command-time provisioning is never attempted.
+// Engine commands (e.g. `run`) genuinely require the dependencies; `path` and
+// `--version` were already handled above and never reach this check.
 if (!existsSync(join(coreDir, "node_modules"))) {
-  // `pipeline path` only needs Node built-ins (discovery.ts has no third-party
-  // imports), so the desktop discovery contract stays read-only-safe even when
-  // provisioning failed: route it through the dependency-free discovery entry
-  // rather than failing with a reinstall hint.
-  if (rawArgs[0] === "path") {
-    const pathCli = join(coreDir, "scripts", "path-cli.ts");
-    const run = spawnSync(
-      process.execPath,
-      ["--experimental-strip-types", pathCli, ...rawArgs.slice(1)],
-      { stdio: "inherit" },
-    );
-    process.exit(run.status ?? 1);
-  }
-  // Commands that need the full engine (e.g. `run`) genuinely require the
-  // dependencies; direct the user to re-install rather than writing here.
   console.error(
     `pipeline: runtime dependencies not found at ${join(coreDir, "node_modules")}.\n` +
       "         `pipeline --version` and `pipeline path` still work; for runs, re-install\n" +

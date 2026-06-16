@@ -116,6 +116,23 @@ check("path --json exits 0 and emits valid JSON", () => {
         throw new Error(`expected re-install hint in stderr; got: ${r.stderr.toString().slice(0, 300)}`);
       }
     });
+
+    // Partial provisioning: node_modules EXISTS but is incomplete (a failed
+    // best-effort npm ci). `path` must still bypass the full CLI (which would die
+    // on its commander import) and return discovery JSON. Regression for the
+    // round-4 finding that the fallback only fired when node_modules was absent.
+    check("partial node_modules (present but incomplete): path --json still exits 0", () => {
+      mkdirSync(join(tmp, "core", "node_modules", ".partial-junk"), { recursive: true });
+      const r = spawnSync(NODE, [join(tmp, "scripts", "pipeline-launcher.mjs"), "path", "--json"], {
+        stdio: "pipe",
+      });
+      if (r.status !== 0) {
+        throw new Error(
+          `expected exit 0 for path --json with partial node_modules; got ${r.status}\nstderr: ${r.stderr.toString().slice(0, 300)}`,
+        );
+      }
+      JSON.parse(r.stdout.toString()); // must be valid discovery JSON
+    });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
