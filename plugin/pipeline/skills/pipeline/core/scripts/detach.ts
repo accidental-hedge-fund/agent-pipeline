@@ -143,6 +143,8 @@ export type SpawnDetachedDeps = {
   /** Process PID used in run-dir name. Injectable so tests get a deterministic path. */
   pid: () => number;
   spawn: typeof spawn;
+  /** Wait for the wrapper's lock handshake. Injectable so tests need not run a real wrapper. */
+  awaitLockHandshake: (runDir: string, timeoutMs: number) => Promise<LockHandshake>;
 };
 
 const defaultSpawnDeps: SpawnDetachedDeps = {
@@ -150,6 +152,7 @@ const defaultSpawnDeps: SpawnDetachedDeps = {
   now: () => Date.now(),
   pid: () => process.pid,
   spawn,
+  awaitLockHandshake: awaitLockHandshakeDefault,
 };
 
 // ---------------------------------------------------------------------------
@@ -255,6 +258,45 @@ async function acquireLock(lp: string, issue: number, timeoutMs: number): Promis
 }
 
 // ---------------------------------------------------------------------------
+// Lock-ownership handshake (#153)
+//
+// The launcher must NOT acquire the per-issue lock and then transfer it to the
+// child after spawn(): if the launcher dies in the window between spawn() and
+// the transfer, the wrapper runs while the lock names a dead launcher PID, and a
+// later run treats the lock as stale and starts a concurrent duplicate. Instead
+// the WRAPPER acquires the lock itself (so the lock always names a live process
+// for its whole life) and writes a handshake file; the launcher waits for that
+// file before reporting the run started, so a concurrent launch is still
+// rejected synchronously.
+// ---------------------------------------------------------------------------
+
+/** Written by the wrapper into its run dir once it holds the per-issue lock. */
+export const LOCK_ACQUIRED_FILE = ".lock-acquired";
+/** Written by the wrapper into its run dir when the lock is held by another run. */
+export const LOCK_FAILED_FILE = ".lock-failed";
+
+/** Outcome of waiting for the wrapper's lock handshake. */
+export type LockHandshake = { acquired: boolean; holder?: string };
+
+/** Poll a run dir for the wrapper's lock handshake file. Resolves
+ *  `{ acquired: true }` when `.lock-acquired` appears, `{ acquired: false, holder }`
+ *  when `.lock-failed` appears, and `{ acquired: false }` on timeout. */
+async function awaitLockHandshakeDefault(runDir: string, timeoutMs: number): Promise<LockHandshake> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (fs.existsSync(path.join(runDir, LOCK_ACQUIRED_FILE))) return { acquired: true };
+    try {
+      const holder = fs.readFileSync(path.join(runDir, LOCK_FAILED_FILE), "utf8").trim();
+      return { acquired: false, holder: holder || undefined };
+    } catch {
+      /* not failed yet */
+    }
+    if (Date.now() >= deadline) return { acquired: false };
+    await new Promise<void>((r) => setTimeout(r, 50));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // spawnDetached (library mode)
 // ---------------------------------------------------------------------------
 
@@ -281,10 +323,9 @@ export async function spawnDetached(
   const { timeout, flockTimeoutMs = 5000 } = opts;
   const home = deps.homedir();
 
-  // Acquire the advisory lock in the foreground so a concurrent second call
-  // fails with a clear error before this function returns.
+  // The wrapper (not the launcher) acquires the per-issue lock — see the
+  // lock-ownership handshake note above. We keep `lp` only for diagnostics.
   const lp = lockFilePath(home, issueNumber);
-  await acquireLock(lp, issueNumber, flockTimeoutMs);
 
   // Create a collision-proof run directory: millisecond-precision timestamp +
   // PID so two launches within the same second (or same millisecond on fast
@@ -300,7 +341,6 @@ export async function spawnDetached(
   const rd = makeRunDir(home, issueNumber, ts);
   fs.mkdirSync(rd, { recursive: true });
   if (fs.existsSync(path.join(rd, "sentinel.json"))) {
-    removeStaleLock(lp);
     throw new Error(
       `pipeline: run directory collision — ${rd} already contains sentinel.json from a prior run. ` +
         `Remove ${rd} if you want to start fresh.`,
@@ -321,7 +361,6 @@ export async function spawnDetached(
     String(issueNumber),
     "--flock-timeout",
     String(flockTimeoutMs),
-    "--lock-pre-acquired", // foreground already holds the lock
     ...(timeout !== undefined ? ["--timeout", String(timeout)] : []),
     ...(pipelineArgs.length > 0 ? ["--", ...pipelineArgs] : []),
   ];
@@ -334,14 +373,27 @@ export async function spawnDetached(
   fs.closeSync(logFd);
 
   if (child.pid === undefined) {
-    // Spawn failed — release the lock we held.
-    removeStaleLock(lp);
     throw new Error(`pipeline: failed to spawn detached process for #${issueNumber}`);
   }
 
-  // Transfer lock ownership to the child process. The wrapper will clean up
-  // the lock file on every exit path; it skips re-acquisition (--lock-pre-acquired).
-  fs.writeFileSync(lp, String(child.pid));
+  // Wait for the wrapper to acquire the lock and signal readiness before we
+  // report the run started. The wrapper owns the lock for its whole life, so the
+  // lock file always names a live PID (no parent-death transfer race). A
+  // concurrent launch for the same issue loses the wrapper's atomic acquire and
+  // reports failure here — preserving the "concurrent launch rejected" contract.
+  const handshake = await deps.awaitLockHandshake(rd, flockTimeoutMs + 2000);
+  if (!handshake.acquired) {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+    } catch {
+      /* wrapper already exited after writing .lock-failed */
+    }
+    throw new Error(
+      `pipeline: issue #${issueNumber} is already running` +
+        (handshake.holder ? ` (held by PID ${handshake.holder})` : "") +
+        `. Wait for the run to finish or remove ${lp} if it is stale.`,
+    );
+  }
 
   child.unref();
   return { runDir: rd, pid: child.pid };
@@ -359,7 +411,6 @@ export async function runWrapper(argv: string[]): Promise<void> {
   let issueNumber = 0;
   let timeout: number | undefined;
   let flockTimeoutMs = 5000;
-  let lockPreAcquired = false;
   const pipelinePassArgs: string[] = [];
 
   let i = 0;
@@ -377,8 +428,6 @@ export async function runWrapper(argv: string[]): Promise<void> {
       timeout = Number(args[++i]);
     } else if (a === "--flock-timeout") {
       flockTimeoutMs = Number(args[++i]);
-    } else if (a === "--lock-pre-acquired") {
-      lockPreAcquired = true;
     }
     i++;
   }
@@ -409,6 +458,34 @@ export async function runWrapper(argv: string[]): Promise<void> {
     }
   }
 
+  // Acquire the per-issue lock FIRST — before registering exit handlers and before
+  // any work — and signal the launcher via a handshake file. The wrapper owns the
+  // lock for its whole life, so the lock file always names a live PID; a launcher
+  // death cannot strand it (#153). Acquiring before the 'exit' handler is registered
+  // means a concurrent-rejection exit writes no sentinel (the run never started).
+  try {
+    await acquireLock(lp, issueNumber, flockTimeoutMs);
+  } catch (err) {
+    let holder = "";
+    try {
+      holder = fs.readFileSync(lp, "utf8").trim();
+    } catch {
+      /* lock vanished between the failed acquire and this read */
+    }
+    try {
+      fs.writeFileSync(path.join(runDirPath, LOCK_FAILED_FILE), holder);
+    } catch {
+      /* best-effort handshake */
+    }
+    process.stderr.write(`${(err as Error).message}\n`);
+    process.exit(1);
+  }
+  try {
+    fs.writeFileSync(path.join(runDirPath, LOCK_ACQUIRED_FILE), String(process.pid));
+  } catch {
+    /* best-effort handshake — the launcher's wait will time out and clean up */
+  }
+
   // 'exit' fires on process.exit() but NOT on SIGKILL. SIGTERM is handled below.
   process.on("exit", (code) => {
     doWriteSentinel(code ?? 1);
@@ -428,17 +505,6 @@ export async function runWrapper(argv: string[]): Promise<void> {
     removeStaleLock(lp);
     process.exit(143);
   });
-
-  // Acquire the advisory lock (skipped when the foreground launcher already holds it).
-  if (!lockPreAcquired) {
-    try {
-      await acquireLock(lp, issueNumber, flockTimeoutMs);
-    } catch (err) {
-      process.stderr.write(`${(err as Error).message}\n`);
-      // No sentinel: lock acquisition failure means the run never started.
-      process.exit(1);
-    }
-  }
 
   // Watchdog timer.
   let watchdogTimer: ReturnType<typeof setTimeout> | undefined;

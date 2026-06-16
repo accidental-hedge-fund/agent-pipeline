@@ -42,8 +42,13 @@ The detached run process SHALL write a `sentinel.json` file to its run directory
 - **WHEN** a detached run is still in progress
 - **THEN** `<run-dir>/sentinel.json` SHALL NOT exist
 
-### Requirement: Advisory flock serializes concurrent launches per issue
-The detached launcher SHALL acquire an advisory flock on a per-issue lock file before spawning the child process and hold it for the child's lifetime. A second `--detach` invocation for the same issue number SHALL attempt the flock for a configurable timeout (default 5 seconds) and exit non-zero with a human-readable error message if the lock cannot be acquired.
+### Requirement: Advisory lock serializes concurrent launches per issue
+The detached wrapper process SHALL acquire the per-issue advisory lock itself, as its first action, and hold it for its own lifetime — so the lock file always names a live process and a launcher death cannot strand it on a dead PID. The launcher SHALL NOT acquire the lock and transfer it to the child after spawning. The launcher SHALL wait for the wrapper to confirm lock ownership (a handshake) before reporting that the run started; if the wrapper reports the lock is already held, the launcher SHALL exit non-zero with a human-readable error. The wrapper SHALL attempt the lock for a configurable timeout (default 5 seconds) and a second `--detach` invocation for the same issue number that cannot acquire it SHALL exit non-zero.
+
+#### Scenario: Launcher death before lock ownership does not strand the lock
+- **WHEN** the launching process dies after spawning the wrapper but before the wrapper finishes starting
+- **THEN** the per-issue lock file SHALL name the wrapper (a live process), not the dead launcher
+- **AND** a later `pipeline run <N> --detach` SHALL NOT treat the lock as stale and start a concurrent duplicate run
 
 #### Scenario: Concurrent launch for the same issue is rejected
 - **WHEN** `pipeline run <N> --detach` is already running

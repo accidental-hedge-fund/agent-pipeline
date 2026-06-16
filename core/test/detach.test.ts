@@ -67,6 +67,8 @@ function makeTestDeps(homeDir: string) {
       // Simulate immediate fd close so openSync logFd is closed
       return child as unknown as ReturnType<(typeof deps)["spawn"]>;
     },
+    // Default: the wrapper acquired the lock — no real wrapper runs in unit tests.
+    awaitLockHandshake: async () => ({ acquired: true }),
     calls,
   };
   return deps;
@@ -364,31 +366,61 @@ test("handleRunSubcommand: missing number exits with code 2 without calling spaw
 // 5. Lock acquired in foreground (Finding: concurrent detach must fail fast)
 // ---------------------------------------------------------------------------
 
-test("spawnDetached: throws when advisory lock is already held by a live process", async () => {
+
+// #153 lock-handoff race fix: the launcher must NOT pre-acquire and transfer the
+// lock (a launcher death between spawn and transfer strands it on a dead PID).
+// The wrapper acquires the lock itself, so the flag is gone.
+test("spawnDetached: wrapper argv does NOT include --lock-pre-acquired (wrapper acquires the lock)", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    // Pre-create the lock file with the current process PID (guaranteed alive).
-    const lp = lockFilePath(home, 42);
-    fs.mkdirSync(path.dirname(lp), { recursive: true });
-    fs.writeFileSync(lp, String(process.pid));
+    await spawnDetached(42, [], {}, deps);
+    const args = deps.calls[0].args;
+    assert.ok(!args.includes("--lock-pre-acquired"), "launcher must not pre-acquire/transfer the lock");
+  } finally {
+    cleanup(home);
+  }
+});
 
+test("spawnDetached: does not create the lock file itself (wrapper owns the lock)", async () => {
+  const home = makeTmpDir();
+  try {
+    const deps = makeTestDeps(home);
+    await spawnDetached(42, [], {}, deps);
+    // The launcher no longer writes the per-issue lock; the wrapper does.
+    assert.ok(!fs.existsSync(lockFilePath(home, 42)), "launcher must not write the lock file");
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("spawnDetached: rejects when the wrapper reports the lock is already held (handshake fail)", async () => {
+  const home = makeTmpDir();
+  try {
+    const deps = { ...makeTestDeps(home), awaitLockHandshake: async () => ({ acquired: false, holder: "4321" }) };
     await assert.rejects(
-      () => spawnDetached(42, [], { flockTimeoutMs: 100 }, deps),
-      /already running/,
+      () => spawnDetached(42, [], {}, deps),
+      /already running \(held by PID 4321\)/,
     );
   } finally {
     cleanup(home);
   }
 });
 
-test("spawnDetached: wrapper argv includes --lock-pre-acquired", async () => {
+test("spawnDetached: waits for the handshake in the child's run dir", async () => {
   const home = makeTmpDir();
   try {
-    const deps = makeTestDeps(home);
-    await spawnDetached(42, [], {}, deps);
-    const args = deps.calls[0].args;
-    assert.ok(args.includes("--lock-pre-acquired"), "missing --lock-pre-acquired flag");
+    let seenRunDir = "";
+    const base = makeTestDeps(home);
+    const deps = {
+      ...base,
+      awaitLockHandshake: async (runDir: string) => {
+        seenRunDir = runDir;
+        return { acquired: true };
+      },
+    };
+    const result = await spawnDetached(42, [], {}, deps);
+    assert.equal(seenRunDir, result.runDir, "launcher must wait on the spawned run dir's handshake");
   } finally {
     cleanup(home);
   }
