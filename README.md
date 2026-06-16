@@ -682,6 +682,136 @@ The contract is deliberately **one-directional — the pipeline only ever reads 
 
 Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one shared implementation. Inverting behavior is a JSON edit, not a code change.
 
+## Desktop Integration
+
+Pipeline Desk (or any desktop app) can launch and supervise `agent-pipeline` runs as subprocesses using two stable, host-neutral entry points.
+
+The `pipeline` command is provided by the `agent-pipeline` npm package. Install it globally to make the command available system-wide:
+
+```bash
+npm install -g agent-pipeline
+pipeline --version   # verify the install
+```
+
+If you prefer not to install globally, you can also invoke it via `npx` with an explicit bin selection:
+
+```bash
+npx --package agent-pipeline pipeline path --json
+```
+
+> **Note:** `npx agent-pipeline` invokes the installer (`scripts/install.mjs`), not the pipeline CLI. Always use `npx --package agent-pipeline pipeline <subcommand>` to reach the `pipeline` bin directly.
+
+### Discover installed hosts — `pipeline path --json`
+
+Before launching a run, probe which hosts are installed:
+
+```bash
+pipeline path --json
+```
+
+Output (always exits 0; check `hostCoverage` to decide what to do):
+
+```jsonc
+// both hosts installed
+{
+  "corePath": "/Users/alice/.claude/skills/pipeline/core",
+  "version": "1.4.0",
+  "hostCoverage": "both",          // "missing" | "claude-only" | "codex-only" | "both"
+  "hosts": {
+    "claude": { "available": true,  "cliBin": "/usr/local/bin/claude" },
+    "codex":  { "available": true,  "cliBin": "/usr/local/bin/codex"  }
+  }
+}
+
+// no install
+{
+  "corePath": null, "version": null, "hostCoverage": "missing",
+  "hosts": {
+    "claude": { "available": false, "cliBin": null },
+    "codex":  { "available": false, "cliBin": null }
+  }
+}
+```
+
+| `hostCoverage` | Meaning |
+|---|---|
+| `"missing"` | `pipeline` core not found at any probe location — prompt user to install |
+| `"claude-only"` | Core found; only the `claude` CLI is reachable |
+| `"codex-only"` | Core found; only the `codex` CLI is reachable |
+| `"both"` | Core found; both CLIs are reachable |
+
+Exit code 0 for all resolved states (including `missing`); non-zero only on a probe error (e.g., `npm` not on PATH).
+
+### Launch a detached run — `pipeline run <N> --detach`
+
+Launches the pipeline as a detached background process that **survives the launcher's exit** (SIGTERM-proof via process-group escape):
+
+```bash
+pipeline run 153 --detach [--timeout <seconds>] [--flock-timeout <ms>]
+```
+
+The command prints the **run directory path** to stdout and exits immediately. The pipeline run continues in the background.
+
+```bash
+RUN_DIR=$(pipeline run 153 --detach --timeout 3600)
+echo "Run dir: $RUN_DIR"
+# /Users/alice/.pipeline/runs/153/2026-06-16_19-49-00
+```
+
+**Options:**
+- `--timeout <seconds>` — watchdog: kills the run after this many seconds and writes a non-zero sentinel. Recommended for production use.
+- `--flock-timeout <ms>` — max ms to wait for the per-issue advisory lock (default: 5000). A second launch for the same issue waits up to this long, then exits non-zero.
+
+### Run directory layout
+
+```
+~/.pipeline/runs/<issue>/<timestamp>/
+  pipeline.log      stdout + stderr of the pipeline run (appended continuously)
+  sentinel.json     written atomically when the run completes (absent while running)
+  ../
+    .lock           advisory lock file (present while a run is active)
+```
+
+### Poll for completion — `sentinel.json`
+
+A poller can classify the run state without parsing prose:
+
+```
+sentinel.json absent  → run is still in progress
+sentinel.json present → run is done (read exitCode to classify)
+```
+
+**`sentinel.json` schema:**
+
+```jsonc
+{
+  "exitCode": 0,                         // 0 = success; non-zero = failed; -1 = watchdog kill
+  "durationMs": 142000,
+  "completedAt": "2026-06-16T20:11:22Z",
+  "timedOut": true                        // only present when --timeout watchdog fired
+}
+```
+
+```javascript
+// Minimal Node.js poller
+const sentinelPath = path.join(runDir, "sentinel.json");
+while (!fs.existsSync(sentinelPath)) await sleep(5000);
+const { exitCode, timedOut } = JSON.parse(fs.readFileSync(sentinelPath, "utf8"));
+// exitCode === 0 → success; timedOut === true → watchdog; else → failure
+```
+
+### Pipeline Desk integration checklist
+
+1. Call `pipeline path --json` on startup; prompt install if `hostCoverage === "missing"`.
+2. Launch: `RUN_DIR=$(pipeline run <N> --detach --timeout 3600)`.
+3. Watch `$RUN_DIR/sentinel.json` for completion (poll or `fs.watch`).
+4. Stream `$RUN_DIR/pipeline.log` to the UI while the run is in progress.
+5. For a concurrent launch attempt on the same issue, `pipeline run` exits non-zero — handle the error (poll until the prior run finishes, then retry).
+
+### Human interfaces are unchanged
+
+`/pipeline` (Claude) and `$pipeline` (Codex) remain the first-class human entry points. The detached launcher is additive — it does not move any state-machine logic to the desktop side.
+
 ## Repository layout
 
 ```text

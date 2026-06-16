@@ -17,6 +17,8 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
+import { spawnDetached } from "./detach.ts";
+import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
   addLabel,
   clearBlocked,
@@ -99,18 +101,29 @@ export interface CliOpts {
   init?: boolean;
   doctor?: boolean;
   failFast?: boolean;
-  /** Emit machine-readable JSON (for --status and the doctor command). */
+  // `pipeline run <N> --detach` options
+  detach?: boolean;
+  timeout?: number;
+  flockTimeout?: number;
+  /** Emit machine-readable JSON (for --status, the doctor command, and `pipeline path`). */
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
   isOk?: boolean;
 }
 
-async function main(): Promise<void> {
+/**
+ * Build and return the configured Commander program (without parsing).
+ * Exported so tests can parse synthetic argv slices and verify CLI behaviour.
+ */
+export function buildCmd(): Command {
   const cmd = new Command();
   cmd
     .name("pipeline")
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
     .version(VERSION, "-V, --version", "print version and exit")
+    // Allow 'pipeline run <N> ...' and 'pipeline path' — they pass a second
+    // positional that Commander would otherwise reject as too many arguments.
+    .allowExcessArguments(true)
     .argument("[number]", "issue or PR number (required unless --cleanup)")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
@@ -132,10 +145,21 @@ async function main(): Promise<void> {
     .option("--base <branch>", "override the base branch (default: from .github/pipeline.yml or 'main')")
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
-    .parse(process.argv);
+    // `pipeline run <N> --detach` options
+    .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
+    .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
+    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number);
+  // Note: `--json` is defined once above; it serves --status, the doctor command,
+  // and `pipeline path` (the path subcommand is exempted from the --status-only check).
+  return cmd;
+}
+
+async function main(): Promise<void> {
+  const cmd = buildCmd();
+  cmd.parse(process.argv);
 
   const opts = cmd.opts<CliOpts>();
-  const numArg = cmd.args[0];
+  let numArg = cmd.args[0];
   const isInit = opts.init || numArg === "init";
   // `pipeline doctor` is a standalone command (like `init`): it runs the
   // preflight checks and exits, with no issue number. Distinct from the
@@ -155,7 +179,9 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  if (opts.json && !isDoctorCommand && !opts.status) {
+  // `pipeline path --json` legitimately emits discovery JSON, so exempt the path
+  // subcommand from the status/doctor-only --json requirement (#153 + #154).
+  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -166,6 +192,32 @@ async function main(): Promise<void> {
     const flag = opts.cleanup ? "--cleanup" : "--init (or 'pipeline init')";
     console.error(`pipeline: 'pipeline doctor' cannot be combined with ${flag}. These are separate commands.`);
     process.exit(2);
+  }
+
+  // `pipeline run <N> [--detach ...]` — subcommand dispatch.
+  if (numArg === "run") {
+    if (opts.detach) {
+      // Detach path: spawn a background wrapper and exit.
+      await handleRunSubcommand(cmd.args[1] ?? "", opts);
+      return;
+    }
+    // Non-detach: `pipeline run <N>` ≡ `pipeline <N>`. Redirect by overriding
+    // numArg so the normal lifecycle (kill-switch, preflight, issue/PR
+    // resolution) applies identically — avoids duplicating those guards here.
+    const runIssueArg = cmd.args[1] ?? "";
+    const runNum = Number.parseInt(runIssueArg, 10);
+    if (!Number.isFinite(runNum) || runNum <= 0) {
+      console.error("pipeline run: <number> argument is required and must be a positive integer");
+      process.exitCode = 2;
+      return;
+    }
+    numArg = runIssueArg;
+  }
+
+  // `pipeline path [--json]` — probe installed hosts and print the result.
+  if (numArg === "path") {
+    await handlePathSubcommand(opts);
+    return;
   }
 
   let cfg: PipelineConfig;
@@ -707,6 +759,110 @@ export async function runSummary(cfg: PipelineConfig, issueNumber: number): Prom
     return;
   }
   printSummary(bundle);
+}
+
+// ---------------------------------------------------------------------------
+// `pipeline run <N>` subcommand handler
+// ---------------------------------------------------------------------------
+
+/** IO seam for tests — override spawnDetached without touching the real filesystem. */
+export interface RunSubcommandDeps {
+  spawnDetached: typeof spawnDetached;
+}
+const defaultRunSubcommandDeps: RunSubcommandDeps = { spawnDetached };
+
+export async function handleRunSubcommand(
+  numStr: string,
+  opts: CliOpts,
+  deps: RunSubcommandDeps = defaultRunSubcommandDeps,
+): Promise<void> {
+  const number = Number.parseInt(numStr ?? "", 10);
+  if (!Number.isFinite(number) || number <= 0) {
+    console.error(`pipeline run: <number> argument is required and must be a positive integer`);
+    process.exitCode = 2;
+    return;
+  }
+
+  if (opts.detach) {
+    // Forward all launch-shaping options so the inner pipeline process respects
+    // the same profile / repo / model the caller specified (e.g. --profile claude).
+    const passArgs: string[] = [];
+    if (opts.profile) passArgs.push("--profile", opts.profile);
+    if (opts.repoPath) passArgs.push("--repo-path", opts.repoPath);
+    if (opts.base) passArgs.push("--base", opts.base);
+    if (opts.domain) passArgs.push("--domain", opts.domain);
+    if (opts.model) passArgs.push("--model", opts.model);
+    // Forward lifecycle / no-write semantics too. Omitting these silently broke
+    // the contract for the highest-risk mode: `pipeline run <N> --detach --dry-run`
+    // would otherwise start a REAL background advance that mutates GitHub/worktree
+    // after the launcher exits. These boolean flags must reach the inner process
+    // (or be rejected) so detached runs preserve dry-run/once/doctor semantics (#153).
+    if (opts.dryRun) passArgs.push("--dry-run");
+    if (opts.once) passArgs.push("--once");
+    if (opts.doctor) passArgs.push("--doctor");
+    if (opts.failFast) passArgs.push("--fail-fast");
+
+    let result: Awaited<ReturnType<typeof spawnDetached>>;
+    try {
+      result = await deps.spawnDetached(number, passArgs, {
+        timeout: opts.timeout,
+        flockTimeoutMs: opts.flockTimeout,
+      });
+    } catch (err) {
+      console.error(`pipeline run: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(result.runDir);
+    console.error(`[pipeline] #${number}: detached run started (PID ${result.pid})`);
+    console.error(`[pipeline] #${number}: log at ${result.runDir}/pipeline.log`);
+    console.error(`[pipeline] #${number}: poll ${result.runDir}/sentinel.json for completion`);
+    return;
+  }
+
+  // Non-detach: `pipeline run <N>` ≡ `pipeline <N>`. Resolve config and advance.
+  let cfg: PipelineConfig;
+  try {
+    cfg = resolveConfig({
+      repoPath: opts.repoPath,
+      domainOverride: opts.domain,
+      baseBranch: opts.base,
+      profile: opts.profile,
+    });
+  } catch (err) {
+    console.error(`pipeline run: ${(err as Error).message}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  if (!opts.dryRun) await ensurePipelineLabels(cfg);
+  await runAdvance(cfg, number, opts);
+}
+
+// ---------------------------------------------------------------------------
+// `pipeline path [--json]` subcommand handler
+// ---------------------------------------------------------------------------
+
+/** IO seam for tests — override discoverHosts. */
+export interface PathSubcommandDeps {
+  discoverHosts: typeof discoverHosts;
+}
+const defaultPathSubcommandDeps: PathSubcommandDeps = { discoverHosts };
+
+export async function handlePathSubcommand(
+  opts: CliOpts,
+  deps: PathSubcommandDeps = defaultPathSubcommandDeps,
+): Promise<void> {
+  let result: Awaited<ReturnType<typeof discoverHosts>>;
+  try {
+    result = await deps.discoverHosts();
+  } catch (err) {
+    console.error(`pipeline path: probe error: ${(err as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(formatDiscovery(result, !!opts.json));
 }
 
 // ---------------------------------------------------------------------------
