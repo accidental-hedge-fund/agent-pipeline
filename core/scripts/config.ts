@@ -95,6 +95,9 @@ const PartialConfigSchema = z.object({
   conventions_md_path: z.string().optional(),
   domain_name: z.string().optional(),
   domain_description: z.string().optional(),
+  // Worktree bootstrap: dependency install step (#174). Non-empty string →
+  // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
+  setup_command: z.string().optional(),
 }).strict();
 
 export interface ResolveOptions {
@@ -259,6 +262,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
+    setup_command: fileConfig.setup_command,
   };
   warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
@@ -495,5 +499,12 @@ review_policy: # which review findings block progression vs. merely advise (#17)
 doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
   runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure
   failFast: ${d.doctor.failFast} # if true, stop at the first failing check instead of collecting all failures
+
+# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)
+#   Auto-detected from lockfile when absent (pnpm-lock.yaml → pnpm install, yarn.lock → yarn install, package-lock.json → npm ci)
+#   Set to "" to skip the install step entirely (opt-out). Examples:
+#     setup_command: ""                                       # opt-out
+#     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
+#     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
 `;
 }

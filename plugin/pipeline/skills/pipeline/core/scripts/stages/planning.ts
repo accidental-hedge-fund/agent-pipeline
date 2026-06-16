@@ -29,6 +29,7 @@ import {
   hasCommitsAhead,
   slugify,
 } from "../worktree.ts";
+import { detectAndInstall } from "../worktree-setup.ts";
 import {
   buildImplementingPrompt,
   buildPlanningOpenspecPrompt,
@@ -216,6 +217,18 @@ export async function advance(
     return { advanced: false, status: "blocked", reason: e.message };
   }
 
+  // ---- Step 5b: dependency install ----
+  try {
+    const setup = await detectAndInstall(wt.path, cfg);
+    if (!setup.skipped) {
+      console.log(`[pipeline] #${issueNumber}: worktree setup complete (${setup.command})`);
+    }
+  } catch (err) {
+    const e = err as Error;
+    await setBlocked(cfg, issueNumber, `Worktree setup failed: ${e.message}`, preImplStage, "worktree-setup-failed");
+    return { advanced: false, status: "blocked", reason: e.message };
+  }
+
   // ---- Step 6: → implementing ----
   await transition(
     cfg,
@@ -399,6 +412,18 @@ async function advanceOpenspec(
   } catch (err) {
     const e = err as Error;
     await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, "ready", "worktree-creation-failed");
+    return { advanced: false, status: "blocked", reason: e.message };
+  }
+
+  // ---- Dependency install ----
+  try {
+    const setup = await detectAndInstall(wt.path, cfg);
+    if (!setup.skipped) {
+      console.log(`[pipeline] #${issueNumber}: worktree setup complete (${setup.command})`);
+    }
+  } catch (err) {
+    const e = err as Error;
+    await setBlocked(cfg, issueNumber, `Worktree setup failed: ${e.message}`, "ready", "worktree-setup-failed");
     return { advanced: false, status: "blocked", reason: e.message };
   }
 

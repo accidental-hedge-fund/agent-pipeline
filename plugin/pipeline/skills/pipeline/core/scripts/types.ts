@@ -57,6 +57,7 @@ export const BLOCKER_KINDS = [
   "push-failed",
   "eval-gate-misconfigured",
   "eval-gate-failed",
+  "worktree-setup-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -140,6 +141,12 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
   "eval-gate-failed":
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "worktree-setup-failed":
+    "The worktree dependency install step failed (see the error above). " +
+    "Fix the root cause (package manager not installed, bad lockfile, network " +
+    "issue), or set `setup_command: \"\"` in `.github/pipeline.yml` to skip " +
+    "the install step. Then remove the `blocked` label and re-run " +
     "`$pipeline {{N}}`.",
 };
 
@@ -239,6 +246,11 @@ export interface PipelineConfig {
     runOnStart: boolean;
     failFast: boolean;
   };
+  // Worktree bootstrap: dependency install step (#174).
+  // When set to a non-empty string, that shell command is run in the worktree
+  // instead of auto-detection. When set to "" the install step is skipped
+  // entirely. When absent (undefined), auto-detection runs from lockfile.
+  setup_command?: string;
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed
   domain_name?: string;
