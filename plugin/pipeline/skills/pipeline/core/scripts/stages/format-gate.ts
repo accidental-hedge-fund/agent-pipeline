@@ -81,6 +81,13 @@ export async function runFormatGate(
             reason: `Format gate command '${command}' failed after auto-fix:\n${r2.combined}`,
           };
         }
+        // Verify the re-run itself did not produce more changes (non-stable formatter).
+        if (await isDirty(wtPath)) {
+          return {
+            status: "blocked",
+            reason: `Format gate command '${command}' is non-stable: re-run after auto-fix still produced uncommitted changes`,
+          };
+        }
       }
     } else {
       // Check-only: block immediately on non-zero exit, no worktree mutation.

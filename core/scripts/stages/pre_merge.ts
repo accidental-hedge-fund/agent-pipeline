@@ -658,7 +658,11 @@ async function computeBranchDeveloperCommits(
     const sha = line.slice(0, sep).trim();
     if (!sha) continue;
     const subj = line.slice(sep + 1).trim();
-    if (isPipelineInternalCommit(subj)) continue;
+    // Only skip the pipeline's own OpenSpec archive commits — auto-format commits
+    // can change implementation files and must remain visible to the stale-spec
+    // guard even though they are classified as pipeline-internal for the
+    // review-SHA gate (#182 finding 3).
+    if (subj.startsWith(OPENSPEC_ARCHIVE_PREFIX)) continue;
     const d = await gitFn(wtPath, ["diff", "--name-only", `${sha}^`, sha], { ignoreFailure: true });
     const paths = d.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
     result.push({ sha, paths });

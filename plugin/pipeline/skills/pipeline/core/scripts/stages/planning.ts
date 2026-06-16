@@ -799,19 +799,19 @@ export async function resumeFromImplementing(
 
   const branch = wt.branch;
 
-  // ---- Format/lint gate (#182): runs before the test gate so auto-formatted
-  //      code is what the test gate validates ----
-  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
-  if (fmtResult.status === "blocked") {
-    await blocker(cfg, issueNumber, fmtResult.reason, "implementing", "needs-human");
-    return { advanced: false, status: "blocked", reason: fmtResult.reason };
-  }
-
   // ---- Test/build gate ----
   const gate = await gateRunner(cfg, issueNumber, wt.path, {}, opts.pipelineRunId, "planning", opts.stateDir);
   if (!gate.skipped && !gate.passed) {
     await blocker(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
+  }
+
+  // ---- Format/lint gate (#182): runs after the test gate so test-fix harness
+  //      commits are also format/lint-checked before the PR is opened ----
+  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
+  if (fmtResult.status === "blocked") {
+    await blocker(cfg, issueNumber, fmtResult.reason, "implementing", "needs-human");
+    return { advanced: false, status: "blocked", reason: fmtResult.reason };
   }
 
   // ---- Push ----

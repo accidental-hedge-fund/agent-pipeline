@@ -68,10 +68,11 @@ test("format gate: no-op when format_gate is absent (undefined cast to empty)", 
 test("format gate: auto-fix produces changes, commit created, re-run passes → ok", async () => {
   const tracker = commitTracker();
   // First exec exits 0 (auto-fix ran successfully). Second exec (re-run) exits 0.
-  // dirtySeq: pre-flight call → false (clean), post-command call → true (dirty).
+  // dirtySeq: pre-flight → false (clean), post-command → true (dirty, triggers commit),
+  //           post-re-run → false (stable, no further changes).
   const result = await runFormatGate("/wt", cfg([{ command: "cargo fmt", auto_fix: true }]), 42, {
     execInWorktree: execSeq([{ code: 0 }, { code: 0 }]),
-    gitIsDirty: dirtySeq([false, true]),
+    gitIsDirty: dirtySeq([false, true, false]),
     gitCommit: tracker.gitCommit,
   });
   assert.equal(result.status, "ok");
@@ -234,6 +235,31 @@ test("format gate: pre-existing dirty worktree blocks before any command runs", 
     "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
     `unexpected reason: ${JSON.stringify(result)}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Regression: auto-fix re-run leaves dirty worktree → non-stable formatter (#182 review-2 finding 2)
+// ---------------------------------------------------------------------------
+
+test("format gate: auto-fix re-run exits 0 but leaves dirty worktree → blocked (non-stable formatter)", async () => {
+  const tracker = commitTracker();
+  // dirtySeq: pre-flight → false, post-command → true (dirty, triggers commit), post-re-run → true again (non-stable)
+  const result = await runFormatGate("/wt", cfg([{ command: "cargo fmt", auto_fix: true }]), 42, {
+    execInWorktree: execSeq([{ code: 0 }, { code: 0 }]),
+    gitIsDirty: dirtySeq([false, true, true]),
+    gitCommit: tracker.gitCommit,
+  });
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("non-stable"),
+    `expected non-stable reason: ${JSON.stringify(result)}`,
+  );
+  assert.ok(
+    "reason" in result && result.reason.includes("cargo fmt"),
+    `expected command name in reason: ${JSON.stringify(result)}`,
+  );
+  // Commit was still created before the non-stable check
+  assert.equal(tracker.commits.length, 1);
 });
 
 // ---------------------------------------------------------------------------

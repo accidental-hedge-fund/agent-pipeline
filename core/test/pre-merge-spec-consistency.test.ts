@@ -92,6 +92,61 @@ test("guard: no developer commits → not blocked", async () => {
   assert.equal(await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps), null);
 });
 
+// ---- computeBranchDeveloperCommits: auto-format commits visible to stale-spec guard (#182 review-2 finding 3) ----
+//
+// maybeArchiveOpenspec uses deps.branchDeveloperCommits when injected; the
+// default implementation is computeBranchDeveloperCommits. We test it indirectly
+// here by omitting the dep and providing a gitInWorktree fake that emits an
+// auto-format commit alongside a diff touching an implementation file. The guard
+// MUST see the commit (so it can detect staleness), verifying that auto-format
+// commits are NOT filtered out of the developer-commit list.
+
+test("computeBranchDeveloperCommits (via guard): auto-format commit changing impl files IS visible to stale-spec guard", async () => {
+  const blocked: string[] = [];
+  // Build a fake log: one auto-format commit that touches an implementation file.
+  // gitInWorktree is called for: "diff --name-only" (candidates), "log" (commits), and
+  // "diff --name-only sha^..sha" (per-commit paths). We discriminate by the args.
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    // 1. diff for candidates (three-dot form: origin/main...HEAD)
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    // 2. log to enumerate commits
+    if (args[0] === "log") {
+      const sha = "autoFmtSha";
+      const msg = `chore: auto-format (#42)`;
+      return { stdout: `${sha}\x1f${msg}`, stderr: "", code: 0 };
+    }
+    // 3. per-commit diff (sha^..sha)
+    if (args[0] === "diff" && args.some((a) => a.includes("^"))) {
+      return { stdout: "core/scripts/foo.ts", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => true,
+    // No branchDeveloperCommits override → uses computeBranchDeveloperCommits default
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewWithMarker, createdAt: "t" }],
+    })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string) => {
+      blocked.push(reason);
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+  // The auto-format commit changed an impl file → stale-spec guard fires → blocked
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    `expected blocked outcome; got: ${JSON.stringify(out)}`);
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0], /stale spec delta/);
+});
+
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
 
 test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, archive never called", async () => {

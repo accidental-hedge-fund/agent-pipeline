@@ -184,19 +184,20 @@ export async function advanceFix(
     }
   }
 
-  // ---- Format/lint gate (#182): runs before the test gate ----
-  const fmtGateFn = deps.runFormatGate ?? runFormatGate;
-  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
-  if (fmtResult.status === "blocked") {
-    await setBlocked(cfg, issueNumber, fmtResult.reason, stage, "needs-human");
-    return { advanced: false, status: "blocked", reason: fmtResult.reason };
-  }
-
   // ---- test/build gate (#15) — must pass before advancing past this fix round ----
   const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, stage, opts.stateDir);
   if (!gate.skipped && !gate.passed) {
     await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage, "test-gate-exhausted");
     return { advanced: false, status: "blocked", reason: "test gate failed" };
+  }
+
+  // ---- Format/lint gate (#182): runs after the test gate so test-fix harness
+  //      commits are also format/lint-checked before the branch is pushed ----
+  const fmtGateFn = deps.runFormatGate ?? runFormatGate;
+  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
+  if (fmtResult.status === "blocked") {
+    await setBlocked(cfg, issueNumber, fmtResult.reason, stage, "needs-human");
+    return { advanced: false, status: "blocked", reason: fmtResult.reason };
   }
 
   const branch = branchName(issueNumber, wt.slug);
