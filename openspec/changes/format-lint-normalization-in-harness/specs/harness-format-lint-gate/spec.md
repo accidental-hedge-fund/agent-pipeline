@@ -29,10 +29,10 @@ The format/lint gate SHALL run before the test/build gate, and the pipeline SHAL
 - **WHEN** the test gate's fix loop commits a fix-harness change in a round
 - **THEN** the pipeline SHALL run the format gate again in a subsequent round before opening or updating the PR
 
-#### Scenario: Convergence is bounded
+#### Scenario: Convergence is bounded and a non-converged state blocks
 
-- **WHEN** the format and test gates keep producing commits every round
-- **THEN** the pipeline SHALL stop after a fixed maximum number of rounds rather than looping indefinitely
+- **WHEN** the format and test gates keep producing commits every round and no round reaches a fixed point within the maximum number of rounds
+- **THEN** the pipeline SHALL block (routing to `needs-human`) rather than looping indefinitely or advancing the non-converged (possibly unformatted or untested) state to a PR
 
 ### Requirement: Auto-fix entries mutate the worktree and commit the diff
 

@@ -114,9 +114,11 @@ export async function runFormatGate(
 
 export type FormatTestGateResult =
   | { ok: true; gate: TestGateResult }
-  // `source` identifies which gate blocked so the caller can pass the matching
-  // literal BlockerKind ("format" → needs-human, "test" → test-gate-exhausted).
-  | { ok: false; reason: string; source: "format" | "test" };
+  // `source` identifies why it blocked so the caller can pass the matching
+  // literal BlockerKind: "test" → test-gate-exhausted; "format" (a format/lint
+  // failure) and "noconverge" (gates still mutating at the round cap) →
+  // needs-human.
+  | { ok: false; reason: string; source: "format" | "test" | "noconverge" };
 
 export interface FormatTestGateDeps {
   runFormatGate?: typeof runFormatGate;
@@ -152,6 +154,7 @@ export async function runFormatAndTestGates(
   const test = deps.runTestGate ?? runTestGate;
 
   let gate: TestGateResult = { skipped: true };
+  let converged = false;
   for (let round = 0; round < MAX_FORMAT_TEST_ROUNDS; round++) {
     const fmtResult = await fmt(wtPath, cfg, issueNumber);
     if (fmtResult.status === "blocked") {
@@ -167,7 +170,25 @@ export async function runFormatAndTestGates(
     // fix loop made no commit (attempts === 0), so the pushed state is
     // simultaneously formatted and tested. Otherwise loop to re-verify both gates
     // against whatever the last mutation produced.
-    if (!fmtResult.committed && (gate.attempts ?? 0) === 0) break;
+    if (!fmtResult.committed && (gate.attempts ?? 0) === 0) {
+      converged = true;
+      break;
+    }
+  }
+
+  // Did NOT reach a fixed point within the cap: the last round still produced a
+  // commit (an auto-format change or a test-gate fix), so the final state may be
+  // unformatted or untested. Block rather than advancing a non-converged state.
+  if (!converged) {
+    return {
+      ok: false,
+      reason:
+        `Format and test gates did not converge after ${MAX_FORMAT_TEST_ROUNDS} rounds — ` +
+        `the last round still produced a commit, so the pushed state may be unformatted ` +
+        `or untested. Investigate the format_gate / test_gate interaction (e.g. a formatter ` +
+        `and the test-fix harness fighting over the same files).`,
+      source: "noconverge",
+    };
   }
   return { ok: true, gate };
 }

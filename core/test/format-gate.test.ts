@@ -365,10 +365,13 @@ test("runFormatAndTestGates: test-gate failure → ok:false, source=test (caller
   assert.equal(res.ok === false && res.source, "test");
 });
 
-test("runFormatAndTestGates: bounded — never exceeds MAX rounds even if mutations persist", async () => {
-  // Both gates always report a mutation; must stop at the cap, not loop forever.
+test("runFormatAndTestGates: non-convergence at the round cap → blocked (source=noconverge), bounded", async () => {
+  // Both gates report a mutation every round, so the loop never reaches a fixed
+  // point. It must BLOCK rather than advance a possibly-unformatted/untested
+  // state at the cap. Bites the bug where the loop fell through to ok:true.
   const c = convergeDeps([{ status: "ok", committed: true }], [{ passed: true, attempts: 1 }]);
   const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
-  assert.equal(res.ok, true);
-  assert.ok(c.fmtCalls() <= 3 && c.testCalls() <= 3, "iterations are bounded");
+  assert.equal(res.ok, false);
+  assert.equal(res.ok === false && res.source, "noconverge");
+  assert.ok(c.fmtCalls() <= 3 && c.testCalls() <= 3, "iterations are bounded (no infinite loop)");
 });

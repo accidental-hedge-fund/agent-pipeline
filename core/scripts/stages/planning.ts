@@ -811,7 +811,7 @@ export async function resumeFromImplementing(
   if (!gates.ok) {
     await blocker(
       cfg, issueNumber, gates.reason, "implementing",
-      gates.source === "format" ? "needs-human" : "test-gate-exhausted",
+      gates.source === "test" ? "test-gate-exhausted" : "needs-human",
     );
     return { advanced: false, status: "blocked", reason: gates.reason };
   }
