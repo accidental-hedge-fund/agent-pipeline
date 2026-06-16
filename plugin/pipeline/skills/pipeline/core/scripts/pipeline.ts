@@ -1064,12 +1064,16 @@ async function dispatch(
       };
     case "planning":
     case "plan-review":
-    case "implementing":
       return {
         advanced: false,
         status: "waiting",
         reason: `${stage} is set mid-flight by the planning/plan-review handler; nothing to do at this point.`,
       };
+    case "implementing":
+      // Re-entry: if a worktree with commits exists, resume the post-implementation
+      // steps (gate → push → PR → review-1) without re-planning or re-implementing.
+      // Falls back to "waiting" when no such worktree exists (mid-flight guard).
+      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
     default:
       return { advanced: false, status: "error", reason: `unknown stage ${stage}` };
   }
