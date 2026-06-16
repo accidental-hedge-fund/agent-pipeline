@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
+import { resolveConfig, scaffoldDefaultConfig, generateConfigSchema, validateConfig } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -105,7 +105,7 @@ export interface CliOpts {
   detach?: boolean;
   timeout?: number;
   flockTimeout?: number;
-  /** Emit machine-readable JSON (for --status, the doctor command, and `pipeline path`). */
+  /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate`). */
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
   isOk?: boolean;
@@ -150,7 +150,9 @@ export function buildCmd(): Command {
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
     .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number);
   // Note: `--json` is defined once above; it serves --status, the doctor command,
-  // and `pipeline path` (the path subcommand is exempted from the --status-only check).
+  // `pipeline path`, and `pipeline config validate` (path/config are exempted from
+  // the --status-only check). `allowExcessArguments(true)` (above) permits the
+  // second positional of `run <N>`, `path`, and `config <verb>`.
   return cmd;
 }
 
@@ -179,9 +181,9 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  // `pipeline path --json` legitimately emits discovery JSON, so exempt the path
-  // subcommand from the status/doctor-only --json requirement (#153 + #154).
-  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path") {
+  // `pipeline path --json` and `pipeline config validate --json` legitimately emit
+  // JSON, so exempt those subcommands from the status/doctor-only --json requirement.
+  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path" && numArg !== "config") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -194,8 +196,22 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // `pipeline config schema` and `pipeline config validate` — dispatch before
+  // resolveConfig() so they work without gh auth or a fully resolvable repo.
+  if (numArg === "config") {
+    await runConfigCommand(cmd.args.slice(1), opts);
+    return;
+  }
+
   // `pipeline run <N> [--detach ...]` — subcommand dispatch.
   if (numArg === "run") {
+    // Reject extra positionals BEFORE the --detach branch so a malformed detached
+    // run (e.g. `pipeline run 123 config validate --detach`) cannot start a real
+    // background advance — the post-dispatch guard never runs on the detach path (#156).
+    if (cmd.args.length > 2) {
+      console.error(`pipeline run: unexpected argument(s): ${cmd.args.slice(2).join(", ")}`);
+      process.exit(2);
+    }
     if (opts.detach) {
       // Detach path: spawn a background wrapper and exit.
       await handleRunSubcommand(cmd.args[1] ?? "", opts);
@@ -218,6 +234,17 @@ async function main(): Promise<void> {
   if (numArg === "path") {
     await handlePathSubcommand(opts);
     return;
+  }
+
+  // Guard: extra positional arguments are a mistake for the remaining commands
+  // (plain `pipeline <N>`, doctor, init). `run <N>` legitimately has two positionals
+  // ("run" + number); `config`/`path` already returned above. Catches e.g.
+  // "pipeline 123 config validate", which would otherwise advance issue 123 (#156).
+  const maxPositionals = cmd.args[0] === "run" ? 2 : 1;
+  if (cmd.args.length > maxPositionals) {
+    const extra = cmd.args.slice(maxPositionals).join(", ");
+    console.error(`pipeline: unexpected argument(s): ${extra}`);
+    process.exit(2);
   }
 
   let cfg: PipelineConfig;
@@ -431,6 +458,68 @@ export async function runInit(cfg: PipelineConfig): Promise<void> {
     console.log(`[pipeline] init: .github/pipeline.yml already exists — skipping scaffold.`);
   }
   console.log(`[pipeline] init: pipeline labels ensured in ${cfg.repo}.`);
+}
+
+// ---------------------------------------------------------------------------
+// Config subcommands (#156)
+// ---------------------------------------------------------------------------
+
+/**
+ * `pipeline config schema`  — print JSON Schema for .github/pipeline.yml
+ * `pipeline config validate` — validate config and print structured diagnostics
+ */
+export async function runConfigCommand(args: string[], opts: CliOpts): Promise<void> {
+  const subcmd = args[0];
+
+  if (subcmd === "schema") {
+    if (args.length > 1) {
+      console.error(`pipeline config schema: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const schema = generateConfigSchema();
+    process.stdout.write(JSON.stringify(schema, null, 2) + "\n");
+    process.exitCode = 0;
+    return;
+  }
+
+  if (subcmd === "validate") {
+    if (args.length > 1) {
+      console.error(`pipeline config validate: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const repoPath = opts.repoPath ?? process.cwd();
+    const result = validateConfig(repoPath, { profile: opts.profile });
+
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else {
+      if (result.diagnostics.length === 0) {
+        console.log("pipeline config: valid (no diagnostics)");
+      } else {
+        for (const d of result.diagnostics) {
+          const prefix = d.severity === "error" ? "ERROR" : "WARN ";
+          const loc = d.path ? ` [${d.path}]` : "";
+          const lineStr = d.line != null ? ` (line ${d.line})` : "";
+          console.log(`  ${prefix}${loc}${lineStr}: ${d.message}`);
+        }
+        if (result.valid) {
+          console.log("pipeline config: valid (warnings only)");
+        } else {
+          console.log("pipeline config: invalid");
+        }
+      }
+    }
+
+    const hasError = result.diagnostics.some((d) => d.severity === "error");
+    process.exitCode = hasError ? 1 : 0;
+    return;
+  }
+
+  const sub = subcmd ? `"${subcmd}"` : "(none)";
+  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate`);
+  process.exitCode = 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 import { z } from "zod";
 import yaml from "js-yaml";
+import { parseDocument } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -9,91 +10,104 @@ import { DEFAULT_CONFIG, type Harness, type PipelineConfig } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 
 const PartialConfigSchema = z.object({
-  repo: z.string().optional(),
-  base_branch: z.string().optional(),
-  worktree_root: z.string().optional(),
-  max_concurrent_worktrees: z.number().int().positive().optional(),
-  auto_recovery_max_retries: z.number().int().min(0).optional(),
-  implementation_timeout: z.number().int().positive().optional(),
-  review_timeout: z.number().int().positive().optional(),
-  fix_timeout: z.number().int().positive().optional(),
-  ci_timeout: z.number().int().positive().optional(),
-  ci_poll_interval: z.number().int().positive().optional(),
+  repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value)."),
+  base_branch: z.string().optional().describe("Branch that PRs target and worktrees branch from."),
+  worktree_root: z.string().optional().describe("Directory (relative to repo root) where pipeline worktrees are created."),
+  max_concurrent_worktrees: z.number().int().positive().optional().describe("Maximum number of simultaneous in-flight worktrees."),
+  auto_recovery_max_retries: z.number().int().min(0).optional().describe("Number of auto-recovery attempts when implementation blocks."),
+  implementation_timeout: z.number().int().positive().optional().describe("Seconds for the implementation harness before timing out."),
+  review_timeout: z.number().int().positive().optional().describe("Seconds per review stage."),
+  fix_timeout: z.number().int().positive().optional().describe("Seconds per fix stage."),
+  ci_timeout: z.number().int().positive().optional().describe("Seconds to wait for CI at pre-merge."),
+  ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
   // Each alias is independently optional so a partial `models:` block (e.g.
   // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
   // and the inert-alias warning keys off which sub-keys were explicitly set.
   models: z
     .object({
-      planning: z.string().optional(),
-      implementing: z.string().optional(),
-      review: z.string().optional(),
-      fix: z.string().optional(),
+      planning: z.string().optional().describe("Model alias for the planning phase (implementer harness)."),
+      implementing: z.string().optional().describe("Model alias for the implementing phase (implementer harness)."),
+      review: z.string().optional().describe("Model alias for the review phase (reviewer harness)."),
+      fix: z.string().optional().describe("Model alias for the fix phase (implementer harness)."),
     })
     .strict()
-    .optional(),
+    .optional()
+    .describe("Per-phase model aliases; only honored when the role's harness is claude (codex ignores them)."),
   openspec: z
     .object({
-      enabled: z.enum(["auto", "on", "off"]).optional(),
-      bootstrap: z.boolean().optional(),
+      enabled: z.enum(["auto", "on", "off"]).optional().describe("Whether to require OpenSpec: auto=only when openspec/ exists, on=always, off=never."),
+      bootstrap: z.boolean().optional().describe("Run 'openspec init' on repos that lack an openspec/ directory."),
     })
-    .optional(),
+    .strict()
+    .optional()
+    .describe("OpenSpec spec-driven-development integration settings."),
   last30days: z
     .object({
-      enabled: z.boolean().optional(),
-      timeout: z.number().int().positive().optional(),
+      enabled: z.boolean().optional().describe("Enable the pre-planning activity brief (opt-in)."),
+      timeout: z.number().int().positive().optional().describe("Timeout in seconds for the last-30-days step."),
     })
-    .optional(),
+    .strict()
+    .optional()
+    .describe("Pre-planning activity brief from the last 30 days of git history."),
   steps: z
     .object({
-      plan_review: z.boolean().optional(),
-      standard_review: z.boolean().optional(),
-      adversarial_review: z.boolean().optional(),
-      docs: z.boolean().optional(),
+      plan_review: z.boolean().optional().describe("Cross-harness review of the plan before coding begins."),
+      standard_review: z.boolean().optional().describe("First review round (review-1) and its fix round."),
+      adversarial_review: z.boolean().optional().describe("Second adversarial review round (review-2) and its fix round."),
+      docs: z.boolean().optional().describe("Include documentation update instructions in the implementing prompt."),
     })
     .strict()
-    .optional(),
+    .optional()
+    .describe("Toggle optional pipeline steps on or off."),
   test_gate: z
     .object({
-      enabled: z.boolean().optional(),
-      command: z.string().optional(),
-      max_attempts: z.number().int().positive().optional(),
-      timeout: z.number().int().positive().optional(),
+      enabled: z.boolean().optional().describe("Enable the test gate before opening a PR."),
+      command: z.string().optional().describe("Explicit test command; auto-detected from lockfile when absent."),
+      max_attempts: z.number().int().positive().optional().describe("Maximum fix-harness invocations before blocking."),
+      timeout: z.number().int().positive().optional().describe("Seconds per test/build run."),
     })
-    .optional(),
+    .strict()
+    .optional()
+    .describe("Run the repo's tests/build before opening a PR."),
   eval_gate: z
     .object({
-      enabled: z.boolean().optional(),
-      command: z.string().optional(),
-      mode: z.enum(["gate", "advisory"]).optional(),
-      timeout: z.number().int().positive().optional(),
-      max_attempts: z.number().int().positive().optional(),
+      enabled: z.boolean().optional().describe("Enable the eval gate (set true to activate; one-time declaration per repo)."),
+      command: z.string().optional().describe("Shell command to run evals (required when enabled)."),
+      mode: z.enum(["gate", "advisory"]).optional().describe("gate: block on failure; advisory: record result and advance."),
+      timeout: z.number().int().positive().optional().describe("Stage-level budget in seconds (shared across attempts)."),
+      max_attempts: z.number().int().positive().optional().describe("Total attempts before giving up (1 = no retry)."),
     })
-    .optional(),
+    .strict()
+    .optional()
+    .describe("Run the repo's eval harness after pre-merge."),
   shipcheck_gate: z
     .object({
-      enabled: z.boolean().optional(),
-      mode: z.enum(["advisory", "gate"]).optional(),
-      max_rounds: z.number().int().min(1).optional(),
-      rubric_path: z.string().optional(),
-      block_on_partial: z.boolean().optional(),
+      enabled: z.boolean().optional().describe("Enable the shipcheck gate."),
+      mode: z.enum(["advisory", "gate"]).optional().describe("advisory: record findings without blocking; gate: block on failure."),
+      max_rounds: z.number().int().min(1).optional().describe("Maximum reviewer invocations before routing to needs-human."),
+      rubric_path: z.string().optional().describe("Repo-root-relative path to the Markdown rubric file."),
+      block_on_partial: z.boolean().optional().describe("When true and mode=gate, a partial verdict also blocks."),
     })
     .strict()
-    .optional(),
+    .optional()
+    .describe("Reviewer-owned acceptance rubric gate after eval-gate."),
   review_policy: z
     .object({
-      block_threshold: z.enum(["critical", "high", "medium", "low"]).optional(),
-      min_confidence: z.number().min(0).max(1).optional(),
-      max_adversarial_rounds: z.number().int().positive().optional(),
+      block_threshold: z.enum(["critical", "high", "medium", "low"]).optional().describe("Findings at or above this severity block progression; below advise only."),
+      min_confidence: z.number().min(0).max(1).optional().describe("Findings below this confidence score (0–1) advise rather than block."),
+      max_adversarial_rounds: z.number().int().positive().optional().describe("Maximum adversarial review re-runs before routing still-blocking findings to needs-human."),
     })
     .strict()
-    .optional(),
+    .optional()
+    .describe("Controls which review findings block progression vs. merely advise."),
   doctor: z
     .object({
-      runOnStart: z.boolean().optional(),
-      failFast: z.boolean().optional(),
+      runOnStart: z.boolean().optional().describe("Run preflight checks before planning; abort on any failure."),
+      failFast: z.boolean().optional().describe("Stop at the first failing check instead of collecting all failures."),
     })
     .strict()
-    .optional(),
+    .optional()
+    .describe("Deterministic preflight capability check settings."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -101,13 +115,13 @@ const PartialConfigSchema = z.object({
   // `command`). The implementer harness remains profile-only — there is no
   // companion `implementer`/`harnesses` key, and the deleted `harnesses:` block
   // stays rejected by the strict schema.
-  review_harness: z.string().optional(),
-  conventions_md_path: z.string().optional(),
-  domain_name: z.string().optional(),
-  domain_description: z.string().optional(),
+  review_harness: z.string().optional().describe("Override the reviewer CLI for the review step (profile default when absent)."),
+  conventions_md_path: z.string().optional().describe("Repo-root-relative path to the conventions file embedded in stage prompts."),
+  domain_name: z.string().optional().describe("Human-readable project name used in prompts and logs."),
+  domain_description: z.string().optional().describe("Short description of this repository for prompt context."),
   // Worktree bootstrap: dependency install step (#174). Non-empty string →
   // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
-  setup_command: z.string().optional(),
+  setup_command: z.string().optional().describe("Shell command to run in the worktree after creation, before the test gate."),
   // Format/lint normalization gate (#182). Each entry runs after implementing
   // and fix-round harnesses exit. auto_fix: true commits changes and re-runs;
   // auto_fix: false blocks on non-zero exit without committing.
@@ -115,10 +129,11 @@ const PartialConfigSchema = z.object({
     .array(
       z.object({ command: z.string(), auto_fix: z.boolean() }).strict(),
     )
-    .optional(),
+    .optional()
+    .describe("Formatter/linter commands to run after implementing and fix-round harnesses exit."),
   // Opt-in sandboxed harness execution (#21). When true, the claude implementer
   // uses --permission-mode default instead of bypassPermissions.
-  harness_sandbox: z.boolean().optional(),
+  harness_sandbox: z.boolean().optional().describe("Run the claude implementer with --permission-mode default instead of bypassPermissions."),
 }).strict();
 
 export interface ResolveOptions {
@@ -453,6 +468,275 @@ export function domainContext(cfg: PipelineConfig): { name: string; description:
     name: cfg.domain_name ?? cfg.repo.split("/")[1] ?? cfg.domain,
     description: cfg.domain_description ?? "this repository",
   };
+}
+
+// ---------------------------------------------------------------------------
+// JSON Schema generation (#156)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the JSON Schema (draft-2020-12) for `.github/pipeline.yml`, derived
+ * from `PartialConfigSchema`. Used by `pipeline config schema`.
+ */
+export function generateConfigSchema(): object {
+  return z.toJSONSchema(PartialConfigSchema);
+}
+
+// ---------------------------------------------------------------------------
+// Config validation (#156): never-throws alternative to resolveConfig()
+// ---------------------------------------------------------------------------
+
+/** Dotted paths of fields whose misconfiguration changes review coverage or
+ *  paid-call volume. A bad value in any of these is always severity "error"
+ *  with rigorGating:true so that a typo never silently degrades rigor. */
+export const RIGOR_GATING_PATHS: readonly string[] = [
+  "review_policy.block_threshold",
+  "review_policy.min_confidence",
+  "review_policy.max_adversarial_rounds",
+  "steps.plan_review",
+  "steps.standard_review",
+  "steps.adversarial_review",
+  "eval_gate.enabled",
+  "eval_gate.mode",
+  "shipcheck_gate.enabled",
+  "shipcheck_gate.mode",
+  "shipcheck_gate.max_rounds",
+  "shipcheck_gate.block_on_partial",
+];
+
+const RIGOR_GATING_SET = new Set(RIGOR_GATING_PATHS);
+
+export interface Diagnostic {
+  severity: "error" | "warning";
+  path: string;
+  message: string;
+  line?: number;
+  rigorGating?: true;
+}
+
+export interface ValidateConfigResult {
+  valid: boolean;
+  diagnostics: Diagnostic[];
+}
+
+export interface ValidateConfigDeps {
+  /** Read file contents; return null if the file does not exist. Defaults to fs.readFileSync. */
+  readFile?: (filePath: string) => string | null;
+  /** Find the git root above startDir; return null if none found. Defaults to the internal findGitRoot. */
+  findGitRoot?: (startDir: string) => string | null;
+  /** Harnesses used for inert-model detection. When absent, loaded from `profile` (or PIPELINE_PROFILE env var). */
+  harnesses?: { implementer: string; reviewer: string };
+  /** Profile name to load harnesses from when `harnesses` is not injected. Defaults to PIPELINE_PROFILE env var or "codex". */
+  profile?: string;
+}
+
+const defaultReadFile = (fp: string): string | null => {
+  try {
+    return fs.readFileSync(fp, "utf8");
+  } catch {
+    return null;
+  }
+};
+
+/** Convert a 0-based character offset in `text` to a 1-indexed line number. */
+function lineFromOffset(text: string, offset: number): number {
+  let line = 1;
+  const end = Math.min(offset, text.length);
+  for (let i = 0; i < end; i++) {
+    if (text[i] === "\n") line++;
+  }
+  return line;
+}
+
+/**
+ * Build a dotted-path → 1-indexed source-line resolver from raw YAML text, so
+ * validation diagnostics for unknown keys and bad values carry a line a desktop
+ * editor can attach to (#156). Uses the `yaml` CST (`parseDocument` node ranges)
+ * rather than regex scanning, so it is correct for flow mappings
+ * (`review_policy: { block_threshold: typo }`) and never matches config-like text
+ * inside a block scalar. Returns a resolver that yields undefined when the path
+ * cannot be located or the source cannot be parsed positionally.
+ */
+export function buildLineLookup(text: string): (dotPath: string) => number | undefined {
+  let doc: ReturnType<typeof parseDocument> | undefined;
+  try {
+    doc = parseDocument(text, { keepSourceTokens: false });
+  } catch {
+    return () => undefined;
+  }
+  type RangedNode = { range?: [number, number, number] };
+  type Pair = { key?: ({ value?: unknown } & RangedNode) };
+  return (dotPath: string): number | undefined => {
+    if (!dotPath) return undefined;
+    const segments = dotPath.split(".");
+    const last = segments[segments.length - 1];
+    const parentPath = segments.slice(0, -1);
+    try {
+      // Prefer the offending KEY's source range over the value's, so a multiline
+      // mapping value (`block_threshold:\n    typo: true`) still points at the key
+      // line, not the nested value line.
+      const parent = parentPath.length === 0 ? doc!.contents : doc!.getIn(parentPath, true);
+      const items = (parent as { items?: Pair[] } | undefined)?.items;
+      if (Array.isArray(items)) {
+        for (const pair of items) {
+          if (pair?.key && String(pair.key.value) === last) {
+            const keyOffset = pair.key.range?.[0];
+            if (typeof keyOffset === "number") return lineFromOffset(text, keyOffset);
+          }
+        }
+      }
+      // Fallback to the value node range (e.g. sequence indices, or when the key
+      // range is unavailable).
+      const node = doc!.getIn(segments, true) as RangedNode | undefined;
+      const offset = node?.range?.[0];
+      return typeof offset === "number" ? lineFromOffset(text, offset) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+}
+
+/**
+ * Validate `.github/pipeline.yml` at the git root of `repoPath` without throwing.
+ * All error conditions are returned as structured `Diagnostic` objects.
+ * Exits 1 semantics are determined by the caller based on `severity: "error"` diagnostics.
+ */
+export function validateConfig(
+  repoPath: string,
+  deps: ValidateConfigDeps = {},
+): ValidateConfigResult {
+  const diagnostics: Diagnostic[] = [];
+
+  // 1. Find git root
+  const findGitRootFn = deps.findGitRoot ?? findGitRoot;
+  const resolvedStart = path.resolve(repoPath);
+  const gitRoot = findGitRootFn(resolvedStart);
+  if (!gitRoot) {
+    diagnostics.push({
+      severity: "error",
+      path: "",
+      message: `No git repository found at or above ${resolvedStart}.`,
+    });
+    return { valid: false, diagnostics };
+  }
+
+  // 2. Read pipeline.yml
+  const readFileFn = deps.readFile ?? defaultReadFile;
+  const configPath = path.join(gitRoot, ".github", "pipeline.yml");
+  const text = readFileFn(configPath);
+  if (text === null) {
+    diagnostics.push({
+      severity: "error",
+      path: "",
+      message: `Config file not found: ${configPath}`,
+    });
+    return { valid: false, diagnostics };
+  }
+
+  // 3. Parse YAML
+  let parsed: unknown;
+  try {
+    parsed = yaml.load(text);
+  } catch (err: unknown) {
+    const yamlErr = err as { mark?: { line?: number }; message?: string };
+    const rawLine = yamlErr?.mark?.line;
+    const diag: Diagnostic = {
+      severity: "error",
+      path: "",
+      message: `YAML parse error: ${yamlErr?.message ?? String(err)}`,
+    };
+    if (typeof rawLine === "number") {
+      diag.line = rawLine + 1; // js-yaml uses 0-indexed lines
+    }
+    diagnostics.push(diag);
+    return { valid: false, diagnostics };
+  }
+
+  // 4. Null YAML (empty file, "---", "~", "null") is valid (no overrides applied).
+  // Any other non-object root (scalar, boolean, number, sequence) is an error.
+  if (parsed == null) {
+    return { valid: true, diagnostics: [] };
+  }
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    diagnostics.push({
+      severity: "error",
+      path: "",
+      message: `Config must be a YAML mapping (object), got ${Array.isArray(parsed) ? "sequence" : typeof parsed}.`,
+    });
+    return { valid: false, diagnostics };
+  }
+
+  // 5. Zod validation
+  const result = PartialConfigSchema.safeParse(parsed);
+  if (!result.success) {
+    const lineOf = buildLineLookup(text);
+    for (const issue of result.error.issues) {
+      if (issue.code === "unrecognized_keys") {
+        // Each unknown key becomes its own diagnostic
+        const parentPath = issue.path.join(".");
+        for (const key of (issue as { path: (string | number)[]; keys: string[]; message: string }).keys) {
+          const dotPath = parentPath ? `${parentPath}.${key}` : key;
+          const diag: Diagnostic = {
+            severity: "error",
+            path: dotPath,
+            message: `Unrecognized key: "${key}"`,
+          };
+          const line = lineOf(dotPath);
+          if (line !== undefined) diag.line = line;
+          diagnostics.push(diag);
+        }
+      } else {
+        const dotPath = issue.path.join(".");
+        const diag: Diagnostic = {
+          severity: "error",
+          path: dotPath,
+          message: issue.message,
+        };
+        const line = lineOf(dotPath);
+        if (line !== undefined) diag.line = line;
+        if (RIGOR_GATING_SET.has(dotPath)) {
+          diag.rigorGating = true;
+        }
+        diagnostics.push(diag);
+      }
+    }
+    return { valid: false, diagnostics };
+  }
+
+  // 6. Inert-model alias detection
+  const fileConfig = result.data;
+  if (fileConfig.models) {
+    let harnesses = deps.harnesses;
+    if (!harnesses) {
+      try {
+        const profileName = deps.profile ?? process.env.PIPELINE_PROFILE ?? "codex";
+        harnesses = loadProfile(profileName).harnesses;
+      } catch {
+        // Profile unavailable — skip inert warnings rather than failing
+        harnesses = undefined;
+      }
+    }
+    // Apply review_harness from the file config (same override resolveConfig applies),
+    // so inert-model detection reflects the actual effective reviewer at runtime.
+    if (harnesses && fileConfig.review_harness) {
+      harnesses = { ...harnesses, reviewer: fileConfig.review_harness };
+    }
+    if (harnesses) {
+      for (const { key, role } of MODEL_ALIAS_ROLES) {
+        const value = fileConfig.models[key];
+        if (value === undefined) continue;
+        if (harnesses[role] !== "codex") continue;
+        diagnostics.push({
+          severity: "warning",
+          path: `models.${key}`,
+          message: `models.${key} is set to "${value}" but the ${role} harness is "codex" — model aliases are only honored by the claude harness. The setting is ignored at runtime.`,
+        });
+      }
+    }
+  }
+
+  const hasError = diagnostics.some((d) => d.severity === "error");
+  return { valid: !hasError, diagnostics };
 }
 
 /**
