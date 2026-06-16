@@ -345,24 +345,14 @@ function makeCreateCfg(): PipelineConfig {
   } as unknown as PipelineConfig;
 }
 
-test("createWorktree: stale path for same issue is reclaimed before capacity check (review-2 finding 1)", async () => {
+test("createWorktree: this issue's stale worktree is reclaimed before the capacity check", async () => {
   const cfg = makeCreateCfg();
-  let callOrder = 0;
-  let removeCallOrder = -1;
-  let countCallOrder = -1;
   let removedIssue: number | null = null;
 
   const deps: CreateWorktreeDeps = {
-    getForIssue: async () => ({ path: "/repo/.worktrees/pipeline-42-slug", slug: "slug" }),
-    existsSync: (p) => p.includes("pipeline-42"),
-    removeWorktree: async (_cfg, issueNumber) => {
-      removedIssue = issueNumber;
-      removeCallOrder = callOrder++;
-    },
-    countActive: async () => {
-      countCallOrder = callOrder++;
-      return 0;
-    },
+    listActive: async () => [makeRec(42, "slug")],
+    existsSync: () => false,
+    removeWorktree: async (_cfg, issueNumber) => { removedIssue = issueNumber; },
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
   };
@@ -370,38 +360,36 @@ test("createWorktree: stale path for same issue is reclaimed before capacity che
   const result = await createWorktree(cfg, 42, "slug", deps);
 
   assert.equal(result.path.includes("pipeline-42"), true);
-  assert.equal(removedIssue, 42, "stale path must be reclaimed");
-  assert.ok(removeCallOrder < countCallOrder, "removeWorktree must fire before countActive");
+  assert.equal(removedIssue, 42, "this issue's stale worktree must be reclaimed");
 });
 
-test("createWorktree: no stale path → does not call removeWorktree before capacity check", async () => {
+test("createWorktree: no stale worktree → does not call removeWorktree", async () => {
   const cfg = makeCreateCfg();
   let removeCalled = false;
 
   const deps: CreateWorktreeDeps = {
-    getForIssue: async () => null,
+    listActive: async () => [],
     existsSync: () => false,
     removeWorktree: async () => { removeCalled = true; },
-    countActive: async () => 0,
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
   };
 
   const result = await createWorktree(cfg, 42, "slug", deps);
   assert.equal(result.path.includes("pipeline-42"), true);
-  assert.equal(removeCalled, false, "removeWorktree must not be called when no stale path exists");
+  assert.equal(removeCalled, false, "removeWorktree must not be called when the issue has no active worktree");
 });
 
-test("createWorktree: stale path reclaimed, then capacity check fires for other issues", async () => {
-  // After reclaiming this issue's stale slot, if OTHER issues still fill the pool,
-  // the capacity error must still fire.
-  const cfg = makeCreateCfg();
+test("createWorktree: capacity check still fires when OTHER issues fill the pool", async () => {
+  // The target issue is excluded from the capacity count, but OTHER issues
+  // occupying the pool must still raise the capacity error.
+  const cfg = makeCreateCfg(); // max_concurrent_worktrees: 1
 
   const deps: CreateWorktreeDeps = {
-    getForIssue: async () => ({ path: "/repo/.worktrees/pipeline-42-slug", slug: "slug" }),
-    existsSync: (p) => p.includes("pipeline-42"),
+    // #42 has a stale worktree AND #99 fills the only slot.
+    listActive: async () => [makeRec(42, "slug"), makeRec(99, "other")],
+    existsSync: () => false,
     removeWorktree: async () => {},
-    countActive: async () => 1, // another issue occupies the remaining slot
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
   };
@@ -409,37 +397,27 @@ test("createWorktree: stale path reclaimed, then capacity check fires for other 
   await assert.rejects(
     () => createWorktree(cfg, 42, "slug", deps),
     /At worktree capacity/,
-    "capacity error must fire when other issues fill the pool after stale reclaim",
+    "capacity error must fire when OTHER issues fill the pool",
   );
 });
 
-test("createWorktree: reclaims by issue number when the title slug changed (review-2 ceiling regression)", async () => {
-  // Issue #42 left pipeline-42-old-title alive after a blocked run (setup
-  // succeeded, then a later ready-stage step blocked). The retry recomputes the
-  // slug to "new-title". The stale worktree MUST be reclaimed by ISSUE NUMBER
-  // (getForIssue), not the current slug path — otherwise countActive() still
-  // counts pipeline-42-old-title and, under max_concurrent_worktrees: 1, the
-  // issue deadlocks at capacity before it can reclaim its own slot.
+test("createWorktree: a full pool of THIS issue's own stale worktrees never blocks its retry", async () => {
+  // Issue #42 accumulated TWO stale worktrees under different slugs (old-a,
+  // old-b) across repeated title changes — enough to exhaust
+  // max_concurrent_worktrees: 1 by itself. The retry uses slug "new-title".
+  // ALL of #42's own worktrees must be reclaimed AND excluded from the capacity
+  // count, so the retry succeeds instead of deadlocking on its own slots.
   //
-  // Bites the slug-keyed reclaim: existsSync("…-new-title") is false, so the
-  // stale old-title worktree would never be removed and the call would throw
+  // Bites the single-record / count-self reclaim: removing only the first
+  // record and counting the rest leaves the pool full (>= 1) and throws
   // "At worktree capacity".
   const cfg = makeCreateCfg(); // max_concurrent_worktrees: 1
-  let staleRemoved = false;
-  let removedWith: { issueNumber: number; slug: string } | null = null;
+  const removed: string[] = [];
 
   const deps: CreateWorktreeDeps = {
-    // The active worktree for #42 is recorded at the OLD slug.
-    getForIssue: async () => ({ path: "/repo/.worktrees/pipeline-42-old-title", slug: "old-title" }),
-    // No directory exists yet at the new slug path.
+    listActive: async () => [makeRec(42, "old-a"), makeRec(42, "old-b")],
     existsSync: () => false,
-    removeWorktree: async (_cfg, issueNumber, slug) => {
-      removedWith = { issueNumber, slug };
-      staleRemoved = true;
-    },
-    // Models real listActive: the stale worktree fills the pool (1/1) until it
-    // is reclaimed, after which the slot is free.
-    countActive: async () => (staleRemoved ? 0 : 1),
+    removeWorktree: async (_cfg, _issueNumber, slug) => { removed.push(slug); },
     mkdirSync: () => {},
     gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
   };
@@ -449,11 +427,11 @@ test("createWorktree: reclaims by issue number when the title slug changed (revi
   assert.equal(
     result.path.includes("pipeline-42-new-title"),
     true,
-    "the fresh worktree uses the new slug",
+    "the fresh worktree uses the new slug and is not blocked by the issue's own stale slots",
   );
   assert.deepEqual(
-    removedWith,
-    { issueNumber: 42, slug: "old-title" },
-    "stale worktree must be reclaimed by issue number at its OLD slug, not the new slug",
+    removed.sort(),
+    ["old-a", "old-b"],
+    "every stale worktree for the issue must be reclaimed, not just the first",
   );
 });

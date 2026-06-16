@@ -159,11 +159,7 @@ export async function branchExists(
 }
 
 export interface CreateWorktreeDeps {
-  countActive?: (cfg: PipelineConfig) => Promise<number>;
-  getForIssue?: (
-    cfg: PipelineConfig,
-    issueNumber: number,
-  ) => Promise<{ path: string; slug: string } | null>;
+  listActive?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
   existsSync?: (p: string) => boolean;
   removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
   mkdirSync?: (p: string, opts: { recursive: boolean }) => void;
@@ -183,37 +179,46 @@ export async function createWorktree(
 ): Promise<{ path: string; branch: string }> {
   const existsFn = deps.existsSync ?? fs.existsSync;
   const removeFn = deps.removeWorktree ?? removeWorktree;
-  const countFn = deps.countActive ?? countActive;
-  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const listActiveFn = deps.listActive ?? listActive;
   const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
   const gitFn = deps.gitCmd ?? git;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
 
-  // Reclaim this issue's existing worktree BEFORE the capacity check so it does
-  // not count against max_concurrent_worktrees on retry. Resolve it by ISSUE
-  // NUMBER, never by the freshly-computed slug path: if the issue title — and
-  // therefore the slug — changed between a blocked run and the retry, a
-  // slug-keyed existsSync(wtPath) check would miss the stale
-  // `pipeline-<N>-<old-slug>` worktree, yet countActive() would still count it,
-  // deadlocking the retry under a full pool (review-2: stale reclaim keyed to
-  // mutable title slug; covers both setup-throw and setup-success-then-block).
-  const existing = await getForIssueFn(cfg, issueNumber);
-  if (existing) {
-    await removeFn(cfg, issueNumber, existing.slug);
+  // Reclaim this issue's existing worktree(s) BEFORE the capacity check so they
+  // never block its own retry. Two interacting rules, both keyed by ISSUE
+  // NUMBER (never the freshly-computed slug path):
+  //
+  //  1. Remove EVERY active worktree recorded for this issue — not just the one
+  //     at the current slug, and not just the first. A title change between a
+  //     blocked run and the retry shifts the slug, and an issue can accumulate
+  //     more than one stale `pipeline-<N>-<slug>` worktree across repeated title
+  //     changes, so a slug-keyed or single-record reclaim leaves a self-owned
+  //     stale worktree behind.
+  //  2. Count capacity over OTHER issues only. Even if (1) somehow leaves a
+  //     record, this issue's own slots must never count against
+  //     max_concurrent_worktrees — we are (re)creating its worktree right now.
+  //
+  // Together these close the review-2 capacity-deadlock class (stale reclaim
+  // keyed to mutable slug / reclaim removes only one worktree): setup-throw,
+  // setup-success-then-block, title/slug change, and multi-stale accumulation.
+  const active = await listActiveFn(cfg);
+  const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
+  for (const rec of mine) {
+    await removeFn(cfg, issueNumber, rec.slug!);
   }
-  // Also clear any directory left at the *current* slug path that getForIssue
-  // did not return (e.g. a leftover from a closed/terminal lookup, which
-  // listActive excludes) so the `git worktree add` below cannot collide with it.
-  if (existsFn(wtPath) && existing?.slug !== slug) {
+  // Also clear any directory left at the *current* slug path that listActive did
+  // not classify as active (e.g. a closed/terminal lookup) so the
+  // `git worktree add` below cannot collide with it.
+  if (existsFn(wtPath) && !mine.some((r) => r.slug === slug)) {
     await removeFn(cfg, issueNumber, slug);
   }
 
-  const active = await countFn(cfg);
-  if (active >= cfg.max_concurrent_worktrees) {
+  const otherActive = active.filter((r) => r.issueNumber !== issueNumber).length;
+  if (otherActive >= cfg.max_concurrent_worktrees) {
     throw new Error(
-      `At worktree capacity (${active}/${cfg.max_concurrent_worktrees}). ` +
+      `At worktree capacity (${otherActive}/${cfg.max_concurrent_worktrees}). ` +
         "Wait for an issue to complete before starting new work.",
     );
   }
