@@ -22,6 +22,7 @@ import {
   clearBlocked,
   getIssueDetail,
   getItemKind,
+  getPrComments,
   getPrDetail,
   getPrForIssue,
   getPrLinkedIssue,
@@ -857,21 +858,35 @@ async function runAdvance(
       // declared in approvalCheckpoints, unless the human already cleared the
       // label (approved) in a prior run.
       if (cfg.approvalCheckpoints.length > 0) {
-        // Get PR HEAD SHA for staleness detection (falls back to NULL_SHA when
-        // no PR exists yet, e.g. at the implementing stage on first run).
+        // Resolve the HEAD SHA and comment thread for staleness detection.
+        //   PR exists  → use PR head SHA + PR comments (merge decision is made in PR).
+        //   No PR yet  → use worktree HEAD SHA + issue comments (e.g. implementing
+        //                stage before the implementer has run and created a PR).
+        // Falls back to NULL_SHA / issue comments on transient error (#23, Findings 4 & 5).
         let headShaForCheckpoint = NULL_SHA;
+        let checkpointComments = detail.comments;
+        let checkpointPrNumber: number | null = null;
         try {
-          const prNumber = await getPrForIssue(cfg, issueNumber);
-          if (prNumber !== null) {
-            const prDetail = await getPrDetail(cfg, prNumber);
+          checkpointPrNumber = await getPrForIssue(cfg, issueNumber);
+          if (checkpointPrNumber !== null) {
+            const prDetail = await getPrDetail(cfg, checkpointPrNumber);
             headShaForCheckpoint = prDetail.head_sha;
+            checkpointComments = await getPrComments(cfg, checkpointPrNumber);
+          } else {
+            // No PR yet — fall back to worktree HEAD for staleness detection.
+            const wt = await getForIssue(cfg, issueNumber);
+            if (wt) {
+              const revResult = await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+              const sha = revResult.stdout.trim();
+              if (/^[a-f0-9]{40}$/.test(sha)) headShaForCheckpoint = sha;
+            }
           }
         } catch {
-          /* PR not found or transient error — keep NULL_SHA */
+          /* transient error — keep NULL_SHA + issue comments */
         }
         // Guard mutations against dry-run: checkpoint discovery is still
         // performed (so the caller sees a "waiting" status), but no GitHub
-        // comment or label is written (#23, Finding 2).
+        // comment or label is written.
         const checkpointDeps: CheckpointDeps = opts.dryRun
           ? {
               postCheckpointComment: async (n) => {
@@ -882,7 +897,11 @@ async function runAdvance(
               },
             }
           : {
-              postCheckpointComment: (n, body) => postComment(cfg, n, body),
+              // Post to PR when one exists so the approval gate appears where the
+              // merge decision is made; fall back to issue when no PR exists yet.
+              postCheckpointComment: checkpointPrNumber !== null
+                ? (_n, body) => postPrComment(cfg, checkpointPrNumber!, body)
+                : (n, body) => postComment(cfg, n, body),
               applyAwaitingApprovalLabel: (n) => addLabel(cfg, n, AWAITING_APPROVAL_LABEL),
             };
         const checkpointOut = await checkApprovalCheckpoint(
@@ -891,7 +910,7 @@ async function runAdvance(
           detail.labels,
           issueNumber,
           headShaForCheckpoint,
-          detail.comments,
+          checkpointComments,
           checkpointDeps,
         );
         if (checkpointOut !== null) {

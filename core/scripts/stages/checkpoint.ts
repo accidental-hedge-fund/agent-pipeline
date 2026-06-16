@@ -115,7 +115,22 @@ export async function checkApprovalCheckpoint(
     if (checkpointComment !== null) {
       const commentStage = extractCheckpointStage(checkpointComment);
       if (commentStage === stage) {
-        // (c) Human removed the label for THIS stage (approved) — dispatch normally.
+        // (c) Human removed the label for THIS stage.
+        // Guard against a SHA mismatch: if the branch advanced after the human removed
+        // the label (but before the pipeline re-ran), the old approval is for a
+        // different commit. Re-issue the checkpoint so the human reviews the new state
+        // (#23, Finding 6).
+        const storedSha = extractCheckpointSha(checkpointComment);
+        if (storedSha !== null && storedSha !== headSha) {
+          const oldShort = storedSha.slice(0, 7);
+          const newShort = headSha === NULL_SHA ? "(no branch)" : headSha.slice(0, 7);
+          const notice = `Branch advanced from ${oldShort} to ${newShort} after label removal; re-issuing checkpoint.`;
+          const body = buildCheckpointComment(stage, headSha, notice);
+          await deps.applyAwaitingApprovalLabel(issueNumber);
+          await deps.postCheckpointComment(issueNumber, body);
+          return { advanced: false, status: "waiting", reason: `checkpoint re-issued at stage ${stage} after head advanced` };
+        }
+        // SHA unchanged (or no sentinel on a hand-crafted comment) — dispatch normally.
         return null;
       }
       // Comment belongs to a different stage — not an approval for this stage.
@@ -124,7 +139,7 @@ export async function checkApprovalCheckpoint(
     // (b) First encounter (or comment is for a different stage) — fire the checkpoint.
     // Apply the label BEFORE posting the comment so a partial failure (comment posted
     // but label application throws) leaves the system in a "still pending" state rather
-    // than looking approved on the next run (Finding 4).
+    // than looking approved on the next run.
     const body = buildCheckpointComment(stage, headSha);
     await deps.applyAwaitingApprovalLabel(issueNumber);
     await deps.postCheckpointComment(issueNumber, body);

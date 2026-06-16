@@ -49,17 +49,31 @@ When the advance loop encounters a pending checkpoint (label present) and the HE
 - **AND** SHALL keep the `pipeline:awaiting-approval` label
 - **AND** SHALL return `{ advanced: false, status: "waiting" }`
 
-### Requirement: Checkpoint cleared — stage dispatches normally after label removal
-When the advance loop resolves a stage listed in `approval_checkpoints` AND the issue does NOT carry `pipeline:awaiting-approval` (the human removed it), the pipeline SHALL dispatch the stage handler normally without issuing a new checkpoint comment.
+### Requirement: Checkpoint cleared — stage dispatches normally after label removal (SHA unchanged)
+When the advance loop resolves a stage listed in `approval_checkpoints` AND the issue does NOT carry `pipeline:awaiting-approval` (the human removed it) AND the current HEAD SHA matches the `<!-- checkpoint-sha: <sha> -->` sentinel in the most recent checkpoint comment, the pipeline SHALL dispatch the stage handler normally without issuing a new checkpoint comment.
 
-#### Scenario: human removes awaiting-approval label and re-invokes
+#### Scenario: human removes awaiting-approval label and re-invokes — SHA unchanged
 - **WHEN** the issue previously had `pipeline:awaiting-approval` applied by a checkpoint
 - **AND** a human has since removed the `pipeline:awaiting-approval` label
 - **AND** the pipeline is re-invoked
 - **AND** the current stage is the same checkpoint stage (e.g. `implementing`)
+- **AND** the current HEAD SHA matches the checkpoint sentinel
 - **THEN** the pipeline SHALL dispatch the `implementing` stage handler
 - **AND** SHALL NOT post a new checkpoint comment
 - **AND** SHALL NOT re-apply the `pipeline:awaiting-approval` label
+
+### Requirement: Stale approval re-issues checkpoint when branch advanced after label removal
+When the advance loop encounters a cleared checkpoint (label absent, same-stage checkpoint comment present) AND the current HEAD SHA does NOT match the stored checkpoint sentinel, the pipeline SHALL re-apply the `pipeline:awaiting-approval` label, post a new checkpoint comment for the new SHA (with a notice that the branch advanced), and return `{ advanced: false, status: "waiting" }` without dispatching the stage.
+
+#### Scenario: branch advances after human removes label — approval re-issued
+- **WHEN** the issue previously had `pipeline:awaiting-approval` applied by a checkpoint
+- **AND** a human removed the `pipeline:awaiting-approval` label (approving the checkpoint)
+- **AND** the branch HEAD advanced (new commit pushed) before the pipeline was re-invoked
+- **AND** the current HEAD SHA does NOT match the `<!-- checkpoint-sha: -->` sentinel in the checkpoint comment
+- **THEN** the pipeline SHALL re-apply the `pipeline:awaiting-approval` label
+- **AND** SHALL post a new `## Pipeline: Awaiting Approval` comment noting that the branch advanced and containing the new `<!-- checkpoint-sha: <new-sha> -->` sentinel
+- **AND** SHALL return `{ advanced: false, status: "waiting" }`
+- **AND** SHALL NOT dispatch the stage handler
 
 ### Requirement: Checkpoint comment contains required resume instructions
 Every `## Pipeline: Awaiting Approval` comment SHALL include a "How to approve" section instructing the human to remove the `pipeline:awaiting-approval` label and re-invoke the pipeline.
@@ -73,7 +87,7 @@ Every `## Pipeline: Awaiting Approval` comment SHALL include a "How to approve" 
   - A "### How to approve" section instructing: remove the `pipeline:awaiting-approval` label, then re-invoke the pipeline
 
 ### Requirement: Checkpoint config validates stage names at config-load time
-`resolveConfig()` SHALL reject any `approval_checkpoints` entry that is not a member of `STAGES`, or that equals `"backlog"` or `"ready-to-deploy"`. An invalid entry SHALL cause `resolveConfig()` to throw a descriptive parse error.
+`resolveConfig()` SHALL reject any `approval_checkpoints` entry that is not a member of `STAGES`, or that equals `"backlog"`, `"ready-to-deploy"`, `"planning"`, or `"plan-review"`. `"planning"` and `"plan-review"` are rejected because they are internal sub-stages executed entirely within `planningStage.advance()` — the advance loop's checkpoint gate never evaluates them independently. An invalid entry SHALL cause `resolveConfig()` to throw a descriptive parse error.
 
 #### Scenario: valid stage name accepted
 - **WHEN** `.github/pipeline.yml` sets `approval_checkpoints: ["implementing", "pre-merge"]`
@@ -86,3 +100,7 @@ Every `## Pipeline: Awaiting Approval` comment SHALL include a "How to approve" 
 #### Scenario: terminal or initial stage rejected
 - **WHEN** `.github/pipeline.yml` sets `approval_checkpoints: ["ready-to-deploy"]`
 - **THEN** `resolveConfig()` SHALL throw with a parse error identifying `"ready-to-deploy"` as not a valid checkpoint stage
+
+#### Scenario: internal planning sub-stage rejected
+- **WHEN** `.github/pipeline.yml` sets `approval_checkpoints: ["planning"]` or `approval_checkpoints: ["plan-review"]`
+- **THEN** `resolveConfig()` SHALL throw with a parse error identifying the entry as not a valid checkpoint stage (these stages are internal to the planning flow and cannot be checkpointed independently)

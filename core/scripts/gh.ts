@@ -854,6 +854,35 @@ export async function listIssueComments(
   return detail.comments;
 }
 
+/**
+ * Fetch the conversation comments on a PULL REQUEST (not the linked issue).
+ * Used by the approval-checkpoint gate to post and read checkpoint comments on
+ * the PR thread when one exists, so the approval gate is visible where the
+ * merge decision is made (#23, Finding 5).
+ */
+export async function getPrComments(
+  cfg: PipelineConfig,
+  prNumber: number,
+): Promise<{ author: string; body: string; createdAt: string }[]> {
+  const stdout = await ghRun([
+    "pr",
+    "view",
+    String(prNumber),
+    "--json",
+    "comments",
+    "-R",
+    cfg.repo,
+  ]);
+  const data = JSON.parse(stdout) as {
+    comments?: { author?: { login: string }; body: string; createdAt: string }[];
+  };
+  return (data.comments ?? []).map((c) => ({
+    author: c.author?.login ?? "unknown",
+    body: c.body ?? "",
+    createdAt: c.createdAt,
+  }));
+}
+
 export function findLatestCommentMatching(
   comments: { author: string; body: string; createdAt: string }[],
   predicate: (body: string) => boolean,

@@ -489,3 +489,94 @@ test("integration: re-invoke with label absent dispatches implementing normally"
   assert.equal(posted.length, 0);
   assert.equal(labeled.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Finding 6: SHA comparison on cleared label — label absent but SHA changed
+// ---------------------------------------------------------------------------
+
+test("checkApprovalCheckpoint (c-sha-stale): label absent + same-stage comment + SHA changed → re-issues checkpoint (Finding 6)", async () => {
+  const { deps, posted, labeled } = makeDeps();
+
+  // Human approved at SHA, then someone pushed NEW_SHA before pipeline re-ran.
+  const existingCheckpoint = makeComment(buildCheckpointComment("implementing", SHA));
+  const result = await checkApprovalCheckpoint(
+    "implementing" as any,
+    { approvalCheckpoints: ["implementing"] },
+    /* labels: no awaiting-approval */ [],
+    42,
+    NEW_SHA, // current head has advanced past the approved SHA
+    [existingCheckpoint],
+    deps,
+  );
+
+  assert.ok(result !== null, "should return waiting — cannot dispatch with stale approval");
+  assert.equal((result as any).status, "waiting");
+  assert.equal(posted.length, 1, "re-issue checkpoint comment for new SHA");
+  assert.ok(posted[0].body.includes(NEW_SHA.slice(0, 7)), "new comment should contain new short SHA");
+  assert.ok(posted[0].body.includes("re-issuing"), "notice text should mention re-issue");
+  assert.equal(labeled.length, 1, "re-apply awaiting-approval label");
+  assert.equal(labeled[0], 42);
+});
+
+test("checkApprovalCheckpoint (c-sha-unchanged): label absent + same-stage comment + SHA unchanged → dispatches normally (Finding 6 — no false positive)", async () => {
+  const { deps, posted, labeled } = makeDeps();
+
+  const existingCheckpoint = makeComment(buildCheckpointComment("implementing", SHA));
+  const result = await checkApprovalCheckpoint(
+    "implementing" as any,
+    { approvalCheckpoints: ["implementing"] },
+    [],
+    42,
+    SHA, // current head matches approved SHA
+    [existingCheckpoint],
+    deps,
+  );
+
+  assert.equal(result, null, "SHA unchanged → dispatch normally (approval is still valid)");
+  assert.equal(posted.length, 0, "must not re-post when SHA matches");
+  assert.equal(labeled.length, 0, "must not re-label when SHA matches");
+});
+
+test("checkApprovalCheckpoint (c-no-sha-sentinel): label absent + same-stage comment with no SHA sentinel → dispatches normally (edge case)", async () => {
+  // A hand-crafted comment without a checkpoint-sha sentinel: storedSha = null.
+  // With no sentinel to compare, trust the human's removal and dispatch.
+  const { deps } = makeDeps();
+  const bodyWithNoSentinel = `${CHECKPOINT_COMMENT_HEADER}\n\n**Stage**: implementing\n\n### How to approve\n1. Remove label.`;
+  const existingCheckpoint = makeComment(bodyWithNoSentinel);
+  const result = await checkApprovalCheckpoint(
+    "implementing" as any,
+    { approvalCheckpoints: ["implementing"] },
+    [],
+    42,
+    NEW_SHA,
+    [existingCheckpoint],
+    deps,
+  );
+  assert.equal(result, null, "no sentinel → trust human, dispatch normally");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4: real worktree SHA (non-NULL) appears in checkpoint comment
+// ---------------------------------------------------------------------------
+
+test("checkApprovalCheckpoint (b): real worktree SHA appears as short SHA in comment — not '(no branch yet)' (Finding 4)", async () => {
+  // Simulates the case where pipeline.ts resolves the worktree HEAD and passes
+  // a real 40-char SHA instead of NULL_SHA when no PR exists yet.
+  const WORKTREE_SHA = "cafe" + "0".repeat(36);
+  const { deps, posted } = makeDeps();
+
+  const result = await checkApprovalCheckpoint(
+    "implementing" as any,
+    { approvalCheckpoints: ["implementing"] },
+    /* labels: none */ [],
+    42,
+    WORKTREE_SHA,
+    /* comments: none */ [],
+    deps,
+  );
+
+  assert.ok(result !== null);
+  assert.equal((result as any).status, "waiting");
+  assert.ok(posted[0].body.includes(WORKTREE_SHA.slice(0, 7)), "short SHA must appear in comment");
+  assert.ok(!posted[0].body.includes("(no branch yet)"), "null-SHA placeholder must NOT appear when real SHA provided");
+});

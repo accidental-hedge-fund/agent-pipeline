@@ -5,11 +5,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   bootstrapWorktree,
   dispatchResume,
   enforceImplCommitRef,
   enforceOpenspecChangeSingular,
+  excludePendingImplFromWorktree,
   invokeImplementer,
   type AdvanceOpts,
   type BootstrapWorktreeDeps,
@@ -446,4 +450,83 @@ test("dispatchResume: pending-impl file present, implementer fails → blocked (
   const result = await dispatchResume(resumeCfg, 42, resumeOpts, deps);
   assert.equal(result.advanced, false);
   assert.equal((result as any).status, "blocked");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression: .pipeline/ excluded from git staging
+// ---------------------------------------------------------------------------
+
+test("excludePendingImplFromWorktree: adds .pipeline/ to gitdir info/exclude (Finding 1 regression)", async () => {
+  const wtPath = await mkdtemp(join(tmpdir(), "pipeline-test-wt-"));
+  const gitdirPath = await mkdtemp(join(tmpdir(), "pipeline-test-gitdir-"));
+  try {
+    // Simulate a linked worktree: .git is a file containing "gitdir: <real-path>"
+    await writeFile(join(wtPath, ".git"), `gitdir: ${gitdirPath}\n`, "utf8");
+    await excludePendingImplFromWorktree(wtPath);
+    const content = await readFile(join(gitdirPath, "info", "exclude"), "utf8");
+    assert.ok(content.includes(".pipeline/"), "info/exclude must contain .pipeline/ so git add -A never stages pending-impl.txt");
+  } finally {
+    await rm(wtPath, { recursive: true, force: true });
+    await rm(gitdirPath, { recursive: true, force: true });
+  }
+});
+
+test("excludePendingImplFromWorktree: idempotent — .pipeline/ not duplicated on repeated calls (Finding 1 regression)", async () => {
+  const wtPath = await mkdtemp(join(tmpdir(), "pipeline-test-wt-"));
+  const gitdirPath = await mkdtemp(join(tmpdir(), "pipeline-test-gitdir-"));
+  try {
+    await writeFile(join(wtPath, ".git"), `gitdir: ${gitdirPath}\n`, "utf8");
+    await excludePendingImplFromWorktree(wtPath);
+    await excludePendingImplFromWorktree(wtPath); // second call
+    const content = await readFile(join(gitdirPath, "info", "exclude"), "utf8");
+    const occurrences = content.split(".pipeline/").length - 1;
+    assert.equal(occurrences, 1, ".pipeline/ must appear exactly once even after repeated calls");
+  } finally {
+    await rm(wtPath, { recursive: true, force: true });
+    await rm(gitdirPath, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2: implementer not re-run on retry after successful impl + failed push
+// ---------------------------------------------------------------------------
+
+test("dispatchResume (Finding 2): implementer not re-invoked on retry after successful impl + failed post-impl step", async () => {
+  let invokeCount = 0;
+  let pendingDeleted = false;
+  let resumeCount = 0;
+
+  const deps: DispatchResumeDeps = {
+    getForIssue: async () => ({ path: "/wt/42-slug", slug: "42-slug" } as any),
+    hasCommitsAhead: async () => true,
+    getIssueDetail: async () => ({ title: "Fix bug", body: "" } as any),
+    // Simulate: pending file exists on first call, gone on second (after deletePendingImpl)
+    readPendingImpl: async () => (pendingDeleted ? null : "the implementing prompt"),
+    deletePendingImpl: async () => { pendingDeleted = true; },
+    invokeImplementer: async () => { invokeCount++; return okHarnessResult(); },
+    // Empty HEAD → implHeadBefore="" → enforceImplCommitRef skipped (safe in unit tests)
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    resumeFromImplementing: async () => {
+      resumeCount++;
+      if (resumeCount === 1) {
+        // First attempt: push/PR creation fails after impl succeeded
+        return { advanced: false, status: "blocked", reason: "push failed" } as any;
+      }
+      return { advanced: true, from: "implementing" as const, to: "review-1" as const, summary: "PR opened" };
+    },
+  };
+
+  // First invocation: impl runs → pending deleted → push fails → blocked
+  const result1 = await dispatchResume(resumeCfg, 42, resumeOpts, deps);
+  assert.equal(result1.advanced, false);
+  assert.equal((result1 as any).status, "blocked");
+  assert.equal(invokeCount, 1, "implementer runs once on first invocation");
+  assert.ok(pendingDeleted, "deletePendingImpl MUST be called after successful implementer run");
+
+  // Second invocation (retry): no pending prompt + commits ahead → skip implementer
+  const result2 = await dispatchResume(resumeCfg, 42, resumeOpts, deps);
+  assert.equal(result2.advanced, true);
+  assert.equal(invokeCount, 1, "implementer must NOT be re-invoked on retry — idempotency (Finding 2)");
+  assert.equal(resumeCount, 2, "resumeFromImplementing called on both invocations");
 });

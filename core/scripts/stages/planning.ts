@@ -51,8 +51,8 @@ import {
   type VerifyDeps,
   type VerifyResult,
 } from "../verify-harness-commits.ts";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { join, isAbsolute } from "node:path";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -113,10 +113,45 @@ export async function bootstrapWorktree(
 const PENDING_IMPL_RELPATH = ".pipeline/pending-impl.txt";
 
 /**
+ * Write `.pipeline/` to the worktree's gitdir `info/exclude` so that
+ * `git add -A` (used by the implementer and the salvage path) never stages
+ * `.pipeline/pending-impl.txt` (#23, Finding 1).
+ *
+ * For a linked worktree, `.git` is a file containing `gitdir: <path>`.
+ * We parse that to find the real gitdir where `info/exclude` lives.
+ * Exported for unit testing.
+ */
+export async function excludePendingImplFromWorktree(wtPath: string): Promise<void> {
+  let gitdir = join(wtPath, ".git");
+  try {
+    const gitFileContent = await readFile(gitdir, "utf8");
+    const m = gitFileContent.match(/^gitdir:\s*(.+)$/m);
+    if (m) {
+      const raw = m[1].trim();
+      gitdir = isAbsolute(raw) ? raw : join(wtPath, raw);
+    }
+  } catch {
+    /* .git is a directory (main worktree) or unreadable — use it as-is */
+  }
+  const infoDir = join(gitdir, "info");
+  await mkdir(infoDir, { recursive: true });
+  const excludeFile = join(infoDir, "exclude");
+  const existing = await readFile(excludeFile, "utf8").catch(() => "");
+  if (!existing.includes(".pipeline/")) {
+    const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+    await writeFile(excludeFile, existing + sep + ".pipeline/\n", "utf8");
+  }
+}
+
+/**
  * Write the implementing prompt to the worktree so dispatchResume can execute
  * it after the human approves the checkpoint (#23, Finding 1).
+ *
+ * Also adds `.pipeline/` to the worktree's gitdir `info/exclude` so the file
+ * is never staged by `git add -A` — in the implementer run or the salvage path.
  */
 async function storePendingImpl(wtPath: string, prompt: string): Promise<void> {
+  await excludePendingImplFromWorktree(wtPath);
   const dir = join(wtPath, ".pipeline");
   await mkdir(dir, { recursive: true });
   await writeFile(join(wtPath, PENDING_IMPL_RELPATH), prompt, "utf8");
@@ -132,6 +167,19 @@ async function readPendingImpl(wtPath: string): Promise<string | null> {
     return await readFile(join(wtPath, PENDING_IMPL_RELPATH), "utf8");
   } catch {
     return null;
+  }
+}
+
+/**
+ * Delete the pending-impl file after a successful implementer invocation
+ * (#23, Finding 2). Idempotent — swallows ENOENT so retries are safe.
+ * Exported for unit testing.
+ */
+export async function deletePendingImpl(wtPath: string): Promise<void> {
+  try {
+    await unlink(join(wtPath, PENDING_IMPL_RELPATH));
+  } catch {
+    /* already absent — idempotent */
   }
 }
 
@@ -928,6 +976,8 @@ export interface DispatchResumeDeps {
   resumeFromImplementing?: typeof resumeFromImplementing;
   /** Read the pending-impl prompt written by storePendingImpl (#23). Injected for unit tests. */
   readPendingImpl?: (wtPath: string) => Promise<string | null>;
+  /** Delete the pending-impl file after a successful implementer run (#23, Finding 2). */
+  deletePendingImpl?: (wtPath: string) => Promise<void>;
   /** Run the implementer harness (#23). Injected for unit tests. */
   invokeImplementer?: typeof invokeImplementer;
   /** Post a blocked comment and apply the blocked label (#23). Injected for unit tests. */
@@ -956,6 +1006,7 @@ export async function dispatchResume(
   const fetchIssue = deps.getIssueDetail ?? getIssueDetail;
   const doResume = deps.resumeFromImplementing ?? resumeFromImplementing;
   const readPendingFn = deps.readPendingImpl ?? readPendingImpl;
+  const deletePendingFn = deps.deletePendingImpl ?? deletePendingImpl;
   const runImpl = deps.invokeImplementer ?? invokeImplementer;
   const markBlocked = deps.setBlocked ?? setBlocked;
   const gitOp = deps.gitInWorktree ?? gitInWorktree;
@@ -992,6 +1043,10 @@ export async function dispatchResume(
       await markBlocked(cfg, issueNumber, `Implementation harness (${primary}) failed: ${reason}`, "implementing", "harness-failure");
       return { advanced: false, status: "blocked", reason };
     }
+    // (#23, Finding 2): consume the pending file immediately after a successful
+    // implementer run so retries fall through to the commit-ahead path instead
+    // of running the implementer again on top of existing commits.
+    await deletePendingFn(wt.path);
     console.log(`[pipeline] #${issueNumber}: implementation done (${implResult.duration.toFixed(0)}s, harness=${primary})`);
     await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
     if (!(await commitsAheadFn(wt.path, cfg.base_branch))) {

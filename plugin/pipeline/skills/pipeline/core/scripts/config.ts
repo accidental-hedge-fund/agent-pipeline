@@ -103,7 +103,16 @@ const PartialConfigSchema = z.object({
   // checkpoint the initial triage stage or the terminal deploy stage).
   approval_checkpoints: z.array(z.string())
     .superRefine((entries, ctx) => {
-      const valid = new Set(STAGES.filter((s) => s !== "backlog" && s !== "ready-to-deploy"));
+      // "backlog" and "ready-to-deploy" are excluded because you cannot checkpoint
+      // the initial triage stage or the terminal deploy stage.
+      // "planning" and "plan-review" are excluded because they are internal
+      // sub-stages driven entirely within planningStage.advance() — the advance
+      // loop's checkpoint gate never evaluates them independently (#23, Finding 3).
+      const valid = new Set(
+        STAGES.filter(
+          (s) => s !== "backlog" && s !== "ready-to-deploy" && s !== "planning" && s !== "plan-review",
+        ),
+      );
       const bad = entries.filter((e) => !valid.has(e as any));
       if (bad.length > 0) {
         ctx.addIssue({

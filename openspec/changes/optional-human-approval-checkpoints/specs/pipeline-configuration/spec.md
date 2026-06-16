@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Config SHALL accept an optional `approval_checkpoints` array
-`PartialConfigSchema` SHALL accept an optional `approval_checkpoints` key whose value is an array of stage-name strings. Each entry SHALL be validated against the `STAGES` constant: entries that are not in `STAGES`, or that equal `"backlog"` or `"ready-to-deploy"`, SHALL be rejected with a descriptive parse error at config-load time. When absent, the field SHALL default to `[]` (empty array), preserving fully-autonomous behavior.
+`PartialConfigSchema` SHALL accept an optional `approval_checkpoints` key whose value is an array of stage-name strings. Each entry SHALL be validated against the `STAGES` constant: entries that are not in `STAGES`, or that equal `"backlog"`, `"ready-to-deploy"`, `"planning"`, or `"plan-review"`, SHALL be rejected with a descriptive parse error at config-load time. `"planning"` and `"plan-review"` are internal sub-stages executed within `planningStage.advance()` and cannot be independently checkpointed by the advance loop. When absent, the field SHALL default to `[]` (empty array), preserving fully-autonomous behavior.
 
 #### Scenario: approval_checkpoints absent — defaults to empty
 - **WHEN** `.github/pipeline.yml` does not include `approval_checkpoints`

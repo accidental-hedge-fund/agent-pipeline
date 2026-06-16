@@ -1090,3 +1090,39 @@ test("resolveConfig: approval_checkpoints empty array is accepted", async () => 
     process.env.PATH = oldPath;
   }
 });
+
+// ---- planning and plan-review rejected as checkpoint stages (Finding 3) ----
+
+test("resolveConfig: approval_checkpoints with 'planning' is rejected (Finding 3)", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: [planning]\n`);
+  const binDir = makeFakeGh("acme/ac6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => err.message.includes("planning"),
+      "resolveConfig must reject 'planning' as a checkpoint stage — it is an internal sub-stage not reachable by the advance loop",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: approval_checkpoints with 'plan-review' is rejected (Finding 3)", async () => {
+  const repo = makeFakeRepo(`approval_checkpoints: [plan-review]\n`);
+  const binDir = makeFakeGh("acme/ac7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => err.message.includes("plan-review"),
+      "resolveConfig must reject 'plan-review' as a checkpoint stage — it is an internal sub-stage not reachable by the advance loop",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
