@@ -162,6 +162,11 @@ const DETACH_TS = fileURLToPath(new URL("./detach.ts", import.meta.url));
  * in a new process group, surviving the launcher's exit. The wrapper writes
  * `sentinel.json` to the run directory on every exit path.
  *
+ * The advisory lock is acquired HERE (in the foreground) so a concurrent
+ * second invocation for the same issue fails non-zero before the first call
+ * returns. After spawning the wrapper, the lock file is updated with the
+ * child's PID so the child's lifetime holds the lock.
+ *
  * Returns the run-directory path (for the caller to print) and the wrapper PID.
  */
 export async function spawnDetached(
@@ -172,6 +177,11 @@ export async function spawnDetached(
 ): Promise<SpawnDetachedResult> {
   const { timeout, flockTimeoutMs = 5000 } = opts;
   const home = deps.homedir();
+
+  // Acquire the advisory lock in the foreground so a concurrent second call
+  // fails with a clear error before this function returns.
+  const lp = lockFilePath(home, issueNumber);
+  await acquireLock(lp, issueNumber, flockTimeoutMs);
 
   // Create run directory (unique per invocation via timestamp).
   const ts = new Date(deps.now())
@@ -196,6 +206,7 @@ export async function spawnDetached(
     String(issueNumber),
     "--flock-timeout",
     String(flockTimeoutMs),
+    "--lock-pre-acquired", // foreground already holds the lock
     ...(timeout !== undefined ? ["--timeout", String(timeout)] : []),
     ...(pipelineArgs.length > 0 ? ["--", ...pipelineArgs] : []),
   ];
@@ -206,11 +217,18 @@ export async function spawnDetached(
   });
 
   fs.closeSync(logFd);
-  child.unref();
 
   if (child.pid === undefined) {
+    // Spawn failed — release the lock we held.
+    removeStaleLock(lp);
     throw new Error(`pipeline: failed to spawn detached process for #${issueNumber}`);
   }
+
+  // Transfer lock ownership to the child process. The wrapper will clean up
+  // the lock file on every exit path; it skips re-acquisition (--lock-pre-acquired).
+  fs.writeFileSync(lp, String(child.pid));
+
+  child.unref();
   return { runDir: rd, pid: child.pid };
 }
 
@@ -219,12 +237,14 @@ export async function spawnDetached(
 // ---------------------------------------------------------------------------
 
 export async function runWrapper(argv: string[]): Promise<void> {
-  // Parse: _wrapper --run-dir <dir> --issue <N> [--timeout <s>] [--flock-timeout <ms>] [-- args...]
+  // Parse: _wrapper --run-dir <dir> --issue <N> [--timeout <s>] [--flock-timeout <ms>]
+  //        [--lock-pre-acquired] [-- args...]
   const args = argv.slice(1); // skip '_wrapper'
   let runDirPath = "";
   let issueNumber = 0;
   let timeout: number | undefined;
   let flockTimeoutMs = 5000;
+  let lockPreAcquired = false;
   const pipelinePassArgs: string[] = [];
 
   let i = 0;
@@ -242,6 +262,8 @@ export async function runWrapper(argv: string[]): Promise<void> {
       timeout = Number(args[++i]);
     } else if (a === "--flock-timeout") {
       flockTimeoutMs = Number(args[++i]);
+    } else if (a === "--lock-pre-acquired") {
+      lockPreAcquired = true;
     }
     i++;
   }
@@ -292,13 +314,15 @@ export async function runWrapper(argv: string[]): Promise<void> {
     process.exit(143);
   });
 
-  // Acquire the advisory lock.
-  try {
-    await acquireLock(lp, issueNumber, flockTimeoutMs);
-  } catch (err) {
-    process.stderr.write(`${(err as Error).message}\n`);
-    // No sentinel: lock acquisition failure means the run never started.
-    process.exit(1);
+  // Acquire the advisory lock (skipped when the foreground launcher already holds it).
+  if (!lockPreAcquired) {
+    try {
+      await acquireLock(lp, issueNumber, flockTimeoutMs);
+    } catch (err) {
+      process.stderr.write(`${(err as Error).message}\n`);
+      // No sentinel: lock acquisition failure means the run never started.
+      process.exit(1);
+    }
   }
 
   // Watchdog timer.

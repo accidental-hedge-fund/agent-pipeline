@@ -22,7 +22,7 @@ import {
   type SpawnDetachedDeps,
   type SentinelData,
 } from "../scripts/detach.ts";
-import { handleRunSubcommand, type RunSubcommandDeps } from "../scripts/pipeline.ts";
+import { buildCmd, handleRunSubcommand, type RunSubcommandDeps } from "../scripts/pipeline.ts";
 import type { CliOpts } from "../scripts/pipeline.ts";
 
 // ---------------------------------------------------------------------------
@@ -351,4 +351,100 @@ test("handleRunSubcommand: missing number exits with code 2 without calling spaw
   } finally {
     process.exitCode = savedExitCode; // always restore, even when original was undefined
   }
+});
+
+// ---------------------------------------------------------------------------
+// 5. Lock acquired in foreground (Finding: concurrent detach must fail fast)
+// ---------------------------------------------------------------------------
+
+test("spawnDetached: throws when advisory lock is already held by a live process", async () => {
+  const home = makeTmpDir();
+  try {
+    const deps = makeTestDeps(home);
+    // Pre-create the lock file with the current process PID (guaranteed alive).
+    const lp = lockFilePath(home, 42);
+    fs.mkdirSync(path.dirname(lp), { recursive: true });
+    fs.writeFileSync(lp, String(process.pid));
+
+    await assert.rejects(
+      () => spawnDetached(42, [], { flockTimeoutMs: 100 }, deps),
+      /already running/,
+    );
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("spawnDetached: wrapper argv includes --lock-pre-acquired", async () => {
+  const home = makeTmpDir();
+  try {
+    const deps = makeTestDeps(home);
+    await spawnDetached(42, [], {}, deps);
+    const args = deps.calls[0].args;
+    assert.ok(args.includes("--lock-pre-acquired"), "missing --lock-pre-acquired flag");
+  } finally {
+    cleanup(home);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6. Option forwarding (Finding: --profile/--domain/--model must reach inner process)
+// ---------------------------------------------------------------------------
+
+test("handleRunSubcommand: detach forwards --profile, --domain, --model to spawnDetached", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  const opts: CliOpts = { detach: true, profile: "claude", domain: "mydom", model: "claude-opus-4-8" };
+  await handleRunSubcommand("99", opts, deps);
+  assert.ok(capturedArgs.includes("--profile"), "missing --profile");
+  assert.ok(capturedArgs.includes("claude"), "missing profile value");
+  assert.ok(capturedArgs.includes("--domain"), "missing --domain");
+  assert.ok(capturedArgs.includes("mydom"), "missing domain value");
+  assert.ok(capturedArgs.includes("--model"), "missing --model");
+  assert.ok(capturedArgs.includes("claude-opus-4-8"), "missing model value");
+});
+
+test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetached", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  const opts: CliOpts = { detach: true, repoPath: "/path/to/repo", base: "main" };
+  await handleRunSubcommand("99", opts, deps);
+  assert.ok(capturedArgs.includes("--repo-path"), "missing --repo-path");
+  assert.ok(capturedArgs.includes("/path/to/repo"), "missing repoPath value");
+  assert.ok(capturedArgs.includes("--base"), "missing --base");
+  assert.ok(capturedArgs.includes("main"), "missing base value");
+});
+
+// ---------------------------------------------------------------------------
+// 7. CLI parser: 'pipeline run 153 --detach' is accepted (Finding: too-many-args)
+// ---------------------------------------------------------------------------
+
+test("CLI parser: 'pipeline run 153 --detach' is accepted without excess-args rejection", () => {
+  const cmd = buildCmd();
+  // Should not throw — allowExcessArguments(true) permits 'run' + '153' as two positionals.
+  assert.doesNotThrow(() => {
+    cmd.parse(["node", "pipeline.ts", "run", "153", "--detach"]);
+  });
+  assert.equal(cmd.args[0], "run");
+  assert.equal(cmd.args[1], "153");
+  assert.equal(cmd.opts<CliOpts>().detach, true);
+});
+
+test("CLI parser: 'pipeline path --json' is accepted without excess-args rejection", () => {
+  const cmd = buildCmd();
+  assert.doesNotThrow(() => {
+    cmd.parse(["node", "pipeline.ts", "path", "--json"]);
+  });
+  assert.equal(cmd.args[0], "path");
+  assert.equal(cmd.opts<CliOpts>().json, true);
 });

@@ -130,6 +130,20 @@ test("discoverHosts: version null when corePath is null", async () => {
   assert.equal(result.version, null);
 });
 
+test("discoverHosts: hosts installed but no pipeline core → hostCoverage=missing", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => null, // no core found
+      which: async (cmd) => `/usr/local/bin/${cmd}`, // both CLIs reachable
+    }),
+  );
+  assert.equal(result.hostCoverage, "missing");
+  assert.equal(result.corePath, null);
+  // Host reachability is still reported accurately even when the core is absent.
+  assert.equal(result.hosts.claude.available, true);
+  assert.equal(result.hosts.codex.available, true);
+});
+
 // ---------------------------------------------------------------------------
 // 4. Probe error bubbles
 // ---------------------------------------------------------------------------

@@ -106,12 +106,19 @@ export interface CliOpts {
   json?: boolean;
 }
 
-async function main(): Promise<void> {
+/**
+ * Build and return the configured Commander program (without parsing).
+ * Exported so tests can parse synthetic argv slices and verify CLI behaviour.
+ */
+export function buildCmd(): Command {
   const cmd = new Command();
   cmd
     .name("pipeline")
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
     .version(VERSION, "-V, --version", "print version and exit")
+    // Allow 'pipeline run <N> ...' and 'pipeline path' — they pass a second
+    // positional that Commander would otherwise reject as too many arguments.
+    .allowExcessArguments(true)
     .argument("[number]", "issue or PR number (required unless --cleanup)")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
@@ -136,8 +143,13 @@ async function main(): Promise<void> {
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
     .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
     // `pipeline path` options
-    .option("--json", "output machine-readable JSON (for `pipeline path`)")
-    .parse(process.argv);
+    .option("--json", "output machine-readable JSON (for `pipeline path`)");
+  return cmd;
+}
+
+async function main(): Promise<void> {
+  const cmd = buildCmd();
+  cmd.parse(process.argv);
 
   const opts = cmd.opts<CliOpts>();
   const numArg = cmd.args[0];
@@ -608,9 +620,18 @@ export async function handleRunSubcommand(
   }
 
   if (opts.detach) {
+    // Forward all launch-shaping options so the inner pipeline process respects
+    // the same profile / repo / model the caller specified (e.g. --profile claude).
+    const passArgs: string[] = [];
+    if (opts.profile) passArgs.push("--profile", opts.profile);
+    if (opts.repoPath) passArgs.push("--repo-path", opts.repoPath);
+    if (opts.base) passArgs.push("--base", opts.base);
+    if (opts.domain) passArgs.push("--domain", opts.domain);
+    if (opts.model) passArgs.push("--model", opts.model);
+
     let result: Awaited<ReturnType<typeof spawnDetached>>;
     try {
-      result = await deps.spawnDetached(number, [], {
+      result = await deps.spawnDetached(number, passArgs, {
         timeout: opts.timeout,
         flockTimeoutMs: opts.flockTimeout,
       });

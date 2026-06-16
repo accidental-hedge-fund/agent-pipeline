@@ -139,7 +139,8 @@ export async function discoverHosts(
   const codexAvailable = codexBin !== null;
 
   let hostCoverage: HostCoverage;
-  if (!claudeAvailable && !codexAvailable) {
+  if (!corePath || (!claudeAvailable && !codexAvailable)) {
+    // No resolved pipeline core, or no host CLIs reachable — not usable.
     hostCoverage = "missing";
   } else if (claudeAvailable && !codexAvailable) {
     hostCoverage = "claude-only";
