@@ -153,6 +153,14 @@ async function main(): Promise<void> {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
+  // Reject 'pipeline doctor' combined with side-effecting modes. cleanup and init
+  // are separate standalone operations; running either when doctor was intended
+  // would silently ignore the doctor intent and mutate state.
+  if (isDoctorCommand && (opts.cleanup || isInit)) {
+    const flag = opts.cleanup ? "--cleanup" : "--init (or 'pipeline init')";
+    console.error(`pipeline: 'pipeline doctor' cannot be combined with ${flag}. These are separate commands.`);
+    process.exit(2);
+  }
 
   let cfg: PipelineConfig;
   try {
@@ -526,8 +534,10 @@ export async function runStatus(
       const worktreeInfo = deps.getForIssue
         ? await deps.getForIssue(cfg, issueNumber).catch(() => null)
         : null;
+      // In JSON mode, label-event failures must propagate to the outer error handler
+      // so the envelope reports status:"error" rather than silently returning stale data.
       const labelEvents = deps.getLabelEvents
-        ? await deps.getLabelEvents(cfg, issueNumber).catch(() => [])
+        ? await deps.getLabelEvents(cfg, issueNumber)
         : [];
       const payload: StatusPayload = buildStatusPayload(
         { ...detail, labelEvents },

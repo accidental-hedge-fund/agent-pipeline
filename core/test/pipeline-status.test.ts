@@ -467,6 +467,30 @@ test("runStatus --json: errors during fetch are encoded as status:error envelope
   assert.match(parsed.error, /network failure/);
 });
 
+test("runStatus --json: getLabelEvents failure is encoded as status:error envelope (finding 2 regression)", async () => {
+  const prevExitCode = process.exitCode;
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLabelEvents: async () => { throw new Error("GitHub timeline rate limit"); },
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+    process.exitCode = prevExitCode;
+  }
+  assert.equal(lines.length, 1, "error path must emit exactly one JSON line");
+  const parsed = JSON.parse(lines[0]) as { schema_version: string; status: string; error: string };
+  assert.equal(parsed.schema_version, "1");
+  assert.equal(parsed.status, "error");
+  assert.match(parsed.error, /rate limit/);
+});
+
 test("runStatus --json: prose output (State:, Stage:, etc.) is NOT emitted", async () => {
   const deps: RunStatusDeps = {
     getIssueDetail: async () => detailAt("review-1", []),
