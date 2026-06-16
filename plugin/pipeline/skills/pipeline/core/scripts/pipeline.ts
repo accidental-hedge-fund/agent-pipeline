@@ -21,6 +21,7 @@ import {
   addLabel,
   clearBlocked,
   getIssueDetail,
+  getIssueLabelEvents,
   getItemKind,
   getPrForIssue,
   getPrLinkedIssue,
@@ -141,6 +142,18 @@ async function main(): Promise<void> {
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
 
+  // Validate machine-mode flags immediately after parsing — before config
+  // resolution or any dispatch — so a typo/construction bug can't silently
+  // fall through to the mutating advance path.
+  if (opts.isOk && !isDoctorCommand) {
+    console.error("pipeline: --is-ok is only valid for the doctor command. Usage: pipeline doctor --is-ok");
+    process.exit(2);
+  }
+  if (opts.json && !isDoctorCommand && !opts.status) {
+    console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
+    process.exit(2);
+  }
+
   let cfg: PipelineConfig;
   try {
     cfg = resolveConfig({
@@ -227,18 +240,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (isKillSwitchActive(cfg.domain)) {
-    console.error(
-      `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
-    );
-    process.exit(0);
-  }
-
   // ---- Mode dispatch (bypass paths) ----
-  // Status, unblock, and override resolve their own issue number and bypass the
-  // run-start preflight gate: status is read-only, and unblock/override are recovery
-  // actions for a stuck run (blocking them with a preflight failure would prevent
-  // recovery).
+  // Status is read-only and must run BEFORE the kill-switch check so that
+  // `pipeline N --status --json` always emits a parseable JSON envelope even
+  // when the kill switch is active.  Unblock and override are recovery actions
+  // for a stuck run; blocking them with a kill-switch check would prevent
+  // recovery, so they also bypass it (below).
   if (opts.status) {
     let issueNumber: number;
     try {
@@ -257,6 +264,14 @@ async function main(): Promise<void> {
     await runStatus(cfg, issueNumber, defaultRunStatusDeps, { json: opts.json });
     return;
   }
+
+  if (isKillSwitchActive(cfg.domain)) {
+    console.error(
+      `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+    );
+    process.exit(0);
+  }
+
   if (opts.unblock !== undefined) {
     let issueNumber: number;
     try {
@@ -485,6 +500,8 @@ export interface RunStatusDeps {
   loadLatestPreflightResult?: typeof loadLatestPreflightResult;
   /** For JSON mode (#154): look up the active worktree for an issue. */
   getForIssue?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ path: string; slug: string } | null>;
+  /** For JSON mode (#154): fetch pipeline-label addition events for `last_event`. */
+  getLabelEvents?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ label: string; createdAt: string }[]>;
 }
 
 const defaultRunStatusDeps: RunStatusDeps = {
@@ -492,6 +509,7 @@ const defaultRunStatusDeps: RunStatusDeps = {
   getPrForIssue,
   loadLatestPreflightResult,
   getForIssue,
+  getLabelEvents: getIssueLabelEvents,
 };
 
 export async function runStatus(
@@ -508,7 +526,15 @@ export async function runStatus(
       const worktreeInfo = deps.getForIssue
         ? await deps.getForIssue(cfg, issueNumber).catch(() => null)
         : null;
-      const payload: StatusPayload = buildStatusPayload(detail, prNumber, worktreeInfo, cfg);
+      const labelEvents = deps.getLabelEvents
+        ? await deps.getLabelEvents(cfg, issueNumber).catch(() => [])
+        : [];
+      const payload: StatusPayload = buildStatusPayload(
+        { ...detail, labelEvents },
+        prNumber,
+        worktreeInfo,
+        cfg,
+      );
       console.log(JSON.stringify(payload));
     } catch (err) {
       const e = err as Error;

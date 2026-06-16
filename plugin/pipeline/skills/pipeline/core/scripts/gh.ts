@@ -115,6 +115,31 @@ export async function getIssueDetail(
   };
 }
 
+/** Fetch pipeline-label additions from the issue timeline for `last_event` (#154).
+ *  Returns label-add events (newest-first by index) for all `pipeline:*` labels,
+ *  or an empty array on any failure (caller treats missing data as stale-but-ok). */
+export async function getIssueLabelEvents(
+  cfg: PipelineConfig,
+  issueNumber: number,
+): Promise<{ label: string; createdAt: string }[]> {
+  try {
+    const stdout = await ghRun([
+      "api",
+      `/repos/${cfg.repo}/issues/${issueNumber}/timeline`,
+      "--paginate",
+      "--jq",
+      '.[] | select(.event == "labeled" and (.label.name | startswith("pipeline:"))) | {label: .label.name, createdAt: .created_at}',
+    ]);
+    return stdout
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { label: string; createdAt: string });
+  } catch {
+    return [];
+  }
+}
+
 /** Lightweight state + label fetch (no comments). Used for worktree-cap
  *  filtering, where we just need to know "is this issue still in-flight?" */
 export async function getIssueStateAndLabels(

@@ -40,6 +40,8 @@ export interface StatusIssueDetail {
   labels: string[];
   comments: { author: string; body: string; createdAt: string }[];
   url: string;
+  /** Pipeline-label addition events (#154); merged with comments to compute `last_event`. */
+  labelEvents?: { label: string; createdAt: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -86,15 +88,23 @@ export function deriveNextAction(stage: string | null, blocked: boolean): string
 
 function deriveLastEvent(
   comments: { author: string; body: string; createdAt: string }[],
+  labelEvents?: { label: string; createdAt: string }[],
 ): { timestamp: string; description: string } | null {
-  const last = [...comments]
-    .reverse()
-    .find((c) => c.body.startsWith("## Pipeline:") || c.body.startsWith("## Review "));
-  if (!last) return null;
-  return {
-    timestamp: last.createdAt,
-    description: last.body.split("\n", 1)[0],
-  };
+  type Candidate = { timestamp: string; description: string };
+  const candidates: Candidate[] = [];
+
+  for (const c of comments) {
+    if (c.body.startsWith("## Pipeline:") || c.body.startsWith("## Review ")) {
+      candidates.push({ timestamp: c.createdAt, description: c.body.split("\n", 1)[0] });
+    }
+  }
+
+  for (const e of labelEvents ?? []) {
+    candidates.push({ timestamp: e.createdAt, description: `Label changed to \`${e.label}\`` });
+  }
+
+  if (candidates.length === 0) return null;
+  return candidates.reduce((latest, c) => (c.timestamp > latest.timestamp ? c : latest));
 }
 
 function deriveReviewSummary(
@@ -150,7 +160,7 @@ export function buildStatusPayload(
     pr,
     branch,
     worktree,
-    last_event: deriveLastEvent(detail.comments),
+    last_event: deriveLastEvent(detail.comments, detail.labelEvents),
     review_summary: deriveReviewSummary(detail.comments),
     next_action: deriveNextAction(stage, blocked),
     config: { repo: cfg.repo, domain: cfg.domain },

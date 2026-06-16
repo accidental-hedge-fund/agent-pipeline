@@ -176,6 +176,43 @@ test("buildStatusPayload: last_event from last Review comment", () => {
   assert.equal(payload.last_event.description, "## Review 1 — approved (commit abc)");
 });
 
+test("buildStatusPayload: last_event from label event when no pipeline comments exist", () => {
+  const detail = makeDetail({
+    comments: [{ author: "human", body: "just a note", createdAt: "2026-06-01T00:00:00Z" }],
+    labelEvents: [{ label: "pipeline:backlog", createdAt: "2026-06-10T12:00:00Z" }],
+  });
+  const payload = buildStatusPayload(detail, null, null, CFG);
+  assert.ok(payload.last_event !== null);
+  assert.equal(payload.last_event.timestamp, "2026-06-10T12:00:00Z");
+  assert.match(payload.last_event.description, /pipeline:backlog/);
+});
+
+test("buildStatusPayload: last_event from label event when newer than last pipeline comment", () => {
+  const detail = makeDetail({
+    comments: [
+      { author: "bot", body: "## Pipeline: Blocked\nsome reason", createdAt: "2026-06-01T00:00:00Z" },
+    ],
+    labelEvents: [{ label: "pipeline:review-1", createdAt: "2026-06-15T08:00:00Z" }],
+  });
+  const payload = buildStatusPayload(detail, null, null, CFG);
+  assert.ok(payload.last_event !== null);
+  assert.equal(payload.last_event.timestamp, "2026-06-15T08:00:00Z");
+  assert.match(payload.last_event.description, /pipeline:review-1/);
+});
+
+test("buildStatusPayload: last_event from comment when newer than label events", () => {
+  const detail = makeDetail({
+    comments: [
+      { author: "bot", body: "## Review 2 — needs-attention (commit xyz)", createdAt: "2026-06-20T10:00:00Z" },
+    ],
+    labelEvents: [{ label: "pipeline:review-2", createdAt: "2026-06-19T08:00:00Z" }],
+  });
+  const payload = buildStatusPayload(detail, null, null, CFG);
+  assert.ok(payload.last_event !== null);
+  assert.equal(payload.last_event.timestamp, "2026-06-20T10:00:00Z");
+  assert.equal(payload.last_event.description, "## Review 2 — needs-attention (commit xyz)");
+});
+
 // ---------------------------------------------------------------------------
 // 4.1 — review_summary
 // ---------------------------------------------------------------------------
