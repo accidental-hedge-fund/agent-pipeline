@@ -149,6 +149,12 @@ async function main(): Promise<void> {
     console.error("pipeline: --is-ok is only valid for the doctor command. Usage: pipeline doctor --is-ok");
     process.exit(2);
   }
+  // --json and --is-ok are mutually exclusive; reject BEFORE config resolution so
+  // the rejection cannot be preceded by config-resolution warnings on stderr (#154).
+  if (opts.json && opts.isOk) {
+    console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
+    process.exit(2);
+  }
   if (opts.json && !isDoctorCommand && !opts.status) {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
@@ -176,6 +182,9 @@ async function main(): Promise<void> {
       // so it can run its own cli/auth/repo-access checks and print the required
       // per-check summary instead of exiting with code 2 before the doctor checks run.
       tolerateGhFailure: isDoctorCommand || !!opts.doctor,
+      // `doctor --is-ok` is a zero-output 0/1 polling gate: suppress non-fatal
+      // config-resolution warnings so a valid-but-warning config stays silent (#154).
+      quiet: isDoctorCommand && !!opts.isOk,
     });
   } catch (err) {
     const e = err as Error;
