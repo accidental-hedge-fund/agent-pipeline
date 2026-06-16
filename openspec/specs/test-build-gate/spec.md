@@ -2,9 +2,7 @@
 
 ## Purpose
 The test/build gate runs the target repo's own test/build command in the worktree and self-heals failures through a bounded generate→test→fix loop before the item advances. It auto-detects the command, stays non-blocking when none is found, and treats a dirty tree as untrustworthy. (The full-CI-command surface for this repo is refined by `test-gate-ci-parity`; the trailer/commit-message invariants on fix-harness commits are refined by `harness-step-verification`.)
-
 ## Requirements
-
 ### Requirement: Disabled gate is skipped
 When `cfg.test_gate.enabled` is `false`, the gate SHALL return a skipped result immediately without detecting or running any command.
 
@@ -13,11 +11,11 @@ When `cfg.test_gate.enabled` is `false`, the gate SHALL return a skipped result 
 - **THEN** the gate SHALL skip and SHALL NOT invoke any test/build command or fix harness
 
 ### Requirement: Command resolution — explicit override, else auto-detection
-The command SHALL be the explicit `cfg.test_gate.command` (parsed without shell semantics) when set; otherwise it SHALL be auto-detected with a defined precedence: a real `package.json` `test` script (package manager chosen from the lockfile — `pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, else npm; a placeholder/echo-only `test` script falls back to a build/typecheck script), then `go.mod`→`go test ./...`, `Cargo.toml`→`cargo test`, a concrete pytest marker→`pytest`, a `Makefile` `test:` target→`make test`.
+The command SHALL be the explicit `cfg.test_gate.command` (run via `sh -c`; the shell parses the string and the pipeline SHALL NOT tokenize it before spawning) when set; otherwise it SHALL be auto-detected with a defined precedence: a real `package.json` `test` script (package manager chosen from the lockfile — `pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, else npm; a placeholder/echo-only `test` script falls back to a build/typecheck script), then `go.mod`→`go test ./...`, `Cargo.toml`→`cargo test`, a concrete pytest marker→`pytest`, a `Makefile` `test:` target→`make test`. Auto-detected commands SHALL be spawned directly without shell wrapping.
 
 #### Scenario: explicit override bypasses detection
 - **WHEN** `cfg.test_gate.command` is set
-- **THEN** that command SHALL be used verbatim and auto-detection SHALL be skipped
+- **THEN** that command SHALL be executed via `sh -c` and auto-detection SHALL be skipped
 
 #### Scenario: detect package.json test with pnpm lockfile
 - **WHEN** the worktree has a `package.json` `test` script and a `pnpm-lock.yaml`
@@ -62,3 +60,4 @@ Each command run SHALL be bounded by `cfg.test_gate.timeout` seconds; a timeout 
 #### Scenario: run exceeds the timeout
 - **WHEN** a command run exceeds `cfg.test_gate.timeout`
 - **THEN** it SHALL be killed and treated as a failed attempt
+
