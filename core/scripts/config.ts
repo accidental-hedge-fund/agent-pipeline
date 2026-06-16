@@ -2,6 +2,7 @@
 
 import { z } from "zod";
 import yaml from "js-yaml";
+import { parseDocument } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -537,40 +538,42 @@ const defaultReadFile = (fp: string): string | null => {
   }
 };
 
-/**
- * Locate the 1-indexed source line of a dotted config path (e.g.
- * `review_policy.block_threshold`) within raw YAML text, so validation
- * diagnostics for unknown keys and bad values carry a line a desktop editor can
- * attach to (#156). Heuristic line map for the config's shallow mapping shape:
- * each path segment must appear as a `key:` line nested deeper than its parent.
- * Returns undefined when the path cannot be located.
- */
-export function findKeyLine(text: string, dotPath: string): number | undefined {
-  if (!dotPath) return undefined;
-  const segments = dotPath.split(".");
-  const lines = text.split("\n");
-  let startIdx = 0;
-  let parentIndent = -1;
-  let foundLine: number | undefined;
-  for (let s = 0; s < segments.length; s++) {
-    const seg = segments[s].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const keyRe = new RegExp(`^(\\s*)["']?${seg}["']?\\s*:`);
-    let matched = false;
-    for (let i = startIdx; i < lines.length; i++) {
-      const m = lines[i].match(keyRe);
-      if (!m) continue;
-      const indent = m[1].length;
-      // Deeper segments must be indented under the parent we already matched.
-      if (s > 0 && indent <= parentIndent) continue;
-      foundLine = i + 1; // 1-indexed
-      parentIndent = indent;
-      startIdx = i + 1;
-      matched = true;
-      break;
-    }
-    if (!matched) return undefined;
+/** Convert a 0-based character offset in `text` to a 1-indexed line number. */
+function lineFromOffset(text: string, offset: number): number {
+  let line = 1;
+  const end = Math.min(offset, text.length);
+  for (let i = 0; i < end; i++) {
+    if (text[i] === "\n") line++;
   }
-  return foundLine;
+  return line;
+}
+
+/**
+ * Build a dotted-path → 1-indexed source-line resolver from raw YAML text, so
+ * validation diagnostics for unknown keys and bad values carry a line a desktop
+ * editor can attach to (#156). Uses the `yaml` CST (`parseDocument` node ranges)
+ * rather than regex scanning, so it is correct for flow mappings
+ * (`review_policy: { block_threshold: typo }`) and never matches config-like text
+ * inside a block scalar. Returns a resolver that yields undefined when the path
+ * cannot be located or the source cannot be parsed positionally.
+ */
+export function buildLineLookup(text: string): (dotPath: string) => number | undefined {
+  let doc: ReturnType<typeof parseDocument> | undefined;
+  try {
+    doc = parseDocument(text, { keepSourceTokens: false });
+  } catch {
+    return () => undefined;
+  }
+  return (dotPath: string): number | undefined => {
+    if (!dotPath) return undefined;
+    try {
+      const node = doc!.getIn(dotPath.split("."), true) as { range?: [number, number, number] } | undefined;
+      const offset = node?.range?.[0];
+      return typeof offset === "number" ? lineFromOffset(text, offset) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
 }
 
 /**
@@ -646,6 +649,7 @@ export function validateConfig(
   // 5. Zod validation
   const result = PartialConfigSchema.safeParse(parsed);
   if (!result.success) {
+    const lineOf = buildLineLookup(text);
     for (const issue of result.error.issues) {
       if (issue.code === "unrecognized_keys") {
         // Each unknown key becomes its own diagnostic
@@ -657,7 +661,7 @@ export function validateConfig(
             path: dotPath,
             message: `Unrecognized key: "${key}"`,
           };
-          const line = findKeyLine(text, dotPath);
+          const line = lineOf(dotPath);
           if (line !== undefined) diag.line = line;
           diagnostics.push(diag);
         }
@@ -668,7 +672,7 @@ export function validateConfig(
           path: dotPath,
           message: issue.message,
         };
-        const line = findKeyLine(text, dotPath);
+        const line = lineOf(dotPath);
         if (line !== undefined) diag.line = line;
         if (RIGOR_GATING_SET.has(dotPath)) {
           diag.rigorGating = true;

@@ -583,3 +583,34 @@ test("validateConfig: unrecognized key carries a source line", () => {
   assert.ok(diag, "expected a diagnostic for the unknown key");
   assert.equal(diag!.line, 2, `expected source line 2, got ${diag!.line}`);
 });
+
+// #156 review-2 round-2: the line locator must be YAML-CST-aware, not a regex scan.
+// Flow mappings and block scalars broke the heuristic; these bite that failure.
+
+test("validateConfig: flow-mapping bad rigor value carries the correct source line (#156)", () => {
+  const yaml = [
+    "base_branch: main",                         // line 1
+    "review_policy: { block_threshold: typo }",  // line 2 — FLOW mapping, invalid enum
+  ].join("\n");
+  const result = validateConfig("/repo", makeDeps(yaml));
+  assert.equal(result.valid, false);
+  const diag = result.diagnostics.find((d: Diagnostic) => d.path === "review_policy.block_threshold");
+  assert.ok(diag, "expected a diagnostic for the flow-mapping key");
+  assert.equal(diag!.rigorGating, true);
+  assert.equal(diag!.line, 2, `flow-mapping key must resolve to line 2; got ${diag!.line}`);
+});
+
+test("validateConfig: block-scalar config-like text does not mislocate the real bad key (#156)", () => {
+  const yaml = [
+    "setup_command: |",               // line 1
+    "  echo 'block_threshold: typo'", // line 2 — config-like text INSIDE a string block scalar
+    "  echo done",                    // line 3
+    "review_policy:",                 // line 4
+    "  block_threshold: typo",        // line 5 — the REAL invalid rigor-gating key
+  ].join("\n");
+  const result = validateConfig("/repo", makeDeps(yaml));
+  assert.equal(result.valid, false);
+  const diag = result.diagnostics.find((d: Diagnostic) => d.path === "review_policy.block_threshold");
+  assert.ok(diag, "expected a diagnostic for the real key");
+  assert.equal(diag!.line, 5, `must locate the real key at line 5, not the block-scalar text; got ${diag!.line}`);
+});
