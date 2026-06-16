@@ -49,6 +49,11 @@ export interface InvokeOptions {
   model?: string;
   /** Stream output to process.stderr/stdout in real time. Default true. */
   stream?: boolean;
+  /**
+   * When true and harness is "claude", passes --permission-mode default instead
+   * of bypassPermissions (#21). Ignored for codex (already sandboxed via --full-auto).
+   */
+  sandbox?: boolean;
 }
 
 export async function invoke(
@@ -65,7 +70,8 @@ export async function invoke(
   let custom = false;
   if (harness === "claude") {
     cmd = "claude";
-    args = ["--print", "--permission-mode", "bypassPermissions", "--output-format", "text"];
+    const permMode = opts.sandbox ? "default" : "bypassPermissions";
+    args = ["--print", "--permission-mode", permMode, "--output-format", "text"];
     if (opts.model) args.push("--model", opts.model);
     args.push(prompt);
   } else if (harness === "codex") {

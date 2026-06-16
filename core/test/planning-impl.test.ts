@@ -76,6 +76,32 @@ test("invokeImplementer: CLI --model override wins over cfg.models.implementing 
   assert.equal(capturedModel, "opus");
 });
 
+test("invokeImplementer: forwards cfg.harness_sandbox as sandbox option to invoke (#21)", async () => {
+  let capturedSandbox: boolean | undefined;
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedSandbox = opts.sandbox;
+      return okResult();
+    },
+  };
+  const cfg = { ...cfgWithImplementing("sonnet"), harness_sandbox: true } as unknown as PipelineConfig;
+  await invokeImplementer("claude", "/wt", "p", cfg, {}, deps);
+  assert.equal(capturedSandbox, true, "sandbox flag must be forwarded from cfg.harness_sandbox");
+});
+
+test("invokeImplementer: harness_sandbox:false forwards sandbox:false to invoke (#21)", async () => {
+  let capturedSandbox: boolean | undefined;
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedSandbox = opts.sandbox;
+      return okResult();
+    },
+  };
+  const cfg = { ...cfgWithImplementing("sonnet"), harness_sandbox: false } as unknown as PipelineConfig;
+  await invokeImplementer("claude", "/wt", "p", cfg, {}, deps);
+  assert.equal(capturedSandbox, false, "sandbox:false must be forwarded (default unchanged)");
+});
+
 // ---------------------------------------------------------------------------
 // Implementation step — issue reference (4.1 / 4.2)
 // ---------------------------------------------------------------------------

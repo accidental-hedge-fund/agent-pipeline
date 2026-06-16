@@ -175,6 +175,7 @@ export async function advance(
     planResult = await invoke(primary, cfg.repo_dir, planPrompt, {
       timeoutSec: cfg.implementation_timeout,
       model: opts.model ?? cfg.models.planning,
+      sandbox: cfg.harness_sandbox,
     });
   } catch (err) {
     const e = err as Error;
@@ -250,6 +251,7 @@ export async function advance(
     const revisionResult = await invoke(primary, cfg.repo_dir, revisionPrompt, {
       timeoutSec: cfg.implementation_timeout,
       model: opts.model ?? cfg.models.planning,
+      sandbox: cfg.harness_sandbox,
     });
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
       const reason = revisionResult.timed_out
@@ -471,9 +473,9 @@ async function advanceOpenspec(
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward, pipelineRunId }), {
-
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
+    sandbox: cfg.harness_sandbox,
   });
   if (!planResult.success) {
     const reason = planResult.timed_out
@@ -597,7 +599,7 @@ async function advanceOpenspec(
       primary,
       wt.path,
       buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext }),
-      { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning },
+      { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning, sandbox: cfg.harness_sandbox },
     );
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
       const reason = revisionResult.timed_out
@@ -976,6 +978,7 @@ export async function invokeImplementer(
   return inv(harness, wtPath, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.implementing,
+    sandbox: cfg.harness_sandbox,
   });
 }
 
