@@ -502,6 +502,34 @@ test("handleRunSubcommand: detach writes a machine-readable run-store.json point
   }
 });
 
+test("handleRunSubcommand: detach pointer resolves a nested --repo-path to the repo ROOT (#155)", async () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "repo-"));
+  fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+  const nested = path.join(repoRoot, "pkgs", "sub");
+  fs.mkdirSync(nested, { recursive: true });
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-"));
+  try {
+    // Pass a checkout SUBDIRECTORY as --repo-path. The inner run resolves it to the
+    // git root via findGitRoot, so the pointer must too — else it points at
+    // <subdir>/.agent-pipeline while the run writes <root>/.agent-pipeline.
+    await handleRunSubcommand("99", { detach: true, repoPath: nested }, {
+      spawnDetached: async () => ({ runDir: wrapperDir, pid: 42 }),
+    });
+    const pointer = JSON.parse(fs.readFileSync(path.join(wrapperDir, "run-store.json"), "utf8"));
+    assert.ok(
+      String(pointer.run_store_dir).startsWith(path.join(repoRoot, ".agent-pipeline")),
+      `pointer must resolve to <repoRoot>/.agent-pipeline; got ${pointer.run_store_dir}`,
+    );
+    assert.ok(
+      !String(pointer.run_store_dir).includes(path.join("pkgs", "sub")),
+      `pointer must not use the nested subdir; got ${pointer.run_store_dir}`,
+    );
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(wrapperDir, { recursive: true, force: true });
+  }
+});
+
 test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetached", async () => {
   let capturedArgs: string[] = [];
   const deps: RunSubcommandDeps = {

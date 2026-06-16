@@ -200,7 +200,10 @@ async function main(): Promise<void> {
   // unavailable. Handle it before config/gh resolution (and before the flag
   // validation below) using only the repo directory (derived from --repo-path or cwd).
   if (numArg === "logs") {
-    const repoDir = opts.repoPath ? path.resolve(opts.repoPath) : (findGitRoot(process.cwd()) ?? process.cwd());
+    // Resolve to the git root (same semantics as resolveConfig) so a nested
+    // --repo-path still finds the run store under the repository root (#155).
+    const logsStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(logsStart) ?? logsStart;
     const logsArg = cmd.args[1];
     const logsRunId =
       typeof logsArg === "string" && logsArg.length > 0 && !logsArg.startsWith("-")
@@ -991,7 +994,11 @@ export async function handleRunSubcommand(
     // desktop consumer could not find the structured event log without guessing —
     // reintroducing the competing artifact format the #155 contract avoids (#155).
     const runStoreRunId = runIdFor(number, new Date());
-    const repoDir = opts.repoPath ? path.resolve(opts.repoPath) : (findGitRoot(process.cwd()) ?? process.cwd());
+    // Resolve the repo dir with the SAME git-root semantics resolveConfig uses for the
+    // inner run (findGitRoot of the start path), so a nested --repo-path still points the
+    // pointer at <repo-root>/.agent-pipeline/runs/... and not a checkout subdirectory (#155).
+    const runStoreStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(runStoreStart) ?? runStoreStart;
     const runStoreDir = runDirPath(repoDir, runStoreRunId);
 
     // Forward all launch-shaping options so the inner pipeline process respects
