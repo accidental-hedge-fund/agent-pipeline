@@ -537,10 +537,11 @@ test("checkApprovalCheckpoint (c-sha-unchanged): label absent + same-stage comme
   assert.equal(labeled.length, 0, "must not re-label when SHA matches");
 });
 
-test("checkApprovalCheckpoint (c-no-sha-sentinel): label absent + same-stage comment with no SHA sentinel → dispatches normally (edge case)", async () => {
-  // A hand-crafted comment without a checkpoint-sha sentinel: storedSha = null.
-  // With no sentinel to compare, trust the human's removal and dispatch.
-  const { deps } = makeDeps();
+test("checkApprovalCheckpoint (c-no-sha-sentinel): label absent + same-stage comment with no SHA sentinel → fires fresh checkpoint (Finding 2)", async () => {
+  // A malformed or hand-crafted comment without a checkpoint-sha sentinel: storedSha = null.
+  // Without a valid sentinel we cannot verify this is a pipeline-issued checkpoint, so
+  // we reject it and fire a fresh pipeline checkpoint (#23, Finding 2).
+  const { deps, posted, labeled } = makeDeps();
   const bodyWithNoSentinel = `${CHECKPOINT_COMMENT_HEADER}\n\n**Stage**: implementing\n\n### How to approve\n1. Remove label.`;
   const existingCheckpoint = makeComment(bodyWithNoSentinel);
   const result = await checkApprovalCheckpoint(
@@ -552,7 +553,51 @@ test("checkApprovalCheckpoint (c-no-sha-sentinel): label absent + same-stage com
     [existingCheckpoint],
     deps,
   );
-  assert.equal(result, null, "no sentinel → trust human, dispatch normally");
+  assert.ok(result !== null, "no sentinel → treat as malformed, fire fresh checkpoint");
+  assert.equal((result as any).status, "waiting");
+  assert.equal(posted.length, 1, "fresh checkpoint comment must be posted");
+  assert.ok(posted[0].body.includes(`<!-- checkpoint-sha: ${NEW_SHA} -->`), "new comment must contain sentinel for current HEAD");
+  assert.equal(labeled.length, 1, "awaiting-approval label must be re-applied");
+});
+
+// Regression for #23 Finding 1: implementing checkpoint posted with real worktree SHA
+// completes in a single approval round-trip (no false re-issue on the cleared check).
+test("(regression F1): implementing checkpoint with real worktree SHA — first approval completes in one round", async () => {
+  // Before the fix, beforeImplementing stored NULL_SHA when no PR existed. On the next run,
+  // the outer gate resolved the real worktree SHA and re-issued (NULL_SHA ≠ realSha).
+  // After the fix, beforeImplementing resolves the real worktree SHA so the round-trip
+  // succeeds without a double-approval.
+  const WORKTREE_SHA = "cafe" + "0".repeat(36);
+
+  // Step 1: implementing checkpoint fires with real worktree SHA (not NULL_SHA)
+  const deps1 = makeDeps();
+  const res1 = await checkApprovalCheckpoint(
+    "implementing" as any,
+    { approvalCheckpoints: ["implementing"] },
+    [],
+    42,
+    WORKTREE_SHA,
+    [],
+    deps1.deps,
+  );
+  assert.ok(res1 !== null, "step 1: checkpoint fires");
+  assert.ok(deps1.posted[0].body.includes(`<!-- checkpoint-sha: ${WORKTREE_SHA} -->`), "step 1: real SHA in sentinel");
+
+  // Step 2: human removes label, pipeline re-runs with same worktree SHA → dispatch immediately
+  const checkpoint = makeComment(deps1.posted[0].body);
+  const deps2 = makeDeps();
+  const res2 = await checkApprovalCheckpoint(
+    "implementing" as any,
+    { approvalCheckpoints: ["implementing"] },
+    /* label removed */ [],
+    42,
+    WORKTREE_SHA,
+    [checkpoint],
+    deps2.deps,
+  );
+  assert.equal(res2, null, "step 2: dispatch normally after single approval — no false re-issue");
+  assert.equal(deps2.posted.length, 0, "no re-issue when SHA matches");
+  assert.equal(deps2.labeled.length, 0, "no re-label when approved");
 });
 
 // ---------------------------------------------------------------------------

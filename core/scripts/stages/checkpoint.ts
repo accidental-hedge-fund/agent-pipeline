@@ -91,8 +91,9 @@ export interface CheckpointDeps {
  *
  * Branches:
  *  (a) stage not in approvalCheckpoints → null (dispatch normally)
- *  (b) label absent + no prior checkpoint comment → fire: post comment + apply label + return waiting
- *  (c) label absent + prior checkpoint comment exists → null (human approved, dispatch normally)
+ *  (b) label absent + no prior checkpoint comment (or comment lacks sentinel) → fire: post comment + apply label + return waiting
+ *  (c) label absent + prior same-stage comment with sentinel matching current HEAD → null (human approved, dispatch normally)
+ *      sentinel absent or mismatched → treated as malformed/stale, falls through to (b) (#23, Finding 2)
  *  (d) label present + SHA matches → return waiting (unchanged, still pending)
  *  (e) label present + SHA stale or no comment found → re-issue comment + return waiting
  */
@@ -116,12 +117,14 @@ export async function checkApprovalCheckpoint(
       const commentStage = extractCheckpointStage(checkpointComment);
       if (commentStage === stage) {
         // (c) Human removed the label for THIS stage.
-        // Guard against a SHA mismatch: if the branch advanced after the human removed
-        // the label (but before the pipeline re-ran), the old approval is for a
-        // different commit. Re-issue the checkpoint so the human reviews the new state
-        // (#23, Finding 6).
         const storedSha = extractCheckpointSha(checkpointComment);
-        if (storedSha !== null && storedSha !== headSha) {
+        if (storedSha !== null) {
+          if (storedSha === headSha) {
+            // Valid pipeline-authored checkpoint: sentinel present and SHA matches current HEAD.
+            // Human removed the label — dispatch normally.
+            return null;
+          }
+          // SHA mismatch: branch advanced after label removal — re-issue (#23, Finding 6).
           const oldShort = storedSha.slice(0, 7);
           const newShort = headSha === NULL_SHA ? "(no branch)" : headSha.slice(0, 7);
           const notice = `Branch advanced from ${oldShort} to ${newShort} after label removal; re-issuing checkpoint.`;
@@ -130,11 +133,11 @@ export async function checkApprovalCheckpoint(
           await deps.postCheckpointComment(issueNumber, body);
           return { advanced: false, status: "waiting", reason: `checkpoint re-issued at stage ${stage} after head advanced` };
         }
-        // SHA unchanged (or no sentinel on a hand-crafted comment) — dispatch normally.
-        return null;
+        // storedSha === null: comment lacks the required sentinel — treat as malformed or
+        // spoofed; fall through to (b) to fire a fresh pipeline checkpoint (#23, Finding 2).
       }
-      // Comment belongs to a different stage — not an approval for this stage.
-      // Fall through to (b) and fire the checkpoint for the current stage.
+      // Comment belongs to a different stage (or lacked a sentinel) — not an approval for
+      // this stage. Fall through to (b) and fire the checkpoint for the current stage.
     }
     // (b) First encounter (or comment is for a different stage) — fire the checkpoint.
     // Apply the label BEFORE posting the comment so a partial failure (comment posted

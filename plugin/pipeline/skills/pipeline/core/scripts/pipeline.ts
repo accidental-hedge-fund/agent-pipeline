@@ -1128,9 +1128,18 @@ async function dispatch(
             if (prNum !== null) {
               const prD = await getPrDetail(cfg, prNum);
               headSha = prD.head_sha;
+            } else {
+              // No PR yet — resolve worktree HEAD for staleness detection, matching the
+              // outer advance gate's resolution (#23, Finding 1).
+              const wt = await getForIssue(cfg, issueNumber);
+              if (wt) {
+                const revResult = await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+                const sha = revResult.stdout.trim();
+                if (/^[a-f0-9]{40}$/.test(sha)) headSha = sha;
+              }
             }
           } catch {
-            /* PR not found or transient error — keep NULL_SHA */
+            /* transient error — keep NULL_SHA */
           }
           return checkApprovalCheckpoint("implementing", cfg, d.labels, issueNumber, headSha, d.comments, cpDeps);
         };
