@@ -287,6 +287,7 @@ export async function runTestGate(
     const fixRes = await invokeFn(harness, wtPath, prompt, {
       timeoutSec: cfg.fix_timeout,
       model: cfg.models.fix,
+      sandbox: cfg.harness_sandbox,
     });
     if (!fixRes.success) {
       const reason = fixRes.timed_out

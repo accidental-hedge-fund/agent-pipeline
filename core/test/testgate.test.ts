@@ -16,7 +16,7 @@ import {
   type RunTestsResult,
   type TestGateDeps,
 } from "../scripts/testgate.ts";
-import type { HarnessResult } from "../scripts/harness.ts";
+import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -61,6 +61,7 @@ function cfgWith(testGate: Partial<PipelineConfig["test_gate"]>): PipelineConfig
     last30days: { enabled: false, timeout: 600 },
     steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
     test_gate: { enabled: true, max_attempts: 3, timeout: 300, ...testGate },
+    harness_sandbox: false,
   };
 }
 
@@ -931,4 +932,57 @@ test("gate (#131): harness committed AND left dirt → salvage not attempted, di
   assert.equal(salvageCalls.length, 0, "salvage applies only to the no-new-commit case");
   assert.equal(out.passed, false);
   assert.match(out.blockReason ?? "", /Fix harness left uncommitted changes/);
+});
+
+// ---------------------------------------------------------------------------
+// harness_sandbox forwarding through the test-gate fix loop (#21)
+// ---------------------------------------------------------------------------
+
+test("gate (regression / #21, sandbox): harness_sandbox:true is forwarded as opts.sandbox=true on test-gate fix invocations", async () => {
+  // Regression: the test-gate fix loop omitted sandbox from InvokeOptions, so
+  // harness_sandbox:true had no effect on autonomous fix attempts — the harness
+  // ran with bypassPermissions despite the opt-in. Verify the captured opts carry
+  // sandbox:true when cfg.harness_sandbox is true.
+  const capturedOpts: Array<InvokeOptions | undefined> = [];
+  await runTestGate(
+    { ...cfgWith({}), harness_sandbox: true },
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async (_harness, _wt, _prompt, opts) => {
+        capturedOpts.push(opts);
+        return okInvoke();
+      },
+      ...cleanGitDeps(),
+    },
+  );
+  assert.ok(capturedOpts.length > 0, "invoke must be called during a failed test-gate fix attempt");
+  for (const opts of capturedOpts) {
+    assert.equal(opts?.sandbox, true, "sandbox must be true when cfg.harness_sandbox is true");
+  }
+});
+
+test("gate (regression / #21, sandbox): harness_sandbox:false keeps opts.sandbox=false on test-gate fix invocations", async () => {
+  // Complement: default (false) must not flip the flag.
+  const capturedOpts: Array<InvokeOptions | undefined> = [];
+  await runTestGate(
+    cfgWith({}),
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async (_harness, _wt, _prompt, opts) => {
+        capturedOpts.push(opts);
+        return okInvoke();
+      },
+      ...cleanGitDeps(),
+    },
+  );
+  assert.ok(capturedOpts.length > 0, "invoke must be called during a failed test-gate fix attempt");
+  for (const opts of capturedOpts) {
+    assert.equal(opts?.sandbox, false, "sandbox must be false when cfg.harness_sandbox is false");
+  }
 });
