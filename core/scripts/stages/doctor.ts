@@ -15,6 +15,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as fs from "node:fs";
 import type { PipelineConfig } from "../types.ts";
+import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -64,6 +65,7 @@ export interface PreflightCheck {
 }
 
 export interface PreflightResult {
+  schema_version: number;
   /** True iff no check failed (skipped checks do not count as failures). */
   ok: boolean;
   checks: CheckOutcome[];
@@ -399,7 +401,7 @@ export async function runPreflight(
       if (opts.failFast) break;
     }
   }
-  return { ok, checks: outcomes, ranAt: new Date().toISOString() };
+  return { schema_version: 1, ok, checks: outcomes, ranAt: new Date().toISOString() };
 }
 
 // ---------------------------------------------------------------------------
@@ -442,13 +444,18 @@ export function doctorResultPath(domain: string): string {
 }
 
 /** Persist the latest preflight result for `--status` to surface. Best-effort:
- *  a write failure is logged but never aborts the run. */
+ *  a write failure is logged but never aborts the run. String fields are
+ *  redaction/injection-sanitized at the FIELD level (before serialization) so
+ *  secrets/role-markers cannot survive JSON-escaping (`KEY=\"x\"`, escaped
+ *  newlines), with a final whole-document pass as defense-in-depth (#161). */
 export async function storePreflightResult(
   config: Pick<PipelineConfig, "domain">,
   result: PreflightResult,
 ): Promise<void> {
   try {
-    await fs.promises.writeFile(doctorResultPath(config.domain), JSON.stringify(result, null, 2), "utf8");
+    const cleaned = sanitizeDeep(result);
+    const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
+    await fs.promises.writeFile(doctorResultPath(config.domain), serialized, "utf8");
   } catch (err) {
     console.warn(`[pipeline] doctor: could not persist preflight result: ${(err as Error).message}`);
   }

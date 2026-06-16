@@ -26,6 +26,7 @@ import {
   type StageRecord,
   type StageUpdate,
 } from "./types.ts";
+import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 
 /** Bundle filename written under `<stateDir>/<issue>/`. */
 export const EVIDENCE_FILE = "evidence.json";
@@ -65,6 +66,7 @@ function nowIso(): string {
  *  a deleted/corrupt bundle must never break the pipeline). */
 function emptyBundle(issue: number): EvidenceBundle {
   return {
+    schema_version: EVIDENCE_SCHEMA_VERSION,
     schemaVersion: EVIDENCE_SCHEMA_VERSION,
     runId: "",
     issue,
@@ -81,18 +83,36 @@ function emptyBundle(issue: number): EvidenceBundle {
   };
 }
 
-/** Atomic write: ensure the issue dir exists, write a `.tmp` sibling, rename. */
+/** Atomic write: ensure the issue dir exists, write a `.tmp` sibling, rename.
+ *  Non-fatal: I/O errors are caught, logged, and do not propagate (#161).
+ *
+ *  Sanitization is applied at the FIELD level (`sanitizeDeep`) BEFORE
+ *  serialization. This is the correct chokepoint for a `JSON.stringify` artifact:
+ *  records appended through paths other than `makeCommandRecord` /
+ *  `makePromptRecord` (e.g. an operator-supplied `OverrideRecord.reason`, review
+ *  or recovery strings) would otherwise reach disk relying only on a
+ *  post-serialize pass, which `JSON.stringify` escaping defeats (`KEY="x"` →
+ *  `KEY=\"x\"`, an embedded `\nassistant:` collapses to mid-line). A trailing
+ *  post-serialize pass is kept as defense-in-depth (#161). */
 async function writeBundle(
   stateDir: string,
   issue: number,
   bundle: EvidenceBundle,
   deps: BundleDeps,
 ): Promise<void> {
-  const finalPath = bundlePath(stateDir, issue);
-  await deps.mkdir(path.dirname(finalPath), { recursive: true });
-  const tmp = `${finalPath}.tmp`;
-  await deps.writeFile(tmp, `${JSON.stringify(bundle, null, 2)}\n`);
-  await deps.rename(tmp, finalPath);
+  try {
+    const finalPath = bundlePath(stateDir, issue);
+    await deps.mkdir(path.dirname(finalPath), { recursive: true });
+    const tmp = `${finalPath}.tmp`;
+    const cleaned = sanitizeDeep(bundle);
+    const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
+    await deps.writeFile(tmp, serialized);
+    await deps.rename(tmp, finalPath);
+  } catch (err) {
+    console.warn(
+      `[pipeline] evidence-bundle: write failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
 }
 
 /** Read + parse the bundle. Returns `null` when the file is absent (ENOENT);
@@ -140,6 +160,7 @@ export async function createBundle(
   deps: BundleDeps = defaultDeps,
 ): Promise<EvidenceBundle> {
   const bundle: EvidenceBundle = {
+    schema_version: EVIDENCE_SCHEMA_VERSION,
     schemaVersion: EVIDENCE_SCHEMA_VERSION,
     runId: args.runId,
     issue: args.issue,
@@ -198,28 +219,11 @@ export async function recordStage(
   await writeBundle(stateDir, issue, bundle, deps);
 }
 
-// Patterns for token formats that must never appear in a bundle.
-const SECRET_VALUE_RE = /(ghp|ghs|gho|ghr|github_pat)_[A-Za-z0-9_]{10,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}/g;
-
-// Env-var names whose values are treated as secrets and redacted.
-const SECRET_NAME_RE = /TOKEN|SECRET|PASSWORD|APIKEY|API_KEY|_PASS$|_KEY$/i;
-
-/** Replace known secret patterns (token formats + env var values) with `[REDACTED]`.
- *  Applied to both `cmd` and raw output before recording. */
-function redactSecrets(text: string): string {
-  // 1. Redact by token format pattern (no env dependency — catches embedded tokens).
-  let result = text.replace(SECRET_VALUE_RE, "[REDACTED]");
-  // 2. Redact values of env vars whose name looks like a secret.
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value && value.length >= 8 && SECRET_NAME_RE.test(name)) {
-      result = result.split(value).join("[REDACTED]");
-    }
-  }
-  return result;
-}
-
 /** Build a sanitized `CommandRecord` — the single chokepoint that enforces the
- *  four-field shape and the 500-char output cap (sensitive-value exclusion). */
+ *  four-field shape and the 500-char output cap (sensitive-value exclusion).
+ *  sanitize() is applied at the field level (before serialization) so that
+ *  role-marker patterns like `assistant:` are caught even when the value appears
+ *  embedded inside a JSON string after JSON.stringify (#161). */
 export function makeCommandRecord(
   cmd: string,
   exitCode: number,
@@ -227,10 +231,10 @@ export function makeCommandRecord(
   output: string,
 ): CommandRecord {
   return {
-    cmd: redactSecrets(cmd),
+    cmd: sanitize(redactSecrets(cmd)),
     exitCode,
     durationMs: Math.round(durationMs),
-    outputExcerpt: redactSecrets(output ?? "").slice(0, OUTPUT_EXCERPT_CAP),
+    outputExcerpt: sanitize(redactSecrets(output ?? "")).slice(0, OUTPUT_EXCERPT_CAP),
   };
 }
 
@@ -273,15 +277,16 @@ export async function recordCommand(
 }
 
 /** Build a sanitized `PromptRecord`. The prompt content is passed through the
- *  same secret-redaction path as `CommandRecord`, and then hashed (SHA-1 prefix)
- *  and excerpted so no raw secret can survive in the bundle. */
+ *  same secret-redaction and injection-denylist path as `CommandRecord`, applied
+ *  at the field level (before serialization) so role-marker patterns are caught
+ *  even when the value appears embedded in a JSON string (#161). */
 export function makePromptRecord(kind: string, harness: string, prompt: string): PromptRecord {
-  const redacted = redactSecrets(prompt);
+  const cleaned = sanitize(redactSecrets(prompt));
   return {
     kind,
     harness,
-    hash: createHash("sha1").update(redacted).digest("hex").slice(0, 8),
-    excerpt: redacted.slice(0, OUTPUT_EXCERPT_CAP),
+    hash: createHash("sha1").update(cleaned).digest("hex").slice(0, 8),
+    excerpt: cleaned.slice(0, OUTPUT_EXCERPT_CAP),
   };
 }
 
