@@ -16,8 +16,7 @@ import {
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
-import { runTestGate, testGateBlockReason } from "../testgate.ts";
-import { runFormatGate } from "./format-gate.ts";
+import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
   type VerifyDeps,
@@ -184,20 +183,21 @@ export async function advanceFix(
     }
   }
 
-  // ---- test/build gate (#15) — must pass before advancing past this fix round ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, stage, opts.stateDir);
-  if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage, "test-gate-exhausted");
-    return { advanced: false, status: "blocked", reason: "test gate failed" };
-  }
-
-  // ---- Format/lint gate (#182): runs after the test gate so test-fix harness
-  //      commits are also format/lint-checked before the branch is pushed ----
+  // ---- Format + test gates to convergence (#182, #15) ----
+  // The format/lint gate runs BEFORE the test gate and both re-run until neither
+  // produces a new commit, so the pushed fix state is simultaneously formatted
+  // and tested — no auto-format commit ships untested, no test-fix commit unformatted.
   const fmtGateFn = deps.runFormatGate ?? runFormatGate;
-  const fmtResult = await fmtGateFn(wt.path, cfg, issueNumber);
-  if (fmtResult.status === "blocked") {
-    await setBlocked(cfg, issueNumber, fmtResult.reason, stage, "needs-human");
-    return { advanced: false, status: "blocked", reason: fmtResult.reason };
+  const gates = await runFormatAndTestGates(
+    cfg, issueNumber, wt.path, stage, pipelineRunId, opts.stateDir,
+    { runFormatGate: fmtGateFn },
+  );
+  if (!gates.ok) {
+    await setBlocked(
+      cfg, issueNumber, gates.reason, stage,
+      gates.source === "format" ? "needs-human" : "test-gate-exhausted",
+    );
+    return { advanced: false, status: "blocked", reason: gates.reason };
   }
 
   const branch = branchName(issueNumber, wt.slug);

@@ -425,21 +425,24 @@ test("resumeFromImplementing: fresh-flow worktree shape (no slug, branch from cr
 // block after a passing test gate (not before).
 // ---------------------------------------------------------------------------
 
-test("resumeFromImplementing: format gate blocked after passing test gate → blocked, no PR opened", async () => {
+test("resumeFromImplementing: format gate blocks first (before the test gate) → blocked, no PR opened (#182)", async () => {
+  // #182: the format/lint gate now runs BEFORE the test gate (so tests see
+  // formatted code). When format blocks, the test gate must NOT run and no PR
+  // is opened. Bites a regression to the old test-then-format ordering.
   let testGateCalled = false;
   let createPrCalled = false;
   const callOrder: string[] = [];
   const setBlockedArgs: string[] = [];
 
   const deps: ResumeFromImplementingDeps = {
+    runFormatGate: async () => {
+      callOrder.push("formatGate");
+      return { status: "blocked", reason: "eslint: 3 errors" };
+    },
     runTestGate: async () => {
       testGateCalled = true;
       callOrder.push("testGate");
       return passedGate();
-    },
-    runFormatGate: async () => {
-      callOrder.push("formatGate");
-      return { status: "blocked", reason: "eslint: 3 errors" };
     },
     getPrForBranch: async () => null,
     createPr: async () => { createPrCalled = true; return 0; },
@@ -461,9 +464,9 @@ test("resumeFromImplementing: format gate blocked after passing test gate → bl
     deps,
   );
 
-  assert.ok(testGateCalled, "test gate must run");
-  assert.ok(callOrder.indexOf("testGate") < callOrder.indexOf("formatGate"),
-    `test gate must run before format gate; got order: ${callOrder.join(" → ")}`);
+  assert.equal(callOrder[0], "formatGate",
+    `format gate must run first; got order: ${callOrder.join(" → ")}`);
+  assert.ok(!testGateCalled, "test gate must NOT run when the format gate blocks first");
   assert.equal(result.advanced, false);
   if (!result.advanced) {
     assert.equal(result.status, "blocked");

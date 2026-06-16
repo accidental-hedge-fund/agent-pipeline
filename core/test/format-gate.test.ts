@@ -3,7 +3,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runFormatGate, type FormatGateDeps } from "../scripts/stages/format-gate.ts";
+import {
+  runFormatGate,
+  runFormatAndTestGates,
+  type FormatGateDeps,
+  type FormatTestGateDeps,
+} from "../scripts/stages/format-gate.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // Minimal config builder — only format_gate is relevant here.
@@ -287,4 +292,83 @@ test("format gate: auto-format commit failure → blocked with error", async () 
     "reason" in result && result.reason.includes("index locked"),
     `expected error detail in reason: ${JSON.stringify(result)}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Format ↔ test convergence (#182) — runFormatAndTestGates
+// ---------------------------------------------------------------------------
+
+const anyCfg = cfg([{ command: "fmt", auto_fix: true }]) as unknown as PipelineConfig;
+
+// Build injected gate deps from per-round scripted results.
+function convergeDeps(
+  fmt: Array<{ status: "ok"; committed: boolean } | { status: "blocked"; reason: string }>,
+  test: Array<{ skipped?: boolean; passed?: boolean; attempts?: number; blockReason?: string }>,
+): { deps: FormatTestGateDeps; fmtCalls: () => number; testCalls: () => number } {
+  let fi = 0;
+  let ti = 0;
+  return {
+    deps: {
+      runFormatGate: (async () => fmt[Math.min(fi++, fmt.length - 1)]) as FormatTestGateDeps["runFormatGate"],
+      runTestGate: (async () => {
+        const r = test[Math.min(ti++, test.length - 1)];
+        return { skipped: r.skipped ?? false, passed: r.passed ?? true, attempts: r.attempts ?? 0, blockReason: r.blockReason };
+      }) as FormatTestGateDeps["runTestGate"],
+    },
+    fmtCalls: () => fi,
+    testCalls: () => ti,
+  };
+}
+
+test("runFormatAndTestGates: clean first round → one format + one test, converged", async () => {
+  const c = convergeDeps([{ status: "ok", committed: false }], [{ passed: true, attempts: 0 }]);
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, true);
+  assert.equal(c.fmtCalls(), 1);
+  assert.equal(c.testCalls(), 1);
+});
+
+test("runFormatAndTestGates: auto-format commit re-runs the test gate (no untested format ships) — bites a format-after-test ordering", async () => {
+  // Round 1: format commits; that must force a re-test. Round 2: format clean, test clean → converge.
+  const c = convergeDeps(
+    [{ status: "ok", committed: true }, { status: "ok", committed: false }],
+    [{ passed: true, attempts: 0 }, { passed: true, attempts: 0 }],
+  );
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, true);
+  assert.equal(c.testCalls(), 2, "the test gate must re-run after the format gate committed");
+});
+
+test("runFormatAndTestGates: a test-gate fix attempt re-runs the format gate (no unformatted test-fix ships)", async () => {
+  // Round 1: test gate ran its fix loop (attempts=2 → committed fix). Round 2: both clean → converge.
+  const c = convergeDeps(
+    [{ status: "ok", committed: false }, { status: "ok", committed: false }],
+    [{ passed: true, attempts: 2 }, { passed: true, attempts: 0 }],
+  );
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, true);
+  assert.equal(c.fmtCalls(), 2, "the format gate must re-run after a test-gate fix mutation");
+});
+
+test("runFormatAndTestGates: format-gate block → ok:false, source=format (caller maps to needs-human)", async () => {
+  const c = convergeDeps([{ status: "blocked", reason: "lint failed" }], [{ passed: true }]);
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, false);
+  assert.equal(res.ok === false && res.source, "format");
+  assert.equal(c.testCalls(), 0, "test gate is not reached when format blocks first");
+});
+
+test("runFormatAndTestGates: test-gate failure → ok:false, source=test (caller maps to test-gate-exhausted)", async () => {
+  const c = convergeDeps([{ status: "ok", committed: false }], [{ passed: false, attempts: 3, blockReason: "tests red" }]);
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, false);
+  assert.equal(res.ok === false && res.source, "test");
+});
+
+test("runFormatAndTestGates: bounded — never exceeds MAX rounds even if mutations persist", async () => {
+  // Both gates always report a mutation; must stop at the cap, not loop forever.
+  const c = convergeDeps([{ status: "ok", committed: true }], [{ passed: true, attempts: 1 }]);
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, true);
+  assert.ok(c.fmtCalls() <= 3 && c.testCalls() <= 3, "iterations are bounded");
 });

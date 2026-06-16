@@ -15,6 +15,25 @@ After the implementing harness exits (and after existing salvage/verify passes) 
 - **THEN** the pipeline SHALL run entry 1 first, then entry 2, in the worktree root
 - **AND** only after both succeed SHALL the pipeline proceed to the test gate
 
+### Requirement: Format and test gates run to a bounded fixed point
+
+The format/lint gate SHALL run before the test/build gate, and the pipeline SHALL re-run both gates until an iteration's format gate commits nothing AND the test gate performs no fix-harness attempts (bounded by a fixed maximum number of rounds). This guarantees the state pushed for review has been BOTH formatted and tested: an auto-format commit can never reach the PR untested (the test gate always runs after the last format), and a test-gate fix-harness commit can never reach the PR unformatted (the format gate always runs after the last test-fix mutation, and any resulting format commit re-triggers the test gate).
+
+#### Scenario: Auto-format commit re-runs the test gate
+
+- **WHEN** the format gate commits an auto-format change in a round
+- **THEN** the pipeline SHALL run the test gate again in a subsequent round before opening or updating the PR
+
+#### Scenario: Test-gate fix mutation re-runs the format gate
+
+- **WHEN** the test gate's fix loop commits a fix-harness change in a round
+- **THEN** the pipeline SHALL run the format gate again in a subsequent round before opening or updating the PR
+
+#### Scenario: Convergence is bounded
+
+- **WHEN** the format and test gates keep producing commits every round
+- **THEN** the pipeline SHALL stop after a fixed maximum number of rounds rather than looping indefinitely
+
 ### Requirement: Auto-fix entries mutate the worktree and commit the diff
 
 For each `format_gate` entry with `auto_fix: true`, the pipeline SHALL run the command, check the worktree for uncommitted changes, and if changes are present, commit them with the message `chore: auto-format (#<issue_number>)`. The pipeline SHALL then re-run the same command to verify the fix is stable; if the re-run exits non-zero, the pipeline SHALL block.

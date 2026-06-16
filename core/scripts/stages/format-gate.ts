@@ -8,10 +8,12 @@
 
 import { spawn } from "node:child_process";
 import { gitInWorktree } from "../worktree.ts";
-import type { PipelineConfig } from "../types.ts";
+import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import type { TestGateResult } from "../testgate.ts";
+import type { PipelineConfig, Stage } from "../types.ts";
 
 export type FormatGateResult =
-  | { status: "ok" }
+  | { status: "ok"; committed: boolean }
   | { status: "blocked"; reason: string };
 
 export interface FormatGateDeps {
@@ -35,11 +37,12 @@ export async function runFormatGate(
   deps: FormatGateDeps = {},
 ): Promise<FormatGateResult> {
   const entries = config.format_gate;
-  if (!entries || entries.length === 0) return { status: "ok" };
+  if (!entries || entries.length === 0) return { status: "ok", committed: false };
 
   const exec = deps.execInWorktree ?? defaultExecInWorktree;
   const isDirty = deps.gitIsDirty ?? defaultGitIsDirty;
   const commitFn = deps.gitCommit ?? defaultGitCommit;
+  let committed = false;
 
   // Pre-flight: block if the worktree is already dirty before any auto-fix command
   // runs — we cannot distinguish pre-existing harness leftovers from command output,
@@ -74,6 +77,7 @@ export async function runFormatGate(
             reason: `Format gate auto-format commit failed: ${commitResult.error}`,
           };
         }
+        committed = true;
         const r2 = await exec(wtPath, command);
         if (r2.code !== 0) {
           return {
@@ -101,7 +105,71 @@ export async function runFormatGate(
     }
   }
 
-  return { status: "ok" };
+  return { status: "ok", committed };
+}
+
+// ---------------------------------------------------------------------------
+// Format ↔ test convergence (#182)
+// ---------------------------------------------------------------------------
+
+export type FormatTestGateResult =
+  | { ok: true; gate: TestGateResult }
+  // `source` identifies which gate blocked so the caller can pass the matching
+  // literal BlockerKind ("format" → needs-human, "test" → test-gate-exhausted).
+  | { ok: false; reason: string; source: "format" | "test" };
+
+export interface FormatTestGateDeps {
+  runFormatGate?: typeof runFormatGate;
+  runTestGate?: typeof runTestGate;
+}
+
+/** Maximum format↔test iterations before proceeding with whatever passed last. */
+export const MAX_FORMAT_TEST_ROUNDS = 3;
+
+/**
+ * Run the format/lint gate and the test/build gate to a fixed point (#182).
+ *
+ * Each iteration runs the format gate FIRST (it may commit auto-format changes)
+ * then the test gate (its fix loop may commit fix-harness changes). The loop
+ * converges when an iteration produces no new commit — which guarantees the
+ * final state has been BOTH formatted and tested. This closes two gaps a fixed
+ * test-then-format ordering left open: an auto-format commit can no longer ship
+ * untested (the test gate always runs after the last format), and a test-fix
+ * commit can no longer ship unformatted (the format gate always runs after the
+ * last test-fix mutation, and a resulting format commit re-triggers the test
+ * gate). Returns the final TestGateResult, or a blocked reason + blocker kind.
+ */
+export async function runFormatAndTestGates(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  wtPath: string,
+  stage: Stage,
+  pipelineRunId: string,
+  stateDir: string | undefined,
+  deps: FormatTestGateDeps = {},
+): Promise<FormatTestGateResult> {
+  const fmt = deps.runFormatGate ?? runFormatGate;
+  const test = deps.runTestGate ?? runTestGate;
+
+  let gate: TestGateResult = { skipped: true };
+  for (let round = 0; round < MAX_FORMAT_TEST_ROUNDS; round++) {
+    const fmtResult = await fmt(wtPath, cfg, issueNumber);
+    if (fmtResult.status === "blocked") {
+      return { ok: false, reason: fmtResult.reason, source: "format" };
+    }
+
+    gate = await test(cfg, issueNumber, wtPath, {}, pipelineRunId, stage, stateDir);
+    if (!gate.skipped && !gate.passed) {
+      return { ok: false, reason: testGateBlockReason(gate), source: "test" };
+    }
+
+    // Converged: the format gate committed nothing this round AND the test gate's
+    // fix loop made no commit (attempts === 0), so the pushed state is
+    // simultaneously formatted and tested. Otherwise loop to re-verify both gates
+    // against whatever the last mutation produced.
+    if (!fmtResult.committed && (gate.attempts ?? 0) === 0) break;
+  }
+  return { ok: true, gate };
 }
 
 // ---------------------------------------------------------------------------
