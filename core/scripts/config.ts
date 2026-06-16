@@ -416,12 +416,15 @@ export function domainContext(cfg: PipelineConfig): { name: string; description:
 
 /**
  * Write a commented starter `.github/pipeline.yml` to the repo if absent.
- * Uses exclusive-create (`flag: "wx"`) so a concurrent second call never
- * clobbers an existing file — EEXIST → { created: false }.
+ * Checks existsSync first so untracked files (absent from a derived worktree's
+ * index but present on disk in the main checkout) are never silently overwritten.
+ * Retains the exclusive-create flag (`wx`) as a TOCTOU backstop — EEXIST → { created: false }.
  */
 export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created: boolean }> {
   const configDir = path.join(repoDir, ".github");
   const configPath = path.join(configDir, "pipeline.yml");
+
+  if (fs.existsSync(configPath)) return { created: false };
 
   fs.mkdirSync(configDir, { recursive: true });
 

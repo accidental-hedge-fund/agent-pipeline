@@ -128,6 +128,25 @@ test("scaffoldDefaultConfig: does not overwrite an existing .github/pipeline.yml
 });
 
 // ---------------------------------------------------------------------------
+// 3.3b regression: untracked-file no-clobber (#176)
+// ---------------------------------------------------------------------------
+
+test("scaffoldDefaultConfig: does not overwrite an existing untracked .github/pipeline.yml (regression #176)", async () => {
+  const repo = makeTempRepo();
+  fs.mkdirSync(path.join(repo, ".github"), { recursive: true });
+
+  // Simulate an untracked file — written directly to disk, not tracked by git.
+  const sentinel = "# sentinel: untracked hand-edited config — must not be overwritten\nbase_branch: untracked-sentinel\n";
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  fs.writeFileSync(configPath, sentinel, "utf8");
+
+  const result = await scaffoldDefaultConfig(repo);
+
+  assert.equal(result.created, false, "should return { created: false } when file already exists");
+  assert.equal(fs.readFileSync(configPath, "utf8"), sentinel, "untracked file content must be unchanged");
+});
+
+// ---------------------------------------------------------------------------
 // 3.4 scaffolded-config validity
 // ---------------------------------------------------------------------------
 
