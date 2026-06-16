@@ -312,6 +312,48 @@ test("gate (#173 regression): auto-detected command passes killProcessGroup=fals
   assert.equal(capturedKillProcessGroup, false, "auto-detected command must not use killProcessGroup");
 });
 
+test("gate (#173 regression): whitespace-only configured command blocks immediately, never runs sh -c", async () => {
+  // Regression for review-2 finding: `sh -c "   "` exits 0 (empty shell script).
+  // A whitespace-only command must be caught before spawn and block the gate.
+  let ran = false;
+  const out = await runTestGate(cfgWith({ command: "   " }), 173, "/wt", {
+    runTests: async () => {
+      ran = true;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(ran, false, "runTests must not be called for whitespace-only command");
+  assert.equal(out.skipped, false);
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.match(out.blockReason ?? "", /empty or whitespace-only/);
+});
+
+test("gate (#173 regression): empty-string configured command blocks immediately, never falls back to auto-detect", async () => {
+  // Regression for review-2 finding: `command: ""` is an explicit misconfiguration;
+  // it must block rather than silently fall back to auto-detection with an empty label.
+  let detectCalled = false;
+  let ran = false;
+  const out = await runTestGate(cfgWith({ command: "" }), 173, "/wt", {
+    detectTestCommand: () => {
+      detectCalled = true;
+      return { cmd: "npm", args: ["test"] };
+    },
+    runTests: async () => {
+      ran = true;
+      return passResult;
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(detectCalled, false, "auto-detection must not run for explicitly-set empty command");
+  assert.equal(ran, false, "runTests must not be called for empty command");
+  assert.equal(out.skipped, false);
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.match(out.blockReason ?? "", /empty or whitespace-only/);
+});
+
 // ---------------------------------------------------------------------------
 // runTestGate — the bounded loop (injected stubs)
 // ---------------------------------------------------------------------------

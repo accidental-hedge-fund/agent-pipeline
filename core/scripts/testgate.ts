@@ -179,7 +179,22 @@ export async function runTestGate(
 
   // Operator-configured commands run through `sh -c` so shell operators
   // (&&, ||, ;, pipes) work. Auto-detected commands spawn directly.
-  const configuredCmd = cfg.test_gate.command;
+  const rawConfiguredCmd = cfg.test_gate.command;
+  // Trim whitespace so `command: "   "` doesn't silently pass as a no-op shell
+  // script (sh exits 0 on an empty body). Undefined stays undefined.
+  const configuredCmd = rawConfiguredCmd?.trim() || undefined;
+
+  // Block early on explicitly-set but empty/whitespace-only commands rather than
+  // silently falling back to auto-detection (which would hide the misconfiguration).
+  if (rawConfiguredCmd !== undefined && !configuredCmd) {
+    return {
+      skipped: false,
+      passed: false,
+      attempts: 0,
+      blockReason: `test_gate.command is set but empty or whitespace-only ("${rawConfiguredCmd}"). Configure a valid command or remove the setting to use auto-detection.`,
+    };
+  }
+
   const command: ParsedCommand | null = configuredCmd
     ? { cmd: "sh", args: ["-c", configuredCmd] }
     : detectFn(wtPath);
