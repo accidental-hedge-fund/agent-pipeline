@@ -48,6 +48,9 @@ function detectLockfile(
 }
 
 const MAX_CAPTURED = 100_000;
+// Wall-clock cap for a single install/setup run. A hung `pnpm install` would
+// otherwise hold the pipeline process and lock alive indefinitely.
+const SETUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 async function defaultSpawnCommand(
   cmd: string,
@@ -62,6 +65,23 @@ async function defaultSpawnCommand(
 
     let stdoutBuf = "";
     let stderrBuf = "";
+    let done = false;
+
+    const label = useShell ? cmd : [cmd, ...args].join(" ");
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
+      // Escalate to SIGKILL if the process hasn't exited after a short grace period.
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 2000);
+      const timeoutMsg = `[setup-timeout: \`${label}\` did not complete within ${SETUP_TIMEOUT_MS / 1000}s]`;
+      resolve({
+        code: -1,
+        stdout: stdoutBuf,
+        stderr: [stderrBuf, timeoutMsg].map((s) => s.trim()).filter(Boolean).join("\n"),
+      });
+    }, SETUP_TIMEOUT_MS);
 
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
@@ -74,9 +94,15 @@ async function defaultSpawnCommand(
       process.stderr.write(text);
     });
     child.on("error", (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
       resolve({ code: -1, stdout: stdoutBuf, stderr: `spawn error: ${err.message}\n${stderrBuf}` });
     });
     child.on("close", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
       resolve({ code: code ?? -1, stdout: stdoutBuf, stderr: stderrBuf });
     });
   });

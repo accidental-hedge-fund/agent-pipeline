@@ -288,3 +288,83 @@ test("install result carries stdout and stderr from the command", async () => {
   assert.equal(result.stdout, "Packages: +42\ndone");
   assert.equal(result.stderr, "warn: something");
 });
+
+// ---------------------------------------------------------------------------
+// Regression (#174 finding 1): setup failure THROWS (not returns skipped) so
+// the caller (planning.ts) sees the error and can transition the issue back to
+// `ready` before blocking. If detectAndInstall were to silently return
+// {skipped:true} on failure, planning.ts would proceed with a broken worktree
+// and the test/build gate would fail with "command not found" errors.
+// ---------------------------------------------------------------------------
+
+test("regression(#174-f1): pnpm install failure throws so caller can transition to ready before blocking", async () => {
+  const deps = spawnResult(["/wt/pnpm-lock.yaml"], 1, "", "ERR_PNPM_PEER_DEP_ISSUES: peer deps");
+  // Must throw — not return {skipped:true}. The catch in planning.ts depends on
+  // this to transition the issue label back to "ready" before setBlocked().
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg(undefined), deps),
+    (err: Error) => {
+      assert.ok(err instanceof Error, "must be an Error instance");
+      assert.ok(err.message.includes("pnpm install"), `must name the command: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test("regression(#174-f1): setup_command failure throws so caller can transition to ready before blocking", async () => {
+  const deps: SetupDeps = {
+    existsSync: () => false,
+    spawnCommand: async () => ({ code: 127, stdout: "", stderr: "command not found: my-setup" }),
+  };
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg("my-setup"), deps),
+    (err: Error) => {
+      assert.ok(err instanceof Error, "must be an Error instance");
+      assert.ok(err.message.includes("setup_command"), `must mention setup_command: ${err.message}`);
+      assert.ok(err.message.includes("127"), `must include exit code: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Timeout (#174 finding 2): when spawnCommand returns code -1 with a
+// [setup-timeout] marker (as defaultSpawnCommand does when the wall-clock cap
+// fires), detectAndInstall surfaces it as a clear error that names the command.
+// ---------------------------------------------------------------------------
+
+test("timeout(#174-f2): pnpm install timeout → throws naming the command and timeout info", async () => {
+  const timeoutMsg = "[setup-timeout: `pnpm install` did not complete within 300s]";
+  const deps: SetupDeps = {
+    existsSync: (p) => p === "/wt/pnpm-lock.yaml",
+    // Simulate what defaultSpawnCommand returns when the SETUP_TIMEOUT_MS fires.
+    spawnCommand: async () => ({ code: -1, stdout: "", stderr: timeoutMsg }),
+  };
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg(undefined), deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("pnpm install"), `must name the command: ${err.message}`);
+      assert.ok(err.message.includes("timeout"), `must mention timeout: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test("timeout(#174-f2): setup_command timeout → throws naming the command and timeout info", async () => {
+  const deps: SetupDeps = {
+    existsSync: () => false,
+    spawnCommand: async () => ({
+      code: -1,
+      stdout: "",
+      stderr: "[setup-timeout: `pnpm install --frozen-lockfile` did not complete within 300s]",
+    }),
+  };
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg("pnpm install --frozen-lockfile"), deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("setup_command"), `must mention setup_command: ${err.message}`);
+      assert.ok(err.message.includes("timeout"), `must mention timeout: ${err.message}`);
+      return true;
+    },
+  );
+});

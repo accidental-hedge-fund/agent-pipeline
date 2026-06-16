@@ -225,7 +225,17 @@ export async function advance(
     }
   } catch (err) {
     const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Worktree setup failed: ${e.message}`, preImplStage, "worktree-setup-failed");
+    // Transition back to ready before blocking so that removing "blocked" re-enters
+    // the full planning flow. Without this, the issue would sit at planning/plan-review
+    // (no-op dispatch states) and never retry after the operator fixes the install.
+    await transition(
+      cfg,
+      issueNumber,
+      preImplStage,
+      "ready",
+      "Worktree setup failed — resetting to ready so unblocking retries planning from the start.",
+    );
+    await setBlocked(cfg, issueNumber, `Worktree setup failed: ${e.message}`, "ready", "worktree-setup-failed");
     return { advanced: false, status: "blocked", reason: e.message };
   }
 
