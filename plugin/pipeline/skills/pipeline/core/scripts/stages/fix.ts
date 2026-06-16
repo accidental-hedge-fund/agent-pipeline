@@ -16,7 +16,7 @@ import {
 import { invoke } from "../harness.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
-import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
   type VerifyDeps,
@@ -46,6 +46,8 @@ export interface AdvanceFixDeps {
   gitDiffFiles?: (wtPath: string, from: string, to: string) => Promise<string[]>;
   /** Validate one OpenSpec change (defaults to `openspec.validateItem`). */
   openspecValidateItem?: (wtPath: string, id: string) => Promise<ValidateResult>;
+  /** Format/lint gate runner (#182); defaults to runFormatGate. */
+  runFormatGate?: typeof runFormatGate;
 }
 
 export async function advanceFix(
@@ -182,11 +184,21 @@ export async function advanceFix(
     }
   }
 
-  // ---- test/build gate (#15) — must pass before advancing past this fix round ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, stage, opts.stateDir);
-  if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), stage, "test-gate-exhausted");
-    return { advanced: false, status: "blocked", reason: "test gate failed" };
+  // ---- Format + test gates to convergence (#182, #15) ----
+  // The format/lint gate runs BEFORE the test gate and both re-run until neither
+  // produces a new commit, so the pushed fix state is simultaneously formatted
+  // and tested — no auto-format commit ships untested, no test-fix commit unformatted.
+  const fmtGateFn = deps.runFormatGate ?? runFormatGate;
+  const gates = await runFormatAndTestGates(
+    cfg, issueNumber, wt.path, stage, pipelineRunId, opts.stateDir,
+    { runFormatGate: fmtGateFn },
+  );
+  if (!gates.ok) {
+    await setBlocked(
+      cfg, issueNumber, gates.reason, stage,
+      gates.source === "test" ? "test-gate-exhausted" : "needs-human",
+    );
+    return { advanced: false, status: "blocked", reason: gates.reason };
   }
 
   const branch = branchName(issueNumber, wt.slug);

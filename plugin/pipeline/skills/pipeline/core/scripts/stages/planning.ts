@@ -40,7 +40,8 @@ import {
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
-import { runTestGate, testGateBlockReason } from "../testgate.ts";
+import { runTestGate } from "../testgate.ts";
+import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
@@ -754,6 +755,7 @@ export interface ResumeFromImplementingDeps {
   gitInWorktree?: typeof gitInWorktree;
   setBlocked?: typeof setBlocked;
   transition?: typeof transition;
+  runFormatGate?: typeof runFormatGate;
 }
 
 /**
@@ -787,14 +789,25 @@ export async function resumeFromImplementing(
   const gitOp = deps.gitInWorktree ?? gitInWorktree;
   const blocker = deps.setBlocked ?? setBlocked;
   const trans = deps.transition ?? transition;
+  const fmtGateFn = deps.runFormatGate ?? runFormatGate;
 
   const branch = wt.branch;
 
-  // ---- Test/build gate ----
-  const gate = await gateRunner(cfg, issueNumber, wt.path, {}, opts.pipelineRunId, "planning", opts.stateDir);
-  if (!gate.skipped && !gate.passed) {
-    await blocker(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
-    return { advanced: false, status: "blocked", reason: "test gate failed" };
+  // ---- Format + test gates to convergence (#182) ----
+  // The format/lint gate runs BEFORE the test gate (so tests see formatted code)
+  // and both re-run until neither produces a new commit, so the pushed state is
+  // simultaneously formatted and tested — no auto-format commit ships untested
+  // and no test-fix commit ships unformatted.
+  const gates = await runFormatAndTestGates(
+    cfg, issueNumber, wt.path, "planning", opts.pipelineRunId, opts.stateDir,
+    { runFormatGate: fmtGateFn, runTestGate: gateRunner },
+  );
+  if (!gates.ok) {
+    await blocker(
+      cfg, issueNumber, gates.reason, "implementing",
+      gates.source === "test" ? "test-gate-exhausted" : "needs-human",
+    );
+    return { advanced: false, status: "blocked", reason: gates.reason };
   }
 
   // ---- Push ----

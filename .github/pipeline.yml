@@ -72,6 +72,20 @@ test_gate:
 #   min_confidence: 0.7 # 0..1 — findings below this confidence advise, not block
 #   max_adversarial_rounds: 3 # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
 
+# format_gate: [] # run formatter/linter commands after implementing and fix-round harnesses (#182)
+#   Entries run in the worktree root in declaration order. auto_fix: true commits any changes and
+#   re-runs to verify stability; auto_fix: false blocks immediately on non-zero exit.
+#   Default: [] (no gate; existing behavior unchanged).
+#   Examples for Rust repos:
+#     - command: cargo fmt
+#       auto_fix: true
+#     - command: cargo clippy -D warnings
+#       auto_fix: false
+#   Examples for JS/TS repos:
+#     - command: eslint --fix src/
+#       auto_fix: true
+#   (agent-pipeline has no active formatter/linter configured; see README for details.)
+
 # doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here
 #   runOnStart: false # if true, run the preflight checks before planning and abort the run on any failure
 #   failFast: false # if true, stop at the first failing check instead of collecting all failures

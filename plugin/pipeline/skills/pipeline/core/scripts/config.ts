@@ -98,6 +98,14 @@ const PartialConfigSchema = z.object({
   // Worktree bootstrap: dependency install step (#174). Non-empty string →
   // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
   setup_command: z.string().optional(),
+  // Format/lint normalization gate (#182). Each entry runs after implementing
+  // and fix-round harnesses exit. auto_fix: true commits changes and re-runs;
+  // auto_fix: false blocks on non-zero exit without committing.
+  format_gate: z
+    .array(
+      z.object({ command: z.string(), auto_fix: z.boolean() }).strict(),
+    )
+    .optional(),
   // Opt-in sandboxed harness execution (#21). When true, the claude implementer
   // uses --permission-mode default instead of bypassPermissions.
   harness_sandbox: z.boolean().optional(),
@@ -266,6 +274,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
     setup_command: fileConfig.setup_command,
+    format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
   };
   warnInertModelAliases(fileConfig.models, merged.harnesses);
@@ -511,6 +520,17 @@ doctor: # deterministic preflight capability check (#146) — run \`pipeline doc
 #     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
 #     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
 
+# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)
+#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;
+#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).
+#   Examples (Rust repo):
+#     - command: cargo fmt
+#       auto_fix: true
+#     - command: cargo clippy -D warnings
+#       auto_fix: false
+#   Examples (JS/TS repo):
+#     - command: eslint --fix src/
+#       auto_fix: true
 # harness_sandbox: false # set true to run the claude implementer with --permission-mode default
 #   instead of bypassPermissions (#21). The codex harness is already sandboxed
 #   via --full-auto and is unaffected. Default false → current invocation unchanged.

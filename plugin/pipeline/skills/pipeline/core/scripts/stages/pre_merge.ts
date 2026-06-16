@@ -31,6 +31,7 @@ import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
+const AUTO_FORMAT_PREFIX = "chore: auto-format (#";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
@@ -45,7 +46,10 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
  * come from a developer. Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+  return (
+    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
+    messageHeadline.startsWith(AUTO_FORMAT_PREFIX)
+  );
 }
 
 export interface AdvancePreMergeOpts {
@@ -654,7 +658,11 @@ async function computeBranchDeveloperCommits(
     const sha = line.slice(0, sep).trim();
     if (!sha) continue;
     const subj = line.slice(sep + 1).trim();
-    if (isPipelineInternalCommit(subj)) continue;
+    // Only skip the pipeline's own OpenSpec archive commits — auto-format commits
+    // can change implementation files and must remain visible to the stale-spec
+    // guard even though they are classified as pipeline-internal for the
+    // review-SHA gate (#182 finding 3).
+    if (subj.startsWith(OPENSPEC_ARCHIVE_PREFIX)) continue;
     const d = await gitFn(wtPath, ["diff", "--name-only", `${sha}^`, sha], { ignoreFailure: true });
     const paths = d.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
     result.push({ sha, paths });

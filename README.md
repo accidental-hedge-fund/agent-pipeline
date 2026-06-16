@@ -255,6 +255,11 @@ eval_gate:                           # run the repo's eval harness after pre-mer
   mode: gate                         # gate (default): block on fail | advisory: record result and always advance
   timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
   max_attempts: 2                    # total attempts before giving up (1 = no retry)
+format_gate:                         # run formatter/linter commands after each implementing/fix harness (#182)
+  - command: cargo fmt               # shell command to run in the worktree root
+    auto_fix: true                   # true: commit any changes and re-run; false: block on non-zero exit
+  - command: cargo clippy -D warnings
+    auto_fix: false
 review_policy:                       # which review findings block progression vs. merely advise
   block_threshold: medium            # critical|high|medium|low — findings below this advise, not block (default: medium; 'high' = more throughput, 'low' = block on everything)
   min_confidence: 0.7                # 0..1 — findings below this confidence advise, not block (default: 0.7)
@@ -392,6 +397,44 @@ test_gate:
 ```
 
 `test_gate.command` is run through `bash -c` with `set -o pipefail`, so compound operators like `&&`, `||`, `;`, and `|` work directly in the config value — and `pipefail` ensures a failing earlier stage in a pipeline (e.g. `npm test | tee log`) fails the gate rather than being hidden by the last stage's exit code. (Configured commands therefore require `bash`; it is assumed present, as on every supported CI runner and dev host.) Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
+
+## Format/lint gate (optional, default off)
+
+The single most common cause of pre-merge CI failures in multi-language repos is formatter/linter drift: the implementing or fix harness produces code that **compiles and passes review but is not style-clean** — `cargo fmt --check`, `cargo clippy -D warnings`, or `eslint` fail only at the CI step after the PR is opened. `format_gate` closes that gap by running configured commands **inside the worktree immediately after each implementing or fix-round harness exits**, before the PR is opened or updated.
+
+Configure `format_gate` in `.github/pipeline.yml` as an array of entries, each with:
+
+- **`command`** (`string`): shell command to run in the worktree root. Run through `/bin/sh -c`, so pipes, `&&`, and env vars are valid.
+- **`auto_fix`** (`boolean`): when `true`, the command is expected to mutate files (e.g. `cargo fmt`, `eslint --fix`). The pipeline commits any changes it produces with message `chore: auto-format (#N)` and re-runs the command to verify stability. When `false`, the command is check-only (e.g. `cargo clippy -D warnings`) — a non-zero exit immediately blocks without any worktree mutation.
+
+```yaml
+format_gate:
+  - command: cargo fmt           # auto-fix: runs, commits any changes, re-runs to confirm stable
+    auto_fix: true
+  - command: cargo clippy -D warnings   # check-only: blocks on non-zero exit
+    auto_fix: false
+```
+
+For JS/TS repos:
+
+```yaml
+format_gate:
+  - command: eslint --fix src/
+    auto_fix: true
+  - command: prettier --check src/
+    auto_fix: false
+```
+
+**How it runs:**
+
+1. After the implementing or fix-round harness exits and commit-range verification passes, each format gate entry runs in order.
+2. `auto_fix: true` — the command runs. If uncommitted changes are present afterward, they are staged and committed as `chore: auto-format (#N)`. The command then re-runs; if the re-run exits non-zero, the pipeline blocks.
+3. `auto_fix: false` — the command runs. If it exits non-zero, the pipeline blocks immediately with the command's combined output as the reason.
+4. If the gate produces an auto-format commit, the review-SHA gate recognizes it as pipeline-internal and does **not** re-trigger a full review cycle.
+
+**When no `format_gate` is configured** (the default), the step is a no-op and behavior is completely unchanged — existing pipeline runs are unaffected.
+
+**Failure handling:** a blocked format gate posts a `## Pipeline: Blocked` comment on the issue with the failing command and its output. Fix the formatting/lint issue in the worktree, commit, clear the `blocked` label, and re-run.
 
 ## Troubleshooting
 

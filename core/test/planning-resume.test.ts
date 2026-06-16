@@ -418,3 +418,60 @@ test("resumeFromImplementing: fresh-flow worktree shape (no slug, branch from cr
   assert.equal(pushedBranch.length, 1, "push should be called once");
   assert.equal(pushedBranch[0], "pipeline/42-fix-the-bug", "pushed branch must match the worktree branch, not pipeline/42-undefined");
 });
+
+// ---------------------------------------------------------------------------
+// Regression (#182 review-2 finding 1): format gate runs AFTER the test gate
+// so test-fix harness commits are also checked. A blocked format gate must
+// block after a passing test gate (not before).
+// ---------------------------------------------------------------------------
+
+test("resumeFromImplementing: format gate blocks first (before the test gate) → blocked, no PR opened (#182)", async () => {
+  // #182: the format/lint gate now runs BEFORE the test gate (so tests see
+  // formatted code). When format blocks, the test gate must NOT run and no PR
+  // is opened. Bites a regression to the old test-then-format ordering.
+  let testGateCalled = false;
+  let createPrCalled = false;
+  const callOrder: string[] = [];
+  const setBlockedArgs: string[] = [];
+
+  const deps: ResumeFromImplementingDeps = {
+    runFormatGate: async () => {
+      callOrder.push("formatGate");
+      return { status: "blocked", reason: "eslint: 3 errors" };
+    },
+    runTestGate: async () => {
+      testGateCalled = true;
+      callOrder.push("testGate");
+      return passedGate();
+    },
+    getPrForBranch: async () => null,
+    createPr: async () => { createPrCalled = true; return 0; },
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async (_cfg, _n, reason) => { setBlockedArgs.push(reason); },
+    transition: async () => {},
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg({ format_gate: [{ command: "eslint .", auto_fix: false }] } as Partial<PipelineConfig>),
+    42,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] Fix (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (n) => `PR #${n} ready.`,
+      pipelineRunId: "run-1",
+    },
+    deps,
+  );
+
+  assert.equal(callOrder[0], "formatGate",
+    `format gate must run first; got order: ${callOrder.join(" → ")}`);
+  assert.ok(!testGateCalled, "test gate must NOT run when the format gate blocks first");
+  assert.equal(result.advanced, false);
+  if (!result.advanced) {
+    assert.equal(result.status, "blocked");
+    assert.ok(result.reason.includes("eslint"), `unexpected reason: ${result.reason}`);
+  }
+  assert.ok(!createPrCalled, "PR must NOT be opened when format gate blocks");
+  assert.ok(setBlockedArgs.length > 0, "setBlocked must be called");
+});
