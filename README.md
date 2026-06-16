@@ -335,7 +335,7 @@ When `test_gate.enabled` (the default), the target repo's **own** test/build com
 
 The command is **auto-detected** (first match wins):
 
-1. Explicit `test_gate.command` override (run through `sh -c` so POSIX shell operators like `&&`, `||`, `;`, and `|` work)
+1. Explicit `test_gate.command` override (run through `bash -c` with `set -o pipefail` so shell operators like `&&`, `||`, `;`, and `|` work — and a failing stage in a pipeline like `npm test | tee log` fails the gate instead of being masked)
 2. `package.json` — a real `test` script (npm placeholder/`echo` stubs skipped), else a `build:check` / `typecheck` / `type-check` / `build` script; the package manager follows the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm)
 3. `go.mod` → `go test ./...`
 4. `Cargo.toml` → `cargo test`
@@ -366,7 +366,7 @@ test_gate:
 }
 ```
 
-`test_gate.command` is run through a POSIX shell (`sh -c`), so compound operators like `&&` work directly in the config value. Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
+`test_gate.command` is run through `bash -c` with `set -o pipefail`, so compound operators like `&&`, `||`, `;`, and `|` work directly in the config value — and `pipefail` ensures a failing earlier stage in a pipeline (e.g. `npm test | tee log`) fails the gate rather than being hidden by the last stage's exit code. (Configured commands therefore require `bash`; it is assumed present, as on every supported CI runner and dev host.) Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
 
 ## Troubleshooting
 

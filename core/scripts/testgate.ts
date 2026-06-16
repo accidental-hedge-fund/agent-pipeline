@@ -177,8 +177,13 @@ export async function runTestGate(
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
   const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
 
-  // Operator-configured commands run through `sh -c` so shell operators
-  // (&&, ||, ;, pipes) work. Auto-detected commands spawn directly.
+  // Operator-configured commands run through `bash -c "set -o pipefail; …"` so
+  // shell operators (&&, ||, ;, pipes) work AND a failing stage in a pipeline
+  // fails the gate. Without pipefail, POSIX sh returns only the LAST pipeline
+  // stage's status, so `npm test | tee log` would report success even when
+  // `npm test` failed and mask broken changes (#174). pipefail is a bash/ksh
+  // feature — plain POSIX `sh`/dash cannot enforce it — so configured commands
+  // require bash. Auto-detected commands spawn directly (no shell).
   const rawConfiguredCmd = cfg.test_gate.command;
   // Trim whitespace so `command: "   "` doesn't silently pass as a no-op shell
   // script (sh exits 0 on an empty body). Undefined stays undefined.
@@ -195,13 +200,16 @@ export async function runTestGate(
     };
   }
 
+  // `set -o pipefail` on its own line (not `;`-joined) so it applies even when
+  // the configured command begins with a comment. The raw command is shown in
+  // the log label below; this wrapper is internal.
   const command: ParsedCommand | null = configuredCmd
-    ? { cmd: "sh", args: ["-c", configuredCmd] }
+    ? { cmd: "bash", args: ["-c", `set -o pipefail\n${configuredCmd}`] }
     : detectFn(wtPath);
   if (!command) return { skipped: true };
 
   // Shell-backed commands require killProcessGroup so all descendants (e.g.
-  // npm, pnpm, a test runner in an && chain) are terminated on timeout.
+  // npm, pnpm, a test runner in an && chain or pipeline) are terminated on timeout.
   const killProcessGroup = !!configuredCmd;
 
   const label = configuredCmd ?? formatCommand(command);
@@ -376,9 +384,9 @@ export function testGateBlockReason(gate: TestGateResult): string {
 /**
  * Spawn the test/build command, capping output and enforcing a wall-clock
  * timeout. A non-zero exit, a timeout, or a spawn error all count as a
- * failure. When `killProcessGroup` is true (required for shell-backed `sh -c`
- * commands) the entire spawned process group is killed on timeout so shell
- * descendants do not outlive the gate.
+ * failure. When `killProcessGroup` is true (required for shell-backed
+ * `bash -c` commands) the entire spawned process group is killed on timeout so
+ * shell descendants do not outlive the gate.
  */
 export async function runTests(
   cwd: string,
