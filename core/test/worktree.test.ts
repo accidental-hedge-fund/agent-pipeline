@@ -5,7 +5,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex } from "../scripts/worktree.ts";
+import * as os from "node:os";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -1117,4 +1120,70 @@ test("createWorktree: no node_modules at worktree root → exclude written, unli
   await createWorktree(cfg, 42, "slug", deps);
   assert.equal(excludeWritten, true, "exclude must be written even when node_modules is absent");
   assert.equal(unlinkCalled, false, "unlink must not be called when there is no node_modules");
+});
+
+// ---------------------------------------------------------------------------
+// realWriteNodeModulesExclude — linked worktree regression (#180 finding 1)
+// ---------------------------------------------------------------------------
+
+test("realWriteNodeModulesExclude: linked worktree (.git file) writes to real gitdir, not .git/info (#180)", async () => {
+  // A `git worktree add` linked worktree has a .git FILE (not a directory)
+  // containing "gitdir: <real-gitdir-path>".  The previous implementation tried
+  // to mkdir .git/info/ which fails with ENOTDIR because .git is a file.
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
+  try {
+    const worktreeRoot = path.join(tmp, "wt");
+    const realGitDir = path.join(tmp, "real-gitdir");
+    await fs.promises.mkdir(worktreeRoot);
+    await fs.promises.mkdir(realGitDir);
+
+    // Simulate a linked worktree: .git is a file pointing at the real gitdir.
+    await fs.promises.writeFile(path.join(worktreeRoot, ".git"), `gitdir: ${realGitDir}\n`);
+
+    await realWriteNodeModulesExclude(worktreeRoot);
+
+    const excludeFile = path.join(realGitDir, "info", "exclude");
+    const content = await fs.promises.readFile(excludeFile, "utf8");
+    assert.ok(
+      content.split("\n").some((l) => l.trim() === "node_modules"),
+      `node_modules must appear in ${excludeFile}; got: ${content}`,
+    );
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("realWriteNodeModulesExclude: regular worktree (.git directory) writes to .git/info/exclude (#180)", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
+  try {
+    const gitInfoDir = path.join(tmp, ".git", "info");
+    await fs.promises.mkdir(gitInfoDir, { recursive: true });
+
+    await realWriteNodeModulesExclude(tmp);
+
+    const content = await fs.promises.readFile(path.join(gitInfoDir, "exclude"), "utf8");
+    assert.ok(
+      content.split("\n").some((l) => l.trim() === "node_modules"),
+      `node_modules must appear in exclude; got: ${content}`,
+    );
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("realWriteNodeModulesExclude: idempotent — duplicate entry not added (#180)", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
+  try {
+    const gitInfoDir = path.join(tmp, ".git", "info");
+    await fs.promises.mkdir(gitInfoDir, { recursive: true });
+
+    await realWriteNodeModulesExclude(tmp);
+    await realWriteNodeModulesExclude(tmp);
+
+    const content = await fs.promises.readFile(path.join(gitInfoDir, "exclude"), "utf8");
+    const lines = content.split("\n").filter((l) => l.trim() === "node_modules");
+    assert.equal(lines.length, 1, "node_modules must appear exactly once");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
 });

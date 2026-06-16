@@ -17,12 +17,14 @@ export interface SalvageDeps {
   /** `git status --porcelain` output for the worktree ("" when clean). */
   gitStatus?: (wtPath: string) => Promise<string>;
   /**
-   * Stage all changes in the worktree, excluding `node_modules` entries.
-   * The default implementation uses `git add -A -- :(exclude)node_modules`
+   * Stage changes in the worktree using the provided git-add args array.
+   * The default implementation passes `["add", "-A", "--", ":(exclude)node_modules"]`
    * so that a node_modules symlink or directory is never staged even if
-   * `.git/info/exclude` is absent or stale.
+   * `.git/info/exclude` is absent or stale.  The args are passed through as
+   * a parameter so tests can assert the required pathspec without relying on
+   * the default implementation.
    */
-  gitAddAll?: (wtPath: string) => Promise<void>;
+  gitAddAll?: (wtPath: string, args: string[]) => Promise<void>;
   /** `git commit -m <message>` in the worktree. */
   gitCommit?: (wtPath: string, message: string) => Promise<void>;
 }
@@ -40,8 +42,10 @@ async function defaultGitStatus(wtPath: string): Promise<string> {
   return res.stdout;
 }
 
-async function defaultGitAddAll(wtPath: string): Promise<void> {
-  await gitInWorktree(wtPath, ["add", "-A", "--", ":(exclude)node_modules"]);
+const SALVAGE_GIT_ADD_ARGS = ["add", "-A", "--", ":(exclude)node_modules"];
+
+async function defaultGitAddAll(wtPath: string, args: string[]): Promise<void> {
+  await gitInWorktree(wtPath, args);
 }
 
 async function defaultGitCommit(wtPath: string, message: string): Promise<void> {
@@ -104,7 +108,7 @@ export async function salvageUncommittedWork(
   const status = await (deps.gitStatus ?? defaultGitStatus)(wtPath);
   if (!status.trim()) return { salvaged: false };
   const message = buildSalvageCommitMessage(issueNumber, pipelineRunId, stageLabel);
-  await (deps.gitAddAll ?? defaultGitAddAll)(wtPath);
+  await (deps.gitAddAll ?? defaultGitAddAll)(wtPath, SALVAGE_GIT_ADD_ARGS);
   await (deps.gitCommit ?? defaultGitCommit)(wtPath, message);
   return { salvaged: true, message };
 }

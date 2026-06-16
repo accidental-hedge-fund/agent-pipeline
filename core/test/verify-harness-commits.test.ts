@@ -559,3 +559,21 @@ test("node_modules scan: empty commit range → scan is no-op, no block (#180)",
   });
   assert.equal(result.ok, true);
 });
+
+test("node_modules scan: commit that only deletes a node_modules entry → scan passes (#180 finding 2)", async () => {
+  // A remediation commit that removes a previously committed node_modules symlink
+  // must NOT be blocked.  The injectable gitDiffTreeFiles returns only what the
+  // default implementation returns (non-deleted paths), so the scan never sees
+  // the deleted node_modules path.
+  const sha = "cleanup1234567890";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["fix: remove node_modules symlink (#180)\n\nIssue: #180"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    // Simulate what defaultGitDiffTreeFiles returns after --diff-filter=d:
+    // the deleted node_modules path is excluded, only other changes are returned.
+    gitDiffTreeFiles: async () => ["core/scripts/worktree.ts"],
+  });
+  assert.equal(result.ok, true, "cleanup commit removing node_modules must not be blocked");
+});

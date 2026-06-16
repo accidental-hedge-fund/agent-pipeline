@@ -31,7 +31,7 @@ function fakeGit(status: string) {
   };
   const deps: SalvageDeps = {
     gitStatus: async () => status,
-    gitAddAll: async (wt) => {
+    gitAddAll: async (wt, _args) => {
       calls.order.push(`add:${wt}`);
     },
     gitCommit: async (wt, message) => {
@@ -190,20 +190,24 @@ test("contract: salvage message satisfies the traceability-trailer validation (b
 // Regression #180: salvage gitAddAll must exclude node_modules
 // ---------------------------------------------------------------------------
 
-test("salvage: gitAddAll is called when dirty worktree contains node_modules and real changed files (#180)", async () => {
+test("salvage: gitAddAll receives :(exclude)node_modules pathspec when worktree contains node_modules (#180)", async () => {
   // Simulates: harness exits with a node_modules symlink AND a real modified file.
-  // gitAddAll must be called exactly once (the exclusion is inside the default
-  // implementation; the seam verifies the call is made so the commit is created).
+  // The salvage path must pass :(exclude)node_modules in the args so the symlink
+  // is never staged even if .git/info/exclude was not yet written.
   const status = "?? node_modules\n M core/scripts/foo.ts\n";
-  let addAllCalls = 0;
+  let capturedArgs: string[] | null = null;
   let commitCreated = false;
   const deps: SalvageDeps = {
     gitStatus: async () => status,
-    gitAddAll: async () => { addAllCalls++; },
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
     gitCommit: async () => { commitCreated = true; },
   };
   const res = await salvageUncommittedWork("/wt", 131, RUN_ID, "implement", deps);
   assert.equal(res.salvaged, true, "worktree is dirty so salvage must run");
-  assert.equal(addAllCalls, 1, "gitAddAll must be called once");
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  assert.ok(
+    (capturedArgs as string[]).includes(":(exclude)node_modules"),
+    `gitAddAll args must include :(exclude)node_modules; got ${JSON.stringify(capturedArgs)}`,
+  );
   assert.equal(commitCreated, true, "commit must be created after staging");
 });

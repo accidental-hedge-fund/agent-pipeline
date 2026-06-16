@@ -93,9 +93,11 @@ async function defaultGitCommitShas(wtPath: string, headBefore: string): Promise
 }
 
 async function defaultGitDiffTreeFiles(wtPath: string, sha: string): Promise<string[]> {
+  // --diff-filter=d (lowercase) excludes deleted paths so a cleanup commit that
+  // removes a previously committed node_modules entry is not blocked by the scan.
   const res = await gitInWorktree(
     wtPath,
-    ["diff-tree", "--no-commit-id", "-r", "--name-only", sha],
+    ["diff-tree", "--no-commit-id", "-r", "--name-only", "--diff-filter=d", sha],
     { ignoreFailure: true },
   );
   return res.stdout.split("\n").map((f) => f.trim()).filter(Boolean);

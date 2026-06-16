@@ -373,8 +373,29 @@ export interface CreateWorktreeDeps {
   unlinkPath?: (p: string) => Promise<void>;
 }
 
-async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
-  const excludeDir = path.join(worktreePath, ".git", "info");
+export async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
+  const gitMarker = path.join(worktreePath, ".git");
+  let excludeDir: string;
+
+  // A linked worktree (created with `git worktree add`) has a .git FILE rather
+  // than a .git directory.  The file contains "gitdir: <real-gitdir-path>" that
+  // points to the per-worktree metadata directory under the main repo's .git.
+  // Attempting mkdir on .git/info/ when .git is a file fails with ENOTDIR, so
+  // we must resolve the real gitdir first.
+  const stat = await fs.promises.stat(gitMarker).catch((e: NodeJS.ErrnoException) => {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  });
+  if (stat !== null && stat.isFile()) {
+    const content = await fs.promises.readFile(gitMarker, "utf8");
+    const match = content.match(/^gitdir:\s*(.+)$/m);
+    if (!match) throw new Error(`Malformed .git file at ${gitMarker}: ${content.slice(0, 80)}`);
+    const realGitDir = path.resolve(worktreePath, match[1].trim());
+    excludeDir = path.join(realGitDir, "info");
+  } else {
+    excludeDir = path.join(gitMarker, "info");
+  }
+
   const excludeFile = path.join(excludeDir, "exclude");
   await fs.promises.mkdir(excludeDir, { recursive: true });
   let existing = "";
