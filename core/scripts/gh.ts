@@ -787,9 +787,21 @@ export async function getPrForIssue(
   return resolvePrForIssue(parsePrList(stdout), issueNumber, cfg.repo);
 }
 
-/** Look up the open PR whose head branch exactly equals {@link branch}.
+/** Select the first same-repo PR whose headRefName exactly equals {@link branch}.
+ *  Fork PRs (isCrossRepository === true) are excluded — they can share branch names
+ *  with pipeline branches and must not be reused as the pipeline's own PR. */
+export function selectPrForBranch(
+  data: { number: number; headRefName: string; isCrossRepository: boolean }[],
+  branch: string,
+): number | null {
+  const match = data.find((pr) => pr.headRefName === branch && !pr.isCrossRepository);
+  return match ? match.number : null;
+}
+
+/** Look up the open same-repo PR whose head branch exactly equals {@link branch}.
  *  Unlike getPrForIssue, this is scoped to one specific branch so stale PRs
- *  from prior slugs (pipeline/N-old-slug) are never returned. */
+ *  from prior slugs (pipeline/N-old-slug) are never returned. Fork PRs sharing
+ *  the same headRefName are excluded via the isCrossRepository guard. */
 export async function getPrForBranch(
   cfg: PipelineConfig,
   branch: string,
@@ -798,7 +810,7 @@ export async function getPrForBranch(
     "pr",
     "list",
     "--json",
-    "number,headRefName",
+    "number,headRefName,isCrossRepository",
     "--state",
     "open",
     "-L",
@@ -806,9 +818,12 @@ export async function getPrForBranch(
     "-R",
     cfg.repo,
   ]);
-  const data = JSON.parse(stdout) as { number: number; headRefName: string }[];
-  const match = data.find((pr) => pr.headRefName === branch);
-  return match ? match.number : null;
+  const data = JSON.parse(stdout) as {
+    number: number;
+    headRefName: string;
+    isCrossRepository: boolean;
+  }[];
+  return selectPrForBranch(data, branch);
 }
 
 // ---------------------------------------------------------------------------

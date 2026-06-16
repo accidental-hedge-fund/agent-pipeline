@@ -13,6 +13,7 @@ import {
   parsePrMergeState,
   pickStage,
   resolvePrForIssue,
+  selectPrForBranch,
   type PrCandidate,
 } from "../scripts/gh.ts";
 import {
@@ -385,6 +386,40 @@ test("resolvePrForIssue: closing ref matches despite mixed casing in owner/repo 
     },
   ];
   assert.equal(resolvePrForIssue(prs, 42, "Owner/Repo"), 11);
+});
+
+// ---------- selectPrForBranch (#175 adversarial regression) ----------
+
+test("selectPrForBranch: returns same-repo PR with exact branch match", () => {
+  const data = [
+    { number: 10, headRefName: "pipeline/175-my-fix", isCrossRepository: false },
+    { number: 11, headRefName: "pipeline/99-other", isCrossRepository: false },
+  ];
+  assert.equal(selectPrForBranch(data, "pipeline/175-my-fix"), 10);
+});
+
+test("selectPrForBranch: fork PR with identical headRefName is rejected (#175 adversarial regression)", () => {
+  // A contributor fork can expose the same branch name; it must not be reused as the
+  // pipeline's own PR (which would bind review at the wrong PR / wrong trust boundary).
+  const data = [
+    { number: 99, headRefName: "pipeline/175-my-fix", isCrossRepository: true },
+  ];
+  assert.equal(selectPrForBranch(data, "pipeline/175-my-fix"), null);
+});
+
+test("selectPrForBranch: same-repo PR wins when fork PR has same branch name (#175 adversarial regression)", () => {
+  const data = [
+    { number: 99, headRefName: "pipeline/175-my-fix", isCrossRepository: true },
+    { number: 10, headRefName: "pipeline/175-my-fix", isCrossRepository: false },
+  ];
+  assert.equal(selectPrForBranch(data, "pipeline/175-my-fix"), 10);
+});
+
+test("selectPrForBranch: returns null when no PR matches the branch", () => {
+  const data = [
+    { number: 10, headRefName: "pipeline/99-other", isCrossRepository: false },
+  ];
+  assert.equal(selectPrForBranch(data, "pipeline/175-my-fix"), null);
 });
 
 // ---------- extractHumanPlanComments (#26) ----------
