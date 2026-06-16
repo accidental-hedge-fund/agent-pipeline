@@ -607,3 +607,243 @@ test("extractAcceptanceCriteria: section absent → returns empty string", () =>
   const result = extractAcceptanceCriteria(body);
   assert.equal(result, "");
 });
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression: rubric_path path escape rejection
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: absolute rubric_path is rejected → fallback used, warning logged", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", rubric_path: "/etc/passwd" });
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT), "should not be read"),
+    readFile: (_p) => { throw new Error("readFile must not be called for an absolute path"); },
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "## Acceptance Criteria\n- AC1", state: "open",
+      url: "u", labels: [], comments: [],
+    }),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  try {
+    const out = await advance(cfg, 70, {}, deps);
+    assert.equal(out.advanced, true);
+    assert.ok(warnings.some((w) => w.includes("resolves outside the repo root")), "must warn about path escape");
+    assert.ok(capturedPrompt.includes("AC1"), "prompt must use AC fallback from issue body");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("shipcheck-gate: traversal rubric_path (../../) is rejected → fallback used", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", rubric_path: "../../etc/passwd" });
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT), null),
+    readFile: (_p) => { throw new Error("readFile must not be called for escape path"); },
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "## Acceptance Criteria\n- AC-escape", state: "open",
+      url: "u", labels: [], comments: [],
+    }),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  try {
+    await advance(cfg, 71, {}, deps);
+    assert.ok(warnings.some((w) => w.includes("resolves outside the repo root")), "must warn about traversal escape");
+    assert.ok(capturedPrompt.includes("AC-escape"), "prompt must use AC fallback");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 regression: revised plan preferred over original
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: Revised Implementation Plan preferred over original plan", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "Issue body", state: "open",
+      url: "u", labels: [], comments: [
+        {
+          author: "pipeline-bot",
+          body: "## Implementation Plan\n\nOriginal step that is now outdated.",
+          createdAt: "2024-01-01T00:00:00Z",
+        },
+        {
+          author: "pipeline-bot",
+          body: "## Revised Implementation Plan\n\nRevised step incorporating review feedback.",
+          createdAt: "2024-01-02T00:00:00Z",
+        },
+      ],
+    }),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 72, {}, deps);
+
+  assert.ok(capturedPrompt.includes("Revised step incorporating review feedback"), "prompt must use revised plan");
+  assert.ok(!capturedPrompt.includes("Original step that is now outdated"), "prompt must not use stale original plan");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4 regression: empty criteria must not silently pass
+// ---------------------------------------------------------------------------
+
+test("parseShipcheckVerdict: pass verdict with empty criteria → conservative fail fallback", () => {
+  const warnings: string[] = [];
+  const emptyPass = JSON.stringify({ verdict: "pass", summary: "looks good", criteria: [] });
+  const result = parseShipcheckVerdict(emptyPass, (w) => warnings.push(w));
+  assert.equal(result.verdict, "fail", "empty criteria must trigger conservative fail, not silent pass");
+  assert.ok(warnings.length > 0, "must warn when criteria is empty");
+});
+
+test("shipcheck-gate: gate mode + pass verdict with empty criteria → blocks (no silent advance)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_rounds: 1 });
+  const emptyPassJson = JSON.stringify({ verdict: "pass", summary: "looks good", criteria: [] });
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => ({ stdout: emptyPassJson, success: true }),
+  };
+
+  const out = await advance(cfg, 73, {}, deps);
+
+  assert.equal(out.advanced, false, "empty criteria must not silently advance in gate mode");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal(log.blocked.length, 1);
+  assert.ok(log.blocked[0].kind === "needs-human");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 5 regression: PR comment failure must not strand the gate
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: PR comment failure → warning logged, gate still advances (advisory)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 99,
+    postPrComment: async () => { throw new Error("PR API down"); },
+  };
+
+  try {
+    const out = await advance(cfg, 74, {}, deps);
+    assert.equal(out.advanced, true, "gate must advance despite PR comment failure");
+    assert.equal(log.comments.length, 1, "issue comment must still be posted");
+    assert.ok(warnings.some((w) => w.includes("PR mirror comment failed")), "must warn about PR comment failure");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("shipcheck-gate: PR comment failure → gate still blocks in gate mode on fail verdict", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(FAIL_VERDICT)),
+    getPrForIssue: async () => 99,
+    postPrComment: async () => { throw new Error("PR API down"); },
+  };
+
+  const out = await advance(cfg, 75, {}, deps);
+
+  assert.equal(out.advanced, false, "block must still happen despite PR comment failure");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.comments.length, 1, "issue comment still posted");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 6 regression: changed files must include line-count deltas
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: changed-files summary includes additions and deletions", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+
+  let capturedPrompt = "";
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getPrDiff: async () => [
+      "diff --git a/src/foo.ts b/src/foo.ts",
+      "--- a/src/foo.ts",
+      "+++ b/src/foo.ts",
+      "@@ -1,3 +1,4 @@",
+      " context",
+      "+added line one",
+      "+added line two",
+      "-removed line",
+      " context",
+      "diff --git a/src/bar.ts b/src/bar.ts",
+      "--- a/src/bar.ts",
+      "+++ b/src/bar.ts",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n"),
+    invokeReviewer: async (prompt) => {
+      capturedPrompt = prompt;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 76, {}, deps);
+
+  assert.ok(capturedPrompt.includes("src/foo.ts (+2 -1)"), "prompt must include foo.ts with line counts");
+  assert.ok(capturedPrompt.includes("src/bar.ts (+1 -1)"), "prompt must include bar.ts with line counts");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 7 regression: timeout comes from cfg.review_timeout, not hardcoded 300
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate: reviewer invoked with cfg.review_timeout, not hardcoded 300", async () => {
+  const log = makeCallLog();
+  // Use a non-default review_timeout to distinguish from the old hardcoded 300.
+  const cfg: ReturnType<typeof baseCfg> = { ...baseCfg({ enabled: true, mode: "advisory" }), review_timeout: 900 };
+
+  let capturedTimeout = 0;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    invokeReviewer: async (_prompt, _dir, timeoutSec) => {
+      capturedTimeout = timeoutSec;
+      return { stdout: fencedJson(PASS_VERDICT), success: true };
+    },
+  };
+
+  await advance(cfg, 77, {}, deps);
+
+  assert.equal(capturedTimeout, 900, "reviewer must receive cfg.review_timeout, not hardcoded 300");
+});

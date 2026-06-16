@@ -20,7 +20,7 @@ import {
   transition as defaultTransition,
 } from "../gh.ts";
 import { getForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
-import { openspecContextFromDiff } from "../openspec.ts";
+import { openspecContextFromDiff, isActive, changeIdsFromPaths, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
 import { substitute } from "../prompts/index.ts";
@@ -117,6 +117,10 @@ function isShipcheckVerdict(v: unknown): v is ShipcheckVerdict {
   if (!["pass", "partial", "fail"].includes(o.verdict as string)) return false;
   if (typeof o.summary !== "string") return false;
   if (!Array.isArray(o.criteria)) return false;
+  // Empty criteria array means the reviewer did not evaluate any rubric criterion.
+  // Treat as parse failure so the conservative fail fallback fires rather than
+  // silently advancing on a pass/partial with no human-auditable breakdown.
+  if (o.criteria.length === 0) return false;
   return o.criteria.every(isShipcheckCriterion);
 }
 
@@ -175,7 +179,7 @@ export interface ShipcheckDeps {
   /** Run git diff --name-only in a worktree. Returns path list. */
   gitDiffNames?: (wtPath: string, base: string) => Promise<string[]>;
   /** Invoke the reviewer harness with a prompt. Returns stdout string or null on failure. */
-  invokeReviewer?: (prompt: string, worktreeDir: string, timeoutSec: number) => Promise<{ stdout: string; success: boolean }>;
+  invokeReviewer?: (prompt: string, worktreeDir: string, timeoutSec: number) => Promise<{ stdout: string; success: boolean; timed_out?: boolean; stderr?: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +265,8 @@ export async function advance(
   // Run reviewer harness up to max_rounds.
   const maxRounds = cfg.shipcheck_gate.max_rounds;
   const reviewerHarness = cfg.harnesses.reviewer;
-  const timeoutSec = 300; // default per-round timeout
+  // Reuse cfg.review_timeout so repos can tune the reviewer latency budget centrally.
+  const timeoutSec = cfg.review_timeout;
 
   let verdict: ShipcheckVerdict | null = null;
   let parseFailure = false;
@@ -273,28 +278,36 @@ export async function advance(
       console.log(`[pipeline] #${issueNumber}: shipcheck-gate invoking reviewer (${reviewerHarness})`);
     }
 
-    let result: { stdout: string; success: boolean };
+    let result: { stdout: string; success: boolean; timed_out?: boolean; stderr?: string };
     if (deps.invokeReviewer) {
       result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
     } else {
       const harnessResult = await defaultInvoke(reviewerHarness, worktreeDir, prompt, {
         timeoutSec,
       });
-      result = { stdout: harnessResult.stdout, success: harnessResult.success };
+      result = {
+        stdout: harnessResult.stdout,
+        success: harnessResult.success,
+        timed_out: harnessResult.timed_out,
+        stderr: harnessResult.stderr,
+      };
     }
 
-    // Finding 4: only parse stdout from successful invocations. A non-zero exit,
-    // spawn error, or timeout must be treated as a failed round regardless of any
-    // output on stdout — a timed-out process that happened to print parseable JSON
-    // must not silently pass the gate.
+    // Only parse stdout from successful invocations. A non-zero exit, spawn error,
+    // or timeout must be treated as a failed round regardless of any output on
+    // stdout — a timed-out process that happened to print parseable JSON must not
+    // silently pass the gate.
     if (!result.success) {
       parseFailure = true;
       if (!verdict) {
+        const timedOut = result.timed_out === true;
+        const prefix = timedOut ? "[reviewer timed out]" : "[reviewer exited non-zero]";
+        const detail = timedOut
+          ? `timed out after ${timeoutSec}s`
+          : result.stdout.trim() || result.stderr?.trim() || "no output";
         verdict = {
           verdict: "fail",
-          summary: result.stdout.trim()
-            ? `[reviewer exited non-zero]: ${result.stdout.slice(0, 500)}`
-            : "[reviewer exited non-zero with no output]",
+          summary: `${prefix}: ${detail.slice(0, 500)}`,
           criteria: [],
         };
       }
@@ -346,11 +359,16 @@ export async function advance(
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck no output (advisory)" };
   }
 
-  // Post verdict comment.
+  // Post verdict comment. Issue comment is authoritative; PR mirror is best-effort
+  // so a transient PR API failure cannot strand the gate before it blocks/advances.
   const comment = formatShipcheckComment(verdict, cfg.shipcheck_gate.mode);
   await postCommentFn(cfg, issueNumber, comment);
   if (prNumber) {
-    await postPrCommentFn(cfg, prNumber, comment);
+    try {
+      await postPrCommentFn(cfg, prNumber, comment);
+    } catch (err) {
+      console.warn(`[pipeline] #${issueNumber}: shipcheck-gate: PR mirror comment failed (non-fatal): ${String(err)}`);
+    }
   }
 
   // Route based on mode and verdict.
@@ -392,9 +410,26 @@ export async function advance(
  * Load the rubric from the configured file path. When absent, logs a warning
  * and returns the provided fallback text (typically the issue's acceptance
  * criteria section or full body).
+ *
+ * Rejects absolute rubric_path values and paths that normalize outside the repo
+ * root to prevent local file disclosure via a malicious .github/pipeline.yml.
  */
 function loadRubric(cfg: PipelineConfig, deps: ShipcheckDeps, fallback: string): string {
+  const repoDir = path.resolve(cfg.repo_dir);
   const rubricPath = path.resolve(cfg.repo_dir, cfg.shipcheck_gate.rubric_path);
+
+  // Check at the file-read boundary: reject absolute rubric_path and any path
+  // that normalizes to outside the repo root (e.g. "../../etc/passwd").
+  if (
+    path.isAbsolute(cfg.shipcheck_gate.rubric_path) ||
+    !rubricPath.startsWith(repoDir + path.sep)
+  ) {
+    console.warn(
+      `[pipeline] shipcheck: rubric_path "${cfg.shipcheck_gate.rubric_path}" resolves outside the repo root; using issue acceptance criteria as rubric.`,
+    );
+    return fallback;
+  }
+
   const readFileFn = deps.readFile ?? defaultReadFile;
   const contents = readFileFn(rubricPath);
   if (contents !== null) return contents;
@@ -430,22 +465,31 @@ export function extractAcceptanceCriteria(body: string): string {
 
 /**
  * Extract the implementation plan + ACs from the issue's comment history.
- * Returns the first comment whose body starts with "## Implementation Plan".
+ * Scans newest-first so that a "## Revised Implementation Plan" posted after
+ * plan-review takes precedence over the stale original plan.
  */
 function extractPlanFromComments(
   comments: { author: string; body: string; createdAt: string }[],
 ): string {
-  for (const c of comments) {
+  const reversed = [...comments].reverse();
+  // Prefer the revised plan posted after plan-review.
+  for (const c of reversed) {
+    if (c.body.startsWith("## Revised Implementation Plan")) {
+      return c.body.slice(0, 4000);
+    }
+  }
+  // Fall back to the latest original plan.
+  for (const c of reversed) {
     if (c.body.startsWith("## Implementation Plan")) {
-      return c.body.slice(0, 4000); // cap to avoid oversized prompts
+      return c.body.slice(0, 4000);
     }
   }
   return "(not available)";
 }
 
 /**
- * Build a changed-files summary from the PR diff.
- * Parses `diff --git a/<path> b/<path>` header lines to list changed files.
+ * Build a changed-files summary from the PR diff, including per-file line-count
+ * deltas (additions/deletions) parsed from the unified diff body.
  * Falls back gracefully when no PR is linked or the diff fetch fails.
  */
 async function gatherChangedFiles(
@@ -456,12 +500,24 @@ async function gatherChangedFiles(
   if (!prNumber) return "(no PR linked)";
   try {
     const diff = await getPrDiffFn(cfg, prNumber);
-    const files: string[] = [];
+    const files: { filePath: string; additions: number; deletions: number }[] = [];
+    let current: { filePath: string; additions: number; deletions: number } | null = null;
+
     for (const line of diff.split("\n")) {
       const m = line.match(/^diff --git a\/(.*) b\//);
-      if (m) files.push(m[1]);
+      if (m) {
+        if (current) files.push(current);
+        current = { filePath: m[1], additions: 0, deletions: 0 };
+      } else if (current) {
+        // Count added/removed lines; skip the unified diff header lines (+++ / ---).
+        if (line.startsWith("+") && !line.startsWith("+++")) current.additions++;
+        else if (line.startsWith("-") && !line.startsWith("---")) current.deletions++;
+      }
     }
-    return files.length ? files.join("\n") : "(no files changed)";
+    if (current) files.push(current);
+
+    if (!files.length) return "(no files changed)";
+    return files.map((f) => `${f.filePath} (+${f.additions} -${f.deletions})`).join("\n");
   } catch {
     return "(changed files: see PR diff)";
   }
@@ -492,7 +548,12 @@ async function gatherEvalSummary(
 
 /**
  * Derive OpenSpec spec deltas from the worktree's branch diff.
- * Returns the delta text or undefined when not applicable.
+ *
+ * Pre-merge archives active change dirs before routing to shipcheck, so the
+ * normal active-path check inside openspecContextFromDiff returns nothing for
+ * those changes. After the active-path attempt returns empty we also check the
+ * archive location (openspec/changes/archive/<id>/specs/) so the spec deltas
+ * that were the acceptance source of truth still reach the reviewer.
  */
 async function gatherOpenspecDeltas(
   cfg: PipelineConfig,
@@ -501,8 +562,20 @@ async function gatherOpenspecDeltas(
 ): Promise<string | undefined> {
   try {
     const diffPaths = await gitDiffNamesFn(wtPath, cfg.base_branch);
-    const deltas = openspecContextFromDiff(cfg, wtPath, diffPaths);
-    return deltas || undefined;
+
+    // Try active change dirs first (the normal pre-archive path).
+    const activeDeltas = openspecContextFromDiff(cfg, wtPath, diffPaths);
+    if (activeDeltas) return activeDeltas;
+
+    // After pre-merge archives the change, active dirs are gone. Check the
+    // archive subdirectory. readSpecDeltas(dir, "archive/<id>") resolves to
+    // openspec/changes/archive/<id>/specs/ which is where archive places them.
+    if (!isActive(cfg, wtPath)) return undefined;
+    const ids = changeIdsFromPaths(diffPaths);
+    const archivedParts = ids
+      .map((id) => readSpecDeltas(wtPath, `archive/${id}`))
+      .filter(Boolean);
+    return archivedParts.length ? archivedParts.join("\n\n") : undefined;
   } catch {
     return undefined;
   }
