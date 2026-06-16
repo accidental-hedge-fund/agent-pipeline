@@ -8,6 +8,10 @@ import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
@@ -1126,27 +1130,77 @@ test("createWorktree: no node_modules at worktree root → exclude written, unli
 // realWriteNodeModulesExclude — linked worktree regression (#180 finding 1)
 // ---------------------------------------------------------------------------
 
-test("realWriteNodeModulesExclude: linked worktree (.git file) writes to real gitdir, not .git/info (#180)", async () => {
-  // A `git worktree add` linked worktree has a .git FILE (not a directory)
-  // containing "gitdir: <real-gitdir-path>".  The previous implementation tried
-  // to mkdir .git/info/ which fails with ENOTDIR because .git is a file.
+test("realWriteNodeModulesExclude: linked worktree (.git file) writes to COMMON gitdir info/exclude, not per-worktree gitdir (#180 review-2 finding 1)", async () => {
+  // In a real `git worktree add` linked worktree:
+  //   - .git is a FILE containing "gitdir: <per-worktree-dir>"
+  //   - <per-worktree-dir> is e.g. <main-repo>/.git/worktrees/<name>
+  //   - <per-worktree-dir>/commondir contains the relative path to the common git dir
+  //   - git resolves info/exclude through the COMMON git dir, not the per-worktree dir
+  // The old implementation wrote to <per-worktree-dir>/info/exclude, which git
+  // never reads for this worktree — so `git add` still staged node_modules entries.
   const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-test-"));
   try {
     const worktreeRoot = path.join(tmp, "wt");
-    const realGitDir = path.join(tmp, "real-gitdir");
+    const commonGitDir = path.join(tmp, "common-gitdir");   // analogous to main-repo/.git
+    const perWorktreeGitDir = path.join(tmp, "per-wt-gitdir"); // analogous to .git/worktrees/<name>
     await fs.promises.mkdir(worktreeRoot);
-    await fs.promises.mkdir(realGitDir);
+    await fs.promises.mkdir(commonGitDir);
+    await fs.promises.mkdir(perWorktreeGitDir);
 
-    // Simulate a linked worktree: .git is a file pointing at the real gitdir.
-    await fs.promises.writeFile(path.join(worktreeRoot, ".git"), `gitdir: ${realGitDir}\n`);
+    // Simulate the 'commondir' file Git writes in the per-worktree dir.
+    const relCommonDir = path.relative(perWorktreeGitDir, commonGitDir);
+    await fs.promises.writeFile(path.join(perWorktreeGitDir, "commondir"), `${relCommonDir}\n`);
+
+    // Simulate a linked worktree: .git is a file pointing at the per-worktree gitdir.
+    await fs.promises.writeFile(path.join(worktreeRoot, ".git"), `gitdir: ${perWorktreeGitDir}\n`);
 
     await realWriteNodeModulesExclude(worktreeRoot);
 
-    const excludeFile = path.join(realGitDir, "info", "exclude");
+    // Must write to the COMMON gitdir's info/exclude.
+    const excludeFile = path.join(commonGitDir, "info", "exclude");
     const content = await fs.promises.readFile(excludeFile, "utf8");
     assert.ok(
       content.split("\n").some((l) => l.trim() === "node_modules"),
-      `node_modules must appear in ${excludeFile}; got: ${content}`,
+      `node_modules must appear in common gitdir ${excludeFile}; got: ${content}`,
+    );
+
+    // Must NOT write to the per-worktree gitdir's info/exclude.
+    const perWtExclude = path.join(perWorktreeGitDir, "info", "exclude");
+    const perWtExists = await fs.promises.access(perWtExclude).then(() => true).catch(() => false);
+    assert.equal(perWtExists, false, "must not write to per-worktree gitdir's info/exclude");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("realWriteNodeModulesExclude: real linked worktree — node_modules symlink not staged after exclude written (#180 review-2 integration)", async () => {
+  // Integration regression: creates a real git repo + linked worktree, calls the
+  // helper, creates a node_modules symlink, and asserts `git add -A` does not stage it.
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-integration-"));
+  try {
+    const mainRepo = path.join(tmp, "main-repo");
+    const linkedWt = path.join(tmp, "linked-wt");
+
+    await execFileAsync("git", ["init", mainRepo]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.email", "test@pipeline.test"]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.name", "Pipeline Test"]);
+    await fs.promises.writeFile(path.join(mainRepo, "README.md"), "test\n");
+    await execFileAsync("git", ["-C", mainRepo, "add", "README.md"]);
+    await execFileAsync("git", ["-C", mainRepo, "commit", "-m", "initial"]);
+    await execFileAsync("git", ["-C", mainRepo, "worktree", "add", linkedWt]);
+
+    await realWriteNodeModulesExclude(linkedWt);
+
+    // Create a node_modules symlink inside the linked worktree (simulates what
+    // `pnpm install` or a harness does when it creates the node_modules link).
+    await fs.promises.symlink(mainRepo, path.join(linkedWt, "node_modules"));
+
+    await execFileAsync("git", ["-C", linkedWt, "add", "-A"]);
+
+    const { stdout } = await execFileAsync("git", ["-C", linkedWt, "status", "--porcelain"]);
+    assert.ok(
+      !stdout.includes("node_modules"),
+      `node_modules must not be staged after exclude is written; git status:\n${stdout}`,
     );
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });

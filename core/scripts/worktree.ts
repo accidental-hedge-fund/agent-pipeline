@@ -379,9 +379,11 @@ export async function realWriteNodeModulesExclude(worktreePath: string): Promise
 
   // A linked worktree (created with `git worktree add`) has a .git FILE rather
   // than a .git directory.  The file contains "gitdir: <real-gitdir-path>" that
-  // points to the per-worktree metadata directory under the main repo's .git.
-  // Attempting mkdir on .git/info/ when .git is a file fails with ENOTDIR, so
-  // we must resolve the real gitdir first.
+  // points to the per-worktree metadata directory under the main repo's .git/worktrees/<name>.
+  // Git resolves info/exclude through the COMMON git dir (the main .git/), not the
+  // per-worktree dir, so writing to <per-worktree>/info/exclude has no effect.
+  // We read the 'commondir' file Git always writes in the per-worktree dir to
+  // find the common git dir and write there instead.
   const stat = await fs.promises.stat(gitMarker).catch((e: NodeJS.ErrnoException) => {
     if (e.code === "ENOENT") return null;
     throw e;
@@ -390,8 +392,19 @@ export async function realWriteNodeModulesExclude(worktreePath: string): Promise
     const content = await fs.promises.readFile(gitMarker, "utf8");
     const match = content.match(/^gitdir:\s*(.+)$/m);
     if (!match) throw new Error(`Malformed .git file at ${gitMarker}: ${content.slice(0, 80)}`);
-    const realGitDir = path.resolve(worktreePath, match[1].trim());
-    excludeDir = path.join(realGitDir, "info");
+    const perWorktreeGitDir = path.resolve(worktreePath, match[1].trim());
+    // 'commondir' holds the path (relative or absolute) to the common git dir.
+    const commondirContent = await fs.promises.readFile(
+      path.join(perWorktreeGitDir, "commondir"),
+      "utf8",
+    ).catch((e: NodeJS.ErrnoException) => {
+      if (e.code === "ENOENT") return null;
+      throw e;
+    });
+    const commonGitDir = commondirContent !== null
+      ? path.resolve(perWorktreeGitDir, commondirContent.trim())
+      : perWorktreeGitDir;
+    excludeDir = path.join(commonGitDir, "info");
   } else {
     excludeDir = path.join(gitMarker, "info");
   }

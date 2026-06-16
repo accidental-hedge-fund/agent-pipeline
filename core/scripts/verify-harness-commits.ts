@@ -163,6 +163,23 @@ export async function verifyHarnessCommits(
   const getCommitShas = deps.gitCommitShas ?? defaultGitCommitShas;
   const getDiffTreeFiles = deps.gitDiffTreeFiles ?? defaultGitDiffTreeFiles;
 
+  // Node-modules scan runs FIRST on every non-empty range, before any other
+  // check that could return early.  This guarantees the diagnostic is surfaced
+  // even when commit-message, trailer, docsOnly, or pathConstraint checks would
+  // also block on a different violation in the same range.
+  const shas = await getCommitShas(wtPath, headBefore);
+  for (const sha of shas) {
+    const files = await getDiffTreeFiles(wtPath, sha);
+    for (const file of files) {
+      if (file.split("/")[0] === "node_modules") {
+        return {
+          ok: false,
+          reason: `Commit ${sha} adds a node_modules entry (${file}); node_modules must not be committed`,
+        };
+      }
+    }
+  }
+
   // Commit-based checks
   const requiresCommits =
     config.issueNumber !== undefined || config.messagePattern || config.requireTrailers?.length;
@@ -239,23 +256,6 @@ export async function verifyHarnessCommits(
     const denied = allFiles.filter((f) => !config.pathConstraint!.allowPattern.test(f));
     if (denied.length > 0) {
       return { ok: false, reason: config.pathConstraint.description };
-    }
-  }
-
-  // Node-modules scan — run on every non-empty range regardless of other checks.
-  // A harness must never commit a node_modules entry of any type; the exclude
-  // written at worktree bootstrap is the first line of defence, this scan is
-  // the second.
-  const shas = await getCommitShas(wtPath, headBefore);
-  for (const sha of shas) {
-    const files = await getDiffTreeFiles(wtPath, sha);
-    for (const file of files) {
-      if (file.split("/")[0] === "node_modules") {
-        return {
-          ok: false,
-          reason: `Commit ${sha} adds a node_modules entry (${file}); node_modules must not be committed`,
-        };
-      }
     }
   }
 

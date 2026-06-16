@@ -577,3 +577,26 @@ test("node_modules scan: commit that only deletes a node_modules entry → scan 
   });
   assert.equal(result.ok, true, "cleanup commit removing node_modules must not be blocked");
 });
+
+test("node_modules scan: node_modules diagnostic is returned even when commit-message check would also block (#180 review-2 finding 2)", async () => {
+  // Regression: the scan used to run AFTER commit-message / trailer checks and
+  // could be skipped by an early return.  A commit that both adds node_modules
+  // AND has a bad message must surface the node_modules diagnostic directly.
+  const sha = "deadbeef12345678";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 180 }, {
+    gitMessages: async () => ["bad message without issue reference"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => ["node_modules", "src/foo.ts"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    "reason" in result && result.reason.includes("node_modules"),
+    `node_modules diagnostic must be returned even when message check also fails; got: ${JSON.stringify(result)}`,
+  );
+  assert.ok(
+    "reason" in result && result.reason.includes(sha),
+    `sha must appear in diagnostic; got: ${JSON.stringify(result)}`,
+  );
+});
