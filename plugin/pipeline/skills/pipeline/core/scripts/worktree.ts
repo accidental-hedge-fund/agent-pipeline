@@ -160,6 +160,10 @@ export async function branchExists(
 
 export interface CreateWorktreeDeps {
   countActive?: (cfg: PipelineConfig) => Promise<number>;
+  getForIssue?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<{ path: string; slug: string } | null>;
   existsSync?: (p: string) => boolean;
   removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
   mkdirSync?: (p: string, opts: { recursive: boolean }) => void;
@@ -180,17 +184,29 @@ export async function createWorktree(
   const existsFn = deps.existsSync ?? fs.existsSync;
   const removeFn = deps.removeWorktree ?? removeWorktree;
   const countFn = deps.countActive ?? countActive;
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
   const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
   const gitFn = deps.gitCmd ?? git;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
 
-  // Reclaim this issue's stale worktree BEFORE the capacity check so it does
-  // not count against max_concurrent_worktrees on retry. This covers the case
-  // where setup succeeded but a later ready-stage step blocked, leaving the
-  // worktree alive (review-2 finding 1: setup-success strands capacity).
-  if (existsFn(wtPath)) {
+  // Reclaim this issue's existing worktree BEFORE the capacity check so it does
+  // not count against max_concurrent_worktrees on retry. Resolve it by ISSUE
+  // NUMBER, never by the freshly-computed slug path: if the issue title — and
+  // therefore the slug — changed between a blocked run and the retry, a
+  // slug-keyed existsSync(wtPath) check would miss the stale
+  // `pipeline-<N>-<old-slug>` worktree, yet countActive() would still count it,
+  // deadlocking the retry under a full pool (review-2: stale reclaim keyed to
+  // mutable title slug; covers both setup-throw and setup-success-then-block).
+  const existing = await getForIssueFn(cfg, issueNumber);
+  if (existing) {
+    await removeFn(cfg, issueNumber, existing.slug);
+  }
+  // Also clear any directory left at the *current* slug path that getForIssue
+  // did not return (e.g. a leftover from a closed/terminal lookup, which
+  // listActive excludes) so the `git worktree add` below cannot collide with it.
+  if (existsFn(wtPath) && existing?.slug !== slug) {
     await removeFn(cfg, issueNumber, slug);
   }
 
