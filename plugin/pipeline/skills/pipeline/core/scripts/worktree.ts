@@ -158,38 +158,82 @@ export async function branchExists(
   return code === 0;
 }
 
+export interface CreateWorktreeDeps {
+  listActive?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  existsSync?: (p: string) => boolean;
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
+  mkdirSync?: (p: string, opts: { recursive: boolean }) => void;
+  gitCmd?: (
+    cfg: PipelineConfig,
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; timeoutMs?: number },
+  ) => Promise<{ stdout: string; stderr: string; code: number }>;
+}
+
 export async function createWorktree(
   cfg: PipelineConfig,
   issueNumber: number,
   slug: string,
+  deps: CreateWorktreeDeps = {},
 ): Promise<{ path: string; branch: string }> {
-  const active = await countActive(cfg);
-  if (active >= cfg.max_concurrent_worktrees) {
-    throw new Error(
-      `At worktree capacity (${active}/${cfg.max_concurrent_worktrees}). ` +
-        "Wait for an issue to complete before starting new work.",
-    );
-  }
+  const existsFn = deps.existsSync ?? fs.existsSync;
+  const removeFn = deps.removeWorktree ?? removeWorktree;
+  const listActiveFn = deps.listActive ?? listActive;
+  const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
+  const gitFn = deps.gitCmd ?? git;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
 
-  // If a worktree already exists at the path, remove it (stale).
-  if (fs.existsSync(wtPath)) {
-    await removeWorktree(cfg, issueNumber, slug);
+  // Reclaim this issue's existing worktree(s) BEFORE the capacity check so they
+  // never block its own retry. Two interacting rules, both keyed by ISSUE
+  // NUMBER (never the freshly-computed slug path):
+  //
+  //  1. Remove EVERY active worktree recorded for this issue — not just the one
+  //     at the current slug, and not just the first. A title change between a
+  //     blocked run and the retry shifts the slug, and an issue can accumulate
+  //     more than one stale `pipeline-<N>-<slug>` worktree across repeated title
+  //     changes, so a slug-keyed or single-record reclaim leaves a self-owned
+  //     stale worktree behind.
+  //  2. Count capacity over OTHER issues only. Even if (1) somehow leaves a
+  //     record, this issue's own slots must never count against
+  //     max_concurrent_worktrees — we are (re)creating its worktree right now.
+  //
+  // Together these close the review-2 capacity-deadlock class (stale reclaim
+  // keyed to mutable slug / reclaim removes only one worktree): setup-throw,
+  // setup-success-then-block, title/slug change, and multi-stale accumulation.
+  const active = await listActiveFn(cfg);
+  const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
+  for (const rec of mine) {
+    await removeFn(cfg, issueNumber, rec.slug!);
+  }
+  // Also clear any directory left at the *current* slug path that listActive did
+  // not classify as active (e.g. a closed/terminal lookup) so the
+  // `git worktree add` below cannot collide with it.
+  if (existsFn(wtPath) && !mine.some((r) => r.slug === slug)) {
+    await removeFn(cfg, issueNumber, slug);
+  }
+
+  const otherActive = active.filter((r) => r.issueNumber !== issueNumber).length;
+  if (otherActive >= cfg.max_concurrent_worktrees) {
+    throw new Error(
+      `At worktree capacity (${otherActive}/${cfg.max_concurrent_worktrees}). ` +
+        "Wait for an issue to complete before starting new work.",
+    );
   }
 
   // Ensure the worktree root exists.
-  fs.mkdirSync(worktreeRoot(cfg), { recursive: true });
+  mkdirFn(worktreeRoot(cfg), { recursive: true });
 
   // Fetch the latest base branch.
-  await git(cfg, cfg.repo_dir, ["fetch", "origin", cfg.base_branch], { ignoreFailure: false });
+  await gitFn(cfg, cfg.repo_dir, ["fetch", "origin", cfg.base_branch], { ignoreFailure: false });
 
   // If the branch exists from a prior failed attempt, delete it.
-  await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+  await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
 
   // Create the worktree.
-  const { code, stderr } = await git(
+  const { code, stderr } = await gitFn(
     cfg,
     cfg.repo_dir,
     ["worktree", "add", wtPath, "-b", branch, `origin/${cfg.base_branch}`],
