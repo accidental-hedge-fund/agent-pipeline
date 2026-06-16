@@ -173,6 +173,33 @@ test("invokePlanStep: forwards cfg.models.planning and sandbox flag to invoke op
   assert.equal(capturedOpts?.timeoutSec, 1200);
 });
 
+test("invokePlanStep: sandbox:true with codex harness still uses cfg.repo_dir (codex unaffected by sandbox flag)", async () => {
+  // Regression for review-2 finding 1 (round 2): invokePlanStep was harness-blind —
+  // it routed all harnesses through wtPath when sandbox=true, changing codex's -C arg.
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("codex", "/wt/issue-42", "plan prompt", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedDir, "/repo", "codex must always use cfg.repo_dir regardless of sandbox flag");
+  assert.notEqual(capturedDir, "/wt/issue-42", "codex must NOT use wtPath when sandbox:true");
+});
+
+test("invokePlanStep: sandbox:false with codex harness uses cfg.repo_dir (baseline unchanged)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("codex", "/wt/issue-42", "plan prompt", cfgWithSandbox(false), {}, deps);
+  assert.equal(capturedDir, "/repo", "codex must use cfg.repo_dir when sandbox:false (baseline)");
+});
+
 // ---------------------------------------------------------------------------
 // Implementation step — issue reference (4.1 / 4.2)
 // ---------------------------------------------------------------------------

@@ -985,9 +985,12 @@ export interface PlanStepDeps {
 
 /**
  * Invoke the implementer harness for a plan-generation or plan-revision step.
- * When `cfg.harness_sandbox` is true the process cwd is the issue worktree
- * (`wtPath`), which confines the sandbox to that worktree. When false the
- * repo root (`cfg.repo_dir`) is used — preserving the pre-change default.
+ * When `cfg.harness_sandbox` is true AND the harness is "claude", the process
+ * cwd is the issue worktree (`wtPath`), confining the sandbox to that tree.
+ * For codex, `cfg.repo_dir` is always used regardless of the sandbox flag —
+ * codex's `-C` arg must be identical whether sandbox is on or off (spec:
+ * "sandboxed flag does not affect codex invocation"). When sandbox is false the
+ * repo root is used for both harnesses, preserving the pre-change default.
  * The model uses the `models.planning` slot (same as the pre-change inline calls).
  */
 export async function invokePlanStep(
@@ -999,7 +1002,7 @@ export async function invokePlanStep(
   deps: PlanStepDeps = {},
 ): Promise<HarnessResult> {
   const inv = deps.invoke ?? invoke;
-  const dir = cfg.harness_sandbox ? wtPath : cfg.repo_dir;
+  const dir = (cfg.harness_sandbox && harness === "claude") ? wtPath : cfg.repo_dir;
   return inv(harness, dir, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model: opts.model ?? cfg.models.planning,
