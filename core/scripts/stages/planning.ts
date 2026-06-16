@@ -25,6 +25,7 @@ import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
   branchName,
   createWorktree,
+  getForIssue,
   gitInWorktree,
   hasCommitsAhead,
   slugify,
@@ -279,29 +280,7 @@ export async function advance(
     }
   }
 
-  // ---- Step 8.5: test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, "planning", opts.stateDir);
-  if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
-    return { advanced: false, status: "blocked", reason: "test gate failed" };
-  }
-
-  // ---- Step 9: push + PR ----
-  const branch = branchName(issueNumber, slug);
-  const push = await gitInWorktree(wt.path, ["push", "-u", "origin", branch], {
-    ignoreFailure: true,
-  });
-  if (push.code !== 0) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      `Git push failed: ${push.stderr.trim()}`,
-      "implementing",
-      "push-failed",
-    );
-    return { advanced: false, status: "blocked", reason: `push failed` };
-  }
-
+  // ---- Steps 8.5–10: test gate + push + PR + implementing → review-1 ----
   const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
   const prBody = [
     `Closes #${issueNumber}`,
@@ -316,42 +295,14 @@ export async function advance(
     planExcerpt,
   ].join("\n") + footer(cfg);
 
-  let prNumber: number;
-  try {
-    prNumber = await createPr(cfg, {
-      branch,
-      title: `[Pipeline] ${title} (#${issueNumber})`,
-      body: prBody,
-    });
-  } catch (err) {
-    const e = err as Error;
-    // Check if a PR already exists (created by a prior partial run).
-    const existing = await getPrForIssue(cfg, issueNumber);
-    if (existing) {
-      prNumber = existing;
-    } else {
-      await setBlocked(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
-      return { advanced: false, status: "blocked", reason: e.message };
-    }
-  }
-
-  console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
-
-  // ---- Step 10: implementing → review-1 ----
-  await transition(
-    cfg,
-    issueNumber,
-    "implementing",
-    "review-1",
-    `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`,
-  );
-
-  return {
-    advanced: true,
-    from: "ready",
-    to: "review-1",
-    summary: `PR #${prNumber} opened after plan-review`,
-  };
+  return resumeFromImplementing(cfg, issueNumber, wt, {
+    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
+    prBody,
+    transitionMessage: (prNumber) =>
+      `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`,
+    pipelineRunId,
+    stateDir: opts.stateDir,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -663,18 +614,8 @@ async function advanceOpenspec(
       return { advanced: false, status: "blocked", reason: osImplCheck.reason };
     }
   }
-  // ---- test/build gate (#15) — must pass before opening a PR ----
-  const gate = await runTestGate(cfg, issueNumber, wt.path, {}, pipelineRunId, "planning", opts.stateDir);
-  if (!gate.skipped && !gate.passed) {
-    await setBlocked(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
-    return { advanced: false, status: "blocked", reason: "test gate failed" };
-  }
-  const branch = branchName(issueNumber, slug);
-  const push = await gitInWorktree(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
-  if (push.code !== 0) {
-    await setBlocked(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing", "push-failed");
-    return { advanced: false, status: "blocked", reason: "push failed" };
-  }
+
+  // ---- test gate + push + PR + implementing → review-1 ----
   const planExcerpt =
     revisedProposal.length > 2000 ? revisedProposal.slice(0, 2000) + "\n\n[…proposal truncated]" : revisedProposal;
   const prBody = [
@@ -690,27 +631,15 @@ async function advanceOpenspec(
     `## Proposal`,
     planExcerpt,
   ].join("\n") + footer(cfg);
-  let prNumber: number;
-  try {
-    prNumber = await createPr(cfg, { branch, title: `[Pipeline] ${title} (#${issueNumber})`, body: prBody });
-  } catch (err) {
-    const existing = await getPrForIssue(cfg, issueNumber);
-    if (existing) {
-      prNumber = existing;
-    } else {
-      await setBlocked(cfg, issueNumber, `PR creation failed: ${(err as Error).message}`, "implementing", "pr-creation-failed");
-      return { advanced: false, status: "blocked", reason: (err as Error).message };
-    }
-  }
-  console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
-  await transition(
-    cfg,
-    issueNumber,
-    "implementing",
-    "review-1",
-    `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
-  );
-  return { advanced: true, from: "ready", to: "review-1", summary: `PR #${prNumber} opened after OpenSpec plan-review` };
+
+  return resumeFromImplementing(cfg, issueNumber, wt, {
+    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
+    prBody,
+    transitionMessage: (prNumber) =>
+      `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
+    pipelineRunId,
+    stateDir: opts.stateDir,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +670,169 @@ export function enforceOpenspecChangeSingular(
     return { ok: false, reason: "no openspec change created" };
   }
   return { ok: true, changeId };
+}
+
+// ---------------------------------------------------------------------------
+// Shared post-implementation helper (#175): gate → push → create-or-find PR →
+// transition implementing → review-1. Called from both the standard and
+// OpenSpec implementing flows, and from the dispatch resume path.
+// ---------------------------------------------------------------------------
+
+/** Injectable seams for {@link resumeFromImplementing} — unit tests inject fakes. */
+export interface ResumeFromImplementingDeps {
+  runTestGate?: typeof runTestGate;
+  getPrForIssue?: typeof getPrForIssue;
+  createPr?: typeof createPr;
+  gitInWorktree?: typeof gitInWorktree;
+  setBlocked?: typeof setBlocked;
+  transition?: typeof transition;
+}
+
+/**
+ * Run the post-implementation steps — test gate → push → create-or-find PR →
+ * transition `implementing → review-1`. Called from both the standard and
+ * OpenSpec flows, and from the dispatch resume path when re-entering at
+ * `implementing` with an existing worktree that has commits ahead of base.
+ *
+ * When a PR already exists (found via `getPrForIssue` before attempting creation)
+ * it is reused so resume runs never attempt to open a duplicate.
+ */
+export async function resumeFromImplementing(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  wt: { path: string; slug: string },
+  opts: {
+    prTitle: string;
+    prBody: string;
+    /** Called with the final PR number to build the transition comment. */
+    transitionMessage: (prNumber: number) => string;
+    pipelineRunId: string;
+    stateDir?: string;
+  },
+  deps: ResumeFromImplementingDeps = {},
+): Promise<Outcome> {
+  const gateRunner = deps.runTestGate ?? runTestGate;
+  const prLookup = deps.getPrForIssue ?? getPrForIssue;
+  const prCreator = deps.createPr ?? createPr;
+  const gitOp = deps.gitInWorktree ?? gitInWorktree;
+  const blocker = deps.setBlocked ?? setBlocked;
+  const trans = deps.transition ?? transition;
+
+  const branch = branchName(issueNumber, wt.slug);
+
+  // ---- Test/build gate ----
+  const gate = await gateRunner(cfg, issueNumber, wt.path, {}, opts.pipelineRunId, "planning", opts.stateDir);
+  if (!gate.skipped && !gate.passed) {
+    await blocker(cfg, issueNumber, testGateBlockReason(gate), "implementing", "test-gate-exhausted");
+    return { advanced: false, status: "blocked", reason: "test gate failed" };
+  }
+
+  // ---- Push ----
+  const push = await gitOp(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
+  if (push.code !== 0) {
+    await blocker(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing", "push-failed");
+    return { advanced: false, status: "blocked", reason: "push failed" };
+  }
+
+  // ---- Create or find PR (check first to avoid duplicates on resume) ----
+  let prNumber: number;
+  const existing = await prLookup(cfg, issueNumber);
+  if (existing) {
+    prNumber = existing;
+    console.log(`[pipeline] #${issueNumber}: PR #${prNumber} already exists — reusing`);
+  } else {
+    try {
+      prNumber = await prCreator(cfg, { branch, title: opts.prTitle, body: opts.prBody });
+      console.log(`[pipeline] #${issueNumber}: PR #${prNumber} created`);
+    } catch (err) {
+      const e = err as Error;
+      await blocker(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
+      return { advanced: false, status: "blocked", reason: e.message };
+    }
+  }
+
+  // ---- implementing → review-1 ----
+  await trans(cfg, issueNumber, "implementing", "review-1", opts.transitionMessage(prNumber));
+
+  return {
+    advanced: true,
+    from: "implementing",
+    to: "review-1",
+    summary: `PR #${prNumber} opened`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch resume path (#175): re-entry at `implementing` when a worktree with
+// commits exists. Called from `dispatch()` in pipeline.ts for the implementing
+// case instead of returning the previous "nothing to do" waiting response.
+// ---------------------------------------------------------------------------
+
+/** Injectable seams for {@link dispatchResume} — unit tests inject fakes. */
+export interface DispatchResumeDeps {
+  getForIssue?: typeof getForIssue;
+  hasCommitsAhead?: typeof hasCommitsAhead;
+  getIssueDetail?: typeof getIssueDetail;
+  resumeFromImplementing?: typeof resumeFromImplementing;
+}
+
+/**
+ * Dispatch resume for the `implementing` stage: check whether the issue has an
+ * existing worktree with commits ahead of the base branch. If so, run the
+ * post-implementation steps (test gate → push → PR → review-1) without
+ * re-planning or re-implementing. If not, return the existing "nothing to do"
+ * waiting response (no regression for mid-flight runs).
+ */
+export async function dispatchResume(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  opts: AdvanceOpts,
+  deps: DispatchResumeDeps = {},
+): Promise<Outcome> {
+  const getWt = deps.getForIssue ?? getForIssue;
+  const commitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
+  const fetchIssue = deps.getIssueDetail ?? getIssueDetail;
+  const doResume = deps.resumeFromImplementing ?? resumeFromImplementing;
+
+  if (opts.dryRun) {
+    console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
+    return { advanced: true, from: "implementing", to: "review-1", summary: "[dry-run] implementing resume" };
+  }
+
+  const wt = await getWt(cfg, issueNumber);
+  if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
+    return {
+      advanced: false,
+      status: "waiting",
+      reason: "implementing is set mid-flight by the planning/plan-review handler; nothing to do at this point.",
+    };
+  }
+
+  const primary: Harness = cfg.harnesses.implementer;
+  const reviewer: string = cfg.harnesses.reviewer;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+
+  const detail = await fetchIssue(cfg, issueNumber);
+  const { title } = detail;
+
+  const prBody = [
+    `Closes #${issueNumber}`,
+    "",
+    "## Summary",
+    `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
+    "",
+    `**Implemented by**: ${primary}`,
+    `**Plan reviewed by**: ${reviewer}`,
+  ].join("\n") + footer(cfg);
+
+  return doResume(cfg, issueNumber, wt, {
+    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
+    prBody,
+    transitionMessage: (prNumber) =>
+      `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}. (Resumed at implementing stage.)`,
+    pipelineRunId,
+    stateDir: opts.stateDir,
+  });
 }
 
 // ---------------------------------------------------------------------------
