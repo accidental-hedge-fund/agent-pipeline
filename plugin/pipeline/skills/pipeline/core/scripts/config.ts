@@ -538,6 +538,42 @@ const defaultReadFile = (fp: string): string | null => {
 };
 
 /**
+ * Locate the 1-indexed source line of a dotted config path (e.g.
+ * `review_policy.block_threshold`) within raw YAML text, so validation
+ * diagnostics for unknown keys and bad values carry a line a desktop editor can
+ * attach to (#156). Heuristic line map for the config's shallow mapping shape:
+ * each path segment must appear as a `key:` line nested deeper than its parent.
+ * Returns undefined when the path cannot be located.
+ */
+export function findKeyLine(text: string, dotPath: string): number | undefined {
+  if (!dotPath) return undefined;
+  const segments = dotPath.split(".");
+  const lines = text.split("\n");
+  let startIdx = 0;
+  let parentIndent = -1;
+  let foundLine: number | undefined;
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const keyRe = new RegExp(`^(\\s*)["']?${seg}["']?\\s*:`);
+    let matched = false;
+    for (let i = startIdx; i < lines.length; i++) {
+      const m = lines[i].match(keyRe);
+      if (!m) continue;
+      const indent = m[1].length;
+      // Deeper segments must be indented under the parent we already matched.
+      if (s > 0 && indent <= parentIndent) continue;
+      foundLine = i + 1; // 1-indexed
+      parentIndent = indent;
+      startIdx = i + 1;
+      matched = true;
+      break;
+    }
+    if (!matched) return undefined;
+  }
+  return foundLine;
+}
+
+/**
  * Validate `.github/pipeline.yml` at the git root of `repoPath` without throwing.
  * All error conditions are returned as structured `Diagnostic` objects.
  * Exits 1 semantics are determined by the caller based on `severity: "error"` diagnostics.
@@ -616,11 +652,14 @@ export function validateConfig(
         const parentPath = issue.path.join(".");
         for (const key of (issue as { path: (string | number)[]; keys: string[]; message: string }).keys) {
           const dotPath = parentPath ? `${parentPath}.${key}` : key;
-          diagnostics.push({
+          const diag: Diagnostic = {
             severity: "error",
             path: dotPath,
             message: `Unrecognized key: "${key}"`,
-          });
+          };
+          const line = findKeyLine(text, dotPath);
+          if (line !== undefined) diag.line = line;
+          diagnostics.push(diag);
         }
       } else {
         const dotPath = issue.path.join(".");
@@ -629,6 +668,8 @@ export function validateConfig(
           path: dotPath,
           message: issue.message,
         };
+        const line = findKeyLine(text, dotPath);
+        if (line !== undefined) diag.line = line;
         if (RIGOR_GATING_SET.has(dotPath)) {
           diag.rigorGating = true;
         }

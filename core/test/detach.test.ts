@@ -13,6 +13,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   spawnDetached,
   writeSentinel,
@@ -617,4 +619,30 @@ test("killProcessTree: falls back to the root group when the ps snapshot is empt
   const killed: number[] = [];
   killProcessTree(777, "SIGKILL", { snapshot: () => "", killGroup: (pgid) => killed.push(pgid) });
   assert.deepEqual(killed, [777], "empty snapshot must still terminate the wrapper group");
+});
+
+// #156 review-2: a malformed detached run must be rejected before it starts.
+// The post-dispatch excess-args guard never runs on the --detach path (it returns
+// first), so `pipeline run <N> extra --detach` must be rejected inside the run
+// branch. CLI spawn test (no gh / repo needed — the guard exits before resolveConfig).
+const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
+
+test("CLI: `pipeline run 123 extra --detach` rejects extra positionals (exit 2, no detached run)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "run", "123", "extra", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /unexpected argument/i);
+});
+
+test("CLI: `pipeline run 123 extra` (non-detach) also rejects extra positionals (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "run", "123", "extra"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /unexpected argument/i);
 });

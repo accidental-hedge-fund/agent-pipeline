@@ -205,6 +205,13 @@ async function main(): Promise<void> {
 
   // `pipeline run <N> [--detach ...]` — subcommand dispatch.
   if (numArg === "run") {
+    // Reject extra positionals BEFORE the --detach branch so a malformed detached
+    // run (e.g. `pipeline run 123 config validate --detach`) cannot start a real
+    // background advance — the post-dispatch guard never runs on the detach path (#156).
+    if (cmd.args.length > 2) {
+      console.error(`pipeline run: unexpected argument(s): ${cmd.args.slice(2).join(", ")}`);
+      process.exit(2);
+    }
     if (opts.detach) {
       // Detach path: spawn a background wrapper and exit.
       await handleRunSubcommand(cmd.args[1] ?? "", opts);

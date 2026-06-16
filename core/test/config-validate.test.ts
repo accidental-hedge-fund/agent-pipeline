@@ -551,3 +551,35 @@ test("RIGOR_GATING_PATHS: includes shipcheck_gate.max_rounds and shipcheck_gate.
   assert.ok(RIGOR_GATING_PATHS.includes("shipcheck_gate.block_on_partial"),
     "RIGOR_GATING_PATHS must include shipcheck_gate.block_on_partial");
 });
+
+// ---------------------------------------------------------------------------
+// #156 review-2: validation diagnostics carry source line numbers
+// (so a desktop editor can attach unknown-key / bad-value errors to a location).
+// ---------------------------------------------------------------------------
+
+test("validateConfig: bad rigor-gating value carries source line + rigorGating", () => {
+  const yaml = [
+    "base_branch: main",        // line 1
+    "review_policy:",           // line 2
+    "  block_threshold: typo",  // line 3 — invalid enum on a rigor-gating path
+  ].join("\n");
+  const result = validateConfig("/repo", makeDeps(yaml));
+  assert.equal(result.valid, false);
+  const diag = result.diagnostics.find((d: Diagnostic) => d.path === "review_policy.block_threshold");
+  assert.ok(diag, "expected a diagnostic for review_policy.block_threshold");
+  assert.equal(diag!.severity, "error");
+  assert.equal(diag!.rigorGating, true, "rigor-gating path must be marked");
+  assert.equal(diag!.line, 3, `expected source line 3, got ${diag!.line}`);
+});
+
+test("validateConfig: unrecognized key carries a source line", () => {
+  const yaml = [
+    "base_branch: main",  // line 1
+    "bogus_key: 1",       // line 2 — unknown top-level key
+  ].join("\n");
+  const result = validateConfig("/repo", makeDeps(yaml));
+  assert.equal(result.valid, false);
+  const diag = result.diagnostics.find((d: Diagnostic) => d.path === "bogus_key");
+  assert.ok(diag, "expected a diagnostic for the unknown key");
+  assert.equal(diag!.line, 2, `expected source line 2, got ${diag!.line}`);
+});

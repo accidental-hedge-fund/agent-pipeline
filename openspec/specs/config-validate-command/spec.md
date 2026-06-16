@@ -17,7 +17,7 @@ Each `Diagnostic` object SHALL have the shape:
 }
 ```
 
-`line` SHALL be present for YAML syntax errors (from the YAML parser's error mark); it SHALL be absent for Zod field-level validation errors.
+`line` SHALL be present for YAML syntax errors (from the YAML parser's error mark). It SHALL also be populated for Zod field-level validation errors — unrecognized keys and invalid values — whenever the offending key can be located in the source YAML, so a desktop editor can attach the diagnostic to a line (this matters most for rigor/cost-gating misconfigs). It MAY be absent only when the key cannot be located in the source.
 
 #### Scenario: valid config exits 0 with no diagnostics
 
@@ -42,7 +42,13 @@ Each `Diagnostic` object SHALL have the shape:
 
 - **WHEN** `.github/pipeline.yml` contains an unrecognized top-level key (e.g. `auto_merge: true`)
 - **THEN** `pipeline config validate --json` SHALL emit a diagnostic with `severity: "error"` and `path` identifying the unknown key
+- **AND** the diagnostic SHALL include the `line` of the unknown key in the source YAML
 - **AND** the command SHALL exit 1
+
+#### Scenario: bad rigor-gating value carries a source line
+
+- **WHEN** `.github/pipeline.yml` sets an invalid value on a rigor-gating path (e.g. `review_policy: { block_threshold: "typo" }`)
+- **THEN** the diagnostic SHALL include `rigorGating: true` and the `line` of the offending key in the source YAML
 
 #### Scenario: human-readable output without --json flag
 
