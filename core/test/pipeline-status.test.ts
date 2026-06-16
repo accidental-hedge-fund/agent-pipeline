@@ -349,3 +349,152 @@ test("runStatus: omits the preflight section (no error) when no stored result ex
   const text = lines.join("\n");
   assert.doesNotMatch(text, /Pipeline doctor/, `preflight section must be absent; got:\n${text}`);
 });
+
+// ---------------------------------------------------------------------------
+// #154: runStatus --json — machine-readable JSON output
+// ---------------------------------------------------------------------------
+
+async function captureStatusJson(
+  stage: string,
+  prNumber: number | null,
+  comments: Comment[] = [],
+  worktreeInfo: { path: string; slug: string } | null = null,
+): Promise<unknown> {
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt(stage, comments),
+    getPrForIssue: async () => prNumber,
+    loadLatestPreflightResult: async () => null,
+    getForIssue: async () => worktreeInfo,
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  try {
+    await runStatus(CFG, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(lines.length, 1, `JSON mode must emit exactly one line; got ${lines.length}: ${lines.join("|")}`);
+  return JSON.parse(lines[0]);
+}
+
+test("runStatus --json: emits exactly one parseable JSON line", async () => {
+  const parsed = await captureStatusJson("review-1", null);
+  assert.ok(parsed !== null && typeof parsed === "object");
+});
+
+test("runStatus --json: schema_version is \"1\"", async () => {
+  const parsed = await captureStatusJson("review-1", null) as { schema_version: string };
+  assert.equal(parsed.schema_version, "1");
+});
+
+test("runStatus --json: all minimum fields are present", async () => {
+  const parsed = await captureStatusJson("review-1", 42) as Record<string, unknown>;
+  for (const field of ["schema_version", "status", "issue", "stage", "pr", "branch", "worktree",
+    "last_event", "review_summary", "next_action", "config"]) {
+    assert.ok(field in parsed, `missing field: ${field}`);
+  }
+});
+
+test("runStatus --json: pr is null when no PR", async () => {
+  const parsed = await captureStatusJson("review-1", null) as { pr: unknown };
+  assert.equal(parsed.pr, null);
+});
+
+test("runStatus --json: pr has number and url when PR exists", async () => {
+  const parsed = await captureStatusJson("review-1", 99) as { pr: { number: number; url: string } };
+  assert.equal(parsed.pr?.number, 99);
+  assert.equal(parsed.pr?.url, "https://github.com/acme/repo/pull/99");
+});
+
+test("runStatus --json: stage is null when no pipeline label", async () => {
+  // Workaround: pass a raw label list that has no pipeline: prefix — use "no-label" stage
+  // by constructing deps manually so we can use any labels array.
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => ({
+      number: 115,
+      type: "issue" as const,
+      title: "test",
+      body: "",
+      state: "open" as const,
+      url: "https://github.com/acme/repo/issues/115",
+      labels: [],
+      comments: [],
+    }),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(lines[0]) as { stage: unknown };
+  assert.equal(parsed.stage, null);
+});
+
+test("runStatus --json: errors during fetch are encoded as status:error envelope", async () => {
+  const prevExitCode = process.exitCode;
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => { throw new Error("network failure"); },
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+    process.exitCode = prevExitCode; // restore: runStatus sets exitCode=1 on error
+  }
+  assert.equal(lines.length, 1, "error path must emit exactly one JSON line");
+  const parsed = JSON.parse(lines[0]) as { schema_version: string; status: string; error: string };
+  assert.equal(parsed.schema_version, "1");
+  assert.equal(parsed.status, "error");
+  assert.match(parsed.error, /network failure/);
+});
+
+test("runStatus --json: prose output (State:, Stage:, etc.) is NOT emitted", async () => {
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(lines.length, 1, "only JSON line must be emitted");
+  assert.doesNotMatch(lines[0], /^State:|^Stage:|^Blocked:|^Repo:/m);
+});
+
+// ---------------------------------------------------------------------------
+// #154: Prose regression guard for --json mode (non-json output UNCHANGED)
+// ---------------------------------------------------------------------------
+
+test("runStatus without --json: existing prose output is byte-identical (regression guard #154)", async () => {
+  // This is the same assertion as the earlier regression guard but explicit about the
+  // json:false path — ensures our changes didn't alter the prose formatter.
+  const lines = await captureStatus("review-2", [ceilingComment({ round: 2, findings: TWO_FINDINGS })]);
+  assert.deepEqual(lines, [
+    "#115 — Surface the needs-human punch-list",
+    "State: open",
+    "Stage: review-2",
+    "Blocked: no",
+    "Repo: acme/repo  domain=test",
+    "PR: (none)",
+    "URL: https://github.com/acme/repo/issues/115",
+    "Last pipeline event: ## Pipeline: Review ceiling reached — human decision required  (2026-06-10T00:00:00Z)",
+  ]);
+});

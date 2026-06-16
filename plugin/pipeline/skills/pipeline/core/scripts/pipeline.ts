@@ -56,12 +56,14 @@ import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
+  formatDoctorJson,
   formatDoctorSummary,
   loadLatestPreflightResult,
   runPreflight,
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
+import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
   reviewStageSkipTarget,
@@ -96,6 +98,10 @@ export interface CliOpts {
   init?: boolean;
   doctor?: boolean;
   failFast?: boolean;
+  /** Emit machine-readable JSON (for --status and the doctor command). */
+  json?: boolean;
+  /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
+  isOk?: boolean;
 }
 
 async function main(): Promise<void> {
@@ -109,7 +115,9 @@ async function main(): Promise<void> {
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
     .option("--fail-fast", "doctor: stop at the first failing check instead of collecting all failures")
+    .option("--is-ok", "doctor: silent exit-0/1 gate (no output); mutually exclusive with --json")
     .option("--status", "read-only status; print stage and exit")
+    .option("--json", "emit machine-readable JSON (for --status or the doctor command)")
     .option("--summary", "print the human-readable evidence-bundle summary for <number> and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
@@ -167,6 +175,14 @@ async function main(): Promise<void> {
         ],
         ranAt: new Date().toISOString(),
       };
+      if (opts.isOk) {
+        // --is-ok: zero bytes of output; exit 1 on any failure.
+        process.exit(1);
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(formatDoctorJson(result)));
+        process.exit(1);
+      }
       console.log(formatDoctorSummary(result));
       process.exit(1);
     }
@@ -222,10 +238,16 @@ async function main(): Promise<void> {
       issueNumber = await resolveIssueNumber(cfg, number);
     } catch (err) {
       const e = err as Error;
-      console.error(`pipeline: ${e.message}`);
-      process.exit(1);
+      if (opts.json) {
+        console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+        process.exitCode = 1;
+      } else {
+        console.error(`pipeline: ${e.message}`);
+        process.exit(1);
+      }
+      return;
     }
-    await runStatus(cfg, issueNumber);
+    await runStatus(cfg, issueNumber, defaultRunStatusDeps, { json: opts.json });
     return;
   }
   if (opts.unblock !== undefined) {
@@ -334,16 +356,44 @@ export interface PreflightCliDeps {
 const defaultPreflightCliDeps: PreflightCliDeps = { runPreflight, storePreflightResult };
 
 /** `pipeline doctor`: run every preflight check, print the summary, persist the
- *  result for `--status`, and set the exit code (0 all-pass, 1 any failure). */
+ *  result for `--status`, and set the exit code (0 all-pass, 1 any failure).
+ *  With `--json`: emit a single unfenced JSON object instead of prose.
+ *  With `--is-ok`: emit zero output; exit 0/1 only (cheap polling gate).
+ *  `--json` and `--is-ok` are mutually exclusive. */
 export async function runDoctor(
   cfg: PipelineConfig,
   opts: CliOpts,
   deps: PreflightCliDeps = defaultPreflightCliDeps,
 ): Promise<void> {
+  if (opts.json && opts.isOk) {
+    console.error(
+      "pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  if (opts.isOk) {
+    // Silent polling gate: run checks, set exit code, zero bytes of output.
+    try {
+      const failFast = opts.failFast ?? cfg.doctor.failFast;
+      const result = await deps.runPreflight(cfg, undefined, { failFast });
+      process.exitCode = result.ok ? 0 : 1;
+    } catch {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const failFast = opts.failFast ?? cfg.doctor.failFast;
   const result = await deps.runPreflight(cfg, undefined, { failFast });
   await deps.storePreflightResult(cfg, result);
-  console.log(formatDoctorSummary(result));
+
+  if (opts.json) {
+    console.log(JSON.stringify(formatDoctorJson(result)));
+  } else {
+    console.log(formatDoctorSummary(result));
+  }
   process.exitCode = result.ok ? 0 : 1;
 }
 
@@ -403,15 +453,41 @@ export interface RunStatusDeps {
   getPrForIssue: typeof getPrForIssue;
   /** Latest stored preflight result (#146); optional so existing callers are unaffected. */
   loadLatestPreflightResult?: typeof loadLatestPreflightResult;
+  /** For JSON mode (#154): look up the active worktree for an issue. */
+  getForIssue?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ path: string; slug: string } | null>;
 }
 
-const defaultRunStatusDeps: RunStatusDeps = { getIssueDetail, getPrForIssue, loadLatestPreflightResult };
+const defaultRunStatusDeps: RunStatusDeps = {
+  getIssueDetail,
+  getPrForIssue,
+  loadLatestPreflightResult,
+  getForIssue,
+};
 
 export async function runStatus(
   cfg: PipelineConfig,
   issueNumber: number,
   deps: RunStatusDeps = defaultRunStatusDeps,
+  statusOpts: { json?: boolean } = {},
 ): Promise<void> {
+  // JSON mode (#154): assemble a stable envelope and emit it; skip all prose.
+  if (statusOpts.json) {
+    try {
+      const detail = await deps.getIssueDetail(cfg, issueNumber);
+      const prNumber = await deps.getPrForIssue(cfg, issueNumber);
+      const worktreeInfo = deps.getForIssue
+        ? await deps.getForIssue(cfg, issueNumber).catch(() => null)
+        : null;
+      const payload: StatusPayload = buildStatusPayload(detail, prNumber, worktreeInfo, cfg);
+      console.log(JSON.stringify(payload));
+    } catch (err) {
+      const e = err as Error;
+      console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   const stage = pickStage(detail.labels);
   const blocked = isBlocked(detail.labels);
