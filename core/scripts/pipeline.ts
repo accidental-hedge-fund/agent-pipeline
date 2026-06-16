@@ -125,6 +125,9 @@ export interface CliOpts {
   detach?: boolean;
   timeout?: number;
   flockTimeout?: number;
+  /** Internal: pre-allocated #155 run-store run id, set by the detached launcher so
+   *  the inner run uses the same `.agent-pipeline/runs/<run-id>` the caller was told. */
+  runId?: string;
   /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate`). */
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
@@ -170,7 +173,8 @@ export function buildCmd(): Command {
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
-    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number);
+    .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
+    .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -980,6 +984,15 @@ export async function handleRunSubcommand(
   }
 
   if (opts.detach) {
+    // Pre-allocate the #155 run-store run id here so the detached caller is given the
+    // SAME `.agent-pipeline/runs/<run-id>` the inner run will use. Without this the
+    // detached launch exposed only the wrapper dir (pipeline.log/sentinel.json), and a
+    // desktop consumer could not find the structured event log without guessing —
+    // reintroducing the competing artifact format the #155 contract avoids (#155).
+    const runStoreRunId = runIdFor(number, new Date());
+    const repoDir = opts.repoPath ? path.resolve(opts.repoPath) : (findGitRoot(process.cwd()) ?? process.cwd());
+    const runStoreDir = runDirPath(repoDir, runStoreRunId);
+
     // Forward all launch-shaping options so the inner pipeline process respects
     // the same profile / repo / model the caller specified (e.g. --profile claude).
     const passArgs: string[] = [];
@@ -997,6 +1010,11 @@ export async function handleRunSubcommand(
     if (opts.once) passArgs.push("--once");
     if (opts.doctor) passArgs.push("--doctor");
     if (opts.failFast) passArgs.push("--fail-fast");
+    // Pin the inner run to the pre-allocated #155 run-store id, and forward
+    // --json-events so the detached run's event stream and run directory are
+    // discoverable via the documented contract rather than the wrapper artifacts (#155).
+    passArgs.push("--run-id", runStoreRunId);
+    if (opts.jsonEvents) passArgs.push("--json-events");
 
     let result: Awaited<ReturnType<typeof spawnDetached>>;
     try {
@@ -1011,8 +1029,9 @@ export async function handleRunSubcommand(
     }
     console.log(result.runDir);
     console.error(`[pipeline] #${number}: detached run started (PID ${result.pid})`);
-    console.error(`[pipeline] #${number}: log at ${result.runDir}/pipeline.log`);
-    console.error(`[pipeline] #${number}: poll ${result.runDir}/sentinel.json for completion`);
+    console.error(`[pipeline] #${number}: wrapper supervision: poll ${result.runDir}/sentinel.json (log: ${result.runDir}/pipeline.log)`);
+    console.error(`[pipeline] #${number}: structured run artifacts at ${runStoreDir}/ — events.jsonl + terminal.log are the Pipeline Desk contract`);
+    console.error(`[pipeline] #${number}: follow with: pipeline logs ${runStoreRunId} --follow`);
     return;
   }
 
@@ -1255,7 +1274,9 @@ async function runAdvance(
     let terminalTee: TerminalLogTee | undefined;
     const runStoreDeps: RunStoreDeps = { ...defaultRunStoreDeps };
     if (stateDir) {
-      const runId = runIdFor(issueNumber, runStartedAt);
+      // Use the run id pinned by a detached launcher when present, so the detached
+      // caller and the inner run share one `.agent-pipeline/runs/<run-id>` (#155).
+      const runId = opts.runId ?? runIdFor(issueNumber, runStartedAt);
       runDir = runDirPath(cfg.repo_dir, runId);
       // stdoutWrite for initRunDir uses the original stdout (before tee starts);
       // this ensures run_start appears on stdout without going to terminal.log.

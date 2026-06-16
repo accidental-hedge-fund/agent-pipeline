@@ -22,6 +22,21 @@ The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/
 
 ---
 
+### Requirement: A detached launch exposes the same run-store run directory
+When `pipeline run <N> --detach` is used, the launcher SHALL pin a `.agent-pipeline/runs/<run-id>` run-store identity and pass it to the inner run (via `--run-id`) so both share one run directory, and SHALL report that run-id/path to the caller. The detached run's `events.jsonl` and `terminal.log` — not the wrapper's `pipeline.log`/`sentinel.json` — are the machine-readable Pipeline Desk contract. `--json-events` SHALL be forwarded to the inner run when set.
+
+#### Scenario: detached launch reports the run-store run directory
+- **WHEN** `pipeline run <N> --detach` is invoked
+- **THEN** the launcher SHALL pin a run-store run-id and forward it to the inner run
+- **AND** the inner run SHALL use that same `.agent-pipeline/runs/<run-id>` directory
+- **AND** the launcher SHALL report the run-store path so a desktop consumer can read `events.jsonl`/`terminal.log` without parsing the wrapper's `pipeline.log`
+
+#### Scenario: --json-events is forwarded to a detached run
+- **WHEN** `pipeline run <N> --detach --json-events` is invoked
+- **THEN** the inner detached run SHALL receive `--json-events`
+
+---
+
 ### Requirement: run.json is written at run directory creation with immutable identity metadata
 Immediately after creating the run directory, the orchestrator SHALL write `run.json` containing: `schema_version` (integer, initial value `1`), `run_id` (string), `issue` (integer), `repo` (string, `owner/name` format), `profile` (active profile name string, or `null` if not set), and `started_at` (ISO 8601 UTC timestamp). `run.json` is written once and SHALL NOT be modified after creation.
 

@@ -450,6 +450,38 @@ test("handleRunSubcommand: detach forwards --profile, --domain, --model to spawn
   assert.ok(capturedArgs.includes("claude-opus-4-8"), "missing model value");
 });
 
+// #155: a detached launch must pin the #155 run-store run id (so the caller can
+// find the same .agent-pipeline/runs/<run-id>/events.jsonl) and forward --json-events.
+test("handleRunSubcommand: detach forwards --run-id (always) so the inner run shares the caller's run dir", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  await handleRunSubcommand("99", { detach: true }, deps);
+  const idx = capturedArgs.indexOf("--run-id");
+  assert.ok(idx >= 0, `--run-id must be forwarded; got ${JSON.stringify(capturedArgs)}`);
+  const runId = capturedArgs[idx + 1];
+  assert.match(runId ?? "", /^99-/, "the pinned run id must be for issue 99");
+});
+
+test("handleRunSubcommand: detach forwards --json-events only when requested", async () => {
+  const capture = async (opts: CliOpts) => {
+    let captured: string[] = [];
+    await handleRunSubcommand("99", opts, {
+      spawnDetached: async (_issue, pipelineArgs) => {
+        captured = pipelineArgs;
+        return { runDir: "/tmp/fake-run", pid: 42 };
+      },
+    });
+    return captured;
+  };
+  assert.ok((await capture({ detach: true, jsonEvents: true })).includes("--json-events"), "must forward --json-events when set");
+  assert.ok(!(await capture({ detach: true })).includes("--json-events"), "must not inject --json-events when unset");
+});
+
 test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetached", async () => {
   let capturedArgs: string[] = [];
   const deps: RunSubcommandDeps = {

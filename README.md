@@ -801,6 +801,16 @@ echo "Run dir: $RUN_DIR"
     .lock           advisory lock file (present while a run is active)
 ```
 
+The wrapper directory above is for **process supervision** (is the run alive? what
+exit code?). For **structured run data**, a detached launch pins and prints the
+same `.agent-pipeline/runs/<run-id>/` run store a foreground run uses — the
+launch logs `structured run artifacts at <repo>/.agent-pipeline/runs/<run-id>/`.
+That directory's **`events.jsonl` and `terminal.log` are the Pipeline Desk
+contract** (not `pipeline.log`): render the stage timeline from `events.jsonl`
+with zero prose parsing, and follow live output with
+`pipeline logs <run-id> --follow`. Pass `--json-events` to also stream the event
+lines to the detached run's stdout (captured in `pipeline.log`).
+
 ### Poll for completion — `sentinel.json`
 
 A poller can classify the run state without parsing prose:
