@@ -850,6 +850,34 @@ test("storePreflightResult: injection phrase in a check detail is redacted on di
   }
 });
 
+test("storePreflightResult: GitHub token in check remediation is redacted on disk", async () => {
+  const cfg = makeConfig({ domain: `doctortest-secret-${process.pid}` });
+  const path = doctorResultPath(cfg.domain);
+  try {
+    const fakeToken = "ghp_ABCDEFGHIJKLMNOPQRabcdefghijklmnopq";
+    const result: PreflightResult = {
+      schema_version: 1,
+      ok: false,
+      ranAt: "2026-06-14T12:00:00.000Z",
+      checks: [
+        {
+          id: "repo-access",
+          description: "repo access",
+          status: "fail",
+          detail: `Token ${fakeToken} cannot access the repo`,
+          remediation: `Rotate ${fakeToken} and run gh auth login.`,
+        },
+      ],
+    };
+    await storePreflightResult(cfg, result);
+    const raw = fs.readFileSync(path, "utf8");
+    assert.ok(!raw.includes(fakeToken), "raw token must not appear in the stored result");
+    assert.ok(raw.includes("[REDACTED]"), "[REDACTED] placeholder must appear");
+  } finally {
+    try { fs.unlinkSync(path); } catch { /* ignore */ }
+  }
+});
+
 test("storePreflightResult: clean result is stored without modification", async () => {
   const cfg = makeConfig({ domain: `doctortest-clean-${process.pid}` });
   const path = doctorResultPath(cfg.domain);

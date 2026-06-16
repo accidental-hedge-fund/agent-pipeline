@@ -26,7 +26,7 @@ import {
   type StageRecord,
   type StageUpdate,
 } from "./types.ts";
-import { sanitize } from "./artifact-sanitize.ts";
+import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 
 /** Bundle filename written under `<stateDir>/<issue>/`. */
 export const EVIDENCE_FILE = "evidence.json";
@@ -208,26 +208,6 @@ export async function recordStage(
   if (update.outcome !== undefined) entry.outcome = update.outcome;
   if (update.commits !== undefined) entry.commits = update.commits;
   await writeBundle(stateDir, issue, bundle, deps);
-}
-
-// Patterns for token formats that must never appear in a bundle.
-const SECRET_VALUE_RE = /(ghp|ghs|gho|ghr|github_pat)_[A-Za-z0-9_]{10,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}/g;
-
-// Env-var names whose values are treated as secrets and redacted.
-const SECRET_NAME_RE = /TOKEN|SECRET|PASSWORD|APIKEY|API_KEY|_PASS$|_KEY$/i;
-
-/** Replace known secret patterns (token formats + env var values) with `[REDACTED]`.
- *  Applied to both `cmd` and raw output before recording. */
-function redactSecrets(text: string): string {
-  // 1. Redact by token format pattern (no env dependency — catches embedded tokens).
-  let result = text.replace(SECRET_VALUE_RE, "[REDACTED]");
-  // 2. Redact values of env vars whose name looks like a secret.
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value && value.length >= 8 && SECRET_NAME_RE.test(name)) {
-      result = result.split(value).join("[REDACTED]");
-    }
-  }
-  return result;
 }
 
 /** Build a sanitized `CommandRecord` — the single chokepoint that enforces the

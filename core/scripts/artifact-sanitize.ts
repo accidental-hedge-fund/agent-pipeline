@@ -1,9 +1,11 @@
-// Write-time injection denylist for machine-readable run artifacts (#161).
+// Write-time injection denylist and secret-value redaction for machine-readable
+// run artifacts (#161).
 //
-// Applied to serialized JSON content before persisting to disk so a replayed
-// artifact line cannot inject instructions into a later agent's context.
-// Matching spans are replaced with [REDACTED-INJECTION] — the record is
-// written with the substitution in place, never silently dropped.
+// Two separate passes are applied before persisting to disk:
+//  1. Secret-value redaction — replaces token formats and env-var secret values
+//     with [REDACTED] so credentials are never stored in run-dir artifacts.
+//  2. Injection denylist — replaces prompt-injection phrases with
+//     [REDACTED-INJECTION] so replayed artifact lines cannot hijack a later agent.
 
 /** Imperative phrase patterns that indicate a prompt-injection attempt. */
 export const INJECTION_PATTERNS: readonly RegExp[] = [
@@ -16,6 +18,29 @@ export const INJECTION_PATTERNS: readonly RegExp[] = [
   /you\s+must\s+now\b/gi,
   /override\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
 ];
+
+/** Token / credential format patterns — matched without env dependency. */
+const SECRET_VALUE_RE =
+  /(ghp|ghs|gho|ghr|github_pat)_[A-Za-z0-9_]{10,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}/g;
+
+/** Env-var names whose values are treated as secrets. */
+const SECRET_NAME_RE = /TOKEN|SECRET|PASSWORD|APIKEY|API_KEY|_PASS$|_KEY$/i;
+
+/**
+ * Replace known secret patterns (token formats + env-var secret values) with
+ * `[REDACTED]`.  Applied to serialized artifact content before writing so raw
+ * credentials can never reach a run-dir file.  Pure for token-format matching;
+ * reads `process.env` for env-var value scrubbing.
+ */
+export function redactSecrets(text: string): string {
+  let result = text.replace(SECRET_VALUE_RE, "[REDACTED]");
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value && value.length >= 8 && SECRET_NAME_RE.test(name)) {
+      result = result.split(value).join("[REDACTED]");
+    }
+  }
+  return result;
+}
 
 /**
  * Apply the injection denylist to `content`.  Every span that matches a
