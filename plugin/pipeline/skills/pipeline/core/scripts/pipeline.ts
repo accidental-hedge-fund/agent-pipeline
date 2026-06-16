@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, scaffoldDefaultConfig } from "./config.ts";
+import { resolveConfig, scaffoldDefaultConfig, findGitRoot } from "./config.ts";
 import {
   addLabel,
   clearBlocked,
@@ -161,7 +161,7 @@ async function main(): Promise<void> {
   // unavailable. Handle it before config/gh resolution using only the repo directory
   // (derived from --repo-path or cwd).
   if (numArg === "logs") {
-    const repoDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = opts.repoPath ? path.resolve(opts.repoPath) : (findGitRoot(process.cwd()) ?? process.cwd());
     const logsArg = cmd.args[1];
     const logsRunId =
       typeof logsArg === "string" && logsArg.length > 0 && !logsArg.startsWith("-")
@@ -665,6 +665,19 @@ export async function runLogs(
 // Unblock mode
 // ---------------------------------------------------------------------------
 
+/** Append a blocker_cleared event to the most recent run directory for issueNumber.
+ *  Best-effort: silently skips if no run directory is found. */
+async function appendBlockerCleared(repoDir: string, issueNumber: number): Promise<void> {
+  const allIds = await listRunIds(repoDir).catch(() => [] as string[]);
+  const id = allIds.find((runId) => runId.startsWith(`${issueNumber}-`));
+  if (!id) return;
+  await appendEvent(
+    runDirPath(repoDir, id),
+    { schema_version: RUN_SCHEMA_VERSION, type: "blocker_cleared", at: evidenceTimestamp() },
+    defaultRunStoreDeps,
+  ).catch(() => {});
+}
+
 async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
@@ -687,6 +700,7 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   ].join("\n");
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
+  await appendBlockerCleared(cfg.repo_dir, issueNumber);
   console.log(`[pipeline] #${issueNumber}: unblocked at ${stage}`);
 }
 
@@ -751,6 +765,7 @@ export async function runOverride(
   // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
     await deps.clearBlocked(cfg, issueNumber);
+    await appendBlockerCleared(cfg.repo_dir, issueNumber);
   }
   console.log(
     `[pipeline] #${issueNumber}: recorded override for finding ${parsed.key} (${parsed.disposition}).`,
@@ -922,7 +937,7 @@ async function runAdvance(
       finalStage = stage;
 
       if (stage === "ready-to-deploy") {
-        const out = await deployReady.finalize(cfg, issueNumber);
+        const out = await deployReady.finalize(cfg, issueNumber, runDir);
         printOutcome(issueNumber, stage, out);
         break;
       }
@@ -1075,7 +1090,10 @@ async function runAdvance(
         lastStage = (out as { to: Stage }).to;
         finalStage = lastStage; // keep final-state accurate when --once breaks after an advance
       } else {
-        // No advance: blocked, waiting, no-op, finalized, error → stop.
+        // Blocked: emit blocker_set so consumers can reconstruct blocking state.
+        if (out.status === "blocked" && runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+        }
         break;
       }
 
@@ -1228,7 +1246,7 @@ async function dispatch(
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":
-      return deployReady.finalize(cfg, issueNumber);
+      return deployReady.finalize(cfg, issueNumber, runDir);
     case "needs-human":
       // Terminal off-ramp; the loop breaks before reaching dispatch, but keep the
       // switch exhaustive so it never falls through to the unknown-stage error.

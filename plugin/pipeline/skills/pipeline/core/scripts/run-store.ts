@@ -169,7 +169,9 @@ export interface InitRunDirOpts {
   startedAt: string;
 }
 
-/** Create the run directory, write run.json, create events.jsonl, append run_start.
+/** Create the run directory, write run.json, append run_start to events.jsonl.
+ *  Idempotent: if run.json already exists (same run-id re-entered), returns
+ *  immediately without touching run.json or events.jsonl.
  *  Non-fatal: I/O errors are caught and logged. */
 export async function initRunDir(
   opts: InitRunDirOpts,
@@ -177,6 +179,17 @@ export async function initRunDir(
 ): Promise<void> {
   try {
     await deps.mkdir(opts.runDir, { recursive: true });
+
+    // Idempotency guard: if run.json already exists this directory was already
+    // initialized. Do not overwrite run.json (written-once contract) and do not
+    // truncate events.jsonl (append-only contract).
+    try {
+      await deps.stat(path.join(opts.runDir, "run.json"));
+      return; // already initialized — leave all files untouched
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      // ENOENT → first initialization, continue below
+    }
 
     const meta: RunMeta = {
       schema_version: RUN_SCHEMA_VERSION,
@@ -191,10 +204,7 @@ export async function initRunDir(
       `${JSON.stringify(meta, null, 2)}\n`,
     );
 
-    // Create empty events.jsonl
-    await deps.writeFile(path.join(opts.runDir, "events.jsonl"), "");
-
-    // Append the run_start event
+    // Append the run_start event (appendFile creates events.jsonl on first use)
     const event: RunStartEvent = {
       schema_version: RUN_SCHEMA_VERSION,
       type: "run_start",

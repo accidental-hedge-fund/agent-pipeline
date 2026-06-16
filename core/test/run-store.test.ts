@@ -104,9 +104,12 @@ function memRunStore() {
       return [...subdirs].map((name) => ({ name, isDirectory: () => true }));
     },
     stat: async (p) => {
-      // Return a deterministic mtime based on path for ordering tests
-      const t = p.includes("run-a") ? 2000 : p.includes("run-b") ? 1000 : 0;
-      return { mtime: new Date(t) };
+      // Deterministic mtime for listRunIds ordering tests (directory names)
+      if (p.includes("run-a")) return { mtime: new Date(2000) };
+      if (p.includes("run-b")) return { mtime: new Date(1000) };
+      // File existence check (used by initRunDir idempotency guard)
+      if (!files.has(p)) throw enoent(p);
+      return { mtime: new Date(0) };
     },
     stdoutWrite: (line) => {
       stdoutLines.push(line);
@@ -169,6 +172,24 @@ test("initRunDir: non-fatal on I/O error (no throw)", async () => {
   };
   // Should not throw
   await initRunDir({ runDir: RUN_DIR, runId: "155-x", issue: ISSUE, repo: "r", profile: null, startedAt: STARTED_AT_ISO }, deps);
+});
+
+// Regression: calling initRunDir twice for the same run-id must not overwrite
+// run.json or truncate events.jsonl — both are written-once / append-only.
+test("initRunDir: second call with same run-id is idempotent (run.json and events.jsonl unchanged)", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const opts = { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO };
+
+  // First call: initialize the run directory
+  await initRunDir(opts, deps);
+  const runJsonAfterFirst = readFile(RUN_JSON);
+  const eventsAfterFirst = readFile(EVENTS_JSONL);
+
+  // Second call: must leave both files completely unchanged
+  await initRunDir(opts, deps);
+  assert.equal(readFile(RUN_JSON), runJsonAfterFirst, "run.json must not be modified on second init");
+  assert.equal(readFile(EVENTS_JSONL), eventsAfterFirst, "events.jsonl must not gain a second run_start on re-init");
 });
 
 // ---------------------------------------------------------------------------
