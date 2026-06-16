@@ -916,6 +916,63 @@ test("resolveConfig: non-boolean doctor.runOnStart is rejected", async () => {
   }
 });
 
+// ---- setup_command (#174) ----
+
+test("resolveConfig: setup_command passes through from file config", async () => {
+  const repo = makeFakeRepo(`setup_command: "pnpm install --frozen-lockfile"\n`);
+  const binDir = makeFakeGh("acme/sc1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.setup_command, "pnpm install --frozen-lockfile");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: setup_command empty string passes through", async () => {
+  const repo = makeFakeRepo(`setup_command: ""\n`);
+  const binDir = makeFakeGh("acme/sc2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.setup_command, "");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: setup_command absent → undefined (auto-detect default)", async () => {
+  const repo = makeFakeRepo(`base_branch: main\n`);
+  const binDir = makeFakeGh("acme/sc3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.setup_command, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: non-string setup_command is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`setup_command: 42\n`);
+  const binDir = makeFakeGh("acme/sc4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // Regression (#146 review 2): when pipeline.yml sets doctor.runOnStart: true,
 // resolveConfig must tolerate a gh failure (return repo:"") so the run-start
 // preflight gate — not the generic config-error path — reports the failure.

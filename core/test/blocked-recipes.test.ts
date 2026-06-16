@@ -130,6 +130,12 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
+  "worktree-setup-failed":
+    "The worktree dependency install step failed (see the error above). " +
+    "Fix the root cause (package manager not installed, bad lockfile, network " +
+    "issue), or set `setup_command: \"\"` in `.github/pipeline.yml` to skip " +
+    "the install step. Then remove the `blocked` label and re-run " +
+    "`$pipeline 7`.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {
@@ -364,4 +370,13 @@ test("review stage uses no-pull-request kind (not pr-creation-failed) for missin
     !src.includes('"pr-creation-failed"'),
     'review.ts must not use "pr-creation-failed" — the review stage does not create PRs; use "no-pull-request" for missing-PR cases',
   );
+});
+
+test("worktree-setup-failed directs to fix root cause or opt out via setup_command, clear label, re-run", () => {
+  const body = comment("worktree-setup-failed");
+  assert.ok(body.includes("dependency install"), "must mention the install step");
+  assert.ok(body.includes("setup_command"), "must mention the setup_command opt-out");
+  assert.ok(body.includes("`blocked`"), "must mention clearing the blocked label");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "must direct to re-run");
+  assert.ok(!body.includes("--unblock"), "must not direct to --unblock");
 });

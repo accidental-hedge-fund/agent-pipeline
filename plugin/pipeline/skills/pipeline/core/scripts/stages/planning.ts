@@ -29,8 +29,10 @@ import {
   getForIssue,
   gitInWorktree,
   hasCommitsAhead,
+  removeWorktree,
   slugify,
 } from "../worktree.ts";
+import { detectAndInstall, type SetupResult } from "../worktree-setup.ts";
 import {
   buildImplementingPrompt,
   buildPlanningOpenspecPrompt,
@@ -50,6 +52,59 @@ import {
   type VerifyResult,
 } from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
+
+// ---------------------------------------------------------------------------
+// Worktree bootstrap (create + dependency install) — exported for unit testing
+// ---------------------------------------------------------------------------
+
+export interface BootstrapWorktreeDeps {
+  createWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<{ path: string; branch: string }>;
+  detectAndInstall?: (worktreePath: string, cfg: Pick<PipelineConfig, "setup_command">) => Promise<SetupResult>;
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
+}
+
+export type BootstrapResult =
+  | { ok: true; wt: { path: string; branch: string }; setupCommand?: string }
+  | { ok: false; reason: string; tag: "worktree-creation-failed" | "worktree-setup-failed" };
+
+/**
+ * Create a worktree and run the dependency install step. On install failure,
+ * removes the just-created worktree before returning so that `countActive()`
+ * on the next retry does not count this failed issue against the capacity limit
+ * (fixing finding 1 from review-2: stale worktree blocks retry at max_concurrent).
+ *
+ * Called at the start of both planning paths so install failures block before
+ * any planning, review, or test stage executes (finding 2 from review-2).
+ */
+export async function bootstrapWorktree(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  slug: string,
+  deps: BootstrapWorktreeDeps = {},
+): Promise<BootstrapResult> {
+  const cwFn = deps.createWorktree ?? createWorktree;
+  const daiFn = deps.detectAndInstall ?? detectAndInstall;
+  const rwFn = deps.removeWorktree ?? removeWorktree;
+
+  let wt: { path: string; branch: string };
+  try {
+    wt = await cwFn(cfg, issueNumber, slug);
+    console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message, tag: "worktree-creation-failed" };
+  }
+
+  try {
+    const setup = await daiFn(wt.path, cfg);
+    if (!setup.skipped) {
+      console.log(`[pipeline] #${issueNumber}: worktree setup complete (${setup.command})`);
+    }
+    return { ok: true, wt, setupCommand: setup.skipped ? undefined : setup.command };
+  } catch (err) {
+    await rwFn(cfg, issueNumber, slug).catch(() => {});
+    return { ok: false, reason: (err as Error).message, tag: "worktree-setup-failed" };
+  }
+}
 
 export interface AdvanceOpts {
   dryRun?: boolean;
@@ -87,6 +142,28 @@ export async function advance(
     console.log(`[pipeline] #${issueNumber}: [dry-run] would plan + ${reviewer} plan-review + ${primary} plan revision + implement + open PR`);
     return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] planning + plan-review" };
   }
+
+  // ---- Worktree bootstrap: create + dependency install BEFORE planning ----
+  // Failures block at "ready" before any planning, review, or test stage runs,
+  // so retries are not charged a full planning round to hit the same install
+  // failure again (spec: worktree-dependency-install, finding 2 from review-2).
+  // bootstrapWorktree also removes the worktree on install failure so the issue
+  // does not count against max_concurrent_worktrees on retry (finding 1).
+  const slug = slugify(title) || `issue-${issueNumber}`;
+  const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug);
+  if (!bootstrap.ok) {
+    await setBlocked(
+      cfg,
+      issueNumber,
+      bootstrap.tag === "worktree-creation-failed"
+        ? `Worktree creation failed: ${bootstrap.reason}`
+        : `Worktree setup failed: ${bootstrap.reason}`,
+      "ready",
+      bootstrap.tag,
+    );
+    return { advanced: false, status: "blocked", reason: bootstrap.reason };
+  }
+  const wt = bootstrap.wt;
 
   // ---- Step 0: optional carry-forward context (last30days) ----
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
@@ -204,18 +281,6 @@ export async function advance(
     );
   } else {
     console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the original plan`);
-  }
-
-  // ---- Step 5: create worktree ----
-  const slug = slugify(title) || `issue-${issueNumber}`;
-  let wt: { path: string; branch: string };
-  try {
-    wt = await createWorktree(cfg, issueNumber, slug);
-    console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
-  } catch (err) {
-    const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, preImplStage, "worktree-creation-failed");
-    return { advanced: false, status: "blocked", reason: e.message };
   }
 
   // ---- Step 6: → implementing ----
@@ -343,16 +408,23 @@ async function advanceOpenspec(
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
 
   // ---- Worktree first: OpenSpec artifacts are files in the change folder. ----
+  // bootstrapWorktree removes the worktree on install failure so the issue does
+  // not count against max_concurrent_worktrees on retry (finding 1 from review-2).
   const slug = slugify(title) || `issue-${issueNumber}`;
-  let wt: { path: string; branch: string };
-  try {
-    wt = await createWorktree(cfg, issueNumber, slug);
-    console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
-  } catch (err) {
-    const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Worktree creation failed: ${e.message}`, "ready", "worktree-creation-failed");
-    return { advanced: false, status: "blocked", reason: e.message };
+  const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug);
+  if (!bootstrap.ok) {
+    await setBlocked(
+      cfg,
+      issueNumber,
+      bootstrap.tag === "worktree-creation-failed"
+        ? `Worktree creation failed: ${bootstrap.reason}`
+        : `Worktree setup failed: ${bootstrap.reason}`,
+      "ready",
+      bootstrap.tag,
+    );
+    return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
+  const wt = bootstrap.wt;
 
   // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
   if (!openspec.isInitialized(wt.path)) {

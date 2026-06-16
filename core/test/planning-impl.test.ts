@@ -6,9 +6,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  bootstrapWorktree,
   enforceImplCommitRef,
   enforceOpenspecChangeSingular,
   invokeImplementer,
+  type BootstrapWorktreeDeps,
 } from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
@@ -264,4 +266,93 @@ test("openspec singularity: no fresh, multiple pre-existing → blocked (ambiguo
   const result = enforceOpenspecChangeSingular([], ["change-abc", "change-def"]);
   assert.equal(result.ok, false);
   assert.ok(!result.ok && result.reason.includes("no openspec change"));
+});
+
+// ---------------------------------------------------------------------------
+// bootstrapWorktree — worktree cleanup on install failure (finding 1, review-2)
+//
+// Regression for: setup failure leaves a live worktree that countActive() counts,
+// so a subsequent createWorktree at max_concurrent_worktrees: 1 hits capacity
+// instead of reclaiming the failed issue's own stale path.
+// ---------------------------------------------------------------------------
+
+const stubCfg = {} as import("../scripts/types.ts").PipelineConfig;
+
+test("bootstrapWorktree: happy path returns ok:true with wt", async () => {
+  const deps: BootstrapWorktreeDeps = {
+    createWorktree: async () => ({ path: "/wt/pipeline-42-slug", branch: "pipeline/42-slug" }),
+    detectAndInstall: async () => ({ skipped: false, command: "pnpm install" }),
+    removeWorktree: async () => { throw new Error("should not be called"); },
+  };
+  const result = await bootstrapWorktree(stubCfg, 42, "slug", deps);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.wt.path, "/wt/pipeline-42-slug");
+    assert.equal(result.setupCommand, "pnpm install");
+  }
+});
+
+test("bootstrapWorktree: worktree creation failure returns ok:false, does not call removeWorktree", async () => {
+  let removeCalled = false;
+  const deps: BootstrapWorktreeDeps = {
+    createWorktree: async () => { throw new Error("git worktree add failed"); },
+    detectAndInstall: async () => { throw new Error("should not be called"); },
+    removeWorktree: async () => { removeCalled = true; },
+  };
+  const result = await bootstrapWorktree(stubCfg, 42, "slug", deps);
+  assert.equal(result.ok, false);
+  assert.equal(removeCalled, false, "removeWorktree must not be called when createWorktree fails");
+  if (!result.ok) {
+    assert.equal(result.tag, "worktree-creation-failed");
+    assert.ok(result.reason.includes("git worktree add failed"));
+  }
+});
+
+test("bootstrapWorktree: install failure → removeWorktree called before returning (finding 1 regression)", async () => {
+  let removeCalledWith: { issueNumber: number; slug: string } | null = null;
+  const deps: BootstrapWorktreeDeps = {
+    createWorktree: async () => ({ path: "/wt/pipeline-42-slug", branch: "pipeline/42-slug" }),
+    detectAndInstall: async () => { throw new Error("pnpm install exited with code 1"); },
+    removeWorktree: async (_cfg, issueNumber, slug) => {
+      removeCalledWith = { issueNumber, slug };
+    },
+  };
+  const result = await bootstrapWorktree(stubCfg, 42, "slug", deps);
+  assert.equal(result.ok, false);
+  assert.ok(removeCalledWith !== null, "removeWorktree must be called to free capacity on retry");
+  assert.equal(removeCalledWith!.issueNumber, 42);
+  assert.equal(removeCalledWith!.slug, "slug");
+  if (!result.ok) {
+    assert.equal(result.tag, "worktree-setup-failed");
+    assert.ok(result.reason.includes("pnpm install exited with code 1"));
+  }
+});
+
+test("bootstrapWorktree: unblock-and-rerun at max_concurrent_worktrees: 1 — capacity freed after cleanup", async () => {
+  // Simulates the review-2 finding 1 scenario:
+  //   run 1: install fails → removeWorktree is called
+  //   run 2: createWorktree can proceed (the stale entry was removed)
+  let createCallCount = 0;
+  let removeCallCount = 0;
+
+  const failingInstallDeps: BootstrapWorktreeDeps = {
+    createWorktree: async () => { createCallCount++; return { path: "/wt", branch: "pipeline/42-slug" }; },
+    detectAndInstall: async () => { throw new Error("install failed"); },
+    removeWorktree: async () => { removeCallCount++; },
+  };
+  const succeedingInstallDeps: BootstrapWorktreeDeps = {
+    createWorktree: async () => { createCallCount++; return { path: "/wt", branch: "pipeline/42-slug" }; },
+    detectAndInstall: async () => ({ skipped: false, command: "pnpm install" }),
+    removeWorktree: async () => { removeCallCount++; },
+  };
+
+  const r1 = await bootstrapWorktree(stubCfg, 42, "slug", failingInstallDeps);
+  assert.equal(r1.ok, false, "first run must fail");
+  assert.equal(removeCallCount, 1, "cleanup must have run after first failure");
+  assert.equal(createCallCount, 1);
+
+  const r2 = await bootstrapWorktree(stubCfg, 42, "slug", succeedingInstallDeps);
+  assert.equal(r2.ok, true, "second run must succeed after cleanup freed capacity");
+  assert.equal(createCallCount, 2, "createWorktree must be callable again after cleanup");
+  assert.equal(removeCallCount, 1, "removeWorktree must not be called on the successful run");
 });

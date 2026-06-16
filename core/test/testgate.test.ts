@@ -257,7 +257,8 @@ test("runTests: failing command → passed false with output", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Shell-operator regression tests (#173): configured command runs via sh -c
+// Shell-operator regression tests (#173, #174): configured command runs via
+// `bash -c "set -o pipefail; …"` — operators work and piped failures surface.
 // ---------------------------------------------------------------------------
 
 test("gate (#173 regression): configured command with && passes when both steps succeed", async () => {
@@ -279,6 +280,30 @@ test("gate (#173 regression): configured command with && fails when first step f
     { ...cleanGitDeps() },
   );
   assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+});
+
+test("gate (#174 regression): piped command fails the gate when an early stage fails (pipefail)", async () => {
+  // `false | true`: the first stage fails. Without `set -o pipefail` the shell
+  // returns only the LAST stage's status (true → 0) and the gate would falsely
+  // pass, masking a broken step (#174). With pipefail the pipeline exits
+  // non-zero and the gate must block. Real process spawn (no runTests stub).
+  const out = await runTestGate(
+    cfgWith({ command: "false | true", max_attempts: 0 }),
+    174,
+    tmpRoot,
+    { ...cleanGitDeps() },
+  );
+  assert.equal(out.passed, false, "a failing early pipeline stage must fail the gate under pipefail");
+  assert.equal(out.attempts, 0);
+});
+
+test("gate (#174 regression): piped command passes when every stage succeeds", async () => {
+  // pipefail must not break the common case: every stage exits 0 → gate passes.
+  const out = await runTestGate(cfgWith({ command: "true | true" }), 174, tmpRoot, {
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, true);
   assert.equal(out.attempts, 0);
 });
 
@@ -312,9 +337,9 @@ test("gate (#173 regression): auto-detected command passes killProcessGroup=fals
   assert.equal(capturedKillProcessGroup, false, "auto-detected command must not use killProcessGroup");
 });
 
-test("gate (#173 regression): whitespace-only configured command blocks immediately, never runs sh -c", async () => {
-  // Regression for review-2 finding: `sh -c "   "` exits 0 (empty shell script).
-  // A whitespace-only command must be caught before spawn and block the gate.
+test("gate (#173 regression): whitespace-only configured command blocks immediately, never runs the shell", async () => {
+  // Regression for review-2 finding: a whitespace-only body exits 0 (empty shell
+  // script). It must be caught before spawn and block the gate.
   let ran = false;
   const out = await runTestGate(cfgWith({ command: "   " }), 173, "/wt", {
     runTests: async () => {
@@ -609,8 +634,9 @@ test("gate (regression / #48, CI parity): explicit CI command fails on second st
     invoke: async () => okInvoke(),
     ...cleanGitDeps(),
   });
-  // Gate must use the configured command wrapped in sh -c (not auto-detect, not tokenized)
-  assert.deepEqual(seenCommand, { cmd: "sh", args: ["-c", "npm run ci"] });
+  // Gate must use the configured command wrapped in `bash -c` with pipefail
+  // (not auto-detect, not tokenized).
+  assert.deepEqual(seenCommand, { cmd: "bash", args: ["-c", "set -o pipefail\nnpm run ci"] });
   // Gate blocks: full CI command failed
   assert.equal(out.passed, false);
   assert.match(out.blockReason ?? "", /plugin mirror/i);
@@ -631,7 +657,7 @@ test("gate: explicit command override bypasses detection", async () => {
     ...cleanGitDeps(),
   });
   assert.equal(detectCalled, false);
-  assert.deepEqual(seen, { cmd: "sh", args: ["-c", "pnpm run test:ci"] });
+  assert.deepEqual(seen, { cmd: "bash", args: ["-c", "set -o pipefail\npnpm run test:ci"] });
   assert.equal(out.passed, true);
 });
 

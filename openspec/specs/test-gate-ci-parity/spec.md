@@ -28,7 +28,7 @@ The pipeline documentation (README) SHALL include a section explaining that if a
 - **THEN** they SHALL see a comment on or near `test_gate.command` explaining that the value matches the repo's full CI command
 
 ### Requirement: This repo's pipeline config sets the full CI command
-This repo's `.github/pipeline.yml` SHALL set `test_gate.command` to `"npm run ci"`, where the `ci` npm script covers all steps run by this repo's CI pipeline: unit tests, the `plugin/` mirror sync check (`node scripts/build.mjs --check`), and the install smoke test. Because configured commands are now run through a POSIX shell, multi-step operators are also valid alternatives — but using `npm run ci` (which wraps all steps in a single npm script) remains the canonical form for this repo.
+This repo's `.github/pipeline.yml` SHALL set `test_gate.command` to `"npm run ci"`, where the `ci` npm script covers all steps run by this repo's CI pipeline: unit tests, the `plugin/` mirror sync check (`node scripts/build.mjs --check`), and the install smoke test. Because configured commands are now run through `bash -c` with `set -o pipefail`, multi-step operators (including pipes, where an early-stage failure correctly fails the gate) are also valid alternatives — but using `npm run ci` (which wraps all steps in a single npm script) remains the canonical form for this repo.
 
 #### Scenario: pipeline.yml for agent-pipeline specifies the full CI command
 - **WHEN** the agent-pipeline repo's `.github/pipeline.yml` is read
@@ -48,13 +48,18 @@ This repo's `.github/pipeline.yml` SHALL set `test_gate.command` to `"npm run ci
 - **WHEN** the `ci` npm script is inspected in `package.json`
 - **THEN** it SHALL invoke the install smoke test (directly or via `npm run ci:install-smoke`) so that a broken installer is caught in-pipeline
 
-### Requirement: Configured test_gate.command is executed through a POSIX shell
-When `test_gate.command` is set in `.github/pipeline.yml`, the pipeline SHALL run that command via `sh -c "<command>"`, giving the operator access to standard POSIX shell operators (`&&`, `||`, `;`, `|`, redirects). The pipeline SHALL NOT tokenize the configured string before spawning; the shell is responsible for parsing.
+### Requirement: Configured test_gate.command is executed through bash with pipefail
+When `test_gate.command` is set in `.github/pipeline.yml`, the pipeline SHALL run that command via `bash -c` with `set -o pipefail` enabled, giving the operator access to standard shell operators (`&&`, `||`, `;`, `|`, redirects) while ensuring a failing earlier stage in a pipeline fails the gate. The pipeline SHALL NOT tokenize the configured string before spawning; the shell is responsible for parsing. (`pipefail` is a bash feature; plain POSIX `sh`/dash cannot enforce it, so configured commands require `bash`.)
 
 #### Scenario: Chained command with && passes when all steps succeed
 - **WHEN** `test_gate.command` is set to `"cmd-a && cmd-b"` (where both commands exit 0)
-- **THEN** the test gate SHALL execute the string through `sh -c`
+- **THEN** the test gate SHALL execute the string through `bash -c` with `set -o pipefail`
 - **AND** the gate SHALL report pass
+
+#### Scenario: Piped command fails when an early stage fails
+- **WHEN** `test_gate.command` is set to `"false | true"` (the first pipeline stage exits non-zero, the last exits 0)
+- **THEN** `set -o pipefail` SHALL make the combined exit code non-zero
+- **AND** the gate SHALL report failure rather than masking the early-stage failure behind the last stage's success
 
 #### Scenario: Chained command with && fails when first step fails
 - **WHEN** `test_gate.command` is set to `"false && true"` (first command exits non-zero)
@@ -63,14 +68,14 @@ When `test_gate.command` is set in `.github/pipeline.yml`, the pipeline SHALL ru
 
 #### Scenario: Single-program configured command is unaffected
 - **WHEN** `test_gate.command` is set to `"npm run ci"` (no shell operators)
-- **THEN** the gate SHALL execute it through `sh -c` and the behavior SHALL be identical to direct spawn for a single command with no special characters
+- **THEN** the gate SHALL execute it through `bash -c` with `set -o pipefail` and the behavior SHALL be identical to direct spawn for a single command with no special characters
 
 ### Requirement: Auto-detected commands continue to use direct spawn
-When `test_gate.command` is NOT set in `.github/pipeline.yml` and the pipeline auto-detects a test command (e.g. `pnpm run test`, `go test ./...`), it SHALL spawn the detected binary and arguments directly — without wrapping in `sh -c`. The shell-execution path applies only to operator-supplied configured commands.
+When `test_gate.command` is NOT set in `.github/pipeline.yml` and the pipeline auto-detects a test command (e.g. `pnpm run test`, `go test ./...`), it SHALL spawn the detected binary and arguments directly — without wrapping in a shell. The shell-execution path applies only to operator-supplied configured commands.
 
 #### Scenario: Auto-detected npm test command runs via direct spawn
 - **WHEN** `test_gate.command` is absent from config
 - **AND** the pipeline detects `pnpm run test` from `package.json`
 - **THEN** the gate SHALL invoke `pnpm` directly with args `["run", "test"]`
-- **AND** SHALL NOT wrap the invocation in `sh -c`
+- **AND** SHALL NOT wrap the invocation in a shell
 

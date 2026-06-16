@@ -21,9 +21,10 @@ openspec:
 test_gate:
   # Run the repo's full CI surface, not just the auto-detected `npm test`: this
   # repo's CI also runs `node scripts/build.mjs --check` (plugin-mirror sync) and
-  # an install smoke test. `command` is run through `sh -c`, so compound operators
-  # like `&&` are valid — using `npm run ci` (a single npm script that wraps all
-  # steps) remains the canonical form for this repo.
+  # an install smoke test. `command` is run through `bash -c` with `set -o
+  # pipefail`, so compound operators like `&&` and pipes `|` are valid AND a
+  # failing stage in a pipeline fails the gate — using `npm run ci` (a single
+  # npm script that wraps all steps) remains the canonical form for this repo.
   command: "npm run ci"
   # enabled: true # set false to disable the pre-PR test gate entirely
   # max_attempts: 3 # fix-harness invocations before blocking

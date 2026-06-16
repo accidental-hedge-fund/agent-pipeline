@@ -298,13 +298,44 @@ The checks (each emits one sentence of remediation text on failure):
 
 The latest result is stored under `/tmp/pipeline-<domain>-doctor-result.json`; `/pipeline N --status` appends that preflight summary (with its timestamp) when one is present, and omits the section otherwise.
 
+## Worktree dependency install (`setup_command`)
+
+When the pipeline creates a fresh worktree for an issue, it automatically runs the repo's dependency install step before any stage executes. This ensures binaries (e.g. `vitest`, `jest`, `tsc`) are available when the test/build gate runs.
+
+**Auto-detection (default):** the pipeline checks the worktree root for a lockfile and runs the corresponding install command:
+
+| Lockfile | Command |
+| --- | --- |
+| `pnpm-lock.yaml` | `pnpm install` |
+| `yarn.lock` | `yarn install` |
+| `package-lock.json` | `npm ci` |
+
+When `node_modules` already exists in the worktree (e.g. on a subsequent run), the install step is skipped automatically (idempotent fast-path). When no lockfile is present and no `setup_command` is configured, the step is silently skipped.
+
+**Override or opt out** with `setup_command` in `.github/pipeline.yml`:
+
+```yaml
+# Explicit install with flags:
+setup_command: "pnpm install --frozen-lockfile"
+
+# Multi-step setup (shell operators work — the command is run via /bin/sh -c):
+setup_command: "pnpm install && pnpm run build:types"
+
+# Opt out entirely (skip the install step even when a lockfile is present):
+setup_command: ""
+```
+
+When `setup_command` is set to a non-empty string, it overrides auto-detection entirely — the configured command runs even when `node_modules` is already present. When set to `""`, the install step is skipped regardless of lockfile presence.
+
+**Failure handling:** if the install command exits non-zero, the pipeline blocks immediately with a `worktree-setup-failed` blocker and surfaces the command output. Subsequent stages never run. The `blocked` comment tells you to fix the root cause (e.g. missing package manager, bad lockfile) or set `setup_command: ""` to opt out, then re-run.
+
 ## Test/build gate (optional, default on)
 
 When `test_gate.enabled` (the default), the target repo's **own** test/build command runs inside the worktree during implementation and **after each fix round**, before a PR is opened or the item advances. If it fails, the implementer harness gets the failure output and retries in a **bounded generate→test→fix loop** — up to `max_attempts` fix invocations (default 3), each test run capped at `timeout` seconds (default 300). The item never opens a PR or advances while the command is failing; persistent failure → `blocked` with the captured output surfaced on the issue.
 
 The command is **auto-detected** (first match wins):
 
-1. Explicit `test_gate.command` override (run through `sh -c` so POSIX shell operators like `&&`, `||`, `;`, and `|` work)
+1. Explicit `test_gate.command` override (run through `bash -c` with `set -o pipefail` so shell operators like `&&`, `||`, `;`, and `|` work — and a failing stage in a pipeline like `npm test | tee log` fails the gate instead of being masked)
 2. `package.json` — a real `test` script (npm placeholder/`echo` stubs skipped), else a `build:check` / `typecheck` / `type-check` / `build` script; the package manager follows the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm)
 3. `go.mod` → `go test ./...`
 4. `Cargo.toml` → `cargo test`
@@ -335,7 +366,7 @@ test_gate:
 }
 ```
 
-`test_gate.command` is run through a POSIX shell (`sh -c`), so compound operators like `&&` work directly in the config value. Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
+`test_gate.command` is run through `bash -c` with `set -o pipefail`, so compound operators like `&&`, `||`, `;`, and `|` work directly in the config value — and `pipefail` ensures a failing earlier stage in a pipeline (e.g. `npm test | tee log`) fails the gate rather than being hidden by the last stage's exit code. (Configured commands therefore require `bash`; it is assumed present, as on every supported CI runner and dev host.) Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
 
 ## Troubleshooting
 
