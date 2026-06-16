@@ -83,6 +83,8 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
+  /** Idempotency guard: true when an archive commit for this issue already exists (#181). */
+  archiveAlreadyDone?: typeof archiveAlreadyDone;
 }
 
 export async function advance(
@@ -206,7 +208,7 @@ export async function advance(
       issueNumber,
       `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
       "pre-merge",
-      "test-gate-exhausted",
+      "needs-human",
     );
     return { advanced: false, status: "blocked", reason: "CI failed" };
   }
@@ -433,11 +435,32 @@ export function staleReviewNotice(reviewedSha: string | null, headSha: string): 
 // ---------------------------------------------------------------------------
 
 /**
+ * Returns true when the PR branch commit history already contains a pipeline-
+ * internal archive commit for this issue (#181). Reads the committed log rather
+ * than the local filesystem so it is reliable across polling iterations: the
+ * guard fires on the very next poll after the archive commit is pushed.
+ */
+export async function archiveAlreadyDone(
+  gitFn: typeof gitInWorktree,
+  wtPath: string,
+  baseBranch: string,
+  issueNumber: number,
+): Promise<boolean> {
+  const log = await gitFn(
+    wtPath,
+    ["log", "--format=%s", `origin/${baseBranch}..HEAD`],
+    { ignoreFailure: true },
+  );
+  const prefix = `${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`;
+  return log.stdout.split("\n").some((line) => line.trim().startsWith(prefix));
+}
+
+/**
  * When OpenSpec is active, archive the change(s) this PR branch introduced so
- * their spec deltas fold into the living `openspec/specs/`. Idempotent: a change
- * already archived is no longer an active dir, so it drops out of the candidate
- * set. Returns a `waiting` Outcome after pushing (CI must re-run), a `blocked`
- * Outcome on failure, or null when there is nothing to do (continue the gate).
+ * their spec deltas fold into the living `openspec/specs/`. Idempotent: once an
+ * archive commit exists on the branch, subsequent polling iterations skip this
+ * step entirely. Returns a `waiting` Outcome after pushing (CI must re-run), a
+ * `blocked` Outcome on failure, or null when there is nothing to do (continue the gate).
  */
 export async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
@@ -453,11 +476,16 @@ export async function maybeArchiveOpenspec(
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
+  const archiveAlreadyDoneFn = deps.archiveAlreadyDone ?? archiveAlreadyDone;
   const branchDeveloperCommitsFn =
     deps.branchDeveloperCommits ?? ((wtPath, base) => computeBranchDeveloperCommits(gitFn, wtPath, base));
 
   const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt || !isActiveFn(cfg, wt.path)) return null;
+
+  // Idempotency guard (#181): if the archive commit already exists on the branch,
+  // skip the archive step entirely on all subsequent polling iterations.
+  if (await archiveAlreadyDoneFn(gitFn, wt.path, cfg.base_branch, issueNumber)) return null;
 
   // Changes this PR branch introduced, still active (not yet archived).
   const diff = await gitFn(
