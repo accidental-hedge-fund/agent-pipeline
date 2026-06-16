@@ -10,6 +10,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 
@@ -59,33 +60,53 @@ async function whichDefault(cmd: string): Promise<string | null> {
 /**
  * Probe candidate install locations in priority order and return the first
  * directory that contains `scripts/pipeline.ts` (the pipeline core). Returns
- * null if no candidate resolves.
+ * null if no candidate resolves. Throws on a hard probe error (e.g., `npm`
+ * binary not found on PATH) so the CLI layer can exit non-zero with a
+ * diagnostic.
  *
  * Order:
- *   1. npm global root (`npm root -g`)
- *   2. ~/.claude/skills/pipeline/core
- *   3. ~/.codex/skills/pipeline/core
- *   4. ./node_modules/pipeline/core (local dev)
+ *   1. Current core (this file's parent's parent — always the running install)
+ *   2. npm global root (`npm root -g`): agent-pipeline, then pipeline
+ *   3. ~/.claude/skills/pipeline/core
+ *   4. ~/.codex/skills/pipeline/core
+ *   5. ./node_modules/{agent-pipeline,pipeline}/core (local dev)
  */
 async function probeCandidatesDefault(): Promise<string | null> {
   const home = os.homedir();
 
+  // Probe 1: the core that contains THIS file — always correct regardless of
+  // install method (skill dir, npm global, local dev clone, plugin marketplace).
+  const selfCore = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  if (fs.existsSync(path.join(selfCore, "scripts", "pipeline.ts"))) {
+    return selfCore;
+  }
+
   // npm global root: `npm root -g` → "<prefix>/lib/node_modules"
+  // Throws when `npm` is not on PATH at all (ENOENT) so the caller can exit
+  // non-zero. Other npm errors (non-zero exit, empty output) are treated as
+  // "no npm global root" — not a hard failure.
   const npmRoot = await (async () => {
     try {
       const { stdout } = await execFileAsync("npm", ["root", "-g"], { encoding: "utf8" });
       const r = stdout.trim();
       return r.length > 0 ? r : null;
-    } catch {
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error("install-location probe failed: `npm` is not on PATH");
+      }
       return null;
     }
   })();
 
   const candidates: string[] = [];
-  if (npmRoot) candidates.push(path.join(npmRoot, "pipeline", "core"));
+  if (npmRoot) {
+    candidates.push(path.join(npmRoot, "agent-pipeline", "core")); // npm global: agent-pipeline
+    candidates.push(path.join(npmRoot, "pipeline", "core"));       // npm global: legacy name
+  }
   candidates.push(path.join(home, ".claude", "skills", "pipeline", "core"));
   candidates.push(path.join(home, ".codex", "skills", "pipeline", "core"));
-  candidates.push(path.join(".", "node_modules", "pipeline", "core"));
+  candidates.push(path.join(".", "node_modules", "agent-pipeline", "core")); // local dev
+  candidates.push(path.join(".", "node_modules", "pipeline", "core"));       // local dev legacy
 
   for (const candidate of candidates) {
     if (fs.existsSync(path.join(candidate, "scripts", "pipeline.ts"))) {

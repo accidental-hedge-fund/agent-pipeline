@@ -162,6 +162,41 @@ test("discoverHosts: probe error throws (not swallowed)", async () => {
   );
 });
 
+// Regression for Finding 5: npm-ENOENT (npm not on PATH) was silently treated
+// as null → the discovery result showed "missing" instead of a probe error.
+// The default probeCandidatesDefault now throws on ENOENT; this test confirms
+// the error propagates through discoverHosts to handlePathSubcommand.
+test("discoverHosts: npm-ENOENT probe error propagates (regression: was silently nil)", async () => {
+  const enoentErr = Object.assign(new Error("npm not found"), { code: "ENOENT" });
+  await assert.rejects(
+    () =>
+      discoverHosts(
+        makeDeps({
+          probeCandidates: async () => { throw enoentErr; },
+        }),
+      ),
+    /ENOENT|npm not found/,
+  );
+});
+
+// handlePathSubcommand must exit non-zero when the probe propagates ENOENT.
+test("handlePathSubcommand: npm-ENOENT probe error sets exit code 1", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const enoentErr = Object.assign(new Error("install-location probe failed: `npm` is not on PATH"), {
+    code: "ENOENT",
+  });
+  const deps: PathSubcommandDeps = {
+    discoverHosts: async () => { throw enoentErr; },
+  };
+  const origExitCode = process.exitCode;
+  try {
+    await handlePathSubcommand({ json: true }, deps);
+    assert.equal(process.exitCode, 1, "exit code must be 1 when npm probe errors");
+  } finally {
+    process.exitCode = origExitCode;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 5. pipeline path --json handler
 // ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@
   "type": "module",
   "private": true,
   "bin": {
-    "agent-pipeline": "scripts/install.mjs"
+    "agent-pipeline": "scripts/install.mjs",
+    "pipeline": "scripts/pipeline-launcher.mjs"
   },
   "engines": {
     "node": ">=18"

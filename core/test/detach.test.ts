@@ -46,6 +46,9 @@ function fakeChild(pid = 12345) {
   });
 }
 
+const FIXED_PID = 42;       // deterministic PID for test run-dir names
+const FIXED_NOW = 1_700_000_000_000; // deterministic timestamp
+
 /** Build a SpawnDetachedDeps that captures spawn args and uses a tmp home dir. */
 function makeTestDeps(homeDir: string) {
   const calls: { cmd: string; args: string[]; opts: Record<string, unknown> }[] = [];
@@ -53,7 +56,8 @@ function makeTestDeps(homeDir: string) {
 
   const deps: SpawnDetachedDeps & { calls: typeof calls } = {
     homedir: () => homeDir,
-    now: () => 1_700_000_000_000,
+    now: () => FIXED_NOW,
+    pid: () => FIXED_PID,
     spawn(cmd, args, opts) {
       calls.push({ cmd, args, opts: opts as Record<string, unknown> });
       const child = fakeChild(nextPid++);
@@ -447,4 +451,41 @@ test("CLI parser: 'pipeline path --json' is accepted without excess-args rejecti
   });
   assert.equal(cmd.args[0], "path");
   assert.equal(cmd.opts<CliOpts>().json, true);
+});
+
+// ---------------------------------------------------------------------------
+// 8. Collision-proof run directories (Finding 3: run dirs must not collide)
+// ---------------------------------------------------------------------------
+
+test("spawnDetached: run dir name includes milliseconds and PID suffix", async () => {
+  const home = makeTmpDir();
+  try {
+    const deps = makeTestDeps(home);
+    const result = await spawnDetached(7, [], {}, deps);
+    const dirName = path.basename(result.runDir);
+    // Millisecond precision: format is YYYY-MM-DD_HH-mm-ss-mmm-p<pid>
+    assert.match(dirName, /-p\d+$/, "run dir must end with -p<pid>");
+    // Fixed now=1_700_000_000_000 has ms part 000; fixed pid=42
+    assert.ok(dirName.includes("-p42"), `expected pid suffix -p42 in ${dirName}`);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("spawnDetached: throws when run dir already has sentinel.json (collision guard)", async () => {
+  const home = makeTmpDir();
+  try {
+    const deps = makeTestDeps(home);
+    // First call succeeds and creates the run dir.
+    const result = await spawnDetached(7, [], {}, deps);
+    // Place a sentinel.json into that run dir to simulate a prior run.
+    fs.writeFileSync(path.join(result.runDir, "sentinel.json"), JSON.stringify({ exitCode: 0 }));
+    // Second call with the same deps (same timestamp + same pid) must throw.
+    await assert.rejects(
+      () => spawnDetached(7, [], {}, deps),
+      /collision|sentinel/i,
+    );
+  } finally {
+    cleanup(home);
+  }
 });

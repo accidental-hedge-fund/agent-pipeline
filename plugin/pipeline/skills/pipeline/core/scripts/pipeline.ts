@@ -152,18 +152,31 @@ async function main(): Promise<void> {
   cmd.parse(process.argv);
 
   const opts = cmd.opts<CliOpts>();
-  const numArg = cmd.args[0];
+  let numArg = cmd.args[0];
   const isInit = opts.init || numArg === "init";
   // `pipeline doctor` is a standalone command (like `init`): it runs the
   // preflight checks and exits, with no issue number. Distinct from the
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
 
-  // `pipeline run <N> [--detach ...]` — subcommand handled early so config
-  // resolution errors surface as the cleaner run-subcommand errors.
+  // `pipeline run <N> [--detach ...]` — subcommand dispatch.
   if (numArg === "run") {
-    await handleRunSubcommand(cmd.args[1] ?? "", opts);
-    return;
+    if (opts.detach) {
+      // Detach path: spawn a background wrapper and exit.
+      await handleRunSubcommand(cmd.args[1] ?? "", opts);
+      return;
+    }
+    // Non-detach: `pipeline run <N>` ≡ `pipeline <N>`. Redirect by overriding
+    // numArg so the normal lifecycle (kill-switch, preflight, issue/PR
+    // resolution) applies identically — avoids duplicating those guards here.
+    const runIssueArg = cmd.args[1] ?? "";
+    const runNum = Number.parseInt(runIssueArg, 10);
+    if (!Number.isFinite(runNum) || runNum <= 0) {
+      console.error("pipeline run: <number> argument is required and must be a positive integer");
+      process.exitCode = 2;
+      return;
+    }
+    numArg = runIssueArg;
   }
 
   // `pipeline path [--json]` — probe installed hosts and print the result.

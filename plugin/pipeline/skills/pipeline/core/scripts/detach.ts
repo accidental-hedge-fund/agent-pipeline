@@ -40,12 +40,15 @@ export type SpawnDetachedResult = {
 export type SpawnDetachedDeps = {
   homedir: () => string;
   now: () => number;
+  /** Process PID used in run-dir name. Injectable so tests get a deterministic path. */
+  pid: () => number;
   spawn: typeof spawn;
 };
 
 const defaultSpawnDeps: SpawnDetachedDeps = {
   homedir: os.homedir,
   now: () => Date.now(),
+  pid: () => process.pid,
   spawn,
 };
 
@@ -183,14 +186,26 @@ export async function spawnDetached(
   const lp = lockFilePath(home, issueNumber);
   await acquireLock(lp, issueNumber, flockTimeoutMs);
 
-  // Create run directory (unique per invocation via timestamp).
+  // Create a collision-proof run directory: millisecond-precision timestamp +
+  // PID so two launches within the same second (or same millisecond on fast
+  // systems) never share a directory. `mkdirSync(..., { recursive: true })`
+  // reuses an existing directory, so we also assert the selected dir has no
+  // leftover sentinel.json from a previous run.
   const ts = new Date(deps.now())
     .toISOString()
     .replace(/[:.]/g, "-")
-    .slice(0, 19)
-    .replace("T", "_");
+    .slice(0, 23)         // include milliseconds: YYYY-MM-DDTHH-mm-ss-mmm
+    .replace("T", "_")
+    + `-p${deps.pid()}`;  // add PID to prevent same-ms collisions
   const rd = makeRunDir(home, issueNumber, ts);
   fs.mkdirSync(rd, { recursive: true });
+  if (fs.existsSync(path.join(rd, "sentinel.json"))) {
+    removeStaleLock(lp);
+    throw new Error(
+      `pipeline: run directory collision — ${rd} already contains sentinel.json from a prior run. ` +
+        `Remove ${rd} if you want to start fresh.`,
+    );
+  }
 
   // Log file: wrapper stdout + stderr are appended here.
   const logPath = path.join(rd, "pipeline.log");

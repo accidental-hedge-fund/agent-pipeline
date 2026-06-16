@@ -656,6 +656,19 @@ Everything else — stages, prompts, GitHub I/O, worktrees, locking — is one s
 
 Pipeline Desk (or any desktop app) can launch and supervise `agent-pipeline` runs as subprocesses using two stable, host-neutral entry points.
 
+The `pipeline` command is provided by the `agent-pipeline` npm package. Install it globally to make the command available system-wide:
+
+```bash
+npm install -g agent-pipeline
+pipeline --version   # verify the install
+```
+
+If you prefer not to install globally, you can also invoke it via `npx`:
+
+```bash
+npx agent-pipeline path --json
+```
+
 ### Discover installed hosts — `pipeline path --json`
 
 Before launching a run, probe which hosts are installed:
