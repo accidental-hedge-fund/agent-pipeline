@@ -271,6 +271,7 @@ review_harness: my-reviewer          # optional: override the reviewer CLI for t
 # The implementer harness is owned by the install profile and cannot be set here.
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
 # rejected at config-parse time.
+harness_sandbox: false               # opt-in: true → claude implementer uses --permission-mode default instead of bypassPermissions (see "Sandboxed harness execution")
 ```
 
 ### Custom reviewer harness (`review_harness`)
@@ -345,6 +346,18 @@ setup_command: ""
 When `setup_command` is set to a non-empty string, it overrides auto-detection entirely — the configured command runs even when `node_modules` is already present. When set to `""`, the install step is skipped regardless of lockfile presence.
 
 **Failure handling:** if the install command exits non-zero, the pipeline blocks immediately with a `worktree-setup-failed` blocker and surfaces the command output. Subsequent stages never run. The `blocked` comment tells you to fix the root cause (e.g. missing package manager, bad lockfile) or set `setup_command: ""` to opt out, then re-run.
+
+## Sandboxed harness execution (`harness_sandbox`)
+
+By default, the claude implementer runs with `--permission-mode bypassPermissions`, which grants unrestricted host access. Set `harness_sandbox: true` in `.github/pipeline.yml` to switch to claude's native sandboxed permission mode:
+
+```yaml
+harness_sandbox: true   # claude implementer uses --permission-mode default (sandboxed)
+```
+
+When `harness_sandbox` is `true`, the claude harness is invoked with `--permission-mode default` instead of `bypassPermissions`. All other flags are unchanged. The codex harness is already workspace-sandboxed via `--full-auto` and is unaffected by this setting in both modes.
+
+**Default** (`harness_sandbox: false` or absent): the invocation is byte-identical to the pre-change behaviour — `--permission-mode bypassPermissions`. No change to existing repos unless you opt in.
 
 ## Test/build gate (optional, default on)
 

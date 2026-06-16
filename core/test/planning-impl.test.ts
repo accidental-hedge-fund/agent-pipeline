@@ -10,7 +10,9 @@ import {
   enforceImplCommitRef,
   enforceOpenspecChangeSingular,
   invokeImplementer,
+  invokePlanStep,
   type BootstrapWorktreeDeps,
+  type PlanStepDeps,
 } from "../scripts/stages/planning.ts";
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
@@ -74,6 +76,128 @@ test("invokeImplementer: CLI --model override wins over cfg.models.implementing 
   };
   await invokeImplementer("claude", "/wt", "p", cfgWithImplementing("haiku"), { model: "opus" }, deps);
   assert.equal(capturedModel, "opus");
+});
+
+test("invokeImplementer: forwards cfg.harness_sandbox as sandbox option to invoke (#21)", async () => {
+  let capturedSandbox: boolean | undefined;
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedSandbox = opts.sandbox;
+      return okResult();
+    },
+  };
+  const cfg = { ...cfgWithImplementing("sonnet"), harness_sandbox: true } as unknown as PipelineConfig;
+  await invokeImplementer("claude", "/wt", "p", cfg, {}, deps);
+  assert.equal(capturedSandbox, true, "sandbox flag must be forwarded from cfg.harness_sandbox");
+});
+
+test("invokeImplementer: harness_sandbox:false forwards sandbox:false to invoke (#21)", async () => {
+  let capturedSandbox: boolean | undefined;
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedSandbox = opts.sandbox;
+      return okResult();
+    },
+  };
+  const cfg = { ...cfgWithImplementing("sonnet"), harness_sandbox: false } as unknown as PipelineConfig;
+  await invokeImplementer("claude", "/wt", "p", cfg, {}, deps);
+  assert.equal(capturedSandbox, false, "sandbox:false must be forwarded (default unchanged)");
+});
+
+// ---------------------------------------------------------------------------
+// Planning-step harness invocation — cwd confinement (#21, review-2 finding 1)
+//
+// Regression for: non-OpenSpec plan-gen and plan-revision invocations used
+// cfg.repo_dir as the process cwd even when harness_sandbox was enabled, allowing
+// the sandboxed process to access the shared repo root instead of being confined
+// to the issue worktree.
+// ---------------------------------------------------------------------------
+
+function cfgWithSandbox(sandbox: boolean): PipelineConfig {
+  return {
+    implementation_timeout: 1200,
+    repo_dir: "/repo",
+    harness_sandbox: sandbox,
+    models: { planning: "haiku", implementing: "sonnet", review: "opus", fix: "sonnet" },
+  } as unknown as PipelineConfig;
+}
+
+test("invokePlanStep: sandbox:true uses wtPath as cwd, not cfg.repo_dir (review-2 finding 1 regression)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue-42", "plan prompt", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedDir, "/wt/issue-42", "sandbox:true must use the issue worktree path as cwd");
+  assert.notEqual(capturedDir, "/repo", "sandbox:true must NOT pass cfg.repo_dir as cwd");
+});
+
+test("invokePlanStep: sandbox:false uses cfg.repo_dir as cwd (default unchanged)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue-42", "plan prompt", cfgWithSandbox(false), {}, deps);
+  assert.equal(capturedDir, "/repo", "sandbox:false must use cfg.repo_dir as cwd");
+});
+
+test("invokePlanStep: plan-revision call also uses wtPath when sandbox:true (covers both call sites)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue-99", "revision prompt", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedDir, "/wt/issue-99");
+});
+
+test("invokePlanStep: forwards cfg.models.planning and sandbox flag to invoke options", async () => {
+  let capturedOpts: { model?: string; sandbox?: boolean; timeoutSec?: number } | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, _dir, _p, opts) => {
+      capturedOpts = opts;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue", "p", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedOpts?.model, "haiku");
+  assert.equal(capturedOpts?.sandbox, true);
+  assert.equal(capturedOpts?.timeoutSec, 1200);
+});
+
+test("invokePlanStep: sandbox:true with codex harness still uses cfg.repo_dir (codex unaffected by sandbox flag)", async () => {
+  // Regression for review-2 finding 1 (round 2): invokePlanStep was harness-blind —
+  // it routed all harnesses through wtPath when sandbox=true, changing codex's -C arg.
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("codex", "/wt/issue-42", "plan prompt", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedDir, "/repo", "codex must always use cfg.repo_dir regardless of sandbox flag");
+  assert.notEqual(capturedDir, "/wt/issue-42", "codex must NOT use wtPath when sandbox:true");
+});
+
+test("invokePlanStep: sandbox:false with codex harness uses cfg.repo_dir (baseline unchanged)", async () => {
+  let capturedDir: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, dir, _p, _opts) => {
+      capturedDir = dir;
+      return okResult();
+    },
+  };
+  await invokePlanStep("codex", "/wt/issue-42", "plan prompt", cfgWithSandbox(false), {}, deps);
+  assert.equal(capturedDir, "/repo", "codex must use cfg.repo_dir when sandbox:false (baseline)");
 });
 
 // ---------------------------------------------------------------------------

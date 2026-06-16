@@ -127,6 +127,7 @@ export async function advanceFix(
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
     model: opts.model ?? cfg.models.fix,
+    sandbox: cfg.harness_sandbox,
   });
 
   if (!result.success) {

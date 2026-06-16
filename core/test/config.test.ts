@@ -973,6 +973,68 @@ test("resolveConfig: non-string setup_command is rejected (strict schema)", asyn
   }
 });
 
+// ---- harness_sandbox (#21) ----
+
+test("resolveConfig: harness_sandbox:true is accepted and returns true", async () => {
+  const repo = makeFakeRepo(`harness_sandbox: true\n`);
+  const binDir = makeFakeGh("acme/hs1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harness_sandbox, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: harness_sandbox absent defaults to false", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/hs2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harness_sandbox, false);
+    assert.equal(cfg.harness_sandbox, DEFAULT_CONFIG.harness_sandbox);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: harness_sandbox:false is accepted and returns false", async () => {
+  const repo = makeFakeRepo(`harness_sandbox: false\n`);
+  const binDir = makeFakeGh("acme/hs3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harness_sandbox, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: harness_sandbox:\"yes\" (non-boolean) is rejected with a validation error", async () => {
+  const repo = makeFakeRepo(`harness_sandbox: "yes"\n`);
+  const binDir = makeFakeGh("acme/hs4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harness_sandbox"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // Regression (#146 review 2): when pipeline.yml sets doctor.runOnStart: true,
 // resolveConfig must tolerate a gh failure (return repo:"") so the run-start
 // preflight gate — not the generic config-error path — reports the failure.
