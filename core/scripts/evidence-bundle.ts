@@ -96,7 +96,7 @@ async function writeBundle(
     const finalPath = bundlePath(stateDir, issue);
     await deps.mkdir(path.dirname(finalPath), { recursive: true });
     const tmp = `${finalPath}.tmp`;
-    const serialized = sanitize(`${JSON.stringify(bundle, null, 2)}\n`);
+    const serialized = sanitize(redactSecrets(`${JSON.stringify(bundle, null, 2)}\n`));
     await deps.writeFile(tmp, serialized);
     await deps.rename(tmp, finalPath);
   } catch (err) {

@@ -17,6 +17,11 @@ export const INJECTION_PATTERNS: readonly RegExp[] = [
   /act\s+as\s+if\b/gi,
   /you\s+must\s+now\b/gi,
   /override\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+  // Model control tokens (ChatML / OpenAI special tokens that inject chat-role framing)
+  /<\|im_start\|>/g,
+  /<\|im_end\|>/g,
+  // Line-start role markers that inject chat-role syntax when an artifact is replayed
+  /^assistant\s*:/gim,
 ];
 
 /** Token / credential format patterns — matched without env dependency. */
@@ -39,6 +44,12 @@ export function redactSecrets(text: string): string {
       result = result.split(value).join("[REDACTED]");
     }
   }
+  // Redact inline env-var assignments whose name matches the secret pattern,
+  // even when the value is not present in process.env (e.g. OPENAI_API_KEY=xyz cmd).
+  result = result.replace(
+    /\b([A-Z][A-Z0-9_]*)\s*=\s*([^\s"'`,;)\\]+)/g,
+    (full, name, _val) => (SECRET_NAME_RE.test(name) ? `${name}=[REDACTED]` : full),
+  );
   return result;
 }
 

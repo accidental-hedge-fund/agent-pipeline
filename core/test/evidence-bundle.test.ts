@@ -730,6 +730,17 @@ test("injection denylist: command output containing injection phrase is redacted
   assert.ok(raw.includes("[REDACTED-INJECTION]"), "injection placeholder must appear in bundle on disk");
 });
 
+// Finding 1 regression: recordOverride with a token in the reason must be redacted at the write chokepoint
+test("writeBundle: recordOverride with GitHub token in reason persists [REDACTED], not the raw token", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  const fakeToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+  await recordOverride(STATE, ISSUE, { key: "abc12345", reason: `Skipping — token is ${fakeToken}` }, deps);
+  const raw = files.get(bundlePath(STATE, ISSUE))!;
+  assert.ok(!raw.includes(fakeToken), "token in override reason must not appear in the bundle");
+  assert.ok(raw.includes("[REDACTED]"), "redaction marker must be present in persisted bundle");
+});
+
 test("injection denylist: clean bundle content is written without modification", async () => {
   const { files, deps } = memFs();
   await createBundle(STATE, { runId: "r", issue: ISSUE, pr: 456, branch: "pipeline/test", harnesses: ["claude"] }, deps);
