@@ -365,6 +365,36 @@ export function findGitRoot(start: string): string | null {
 }
 
 /**
+ * Resolve the minimal config needed by `pipeline release` without calling `gh`.
+ * Reads repo_dir from the provided git root and base_branch from pipeline.yml
+ * (local file only — no network calls).
+ */
+export function resolveReleaseConfig(
+  repoDir: string,
+  baseBranchOverride?: string,
+): { repo_dir: string; repo: string; base_branch: string } {
+  let baseBranch = DEFAULT_CONFIG.base_branch;
+  const configPath = path.join(repoDir, ".github", "pipeline.yml");
+  try {
+    if (fs.existsSync(configPath)) {
+      const text = fs.readFileSync(configPath, "utf8");
+      const parsed = yaml.load(text);
+      if (parsed && typeof parsed === "object" && "base_branch" in parsed) {
+        const b = (parsed as { base_branch?: unknown }).base_branch;
+        if (typeof b === "string") baseBranch = b;
+      }
+    }
+  } catch {
+    // Ignore config read/parse errors: fall back to the default branch.
+  }
+  return {
+    repo_dir: repoDir,
+    repo: "",
+    base_branch: baseBranchOverride ?? baseBranch,
+  };
+}
+
+/**
  * Read the conventions excerpt to embed in stage prompts. Falls back to a
  * stub if the configured path doesn't exist. Truncates to keep prompts
  * focused.

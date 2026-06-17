@@ -34,6 +34,8 @@ export interface ReleaseContext {
   date: string;
   theme: string;
   shippedPRs: ShippedPR[];
+  /** Issue numbers confirmed shipped (resolved from PR closing references). Empty in dry-run or when no PRs detected. */
+  shippedIssueNumbers: number[];
 }
 
 export interface CommandResult {
@@ -49,6 +51,8 @@ export interface ReleaseDeps {
   runCommand(cmd: string, args: string[], opts?: { cwd?: string }): CommandResult;
   spawnEditor(editor: string, filePath: string): void;
   fetchPRTitle(num: number): Promise<string>;
+  /** Fetch the issue numbers closed by a given PR via `gh pr view --json closingIssuesReferences`. */
+  fetchPRClosingIssues(num: number): Promise<number[]>;
   today(): string;
   stdout(msg: string): void;
   stderr(msg: string): void;
@@ -58,7 +62,8 @@ export interface ReleaseDeps {
 // Real deps
 // ---------------------------------------------------------------------------
 
-export function realReleaseDeps(): ReleaseDeps {
+/** Create real deps. Pass repoDir so gh commands run in the target repo's cwd. */
+export function realReleaseDeps(repoDir?: string): ReleaseDeps {
   return {
     readFile: (p) => fs.readFileSync(p, "utf8"),
     writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
@@ -90,10 +95,27 @@ export function realReleaseDeps(): ReleaseDeps {
       const result = spawnSync(
         "gh",
         ["pr", "view", String(num), "--json", "title", "--jq", ".title"],
-        { encoding: "utf8", stdio: "pipe" },
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
       );
       if (result.status !== 0) return `PR #${num}`;
       return result.stdout.trim() || `PR #${num}`;
+    },
+    fetchPRClosingIssues: async (num) => {
+      const result = spawnSync(
+        "gh",
+        [
+          "pr", "view", String(num),
+          "--json", "closingIssuesReferences",
+          "--jq", ".closingIssuesReferences[].number",
+        ],
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+      );
+      if (result.status !== 0 || !result.stdout.trim()) return [];
+      return result.stdout
+        .trim()
+        .split("\n")
+        .map(Number)
+        .filter((n) => Number.isFinite(n) && n > 0);
     },
     today: () => new Date().toISOString().slice(0, 10),
     stdout: (msg) => process.stdout.write(msg + "\n"),
@@ -440,10 +462,21 @@ export function prependShippedBlock(text: string, ctx: ReleaseContext): string {
  * 4. Stamp the per-issue semver table.
  *
  * Finds rows in the `| # | Impact | Config | Theme | → Release | Depends on |` table
- * where `→ Release` = `v{version}` and prefixes them with `✅`.
+ * where `→ Release` = `v{version}` AND the issue number is in `ctx.shippedIssueNumbers`,
+ * then marks them with `✅`. Rows whose version matches but whose issue number is not
+ * in the shipped set are left unchanged (they were deferred or planned but not merged).
+ * When `shippedIssueNumbers` is empty (dry-run or no PRs detected) no rows are stamped.
+ *
+ * An optional `warn` callback receives a message for each version-matched row that was
+ * not stamped, so the caller can surface it to the maintainer.
  */
-export function stampPerIssueTable(text: string, ctx: ReleaseContext): string {
-  const { version } = ctx;
+export function stampPerIssueTable(
+  text: string,
+  ctx: ReleaseContext,
+  warn?: (msg: string) => void,
+): string {
+  const { version, shippedIssueNumbers } = ctx;
+  const shippedSet = new Set(shippedIssueNumbers);
   const tableHeader = "| # | Impact | Config | Theme | → Release | Depends on |";
   if (!text.includes(tableHeader)) {
     throw new Error(
@@ -470,10 +503,21 @@ export function stampPerIssueTable(text: string, ctx: ReleaseContext): string {
       // col[5] is "→ Release" (0-indexed: 0=empty, 1=#N, 2=impact, 3=config, 4=theme, 5=→Release, 6=depends)
       if (cols.length < 7) continue;
       const releaseCol = cols[5].trim();
-      if (releaseCol === `v${version}`) {
+      if (releaseCol !== `v${version}`) continue;
+
+      // Extract the issue number from the # column (e.g., " #170 " → 170).
+      const issueMatch = cols[1].trim().match(/^#(\d+)$/);
+      const issueNum = issueMatch ? Number(issueMatch[1]) : NaN;
+
+      if (shippedSet.size > 0 && !Number.isNaN(issueNum) && shippedSet.has(issueNum)) {
         cols[5] = ` ✅ v${version} `;
         lines[i] = cols.join("|");
+      } else if (shippedSet.size > 0 && !Number.isNaN(issueNum) && !shippedSet.has(issueNum)) {
+        warn?.(
+          `[pipeline release] note: per-issue row #${issueNum} is planned for v${version} but was not in the shipped PR set — leaving unchanged (verify manually)`,
+        );
       }
+      // shippedSet.size === 0: no confirmed shipped issues (dry-run / no PRs detected), leave unchanged
     }
   }
   return lines.join("\n");
@@ -482,13 +526,19 @@ export function stampPerIssueTable(text: string, ctx: ReleaseContext): string {
 /**
  * Apply all four ROADMAP mutations atomically in memory.
  * Throws with a named-anchor error on the first missing site.
+ * The optional `warn` callback is forwarded to stampPerIssueTable for
+ * per-row "planned but not shipped" notifications.
  */
-export function scaffoldRoadmap(roadmapText: string, ctx: ReleaseContext): string {
+export function scaffoldRoadmap(
+  roadmapText: string,
+  ctx: ReleaseContext,
+  warn?: (msg: string) => void,
+): string {
   let text = roadmapText;
   text = patchIntroLine(text, ctx);
   text = patchReleasePlanRow(text, ctx);
   text = prependShippedBlock(text, ctx);
-  text = stampPerIssueTable(text, ctx);
+  text = stampPerIssueTable(text, ctx, warn);
   return text;
 }
 
@@ -525,6 +575,33 @@ export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Shipped issue number resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * For each shipped PR, fetch the GitHub issue numbers it closes and return the
+ * deduplicated union. Falls back gracefully: if `fetchPRClosingIssues` fails for
+ * a PR, that PR is skipped (a warning is emitted) rather than aborting.
+ */
+export async function collectShippedIssueNumbers(
+  prs: ShippedPR[],
+  deps: Pick<ReleaseDeps, "fetchPRClosingIssues" | "stderr">,
+): Promise<number[]> {
+  const issueNums = new Set<number>();
+  for (const pr of prs) {
+    try {
+      const closing = await deps.fetchPRClosingIssues(pr.number);
+      for (const n of closing) issueNums.add(n);
+    } catch {
+      deps.stderr(
+        `[pipeline release] warning: could not fetch closing issues for PR #${pr.number} — skipping`,
+      );
+    }
+  }
+  return [...issueNums].sort((a, b) => a - b);
+}
+
+// ---------------------------------------------------------------------------
 // Main orchestrator
 // ---------------------------------------------------------------------------
 
@@ -532,135 +609,156 @@ export async function runRelease(
   versionArg: string,
   opts: ReleaseOpts,
   cfg: { repo_dir: string; repo: string; base_branch?: string },
-  deps: ReleaseDeps = realReleaseDeps(),
+  deps?: ReleaseDeps,
 ): Promise<void> {
+  const d = deps ?? realReleaseDeps(cfg.repo_dir);
   const repoDir = cfg.repo_dir;
   const rootPkgPath = path.join(repoDir, "package.json");
   const corePkgPath = path.join(repoDir, "core", "package.json");
   const roadmapPath = path.join(repoDir, "ROADMAP.md");
 
   // 1. Read current version for alias expansion.
-  const corePkgText = deps.readFile(corePkgPath);
+  const corePkgText = d.readFile(corePkgPath);
   const previousVersion = (JSON.parse(corePkgText) as { version: string }).version;
 
   // 2. Resolve version — throws on invalid input.
   const resolvedVersion = resolveVersion(versionArg, previousVersion);
-  deps.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
+  d.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
 
   // 3. Find last git tag for git-log range (local git call, safe in all modes).
-  const tagResult = deps.runCommand("git", ["describe", "--tags", "--abbrev=0"], { cwd: repoDir });
+  const tagResult = d.runCommand("git", ["describe", "--tags", "--abbrev=0"], { cwd: repoDir });
   const lastTag = tagResult.code === 0 ? tagResult.stdout.trim() : "";
   if (lastTag) {
-    deps.stdout(`[pipeline release] git log range: ${lastTag}..HEAD`);
+    d.stdout(`[pipeline release] git log range: ${lastTag}..HEAD`);
   } else {
-    deps.stdout("[pipeline release] no previous tag found; git log range: HEAD");
+    d.stdout("[pipeline release] no previous tag found; git log range: HEAD");
   }
 
   // 4. Read ROADMAP and extract theme (local, safe in all modes).
-  const roadmapText = deps.readFile(roadmapPath);
+  const roadmapText = d.readFile(roadmapPath);
   const theme = extractTheme(roadmapText, resolvedVersion);
-  const today = deps.today();
+  const today = d.today();
 
   // --- Dry-run path: local-only, no file writes, no GitHub API calls ---
   if (opts.dryRun) {
     // Discover PR numbers from git log only (localOnly=true skips fetchPRTitle → gh).
-    const shippedPRs = await discoverShippedPRs(lastTag, repoDir, deps, /* localOnly= */ true);
+    const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d, /* localOnly= */ true);
 
-    const ctx: ReleaseContext = { version: resolvedVersion, previousVersion, date: today, theme, shippedPRs };
+    // shippedIssueNumbers is empty in dry-run: resolving closing issues requires GitHub API.
+    const ctx: ReleaseContext = {
+      version: resolvedVersion, previousVersion, date: today, theme,
+      shippedPRs, shippedIssueNumbers: [],
+    };
 
     // Compute version-bump diffs in memory (no file writes).
-    const rootPkgOld = deps.readFile(rootPkgPath);
+    const rootPkgOld = d.readFile(rootPkgPath);
     const rootPkgNew = bumpVersionInMemory(rootPkgOld, resolvedVersion);
     const corePkgNew = bumpVersionInMemory(corePkgText, resolvedVersion);
 
     const rootDiff = computeUnifiedDiff(rootPkgOld, rootPkgNew, "a/package.json", "b/package.json");
     const coreDiff = computeUnifiedDiff(corePkgText, corePkgNew, "a/core/package.json", "b/core/package.json");
 
-    // Scaffold ROADMAP in memory and diff it.
+    // Scaffold ROADMAP in memory and diff it (per-issue table is not stamped in dry-run).
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
     const roadmapDiff = computeUnifiedDiff(roadmapText, patchedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
 
     const prBody = buildPRBody(ctx, lastTag);
 
-    deps.stdout(`\n=== Resolved version: ${resolvedVersion} ===\n`);
-    deps.stdout(`=== package.json diff ===`);
-    deps.stdout(rootDiff || "(no changes)");
-    deps.stdout(`\n=== core/package.json diff ===`);
-    deps.stdout(coreDiff || "(no changes)");
-    deps.stdout(`\n=== ROADMAP.md diff ===`);
-    deps.stdout(roadmapDiff || "(no changes)");
-    deps.stdout(`\n=== PR body ===`);
-    deps.stdout(prBody);
+    d.stdout(`\n=== Resolved version: ${resolvedVersion} ===\n`);
+    d.stdout(`=== package.json diff ===`);
+    d.stdout(rootDiff || "(no changes)");
+    d.stdout(`\n=== core/package.json diff ===`);
+    d.stdout(coreDiff || "(no changes)");
+    d.stdout(`\n=== ROADMAP.md diff ===`);
+    d.stdout(roadmapDiff || "(no changes)");
+    d.stdout(`\n=== PR body ===`);
+    d.stdout(prBody);
     return;
   }
 
   // --- Live path ---
 
-  // 5. Bump version in both package.json files.
-  deps.stdout("[pipeline release] bumping version in package.json files...");
-  bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, deps);
+  // 5. Pre-validate all ROADMAP anchors in memory BEFORE writing any files.
+  //    scaffoldRoadmap throws with a named-anchor error if any of the four sites is missing.
+  //    This guarantees a missing anchor aborts cleanly before version files are written.
+  d.stdout("[pipeline release] validating ROADMAP.md anchors...");
+  const validationCtx: ReleaseContext = {
+    version: resolvedVersion, previousVersion, date: today, theme,
+    shippedPRs: [], shippedIssueNumbers: [],
+  };
+  scaffoldRoadmap(roadmapText, validationCtx);  // throws on missing anchor; result discarded
 
-  // 6. Regenerate plugin/ mirror.
-  deps.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
-  const buildResult = deps.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
+  // 6. Bump version in both package.json files.
+  d.stdout("[pipeline release] bumping version in package.json files...");
+  bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, d);
+
+  // 7. Regenerate plugin/ mirror.
+  d.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
+  const buildResult = d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
   if (buildResult.code !== 0) {
-    deps.stderr(buildResult.stdout);
-    deps.stderr(buildResult.stderr);
+    d.stderr(buildResult.stdout);
+    d.stderr(buildResult.stderr);
     throw new Error(
       `[pipeline release] mirror regen failed: node scripts/build.mjs exited ${buildResult.code}`,
     );
   }
 
-  // 7. CI gate — abort here if CI fails; no GitHub API has been called yet.
-  deps.stdout("[pipeline release] running CI gate (npm run ci)...");
-  const ciResult = deps.runCommand("npm", ["run", "ci"], { cwd: repoDir });
+  // 8. CI gate — abort here if CI fails; no GitHub API has been called yet.
+  d.stdout("[pipeline release] running CI gate (npm run ci)...");
+  const ciResult = d.runCommand("npm", ["run", "ci"], { cwd: repoDir });
   if (ciResult.code !== 0) {
-    deps.stderr(ciResult.stdout);
-    deps.stderr(ciResult.stderr);
+    d.stderr(ciResult.stdout);
+    d.stderr(ciResult.stderr);
     throw new Error(
       `[pipeline release] CI gate failed: npm run ci exited ${ciResult.code}`,
     );
   }
-  deps.stdout("[pipeline release] CI passed.");
+  d.stdout("[pipeline release] CI passed.");
 
-  // 8. Discover shipped PRs with title enrichment (first GitHub API call; only reached after CI).
-  const shippedPRs = await discoverShippedPRs(lastTag, repoDir, deps);
+  // 9. Discover shipped PRs with title enrichment (first GitHub API call; only reached after CI).
+  const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d);
 
-  // 9. Scaffold ROADMAP in memory and build PR body.
-  const ctx: ReleaseContext = { version: resolvedVersion, previousVersion, date: today, theme, shippedPRs };
-  const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
+  // 10. Resolve shipped issue numbers from PR closing references (required for per-issue stamping).
+  const shippedIssueNumbers = await collectShippedIssueNumbers(shippedPRs, d);
+
+  // 11. Scaffold ROADMAP in memory and build PR body.
+  const ctx: ReleaseContext = {
+    version: resolvedVersion, previousVersion, date: today, theme,
+    shippedPRs, shippedIssueNumbers,
+  };
+  const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
   const prBody = buildPRBody(ctx, lastTag);
 
-  // 10. Write scaffolded ROADMAP to disk.
-  deps.stdout("[pipeline release] writing scaffolded ROADMAP.md...");
-  deps.writeFile(roadmapPath, patchedRoadmap);
+  // 12. Write scaffolded ROADMAP to disk.
+  d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");
+  d.writeFile(roadmapPath, patchedRoadmap);
 
-  // 11. Open $EDITOR for human confirmation.
+  // 13. Open $EDITOR for human confirmation.
   if (!opts.noEdit) {
     const editor = process.env.EDITOR;
     if (!editor) {
-      deps.stderr(
+      d.stderr(
         "[pipeline release] warning: $EDITOR is not set — proceeding as --no-edit (committing scaffolded ROADMAP as-is)",
       );
     } else {
-      deps.stdout(`[pipeline release] opening ${roadmapPath} in $EDITOR (${editor}) for review...`);
-      deps.spawnEditor(editor, roadmapPath);
+      d.stdout(`[pipeline release] opening ${roadmapPath} in $EDITOR (${editor}) for review...`);
+      d.spawnEditor(editor, roadmapPath);
     }
   }
 
-  // 12. Create release branch, commit, and open PR.
+  // 14. Create release branch, commit, and open PR.
   const branch = `release/v${resolvedVersion}`;
-  deps.stdout(`[pipeline release] creating branch ${branch}...`);
+  d.stdout(`[pipeline release] creating branch ${branch}...`);
 
-  const checkoutResult = deps.runCommand("git", ["checkout", "-b", branch], { cwd: repoDir });
+  const checkoutResult = d.runCommand("git", ["checkout", "-b", branch], { cwd: repoDir });
   if (checkoutResult.code !== 0) {
     throw new Error(
       `[pipeline release] git checkout -b ${branch} failed: ${checkoutResult.stderr.trim()}`,
     );
   }
 
-  deps.stdout("[pipeline release] staging release files...");
-  const addResult = deps.runCommand(
+  d.stdout("[pipeline release] staging release files...");
+  const addResult = d.runCommand(
     "git",
     ["add", "package.json", "core/package.json", "ROADMAP.md", "plugin/"],
     { cwd: repoDir },
@@ -670,14 +768,14 @@ export async function runRelease(
   }
 
   const commitMsg = `release: ${resolvedVersion} — ${theme}\n\nIssue: #170\nPipeline-Run: 170/${today}T00:00:00Z`;
-  const commitResult = deps.runCommand("git", ["commit", "-m", commitMsg], { cwd: repoDir });
+  const commitResult = d.runCommand("git", ["commit", "-m", commitMsg], { cwd: repoDir });
   if (commitResult.code !== 0) {
     throw new Error(`[pipeline release] git commit failed: ${commitResult.stderr.trim()}`);
   }
-  deps.stdout("[pipeline release] committed release files.");
+  d.stdout("[pipeline release] committed release files.");
 
-  deps.stdout("[pipeline release] pushing branch and opening release PR...");
-  const pushResult = deps.runCommand("git", ["push", "-u", "origin", branch], { cwd: repoDir });
+  d.stdout("[pipeline release] pushing branch and opening release PR...");
+  const pushResult = d.runCommand("git", ["push", "-u", "origin", branch], { cwd: repoDir });
   if (pushResult.code !== 0) {
     throw new Error(`[pipeline release] git push failed: ${pushResult.stderr.trim()}`);
   }
@@ -685,7 +783,7 @@ export async function runRelease(
   // Use configured base_branch (from .github/pipeline.yml or --base CLI flag), default "main".
   const baseBranch = cfg.base_branch ?? "main";
   const prTitle = `release: ${resolvedVersion} — ${theme}`;
-  const prResult = deps.runCommand(
+  const prResult = d.runCommand(
     "gh",
     ["pr", "create", "--title", prTitle, "--body", prBody, "--base", baseBranch],
     { cwd: repoDir },
@@ -695,5 +793,5 @@ export async function runRelease(
   }
 
   const prUrl = prResult.stdout.trim();
-  deps.stdout(`[pipeline release] release PR opened: ${prUrl}`);
+  d.stdout(`[pipeline release] release PR opened: ${prUrl}`);
 }

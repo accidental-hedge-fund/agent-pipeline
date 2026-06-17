@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
+import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -332,6 +332,29 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // Early release dispatch — derives repo_dir/base_branch from local git state
+  // only; no `gh` call. This means dry-run and CI-failure paths never call any
+  // GitHub API before runRelease itself gates on CI passing.
+  if (isReleaseCommand) {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir);
+    if (!repoDir) {
+      console.error(
+        `pipeline: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    const localCfg = resolveReleaseConfig(repoDir, opts.base);
+    const versionArg = cmd.args[1] as string;
+    try {
+      await runRelease(versionArg, { dryRun: opts.dryRun, noEdit: opts.edit === false }, localCfg);
+    } catch (err) {
+      console.error(`pipeline release: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   let cfg: PipelineConfig;
   try {
     cfg = resolveConfig({
@@ -403,18 +426,6 @@ async function main(): Promise<void> {
 
   if (isDoctorCommand) {
     await runDoctor(cfg, opts);
-    return;
-  }
-
-  if (isReleaseCommand) {
-    // versionArgEarly validation above guarantees cmd.args[1] is present and non-numeric here.
-    const versionArg = cmd.args[1] as string;
-    try {
-      await runRelease(versionArg, { dryRun: opts.dryRun, noEdit: opts.edit === false }, cfg);
-    } catch (err) {
-      console.error(`pipeline release: ${(err as Error).message}`);
-      process.exit(1);
-    }
     return;
   }
 

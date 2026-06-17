@@ -18,6 +18,7 @@ import {
   prependShippedBlock,
   stampPerIssueTable,
   discoverShippedPRs,
+  collectShippedIssueNumbers,
   buildPRBody,
   extractTheme,
   computeUnifiedDiff,
@@ -44,6 +45,7 @@ function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
     runCommand: () => ({ code: 0, stdout: "", stderr: "" }),
     spawnEditor: (editor, filePath) => { editorCalls.push(`${editor}:${filePath}`); },
     fetchPRTitle: async (n) => `Title of PR #${n}`,
+    fetchPRClosingIssues: async (_n) => [],
     today: () => "2026-06-16",
     stdout: (msg) => { stdoutLines.push(msg); },
     stderr: (msg) => { stderrLines.push(msg); },
@@ -223,6 +225,9 @@ const SAMPLE_CTX: ReleaseContext = {
     { number: 203, title: "release: pipeline release sub-command" },
     { number: 204, title: "intake: pipeline intake sub-command" },
   ],
+  // Issues #170 and #158 are the v1.6.0 entries in SAMPLE_ROADMAP's per-issue table.
+  // PR #203 closes issue #170; PR #204 closes issue #158 (fixture mapping).
+  shippedIssueNumbers: [158, 170],
 };
 
 // ---------------------------------------------------------------------------
@@ -321,13 +326,31 @@ test("prependShippedBlock: uses placeholder row when no shipped PRs", () => {
   assert.ok(result.includes("no merged PRs detected"), "placeholder row present when no PRs");
 });
 
-test("stampPerIssueTable: stamps matching rows with ✅ prefix", () => {
+test("stampPerIssueTable: stamps only rows whose issue number is in shippedIssueNumbers", () => {
+  // SAMPLE_CTX has shippedIssueNumbers: [158, 170]; per-issue table has #158 and #170 for v1.6.0.
   const result = stampPerIssueTable(SAMPLE_ROADMAP, SAMPLE_CTX);
 
-  // Rows with v1.6.0 should be stamped.
-  assert.ok(result.includes("✅ v1.6.0"), "v1.6.0 rows stamped");
-  // v1.5.0 rows should be unchanged.
+  assert.ok(result.includes("✅ v1.6.0"), "v1.6.0 rows in shipped set are stamped");
   assert.ok(!result.includes("✅ v1.5.0"), "v1.5.0 rows NOT stamped");
+});
+
+test("stampPerIssueTable: leaves v{version} rows unchanged when shippedIssueNumbers is empty", () => {
+  // Empty shippedIssueNumbers (dry-run / no PRs) must not stamp any row.
+  const ctx: ReleaseContext = { ...SAMPLE_CTX, shippedIssueNumbers: [] };
+  const result = stampPerIssueTable(SAMPLE_ROADMAP, ctx);
+
+  assert.ok(!result.includes("✅ v1.6.0"), "no stamping when shippedIssueNumbers is empty");
+});
+
+test("stampPerIssueTable: emits warn for rows with matching version not in shipped set", () => {
+  // Issue #158 is planned for v1.6.0 but not in the shipped set — warn should fire.
+  const ctx: ReleaseContext = { ...SAMPLE_CTX, shippedIssueNumbers: [170] };
+  const warnings: string[] = [];
+  const result = stampPerIssueTable(SAMPLE_ROADMAP, ctx, (msg) => warnings.push(msg));
+
+  assert.ok(result.includes("✅ v1.6.0"), "issue #170 is stamped (in shipped set)");
+  assert.equal(warnings.length, 1, "one warning for unshipped row");
+  assert.ok(warnings[0].includes("#158"), "warning mentions the unshipped issue number");
 });
 
 test("stampPerIssueTable: throws when per-issue table header is not found", () => {
@@ -357,6 +380,63 @@ test("scaffoldRoadmap bites: without mutations, the original text has none of th
   assert.ok(!SAMPLE_ROADMAP.includes("**v1.6.0** ✅ shipped"), "no pre-existing ✅ shipped for v1.6.0 in plan row");
   assert.ok(!SAMPLE_ROADMAP.includes("✅ v1.6.0"), "no pre-existing per-issue stamp for v1.6.0");
   assert.ok(!SAMPLE_ROADMAP.includes("**v1.6.0 — Intake"), "no pre-existing v1.6.0 shipped block header");
+});
+
+// ---------------------------------------------------------------------------
+// collectShippedIssueNumbers
+// ---------------------------------------------------------------------------
+
+test("collectShippedIssueNumbers: fetches closing issues for each PR and returns deduplicated sorted list", async () => {
+  const deps = makeDeps({
+    fetchPRClosingIssues: async (n) => {
+      if (n === 203) return [170];
+      if (n === 204) return [158];
+      return [];
+    },
+  });
+  const result = await collectShippedIssueNumbers(
+    [{ number: 203, title: "PR A" }, { number: 204, title: "PR B" }],
+    deps,
+  );
+  assert.deepEqual(result, [158, 170], "returns sorted issue numbers");
+});
+
+test("collectShippedIssueNumbers: deduplicates issues referenced by multiple PRs", async () => {
+  const deps = makeDeps({
+    fetchPRClosingIssues: async (n) => {
+      if (n === 203) return [170, 158];
+      if (n === 204) return [158];  // duplicate
+      return [];
+    },
+  });
+  const result = await collectShippedIssueNumbers(
+    [{ number: 203, title: "A" }, { number: 204, title: "B" }],
+    deps,
+  );
+  assert.deepEqual(result, [158, 170], "duplicates collapsed");
+});
+
+test("collectShippedIssueNumbers: returns empty array when no closing issues are found", async () => {
+  const deps = makeDeps({ fetchPRClosingIssues: async () => [] });
+  const result = await collectShippedIssueNumbers([{ number: 203, title: "A" }], deps);
+  assert.deepEqual(result, []);
+});
+
+test("collectShippedIssueNumbers: skips PRs where fetchPRClosingIssues throws and emits warning", async () => {
+  const warnings: string[] = [];
+  const deps = makeDeps({
+    fetchPRClosingIssues: async (n) => {
+      if (n === 203) throw new Error("network error");
+      return [158];
+    },
+    stderr: (msg) => { warnings.push(msg); },
+  });
+  const result = await collectShippedIssueNumbers(
+    [{ number: 203, title: "A" }, { number: 204, title: "B" }],
+    deps,
+  );
+  assert.deepEqual(result, [158], "failed PR skipped, others collected");
+  assert.ok(warnings.some((w) => w.includes("#203")), "warning mentions the failed PR");
 });
 
 // ---------------------------------------------------------------------------
@@ -454,6 +534,7 @@ test("buildPRBody: includes version, theme, date, and PR list", () => {
     date: "2026-06-17",
     theme: "Intake & backlog automation",
     shippedPRs: [{ number: 203, title: "Release PR" }],
+    shippedIssueNumbers: [],
   };
   const body = buildPRBody(ctx, "v1.5.0");
 
@@ -556,8 +637,9 @@ test("discoverShippedPRs: localOnly=true returns placeholder titles without call
   assert.equal(prs[0].title, "PR #203", "placeholder title used");
 });
 
-test("runRelease dry-run: no file writes and no fetchPRTitle calls", async () => {
+test("runRelease dry-run: no file writes, no fetchPRTitle, and no fetchPRClosingIssues calls", async () => {
   let fetchCalled = false;
+  let closingCalled = false;
   const writes: string[] = [];
 
   const deps = makeDeps({
@@ -574,12 +656,14 @@ test("runRelease dry-run: no file writes and no fetchPRTitle calls", async () =>
       return { code: 0, stdout: "", stderr: "" };
     },
     fetchPRTitle: async (n) => { fetchCalled = true; return `PR #${n}`; },
+    fetchPRClosingIssues: async (n) => { closingCalled = true; return []; },
   });
 
   await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
 
   assert.equal(writes.length, 0, "no files written in dry-run");
   assert.ok(!fetchCalled, "fetchPRTitle (gh pr view) not called in dry-run");
+  assert.ok(!closingCalled, "fetchPRClosingIssues not called in dry-run");
 });
 
 test("runRelease dry-run: output contains unified diff markers (not full file content)", async () => {
@@ -636,6 +720,77 @@ test("runRelease live: CI failure aborts before any GitHub API call (no fetchPRT
     (err: Error) => err.message.includes("CI gate failed"),
   );
   assert.ok(!fetchCalled, "fetchPRTitle must NOT be called when CI fails");
+});
+
+test("runRelease live: CI failure aborts before any fetchPRClosingIssues call", async () => {
+  let closingCalled = false;
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "node" && args[0] === "scripts/build.mjs") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "npm") return { code: 1, stdout: "FAIL", stderr: "test failed" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRClosingIssues: async (n) => { closingCalled = true; return []; },
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    (err: Error) => err.message.includes("CI gate failed"),
+  );
+  assert.ok(!closingCalled, "fetchPRClosingIssues must NOT be called when CI fails");
+});
+
+test("runRelease live: missing ROADMAP anchor aborts before any file write", async () => {
+  const writes: string[] = [];
+  // ROADMAP missing the release-plan row for v1.6.0
+  const roadmapMissingRow = SAMPLE_ROADMAP.replace("| **v1.6.0** |", "| **v1.7.0** |");
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return roadmapMissingRow;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    (err: Error) => err.message.includes("release-plan-row"),
+  );
+  assert.equal(writes.length, 0, "no files written when ROADMAP anchor is missing");
+});
+
+test("runRelease dry-run: fetchPRClosingIssues is never called", async () => {
+  let closingCalled = false;
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRClosingIssues: async (n) => { closingCalled = true; return []; },
+  });
+
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.ok(!closingCalled, "fetchPRClosingIssues must NOT be called in dry-run");
 });
 
 // ---------------------------------------------------------------------------
