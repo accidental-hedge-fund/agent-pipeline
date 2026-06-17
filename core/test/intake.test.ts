@@ -14,6 +14,7 @@ import {
   validateSpecBody,
   labelCreateArgs,
   isLabelAlreadyExists,
+  reservePushArgs,
   type IntakeDeps,
   type IntakeOpts,
 } from "../scripts/stages/intake.ts";
@@ -784,6 +785,26 @@ test("isLabelAlreadyExists: treats the gh already-exists error as benign, others
   assert.equal(isLabelAlreadyExists(1, existsErr), true, "already-exists is benign (label present)");
   assert.equal(isLabelAlreadyExists(0, ""), false, "success is not an already-exists case");
   assert.equal(isLabelAlreadyExists(1, "HTTP 403: Resource not accessible"), false, "other failures are real errors");
+});
+
+test("reservePushArgs: builds a CREATE-ONLY push with an empty --force-with-lease (never moves an existing ref) (#158 review-2)", () => {
+  const args = reservePushArgs("intake/foo-0123456-tok123", "deadbeefcafe");
+  // The bite: an empty --force-with-lease (expect ref absent) is what makes the push refuse
+  // to fast-forward (MOVE) an existing ref. Without it, a plain push to an ancestor ref would
+  // silently advance someone else's branch.
+  assert.ok(
+    args.includes("--force-with-lease=refs/heads/intake/foo-0123456-tok123:"),
+    `must carry the empty-lease create-only flag, got: ${args.join(" ")}`,
+  );
+  assert.ok(args[0] === "push" && args.includes("--porcelain"), "is a porcelain push");
+  assert.ok(
+    args.includes("deadbeefcafe:refs/heads/intake/foo-0123456-tok123"),
+    "pushes the pinned base SHA to the branch ref",
+  );
+  // The lease value must be empty (expect-absent), not a SHA — a non-empty lease would permit
+  // an update when the remote matched, defeating create-only.
+  const lease = args.find((a) => a.startsWith("--force-with-lease="))!;
+  assert.ok(lease.endsWith(":"), `lease must be empty (expect-absent), got: ${lease}`);
 });
 
 // ---------------------------------------------------------------------------

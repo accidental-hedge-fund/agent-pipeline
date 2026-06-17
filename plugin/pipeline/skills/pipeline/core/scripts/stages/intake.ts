@@ -71,13 +71,15 @@ export interface IntakeDeps {
    */
   gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
   /**
-   * Reserve `origin/<branch>` at the given SHA, create-only, BEFORE issue creation. Two
+   * Reserve `origin/<branch>` at the given SHA, create-only, BEFORE issue creation. Three
    * guarantees: (1) it SHALL fail when the ref already exists at ANY SHA — including the
-   * same SHA, where a plain push no-ops "up-to-date" — so a branch collision is caught;
-   * and (2) it SHALL exercise the SAME push transport/credentials that gitPushBranch uses
-   * to publish the roadmap commit, so a missing/read-only push credential fails HERE rather
-   * than after the irreversible issue creation. The reference implementation uses
-   * `git push --porcelain` and treats only a newly-created ref ('*') as success.
+   * same SHA (a plain push no-ops "up-to-date") AND an ancestor SHA (a plain push would
+   * fast-forward and MOVE the existing ref); it SHALL NOT modify an existing ref. (2) It
+   * SHALL exercise the SAME push transport/credentials that gitPushBranch uses to publish
+   * the roadmap commit, so a missing/read-only push credential fails HERE rather than after
+   * the irreversible issue creation. (3) On collision or failure it SHALL abort before
+   * createIssue. The reference implementation uses `git push` with an empty
+   * `--force-with-lease` (expect-absent) and treats only a newly-created ref ('*') as success.
    */
   reserveRemoteBranch(repoDir: string, branch: string, sha: string): void;
   /**
@@ -203,21 +205,22 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
     reserveRemoteBranch: (dir, branch, sha) => {
       // Reserve via the SAME `git push` transport used later to publish the roadmap commit, so
       // a missing/read-only origin push credential fails HERE — before the issue — instead of
-      // after it (which would strand a labeled issue). Create-only via --porcelain status flags
-      // (verified against the live remote): '*' = newly created ref → reserved; '=' = up-to-date
-      // (ref already exists at the same SHA) and '!' = rejected (exists at a different SHA) →
-      // collision. A plain push would no-op-succeed on the '=' case, so the flag parse is what
-      // makes this both race-safe AND a real proof of push capability.
-      const result = spawnSync(
-        "git",
-        ["push", "--porcelain", "origin", `${sha}:refs/heads/${branch}`],
-        { encoding: "utf8", stdio: "pipe", cwd: dir },
-      );
+      // after it (which would strand a labeled issue). TRULY create-only via an empty
+      // --force-with-lease (expect the ref absent): git then refuses to update an existing ref
+      // AT ALL — including a fast-forward to a descendant SHA, which a plain push would silently
+      // perform and MOVE someone else's branch. Verified against the live remote: new ref → '*'
+      // exit 0; existing ref at any SHA (incl. an ancestor) → '!' "(stale info)" exit 1, ref
+      // unchanged.
+      const result = spawnSync("git", reservePushArgs(branch, sha), {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
       const out = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
       const statusLine = out.split("\n").find((l) => l.includes(`:refs/heads/${branch}`)) ?? "";
       const flag = statusLine.charAt(0);
-      if (result.status === 0 && flag === "*") return; // newly created → reserved
-      if (flag === "=" || flag === "!") {
+      if (result.status === 0 && flag === "*") return; // newly created → reserved (never moves an existing ref)
+      if (flag === "!" || flag === "=" || /stale info/i.test(out)) {
         throw new Error(
           `[pipeline intake] branch ${branch} already exists on origin — aborting before creating any issue.\n` +
             `  A concurrent or prior intake run reserved it; re-run to get a fresh branch name.`,
@@ -318,6 +321,25 @@ export function labelCreateArgs(name: string, color: string): string[] {
  */
 export function isLabelAlreadyExists(status: number, stderr: string): boolean {
   return status !== 0 && /already exists/i.test(stderr);
+}
+
+/**
+ * Build the `git push` args for a CREATE-ONLY branch reservation. The empty
+ * `--force-with-lease=refs/heads/<branch>:` (no expected OID = expect the ref absent)
+ * makes git refuse to update an existing ref — including a fast-forward to a descendant
+ * SHA, which a plain push would silently perform and MOVE someone else's branch
+ * (data-corruption). Verified against the live remote: new ref → '*' exit 0; existing ref
+ * at any SHA → '!' "(stale info)" exit 1 with the ref unchanged. Drift-guard: a unit test
+ * asserts the empty-lease flag is present.
+ */
+export function reservePushArgs(branch: string, sha: string): string[] {
+  return [
+    "push",
+    "--porcelain",
+    `--force-with-lease=refs/heads/${branch}:`,
+    "origin",
+    `${sha}:refs/heads/${branch}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
