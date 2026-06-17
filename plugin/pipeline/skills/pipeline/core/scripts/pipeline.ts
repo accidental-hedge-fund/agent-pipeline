@@ -269,6 +269,28 @@ async function main(): Promise<void> {
     console.error(`pipeline: 'pipeline release' cannot be combined with ${conflict}. These are separate commands.`);
     process.exit(2);
   }
+  // Reject 'pipeline intake' combined with issue-advance modes or other standalone
+  // commands.  Intake is a write-once operation; mixing it with read-only, cleanup,
+  // or advance flags leads to ambiguous (and potentially mutating) behaviour.
+  if (isIntakeCommand) {
+    const intakeConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--status", opts.status],
+      ["--cleanup", opts.cleanup],
+      ["--init (or 'pipeline init')", isInit],
+      ["doctor", isDoctorCommand],
+      ["--doctor", opts.doctor],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+    ];
+    for (const [flag, active] of intakeConflicts) {
+      if (active) {
+        console.error(
+          `pipeline: 'pipeline intake' cannot be combined with ${flag}. These are separate commands.`,
+        );
+        process.exit(2);
+      }
+    }
+  }
   // Validate the release version argument early (before config resolution) so a
   // malformed invocation fails cleanly without requiring gh auth or a valid config.
   if (isReleaseCommand) {

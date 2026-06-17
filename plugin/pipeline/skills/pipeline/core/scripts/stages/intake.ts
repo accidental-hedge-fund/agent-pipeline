@@ -34,8 +34,22 @@ export interface IntakeDeps {
   runHarness(prompt: string): Promise<{ success: boolean; output: string }>;
   /** Create a GitHub issue and return its number. */
   createIssue(title: string, body: string, labels: string[]): Promise<number>;
+  /**
+   * Read a file at a specific git ref (e.g. origin/<baseBranch>) without
+   * modifying the working tree. relPath is repo-relative (e.g. "ROADMAP.md").
+   * This ensures mutations are computed from the integration branch's content,
+   * not a potentially-stale caller checkout.
+   */
+  readFileAtBase(repoDir: string, baseBranch: string, relPath: string): string;
+  /** Generic local file read (for writes only — ROADMAP reads use readFileAtBase). */
   readFile(p: string): string;
   writeFile(p: string, content: string): void;
+  /**
+   * Ensure a GitHub label exists (creates it with the given color when absent,
+   * idempotent via --force). Must be called before createIssue so that issue
+   * creation with that label never fails due to a missing label.
+   */
+  ensureLabel(repoDir: string, name: string, color: string): Promise<void>;
   /**
    * Throw if ROADMAP.md has uncommitted local changes in the working tree.
    * Prevents overwriting in-progress edits with the intake write.
@@ -86,8 +100,41 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
       }
       return Number(m[1]);
     },
+    readFileAtBase: (dir, baseBranch, relPath) => {
+      // Read the file at origin/<baseBranch> without touching the working tree.
+      // This ensures mutations are computed from the integration branch's content
+      // even when intake is run from a feature worktree or a stale checkout.
+      // A failure here also serves as a preflight: if origin/<baseBranch> is not
+      // accessible, we bail before creating any irreversible GitHub issue.
+      const result = spawnSync("git", ["show", `origin/${baseBranch}:${relPath}`], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `[pipeline intake] could not read ${relPath} from origin/${baseBranch} (exit ${result.status}): ` +
+            `${result.stderr?.trim() ?? ""}.\n` +
+            `  Ensure origin/${baseBranch} is fetched: git fetch origin ${baseBranch}`,
+        );
+      }
+      return result.stdout;
+    },
     readFile: (p) => fs.readFileSync(p, "utf8"),
     writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
+    ensureLabel: async (dir, name, color) => {
+      // gh label create --force is idempotent: creates if absent, updates if present.
+      const result = spawnSync("gh", ["label", "create", name, "--color", color, "--force"], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `[pipeline intake] could not ensure label "${name}" (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+        );
+      }
+    },
     gitEnsureClean: (dir) => {
       const result = spawnSync("git", ["status", "--porcelain", "--", "ROADMAP.md"], {
         encoding: "utf8",
@@ -289,14 +336,20 @@ export async function runIntake(
     }
   }
 
+  // 2. Read ROADMAP from origin/<base_branch> — not the caller's working tree.
+  //    This ensures release-slot inference, context, and mutations are all based
+  //    on the integration branch's content, regardless of the caller's local
+  //    checkout state.  A failure here also acts as a preflight: if
+  //    origin/<base_branch> is inaccessible, we bail before any GitHub writes.
+  const roadmapAtBase = d.readFileAtBase(repoDir, cfg.base_branch, "ROADMAP.md");
+
   // Normalize release slot — strip leading "v" for internal use.
   let version: string;
   if (opts.release) {
     version = opts.release.startsWith("v") ? opts.release.slice(1) : opts.release;
   } else {
-    // 2. Infer from ROADMAP.
-    const roadmapText = d.readFile(roadmapPath);
-    const inferred = inferReleaseSlot(roadmapText);
+    // 3. Infer from the base-branch ROADMAP.
+    const inferred = inferReleaseSlot(roadmapAtBase);
     if (!inferred) {
       throw new Error(
         `[pipeline intake] could not infer a release slot from ROADMAP.md — ` +
@@ -307,11 +360,10 @@ export async function runIntake(
     d.log(`[pipeline intake] proposed release slot: v${version}`);
   }
 
-  // 3. Read ROADMAP context for the target lane.
-  const roadmapTextForContext = d.readFile(roadmapPath);
-  const releaseContext = extractReleaseContext(roadmapTextForContext, version);
+  // 4. Extract ROADMAP context for the harness prompt.
+  const releaseContext = extractReleaseContext(roadmapAtBase, version);
 
-  // 4. Build and invoke the spec-generation prompt.
+  // 5. Build and invoke the spec-generation prompt.
   d.log(`[pipeline intake] generating spec via model harness...`);
   const prompt = buildIntakePrompt({
     description: opts.description.trim(),
@@ -331,18 +383,19 @@ export async function runIntake(
 
   d.log(`[pipeline intake] spec generated: "${title}"`);
 
-  // 5. Validate the generated spec body — fail early before any irreversible action.
+  // 6. Validate the generated spec body — fail early before any irreversible action.
   validateSpecBody(specBody);
 
-  // 6. Precompute roadmap mutations with a placeholder issue number to validate all
-  //    ROADMAP anchors exist. This must succeed before creating any GitHub issue so
-  //    anchor drift never leaves behind an orphaned issue with no roadmap PR.
-  const originalRoadmap = d.readFile(roadmapPath);
-  const prevalidatedRoadmap = applyRoadmapMutations(originalRoadmap, version, 0, title, oneLiner);
+  // 7. Precompute roadmap mutations with a placeholder issue number to validate all
+  //    ROADMAP anchors exist.  Uses base-branch content so anchor validation reflects
+  //    the integration branch, not a potentially-stale caller worktree.
+  //    This must succeed before creating any GitHub issue so anchor drift never leaves
+  //    behind an orphaned issue with no roadmap PR.
+  const prevalidatedRoadmap = applyRoadmapMutations(roadmapAtBase, version, 0, title, oneLiner);
 
   // Dry-run path: print proposed body + diff and exit without any writes.
   if (opts.dryRun) {
-    const diff = computeUnifiedDiff(originalRoadmap, prevalidatedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
+    const diff = computeUnifiedDiff(roadmapAtBase, prevalidatedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
     d.log("\n=== Proposed issue body ===\n");
     d.log(specBody);
     d.log("\n=== Proposed ROADMAP.md diff ===\n");
@@ -350,39 +403,61 @@ export async function runIntake(
     return;
   }
 
-  // 7. Git preflight: ensure ROADMAP.md has no uncommitted local changes so we do
-  //    not silently overwrite in-progress edits when we write the mutated roadmap.
+  // 8. Git preflight: ensure ROADMAP.md has no uncommitted local changes so we do
+  //    not silently lose in-progress edits when gitCreateBranch checks out the
+  //    base branch (git checkout rejects conflicting local changes).
   d.gitEnsureClean(repoDir);
 
-  // 8. Create the GitHub issue — only after all deterministic prerequisites pass.
+  // 9. Ensure both required labels exist before issue creation.  Intake bypasses
+  //    the normal `pipeline init` label-bootstrap path, so release:vX.Y.Z labels
+  //    (dynamically named) and pipeline:ready may be absent in a fresh repo.
+  await d.ensureLabel(repoDir, "pipeline:ready", "1D76DB");
+  await d.ensureLabel(repoDir, `release:v${version}`, "e4e669");
+
+  // 10. Create the GitHub issue — only after all deterministic prerequisites pass.
   d.log(`[pipeline intake] creating GitHub issue...`);
   const labels = [`pipeline:ready`, `release:v${version}`];
   const issueNumber = await d.createIssue(title, specBody, labels);
   d.log(`[pipeline intake] created issue #${issueNumber}: ${title}`);
 
-  // 9. Apply the three ROADMAP mutations with the real issue number.
-  const mutatedRoadmap = applyRoadmapMutations(originalRoadmap, version, issueNumber, title, oneLiner);
+  // 11. Apply the three ROADMAP mutations with the real issue number.
+  const mutatedRoadmap = applyRoadmapMutations(roadmapAtBase, version, issueNumber, title, oneLiner);
 
-  // 10. Create a branch FROM the base branch, write ROADMAP, commit, and open PR.
+  // 12. Create a branch FROM the base branch, write ROADMAP, commit, and open PR.
+  //     Wrap in try-catch: if any post-issue step fails, the issue is already live
+  //     so log a recovery command so the user can complete the roadmap PR manually.
   const slug = slugifyTitle(title);
   const branch = `intake/issue-${issueNumber}-${slug}`;
-  d.log(`[pipeline intake] creating branch ${branch} from origin/${cfg.base_branch}...`);
-  d.gitCreateBranch(repoDir, branch, cfg.base_branch);
-
-  d.writeFile(roadmapPath, mutatedRoadmap);
-  d.log(`[pipeline intake] wrote ROADMAP.md`);
-
-  const commitMsg =
-    `docs: ROADMAP — intake #${issueNumber} (${title})\n\n` +
-    `Issue: #158\nPipeline-Run: 158/2026-06-17T02:48:33Z`;
-  d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
-
   const prTitle = `intake: ROADMAP slot for #${issueNumber} — ${title}`;
-  const prBody = buildPRBody(issueNumber, title, specBody, version);
-  const prUrl = await d.createPR(repoDir, prTitle, prBody, cfg.base_branch, branch);
+  try {
+    d.log(`[pipeline intake] creating branch ${branch} from origin/${cfg.base_branch}...`);
+    d.gitCreateBranch(repoDir, branch, cfg.base_branch);
 
-  d.log(`[pipeline intake] roadmap PR opened: ${prUrl}`);
-  d.log(`[pipeline intake] done — issue #${issueNumber} created; roadmap PR: ${prUrl}`);
+    d.writeFile(roadmapPath, mutatedRoadmap);
+    d.log(`[pipeline intake] wrote ROADMAP.md`);
+
+    const commitMsg =
+      `docs: ROADMAP — intake #${issueNumber} (${title})\n\n` +
+      `Issue: #158\nPipeline-Run: 158/2026-06-17T02:48:33Z`;
+    d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
+
+    const prBody = buildPRBody(issueNumber, title, specBody, version);
+    const prUrl = await d.createPR(repoDir, prTitle, prBody, cfg.base_branch, branch);
+
+    d.log(`[pipeline intake] roadmap PR opened: ${prUrl}`);
+    d.log(`[pipeline intake] done — issue #${issueNumber} created; roadmap PR: ${prUrl}`);
+  } catch (err) {
+    d.log(
+      `\n[pipeline intake] ERROR: issue #${issueNumber} was created but the roadmap PR step failed.\n` +
+        `  Recovery — complete the roadmap PR manually:\n` +
+        `    git checkout -b ${branch} origin/${cfg.base_branch}\n` +
+        `    # Add ROADMAP.md: release-plan row, per-issue row, detail bullet for #${issueNumber} at v${version}\n` +
+        `    git add ROADMAP.md && git commit -m "docs: ROADMAP — intake #${issueNumber} (${title})"\n` +
+        `    git push -u origin ${branch}\n` +
+        `    gh pr create --title "${prTitle}" --base ${cfg.base_branch} --head ${branch}`,
+    );
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------

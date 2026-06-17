@@ -67,12 +67,14 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
   _writtenFiles: Record<string, string>;
   _logLines: string[];
   _gitEnsureCleanCalls: string[];
+  _ensureLabelCalls: Array<{ name: string; color: string }>;
 } {
   const createIssueCalls: Array<{ title: string; body: string; labels: string[] }> = [];
   const createPRCalls: Array<{ title: string; body: string; base: string; head: string }> = [];
   const writtenFiles: Record<string, string> = {};
   const logLines: string[] = [];
   const gitEnsureCleanCalls: string[] = [];
+  const ensureLabelCalls: Array<{ name: string; color: string }> = [];
 
   const base: IntakeDeps = {
     runHarness: async (_prompt) => ({
@@ -100,12 +102,19 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
       createIssueCalls.push({ title, body, labels });
       return 999;
     },
+    readFileAtBase: (_dir, _baseBranch, relPath) => {
+      if (relPath === "ROADMAP.md") return ROADMAP_FIXTURE;
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
+    },
     readFile: (p) => {
       if (p.endsWith("ROADMAP.md")) return ROADMAP_FIXTURE;
       throw new Error(`readFile not mocked for ${p}`);
     },
     writeFile: (p, content) => {
       writtenFiles[p] = content;
+    },
+    ensureLabel: async (_dir, name, color) => {
+      ensureLabelCalls.push({ name, color });
     },
     gitEnsureClean: (dir) => {
       gitEnsureCleanCalls.push(dir);
@@ -125,6 +134,7 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
   (base as unknown as { _writtenFiles: typeof writtenFiles })._writtenFiles = writtenFiles;
   (base as unknown as { _logLines: typeof logLines })._logLines = logLines;
   (base as unknown as { _gitEnsureCleanCalls: typeof gitEnsureCleanCalls })._gitEnsureCleanCalls = gitEnsureCleanCalls;
+  (base as unknown as { _ensureLabelCalls: typeof ensureLabelCalls })._ensureLabelCalls = ensureLabelCalls;
   return base as ReturnType<typeof makeDeps>;
 }
 
@@ -314,9 +324,9 @@ test("intake: no issue or PR created when harness fails", async () => {
 test("intake: exits non-zero with anchor name when release-plan anchor is absent", async () => {
   const roadmapWithoutNoneRow = ROADMAP_FIXTURE.replace("| *(none)* |", "| REMOVED |");
   const deps = makeDeps({
-    readFile: (p) => {
-      if (p.endsWith("ROADMAP.md")) return roadmapWithoutNoneRow;
-      throw new Error(`readFile not mocked for ${p}`);
+    readFileAtBase: (_dir, _baseBranch, relPath) => {
+      if (relPath === "ROADMAP.md") return roadmapWithoutNoneRow;
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
     },
   });
   const opts: IntakeOpts = { description: "add retry logic", release: "1.6.0" };
@@ -335,9 +345,9 @@ test("intake: exits non-zero with anchor name when detail section is absent for 
     "### v1.7.0 — something else (minor)",
   );
   const deps = makeDeps({
-    readFile: (p) => {
-      if (p.endsWith("ROADMAP.md")) return roadmapWithoutSection;
-      throw new Error(`readFile not mocked for ${p}`);
+    readFileAtBase: (_dir, _baseBranch, relPath) => {
+      if (relPath === "ROADMAP.md") return roadmapWithoutSection;
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
     },
   });
   const opts: IntakeOpts = { description: "add retry logic", release: "1.6.0" };
@@ -591,7 +601,44 @@ test("intake: dry-run uses #TBD placeholder in per-issue table row (not #0)", as
 });
 
 // ---------------------------------------------------------------------------
-// CLI: unknown subcommand exits 2 with usage listing (finding 4 regression)
+// Finding 1 (regression): readFileAtBase used for all ROADMAP reads
+// ---------------------------------------------------------------------------
+
+test("intake: readFileAtBase is called with cfg.base_branch for ROADMAP content", async () => {
+  const readAtBaseCalls: Array<{ baseBranch: string; relPath: string }> = [];
+  const deps = makeDeps({
+    readFileAtBase: (_dir, baseBranch, relPath) => {
+      readAtBaseCalls.push({ baseBranch, relPath });
+      return ROADMAP_FIXTURE;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  assert.ok(
+    readAtBaseCalls.some((c) => c.baseBranch === "main" && c.relPath === "ROADMAP.md"),
+    "readFileAtBase must be called with cfg.base_branch='main' and relPath='ROADMAP.md'",
+  );
+});
+
+test("intake: readFileAtBase is also called in dry-run mode", async () => {
+  const readAtBaseCalls: Array<{ baseBranch: string; relPath: string }> = [];
+  const deps = makeDeps({
+    readFileAtBase: (_dir, baseBranch, relPath) => {
+      readAtBaseCalls.push({ baseBranch, relPath });
+      return ROADMAP_FIXTURE;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", dryRun: true };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  assert.ok(
+    readAtBaseCalls.some((c) => c.relPath === "ROADMAP.md"),
+    "readFileAtBase must be called even in dry-run mode",
+  );
+  assert.equal(deps._createIssueCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 (regression): CLI conflict guard rejects incompatible flags
 // ---------------------------------------------------------------------------
 
 import { fileURLToPath } from "node:url";
@@ -608,4 +655,111 @@ test("CLI: unrecognized sub-command exits 2 with usage error listing recognized 
   assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
   assert.ok(result.stderr.includes("unrecognized sub-command"), `expected usage error; stderr:\n${result.stderr}`);
   assert.ok(result.stderr.includes("intake"), `expected intake listed in recognized sub-commands; stderr:\n${result.stderr}`);
+});
+
+test("CLI: pipeline intake --status exits 2 with conflict error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "intake", "--status", "--description", "x"],
+    { encoding: "utf8", env: { ...process.env } },
+  );
+  assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
+  assert.ok(result.stderr.includes("intake"), `expected intake in error; stderr:\n${result.stderr}`);
+  assert.ok(result.stderr.includes("--status"), `expected --status in conflict message; stderr:\n${result.stderr}`);
+});
+
+test("CLI: pipeline intake --cleanup exits 2 with conflict error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "intake", "--cleanup"],
+    { encoding: "utf8", env: { ...process.env } },
+  );
+  assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
+  assert.ok(result.stderr.includes("--cleanup"), `expected --cleanup in conflict message; stderr:\n${result.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 (regression): ensureLabel called before createIssue for both labels
+// ---------------------------------------------------------------------------
+
+test("intake: ensureLabel is called for pipeline:ready and release:vX.Y.Z before createIssue", async () => {
+  const callOrder: string[] = [];
+  const deps = makeDeps({
+    ensureLabel: async (_dir, name, _color) => {
+      callOrder.push(`ensureLabel:${name}`);
+    },
+    createIssue: async (title, body, labels) => {
+      callOrder.push("createIssue");
+      deps._createIssueCalls.push({ title, body, labels });
+      return 999;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+
+  const readyIdx = callOrder.indexOf("ensureLabel:pipeline:ready");
+  const releaseIdx = callOrder.indexOf("ensureLabel:release:v1.6.0");
+  const issueIdx = callOrder.indexOf("createIssue");
+  assert.ok(readyIdx !== -1, "ensureLabel(pipeline:ready) should be called");
+  assert.ok(releaseIdx !== -1, "ensureLabel(release:v1.6.0) should be called");
+  assert.ok(issueIdx !== -1, "createIssue should be called");
+  assert.ok(readyIdx < issueIdx, "ensureLabel(pipeline:ready) must run before createIssue");
+  assert.ok(releaseIdx < issueIdx, "ensureLabel(release:v1.6.0) must run before createIssue");
+});
+
+test("intake: ensureLabel is NOT called in dry-run mode", async () => {
+  const deps = makeDeps();
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", dryRun: true };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  assert.equal(deps._ensureLabelCalls.length, 0, "ensureLabel should not be called in dry-run");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4 (regression): recovery log emitted when post-issue step fails
+// ---------------------------------------------------------------------------
+
+test("intake: recovery log emitted when gitCreateBranch fails after issue creation", async () => {
+  const deps = makeDeps({
+    gitCreateBranch: () => {
+      throw new Error("[pipeline intake] git checkout failed: push permission denied");
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+
+  let threw = false;
+  try {
+    await runIntake(opts, DEFAULT_CFG, deps);
+  } catch (_e) {
+    threw = true;
+  }
+  assert.ok(threw, "should re-throw the git error");
+  assert.equal(deps._createIssueCalls.length, 1, "issue should have been created before the failure");
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("#999"), "recovery log must reference the created issue number");
+  assert.ok(
+    allLog.toLowerCase().includes("recovery") || allLog.toLowerCase().includes("manually"),
+    "recovery log must contain recovery instructions",
+  );
+});
+
+test("intake: recovery log emitted when createPR fails after issue creation", async () => {
+  const deps = makeDeps({
+    createPR: async () => {
+      throw new Error("[pipeline intake] gh pr create failed: no push access");
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+
+  let threw = false;
+  try {
+    await runIntake(opts, DEFAULT_CFG, deps);
+  } catch (_e) {
+    threw = true;
+  }
+  assert.ok(threw, "should re-throw the PR error");
+  assert.equal(deps._createIssueCalls.length, 1, "issue should have been created before the PR failure");
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("#999"), "recovery log must reference the created issue number");
 });
