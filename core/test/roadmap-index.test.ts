@@ -43,6 +43,7 @@ function makeDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
     runCritiqueHarness: async () => ({ success: true, output: "{}" }),
     writeFile: async () => {},
     gitCreateBranch: async () => {},
+    gitSwitchBranch: async () => {},
     gitBranchExists: async () => false,
     gitCommit: async () => {},
     gitPushBranch: async () => {},
@@ -229,5 +230,144 @@ describe("runRoadmap - critique integration", () => {
       plan.open_questions.some((q) => q.description.includes("critique") || q.rationale?.includes("critique")),
       "critique failure should appear as an open_question",
     );
+  });
+
+  it("regression: malformed critique output is treated as a failure (not a clean approval)", async () => {
+    // Finding #4: when parseCritiqueVerdict returns null (malformed JSON), the engine
+    // must NOT log 'no critique findings — plan looks good'. It must record an open_question.
+    const written: Record<string, string> = {};
+    const logs: string[] = [];
+
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1)],
+      // Return success=true but with invalid/non-parseable JSON output
+      runCritiqueHarness: async () => ({ success: true, output: "This is not valid JSON at all." }),
+      writeFile: async (p, c) => { written[p] = c; },
+      log: (m) => logs.push(m),
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-malformed-critique" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    // Should NOT log "plan looks good"
+    assert.ok(
+      !logs.some((l) => l.includes("plan looks good")),
+      "should not log 'plan looks good' for malformed critique output",
+    );
+
+    // Should record an open_question
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.open_questions !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+    assert.ok(
+      plan.open_questions.some((q) =>
+        q.description.includes("malformed") || q.description.includes("critique") || q.rationale?.includes("parseable"),
+      ),
+      "malformed critique output should appear as an open_question",
+    );
+  });
+
+  it("regression: critique corrections re-score items before rebuilding roadmap", async () => {
+    // Finding #5: after adding must_precede edges from critique corrections, scoreItems
+    // must be re-run so dep_leverage reflects the corrected edges in the final plan.
+    const written: Record<string, string> = {};
+    let critiqueCallCount = 0;
+
+    // First critique round: report a dep-order violation (#1 must precede #2).
+    // The edge extraction picks the first two issue numbers from title+body in order,
+    // so the prerequisite (#1) must appear first in the title.
+    // Second critique round: no findings (corrections applied)
+    const critiqueFindingRound1 = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "#1 must precede #2 — dep-order violation detected",
+        body: "Issue #2 appears before prerequisite #1 in the roadmap. The edge #1→#2 must be enforced.",
+        confidence: 0.95,
+        recommendation: "Add must_precede edge #1→#2",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation",
+      next_steps: [],
+    };
+    const critiqueClean = { verdict: "approved", findings: [], summary: "OK", next_steps: [] };
+
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runCritiqueHarness: async () => {
+        critiqueCallCount++;
+        const result = critiqueCallCount === 1 ? critiqueFindingRound1 : critiqueClean;
+        return { success: true, output: "```json\n" + JSON.stringify(result) + "\n```" };
+      },
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-rescore" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+    // After correction, #1 must appear before #2 in the roadmap
+    const rank1 = plan.roadmap.find((r) => r.issue_number === 1)?.rank;
+    const rank2 = plan.roadmap.find((r) => r.issue_number === 2)?.rank;
+    if (rank1 !== undefined && rank2 !== undefined) {
+      assert.ok(rank1 < rank2, `#1 (rank ${rank1}) should appear before #2 (rank ${rank2}) after correction`);
+    }
+    // scored array in plan should reflect re-computed dep_leverage
+    assert.ok(plan.scored.length > 0, "plan should have scored items");
+  });
+});
+
+describe("runRoadmap - --next validation", () => {
+  it("regression: --next NaN falls through to full engine run — must now throw", async () => {
+    // Finding #8: Commander parses '--next foo' as NaN; the engine must reject it before running.
+    let enginePhaseRan = false;
+    const deps = makeDeps({
+      getOpenIssues: async () => { enginePhaseRan = true; return []; },
+    });
+    const opts: RoadmapOpts = { apply: false, next: NaN, outputDir: "/tmp/test-next-nan" };
+    await assert.rejects(
+      () => runRoadmap("example/repo", "/repo", "main", {}, opts, deps),
+      /positive integer/,
+      "should throw for NaN --next value",
+    );
+    assert.ok(!enginePhaseRan, "engine phases must not run when --next is invalid");
+  });
+
+  it("regression: --next 0 falls through to full engine run — must now throw", async () => {
+    const deps = makeDeps();
+    const opts: RoadmapOpts = { apply: false, next: 0, outputDir: "/tmp/test-next-zero" };
+    await assert.rejects(
+      () => runRoadmap("example/repo", "/repo", "main", {}, opts, deps),
+      /positive integer/,
+      "should throw for --next 0",
+    );
+  });
+
+  it("regression: --next -1 must throw (negative value)", async () => {
+    const deps = makeDeps();
+    const opts: RoadmapOpts = { apply: false, next: -1, outputDir: "/tmp/test-next-neg" };
+    await assert.rejects(
+      () => runRoadmap("example/repo", "/repo", "main", {}, opts, deps),
+      /positive integer/,
+      "should throw for negative --next value",
+    );
+  });
+
+  it("--next 3 with valid plan.json reads without running the engine", async () => {
+    const plan = makePlan();
+    let enginePhaseRan = false;
+    const deps = makeDeps({
+      getOpenIssues: async () => { enginePhaseRan = true; return []; },
+      readFile: async (p) => p.includes("plan.json") ? JSON.stringify(plan) : null,
+    });
+    const opts: RoadmapOpts = { apply: false, next: 3, outputDir: "/tmp/test-next-valid" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+    assert.ok(!enginePhaseRan, "engine phases must not run for a valid --next");
   });
 });

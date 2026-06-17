@@ -85,16 +85,62 @@ function buildComprehendPrompt(repo: string, openIssueCount: number): string {
 
 /**
  * Build the adversarial critique prompt (phase 7).
+ * Receives the full plan data so all mandatory checks have the information they need:
+ * - score_breakdown per issue (for reproducibility checks)
+ * - issue titles/labels (for duplicate and actionability checks)
+ * - hygiene proposals (to detect mislabeling)
+ * - full dep graph including open_questions
+ * - ALL roadmap entries, not just top-20
  */
-function buildCritiquePrompt(planJsonExcerpt: string): string {
+function buildCritiquePrompt(
+  roadmap: import("./types.ts").RoadmapEntry[],
+  depGraph: import("./types.ts").DepGraph,
+  hygiene: import("./types.ts").HygieneItem[],
+  openQuestions: import("./types.ts").OpenQuestion[],
+  items: InventoryItem[],
+): string {
+  const planData = JSON.stringify(
+    {
+      roadmap: roadmap.map((r) => ({
+        rank: r.rank,
+        issue_number: r.issue_number,
+        title: r.title,
+        tier: r.tier,
+        priority: r.priority,
+        score_breakdown: r.score_breakdown,
+        effort: r.effort,
+        blocked_by: r.blocked_by,
+        unblocks: r.unblocks,
+        risks: r.risks,
+        dep_rationale: r.dep_rationale,
+      })),
+      dependency_graph: {
+        must_precede: depGraph.must_precede,
+        cycle_reports: depGraph.cycle_reports,
+        open_questions: depGraph.open_questions,
+      },
+      hygiene_proposals: hygiene.map((h) => ({ issue_number: h.issue_number, action: h.action, evidence: h.evidence })),
+      open_questions: openQuestions,
+      issue_metadata: items.map((i) => ({
+        number: i.issue.number,
+        title: i.issue.title,
+        labels: i.issue.labels,
+        body_length: i.issue.body.length,
+        has_acceptance_criteria: /- \[ \]/.test(i.issue.body),
+      })),
+    },
+    null,
+    2,
+  );
+
   return (
     `You are adversarially reviewing a backlog roadmap plan for correctness and consistency.\n\n` +
-    `## Plan excerpt\n\n\`\`\`json\n${planJsonExcerpt}\n\`\`\`\n\n` +
+    `## Full plan data\n\n\`\`\`json\n${planData}\n\`\`\`\n\n` +
     `Attack the plan for:\n` +
-    `1. Dependency-order violations (a dependent appears before its prerequisite in the roadmap)\n` +
-    `2. Non-reproducible scores (scores that seem inconsistent with the described formula)\n` +
-    `3. Missed duplicates (same work described twice with different issue numbers)\n` +
-    `4. Mislabeled "ready" issues (issues that aren't actually actionable)\n\n` +
+    `1. Dependency-order violations (a dependent appears before its prerequisite in the roadmap; check rank vs blocked_by)\n` +
+    `2. Non-reproducible scores (verify: priority = (impact × confidence × ease) + risk_reduction + dep_leverage from score_breakdown)\n` +
+    `3. Missed duplicates (same work described twice with different issue numbers; compare titles and labels)\n` +
+    `4. Mislabeled "ready" issues (issues with no acceptance criteria or very short bodies that may not be actionable)\n\n` +
     `Return findings using this exact JSON schema:\n\`\`\`json\n${REVIEW_VERDICT_SCHEMA_BLOCK}\n\`\`\`\n\n` +
     `For dep-order violations, set category to "dep-order-violation".\n` +
     `Use severity "high" for dep-order violations, "medium" for score issues, "low" for style findings.\n` +
@@ -229,9 +275,15 @@ export async function runRoadmap(
 
   const outputDir = resolveOutputDir(repoDir, repo, opts.outputDir);
 
-  // --next path: read plan.json without re-running the engine
-  if (opts.next !== undefined && opts.next > 0) {
-    await runNext(opts.next, outputDir, deps);
+  // --next path: validate then read plan.json without re-running the engine
+  if (opts.next !== undefined) {
+    const n = opts.next;
+    if (!Number.isInteger(n) || n <= 0) {
+      const msg = `--next requires a positive integer, got: ${String(n)}. Usage: pipeline roadmap --next <N>`;
+      deps.log(`[roadmap] error: ${msg}`);
+      throw new Error(msg);
+    }
+    await runNext(n, outputDir, deps);
     return;
   }
 
@@ -255,7 +307,7 @@ export async function runRoadmap(
 
   // Phase 4: Score
   deps.log("[roadmap] phase 4: scoring...");
-  const scored = scoreItems(items, depGraph, config.score_weights);
+  let scored = scoreItems(items, depGraph, config.score_weights);
 
   // Phase 5: Roadmap tiers (canonical tier order within each dep-tier preserved)
   deps.log("[roadmap] phase 5: producing tiered roadmap...");
@@ -274,25 +326,9 @@ export async function runRoadmap(
   let correctionRound = 0;
 
   while (correctionRound < MAX_CORRECTION_ROUNDS) {
-    const planExcerpt = JSON.stringify(
-      {
-        roadmap: roadmap.slice(0, 20).map((r) => ({
-          rank: r.rank,
-          issue_number: r.issue_number,
-          tier: r.tier,
-          priority: r.priority,
-          blocked_by: r.blocked_by,
-        })),
-        dependency_graph: {
-          must_precede: depGraph.must_precede,
-          cycle_reports: depGraph.cycle_reports,
-        },
-      },
-      null,
-      2,
+    const critiqueResult = await deps.runCritiqueHarness(
+      buildCritiquePrompt(roadmap, depGraph, hygiene, openQuestions, items),
     );
-
-    const critiqueResult = await deps.runCritiqueHarness(buildCritiquePrompt(planExcerpt));
 
     if (!critiqueResult.success) {
       deps.log("[roadmap] phase 7: critique harness failed — recording as open question");
@@ -305,7 +341,17 @@ export async function runRoadmap(
     }
 
     const verdict = parseCritiqueVerdict(critiqueResult.output);
-    if (!verdict || verdict.findings.length === 0) {
+    if (verdict === null) {
+      // Malformed output — treat as a critique failure, not a clean approval
+      deps.log("[roadmap] phase 7: critique returned malformed output — recording open question");
+      openQuestions.push({
+        description: "Adversarial critique returned malformed output — roadmap may have undetected dep-order violations",
+        related_issues: [],
+        rationale: "critique output was not parseable as a review verdict JSON; re-run 'pipeline roadmap' to retry",
+      });
+      break;
+    }
+    if (verdict.findings.length === 0) {
       deps.log("[roadmap] phase 7: no critique findings — plan looks good");
       break;
     }
@@ -370,6 +416,9 @@ export async function runRoadmap(
     if (newEdges.length > 0) {
       const allIssueNums = items.map((i) => i.issue.number);
       depGraph = addMustPrecedeEdges(depGraph, newEdges, allIssueNums);
+      // Re-score with the updated dep graph so dep_leverage and dep_rationale reflect
+      // the corrected edges before rebuilding the roadmap order.
+      scored = scoreItems(items, depGraph, config.score_weights);
       roadmap = applyDepAdjustment(scored, items, depGraph);
     }
 

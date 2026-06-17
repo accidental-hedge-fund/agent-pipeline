@@ -6,7 +6,9 @@ import {
   topoSort,
   findTextualDepCandidates,
   findFileBasedDepCandidates,
+  findCrossFileDepCandidates,
   parseDepVerifyResult,
+  buildDepVerifyPrompt,
   buildDepgraph,
   addMustPrecedeEdges,
 } from "../scripts/roadmap/depgraph.ts";
@@ -155,14 +157,28 @@ describe("findFileBasedDepCandidates", () => {
       "issues 1 and 3 share no files — should not be a candidate pair");
   });
 
-  it("skips pairs already in existing textual candidates", () => {
+  it("skips the specific direction already in existing candidates, but generates the reverse", () => {
+    // If [1,2] is already a textual candidate, findFileBasedDepCandidates should skip [1,2]
+    // but still generate [2,1] so both directions are source-verified.
     const items: InventoryItem[] = [
       { issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
       { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
     ];
     const existing: Array<[number, number]> = [[1, 2]];
     const candidates = findFileBasedDepCandidates(items, existing);
-    assert.equal(candidates.length, 0, "pair 1→2 already exists in textual candidates");
+    // [1,2] is already covered; [2,1] is new and should be generated
+    assert.ok(!candidates.some(([a, b]) => a === 1 && b === 2), "should not re-generate pair 1→2 (already in existing)");
+    assert.ok(candidates.some(([a, b]) => a === 2 && b === 1), "should generate reverse pair 2→1 (new direction)");
+  });
+
+  it("skips both directions only when both are already in existing candidates", () => {
+    const items: InventoryItem[] = [
+      { issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+      { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+    ];
+    const existing: Array<[number, number]> = [[1, 2], [2, 1]];
+    const candidates = findFileBasedDepCandidates(items, existing);
+    assert.equal(candidates.length, 0, "both directions already covered — no new candidates");
   });
 
   it("returns empty for items with no shared files", () => {
@@ -300,6 +316,140 @@ describe("buildDepgraph", () => {
     assert.deepEqual(cycleReports, []);
     assert.equal(tiers[0][0], 5, "#5 (prerequisite) must be in tier 0");
     assert.equal(tiers[1][0], 10, "#10 (depender) must be in tier 1");
+  });
+});
+
+describe("buildDepVerifyPrompt — prompt direction regression", () => {
+  it("asks whether the DEPENDER depends on the PREREQUISITE (not the reverse)", async () => {
+    // Regression for review finding #1: the old prompt asked "does A depend on B" where A was
+    // the prerequisite and B was the depender — semantically backwards.
+    // When '#10 depends on #5', the prerequisite is #5 and the depender is #10.
+    // The prompt must ask: 'can #10 (depender) be completed without #5 (prerequisite)?'
+    const prereq: InventoryItem = {
+      issue: { number: 5, title: "Shared types", body: "Provides shared types.", labels: [], url: "", state: "open" },
+      touched_files: ["core/types.ts"],
+    };
+    const depender: InventoryItem = {
+      issue: { number: 10, title: "Consumer", body: "Depends on #5 for types.", labels: [], url: "", state: "open" },
+      touched_files: ["core/consumer.ts"],
+    };
+    const deps = {
+      runHarness: async () => ({ success: true, output: "{}" }),
+      readFile: async () => null,
+      log: () => {},
+    };
+
+    const prompt = await buildDepVerifyPrompt(prereq, depender, deps);
+    // The prompt must say depender (#10) cannot be completed without prerequisite (#5)
+    assert.ok(
+      prompt.includes("#10") && prompt.includes("#5"),
+      "prompt must reference both issue numbers",
+    );
+    assert.ok(
+      /whether issue #10 depends on issue #5/i.test(prompt) ||
+      /#10.*CANNOT be completed without #5/i.test(prompt) ||
+      /#10 \(depender\).*#5 \(prerequisite\)/i.test(prompt),
+      `prompt should ask if #10 (depender) depends on #5 (prerequisite), got: ${prompt.slice(0, 300)}`,
+    );
+    // Must NOT ask if the prerequisite (#5) cannot be completed without the depender (#10)
+    assert.ok(
+      !/whether issue #5.*CANNOT be completed without #10/i.test(prompt),
+      "prompt must NOT ask if the prerequisite depends on the depender",
+    );
+  });
+
+  it("includes files from both prerequisite and depender for cross-file detection", async () => {
+    const prereq: InventoryItem = {
+      issue: { number: 1, title: "Add types", body: "Creates types.ts.", labels: [], url: "", state: "open" },
+      touched_files: ["core/types.ts"],
+    };
+    const depender: InventoryItem = {
+      issue: { number: 2, title: "Use types", body: "Imports from types.", labels: [], url: "", state: "open" },
+      touched_files: ["core/consumer.ts"],
+    };
+    const filesRead: string[] = [];
+    const deps = {
+      runHarness: async () => ({ success: true, output: "{}" }),
+      readFile: async (f: string) => { filesRead.push(f); return `// ${f} content`; },
+      log: () => {},
+    };
+
+    await buildDepVerifyPrompt(prereq, depender, deps);
+    // Should read files from BOTH issues, not just shared files
+    assert.ok(filesRead.includes("core/types.ts"), "should read prerequisite's files");
+    assert.ok(filesRead.includes("core/consumer.ts"), "should read depender's files");
+  });
+});
+
+describe("findFileBasedDepCandidates — both-direction regression", () => {
+  it("generates BOTH directions for a shared-file pair (not just one)", () => {
+    const items: InventoryItem[] = [
+      { issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+      { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+    ];
+    const candidates = findFileBasedDepCandidates(items, []);
+    // Both directions must be generated so the harness can verify each independently
+    const has12 = candidates.some(([a, b]) => a === 1 && b === 2);
+    const has21 = candidates.some(([a, b]) => a === 2 && b === 1);
+    assert.ok(has12, "should generate candidate [1, 2]");
+    assert.ok(has21, "should generate candidate [2, 1]");
+  });
+});
+
+describe("findCrossFileDepCandidates", () => {
+  it("detects a cross-file import: consumer.ts (issue 2) imports from types.ts (issue 1)", async () => {
+    // Regression for review finding #2: issue A modifies consumer.ts that imports a type
+    // from types.ts which issue B creates. They share no touched_files, but we detect the import.
+    const items: InventoryItem[] = [
+      {
+        issue: { number: 1, title: "Add types", body: "", labels: [], url: "", state: "open" },
+        touched_files: ["core/types.ts"],
+      },
+      {
+        issue: { number: 2, title: "Use types", body: "", labels: [], url: "", state: "open" },
+        touched_files: ["core/consumer.ts"],
+      },
+    ];
+
+    const fileContents: Record<string, string> = {
+      "core/types.ts": "export type T = string;",
+      "core/consumer.ts": `import type { T } from './types';\nexport function use(t: T) {}`,
+    };
+
+    const deps = {
+      runHarness: async () => ({ success: true, output: "{}" }),
+      readFile: async (f: string) => fileContents[f] ?? null,
+      log: () => {},
+    };
+
+    const candidates = await findCrossFileDepCandidates(items, [], deps);
+    // consumer.ts imports from types.ts → issue 2 (consumer) may depend on issue 1 (types)
+    // We expect a candidate [1, 2] (prereq=1, depender=2) to be generated
+    assert.ok(
+      candidates.some(([a, b]) => a === 1 && b === 2),
+      "should generate candidate [1, 2] — issue 1 (types.ts) as potential prerequisite for issue 2 (consumer.ts)",
+    );
+  });
+
+  it("returns no candidates when no import relationships are found", async () => {
+    const items: InventoryItem[] = [
+      {
+        issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" },
+        touched_files: ["core/a.ts"],
+      },
+      {
+        issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" },
+        touched_files: ["core/b.ts"],
+      },
+    ];
+    const deps = {
+      runHarness: async () => ({ success: true, output: "{}" }),
+      readFile: async () => "export const x = 1;", // no imports
+      log: () => {},
+    };
+
+    const candidates = await findCrossFileDepCandidates(items, [], deps);
+    assert.deepEqual(candidates, []);
   });
 });
 

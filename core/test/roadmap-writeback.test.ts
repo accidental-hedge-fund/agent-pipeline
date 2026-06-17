@@ -45,6 +45,7 @@ function makeDeps(overrides: Partial<WritebackDeps> = {}): WritebackDeps {
     writeFile: async () => {},
     readFile: async () => null,
     gitCreateBranch: async () => {},
+    gitSwitchBranch: async () => {},
     gitBranchExists: async () => false,
     gitCommit: async () => {},
     gitPushBranch: async () => {},
@@ -258,5 +259,32 @@ describe("openRoadmapPr - idempotency", () => {
     await openRoadmapPr(plan, "/repo", "develop", deps);
     assert.equal(createBranchFromRef, "develop", "branch should be created from the configured baseBranch");
     assert.equal(prCreateCallCount, 1, "should create PR when branch and docs are new");
+  });
+
+  it("regression: switches to existing roadmap branch before committing (never commits to wrong branch)", async () => {
+    // Finding #6: when the local roadmap branch already exists but no open PR is found,
+    // the engine must call gitSwitchBranch before writing docs — otherwise the commit
+    // lands on whatever branch the repo currently has checked out (e.g., main).
+    let switchedToBranch: string | undefined;
+    let createBranchCalled = false;
+
+    const deps = makeDeps({
+      findPrByHead: async () => null,
+      gitBranchExists: async () => true, // branch already exists locally
+      gitCreateBranch: async () => { createBranchCalled = true; },
+      gitSwitchBranch: async (_repoDir, branch) => { switchedToBranch = branch; },
+      createPr: async () => "https://github.com/example/repo/pull/2",
+    });
+
+    const plan = makePlan();
+    await openRoadmapPr(plan, "/repo", "main", deps);
+
+    assert.ok(!createBranchCalled, "should not re-create an existing branch");
+    assert.ok(switchedToBranch !== undefined, "must call gitSwitchBranch when branch already exists");
+    // The switched branch should be the roadmap branch (not main or anything else)
+    assert.ok(
+      switchedToBranch!.startsWith("roadmap/"),
+      `gitSwitchBranch should be called with the roadmap branch, got: ${switchedToBranch}`,
+    );
   });
 });

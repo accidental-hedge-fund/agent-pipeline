@@ -8,6 +8,8 @@ import {
   getIssueLabelEvents,
   isBlocked,
   mapRawIssue,
+  mapApiIssue,
+  type GhApiIssueRaw,
   normalizeClosingRefs,
   parseChecksAggregate,
   parseMergeable,
@@ -586,4 +588,62 @@ test("mapRawIssue: labels array is extracted from {name} objects", () => {
   };
   const issue = mapRawIssue(raw);
   assert.deepEqual(issue.labels, ["bug", "needs-triage"]);
+});
+
+// ---------------------------------------------------------------------------
+// mapApiIssue (paginated getOpenIssues, finding #7 regression)
+// The gh api repos/<repo>/issues endpoint returns snake_case fields and
+// includes pull requests alongside issues. mapApiIssue must translate correctly.
+// ---------------------------------------------------------------------------
+
+test("mapApiIssue: maps html_url and updated_at correctly", () => {
+  const raw: GhApiIssueRaw = {
+    number: 42,
+    title: "Add dark mode",
+    body: "As a user I want dark mode.",
+    labels: [{ name: "enhancement" }],
+    html_url: "https://github.com/example/repo/issues/42",
+    state: "open",
+    updated_at: "2026-01-15T00:00:00Z",
+  };
+  const issue = mapApiIssue(raw);
+  assert.equal(issue.number, 42);
+  assert.equal(issue.url, "https://github.com/example/repo/issues/42", "url should map from html_url");
+  assert.equal(issue.updatedAt, "2026-01-15T00:00:00Z", "updatedAt should map from updated_at");
+  assert.equal(issue.state, "open");
+  assert.deepEqual(issue.labels, ["enhancement"]);
+});
+
+test("mapApiIssue: handles null body gracefully", () => {
+  const raw: GhApiIssueRaw = {
+    number: 5,
+    title: "No body",
+    body: null,
+    labels: [],
+    html_url: "https://github.com/example/repo/issues/5",
+    state: "open",
+  };
+  const issue = mapApiIssue(raw);
+  assert.equal(issue.body, "");
+});
+
+test("mapApiIssue: pull_request field is present — caller must filter PRs", () => {
+  // The GitHub API includes PRs under the issues endpoint. PRs have a pull_request field.
+  // getOpenIssues filters them via raw.filter(r => !r.pull_request).
+  // This test verifies mapApiIssue does NOT crash on a PR-shaped entry and that the
+  // pull_request field is detectable for filtering.
+  const pr: GhApiIssueRaw = {
+    number: 100,
+    title: "Add feature (PR)",
+    body: "PR body",
+    labels: [],
+    html_url: "https://github.com/example/repo/pull/100",
+    state: "open",
+    pull_request: { url: "https://api.github.com/repos/example/repo/pulls/100" },
+  };
+  // The caller filters: raw.filter(r => !r.pull_request)
+  assert.ok(pr.pull_request !== undefined, "PR entry should have pull_request field for filtering");
+  // mapApiIssue itself maps correctly even for PRs (the filter happens before this call)
+  const mapped = mapApiIssue(pr);
+  assert.equal(mapped.number, 100);
 });

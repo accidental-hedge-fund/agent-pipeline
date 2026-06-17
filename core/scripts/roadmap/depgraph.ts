@@ -18,15 +18,23 @@ export interface DepgraphDeps {
 
 /**
  * Build a dep-verify prompt for a candidate pair. Reads file content from deps.
+ * Convention: prerequisite must come before depender in the roadmap.
+ * The prompt asks whether the DEPENDER cannot be completed without the PREREQUISITE.
  */
 export async function buildDepVerifyPrompt(
-  itemA: InventoryItem,
-  itemB: InventoryItem,
+  prerequisite: InventoryItem,
+  depender: InventoryItem,
   deps: DepgraphDeps,
 ): Promise<string> {
-  // Collect shared files
-  const sharedFiles = itemA.touched_files.filter((f) => itemB.touched_files.includes(f));
-  const filesToRead = sharedFiles.slice(0, 3); // limit to 3 files
+  // Read shared files + each issue's own files to detect cross-file import relationships.
+  const sharedFiles = prerequisite.touched_files.filter((f) => depender.touched_files.includes(f));
+  const prereqOnly = prerequisite.touched_files.filter((f) => !sharedFiles.includes(f));
+  const dependerOnly = depender.touched_files.filter((f) => !sharedFiles.includes(f));
+  const filesToRead = [
+    ...sharedFiles,
+    ...prereqOnly.slice(0, 2),
+    ...dependerOnly.slice(0, 2),
+  ].slice(0, 5); // limit total to 5 files
 
   let fileContents = "";
   for (const f of filesToRead) {
@@ -37,11 +45,13 @@ export async function buildDepVerifyPrompt(
   }
 
   return (
-    `You are analyzing whether issue #${itemA.issue.number} depends on issue #${itemB.issue.number} (i.e., #${itemA.issue.number} CANNOT be completed without #${itemB.issue.number}).\n\n` +
-    `## Issue A (#${itemA.issue.number}): ${itemA.issue.title}\n${itemA.issue.body.slice(0, 1000)}\n\n` +
-    `## Issue B (#${itemB.issue.number}): ${itemB.issue.title}\n${itemB.issue.body.slice(0, 1000)}\n\n` +
-    (fileContents ? `## Shared files\n${fileContents}\n\n` : "") +
-    `Determine if #${itemA.issue.number} depends on #${itemB.issue.number} by examining the source files.\n` +
+    `You are analyzing whether issue #${depender.issue.number} depends on issue #${prerequisite.issue.number}` +
+    ` (i.e., #${depender.issue.number} CANNOT be completed without #${prerequisite.issue.number}).\n\n` +
+    `## Prerequisite candidate (#${prerequisite.issue.number}): ${prerequisite.issue.title}\n${prerequisite.issue.body.slice(0, 1000)}\n\n` +
+    `## Depender candidate (#${depender.issue.number}): ${depender.issue.title}\n${depender.issue.body.slice(0, 1000)}\n\n` +
+    (fileContents ? `## Source files\n${fileContents}\n\n` : "") +
+    `Determine if #${depender.issue.number} (depender) depends on #${prerequisite.issue.number} (prerequisite) by examining the source files.\n` +
+    `Look for: imports, type references, shared config keys, data migration ordering, API contracts.\n` +
     `Return a JSON object:\n` +
     `{"edge_confirmed": boolean, "file_line": "path/to/file.ts:42 or empty", "rationale": "explanation", "is_strong": boolean}\n\n` +
     `edge_confirmed: true only when you find a concrete source-code coupling (an import, shared config key, data migration order, etc.).\n` +
@@ -99,10 +109,9 @@ export function findTextualDepCandidates(items: InventoryItem[]): Array<[IssueNu
 
 /**
  * Generate dependency candidates from shared touched-file relationships.
- * When two issues share touched files, either may depend on the other — the
- * harness will source-verify and confirm or deny the edge.
- * Returns pairs [prerequisite-candidate, depender-candidate]; the caller deduplicates
- * against textual candidates before verification.
+ * When two issues share touched files, BOTH directions are generated so the
+ * harness source-verifies each independently.
+ * Returns pairs [prerequisite-candidate, depender-candidate].
  */
 export function findFileBasedDepCandidates(
   items: InventoryItem[],
@@ -118,14 +127,82 @@ export function findFileBasedDepCandidates(
       const sharedFiles = a.touched_files.filter((f) => b.touched_files.includes(f));
       if (sharedFiles.length === 0) continue;
 
-      // Check both directions (either could be the prerequisite)
+      // Generate both directions so the harness can verify which dependency is real.
       const fwdKey = `${a.issue.number}:${b.issue.number}`;
       const revKey = `${b.issue.number}:${a.issue.number}`;
-      if (!existing.has(fwdKey) && !existing.has(revKey)) {
-        // Add one candidate pair (a as prerequisite, b as depender); the harness will confirm direction
+      if (!existing.has(fwdKey)) {
         candidates.push([a.issue.number, b.issue.number]);
         existing.add(fwdKey);
-        existing.add(revKey); // prevent the reverse from being added as a duplicate
+      }
+      if (!existing.has(revKey)) {
+        candidates.push([b.issue.number, a.issue.number]);
+        existing.add(revKey);
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Scan touched files for import references that point to another issue's files.
+ * Generates candidate pairs for cross-file dependencies (e.g., issue A's file
+ * imports a type from issue B's file — no shared file, but a real coupling).
+ * Returns pairs [prerequisite-candidate, depender-candidate].
+ */
+export async function findCrossFileDepCandidates(
+  items: InventoryItem[],
+  existingCandidates: Array<[IssueNumber, IssueNumber]>,
+  deps: DepgraphDeps,
+): Promise<Array<[IssueNumber, IssueNumber]>> {
+  const existing = new Set(existingCandidates.map(([a, b]) => `${a}:${b}`));
+  const candidates: Array<[IssueNumber, IssueNumber]> = [];
+
+  // Build map: file stem → issue numbers that touch it
+  const stemToIssues = new Map<string, IssueNumber[]>();
+  for (const item of items) {
+    for (const f of item.touched_files) {
+      // Use the filename stem (e.g., "types" from "core/types.ts") as the key
+      const stem = f.replace(/\.[^./]+$/, "").replace(/.*\//, "");
+      if (!stem) continue;
+      if (!stemToIssues.has(stem)) stemToIssues.set(stem, []);
+      stemToIssues.get(stem)!.push(item.issue.number);
+    }
+  }
+
+  // Import regex: TS/JS/Python-style import statements
+  const importRe = /(?:from\s+['"]|import\s+['"]|require\s*\(\s*['"])([^'"]+)['"]/g;
+
+  for (const item of items) {
+    for (const filePath of item.touched_files.slice(0, 5)) {
+      const content = await deps.readFile(filePath);
+      if (!content) continue;
+
+      importRe.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = importRe.exec(content)) !== null) {
+        const importPath = m[1];
+        // Extract the stem of the imported module (last path segment, no extension)
+        const importStem = importPath.replace(/\.[^./]+$/, "").replace(/.*\//, "");
+        if (!importStem) continue;
+
+        const otherNums = stemToIssues.get(importStem);
+        if (!otherNums) continue;
+
+        for (const otherNum of otherNums) {
+          if (otherNum === item.issue.number) continue;
+          // item.issue.number (depender) imports from otherNum's file (prerequisite)
+          const fwdKey = `${otherNum}:${item.issue.number}`;
+          const revKey = `${item.issue.number}:${otherNum}`;
+          if (!existing.has(fwdKey)) {
+            candidates.push([otherNum, item.issue.number]);
+            existing.add(fwdKey);
+          }
+          // Also verify the reverse in case we got the direction wrong
+          if (!existing.has(revKey)) {
+            candidates.push([item.issue.number, otherNum]);
+            existing.add(revKey);
+          }
+        }
       }
     }
   }
@@ -229,14 +306,20 @@ export async function buildDepgraph(
 
   const itemByNumber = new Map(items.map((i) => [i.issue.number, i]));
 
-  // Find candidate dependency pairs from both issue text and shared touched files.
+  // Find candidate dependency pairs from issue text, shared files, and cross-file imports.
   // Candidate pair [prerequisite, depender]: prerequisite must come before depender.
   const textualCandidates = findTextualDepCandidates(items);
   deps.log(`[roadmap] depgraph: found ${textualCandidates.length} textual dep candidates`);
   const fileCandidates = findFileBasedDepCandidates(items, textualCandidates);
-  deps.log(`[roadmap] depgraph: found ${fileCandidates.length} file-based dep candidates`);
+  deps.log(`[roadmap] depgraph: found ${fileCandidates.length} shared-file dep candidates`);
+  const crossFileCandidates = await findCrossFileDepCandidates(
+    items,
+    [...textualCandidates, ...fileCandidates],
+    deps,
+  );
+  deps.log(`[roadmap] depgraph: found ${crossFileCandidates.length} cross-file dep candidates`);
 
-  const allCandidates = [...textualCandidates, ...fileCandidates];
+  const allCandidates = [...textualCandidates, ...fileCandidates, ...crossFileCandidates];
 
   // Source-verify each candidate. Edge convention: {from: prerequisite, to: depender}
   // so "from must precede to" = prerequisite comes before depender in the roadmap.

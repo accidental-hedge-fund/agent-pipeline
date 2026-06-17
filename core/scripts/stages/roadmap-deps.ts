@@ -70,6 +70,11 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       if (r.status !== 0) throw new Error(`git checkout -b ${branch} failed: ${r.stderr}`);
     },
 
+    gitSwitchBranch: async (repoDir, branch) => {
+      const r = spawnSync("git", ["checkout", branch], { cwd: repoDir, encoding: "utf8" });
+      if (r.status !== 0) throw new Error(`git checkout ${branch} failed: ${r.stderr}`);
+    },
+
     gitCommit: async (repoDir, files, message) => {
       const add = spawnSync("git", ["add", "--", ...files], { cwd: repoDir, encoding: "utf8" });
       if (add.status !== 0) throw new Error(`git add failed: ${add.stderr}`);

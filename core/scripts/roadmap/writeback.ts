@@ -14,6 +14,7 @@ export interface WritebackDeps {
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string | null>;
   gitCreateBranch(repoDir: string, branch: string, fromRef?: string): Promise<void>;
+  gitSwitchBranch(repoDir: string, branch: string): Promise<void>;
   gitBranchExists(repoDir: string, branch: string): Promise<boolean>;
   gitCommit(repoDir: string, files: string[], message: string): Promise<void>;
   gitPushBranch(repoDir: string, branch: string): Promise<void>;
@@ -193,6 +194,10 @@ export async function openRoadmapPr(
   if (!branchExists) {
     // Create branch from the configured base so the PR targets the right history
     await deps.gitCreateBranch(repoDir, branch, baseBranch);
+  } else {
+    // Always switch to the roadmap branch before writing — prevents committing to the
+    // invoking branch (e.g., main) when the roadmap branch already exists locally.
+    await deps.gitSwitchBranch(repoDir, branch);
   }
   await deps.writeFile(docsPath, md);
   const commitMsg = `docs: roadmap for ${plan.repo} (generated ${plan.generated_at.slice(0, 10)})\n\nIssue: #171\nPipeline-Run: 171/2026-06-17T04:37:16Z`;

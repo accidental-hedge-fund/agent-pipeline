@@ -1034,32 +1034,56 @@ export function mapRawIssue(issue: GhIssueRaw): OpenIssue {
 }
 
 /**
- * Fetch all open issues from a repo.
- * Uses `gh issue list --json` with confirmed field names.
+ * Shape returned by `gh api repos/<repo>/issues` (REST API).
+ * Field names differ from `gh issue list --json` (snake_case, html_url, etc.).
+ */
+export interface GhApiIssueRaw {
+  number: number;
+  title: string;
+  body: string | null;
+  labels: { name: string }[];
+  html_url: string;
+  state: string;
+  updated_at?: string;
+  /** Present on pull requests; absent on issues. Used to filter PRs out. */
+  pull_request?: unknown;
+}
+
+/**
+ * Map a raw `gh api repos/<repo>/issues` entry to the typed `OpenIssue` shape.
+ * Exported for unit testing.
+ */
+export function mapApiIssue(issue: GhApiIssueRaw): OpenIssue {
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body ?? "",
+    labels: (issue.labels ?? []).map((l) => l.name),
+    url: issue.html_url,
+    state: (issue.state?.toLowerCase() === "closed" ? "closed" : "open") as "open" | "closed",
+    updatedAt: issue.updated_at,
+  };
+}
+
+/**
+ * Fetch ALL open issues from a repo via paginated `gh api` calls.
+ * Uses `gh api repos/<repo>/issues --paginate` so repositories with more than
+ * 100 open issues are not silently truncated (the old `gh issue list --limit 500` cap).
+ * PRs are filtered out (the GitHub API includes them under the issues endpoint).
  */
 export async function getOpenIssues(
   repo: string,
   opts: { labels?: string[] } = {},
 ): Promise<OpenIssue[]> {
-  const args = [
-    "issue",
-    "list",
-    "--state",
-    "open",
-    "--json",
-    "number,title,body,labels,url,state,updatedAt",
-    "--limit",
-    "500",
-    "-R",
-    repo,
-  ];
+  let apiPath = `repos/${repo}/issues?state=open&per_page=100`;
   if (opts.labels && opts.labels.length > 0) {
-    args.push("--label", opts.labels.join(","));
+    apiPath += `&labels=${encodeURIComponent(opts.labels.join(","))}`;
   }
 
-  const stdout = await ghRun(args, { timeoutMs: 60_000 });
-  const raw = JSON.parse(stdout) as GhIssueRaw[];
-  return raw.map(mapRawIssue);
+  const stdout = await ghRun(["api", apiPath, "--paginate"], { timeoutMs: 120_000 });
+  const raw = JSON.parse(stdout) as GhApiIssueRaw[];
+  // Filter PRs: the GitHub API lists PRs under the issues endpoint; PRs have a pull_request field.
+  return raw.filter((r) => !r.pull_request).map(mapApiIssue);
 }
 
 interface GhMilestoneRaw {
