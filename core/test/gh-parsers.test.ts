@@ -647,3 +647,49 @@ test("mapApiIssue: pull_request field is present — caller must filter PRs", ()
   const mapped = mapApiIssue(pr);
   assert.equal(mapped.number, 100);
 });
+
+// ---------------------------------------------------------------------------
+// Multi-page pagination parsing regression (#171, finding 1 round 2)
+// gh api --paginate without --slurp emits each page as a separate JSON array
+// on stdout, producing "[...]\n[...]" which JSON.parse throws on.
+// With --slurp, gh wraps all pages into [[page1...], [page2...]] which is valid
+// JSON. The caller must .flat() before filtering PRs.
+// ---------------------------------------------------------------------------
+
+test("getOpenIssues pagination: --slurp output (array-of-arrays) round-trips via flat()+filter()", () => {
+  const page1: GhApiIssueRaw[] = [
+    { number: 1, title: "Issue one", body: "body", labels: [], html_url: "https://github.com/x/y/issues/1", state: "open" },
+    { number: 2, title: "Issue two", body: "body", labels: [], html_url: "https://github.com/x/y/issues/2", state: "open" },
+  ];
+  const page2: GhApiIssueRaw[] = [
+    { number: 3, title: "Issue three", body: "body", labels: [], html_url: "https://github.com/x/y/issues/3", state: "open" },
+    // A PR entry that must be filtered out
+    { number: 4, title: "A PR", body: "", labels: [], html_url: "https://github.com/x/y/pull/4", state: "open", pull_request: { url: "https://api.github.com/repos/x/y/pulls/4" } },
+  ];
+
+  // Simulate what gh api --paginate --slurp produces: [[...page1...], [...page2...]]
+  const slurpedStdout = JSON.stringify([page1, page2]);
+
+  // Verify the format is valid JSON (would throw without --slurp on multi-page responses)
+  const parsed = JSON.parse(slurpedStdout) as GhApiIssueRaw[][];
+  const flattened = parsed.flat();
+  const issues = flattened.filter((r) => !r.pull_request).map(mapApiIssue);
+
+  assert.equal(issues.length, 3, "should include all 3 issues across both pages");
+  assert.equal(issues[0].number, 1);
+  assert.equal(issues[1].number, 2);
+  assert.equal(issues[2].number, 3);
+});
+
+test("getOpenIssues pagination: non-slurped multi-page JSON is invalid and JSON.parse throws", () => {
+  // Without --slurp, gh api --paginate writes each page as a separate JSON array on stdout.
+  const page1Json = JSON.stringify([{ number: 1, title: "A", body: "", labels: [], html_url: "u", state: "open" }]);
+  const page2Json = JSON.stringify([{ number: 2, title: "B", body: "", labels: [], html_url: "u", state: "open" }]);
+  const nonSlurpedStdout = page1Json + "\n" + page2Json;
+
+  // This is what breaks without --slurp: two adjacent JSON documents are not valid JSON.
+  assert.throws(
+    () => JSON.parse(nonSlurpedStdout),
+    "multi-page non-slurped stdout must throw on JSON.parse to document why --slurp is required",
+  );
+});

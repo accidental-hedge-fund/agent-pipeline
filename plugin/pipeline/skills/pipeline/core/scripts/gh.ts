@@ -1080,8 +1080,9 @@ export async function getOpenIssues(
     apiPath += `&labels=${encodeURIComponent(opts.labels.join(","))}`;
   }
 
-  const stdout = await ghRun(["api", apiPath, "--paginate"], { timeoutMs: 120_000 });
-  const raw = JSON.parse(stdout) as GhApiIssueRaw[];
+  const stdout = await ghRun(["api", apiPath, "--paginate", "--slurp"], { timeoutMs: 120_000 });
+  // --slurp wraps each page array into an outer array: [[page1...], [page2...]]. Flatten before filtering.
+  const raw = (JSON.parse(stdout) as GhApiIssueRaw[][]).flat();
   // Filter PRs: the GitHub API lists PRs under the issues endpoint; PRs have a pull_request field.
   return raw.filter((r) => !r.pull_request).map(mapApiIssue);
 }
@@ -1097,10 +1098,11 @@ interface GhMilestoneRaw {
  * Uses `gh api repos/<repo>/milestones`.
  */
 export async function getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>> {
-  const stdout = await ghRun(["api", `repos/${repo}/milestones`, "--paginate"], {
+  const stdout = await ghRun(["api", `repos/${repo}/milestones`, "--paginate", "--slurp"], {
     timeoutMs: 30_000,
   });
-  const raw = JSON.parse(stdout) as GhMilestoneRaw[];
+  // --slurp wraps each page array into an outer array. Flatten before mapping.
+  const raw = (JSON.parse(stdout) as GhMilestoneRaw[][]).flat();
   return raw.map((m) => ({ id: m.id, number: m.number, title: m.title }));
 }
 
