@@ -294,6 +294,11 @@ export interface PipelineConfig {
     hygiene_auto_apply?: boolean;
     pr_docs?: boolean;
   };
+  // Sweep backlog maintenance pass (#168). Optional per-repo sufficiency thresholds.
+  sweep?: {
+    min_body_length?: number;
+    required_sections?: string[];
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults

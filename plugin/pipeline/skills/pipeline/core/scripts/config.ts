@@ -157,6 +157,16 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Backlog roadmap engine settings (#171)."),
+  // Sweep backlog maintenance pass (#168). Optional per-repo thresholds for the
+  // sufficiency heuristic that determines which issues get re-specced.
+  sweep: z
+    .object({
+      min_body_length: z.number().int().min(0).optional().describe("Minimum body character count for an issue to be considered sufficient (default: 150)."),
+      required_sections: z.array(z.string()).optional().describe("Section headings (without ##) that must be present for an issue to be considered sufficient (default: Summary, User story, Acceptance criteria, Out of scope)."),
+    })
+    .strict()
+    .optional()
+    .describe("Sweep backlog maintenance pass settings (#168)."),
 }).strict();
 
 export interface ResolveOptions {
@@ -339,6 +349,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
     roadmap: fileConfig.roadmap,
+    sweep: fileConfig.sweep,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;

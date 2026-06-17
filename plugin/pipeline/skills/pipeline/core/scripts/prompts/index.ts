@@ -459,6 +459,20 @@ export function buildIntakePrompt(a: BuildIntakeArgs): string {
   });
 }
 
+export interface BuildSweepArgs {
+  issueTitle: string;
+  existingBody: string;
+  repoContext: string;
+}
+
+export function buildSweepPrompt(a: BuildSweepArgs): string {
+  return substitute(loadTemplate("sweep"), {
+    issue_title: a.issueTitle,
+    existing_body: a.existingBody,
+    repo_context: a.repoContext,
+  });
+}
+
 // Exported for tests. CONFIDENCE_CALIBRATION_BLOCK is exposed so the drift test
 // can assert both review prompts embed the shared constant byte-for-byte.
 export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK };

@@ -1,0 +1,515 @@
+// Tests for the `pipeline sweep` sub-command (#168).
+//
+// All tests are network- and filesystem-free: I/O is injected via the
+// SweepDeps seam. Each test proves the code bites (assertions on specific
+// outcomes, error cases, or missing-dep calls).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  isSufficient,
+  isIssueInPerIssueTable,
+  isIssueInReleasePlanTable,
+  isIssueInDetailSections,
+  validateSweepSpecBody,
+  runSweep,
+  type SweepDeps,
+  type SweepIssue,
+  type SweepOpts,
+  type SweepConfig,
+} from "../scripts/stages/sweep.ts";
+
+// ---------------------------------------------------------------------------
+// Minimal ROADMAP fixture (mirrors intake.test.ts)
+// ---------------------------------------------------------------------------
+
+const ROADMAP_FIXTURE = `# Roadmap
+
+Everything below v1.5.0 is the post-1.5.0 line.
+
+## Release plan (sem-ver)
+
+| Release | Bump | Theme | Issues | Why this bump |
+|---|---|---|---|---|
+| **v1.5.0** ✅ shipped | minor | Pipeline Desk desktop contracts | #153 | Shipped. |
+| **v1.6.0** | minor | Intake & backlog automation | #158 | Adds intake. |
+| *(none)* | — | Research trackers | #14, #27 | Research only. |
+
+Per-issue sem-ver detail:
+
+| # | Impact | Config | Theme | → Release | Depends on |
+|---|--------|--------|-------|-----------|------------|
+| #153 | minor | none | desktop | v1.5.0 | — |
+| #158 | minor | new sub-command | intake & roadmap sync | v1.6.0 | — |
+| #14 | none | — | research | *(none)* | — |
+| #27 | none | — | research | *(none)* | — |
+
+## Remaining work — detail
+
+### v1.6.0 — intake & backlog automation (minor)
+
+- **#158** — Front-door intake sub-command.
+
+### Trackers (no release)
+
+- **#14, #27** — research epics.
+`;
+
+const FAKE_BASE_SHA = "0123456789abcdef0123456789abcdef01234567";
+const DEFAULT_CFG = { repo_dir: "/fake/repo", repo: "owner/repo", base_branch: "main" };
+
+// ---------------------------------------------------------------------------
+// Minimal spec body that passes validation
+// ---------------------------------------------------------------------------
+
+const VALID_SPEC_BODY = [
+  "## Summary",
+  "A retry mechanism for the fix loop that recovers from transient failures.",
+  "",
+  "## User story",
+  "As a pipeline operator,",
+  "I want the fix loop to retry on transient errors,",
+  "so that a temporary network failure does not block the run.",
+  "",
+  "## Acceptance criteria",
+  "- [ ] Running `pipeline N` with a transient fix error retries up to 3 times.",
+  "- [ ] A permanent error still blocks with a clear message.",
+  "",
+  "## Out of scope",
+  "- Retry logic for the planning or review stages.",
+].join("\n");
+
+// ---------------------------------------------------------------------------
+// Fake deps factory
+// ---------------------------------------------------------------------------
+
+function makeDeps(overrides: Partial<SweepDeps> = {}): SweepDeps & {
+  _updateCalls: Array<{ repo: string; num: number; body: string }>;
+  _harnessCalls: string[];
+  _createPRCalls: Array<{ title: string; body: string; base: string; head: string }>;
+  _logLines: string[];
+  _writtenFiles: Record<string, string>;
+  _gitEnsureCleanCalls: string[];
+  _branchCalls: Array<{ branch: string; fromRef: string }>;
+} {
+  const updateCalls: Array<{ repo: string; num: number; body: string }> = [];
+  const harnessCalls: string[] = [];
+  const createPRCalls: Array<{ title: string; body: string; base: string; head: string }> = [];
+  const logLines: string[] = [];
+  const writtenFiles: Record<string, string> = {};
+  const gitEnsureCleanCalls: string[] = [];
+  const branchCalls: Array<{ branch: string; fromRef: string }> = [];
+
+  const base: SweepDeps = {
+    listIssues: async (_repo) => [],
+    updateIssueBody: async (repo, num, body) => { updateCalls.push({ repo, num, body }); },
+    runHarness: async (_prompt) => {
+      harnessCalls.push(_prompt);
+      return { success: true, output: VALID_SPEC_BODY };
+    },
+    readFile: (_p) => ROADMAP_FIXTURE,
+    writeFile: (p, content) => { writtenFiles[p] = content; },
+    gitResolveBaseSha: (_dir, _branch) => FAKE_BASE_SHA,
+    readFileAtBase: (_dir, _ref, relPath) => {
+      if (relPath === "ROADMAP.md") return ROADMAP_FIXTURE;
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
+    },
+    gitEnsureClean: (dir) => { gitEnsureCleanCalls.push(dir); },
+    gitCreateBranch: (_dir, branch, fromRef) => { branchCalls.push({ branch, fromRef }); },
+    gitPushBranch: (_dir, _branch) => {},
+    gitCommit: (_dir, _files, _msg) => {},
+    createPR: async (_dir, title, body, base, head) => {
+      createPRCalls.push({ title, body, base, head });
+      return "https://github.com/owner/repo/pull/99";
+    },
+    today: () => "2026-06-17",
+    log: (msg) => logLines.push(msg),
+    ...overrides,
+  };
+
+  (base as unknown as { _updateCalls: typeof updateCalls })._updateCalls = updateCalls;
+  (base as unknown as { _harnessCalls: typeof harnessCalls })._harnessCalls = harnessCalls;
+  (base as unknown as { _createPRCalls: typeof createPRCalls })._createPRCalls = createPRCalls;
+  (base as unknown as { _logLines: typeof logLines })._logLines = logLines;
+  (base as unknown as { _writtenFiles: typeof writtenFiles })._writtenFiles = writtenFiles;
+  (base as unknown as { _gitEnsureCleanCalls: typeof gitEnsureCleanCalls })._gitEnsureCleanCalls = gitEnsureCleanCalls;
+  (base as unknown as { _branchCalls: typeof branchCalls })._branchCalls = branchCalls;
+  return base as ReturnType<typeof makeDeps>;
+}
+
+// ---------------------------------------------------------------------------
+// 2. isSufficient unit tests (task 2.2)
+// ---------------------------------------------------------------------------
+
+test("isSufficient: sufficient body with all sections passes", () => {
+  const body = [
+    "## Summary",
+    "A full description of the feature.",
+    "",
+    "## User story",
+    "As a user, I want this, so that that.",
+    "",
+    "## Acceptance criteria",
+    "- [ ] It works when Y.",
+    "",
+    "## Out of scope",
+    "- Nothing else.",
+  ].join("\n");
+  assert.ok(isSufficient(body), "should be sufficient");
+});
+
+test("isSufficient: single-sentence body fails", () => {
+  assert.ok(!isSufficient("Add retry logic."), "single sentence should be thin");
+});
+
+test("isSufficient: body below min_body_length fails", () => {
+  const body = "## Summary\nShort.\n## User story\nAs a user.";
+  assert.ok(!isSufficient(body, { min_body_length: 500 }), "too short should be thin");
+});
+
+test("isSufficient: missing required sections fails", () => {
+  const body = "## Summary\n" + "x".repeat(200);
+  assert.ok(!isSufficient(body), "only 1 section should be thin");
+});
+
+test("isSufficient: configurable min_body_length — 200-char body is thin with threshold 300", () => {
+  const body = "## Summary\n" + "x".repeat(190) + "\n## User story\nAs a user, I want.\n## Acceptance criteria\n- [ ] ok.\n## Out of scope\n- none.";
+  assert.ok(isSufficient(body), "should pass default threshold (150)");
+  assert.ok(!isSufficient(body, { min_body_length: 300 }), "should fail threshold of 300");
+});
+
+test("isSufficient: uses custom required_sections when configured", () => {
+  const body = "## Summary\nA thing.\n## Custom\nYes.\n## Done\nDone.\n" + "x".repeat(120);
+  assert.ok(!isSufficient(body), "should fail default sections");
+  assert.ok(isSufficient(body, { required_sections: ["Summary", "Custom"] }), "should pass custom sections");
+});
+
+// ---------------------------------------------------------------------------
+// 5. ROADMAP presence checks
+// ---------------------------------------------------------------------------
+
+test("isIssueInPerIssueTable: detects present issue", () => {
+  assert.ok(isIssueInPerIssueTable(ROADMAP_FIXTURE, 158), "#158 is in table");
+  assert.ok(!isIssueInPerIssueTable(ROADMAP_FIXTURE, 168), "#168 is NOT in table");
+});
+
+test("isIssueInReleasePlanTable: detects present issue", () => {
+  assert.ok(isIssueInReleasePlanTable(ROADMAP_FIXTURE, 158), "#158 is in release plan");
+  assert.ok(!isIssueInReleasePlanTable(ROADMAP_FIXTURE, 168), "#168 is NOT in release plan");
+});
+
+test("isIssueInDetailSections: detects present issue", () => {
+  assert.ok(isIssueInDetailSections(ROADMAP_FIXTURE, 158), "#158 is in detail sections");
+  assert.ok(!isIssueInDetailSections(ROADMAP_FIXTURE, 168), "#168 is NOT in detail sections");
+});
+
+// ---------------------------------------------------------------------------
+// 9.1 Dry-run path: no writes, report printed
+// ---------------------------------------------------------------------------
+
+test("sweep: dry-run — no updateIssueBody, no createPR called", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "add retry logic", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [thinIssue] });
+  const opts: SweepOpts = { apply: false };
+
+  await runSweep(opts, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._updateCalls.length, 0, "updateIssueBody should not be called in dry-run");
+  assert.equal(deps._createPRCalls.length, 0, "createPR should not be called in dry-run");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("preview mode"), "should print preview notice");
+  assert.ok(allLog.includes("Sweep Summary"), "should print summary report");
+});
+
+test("sweep: dry-run — proposed spec printed for thin issue", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "add retry logic", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [thinIssue] });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("Proposed spec for #42"), "should print proposed spec header");
+  assert.ok(allLog.includes("## Summary"), "should print spec content");
+});
+
+test("sweep: dry-run — roadmap diff printed, no branch created", async () => {
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [thinIssue] });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._branchCalls.length, 0, "no branch should be created in dry-run");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("ROADMAP.md diff"), "should print roadmap diff");
+});
+
+// ---------------------------------------------------------------------------
+// 9.2 --apply path: thin issues updated, sufficient skipped, roadmap PR opened
+// ---------------------------------------------------------------------------
+
+test("sweep: --apply — thin issue body is updated", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "add retry logic", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [thinIssue] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._updateCalls.length, 1, "updateIssueBody should be called for thin issue");
+  assert.equal(deps._updateCalls[0].num, 42);
+  assert.ok(deps._updateCalls[0].body.includes("## Summary"), "new body should have Summary section");
+});
+
+test("sweep: --apply — sufficient issue is NOT updated", async () => {
+  const sufficientBody = VALID_SPEC_BODY + "\n" + "x".repeat(50);
+  const sufficientIssue: SweepIssue = { number: 99, title: "already specced", body: sufficientBody };
+  const deps = makeDeps({ listIssues: async () => [sufficientIssue] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._updateCalls.length, 0, "updateIssueBody should NOT be called for sufficient issue");
+});
+
+test("sweep: --apply — roadmap PR opened for absent issues", async () => {
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [thinIssue] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._createPRCalls.length, 1, "createPR should be called");
+  const pr = deps._createPRCalls[0];
+  assert.ok(pr.title.includes("sweep"), "PR title should mention sweep");
+  assert.equal(pr.base, "main", "PR should target main branch");
+  assert.ok(pr.head.includes("sweep/"), "PR head should use sweep/ branch convention");
+});
+
+test("sweep: --apply — no PR if ROADMAP already in sync", async () => {
+  // #158 is already in all three ROADMAP structures in the fixture.
+  const sufficientBody = VALID_SPEC_BODY + "\n" + "x".repeat(50);
+  const alreadyInRoadmap: SweepIssue = { number: 158, title: "intake sub-command", body: sufficientBody };
+  const deps = makeDeps({ listIssues: async () => [alreadyInRoadmap] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._createPRCalls.length, 0, "no PR if ROADMAP already in sync");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("already in sync"), "should log in-sync message");
+});
+
+// ---------------------------------------------------------------------------
+// 9.3 Idempotent re-run: re-specced issues are recognized as sufficient
+// ---------------------------------------------------------------------------
+
+test("sweep: idempotent — second run skips already-specced issues", async () => {
+  // Simulate a second run: the issue body is now the valid spec from the first run.
+  const alreadySpecced: SweepIssue = { number: 42, title: "add retry logic", body: VALID_SPEC_BODY };
+  const deps = makeDeps({ listIssues: async () => [alreadySpecced] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._harnessCalls.length, 0, "no harness call for already-specced issue");
+  assert.equal(deps._updateCalls.length, 0, "no update for already-specced issue");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("left-as-is"), "should report left-as-is");
+});
+
+// ---------------------------------------------------------------------------
+// 9.4 Blocked issue: harness failure records blocked, continues
+// ---------------------------------------------------------------------------
+
+test("sweep: blocked issue appears in report with reason; remaining issues processed", async () => {
+  const thin1: SweepIssue = { number: 10, title: "issue 10", body: "Short." };
+  const thin2: SweepIssue = { number: 11, title: "issue 11", body: "Short." };
+  let call = 0;
+  const deps = makeDeps({
+    listIssues: async () => [thin1, thin2],
+    runHarness: async (_p) => {
+      call++;
+      if (call === 1) return { success: false, output: "model timeout" };
+      return { success: true, output: VALID_SPEC_BODY };
+    },
+  });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("BLOCKED"), "blocked issue should appear in report");
+  // Second issue should still be processed.
+  assert.equal(deps._updateCalls.length, 1, "second issue should still be updated");
+  assert.equal(deps._updateCalls[0].num, 11);
+});
+
+test("sweep: harness exception records blocked, does not abort", async () => {
+  const thinIssue: SweepIssue = { number: 5, title: "throwing issue", body: "x" };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    runHarness: async (_p) => { throw new Error("connection refused"); },
+  });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("BLOCKED"), "blocked issue should appear in report");
+  assert.ok(allLog.includes("connection refused"), "reason should include the error message");
+});
+
+// ---------------------------------------------------------------------------
+// 9.5 Roadmap reconciliation dry-run: diff printed, no branch
+// ---------------------------------------------------------------------------
+
+test("sweep: roadmap dry-run — diff printed, no branch, no PR", async () => {
+  const absent: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [absent] });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._branchCalls.length, 0, "no branch in dry-run");
+  assert.equal(deps._createPRCalls.length, 0, "no PR in dry-run");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("ROADMAP.md diff"), "diff should be printed");
+});
+
+// ---------------------------------------------------------------------------
+// 9.6 Roadmap reconciliation --apply: branch created, PR opened, no direct commit to default branch
+// ---------------------------------------------------------------------------
+
+test("sweep: --apply roadmap — branch forks from pinned base SHA", async () => {
+  const absent: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [absent] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.ok(deps._branchCalls.length > 0, "branch should be created");
+  assert.equal(deps._branchCalls[0].fromRef, FAKE_BASE_SHA, "branch forks from the pinned base SHA");
+});
+
+test("sweep: --apply roadmap — ROADMAP.md is written in the new branch", async () => {
+  const absent: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [absent] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  const roadmapWritten = Object.keys(deps._writtenFiles).some((p) => p.endsWith("ROADMAP.md"));
+  assert.ok(roadmapWritten, "ROADMAP.md should be written");
+  const written = deps._writtenFiles[Object.keys(deps._writtenFiles).find((p) => p.endsWith("ROADMAP.md"))!];
+  assert.ok(written.includes("#168"), "ROADMAP should include the new issue");
+});
+
+// ---------------------------------------------------------------------------
+// 9.7 Config override: min_body_length 300 causes 200-char body to be thin
+// ---------------------------------------------------------------------------
+
+test("sweep: config override min_body_length=300 causes 200-char body to be thin", async () => {
+  const body200 = "## Summary\n" + "x".repeat(180) + "\n## User story\nAs a user.\n## Acceptance criteria\n- [ ] ok.\n## Out of scope\n- none.";
+  const issue: SweepIssue = { number: 77, title: "config override test", body: body200 };
+  const deps = makeDeps({ listIssues: async () => [issue] });
+  const sweepConfig: SweepConfig = { min_body_length: 300 };
+
+  await runSweep({ apply: false }, DEFAULT_CFG, sweepConfig, deps);
+
+  assert.equal(deps._harnessCalls.length, 1, "harness should be called for thin issue (threshold 300)");
+});
+
+// ---------------------------------------------------------------------------
+// 9.8 --repo flag: listIssues called with supplied owner/repo
+// ---------------------------------------------------------------------------
+
+test("sweep: --repo flag is passed to listIssues", async () => {
+  const capturedRepos: string[] = [];
+  const deps = makeDeps({
+    listIssues: async (repo) => { capturedRepos.push(repo); return []; },
+  });
+
+  await runSweep({ apply: false, repo: "other/repo" }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(capturedRepos.length, 1);
+  assert.equal(capturedRepos[0], "other/repo", "should use the supplied --repo value");
+});
+
+test("sweep: defaults to cfg.repo when --repo is absent", async () => {
+  const capturedRepos: string[] = [];
+  const deps = makeDeps({
+    listIssues: async (repo) => { capturedRepos.push(repo); return []; },
+  });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(capturedRepos[0], "owner/repo", "should use cfg.repo when --repo omitted");
+});
+
+// ---------------------------------------------------------------------------
+// Summary report
+// ---------------------------------------------------------------------------
+
+test("sweep: summary report includes per-issue action and reason", async () => {
+  const thin: SweepIssue = { number: 5, title: "thin issue", body: "x" };
+  const deps = makeDeps({ listIssues: async () => [thin] });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("#5 thin issue"), "report should include issue number and title");
+});
+
+test("sweep: summary report includes aggregate counts", async () => {
+  const thin: SweepIssue = { number: 5, title: "thin", body: "x" };
+  const deps = makeDeps({ listIssues: async () => [thin] });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("inspected"), "report should include aggregate count line");
+});
+
+test("sweep: summary report indicates preview-only when --apply is absent", async () => {
+  const deps = makeDeps({ listIssues: async () => [] });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("Preview only") || allLog.includes("no writes"), "should indicate preview mode");
+});
+
+test("sweep: summary report indicates writes applied when --apply is present", async () => {
+  const deps = makeDeps({ listIssues: async () => [] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("Writes applied") || allLog.includes("applied"), "should indicate writes applied");
+});
+
+// ---------------------------------------------------------------------------
+// validateSweepSpecBody
+// ---------------------------------------------------------------------------
+
+test("validateSweepSpecBody: accepts body with all required sections", () => {
+  assert.doesNotThrow(() => validateSweepSpecBody(VALID_SPEC_BODY));
+});
+
+test("validateSweepSpecBody: throws when required section is missing", () => {
+  const noUserStory = VALID_SPEC_BODY.replace("## User story\n", "## Something else\n");
+  assert.throws(() => validateSweepSpecBody(noUserStory), /missing required sections.*User story/);
+});
+
+test("validateSweepSpecBody: throws when no checkable criteria", () => {
+  const noCheckbox = VALID_SPEC_BODY.replace(/- \[ \]/g, "*");
+  assert.throws(() => validateSweepSpecBody(noCheckbox), /no checkable acceptance criteria/);
+});
+
+// ---------------------------------------------------------------------------
+// CLI: sweep dispatched correctly
+// ---------------------------------------------------------------------------
+
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
+
+test("CLI: pipeline sweep is listed in recognized sub-commands on unrecognized cmd error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "unknowncmd"],
+    { encoding: "utf8", env: { ...process.env } },
+  );
+  assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
+  assert.ok(result.stderr.includes("sweep"), `expected sweep listed in recognized sub-commands; stderr:\n${result.stderr}`);
+});
