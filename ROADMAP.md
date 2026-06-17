@@ -193,6 +193,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170, #171, #168 | Shipped 2026-06-17 (tag `v1.6.0`) — sixth minor. Front-door intake (#158), release-PR automation (#170), backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168). See **Shipped** above for the per-PR detail. (#23 + #149 carried to v1.7.0.) |
 | **v1.6.1** | patch | Version-staleness detection | #186 | Planned. The version is already single-sourced from `core/package.json` (v1.6.0); this adds the missing *detection* guard: a `doctor` stale-install / version-coherence check + a `launcher-smoke` assertion that `--version` equals the installed `core/package.json`. Surfaced during the v1.6.0 release-verification sweep (prevents stale-install phantom-P0s like #176). |
 | **v1.7.0** | minor | Carried autonomy (forge-resistance) | #23, #149 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open) and **#149** (bounded auto-loop, depends on #23). |
+| **v1.7.0** | minor | Roadmap `release_model` config: bundle issues into milestones | #214 | The backlog-roadmap engine gains a `roadmap.release_model` setting (`semver` or `continuous`) that controls how its ranked plan is grouped into milestones, populating the roadmap's currently-empty `milestones[]` output. Additive; existing flows unchanged. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -237,6 +238,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #171 | minor | adds `roadmap:` config + new mode | backlog-roadmap engine | v1.6.0 | #158 |
 | #168 | minor | new sub-command | sweep re-spec / roadmap rebase | v1.6.0 | #158 / #171 |
 | #186 | patch | none | version-staleness detection | v1.6.1 | — |
+| #214 | minor | new sub-command | intake | v1.7.0 | — |
 | _(anchor)_ | — | — | structural insertion anchor for `intake`/`sweep` (do not remove) | *(none)* | — |
 
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
@@ -302,6 +304,7 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 
 ### v1.7.0 — carried autonomy / forge-resistance (minor)
 
+- **#214** — The backlog-roadmap engine gains a `roadmap.release_model` setting (`semver` or `continuous`) that controls how its ranked plan is grouped into milestones, populating the roadmap's currently-empty `milestones[]` output.
 - **#23, #149** — Graduated-autonomy approval checkpoints (#23) and bounded auto-loop (#149), carried forward from the v1.5.0/v1.6.0 lines. #23 is parked on a checkpoint-comment forge-resistance security property (PR #194 open); #149 depends on #23.
 
 ## Decisions
