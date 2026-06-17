@@ -193,7 +193,6 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170, #171, #168 | Shipped 2026-06-17 (tag `v1.6.0`) — sixth minor. Front-door intake (#158), release-PR automation (#170), backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168). See **Shipped** above for the per-PR detail. (#23 + #149 carried to v1.7.0.) |
 | **v1.6.1** | patch | Version-staleness detection | #186 | Planned. The version is already single-sourced from `core/package.json` (v1.6.0); this adds the missing *detection* guard: a `doctor` stale-install / version-coherence check + a `launcher-smoke` assertion that `--version` equals the installed `core/package.json`. Surfaced during the v1.6.0 release-verification sweep (prevents stale-install phantom-P0s like #176). |
 | **v1.7.0** | minor | Carried autonomy (forge-resistance) | #23, #149 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open) and **#149** (bounded auto-loop, depends on #23). |
-| *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 
@@ -237,8 +236,6 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #171 | minor | adds `roadmap:` config + new mode | backlog-roadmap engine | v1.6.0 | #158 |
 | #168 | minor | new sub-command | sweep re-spec / roadmap rebase | v1.6.0 | #158 / #171 |
 | #186 | patch | none | version-staleness detection | v1.6.1 | — |
-| #14 | none | — | research | *(none)* | — |
-| #27 | none | — | research | *(none)* | — |
 
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
 
@@ -301,10 +298,6 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 
 - **#158** — Front-door intake sub-command. A new no-issue-number `/pipeline` mode (alongside `--init` / `--cleanup` / `--version`) takes a short description, expands it into a decision-complete spec using the same contract as the `/pm` issue-spec agent (Summary / User story / Acceptance criteria / Out of scope / Open questions; WHAT-not-HOW), **creates the GitHub issue** with the right `pipeline:*` + `release:*` labels, and **proposes a `ROADMAP.md` update** — release-plan row, per-issue sem-ver row, and detail section — as a branch + PR for human review. The model-invoking spec step is the only non-deterministic part; issue creation and roadmap editing are deterministic given the spec. A dry-run prints the proposed issue + roadmap diff with no writes. Keeps the "pipeline never merges" contract: a human owns the roadmap-PR and release-slot decisions. **Open design forks** (in the issue): reuse `/pm` vs. embed an equivalent prompt; how the version is chosen / whether a new lane may be proposed; structured vs. anchor-based roadmap editing.
 
-### Trackers (no release)
-
-- **#14, #27** — dark-factory research epics; children filed and individually dispositioned — keep as provenance.
-
 ## Decisions
 
 - **#24** — The pipeline never extends past `ready-to-deploy` (no auto-merge / preview / canary / rollback). **Closed — still holds** (12 PRs left for human merge across the 2026-06-08/09 run, zero auto-merges).
@@ -321,5 +314,5 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 - The **review layer** runs `reviewMode: prompt-harness` (reviewer CLI invoked directly with a JSON-returning prompt; companion plugins optional) — standard + adversarial passes, both carrying real weight. #56 (shipped in 1.0) single-sourced the verdict schema; #57/#85 harden the prompts and drift guard; #17 (merged) gives it an audited convergence escape hatch.
 - The **mirror-staleness dogfooding** (#61) is active: every run's test gate runs `npm run ci` (includes `build.mjs --check`). #75 removes the remaining manual-regen friction.
 - Within a release, issues are value-ranked; releases are ordered by dependency + theme cohesion (v1.0.1 first — lowest-risk, no deps, hardens the self-dev loop).
-- Every open issue carries a `release:v*` label mirroring this plan (applied 2026-06-10); research trackers #14/#27 are intentionally unlabeled.
+- Every open issue carries a `release:v*` label mirroring this plan (applied 2026-06-10).
 - Withdrawn 2026-06-10: the umbrella tracker and the review-default-off proposals (no longer in the backlog).
