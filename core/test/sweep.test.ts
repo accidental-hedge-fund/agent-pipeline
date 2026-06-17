@@ -12,6 +12,7 @@ import {
   isIssueInReleasePlanTable,
   isIssueInDetailSections,
   validateSweepSpecBody,
+  filterOutPullRequests,
   runSweep,
   type SweepDeps,
   type SweepIssue,
@@ -91,6 +92,8 @@ function makeDeps(overrides: Partial<SweepDeps> = {}): SweepDeps & {
   _writtenFiles: Record<string, string>;
   _gitEnsureCleanCalls: string[];
   _branchCalls: Array<{ branch: string; fromRef: string }>;
+  _reserveBranchCalls: Array<{ branch: string; sha: string }>;
+  _callOrder: string[];
 } {
   const updateCalls: Array<{ repo: string; num: number; body: string }> = [];
   const harnessCalls: string[] = [];
@@ -99,10 +102,16 @@ function makeDeps(overrides: Partial<SweepDeps> = {}): SweepDeps & {
   const writtenFiles: Record<string, string> = {};
   const gitEnsureCleanCalls: string[] = [];
   const branchCalls: Array<{ branch: string; fromRef: string }> = [];
+  const reserveBranchCalls: Array<{ branch: string; sha: string }> = [];
+  // Tracks the order of key operations for ordering assertions.
+  const callOrder: string[] = [];
 
   const base: SweepDeps = {
     listIssues: async (_repo) => [],
-    updateIssueBody: async (repo, num, body) => { updateCalls.push({ repo, num, body }); },
+    updateIssueBody: async (repo, num, body) => {
+      callOrder.push("updateIssueBody");
+      updateCalls.push({ repo, num, body });
+    },
     runHarness: async (_prompt) => {
       harnessCalls.push(_prompt);
       return { success: true, output: VALID_SPEC_BODY };
@@ -116,6 +125,10 @@ function makeDeps(overrides: Partial<SweepDeps> = {}): SweepDeps & {
     },
     gitEnsureClean: (dir) => { gitEnsureCleanCalls.push(dir); },
     gitCreateBranch: (_dir, branch, fromRef) => { branchCalls.push({ branch, fromRef }); },
+    reserveRemoteBranch: (_dir, branch, sha) => {
+      callOrder.push("reserveRemoteBranch");
+      reserveBranchCalls.push({ branch, sha });
+    },
     gitPushBranch: (_dir, _branch) => {},
     gitCommit: (_dir, _files, _msg) => {},
     createPR: async (_dir, title, body, base, head) => {
@@ -123,6 +136,7 @@ function makeDeps(overrides: Partial<SweepDeps> = {}): SweepDeps & {
       return "https://github.com/owner/repo/pull/99";
     },
     today: () => "2026-06-17",
+    randomToken: () => "abc123",
     log: (msg) => logLines.push(msg),
     ...overrides,
   };
@@ -134,6 +148,8 @@ function makeDeps(overrides: Partial<SweepDeps> = {}): SweepDeps & {
   (base as unknown as { _writtenFiles: typeof writtenFiles })._writtenFiles = writtenFiles;
   (base as unknown as { _gitEnsureCleanCalls: typeof gitEnsureCleanCalls })._gitEnsureCleanCalls = gitEnsureCleanCalls;
   (base as unknown as { _branchCalls: typeof branchCalls })._branchCalls = branchCalls;
+  (base as unknown as { _reserveBranchCalls: typeof reserveBranchCalls })._reserveBranchCalls = reserveBranchCalls;
+  (base as unknown as { _callOrder: typeof callOrder })._callOrder = callOrder;
   return base as ReturnType<typeof makeDeps>;
 }
 
@@ -663,5 +679,126 @@ test("CLI: pipeline sweep --apply --dry-run exits with error", () => {
   assert.ok(
     result.stderr.includes("mutually exclusive"),
     `expected mutually exclusive error; stderr:\n${result.stderr}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Review 2 — Finding 1: PR filtering
+// ---------------------------------------------------------------------------
+
+test("filterOutPullRequests: drops items with pull_request field, keeps plain issues", () => {
+  const items = [
+    { number: 1, title: "a real issue", body: "some body", pull_request: undefined },
+    { number: 2, title: "an open PR", body: "PR body", pull_request: { url: "https://..." } },
+    { number: 3, title: "another issue", body: null },
+  ];
+  const result = filterOutPullRequests(items);
+  assert.equal(result.length, 2, "should drop the PR entry");
+  assert.equal(result[0].number, 1);
+  assert.equal(result[1].number, 3);
+  assert.equal(result[1].body, "", "null body should become empty string");
+});
+
+test("filterOutPullRequests: all items are PRs → empty result", () => {
+  const items = [
+    { number: 10, title: "pr", body: "x", pull_request: { url: "u" } },
+    { number: 11, title: "pr2", body: "y", pull_request: {} },
+  ];
+  assert.equal(filterOutPullRequests(items).length, 0);
+});
+
+test("sweep: issues returned by listIssues are swept; PR entries must be excluded by the dep impl", async () => {
+  // The orchestrator receives the filtered list from SweepDeps.listIssues.
+  // This test verifies the orchestrator only processes what listIssues returns,
+  // not that it re-filters — the filter lives in realSweepDeps.listIssues.
+  const thinIssue: SweepIssue = { number: 5, title: "real issue", body: "Short." };
+  const deps = makeDeps({
+    // listIssues already returns only issues (no PRs) — per the SweepDeps contract
+    listIssues: async () => [thinIssue],
+  });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._harnessCalls.length, 1, "harness called once for the one real issue");
+});
+
+// ---------------------------------------------------------------------------
+// Review 2 — Finding 2: branch reservation before issue writes
+// ---------------------------------------------------------------------------
+
+test("sweep: --apply reserves remote branch before any issue body update", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "thin", body: "Short." };
+  const deps = makeDeps({ listIssues: async () => [thinIssue] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  const reserveIdx = deps._callOrder.indexOf("reserveRemoteBranch");
+  const updateIdx = deps._callOrder.indexOf("updateIssueBody");
+  assert.ok(reserveIdx >= 0, "reserveRemoteBranch should be called");
+  assert.ok(updateIdx >= 0, "updateIssueBody should be called");
+  assert.ok(reserveIdx < updateIdx, "reserveRemoteBranch must precede updateIssueBody");
+});
+
+test("sweep: --apply reserveRemoteBranch failure aborts before any issue writes", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "thin", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    reserveRemoteBranch: (_dir, _branch, _sha) => {
+      throw new Error("branch already exists on origin");
+    },
+  });
+
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /already exists on origin/,
+  );
+  assert.equal(deps._updateCalls.length, 0, "no issue writes should occur after reservation failure");
+});
+
+test("sweep: --apply branch name includes today's date and a random token", async () => {
+  const deps = makeDeps({ listIssues: async () => [] });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.ok(deps._branchCalls.length > 0, "gitCreateBranch should be called");
+  const branchName = deps._branchCalls[0].branch;
+  assert.ok(branchName.startsWith("sweep/2026-06-17"), "branch should start with sweep/<today>");
+  assert.ok(branchName.includes("abc123"), "branch should include the random token");
+});
+
+// ---------------------------------------------------------------------------
+// Review 2 — Finding 3: *(none)* row recognition
+// ---------------------------------------------------------------------------
+
+test("isIssueInReleasePlanTable: detects issues in *(none)* release-plan row", () => {
+  const roadmap = [
+    "## Release plan (sem-ver)",
+    "| Release | Bump | Theme | Issues | Why this bump |",
+    "|---|---|---|---|---|",
+    "| **v1.6.0** | minor | Intake | #158 | Adds intake. |",
+    "| *(none)* | — | Research trackers | #14, #27 | Research only. |",
+  ].join("\n");
+  assert.ok(isIssueInReleasePlanTable(roadmap, 14), "#14 should be detected in *(none)* row");
+  assert.ok(isIssueInReleasePlanTable(roadmap, 27), "#27 should be detected in *(none)* row");
+  assert.ok(isIssueInReleasePlanTable(roadmap, 158), "#158 should still be detected in versioned row");
+  assert.ok(!isIssueInReleasePlanTable(roadmap, 99), "#99 absent should not be detected");
+});
+
+test("sweep: reconciliation does not add release-plan row for issue already in *(none)* row", async () => {
+  // #14 is in the per-issue table and in the *(none)* release-plan row; the reconciliation
+  // must NOT add a new versioned release-plan row for it (Finding 3).
+  const issue14: SweepIssue = { number: 14, title: "research tracker", body: VALID_SPEC_BODY + "\n" + "x".repeat(50) };
+  const deps = makeDeps({
+    listIssues: async () => [issue14],
+  });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  // If #14 would have been incorrectly added, the diff would mention it.
+  // With the fix, #14 is already in all structures so the diff should be empty.
+  assert.ok(
+    allLog.includes("no changes") || !allLog.includes("| #14 |"),
+    "should not add a release-plan row for #14 already in *(none)* row",
   );
 });

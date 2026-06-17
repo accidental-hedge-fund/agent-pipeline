@@ -13,6 +13,7 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
 import { buildSweepPrompt } from "../prompts/index.ts";
@@ -22,7 +23,7 @@ import {
   insertDetailSectionBullet,
   computeUnifiedDiff,
 } from "./release.ts";
-import { inferReleaseSlot, extractOneLiner } from "./intake.ts";
+import { inferReleaseSlot, extractOneLiner, reservePushArgs } from "./intake.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -74,8 +75,16 @@ export interface SweepDeps {
   gitEnsureClean(repoDir: string): void;
   /** Create and checkout a new branch starting from the given ref. */
   gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
+  /**
+   * Reserve a remote branch ref create-only (fails if the ref already exists).
+   * Follows the intake pattern: proves push credentials work before any irreversible
+   * issue writes, and prevents branch collisions on same-day reruns.
+   */
+  reserveRemoteBranch(repoDir: string, branch: string, sha: string): void;
   /** Push the current branch to origin. */
   gitPushBranch(repoDir: string, branch: string): void;
+  /** Return a short random token for collision-resistant branch naming. */
+  randomToken(): string;
   /** Stage files and commit. */
   gitCommit(repoDir: string, files: string[], message: string): void;
   /** Open a PR; returns the PR URL. */
@@ -114,8 +123,8 @@ export function realSweepDeps(repoDir: string): SweepDeps {
             `[pipeline sweep] gh api issues failed (page ${page}, exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
           );
         }
-        const batch = JSON.parse(result.stdout.trim() || "[]") as Array<{ number: number; title: string; body: string | null }>;
-        all.push(...batch.map((i) => ({ number: i.number, title: i.title, body: i.body ?? "" })));
+        const batch = JSON.parse(result.stdout.trim() || "[]") as Array<{ number: number; title: string; body: string | null; pull_request?: unknown }>;
+        all.push(...filterOutPullRequests(batch));
         if (batch.length < PAGE_SIZE) break;
         page++;
       }
@@ -199,6 +208,27 @@ export function realSweepDeps(repoDir: string): SweepDeps {
         );
       }
     },
+    reserveRemoteBranch: (dir, branch, sha) => {
+      const result = spawnSync("git", reservePushArgs(branch, sha), {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      const out = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+      const statusLine = out.split("\n").find((l) => l.includes(`:refs/heads/${branch}`)) ?? "";
+      const flag = statusLine.charAt(0);
+      if (result.status === 0 && flag === "*") return; // newly created — reserved
+      if (flag === "!" || flag === "=" || /stale info/i.test(out)) {
+        throw new Error(
+          `[pipeline sweep] branch ${branch} already exists on origin — aborting before any issue writes.\n` +
+            `  A concurrent or prior sweep run reserved it; re-run to get a fresh branch name.`,
+        );
+      }
+      throw new Error(
+        `[pipeline sweep] could not reserve origin/${branch} via git push (exit ${result.status}): ${(result.stderr || result.stdout || "").trim()}\n` +
+          `  The branch may already exist, or push credentials are missing or read-only.`,
+      );
+    },
     gitPushBranch: (dir, branch) => {
       const result = spawnSync("git", ["push", "-u", "origin", branch], {
         encoding: "utf8",
@@ -247,8 +277,27 @@ export function realSweepDeps(repoDir: string): SweepDeps {
       return prResult.stdout.trim();
     },
     today: () => new Date().toISOString().slice(0, 10),
+    randomToken: () => crypto.randomBytes(3).toString("hex"),
     log: (msg) => process.stdout.write(msg + "\n"),
   };
+}
+
+// ---------------------------------------------------------------------------
+// PR filter (Finding 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Filter out pull requests from the GitHub REST /issues API response.
+ * The /repos/{owner}/{repo}/issues endpoint includes PRs; items with a
+ * `pull_request` field MUST be excluded to prevent sweep from rewriting active
+ * PR descriptions and adding PR numbers to ROADMAP.md as if they were issues.
+ */
+export function filterOutPullRequests(
+  items: Array<{ number: number; title: string; body: string | null; pull_request?: unknown }>,
+): Array<{ number: number; title: string; body: string }> {
+  return items
+    .filter((i) => !i.pull_request)
+    .map((i) => ({ number: i.number, title: i.title, body: i.body ?? "" }));
 }
 
 // ---------------------------------------------------------------------------
@@ -298,8 +347,9 @@ export function isIssueInPerIssueTable(roadmapText: string, issueNum: number): b
 }
 
 /**
- * Check if an issue number is referenced in the release-plan table (any row
- * with `| **v...` that contains `#N`).
+ * Check if an issue number is referenced in the release-plan table.
+ * Matches both versioned rows (`| **v...`) and the no-release row (`| *(none)*`),
+ * which `| **v...`-only filtering missed (Finding 3).
  *
  * Uses a word-boundary regex so #15 does not false-positive when only #158 is
  * present (the substring "#15" appears inside "#158").
@@ -308,7 +358,7 @@ export function isIssueInReleasePlanTable(roadmapText: string, issueNum: number)
   const pattern = new RegExp(`#${issueNum}(?!\\d)`);
   const lines = roadmapText.split("\n");
   for (const line of lines) {
-    if (!line.startsWith("| **v")) continue;
+    if (!line.startsWith("| **v") && !line.startsWith("| *(none)*")) continue;
     if (pattern.test(line)) return true;
   }
   return false;
@@ -394,11 +444,16 @@ export async function runSweep(
     d.log("  Pass --apply to update issue bodies and open the ROADMAP reconciliation PR.\n");
   }
 
-  // Finding 3: --apply preflight — validate all roadmap git state BEFORE any issue
-  // writes so a git failure cannot leave issue bodies updated with no ROADMAP PR.
+  // --apply preflight — validate roadmap git state AND reserve the remote branch
+  // BEFORE any issue writes (Finding 2). The branch reservation serves two purposes:
+  //   (a) It proves the push credential works, so a missing/read-only origin push
+  //       fails here — before any issue body is updated — instead of after.
+  //   (b) A collision-resistant name (date + random token) prevents same-day reruns
+  //       from hitting an existing remote ref and stranding updated issues with no PR.
   let preflightedBaseSha: string | undefined;
   let preflightedRoadmapAtBase: string | null = null;
   let roadmapSkippedInPreflight = false;
+  let preflightedBranch: string | undefined;
 
   if (opts.apply) {
     preflightedBaseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
@@ -408,6 +463,14 @@ export async function runSweep(
       roadmapSkippedInPreflight = true;
     }
     d.gitEnsureClean(repoDir);
+
+    // Compute branch name and reserve it on origin BEFORE any issue writes.
+    const preflightToday = d.today();
+    preflightedBranch = `sweep/${preflightToday}-roadmap-reconcile-${d.randomToken()}`;
+    d.log(`[pipeline sweep] creating local branch ${preflightedBranch} and reserving remote ref...`);
+    d.gitCreateBranch(repoDir, preflightedBranch, preflightedBaseSha);
+    d.reserveRemoteBranch(repoDir, preflightedBranch, preflightedBaseSha);
+    d.log(`[pipeline sweep] remote branch reserved — push credentials verified.\n`);
   }
 
   // ---------------------------------------------------------------------------
@@ -625,12 +688,11 @@ export async function runSweep(
       }
     }
   } else if (mutatedRoadmap !== roadmapAtBase) {
-    // --apply path: commit the mutated ROADMAP on a new branch and open a PR.
-    // Note: gitEnsureClean was already called in the preflight above.
+    // --apply path: commit the mutated ROADMAP on the already-reserved branch and open a PR.
+    // The branch was created + reserved in the preflight (before issue writes), so the push
+    // is a fast-forward onto the already-reserved ref over the already-proven credential.
+    const branch = preflightedBranch!;
     const today = d.today();
-    const branch = `sweep/${today}-roadmap-reconcile`;
-    d.log(`[pipeline sweep] creating roadmap reconciliation branch ${branch}...`);
-    d.gitCreateBranch(repoDir, branch, baseSha);
 
     d.writeFile(roadmapPath, mutatedRoadmap);
     const commitMsg =
