@@ -702,32 +702,55 @@ export async function runSweep(
     const branch = preflightedBranch!;
     const today = d.today();
 
+    const prTitle = `sweep: ROADMAP reconciliation (${today})`;
+    // Track which delivery step is in flight so the recovery instructions match reality: a
+    // write/commit failure means there is NO reconciliation commit on the branch, so a bare
+    // push+PR would open a PR with no ROADMAP change — the user must (re)create the commit first.
+    let deliveryPhase: "write" | "commit" | "push" | "pr" = "write";
     try {
+      deliveryPhase = "write";
       d.writeFile(roadmapPath, mutatedRoadmap);
       const commitMsg =
         `docs: ROADMAP — sweep reconciliation (${today})\n\n` +
         `Added ${roadmapAdded.length} issue(s) to ROADMAP.md: ${roadmapAdded.map((n) => `#${n}`).join(", ")}.\n\n` +
         `Issue: #168\nPipeline-Run: 168/2026-06-17T06:08:26Z`;
+      deliveryPhase = "commit";
       d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
+      deliveryPhase = "push";
       d.gitPushBranch(repoDir, branch);
 
-      const prTitle = `sweep: ROADMAP reconciliation (${today})`;
+      deliveryPhase = "pr";
       const prBody = buildRoadmapPRBody(roadmapAdded, roadmapErrors, today);
       const prUrl = await d.createPR(repoDir, prTitle, prBody, cfg.base_branch, branch);
       d.log(`[pipeline sweep] roadmap reconciliation PR opened: ${prUrl}`);
     } catch (err) {
       roadmapDeliveryBlocked = true;
       d.log(
-        `\n[pipeline sweep] ERROR: roadmap delivery failed: ${err instanceof Error ? err.message : String(err)}`,
+        `\n[pipeline sweep] ERROR: roadmap delivery failed during the ${deliveryPhase} step: ${err instanceof Error ? err.message : String(err)}`,
       );
       d.log(`  Issue bodies above have already been rewritten on GitHub.`);
       d.log(`  Branch "${branch}" has been reserved on origin.`);
-      d.log(`  To recover, manually push and open the PR:`);
-      d.log(`    git push -u origin ${branch}`);
-      d.log(
-        `    gh pr create --base ${cfg.base_branch} --head ${branch}` +
-          ` --title "sweep: ROADMAP reconciliation (${today})" --body "Manually recovered sweep run."`,
-      );
+      if (deliveryPhase === "write" || deliveryPhase === "commit") {
+        // No reconciliation commit exists on the branch. A bare push+PR would deliver NO
+        // ROADMAP change, so the recovery must (re)create the commit first.
+        const want = roadmapAdded.length > 0 ? roadmapAdded.map((n) => `#${n}`).join(", ") : "(none computed)";
+        d.log(`  The ROADMAP reconciliation commit was NOT created. To recover:`);
+        d.log(`    # inspect/repair ROADMAP.md — intended additions: ${want}`);
+        d.log(`    git add ROADMAP.md && git commit -m "docs: ROADMAP — sweep reconciliation (${today})"`);
+        d.log(`    git push origin ${branch}`);
+        d.log(
+          `    gh pr create --base ${cfg.base_branch} --head ${branch}` +
+            ` --title "${prTitle}" --body "Manually recovered sweep run."`,
+        );
+      } else {
+        // The reconciliation is committed on the branch; only push/PR remains.
+        d.log(`  The ROADMAP reconciliation is committed on ${branch}; only push/PR remains. To recover:`);
+        d.log(`    git push origin ${branch}`);
+        d.log(
+          `    gh pr create --base ${cfg.base_branch} --head ${branch}` +
+            ` --title "${prTitle}" --body "Manually recovered sweep run."`,
+        );
+      }
     }
 
     if (roadmapErrors.length > 0) {
@@ -750,6 +773,17 @@ export async function runSweep(
   };
 
   printSummaryReport(d, classified, roadmapDelta, opts.apply ?? false, roadmapDeliveryBlocked);
+
+  // Propagate a failure AFTER the summary + recovery instructions are printed: issue bodies
+  // were rewritten but the required ROADMAP reconciliation branch/PR was not delivered. The
+  // CLI maps a thrown error to a non-zero exit, so automation keying off exit status does not
+  // treat this partial bulk mutation as a complete success (#168 review-2).
+  if (roadmapDeliveryBlocked) {
+    throw new Error(
+      "[pipeline sweep] roadmap reconciliation was not delivered after issue bodies were rewritten — " +
+        "follow the recovery instructions above. Exiting non-zero so this partial run is not treated as complete.",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

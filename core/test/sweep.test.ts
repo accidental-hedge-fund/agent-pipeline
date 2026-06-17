@@ -297,6 +297,62 @@ test("sweep: --apply — roadmap PR opened for absent issues", async () => {
   assert.ok(pr.head.includes("sweep/"), "PR head should use sweep/ branch convention");
 });
 
+test("sweep: --apply — roadmap delivery failure propagates a non-zero exit (runSweep throws) (#168 review-2)", async () => {
+  // After issue bodies are rewritten, a ROADMAP delivery failure must NOT be swallowed —
+  // runSweep must throw so the CLI exits non-zero (automation keys off exit status). Otherwise
+  // a partial bulk mutation (issues rewritten, ROADMAP PR missing) looks like success.
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    createPR: async () => { throw new Error("gh pr create failed: no push access"); },
+  });
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /roadmap reconciliation was not delivered/,
+  );
+  assert.equal(deps._updateCalls.length, 1, "issue body was rewritten before the delivery failure (partial mutation)");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("roadmap delivery failed"), "recovery message is still printed before the throw");
+});
+
+test("sweep: --apply — gitCommit failure prints phase-specific recovery (commit ROADMAP first) (#168 review-2)", async () => {
+  // If gitCommit fails after writeFile there is NO reconciliation commit on the branch, so a
+  // bare push+PR would open a PR with no ROADMAP change. The recovery must instruct committing
+  // ROADMAP.md first.
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    gitCommit: () => { throw new Error("git commit failed: pre-commit hook rejected"); },
+  });
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /roadmap reconciliation was not delivered/,
+  );
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("failed during the commit step"), "names the failed delivery phase");
+  assert.ok(allLog.includes("commit was NOT created"), "warns the reconciliation commit is missing");
+  assert.ok(/git add ROADMAP\.md && git commit/.test(allLog), "recovery instructs committing ROADMAP.md first");
+  assert.equal(deps._createPRCalls.length, 0, "no PR opened when the commit fails");
+});
+
+test("sweep: --apply — gitPushBranch failure prints push/PR-only recovery (commit already exists) (#168 review-2)", async () => {
+  // Contrast: when the commit succeeded but push failed, the reconciliation IS committed —
+  // the recovery is push/PR-only and must NOT tell the user to recreate the commit.
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    gitPushBranch: () => { throw new Error("git push failed: transient network error"); },
+  });
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /roadmap reconciliation was not delivered/,
+  );
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("failed during the push step"), "names the push phase");
+  assert.ok(allLog.includes("only push/PR remains"), "push/PR-only recovery when the commit exists");
+  assert.ok(!allLog.includes("commit was NOT created"), "does NOT tell the user to recreate the commit");
+});
+
 test("sweep: --apply — no PR if ROADMAP already in sync", async () => {
   // #158 is already in all three ROADMAP structures in the fixture.
   const sufficientBody = VALID_SPEC_BODY + "\n" + "x".repeat(50);
@@ -779,8 +835,12 @@ test("sweep: createPR failure after issue updates — reports rewritten issue, d
     createPR: async () => { throw new Error("gh pr create: authentication required"); },
   });
 
-  // Must NOT propagate the error — the recovery block catches it and still prints the summary.
-  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+  // MUST propagate the failure (after printing the summary + recovery) so the CLI exits
+  // non-zero — but the issue rewrite + recovery instructions + summary still happen first.
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /roadmap reconciliation was not delivered/,
+  );
 
   // 1. The issue body was updated before the PR failure.
   assert.equal(deps._updateCalls.length, 1, "issue body should have been updated before PR failure");
@@ -796,7 +856,7 @@ test("sweep: createPR failure after issue updates — reports rewritten issue, d
   assert.ok(allLog.includes("sweep/2026-06-17"), "should show the reserved branch name");
   assert.ok(allLog.includes("gh pr create"), "should show a manual gh pr create command");
 
-  // 4. Summary report is still printed.
+  // 4. Summary report is still printed (before the throw).
   assert.ok(allLog.includes("Sweep Summary"), "summary report should be printed despite PR failure");
 
   // 5. The summary shows the rewritten issue.
@@ -809,14 +869,17 @@ test("sweep: createPR failure after issue updates — reports rewritten issue, d
   );
 });
 
-test("sweep: gitPushBranch failure after issue updates — recovery path printed, summary still appears", async () => {
+test("sweep: gitPushBranch failure after issue updates — recovery path printed, summary still appears, then throws", async () => {
   const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
   const deps = makeDeps({
     listIssues: async () => [thinIssue],
     gitPushBranch: (_dir, _branch) => { throw new Error("push rejected: remote branch diverged"); },
   });
 
-  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /roadmap reconciliation was not delivered/,
+  );
 
   assert.equal(deps._updateCalls.length, 1, "issue body should have been updated before push failure");
   const allLog = deps._logLines.join("\n");

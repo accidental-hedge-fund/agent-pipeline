@@ -105,12 +105,27 @@ After completing issue classification and (optionally) re-speccing, the handler 
 
 Under dry-run mode (no `--apply`), the handler SHALL print the proposed ROADMAP diff without creating a branch or PR.
 
+If, under `--apply`, the roadmap delivery (write → commit → push → PR) fails AFTER any issue body has been rewritten, the handler SHALL print the summary and step-aware recovery instructions and then SHALL propagate a failure (exit non-zero), so automation keying off exit status does not treat the partial bulk mutation (issues rewritten, ROADMAP PR missing) as a complete success. The recovery instructions SHALL match the failed step: when no reconciliation commit exists (a write or commit failure), they SHALL instruct the user to (re)create the ROADMAP.md commit on the reserved branch before pushing and opening the PR; when the commit already exists (a push or PR failure), they SHALL instruct only the push and PR.
+
 #### Scenario: Roadmap reconciliation PR is opened under `--apply`
 
 - **WHEN** `pipeline sweep --apply` completes
 - **THEN** a new branch SHALL be created containing the ROADMAP.md reconciliation
 - **AND** a PR targeting the default branch SHALL be opened
 - **AND** no direct commit to the default branch SHALL occur
+
+#### Scenario: Roadmap delivery failure after issue rewrites exits non-zero
+
+- **WHEN** `pipeline sweep --apply` rewrites one or more issue bodies but the roadmap branch/PR delivery then fails
+- **THEN** the handler SHALL print the summary and recovery instructions
+- **AND** SHALL exit non-zero (propagate a failure) rather than reporting success for the partial mutation
+
+#### Scenario: Recovery instructions match the failed delivery step
+
+- **WHEN** the delivery fails before a reconciliation commit exists on the branch (a `ROADMAP.md` write or commit failure)
+- **THEN** the recovery instructions SHALL tell the user to inspect/repair `ROADMAP.md` and create the commit on the reserved branch before pushing and opening the PR
+- **AND WHEN** the delivery fails after the commit exists (a push or PR-create failure)
+- **THEN** the recovery instructions SHALL tell the user only to push the reserved branch and open the PR
 
 #### Scenario: All three ROADMAP structures are updated consistently
 
