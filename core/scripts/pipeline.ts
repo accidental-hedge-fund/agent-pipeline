@@ -68,6 +68,7 @@ import {
   type TerminalLogTee,
 } from "./run-store.ts";
 import { runRelease } from "./stages/release.ts";
+import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -137,6 +138,10 @@ export interface CliOpts {
   /** Release: skip opening $EDITOR for ROADMAP review (commit scaffolded ROADMAP as-is).
    *  Commander's `--no-edit` sets `edit: false` here. */
   edit?: boolean;
+  /** Intake: short free-text description to spec into a GitHub issue. */
+  description?: string;
+  /** Intake/release: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
+  release?: string;
 }
 
 /**
@@ -152,7 +157,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -180,7 +185,9 @@ export function buildCmd(): Command {
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
     .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
     .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)")
-    .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)");
+    .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
+    .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
+    .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -201,6 +208,8 @@ async function main(): Promise<void> {
   const isDoctorCommand = numArg === "doctor";
   // `pipeline release <version>` prepares a release PR — no issue number required.
   const isReleaseCommand = numArg === "release";
+  // `pipeline intake [--description "<text>"] [--release vX.Y.Z]` — no issue number.
+  const isIntakeCommand = numArg === "intake";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -322,10 +331,10 @@ async function main(): Promise<void> {
   }
 
   // Guard: extra positional arguments are a mistake for the remaining commands
-  // (plain `pipeline <N>`, doctor, init). `run <N>` and `release <version>`
-  // legitimately have two positionals; `config`/`path` already returned above.
-  // Catches e.g. "pipeline 123 config validate" (#156).
-  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" ? 2 : 1;
+  // (plain `pipeline <N>`, doctor, init). `run <N>`, `release <version>`, and
+  // `intake [description]` legitimately have two positionals; `config`/`path`
+  // already returned above. Catches e.g. "pipeline 123 config validate" (#156).
+  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" ? 2 : 1;
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
@@ -350,6 +359,34 @@ async function main(): Promise<void> {
       await runRelease(versionArg, { dryRun: opts.dryRun, noEdit: opts.edit === false }, localCfg);
     } catch (err) {
       console.error(`pipeline release: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Early intake dispatch — derives repo_dir/base_branch from local git state
+  // only; the spec-generation step calls the harness but creates no pipeline
+  // stage labels. Dispatch happens before full config resolution.
+  if (isIntakeCommand) {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir);
+    if (!repoDir) {
+      console.error(
+        `pipeline: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    const intakeCfg = resolveReleaseConfig(repoDir, opts.base);
+    // Description: prefer --description flag, fall back to the second positional arg.
+    const descriptionArg = opts.description ?? cmd.args[1];
+    try {
+      await runIntake(
+        { description: descriptionArg ?? "", release: opts.release, dryRun: opts.dryRun },
+        intakeCfg,
+        realIntakeDeps(repoDir),
+      );
+    } catch (err) {
+      console.error(`pipeline intake: ${(err as Error).message}`);
       process.exit(1);
     }
     return;
@@ -432,7 +469,7 @@ async function main(): Promise<void> {
   const number = Number.parseInt(numArg ?? "", 10);
   if (!Number.isFinite(number) || number <= 0) {
     console.error(
-      `pipeline: argument <number> is required (or use --cleanup, --init, 'pipeline init', 'pipeline doctor', or 'pipeline logs')`,
+      `pipeline: argument <number> is required (or use --cleanup, --init, 'pipeline init', 'pipeline doctor', 'pipeline release', 'pipeline intake', or 'pipeline logs')`,
     );
     process.exit(2);
   }

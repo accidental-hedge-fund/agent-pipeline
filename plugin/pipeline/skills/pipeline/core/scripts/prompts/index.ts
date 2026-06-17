@@ -445,6 +445,20 @@ function buildConfidenceCalibrationWithPolicy(
   );
 }
 
+export interface BuildIntakeArgs {
+  description: string;
+  repoContext: string;
+  roadmapContext: string;
+}
+
+export function buildIntakePrompt(a: BuildIntakeArgs): string {
+  return substitute(loadTemplate("intake"), {
+    description: a.description,
+    repo_context: a.repoContext,
+    roadmap_context: a.roadmapContext,
+  });
+}
+
 // Exported for tests. CONFIDENCE_CALIBRATION_BLOCK is exposed so the drift test
 // can assert both review prompts embed the shared constant byte-for-byte.
 export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK };
