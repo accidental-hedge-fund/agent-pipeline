@@ -61,6 +61,9 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
 /pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run  preview only; no writes
+/pipeline roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run; no number)
+/pipeline roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
+/pipeline roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 

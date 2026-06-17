@@ -7,6 +7,7 @@ import {
   getHarnessLabel,
   getIssueLabelEvents,
   isBlocked,
+  mapRawIssue,
   normalizeClosingRefs,
   parseChecksAggregate,
   parseMergeable,
@@ -520,4 +521,69 @@ test("getIssueLabelEvents: a GitHub failure propagates (so the status JSON error
     throw new Error("GraphQL: rate limited");
   };
   await assert.rejects(() => getIssueLabelEvents(LABEL_CFG, 154, run), /rate limited/);
+});
+
+// ---------------------------------------------------------------------------
+// mapRawIssue (getOpenIssues pure parser, #171)
+// ---------------------------------------------------------------------------
+
+test("mapRawIssue: maps fields correctly for an open issue", () => {
+  const raw = {
+    number: 42,
+    title: "Add dark mode",
+    body: "As a user I want dark mode.",
+    labels: [{ name: "enhancement" }, { name: "p2" }],
+    url: "https://github.com/example/repo/issues/42",
+    state: "OPEN",
+    updatedAt: "2026-01-15T00:00:00Z",
+  };
+  const issue = mapRawIssue(raw);
+  assert.equal(issue.number, 42);
+  assert.equal(issue.title, "Add dark mode");
+  assert.equal(issue.body, "As a user I want dark mode.");
+  assert.deepEqual(issue.labels, ["enhancement", "p2"]);
+  assert.equal(issue.state, "open");
+  assert.equal(issue.updatedAt, "2026-01-15T00:00:00Z");
+});
+
+test("mapRawIssue: maps CLOSED state correctly", () => {
+  const raw = {
+    number: 1,
+    title: "Old issue",
+    body: "",
+    labels: [],
+    url: "https://github.com/example/repo/issues/1",
+    state: "closed",
+    updatedAt: undefined,
+  };
+  const issue = mapRawIssue(raw);
+  assert.equal(issue.state, "closed");
+});
+
+test("mapRawIssue: handles null/undefined body gracefully", () => {
+  const raw = {
+    number: 5,
+    title: "No body",
+    body: null as unknown as string,
+    labels: [],
+    url: "https://github.com/example/repo/issues/5",
+    state: "open",
+    updatedAt: undefined,
+  };
+  const issue = mapRawIssue(raw);
+  assert.equal(issue.body, "");
+});
+
+test("mapRawIssue: labels array is extracted from {name} objects", () => {
+  const raw = {
+    number: 7,
+    title: "Labeled issue",
+    body: "body",
+    labels: [{ name: "bug" }, { name: "needs-triage" }],
+    url: "",
+    state: "open",
+    updatedAt: undefined,
+  };
+  const issue = mapRawIssue(raw);
+  assert.deepEqual(issue.labels, ["bug", "needs-triage"]);
 });

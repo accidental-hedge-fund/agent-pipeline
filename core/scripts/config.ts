@@ -134,6 +134,29 @@ const PartialConfigSchema = z.object({
   // Opt-in sandboxed harness execution (#21). When true, the claude implementer
   // uses --permission-mode default instead of bypassPermissions.
   harness_sandbox: z.boolean().optional().describe("Run the claude implementer with --permission-mode default instead of bypassPermissions."),
+  // Backlog roadmap engine (#171). Optional per-repo overrides for label
+  // filtering, scoring weights, and write-back behaviour.
+  roadmap: z
+    .object({
+      include_labels: z.array(z.string()).optional().describe("Include only issues with at least one of these labels."),
+      exclude_labels: z.array(z.string()).optional().describe("Exclude issues that carry any of these labels."),
+      score_weights: z
+        .object({
+          impact: z.number().optional(),
+          confidence: z.number().optional(),
+          ease: z.number().optional(),
+          risk_reduction: z.number().optional(),
+          dep_leverage: z.number().optional(),
+        })
+        .strict()
+        .optional()
+        .describe("Multiplier overrides for each scoring sub-factor (default: 1.0 each)."),
+      hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
+      pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
+    })
+    .strict()
+    .optional()
+    .describe("Backlog roadmap engine settings (#171)."),
 }).strict();
 
 export interface ResolveOptions {
@@ -315,6 +338,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     setup_command: fileConfig.setup_command,
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
+    roadmap: fileConfig.roadmap,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;

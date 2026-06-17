@@ -142,6 +142,10 @@ export interface CliOpts {
   description?: string;
   /** Intake/release: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
   release?: string;
+  /** Roadmap: gate GitHub write-backs (comments, PRs); default is dry-run. */
+  apply?: boolean;
+  /** Roadmap: emit top-N dependency-safe issues from an existing plan.json. */
+  next?: number;
 }
 
 /**
@@ -157,7 +161,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -187,7 +191,9 @@ export function buildCmd(): Command {
     .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)")
     .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
     .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
-    .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)");
+    .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
+    .option("--apply", "roadmap: execute GitHub write-backs (hygiene comments, roadmap PR); default is dry-run")
+    .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number);
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -414,10 +420,45 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early roadmap dispatch — no issue number, derives repo/config from local git state.
+  if (numArg === "roadmap") {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir);
+    if (!repoDir) {
+      console.error(
+        `pipeline: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    let roadmapCfg: import("./types.ts").PipelineConfig;
+    try {
+      roadmapCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline roadmap: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const { runRoadmap } = await import("./roadmap/index.ts");
+    const { realRoadmapDeps } = await import("./stages/roadmap-deps.ts");
+    try {
+      await runRoadmap(
+        roadmapCfg.repo,
+        roadmapCfg.repo_dir,
+        roadmapCfg.base_branch,
+        roadmapCfg.roadmap ?? {},
+        { apply: !!opts.apply, next: opts.next, dryRun: opts.dryRun },
+        realRoadmapDeps(roadmapCfg),
+      );
+    } catch (err) {
+      console.error(`pipeline roadmap: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +

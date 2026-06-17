@@ -992,3 +992,113 @@ export function parseMergeable(detail: PrDetail): "clean" | "conflict" | "unknow
   if (state === "DIRTY" || state === "BEHIND" || state === "BLOCKED") return "conflict";
   return "unknown";
 }
+
+// ---------------------------------------------------------------------------
+// Roadmap engine helpers (#171)
+// ---------------------------------------------------------------------------
+
+export interface OpenIssue {
+  number: number;
+  title: string;
+  body: string;
+  labels: string[];
+  url: string;
+  state: "open" | "closed";
+  updatedAt?: string;
+}
+
+interface GhIssueRaw {
+  number: number;
+  title: string;
+  body: string;
+  labels: { name: string }[];
+  url: string;
+  state: string;
+  updatedAt?: string;
+}
+
+/**
+ * Map a raw `gh issue list --json` entry to the typed `OpenIssue` shape.
+ * Exported for unit testing.
+ */
+export function mapRawIssue(issue: GhIssueRaw): OpenIssue {
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body ?? "",
+    labels: (issue.labels ?? []).map((l) => l.name),
+    url: issue.url,
+    state: (issue.state?.toLowerCase() === "closed" ? "closed" : "open") as "open" | "closed",
+    updatedAt: issue.updatedAt,
+  };
+}
+
+/**
+ * Fetch all open issues from a repo.
+ * Uses `gh issue list --json` with confirmed field names.
+ */
+export async function getOpenIssues(
+  repo: string,
+  opts: { labels?: string[] } = {},
+): Promise<OpenIssue[]> {
+  const args = [
+    "issue",
+    "list",
+    "--state",
+    "open",
+    "--json",
+    "number,title,body,labels,url,state,updatedAt",
+    "--limit",
+    "500",
+    "-R",
+    repo,
+  ];
+  if (opts.labels && opts.labels.length > 0) {
+    args.push("--label", opts.labels.join(","));
+  }
+
+  const stdout = await ghRun(args, { timeoutMs: 60_000 });
+  const raw = JSON.parse(stdout) as GhIssueRaw[];
+  return raw.map(mapRawIssue);
+}
+
+interface GhMilestoneRaw {
+  id: number;
+  number: number;
+  title: string;
+}
+
+/**
+ * Fetch all milestones for a repo.
+ * Uses `gh api repos/<repo>/milestones`.
+ */
+export async function getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>> {
+  const stdout = await ghRun(["api", `repos/${repo}/milestones`, "--paginate"], {
+    timeoutMs: 30_000,
+  });
+  const raw = JSON.parse(stdout) as GhMilestoneRaw[];
+  return raw.map((m) => ({ id: m.id, number: m.number, title: m.title }));
+}
+
+/**
+ * Create a milestone in a repo and return its number.
+ */
+export async function createMilestone(
+  repo: string,
+  title: string,
+  dueOn?: string,
+): Promise<number> {
+  const args = [
+    "api",
+    `repos/${repo}/milestones`,
+    "--method",
+    "POST",
+    "--field",
+    `title=${title}`,
+  ];
+  if (dueOn) args.push("--field", `due_on=${dueOn}`);
+
+  const stdout = await ghRun(args, { timeoutMs: 30_000 });
+  const result = JSON.parse(stdout) as { number: number };
+  return result.number;
+}

@@ -278,6 +278,22 @@ export interface PipelineConfig {
   // harnesses exit. auto_fix: true → commit any produced changes and re-run;
   // auto_fix: false → block immediately on non-zero exit. Default: [].
   format_gate: { command: string; auto_fix: boolean }[];
+  // Backlog roadmap engine (#171). Optional per-repo overrides for filtering,
+  // scoring weights, and write-back behaviour. All keys are optional; defaults
+  // apply when the block is absent.
+  roadmap?: {
+    include_labels?: string[];
+    exclude_labels?: string[];
+    score_weights?: {
+      impact?: number;
+      confidence?: number;
+      ease?: number;
+      risk_reduction?: number;
+      dep_leverage?: number;
+    };
+    hygiene_auto_apply?: boolean;
+    pr_docs?: boolean;
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
