@@ -767,6 +767,65 @@ test("sweep: --apply branch name includes today's date and a random token", asyn
 });
 
 // ---------------------------------------------------------------------------
+// Review 3 — Finding 1: roadmap delivery failure after issue writes → recovery path
+// ---------------------------------------------------------------------------
+
+test("sweep: createPR failure after issue updates — reports rewritten issue, delivery failure, and recovery command", async () => {
+  // #168 is absent from the fixture ROADMAP, so a roadmap PR would be attempted.
+  // createPR throws to simulate a post-issue-write delivery failure.
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    createPR: async () => { throw new Error("gh pr create: authentication required"); },
+  });
+
+  // Must NOT propagate the error — the recovery block catches it and still prints the summary.
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  // 1. The issue body was updated before the PR failure.
+  assert.equal(deps._updateCalls.length, 1, "issue body should have been updated before PR failure");
+  assert.equal(deps._updateCalls[0].num, 168, "the updated issue number should be #168");
+
+  const allLog = deps._logLines.join("\n");
+
+  // 2. Delivery failure is reported.
+  assert.ok(allLog.includes("roadmap delivery failed"), "should report roadmap delivery failure");
+  assert.ok(allLog.includes("authentication required"), "should include the underlying error message");
+
+  // 3. Actionable recovery path is shown: branch name and gh pr create command.
+  assert.ok(allLog.includes("sweep/2026-06-17"), "should show the reserved branch name");
+  assert.ok(allLog.includes("gh pr create"), "should show a manual gh pr create command");
+
+  // 4. Summary report is still printed.
+  assert.ok(allLog.includes("Sweep Summary"), "summary report should be printed despite PR failure");
+
+  // 5. The summary shows the rewritten issue.
+  assert.ok(allLog.includes("#168"), "summary should include the rewritten issue number");
+
+  // 6. Summary indicates delivery was blocked (not falsely claiming success).
+  assert.ok(
+    allLog.includes("ROADMAP delivery BLOCKED") || allLog.includes("BLOCKED"),
+    "summary should indicate roadmap delivery was blocked",
+  );
+});
+
+test("sweep: gitPushBranch failure after issue updates — recovery path printed, summary still appears", async () => {
+  const thinIssue: SweepIssue = { number: 168, title: "sweep sub-command", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    gitPushBranch: (_dir, _branch) => { throw new Error("push rejected: remote branch diverged"); },
+  });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._updateCalls.length, 1, "issue body should have been updated before push failure");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("roadmap delivery failed"), "should report delivery failure");
+  assert.ok(allLog.includes("push rejected"), "should include push error message");
+  assert.ok(allLog.includes("Sweep Summary"), "summary should still be printed");
+});
+
+// ---------------------------------------------------------------------------
 // Review 2 — Finding 3: *(none)* row recognition
 // ---------------------------------------------------------------------------
 

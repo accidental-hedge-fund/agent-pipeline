@@ -678,6 +678,10 @@ export async function runSweep(
     }
   }
 
+  // Tracks whether the roadmap delivery (commit + push + PR) failed after issue
+  // bodies were already written. Used to adjust the summary report message.
+  let roadmapDeliveryBlocked = false;
+
   if (!opts.apply) {
     const diff = computeUnifiedDiff(roadmapAtBase, mutatedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
     d.log("\n=== Proposed ROADMAP.md diff ===\n");
@@ -691,21 +695,40 @@ export async function runSweep(
     // --apply path: commit the mutated ROADMAP on the already-reserved branch and open a PR.
     // The branch was created + reserved in the preflight (before issue writes), so the push
     // is a fast-forward onto the already-reserved ref over the already-proven credential.
+    //
+    // Wrap in try/catch: if any delivery step fails after issue bodies have been rewritten,
+    // we must still print the summary and recovery instructions rather than aborting with
+    // only an uncaught exception. This is the partial-write recovery block.
     const branch = preflightedBranch!;
     const today = d.today();
 
-    d.writeFile(roadmapPath, mutatedRoadmap);
-    const commitMsg =
-      `docs: ROADMAP — sweep reconciliation (${today})\n\n` +
-      `Added ${roadmapAdded.length} issue(s) to ROADMAP.md: ${roadmapAdded.map((n) => `#${n}`).join(", ")}.\n\n` +
-      `Issue: #168\nPipeline-Run: 168/2026-06-17T06:08:26Z`;
-    d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
-    d.gitPushBranch(repoDir, branch);
+    try {
+      d.writeFile(roadmapPath, mutatedRoadmap);
+      const commitMsg =
+        `docs: ROADMAP — sweep reconciliation (${today})\n\n` +
+        `Added ${roadmapAdded.length} issue(s) to ROADMAP.md: ${roadmapAdded.map((n) => `#${n}`).join(", ")}.\n\n` +
+        `Issue: #168\nPipeline-Run: 168/2026-06-17T06:08:26Z`;
+      d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
+      d.gitPushBranch(repoDir, branch);
 
-    const prTitle = `sweep: ROADMAP reconciliation (${today})`;
-    const prBody = buildRoadmapPRBody(roadmapAdded, roadmapErrors, today);
-    const prUrl = await d.createPR(repoDir, prTitle, prBody, cfg.base_branch, branch);
-    d.log(`[pipeline sweep] roadmap reconciliation PR opened: ${prUrl}`);
+      const prTitle = `sweep: ROADMAP reconciliation (${today})`;
+      const prBody = buildRoadmapPRBody(roadmapAdded, roadmapErrors, today);
+      const prUrl = await d.createPR(repoDir, prTitle, prBody, cfg.base_branch, branch);
+      d.log(`[pipeline sweep] roadmap reconciliation PR opened: ${prUrl}`);
+    } catch (err) {
+      roadmapDeliveryBlocked = true;
+      d.log(
+        `\n[pipeline sweep] ERROR: roadmap delivery failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      d.log(`  Issue bodies above have already been rewritten on GitHub.`);
+      d.log(`  Branch "${branch}" has been reserved on origin.`);
+      d.log(`  To recover, manually push and open the PR:`);
+      d.log(`    git push -u origin ${branch}`);
+      d.log(
+        `    gh pr create --base ${cfg.base_branch} --head ${branch}` +
+          ` --title "sweep: ROADMAP reconciliation (${today})" --body "Manually recovered sweep run."`,
+      );
+    }
 
     if (roadmapErrors.length > 0) {
       for (const e of roadmapErrors) {
@@ -726,7 +749,7 @@ export async function runSweep(
     errors: roadmapErrors.length,
   };
 
-  printSummaryReport(d, classified, roadmapDelta, opts.apply ?? false);
+  printSummaryReport(d, classified, roadmapDelta, opts.apply ?? false, roadmapDeliveryBlocked);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +782,7 @@ function printSummaryReport(
   classified: ClassifiedIssue[],
   roadmapDelta: { added: number; unchanged: number; errors: number } | null,
   applied: boolean,
+  roadmapDeliveryBlocked = false,
 ): void {
   d.log("\n=== Sweep Summary ===\n");
 
@@ -783,7 +807,9 @@ function printSummaryReport(
     d.log(`\nROADMAP delta: ${roadmapDelta.added} issue(s) added, ${roadmapDelta.unchanged} already present, ${roadmapDelta.errors} error(s)`);
   }
 
-  if (applied) {
+  if (applied && roadmapDeliveryBlocked) {
+    d.log("\nIssue bodies updated in place. ROADMAP delivery BLOCKED — see recovery instructions above.");
+  } else if (applied) {
     d.log("\nWrites applied: issue bodies updated in place; roadmap change delivered as a branch + PR.");
   } else {
     d.log("\nPreview only — no writes performed. Run with --apply to commit changes.");
