@@ -69,6 +69,7 @@ import {
 } from "./run-store.ts";
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
+import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -142,10 +143,12 @@ export interface CliOpts {
   description?: string;
   /** Intake/release: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
   release?: string;
-  /** Roadmap: gate GitHub write-backs (comments, PRs); default is dry-run. */
+  /** Roadmap/sweep: gate GitHub write-backs (comments, PRs); default is dry-run. */
   apply?: boolean;
   /** Roadmap: emit top-N dependency-safe issues from an existing plan.json. */
   next?: number;
+  /** Sweep: override the target GitHub repository (owner/repo). */
+  repo?: string;
 }
 
 /**
@@ -161,7 +164,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap | sweep")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -192,8 +195,9 @@ export function buildCmd(): Command {
     .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
     .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap: execute GitHub write-backs (hygiene comments, roadmap PR); default is dry-run")
-    .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number);
+    .option("--apply", "roadmap/sweep: execute GitHub write-backs (issue updates, roadmap PR); default is dry-run")
+    .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
+    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -216,6 +220,8 @@ async function main(): Promise<void> {
   const isReleaseCommand = numArg === "release";
   // `pipeline intake [--description "<text>"] [--release vX.Y.Z]` — no issue number.
   const isIntakeCommand = numArg === "intake";
+  // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
+  const isSweepCommand = numArg === "sweep";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -361,7 +367,8 @@ async function main(): Promise<void> {
   // Guard: extra positional arguments are a mistake for the remaining commands
   // (plain `pipeline <N>`, doctor, init). `run <N>`, `release <version>`, and
   // `intake [description]` legitimately have two positionals; `config`/`path`
-  // already returned above. Catches e.g. "pipeline 123 config validate" (#156).
+  // already returned above. `sweep` is a bulk command with no issue number —
+  // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
   const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" ? 2 : 1;
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
@@ -455,10 +462,39 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early sweep dispatch — no issue number, uses resolveConfig for repo discovery.
+  if (isSweepCommand) {
+    // Finding 1: --dry-run and --apply are mutually exclusive for sweep.
+    if (opts.dryRun && opts.apply) {
+      console.error("pipeline sweep: --dry-run and --apply are mutually exclusive — omit one.");
+      process.exit(2);
+    }
+    let sweepCfg: import("./types.ts").PipelineConfig;
+    try {
+      sweepCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline sweep: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const sweepConfig = sweepCfg.sweep ?? {};
+    try {
+      await runSweep(
+        { apply: !!opts.apply, repo: opts.repo },
+        { repo_dir: sweepCfg.repo_dir, repo: sweepCfg.repo, base_branch: sweepCfg.base_branch },
+        sweepConfig,
+        realSweepDeps(sweepCfg.repo_dir),
+      );
+    } catch (err) {
+      console.error(`pipeline sweep: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +

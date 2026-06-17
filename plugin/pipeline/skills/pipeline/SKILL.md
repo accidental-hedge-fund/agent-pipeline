@@ -61,6 +61,9 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
 /pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run  preview only; no writes
+/pipeline sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
+/pipeline sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
+/pipeline sweep --apply --repo other/r   sweep a different repository
 /pipeline roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run; no number)
 /pipeline roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
 /pipeline roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
@@ -109,6 +112,20 @@ The spec-generation step is the only model call; issue creation and roadmap edit
 are deterministic. The roadmap update is opened as a PR for human review — the
 pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
 proposes the first open lane from `ROADMAP.md`.
+
+`sweep` is the **batch** companion to `intake`: it re-specs every thin issue in
+the existing backlog and reconciles `ROADMAP.md` in one pass:
+
+```bash
+/pipeline sweep                  # preview what would change (no writes)
+/pipeline sweep --apply          # apply: update issues + open ROADMAP PR
+/pipeline sweep --apply --repo owner/repo   # target a different repo
+```
+
+Default is preview-only (dry-run). With `--apply`: thin issue bodies are updated
+in place; the ROADMAP reconciliation is delivered as a branch + PR for human
+review (never committed directly to the default branch). Re-running sweep is
+idempotent — already-specced issues are recognized as sufficient and skipped.
 
 ## Setup (zero install after first run)
 

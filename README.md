@@ -206,6 +206,9 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
 /pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
+/pipeline sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
+/pipeline sweep --apply                       same, updating issue bodies and opening a ROADMAP reconciliation PR
+/pipeline sweep --apply --repo other/repo     sweep a different repository
 /pipeline roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run; no number)
 /pipeline roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
 /pipeline roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
@@ -249,6 +252,49 @@ The number is auto-detected as an issue or PR. PRs resolve to their linked closi
 | `--dry-run` | Print the proposed issue body and ROADMAP diff; exit without writing to GitHub or the filesystem. |
 
 The pipeline never merges — the ROADMAP PR requires a human to review and merge the release-slot placement.
+
+## Sweep sub-command
+
+`pipeline sweep` is a no-issue-number batch maintenance pass that re-specs every thin issue in the backlog and reconciles `ROADMAP.md` in one shot. Without `--apply` it only **previews** what it would change — safe to run at any time.
+
+```bash
+# Preview: print which issues would be re-specced and the proposed ROADMAP diff (no writes):
+/pipeline sweep
+
+# Apply: update thin issue bodies and open a ROADMAP reconciliation PR:
+/pipeline sweep --apply
+
+# Target a different repository:
+/pipeline sweep --apply --repo owner/other-repo
+```
+
+**What it does:**
+
+1. **Classify (deterministic):** for each open issue, applies a structural heuristic to decide if it is *sufficient* (leave as-is) or *thin* (needs re-speccing). The heuristic checks body length ≥ 150 chars, presence of ≥ 2 required section headings, and that the body isn't a single sentence.
+2. **Re-spec (model-invoking, one call per thin issue):** for each thin issue, invokes the claude harness to generate an implementable spec body following the WHAT-not-HOW contract (Summary, User story, Acceptance criteria, Out of scope; Open questions only when genuinely ambiguous). Author context is preserved, not discarded.
+3. **Roadmap reconciliation (deterministic):** identifies open issues absent from any of the three ROADMAP structures (release-plan table, per-issue sem-ver table, detail sections) and adds them. Under `--apply`, the update is delivered as a branch + PR for human review — never committed directly to the default branch.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--apply` | Apply writes: update thin issue bodies and open the ROADMAP reconciliation PR. Default is dry-run (preview only). |
+| `--repo <owner/repo>` | Override the target repository. Default: current repo from `gh` config. |
+
+**Idempotency:** a second sweep run recognizes already-specced issues as sufficient and skips them — no model calls, no updates.
+
+The pipeline never merges — the ROADMAP reconciliation PR requires a human to review and merge.
+
+**Config overrides** (`.github/pipeline.yml`):
+```yaml
+sweep:
+  min_body_length: 200        # minimum body chars (default: 150)
+  required_sections:           # headings that must be present (without ##)
+    - Summary
+    - User story
+    - Acceptance criteria
+    - Out of scope
+```
 
 ## Onboarding a new repo
 
