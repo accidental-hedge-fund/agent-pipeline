@@ -14,8 +14,10 @@ export interface WritebackDeps {
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string | null>;
   gitCreateBranch(repoDir: string, branch: string, fromRef?: string): Promise<void>;
+  gitBranchExists(repoDir: string, branch: string): Promise<boolean>;
   gitCommit(repoDir: string, files: string[], message: string): Promise<void>;
   gitPushBranch(repoDir: string, branch: string): Promise<void>;
+  findPrByHead(repo: string, head: string): Promise<string | null>;
   createPr(repoDir: string, title: string, body: string, base: string, head: string): Promise<string>;
   createLabel(repo: string, name: string, color: string): Promise<void>;
   applyLabel(repo: string, issueNumber: number, label: string): Promise<void>;
@@ -172,8 +174,26 @@ export async function openRoadmapPr(
   const docsPath = `${repoDir}/docs/roadmaps/${repoSlug}.md`;
   const relPath = `docs/roadmaps/${repoSlug}.md`;
 
+  // Idempotency: if a PR already exists for this branch, return its URL without re-creating
+  const existingPr = await deps.findPrByHead(plan.repo, branch);
+  if (existingPr) {
+    deps.log(`[roadmap] roadmap PR already exists for branch ${branch}: ${existingPr}`);
+    return existingPr;
+  }
+
+  // Check if docs content is unchanged compared to what we'd write — no-op if identical
+  const existingContent = await deps.readFile(docsPath);
+  if (existingContent === md) {
+    deps.log(`[roadmap] roadmap docs unchanged — skipping PR creation`);
+    return null;
+  }
+
   deps.log(`[roadmap] opening roadmap PR on branch ${branch}...`);
-  await deps.gitCreateBranch(repoDir, branch);
+  const branchExists = await deps.gitBranchExists(repoDir, branch);
+  if (!branchExists) {
+    // Create branch from the configured base so the PR targets the right history
+    await deps.gitCreateBranch(repoDir, branch, baseBranch);
+  }
   await deps.writeFile(docsPath, md);
   const commitMsg = `docs: roadmap for ${plan.repo} (generated ${plan.generated_at.slice(0, 10)})\n\nIssue: #171\nPipeline-Run: 171/2026-06-17T04:37:16Z`;
   await deps.gitCommit(repoDir, [relPath], commitMsg);

@@ -76,10 +76,11 @@ export function estimateRiskReduction(item: InventoryItem): number {
 /**
  * Compute dep_leverage: how many issues does this unblock?
  * Returns a score 1–5 based on unblock count.
+ * Edge convention: {from: prerequisite, to: depender} — edges where from===issueNumber
+ * mean this issue is a prerequisite for other issues (i.e., it unblocks them).
  */
 export function computeDepLeverage(issueNumber: IssueNumber, graph: DepGraph): number {
-  // Count direct must_precede successors (issues that depend on this one)
-  const unblocks = graph.must_precede.filter((e) => e.to === issueNumber).length;
+  const unblocks = graph.must_precede.filter((e) => e.from === issueNumber).length;
   if (unblocks >= 4) return 5;
   if (unblocks === 3) return 4;
   if (unblocks === 2) return 3;
@@ -169,12 +170,15 @@ function extractRisks(item: InventoryItem): string[] {
 }
 
 function buildDepRationale(issueNumber: IssueNumber, graph: DepGraph): string {
+  // Edge convention: {from: prerequisite, to: depender}
+  // "blocked by" = this issue is a depender, so edges where to === issueNumber; prerequisite = from
   const blockedBy = graph.must_precede
-    .filter((e) => e.from === issueNumber)
-    .map((e) => `#${e.to}`);
-  const unblocks = graph.must_precede
     .filter((e) => e.to === issueNumber)
     .map((e) => `#${e.from}`);
+  // "unblocks" = this issue is a prerequisite, so edges where from === issueNumber; depender = to
+  const unblocks = graph.must_precede
+    .filter((e) => e.from === issueNumber)
+    .map((e) => `#${e.to}`);
 
   const parts: string[] = [];
   if (blockedBy.length > 0) parts.push(`Blocked by: ${blockedBy.join(", ")}`);
@@ -192,9 +196,12 @@ function assignTier(
   topoTier: number,
   scored: ScoredItem,
 ): Tier {
+  // Edge convention: {from: prerequisite, to: depender}
+  // "isEnablerByDeps" = this issue is a prerequisite for 2+ others = many edges where from===issueNumber
   const isEnablerByDeps =
-    graph.must_precede.filter((e) => e.to === issueNumber).length >= 2;
-  const hasNoDeps = graph.must_precede.filter((e) => e.from === issueNumber).length === 0;
+    graph.must_precede.filter((e) => e.from === issueNumber).length >= 2;
+  // "hasNoDeps" = this issue has no prerequisites = no edges where to===issueNumber
+  const hasNoDeps = graph.must_precede.filter((e) => e.to === issueNumber).length === 0;
   const text = `${item.issue.title}\n${item.issue.body}`.toLowerCase();
   const isCleanup = /refactor|cleanup|deprecat|tech.debt|remove.dead/.test(text);
   const isResearch = /spike|research|investigate|explore/.test(text);
@@ -211,6 +218,7 @@ function assignTier(
 /**
  * Apply dependency ordering to produce tiered roadmap entries.
  * A dependent MUST NOT appear before its must_precede prerequisite.
+ * Within the same topo tier, items are ordered by canonical tier then priority.
  */
 export function applyDepAdjustment(
   scored: ScoredItem[],
@@ -229,29 +237,38 @@ export function applyDepAdjustment(
   });
 
   const itemByNumber = new Map(items.map((i) => [i.issue.number, i]));
-  const scoredByNumber = new Map(scored.map((s) => [s.issue_number, s]));
-
-  // Sort by: topo tier first (must respect dep order), then priority descending
-  const sorted = [...scored].sort((a, b) => {
-    const ta = topoTierMap.get(a.issue_number) ?? 0;
-    const tb = topoTierMap.get(b.issue_number) ?? 0;
-    if (ta !== tb) return ta - tb;
-    return b.priority - a.priority;
-  });
 
   const TIER_ORDER: Tier[] = ["enablers", "dependency-unlock", "high-value/low-risk", "larger-bets", "cleanup"];
 
-  return sorted.map((s, idx): RoadmapEntry => {
+  // Two-pass: first assign canonical tiers (needs topo tier info), then sort
+  const withTiers = scored.map((s) => {
     const item = itemByNumber.get(s.issue_number)!;
     const topoTierIdx = topoTierMap.get(s.issue_number) ?? 0;
     const tier = assignTier(s.issue_number, item, graph, topoTierIdx, s);
+    return { s, tier, topoTierIdx };
+  });
 
+  // Sort by: topo tier first (hard dep constraint), then canonical tier, then priority desc
+  withTiers.sort((a, b) => {
+    if (a.topoTierIdx !== b.topoTierIdx) return a.topoTierIdx - b.topoTierIdx;
+    const ta = TIER_ORDER.indexOf(a.tier);
+    const tb = TIER_ORDER.indexOf(b.tier);
+    if (ta !== tb) return ta - tb;
+    return b.s.priority - a.s.priority;
+  });
+
+  return withTiers.map(({ s, tier }, idx): RoadmapEntry => {
+    const item = itemByNumber.get(s.issue_number)!;
+
+    // Edge convention: {from: prerequisite, to: depender}
+    // "unblocks" = this issue is a prerequisite; edges where from===issueNumber → dependers
     const unblocks = graph.must_precede
-      .filter((e) => e.to === s.issue_number)
-      .map((e) => e.from);
-    const blocked_by = graph.must_precede
       .filter((e) => e.from === s.issue_number)
       .map((e) => e.to);
+    // "blocked_by" = this issue is a depender; edges where to===issueNumber → prerequisites
+    const blocked_by = graph.must_precede
+      .filter((e) => e.to === s.issue_number)
+      .map((e) => e.from);
 
     return {
       rank: idx + 1,

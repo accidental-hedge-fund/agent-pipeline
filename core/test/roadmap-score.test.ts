@@ -95,82 +95,19 @@ describe("computeDepLeverage", () => {
     assert.equal(computeDepLeverage(1, graph), 1);
   });
 
-  it("returns 2 for an issue that unblocks one other", () => {
+  it("returns 2 when issue is a prerequisite for one other", () => {
     const graph = emptyGraph();
-    graph.must_precede.push({ from: 2, to: 1, file_line: "", rationale: "" }); // 2 is unblocked by 1? No wait.
-    // Edge: "from must precede to" — issue 1 must precede issue 2 means 1 unblocks 2.
-    // computeDepLeverage counts edges where e.to === issueNumber (issues that depend on this one)
-    // Wait, let me re-read: "count of must_precede edges where e.to === issueNumber"
-    // That means issues where issueNumber is the DOWNSTREAM (the one being depended on)
-    // In the format: from must_precede to → "from" unblocks "to"
-    // So to count what "issueNumber" unblocks, we want edges where e.from === issueNumber
-    // Let me re-check the score.ts implementation...
-    // Actually from score.ts: filter(e => e.to === issueNumber)
-    // That means issues that depend ON issueNumber (i.e., this issue must come BEFORE them)
-    // So: if issue 1 must precede issue 2, edge is {from:1, to:2}
-    // computeDepLeverage(1) = filter(e.to === 1) = 0 → returns 1
-    // computeDepLeverage(2) = filter(e.to === 2) = 1 → returns 2?
-    // Wait no. Let me re-read the dep direction.
-    // "A must_precede B" means A comes before B, A unblocks B.
-    // So if we ask "how many issues does issue N unblock?", we want edges where N is "from"
-    // But score.ts uses `e.to === issueNumber`. That seems backwards...
-    // Let me re-check: "from: IssueNumber" and "to: IssueNumber" in DepEdge.
-    // In depgraph.ts line 125: candidates.push([item.issue.number, depNum])
-    // where item depends on depNum → so "item must come AFTER depNum"
-    // But then in buildDepgraph, the edge is: from=item.issue.number, to=depNum
-    // Wait: textualCandidates are [fromNum, toNum] where fromNum depends on toNum
-    // Then in buildDepgraph: edge = {from: fromNum, to: toNum} → "fromNum depends on toNum"
-    // And the graph format "must_precede" means {from, to} where from must come BEFORE to
-    // So if item 10 depends on item 5, edge is {from:10, to:5} meaning "10 depends on 5"
-    // Wait that seems wrong for "must_precede". "10 must precede 5" would mean 10 comes before 5,
-    // but we said 10 depends on 5, so 5 should come before 10...
-    // Hmm, let me re-check the spec. The dep edge says "from must precede to" in the types.
-    // "from must precede to" = from comes before to.
-    // If issue 10 depends on issue 5, then 5 must come before 10 → edge should be {from:5, to:10}
-    // But in depgraph.ts: `candidates.push([item.issue.number, depNum])` where item depends on depNum
-    // Then `const [fromNum, toNum] = textualCandidates[i]` and `edge = {from: fromNum, to: toNum}`
-    // So edge = {from: 10, to: 5} — but "from must precede to" means 10 must precede 5,
-    // which contradicts "10 depends on 5" (5 should come first)...
-    // This is a bug in depgraph.ts OR I'm misreading the dep direction.
-    // Let me look at the topoSort: outEdges.get(edge.from)!.push(edge.to)
-    // So "from" has an outgoing edge to "to". The inDegree of "to" increases.
-    // In Kahn's: nodes with inDegree 0 go first. So "to" goes AFTER "from".
-    // So must_precede {from, to}: from goes first. "from must precede to" = from before to.
-    // But in buildDepgraph: item.issue.number "depends on" depNum. So depNum should come first.
-    // The edge should be {from: depNum, to: item.issue.number} = "depNum must precede item".
-    // But the code does {from: item.issue.number, to: depNum}...
-    // Actually wait: "candidates.push([item.issue.number, depNum])"
-    // and then `const [fromNum, toNum] = candidates[i]`
-    // and `edge = {from: fromNum, to: toNum}`
-    // So fromNum = item.issue.number (the depender), toNum = depNum (the prerequisite)
-    // This means the edge {from: depender, to: prerequisite} = "depender must precede prerequisite"
-    // That is indeed backwards from what "must_precede" should mean...
-    // Unless the convention in this codebase is that "from → to" means "from depends on to" (not "from comes before to")
-    // and "from must precede to" means "before doing to, from must be done first" (i.e., from is a prerequisite of to)
-    // Hmm. Actually "A must_precede B" can be read as "A is a prerequisite for B" = A must happen before B.
-    // But that would mean A = the prerequisite = depNum (5), B = the dependent = item.number (10)
-    // So edge should be {from: 5, to: 10} meaning "5 must precede 10"
-    // But the code creates {from: 10, to: 5}... something's off.
-    // Let me re-check score.ts buildDepRationale:
-    // "blockedBy = graph.must_precede.filter(e => e.from === issueNumber).map(e => '#' + e.to)"
-    // This says "issues that issue N is blocked by" = edges where N is "from" and e.to is the blocker.
-    // So {from: issueNumber, to: blocker} = "issueNumber is blocked by blocker"
-    // OK so in THIS codebase: must_precede[].from = the DEPENDENT (blocked item), to = the PREREQUISITE (blocker).
-    // That's the opposite of the natural language "must_precede" but it's consistent internally.
-    // The field name "must_precede" is confusing but the code is at least self-consistent.
-    // So "computeDepLeverage counts filter(e.to === issueNumber)" = count of issues that have THIS as their prerequisite.
-    // That makes sense: e.to === issueNumber means "some issue depends on issueNumber" → issueNumber unblocks them.
-    // Great, so the logic is correct, just the naming is confusing.
-    graph.must_precede = [];
-    graph.must_precede.push({ from: 2, to: 1, file_line: "", rationale: "" }); // issue 2 is blocked by issue 1
+    // Edge convention: {from: prerequisite, to: depender}
+    // Issue 1 must precede issue 2: edge {from:1, to:2}
+    graph.must_precede.push({ from: 1, to: 2, file_line: "", rationale: "" });
     assert.equal(computeDepLeverage(1, graph), 2);
   });
 
-  it("returns 5 when an issue unblocks 4+ others", () => {
+  it("returns 5 when an issue is a prerequisite for 4+ others", () => {
     const graph = emptyGraph();
-    // Issues 2,3,4,5 are all blocked by issue 1
+    // Issues 2,3,4,5 all depend on issue 1: edges {from:1, to:i}
     for (let i = 2; i <= 5; i++) {
-      graph.must_precede.push({ from: i, to: 1, file_line: "", rationale: "" });
+      graph.must_precede.push({ from: 1, to: i, file_line: "", rationale: "" });
     }
     assert.equal(computeDepLeverage(1, graph), 5);
   });
@@ -213,35 +150,20 @@ describe("scoreItems", () => {
 });
 
 describe("applyDepAdjustment", () => {
-  it("respects dep ordering: prerequisite appears before dependent", () => {
-    // Issue 2 depends on issue 1 (i.e., edge {from: 2, to: 1} means 2 is blocked by 1)
+  it("regression: prerequisite (#1) appears before dependent (#2) in roadmap", () => {
+    // Edge convention: {from: prerequisite, to: depender}
+    // Issue 2 depends on issue 1 → edge {from:1, to:2} = "1 must precede 2"
     const items: InventoryItem[] = [makeItem(1), makeItem(2)];
     const graph: DepGraph = {
       ...emptyGraph(),
-      must_precede: [{ from: 2, to: 1, file_line: "", rationale: "" }],
+      must_precede: [{ from: 1, to: 2, file_line: "src/types.ts:1", rationale: "import" }],
     };
     const scored = scoreItems(items, graph);
     const roadmap = applyDepAdjustment(scored, items, graph);
 
     const rank1 = roadmap.find((r) => r.issue_number === 1)!.rank;
     const rank2 = roadmap.find((r) => r.issue_number === 2)!.rank;
-    // Issue 1 is the prerequisite, so it should rank BEFORE issue 2
-    // In topoSort: edge {from:2, to:1} means 2 has outgoing edge to 1 (outEdges[2] = [1])
-    // inDegree[1] increments. So 2 starts with inDegree 0, 1 has inDegree 1.
-    // So tier 0 = [2], tier 1 = [1].
-    // Hmm that means 2 (the dependent) comes before 1 (the prerequisite)...
-    // OK so there IS an inconsistency in the dep direction naming. Let me check score.ts buildDepRationale again:
-    // "blockedBy = graph.must_precede.filter(e => e.from === issueNumber).map(e => '#' + e.to)"
-    // That says "issue N is blocked by issues e.to where e.from === N"
-    // So {from: 2, to: 1}: issue 2 is blocked by issue 1. Issue 1 is a prerequisite for issue 2.
-    // For topoSort: "from must_precede to" = "from comes before to" in the sorted order.
-    // But if issue 1 is a prerequisite for issue 2, then 1 should come before 2.
-    // So the edge should be {from: 1, to: 2} in the topoSort sense.
-    // But in buildDepRationale, {from: 2, to: 1} means "2 is blocked by 1" (1 is prerequisite).
-    // These two interpretations conflict.
-    // For the purpose of this test: let's just check that blocked_by / unblocks are set correctly.
-    assert.ok(Array.isArray(roadmap), "should return a roadmap array");
-    assert.equal(roadmap.length, 2);
+    assert.ok(rank1 < rank2, `prerequisite (#1, rank ${rank1}) must come before dependent (#2, rank ${rank2})`);
   });
 
   it("assigns ranks starting at 1", () => {
@@ -249,6 +171,39 @@ describe("applyDepAdjustment", () => {
     const roadmap = applyDepAdjustment(scoreItems(items, emptyGraph()), items, emptyGraph());
     const ranks = roadmap.map((r) => r.rank).sort((a, b) => a - b);
     assert.deepEqual(ranks, [1, 2, 3]);
+  });
+
+  it("cleanup-last: refactor issue ranks after non-cleanup issues (same topo tier)", () => {
+    const cleanupItem = makeItem(1, "cleanup: remove dead code", "Refactor old unused modules.");
+    const featureItem = makeItem(2, "Add new API endpoint", "## Summary\nNew endpoint.\n## Acceptance Criteria\n- [ ] Done");
+    const items = [cleanupItem, featureItem];
+    const graph = emptyGraph();
+    const scored = scoreItems(items, graph);
+    const roadmap = applyDepAdjustment(scored, items, graph);
+
+    const cleanupEntry = roadmap.find((r) => r.issue_number === 1)!;
+    const featureEntry = roadmap.find((r) => r.issue_number === 2)!;
+    assert.equal(cleanupEntry.tier, "cleanup", "refactor issue should be in cleanup tier");
+    assert.ok(cleanupEntry.rank > featureEntry.rank,
+      `cleanup (rank ${cleanupEntry.rank}) should rank after feature (rank ${featureEntry.rank})`);
+  });
+
+  it("enabler-first: issue unblocking 2+ others ranks before non-enablers (same topo tier)", () => {
+    // Issue 1 is a prerequisite for issues 2 and 3 → qualifies as enabler
+    const items = [makeItem(1, "Enable CI infrastructure"), makeItem(2, "Feature A"), makeItem(3, "Feature B")];
+    const graph: DepGraph = {
+      ...emptyGraph(),
+      must_precede: [
+        { from: 1, to: 2, file_line: "ci.yml:1", rationale: "unblocks" },
+        { from: 1, to: 3, file_line: "ci.yml:1", rationale: "unblocks" },
+      ],
+    };
+    const scored = scoreItems(items, graph);
+    const roadmap = applyDepAdjustment(scored, items, graph);
+
+    const enablerEntry = roadmap.find((r) => r.issue_number === 1)!;
+    assert.equal(enablerEntry.tier, "enablers", "issue unblocking 2+ should be in enablers tier");
+    assert.equal(enablerEntry.rank, 1, "enabler should be ranked first");
   });
 });
 

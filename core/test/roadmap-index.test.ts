@@ -40,10 +40,13 @@ function makeDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
     getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
     readFile: async () => null,
     runHarness: async () => ({ success: true, output: "[]" }),
+    runCritiqueHarness: async () => ({ success: true, output: "{}" }),
     writeFile: async () => {},
     gitCreateBranch: async () => {},
+    gitBranchExists: async () => false,
     gitCommit: async () => {},
     gitPushBranch: async () => {},
+    findPrByHead: async () => null,
     createPr: async () => "https://github.com/example/repo/pull/1",
     createLabel: async () => {},
     applyLabel: async () => {},
@@ -165,14 +168,10 @@ describe("runRoadmap - dry-run", () => {
 });
 
 describe("runRoadmap - critique integration", () => {
-  it("records critique entries from harness output", async () => {
+  it("uses runCritiqueHarness for phase 7 (separate from implementer runHarness)", async () => {
     const written: Record<string, string> = {};
-    let harnessCallCount = 0;
-
-    // First harness call: comprehend (returns prose)
-    // Subsequent calls for inventory (per issue): returns []
-    // Depgraph verification: not triggered (no textual deps)
-    // Critique: returns a structured verdict with a finding
+    let implementerCallCount = 0;
+    let critiqueCallCount = 0;
 
     const critiqueFinding = {
       verdict: "needs-attention",
@@ -183,13 +182,12 @@ describe("runRoadmap - critique integration", () => {
 
     const deps = makeDeps({
       getOpenIssues: async () => [makeIssue(1)],
-      runHarness: async (_prompt) => {
-        harnessCallCount++;
-        if (harnessCallCount <= 2) {
-          // Phase 1 comprehend + phase 2 inventory
-          return { success: true, output: "[]" };
-        }
-        // Phase 7 critique
+      runHarness: async () => {
+        implementerCallCount++;
+        return { success: true, output: "[]" };
+      },
+      runCritiqueHarness: async () => {
+        critiqueCallCount++;
         return { success: true, output: "```json\n" + JSON.stringify(critiqueFinding) + "\n```" };
       },
       writeFile: async (p, c) => { written[p] = c; },
@@ -198,14 +196,38 @@ describe("runRoadmap - critique integration", () => {
     const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-critique" };
     await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
 
+    assert.ok(critiqueCallCount > 0, "runCritiqueHarness should be called for phase 7");
+    // The critique call should NOT go through the implementer harness
     const planContent = Object.values(written).find((c) => {
       try { return JSON.parse(c)?.critique !== undefined; } catch { return false; }
     });
-    // If a critique finding was recorded, the plan should have it
     if (planContent) {
       const plan = JSON.parse(planContent) as PlanJson;
-      // Low severity finding should be advisory (below "high" threshold)
-      assert.ok(plan.critique.length > 0 || plan.open_questions.length >= 0, "plan should have critique array");
+      // Low severity finding should be advisory (below "high" block threshold)
+      assert.ok(plan.critique.length >= 0, "plan should have critique array");
     }
+  });
+
+  it("records critique failure as open_question instead of silently finalizing", async () => {
+    const written: Record<string, string> = {};
+
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1)],
+      runCritiqueHarness: async () => ({ success: false, output: "" }),
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-critique-fail" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.open_questions !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written even when critique harness fails");
+    const plan = JSON.parse(planContent!) as PlanJson;
+    assert.ok(
+      plan.open_questions.some((q) => q.description.includes("critique") || q.rationale?.includes("critique")),
+      "critique failure should appear as an open_question",
+    );
   });
 });

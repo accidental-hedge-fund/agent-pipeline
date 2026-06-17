@@ -35,7 +35,10 @@ export interface RoadmapOpts {
   outputDir?: string;
 }
 
-export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps {}
+export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps {
+  /** Critique harness: must be the reviewer role (not implementer). */
+  runCritiqueHarness(prompt: string): Promise<{ success: boolean; output: string }>;
+}
 
 interface CritiqueVerdict {
   verdict: string;
@@ -100,42 +103,64 @@ function buildCritiquePrompt(planJsonExcerpt: string): string {
 }
 
 /**
- * Generate basic hygiene proposals from the inventory.
+ * Generate hygiene proposals from the inventory.
+ * Returns { hygiene, openQuestions }: proposals with concrete file:line evidence go to hygiene[];
+ * issue-only observations (no file:line citation) go to openQuestions so that maintainers
+ * are not asked to apply an action without a verifiable code reference.
  */
-function generateHygiene(items: InventoryItem[]): HygieneItem[] {
+function generateHygiene(items: InventoryItem[]): { hygiene: HygieneItem[]; openQuestions: OpenQuestion[] } {
   const hygiene: HygieneItem[] = [];
+  const openQuestions: OpenQuestion[] = [];
 
   for (const item of items) {
     const body = item.issue.body ?? "";
     const title = item.issue.title ?? "";
+    const firstFile = item.touched_files[0];
 
     if (body.trim().length < 100 && !body.includes("- [ ]")) {
-      hygiene.push({
-        issue_number: item.issue.number,
-        action: "rewrite-title",
-        comment_text:
-          `## Roadmap: Issue needs more detail\n\n` +
-          `This issue has a very short description and no acceptance criteria. ` +
-          `Consider expanding with: Summary, User story, Acceptance criteria (- [ ] checkboxes), Out of scope.\n\n` +
-          `*Automated by \`pipeline roadmap\`*`,
-        evidence: `body length ${body.trim().length} chars, no acceptance criteria`,
-      });
+      if (firstFile) {
+        // We have a source-file reference: use it as the file:line citation
+        hygiene.push({
+          issue_number: item.issue.number,
+          action: "rewrite-title",
+          comment_text:
+            `## Roadmap: Issue needs more detail\n\n` +
+            `This issue has a very short description and no acceptance criteria. ` +
+            `Consider expanding with: Summary, User story, Acceptance criteria (- [ ] checkboxes), Out of scope.\n\n` +
+            `*Automated by \`pipeline roadmap\`*`,
+          evidence: `${firstFile}:1 (issue body ${body.trim().length} chars, no acceptance criteria)`,
+        });
+      } else {
+        openQuestions.push({
+          description: `Issue #${item.issue.number} "${title}" has a very short body (${body.trim().length} chars) and no acceptance criteria — consider rewriting`,
+          related_issues: [item.issue.number],
+          rationale: "issue metadata only; no file:line evidence available",
+        });
+      }
     }
 
     if (/spike|investigate|research|explore/.test(title.toLowerCase())) {
-      hygiene.push({
-        issue_number: item.issue.number,
-        action: "spike",
-        comment_text:
-          `## Roadmap: This looks like a spike/research item\n\n` +
-          `Consider time-boxing this to a fixed investigation period and creating a follow-up issue with findings.\n\n` +
-          `*Automated by \`pipeline roadmap\`*`,
-        evidence: "title contains research/spike keywords",
-      });
+      if (firstFile) {
+        hygiene.push({
+          issue_number: item.issue.number,
+          action: "spike",
+          comment_text:
+            `## Roadmap: This looks like a spike/research item\n\n` +
+            `Consider time-boxing this to a fixed investigation period and creating a follow-up issue with findings.\n\n` +
+            `*Automated by \`pipeline roadmap\`*`,
+          evidence: `${firstFile}:1 (title contains research/spike keywords)`,
+        });
+      } else {
+        openQuestions.push({
+          description: `Issue #${item.issue.number} "${title}" looks like a spike/research item — consider time-boxing`,
+          related_issues: [item.issue.number],
+          rationale: "issue metadata only; no file:line evidence available",
+        });
+      }
     }
   }
 
-  return hygiene;
+  return { hygiene, openQuestions };
 }
 
 /**
@@ -232,18 +257,18 @@ export async function runRoadmap(
   deps.log("[roadmap] phase 4: scoring...");
   const scored = scoreItems(items, depGraph, config.score_weights);
 
-  // Phase 5: Roadmap tiers
+  // Phase 5: Roadmap tiers (canonical tier order within each dep-tier preserved)
   deps.log("[roadmap] phase 5: producing tiered roadmap...");
   let roadmap = applyDepAdjustment(scored, items, depGraph);
 
-  // Phase 6: Hygiene
+  // Phase 6: Hygiene (proposals with file:line go to hygiene[]; issue-only to openQuestions)
   deps.log("[roadmap] phase 6: hygiene analysis...");
-  const hygiene = generateHygiene(items);
+  const { hygiene, openQuestions: hygieneOpenQuestions } = generateHygiene(items);
 
-  // Phase 7: Adversarial critique (up to 2 correction rounds)
+  // Phase 7: Adversarial critique (up to 2 correction rounds, using reviewer harness)
   deps.log("[roadmap] phase 7: adversarial critique...");
 
-  const openQuestions: OpenQuestion[] = [...depGraph.open_questions];
+  const openQuestions: OpenQuestion[] = [...depGraph.open_questions, ...hygieneOpenQuestions];
   const critiqueEntries: CritiqueEntry[] = [];
   const MAX_CORRECTION_ROUNDS = 2;
   let correctionRound = 0;
@@ -267,10 +292,15 @@ export async function runRoadmap(
       2,
     );
 
-    const critiqueResult = await deps.runHarness(buildCritiquePrompt(planExcerpt));
+    const critiqueResult = await deps.runCritiqueHarness(buildCritiquePrompt(planExcerpt));
 
     if (!critiqueResult.success) {
-      deps.log("[roadmap] phase 7: critique harness failed — skipping correction round");
+      deps.log("[roadmap] phase 7: critique harness failed — recording as open question");
+      openQuestions.push({
+        description: "Adversarial critique harness failed — roadmap may have undetected dep-order violations",
+        related_issues: [],
+        rationale: "critique harness returned success:false; re-run 'pipeline roadmap' to retry",
+      });
       break;
     }
 
@@ -340,7 +370,7 @@ export async function runRoadmap(
     if (newEdges.length > 0) {
       const allIssueNums = items.map((i) => i.issue.number);
       depGraph = addMustPrecedeEdges(depGraph, newEdges, allIssueNums);
-      roadmap = sortRoadmapByTier(applyDepAdjustment(scored, items, depGraph));
+      roadmap = applyDepAdjustment(scored, items, depGraph);
     }
 
     if (correctionRound >= MAX_CORRECTION_ROUNDS) {

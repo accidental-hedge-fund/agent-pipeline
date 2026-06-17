@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   topoSort,
   findTextualDepCandidates,
+  findFileBasedDepCandidates,
   parseDepVerifyResult,
   buildDepgraph,
   addMustPrecedeEdges,
@@ -68,22 +69,25 @@ describe("topoSort", () => {
 });
 
 describe("findTextualDepCandidates", () => {
-  it("detects 'depends on #N' in issue body", () => {
+  it("returns [prerequisite, depender] pairs: 'depends on #5' → #5 before #10", () => {
     const items: InventoryItem[] = [
       makeItem(10, "This issue depends on #5 to be completed first."),
       makeItem(5, "Stand-alone issue."),
     ];
     const candidates = findTextualDepCandidates(items);
-    assert.ok(candidates.some(([from, to]) => from === 10 && to === 5));
+    // #5 is the prerequisite, #10 is the depender → pair [5, 10]
+    assert.ok(candidates.some(([prereq, depender]) => prereq === 5 && depender === 10),
+      "prerequisite (#5) should be first, depender (#10) should be second");
   });
 
-  it("detects 'requires #N' in issue body", () => {
+  it("detects 'requires #N' in issue body with correct [prerequisite, depender] order", () => {
     const items: InventoryItem[] = [
       makeItem(20, "Requires #15 for the shared types."),
       makeItem(15, "Provides the shared types."),
     ];
     const candidates = findTextualDepCandidates(items);
-    assert.ok(candidates.some(([from, to]) => from === 20 && to === 15));
+    // #15 is the prerequisite, #20 is the depender → pair [15, 20]
+    assert.ok(candidates.some(([prereq, depender]) => prereq === 15 && depender === 20));
   });
 
   it("ignores references to issues not in the backlog", () => {
@@ -137,6 +141,40 @@ describe("parseDepVerifyResult", () => {
   });
 });
 
+describe("findFileBasedDepCandidates", () => {
+  it("generates candidate pairs for issues sharing touched files", () => {
+    const items: InventoryItem[] = [
+      { issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts", "core/bar.ts"] },
+      { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+      { issue: { number: 3, title: "C", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/baz.ts"] },
+    ];
+    const candidates = findFileBasedDepCandidates(items, []);
+    assert.ok(candidates.some(([a, b]) => (a === 1 && b === 2) || (a === 2 && b === 1)),
+      "issues 1 and 2 share core/foo.ts — should be a candidate pair");
+    assert.ok(!candidates.some(([a, b]) => (a === 1 && b === 3) || (a === 3 && b === 1)),
+      "issues 1 and 3 share no files — should not be a candidate pair");
+  });
+
+  it("skips pairs already in existing textual candidates", () => {
+    const items: InventoryItem[] = [
+      { issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+      { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["core/foo.ts"] },
+    ];
+    const existing: Array<[number, number]> = [[1, 2]];
+    const candidates = findFileBasedDepCandidates(items, existing);
+    assert.equal(candidates.length, 0, "pair 1→2 already exists in textual candidates");
+  });
+
+  it("returns empty for items with no shared files", () => {
+    const items: InventoryItem[] = [
+      { issue: { number: 1, title: "A", body: "", labels: [], url: "", state: "open" }, touched_files: ["a.ts"] },
+      { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["b.ts"] },
+    ];
+    const candidates = findFileBasedDepCandidates(items, []);
+    assert.deepEqual(candidates, []);
+  });
+});
+
 describe("buildDepgraph", () => {
   it("returns empty graph for empty backlog", async () => {
     const deps: DepgraphDeps = {
@@ -150,7 +188,7 @@ describe("buildDepgraph", () => {
     assert.deepEqual(graph.cycle_reports, []);
   });
 
-  it("promotes textually-confirmed strong edge to must_precede", async () => {
+  it("promotes textually-confirmed strong edge to must_precede with correct direction", async () => {
     const items: InventoryItem[] = [
       makeItem(10, "This issue depends on #5."),
       makeItem(5, "Foundation issue."),
@@ -170,11 +208,13 @@ describe("buildDepgraph", () => {
     };
 
     const graph = await buildDepgraph(items, deps);
-    assert.ok(graph.must_precede.some((e) => e.from === 10 && e.to === 5));
+    // Edge convention: {from: prerequisite, to: depender} — #5 must precede #10
+    assert.ok(graph.must_precede.some((e) => e.from === 5 && e.to === 10),
+      "prerequisite (#5) should be 'from', depender (#10) should be 'to'");
     assert.deepEqual(graph.cycle_reports, []);
   });
 
-  it("promotes textually-confirmed weak edge to should_precede", async () => {
+  it("promotes textually-confirmed weak edge to should_precede with correct direction", async () => {
     const items: InventoryItem[] = [
       makeItem(10, "This issue depends on #5."),
       makeItem(5, "Foundation issue."),
@@ -194,8 +234,39 @@ describe("buildDepgraph", () => {
     };
 
     const graph = await buildDepgraph(items, deps);
-    assert.ok(graph.should_precede.some((e) => e.from === 10 && e.to === 5));
+    assert.ok(graph.should_precede.some((e) => e.from === 5 && e.to === 10));
     assert.deepEqual(graph.must_precede, []);
+  });
+
+  it("source-verifies file-based candidates without textual hint", async () => {
+    // Issues share touched files but issue bodies don't mention each other
+    const items: InventoryItem[] = [
+      {
+        issue: { number: 1, title: "Add type T", body: "Add a new type.", labels: [], url: "", state: "open" },
+        touched_files: ["core/types.ts"],
+      },
+      {
+        issue: { number: 2, title: "Use type T", body: "Use the new type.", labels: [], url: "", state: "open" },
+        touched_files: ["core/types.ts", "core/consumer.ts"],
+      },
+    ];
+
+    const confirmResult = JSON.stringify({
+      edge_confirmed: true,
+      file_line: "core/types.ts:1",
+      rationale: "Consumer imports type from provider",
+      is_strong: true,
+    });
+
+    const deps: DepgraphDeps = {
+      runHarness: async () => ({ success: true, output: confirmResult }),
+      readFile: async () => "export type T = string;",
+      log: () => {},
+    };
+
+    const graph = await buildDepgraph(items, deps);
+    // The file-based candidate should have been source-verified and promoted
+    assert.ok(graph.must_precede.length > 0, "file-based candidate should be promoted to must_precede");
   });
 
   it("puts unverified candidates in open_questions", async () => {
@@ -220,6 +291,15 @@ describe("buildDepgraph", () => {
     const graph = await buildDepgraph(items, deps);
     assert.deepEqual(graph.must_precede, []);
     assert.ok(graph.open_questions.length > 0, "unverified edge should be in open_questions");
+  });
+
+  it("regression: topoSort with must_precede ranks prerequisite before dependent", () => {
+    // "#10 depends on #5" → edge {from:5, to:10} → topoSort puts #5 in tier 0, #10 in tier 1
+    const edges: DepEdge[] = [{ from: 5, to: 10, file_line: "src/main.ts:1", rationale: "import" }];
+    const { tiers, cycleReports } = topoSort([5, 10], edges);
+    assert.deepEqual(cycleReports, []);
+    assert.equal(tiers[0][0], 5, "#5 (prerequisite) must be in tier 0");
+    assert.equal(tiers[1][0], 10, "#10 (depender) must be in tier 1");
   });
 });
 

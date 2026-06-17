@@ -21,7 +21,9 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
 
     readFile: async (p) => {
       try {
-        return fs.readFileSync(p, "utf8");
+        // Resolve relative paths against cfg.repo_dir so --repo-path and subdir runs work correctly
+        const resolved = path.isAbsolute(p) ? p : path.join(cfg.repo_dir, p);
+        return fs.readFileSync(resolved, "utf8");
       } catch {
         return null;
       }
@@ -37,10 +39,27 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       return { success: result.success, output: result.stdout };
     },
 
+    runCritiqueHarness: async (prompt) => {
+      const result = await invoke(
+        cfg.harnesses.reviewer,
+        cfg.repo_dir,
+        prompt,
+        { stream: true, model: cfg.models.review },
+      );
+      return { success: result.success, output: result.stdout };
+    },
+
     writeFile: async (p, content) => {
       const dir = path.dirname(p);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(p, content, "utf8");
+    },
+
+    gitBranchExists: async (repoDir, branch) => {
+      const r = spawnSync("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+        cwd: repoDir, encoding: "utf8",
+      });
+      return r.status === 0;
     },
 
     gitCreateBranch: async (repoDir, branch, fromRef) => {
@@ -61,6 +80,21 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
     gitPushBranch: async (repoDir, branch) => {
       const r = spawnSync("git", ["push", "origin", branch], { cwd: repoDir, encoding: "utf8" });
       if (r.status !== 0) throw new Error(`git push failed: ${r.stderr}`);
+    },
+
+    findPrByHead: async (repo, head) => {
+      const r = spawnSync(
+        "gh",
+        ["pr", "list", "--head", head, "--json", "url", "-R", repo, "--state", "open"],
+        { encoding: "utf8" },
+      );
+      if (r.status !== 0) return null;
+      try {
+        const items = JSON.parse(r.stdout) as Array<{ url: string }>;
+        return items[0]?.url ?? null;
+      } catch {
+        return null;
+      }
     },
 
     createPr: async (repoDir, title, body, base, head) => {

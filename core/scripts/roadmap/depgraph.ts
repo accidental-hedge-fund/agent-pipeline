@@ -74,6 +74,8 @@ export function parseDepVerifyResult(output: string): DepVerifyResult | null {
 /**
  * Check whether there are any textual dependency hints in issue bodies
  * (e.g., "depends on #42", "requires #10").
+ * Returns pairs [prerequisite, depender] so the edge {from: prerequisite, to: depender}
+ * means "prerequisite must precede depender".
  */
 export function findTextualDepCandidates(items: InventoryItem[]): Array<[IssueNumber, IssueNumber]> {
   const issueNumbers = new Set(items.map((i) => i.issue.number));
@@ -87,8 +89,43 @@ export function findTextualDepCandidates(items: InventoryItem[]): Array<[IssueNu
     while ((m = depRe.exec(text)) !== null) {
       const depNum = Number.parseInt(m[1], 10);
       if (issueNumbers.has(depNum) && depNum !== item.issue.number) {
-        // issue depends on depNum → depNum must_precede issue
-        candidates.push([item.issue.number, depNum]);
+        // item.issue depends on depNum → depNum (prerequisite) must precede item.issue (depender)
+        candidates.push([depNum, item.issue.number]);
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Generate dependency candidates from shared touched-file relationships.
+ * When two issues share touched files, either may depend on the other — the
+ * harness will source-verify and confirm or deny the edge.
+ * Returns pairs [prerequisite-candidate, depender-candidate]; the caller deduplicates
+ * against textual candidates before verification.
+ */
+export function findFileBasedDepCandidates(
+  items: InventoryItem[],
+  existingCandidates: Array<[IssueNumber, IssueNumber]>,
+): Array<[IssueNumber, IssueNumber]> {
+  const existing = new Set(existingCandidates.map(([a, b]) => `${a}:${b}`));
+  const candidates: Array<[IssueNumber, IssueNumber]> = [];
+
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      const a = items[i];
+      const b = items[j];
+      const sharedFiles = a.touched_files.filter((f) => b.touched_files.includes(f));
+      if (sharedFiles.length === 0) continue;
+
+      // Check both directions (either could be the prerequisite)
+      const fwdKey = `${a.issue.number}:${b.issue.number}`;
+      const revKey = `${b.issue.number}:${a.issue.number}`;
+      if (!existing.has(fwdKey) && !existing.has(revKey)) {
+        // Add one candidate pair (a as prerequisite, b as depender); the harness will confirm direction
+        candidates.push([a.issue.number, b.issue.number]);
+        existing.add(fwdKey);
+        existing.add(revKey); // prevent the reverse from being added as a duplicate
       }
     }
   }
@@ -190,27 +227,33 @@ export async function buildDepgraph(
 
   if (items.length === 0) return graph;
 
-  // Find candidate dependency pairs from issue text
-  const textualCandidates = findTextualDepCandidates(items);
-  deps.log(`[roadmap] depgraph: found ${textualCandidates.length} textual dep candidates`);
-
   const itemByNumber = new Map(items.map((i) => [i.issue.number, i]));
 
-  // Source-verify each candidate
-  for (const [fromNum, toNum] of textualCandidates) {
-    const itemFrom = itemByNumber.get(fromNum);
-    const itemTo = itemByNumber.get(toNum);
+  // Find candidate dependency pairs from both issue text and shared touched files.
+  // Candidate pair [prerequisite, depender]: prerequisite must come before depender.
+  const textualCandidates = findTextualDepCandidates(items);
+  deps.log(`[roadmap] depgraph: found ${textualCandidates.length} textual dep candidates`);
+  const fileCandidates = findFileBasedDepCandidates(items, textualCandidates);
+  deps.log(`[roadmap] depgraph: found ${fileCandidates.length} file-based dep candidates`);
 
-    if (!itemFrom || !itemTo) continue;
+  const allCandidates = [...textualCandidates, ...fileCandidates];
 
-    deps.log(`[roadmap] depgraph: verifying #${fromNum} → #${toNum}...`);
-    const prompt = await buildDepVerifyPrompt(itemFrom, itemTo, deps);
+  // Source-verify each candidate. Edge convention: {from: prerequisite, to: depender}
+  // so "from must precede to" = prerequisite comes before depender in the roadmap.
+  for (const [prereqNum, dependerNum] of allCandidates) {
+    const itemPrereq = itemByNumber.get(prereqNum);
+    const itemDepender = itemByNumber.get(dependerNum);
+
+    if (!itemPrereq || !itemDepender) continue;
+
+    deps.log(`[roadmap] depgraph: verifying prerequisite #${prereqNum} → depender #${dependerNum}...`);
+    const prompt = await buildDepVerifyPrompt(itemPrereq, itemDepender, deps);
     const result = await deps.runHarness(prompt);
 
     if (!result.success) {
       graph.open_questions.push({
-        description: `Could not verify dependency #${fromNum} → #${toNum} (harness failed)`,
-        related_issues: [fromNum, toNum],
+        description: `Could not verify dependency #${prereqNum} → #${dependerNum} (harness failed)`,
+        related_issues: [prereqNum, dependerNum],
         rationale: "harness failure during dep verification",
       });
       continue;
@@ -219,8 +262,8 @@ export async function buildDepgraph(
     const verified = parseDepVerifyResult(result.output);
     if (!verified) {
       graph.open_questions.push({
-        description: `Could not parse dep-verify result for #${fromNum} → #${toNum}`,
-        related_issues: [fromNum, toNum],
+        description: `Could not parse dep-verify result for #${prereqNum} → #${dependerNum}`,
+        related_issues: [prereqNum, dependerNum],
         rationale: "parse failure",
       });
       continue;
@@ -228,26 +271,26 @@ export async function buildDepgraph(
 
     if (!verified.edge_confirmed) {
       graph.open_questions.push({
-        description: `Dependency #${fromNum} → #${toNum} not source-verified`,
-        related_issues: [fromNum, toNum],
+        description: `Dependency #${prereqNum} → #${dependerNum} not source-verified`,
+        related_issues: [prereqNum, dependerNum],
         rationale: verified.rationale || "edge not source-verified",
       });
       continue;
     }
 
     const edge: DepEdge = {
-      from: fromNum,
-      to: toNum,
+      from: prereqNum,
+      to: dependerNum,
       file_line: verified.file_line,
       rationale: verified.rationale,
     };
 
     if (verified.is_strong) {
       graph.must_precede.push(edge);
-      deps.log(`[roadmap] depgraph: promoted must_precede #${fromNum} → #${toNum} (${verified.file_line})`);
+      deps.log(`[roadmap] depgraph: promoted must_precede #${prereqNum} → #${dependerNum} (${verified.file_line})`);
     } else {
       graph.should_precede.push(edge);
-      deps.log(`[roadmap] depgraph: promoted should_precede #${fromNum} → #${toNum} (${verified.file_line})`);
+      deps.log(`[roadmap] depgraph: promoted should_precede #${prereqNum} → #${dependerNum} (${verified.file_line})`);
     }
   }
 

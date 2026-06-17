@@ -9,6 +9,7 @@ import {
   renderRoadmapMd,
   writeRoadmapMd,
   applyHygiene,
+  openRoadmapPr,
 } from "../scripts/roadmap/writeback.ts";
 import type { HygieneItem, PlanJson } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
@@ -44,8 +45,10 @@ function makeDeps(overrides: Partial<WritebackDeps> = {}): WritebackDeps {
     writeFile: async () => {},
     readFile: async () => null,
     gitCreateBranch: async () => {},
+    gitBranchExists: async () => false,
     gitCommit: async () => {},
     gitPushBranch: async () => {},
+    findPrByHead: async () => null,
     createPr: async () => "https://github.com/example/repo/pull/1",
     createLabel: async () => {},
     applyLabel: async () => {},
@@ -209,5 +212,51 @@ describe("applyHygiene - idempotency", () => {
 
     await applyHygiene([item], "example/repo", { apply: true }, deps);
     assert.equal(commentCallCount, 1, "should post comment when sentinel is absent");
+  });
+});
+
+describe("openRoadmapPr - idempotency", () => {
+  it("returns existing PR URL when a PR already exists for the branch (no duplicate PR)", async () => {
+    const existingPrUrl = "https://github.com/example/repo/pull/42";
+    let prCreateCallCount = 0;
+    const deps = makeDeps({
+      findPrByHead: async () => existingPrUrl,
+      createPr: async () => { prCreateCallCount++; return "https://github.com/example/repo/pull/99"; },
+    });
+    const plan = makePlan();
+    const result = await openRoadmapPr(plan, "/repo", "main", deps);
+    assert.equal(result, existingPrUrl, "should return existing PR URL");
+    assert.equal(prCreateCallCount, 0, "should not create a new PR when one already exists");
+  });
+
+  it("returns null when docs content is unchanged (no redundant PR)", async () => {
+    let prCreateCallCount = 0;
+    const plan = makePlan();
+    // Simulate existing docs file with identical content
+    const { renderRoadmapMd: render } = await import("../scripts/roadmap/writeback.ts");
+    const existingContent = render(plan);
+    const deps = makeDeps({
+      findPrByHead: async () => null,
+      readFile: async () => existingContent,  // existing docs matches what we'd write
+      createPr: async () => { prCreateCallCount++; return "https://github.com/example/repo/pull/1"; },
+    });
+    const result = await openRoadmapPr(plan, "/repo", "main", deps);
+    assert.equal(result, null, "should return null when docs are unchanged");
+    assert.equal(prCreateCallCount, 0, "should not create PR for unchanged docs");
+  });
+
+  it("creates branch from baseBranch (not from HEAD) when branch does not exist", async () => {
+    let createBranchFromRef: string | undefined;
+    let prCreateCallCount = 0;
+    const deps = makeDeps({
+      findPrByHead: async () => null,
+      gitBranchExists: async () => false,
+      gitCreateBranch: async (_repoDir, _branch, fromRef) => { createBranchFromRef = fromRef; },
+      createPr: async () => { prCreateCallCount++; return "https://github.com/example/repo/pull/1"; },
+    });
+    const plan = makePlan();
+    await openRoadmapPr(plan, "/repo", "develop", deps);
+    assert.equal(createBranchFromRef, "develop", "branch should be created from the configured baseBranch");
+    assert.equal(prCreateCallCount, 1, "should create PR when branch and docs are new");
   });
 });
