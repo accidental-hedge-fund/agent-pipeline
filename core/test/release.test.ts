@@ -1009,6 +1009,45 @@ test("runRelease: aborts before any write when a release-managed path is dirty (
   assert.ok(!restoreInvoked(commands), "no rollback issued — nothing was mutated");
 });
 
+test("runRelease: clean-tree guard forces --untracked-files=all (config-independent) (#170 review-2)", async () => {
+  // Plain `git status` honors `status.showUntrackedFiles`, so a maintainer with that set to
+  // `no` could slip an untracked file under plugin/ past the guard — which build.mjs's rm -rf
+  // would then destroy. The guard MUST pass --untracked-files=all so detection does not depend
+  // on user git config. This asserts the flag is present on the status command.
+  const statusCalls: string[][] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") { statusCalls.push([cmd, ...args]); return { code: 0, stdout: "", stderr: "" }; }
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "release: thing (#204)", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") return { code: 0, stdout: "https://github.com/org/repo/pull/301", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `Title #${n}`,
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158] : []),
+  });
+
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  assert.equal(statusCalls.length, 1, "git status checked exactly once");
+  assert.ok(
+    statusCalls[0].includes("--untracked-files=all"),
+    `clean-tree guard must force untracked detection, got: ${statusCalls[0].join(" ")}`,
+  );
+  // The pathspec covers all five release-managed paths (after the `--` separator).
+  const sep = statusCalls[0].indexOf("--");
+  const paths = statusCalls[0].slice(sep + 1);
+  for (const p of ["package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"]) {
+    assert.ok(paths.includes(p), `pathspec includes ${p}, got: ${paths.join(" ")}`);
+  }
+});
+
 test("runRelease: a clean working tree passes the precondition (status checked, no edits) (#170 review-2)", async () => {
   // With a clean tree (git status --porcelain empty), the release proceeds past the
   // precondition and reaches PR creation. Proves the precondition gates on real status output.

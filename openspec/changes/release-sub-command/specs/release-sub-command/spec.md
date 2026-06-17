@@ -104,6 +104,8 @@ After the version bump and mirror regen, the command SHALL run `npm run ci` from
 
 The live release SHALL refuse to start if any release-managed path — `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, or `.claude-plugin/` — has uncommitted changes (tracked modifications or untracked files) when the command begins, failing fast with a non-zero exit before bumping the version, regenerating the mirror, or writing any file. This clean-tree precondition makes the rollback provably lossless.
 
+Untracked-file detection SHALL be forced independent of the user's git configuration (i.e. it SHALL NOT rely on `status.showUntrackedFiles`), because the mirror regen step removes and rebuilds `plugin/` wholesale and would otherwise destroy an untracked file the guard failed to report. Ignored files under the regenerated mirror directories (`plugin/`, `.claude-plugin/`) are explicitly excluded from the lossless guarantee: those directories are generated build output that the mirror regen rewrites wholesale, so git-ignored content there is disposable by repo convention.
+
 Any abort after the version bump and mirror regen but before the release branch is created — mirror-regen failure, CI failure, issue-discovery failure, or an editor abort — SHALL restore `package.json`, `core/package.json`, `ROADMAP.md`, and the regenerated `plugin/` mirror to their pre-release (HEAD) state and remove any untracked mirror debris generated during the run, so a retry reads the original `previousVersion` and is not poisoned by stranded version/mirror changes. Because the precondition guaranteed these paths matched HEAD at the start, the rollback restores exactly the pre-release working tree and never discards a maintainer's pre-existing edits.
 
 #### Scenario: A dirty release-managed path fails fast before any mutation
@@ -111,6 +113,11 @@ Any abort after the version bump and mirror regen but before the release branch 
 - **WHEN** any of `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, or `.claude-plugin/` has uncommitted changes at the start of a live release
 - **THEN** the command SHALL exit non-zero naming the dirty paths and SHALL NOT bump the version, regenerate the mirror, or write any file
 - **AND** because nothing was mutated, no rollback is performed (there is nothing to restore and nothing to discard)
+
+#### Scenario: Untracked-file detection does not depend on user git config
+
+- **WHEN** the clean-tree precondition checks the release-managed paths
+- **THEN** it SHALL force untracked-file reporting (e.g. `git status --porcelain --untracked-files=all`) so an untracked file under `plugin/` is detected even when the maintainer has `status.showUntrackedFiles=no` configured
 
 #### Scenario: post-bump abort rolls back the bumped files
 

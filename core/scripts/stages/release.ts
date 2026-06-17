@@ -738,9 +738,17 @@ export async function runRelease(
   // up front makes the rollback provably lossless — the paths matched HEAD when we began, so
   // restoring from HEAD restores exactly the pre-release state — and keeps the automated
   // release commit free of unrelated edits (#170 review-2).
+  //
+  // `--untracked-files=all` is REQUIRED: plain `git status` honors `status.showUntrackedFiles`,
+  // so a maintainer with that set to `no` would slip an untracked file under `plugin/` past
+  // this guard — and `scripts/build.mjs` rm -rf's `plugin/` wholesale before regenerating, so
+  // that file would be destroyed. Forcing `=all` makes detection independent of user git config.
+  // Ignored files under the regenerated mirror dirs (`plugin/`, `.claude-plugin/`) are EXPLICITLY
+  // excluded from the lossless guarantee: those dirs are generated build output that build.mjs
+  // rewrites wholesale, so anything git-ignored there is disposable by repo convention.
   const releaseManagedPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"];
   d.stdout("[pipeline release] checking working tree is clean in release-managed paths...");
-  const statusResult = d.runCommand("git", ["status", "--porcelain", "--", ...releaseManagedPaths], { cwd: repoDir });
+  const statusResult = d.runCommand("git", ["status", "--porcelain", "--untracked-files=all", "--", ...releaseManagedPaths], { cwd: repoDir });
   if (statusResult.code !== 0) {
     throw new Error(
       `[pipeline release] could not verify working-tree cleanliness (git status exited ${statusResult.code}: ${statusResult.stderr.trim()})`,
