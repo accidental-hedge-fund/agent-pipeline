@@ -192,8 +192,8 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.5.0** ✅ shipped | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Shipped 2026-06-16 (tag `v1.5.0`) — fifth minor. Machine-facing launch/discovery, JSON status/preflight, stable run directory + JSON events + non-hanging log-follow, config schema/validate, and run-artifact conventions so Pipeline Desk can supervise runs without scraping terminal prose. Human `/pipeline` / `$pipeline` flows unchanged. See **Shipped** above. (#23 + #149 carried to v1.6.0.) |
 | **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170, #171, #168 | Shipped 2026-06-17 (tag `v1.6.0`) — sixth minor. Front-door intake (#158), release-PR automation (#170), backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168). See **Shipped** above for the per-PR detail. (#23 + #149 carried to v1.7.0.) |
 | **v1.6.1** | patch | Version-staleness detection | #186 | Planned. The version is already single-sourced from `core/package.json` (v1.6.0); this adds the missing *detection* guard: a `doctor` stale-install / version-coherence check + a `launcher-smoke` assertion that `--version` equals the installed `core/package.json`. Surfaced during the v1.6.0 release-verification sweep (prevents stale-install phantom-P0s like #176). |
-| **v1.7.0** | minor | Carried autonomy (forge-resistance) | #23, #149 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open) and **#149** (bounded auto-loop, depends on #23). |
-| **v1.7.0** | minor | Roadmap `release_model` config: bundle issues into milestones | #214 | The backlog-roadmap engine gains a `roadmap.release_model` setting (`semver` or `continuous`) that controls how its ranked plan is grouped into milestones, populating the roadmap's currently-empty `milestones[]` output. Additive; existing flows unchanged. |
+| **v1.7.0** | minor | Control plane & release_model | #214, #216, #217 | Cockpit-enablement control plane: `roadmap.release_model` (`semver`/`continuous`) populating the engine's `milestones[]` (#214), a `pipeline triage` stage-label command (#216), and a human-invoked, **loop-isolated** `pipeline merge` command (#217). Single-sourced so pipeline-desk's stage dropdown / merge button call them. |
+| **v1.8.0** | minor | Carried autonomy (forge-resistance) | #23, #149 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open) and **#149** (bounded auto-loop, depends on #23). |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -224,9 +224,9 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
 | #70 | minor | adds key | per-step models | v1.2.0 | #91 ✓ |
 | #144 | patch | none | convergence robustness | v1.2.0 | — |
-| #23 | minor | adds key | graduated autonomy | v1.3.0 | — |
+| #23 | minor | adds key | graduated autonomy | v1.8.0 | — |
 | #21 | minor | adds key | execution isolation | v1.3.0 | #93 ✓ |
-| #149 | minor | adds key | bounded auto-loop | v1.3.0 | #23 / #21 / #133 ✓ |
+| #149 | minor | adds key | bounded auto-loop | v1.8.0 | #23 / #21 / #133 ✓ |
 | #148 | minor | adds key | private eval / shipcheck gate | v1.4.0 | #12 / #147 |
 | #153 | minor | none | desktop launcher/discovery | v1.5.0 | — |
 | #154 | minor | JSON output only | desktop status/preflight | v1.5.0 | #146 |
@@ -238,7 +238,9 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #171 | minor | adds `roadmap:` config + new mode | backlog-roadmap engine | v1.6.0 | #158 |
 | #168 | minor | new sub-command | sweep re-spec / roadmap rebase | v1.6.0 | #158 / #171 |
 | #186 | patch | none | version-staleness detection | v1.6.1 | — |
-| #214 | minor | new sub-command | intake | v1.7.0 | — |
+| #214 | minor | adds `roadmap.release_model` config | release_model / milestone grouping | v1.7.0 | #171 |
+| #216 | minor | new sub-command | triage (stage labels) | v1.7.0 | — |
+| #217 | minor | new sub-command | human-invoked PR merge | v1.7.0 | — |
 | _(anchor)_ | — | — | structural insertion anchor for `intake`/`sweep` (do not remove) | *(none)* | — |
 
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
@@ -302,10 +304,15 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 
 - **#158** — Front-door intake sub-command. A new no-issue-number `/pipeline` mode (alongside `--init` / `--cleanup` / `--version`) takes a short description, expands it into a decision-complete spec using the same contract as the `/pm` issue-spec agent (Summary / User story / Acceptance criteria / Out of scope / Open questions; WHAT-not-HOW), **creates the GitHub issue** with the right `pipeline:*` + `release:*` labels, and **proposes a `ROADMAP.md` update** — release-plan row, per-issue sem-ver row, and detail section — as a branch + PR for human review. The model-invoking spec step is the only non-deterministic part; issue creation and roadmap editing are deterministic given the spec. A dry-run prints the proposed issue + roadmap diff with no writes. Keeps the "pipeline never merges" contract: a human owns the roadmap-PR and release-slot decisions. **Open design forks** (in the issue): reuse `/pm` vs. embed an equivalent prompt; how the version is chosen / whether a new lane may be proposed; structured vs. anchor-based roadmap editing.
 
-### v1.7.0 — carried autonomy / forge-resistance (minor)
+### v1.7.0 — control plane & release_model (minor)
 
-- **#214** — The backlog-roadmap engine gains a `roadmap.release_model` setting (`semver` or `continuous`) that controls how its ranked plan is grouped into milestones, populating the roadmap's currently-empty `milestones[]` output.
-- **#23, #149** — Graduated-autonomy approval checkpoints (#23) and bounded auto-loop (#149), carried forward from the v1.5.0/v1.6.0 lines. #23 is parked on a checkpoint-comment forge-resistance security property (PR #194 open); #149 depends on #23.
+- **#214** — The backlog-roadmap engine gains a `roadmap.release_model` setting (`semver` or `continuous`) that controls how its ranked plan is grouped into milestones, populating the roadmap's currently-empty `milestones[]` output and (idempotently) mirroring the grouping to GitHub milestones/labels — `plan.json` as the generated source of truth, GitHub as the engine-owned mirror.
+- **#216** — `pipeline triage <issue> --stage ready|backlog`: a deterministic CLI command to move an issue between the pre-pipeline stage labels (single-sourced; pipeline-desk's stage dropdown calls it).
+- **#217** — `pipeline merge <pr>`: a human-invoked, **loop-isolated** PR-merge command — the autonomous `advance` loop never merges (rule #4); pipeline-desk's merge button calls it.
+
+### v1.8.0 — carried autonomy / forge-resistance (minor)
+
+- **#23, #149** — Graduated-autonomy approval checkpoints (#23) and bounded auto-loop (#149), carried forward from the v1.5.0/v1.6.0/v1.7.0 lines. #23 is parked on a checkpoint-comment forge-resistance security property (PR #194 open); #149 depends on #23.
 
 ## Decisions
 
