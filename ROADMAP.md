@@ -191,6 +191,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.4.0** ✅ shipped | minor | Private eval / shipcheck gate | #148 | Shipped 2026-06-16 (tag `v1.4.0`). Opt-in reviewer-owned `shipcheck` acceptance-rubric gate before `ready-to-deploy` (default off; wired into pre-merge + eval exit paths; realpath-confined rubric; rejects malformed/timed-out verdicts). #23 + #149 carried to v1.5.0. See **Shipped** above. |
 | **v1.5.0** ✅ shipped | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Shipped 2026-06-16 (tag `v1.5.0`) — fifth minor. Machine-facing launch/discovery, JSON status/preflight, stable run directory + JSON events + non-hanging log-follow, config schema/validate, and run-artifact conventions so Pipeline Desk can supervise runs without scraping terminal prose. Human `/pipeline` / `$pipeline` flows unchanged. See **Shipped** above. (#23 + #149 carried to v1.6.0.) |
 | **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170, #171, #168 | Shipped 2026-06-17 (tag `v1.6.0`) — sixth minor. Front-door intake (#158), release-PR automation (#170), backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168). See **Shipped** above for the per-PR detail. (#23 + #149 carried to v1.7.0.) |
+| **v1.6.1** | patch | Version-staleness detection | #186 | Planned. The version is already single-sourced from `core/package.json` (v1.6.0); this adds the missing *detection* guard: a `doctor` stale-install / version-coherence check + a `launcher-smoke` assertion that `--version` equals the installed `core/package.json`. Surfaced during the v1.6.0 release-verification sweep (prevents stale-install phantom-P0s like #176). |
 | **v1.7.0** | minor | Carried autonomy (forge-resistance) | #23, #149 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open) and **#149** (bounded auto-loop, depends on #23). |
 | *(none)* | — | Research trackers | #14, #27 | Decomposed research epics; they spawn child issues and ship no code themselves, so they map to no release. |
 
@@ -235,6 +236,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #170 | minor | new sub-command | release-PR automation | v1.6.0 | — |
 | #171 | minor | adds `roadmap:` config + new mode | backlog-roadmap engine | v1.6.0 | #158 |
 | #168 | minor | new sub-command | sweep re-spec / roadmap rebase | v1.6.0 | #158 / #171 |
+| #186 | patch | none | version-staleness detection | v1.6.1 | — |
 | #14 | none | — | research | *(none)* | — |
 | #27 | none | — | research | *(none)* | — |
 
