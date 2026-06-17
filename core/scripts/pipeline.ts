@@ -367,8 +367,9 @@ async function main(): Promise<void> {
   // Guard: extra positional arguments are a mistake for the remaining commands
   // (plain `pipeline <N>`, doctor, init). `run <N>`, `release <version>`, and
   // `intake [description]` legitimately have two positionals; `config`/`path`
-  // already returned above. Catches e.g. "pipeline 123 config validate" (#156).
-  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" || cmd.args[0] === "sweep" ? 2 : 1;
+  // already returned above. `sweep` is a bulk command with no issue number —
+  // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
+  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" ? 2 : 1;
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
@@ -463,6 +464,11 @@ async function main(): Promise<void> {
 
   // Early sweep dispatch — no issue number, uses resolveConfig for repo discovery.
   if (isSweepCommand) {
+    // Finding 1: --dry-run and --apply are mutually exclusive for sweep.
+    if (opts.dryRun && opts.apply) {
+      console.error("pipeline sweep: --dry-run and --apply are mutually exclusive — omit one.");
+      process.exit(2);
+    }
     let sweepCfg: import("./types.ts").PipelineConfig;
     try {
       sweepCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });

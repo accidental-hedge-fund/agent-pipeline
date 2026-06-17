@@ -409,19 +409,19 @@ test("sweep: config override min_body_length=300 causes 200-char body to be thin
 });
 
 // ---------------------------------------------------------------------------
-// 9.8 --repo flag: listIssues called with supplied owner/repo
+// 9.8 --repo flag: accepted when matching cfg.repo; rejected when different
 // ---------------------------------------------------------------------------
 
-test("sweep: --repo flag is passed to listIssues", async () => {
+test("sweep: --repo matching cfg.repo is accepted and passed to listIssues", async () => {
   const capturedRepos: string[] = [];
   const deps = makeDeps({
     listIssues: async (repo) => { capturedRepos.push(repo); return []; },
   });
-
-  await runSweep({ apply: false, repo: "other/repo" }, DEFAULT_CFG, {}, deps);
+  // --repo matches cfg.repo — no-op override, must not throw
+  await runSweep({ apply: false, repo: DEFAULT_CFG.repo }, DEFAULT_CFG, {}, deps);
 
   assert.equal(capturedRepos.length, 1);
-  assert.equal(capturedRepos[0], "other/repo", "should use the supplied --repo value");
+  assert.equal(capturedRepos[0], DEFAULT_CFG.repo, "should use cfg.repo when --repo matches");
 });
 
 test("sweep: defaults to cfg.repo when --repo is absent", async () => {
@@ -496,6 +496,130 @@ test("validateSweepSpecBody: throws when no checkable criteria", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Finding 2: --repo guard (cross-repo rejection)
+// ---------------------------------------------------------------------------
+
+test("sweep: --repo differs from cfg.repo throws before any writes", async () => {
+  const deps = makeDeps({ listIssues: async () => [] });
+
+  await assert.rejects(
+    () => runSweep({ apply: true, repo: "other/repo" }, DEFAULT_CFG, {}, deps),
+    /--repo "other\/repo" differs from the configured repo/,
+  );
+  assert.equal(deps._updateCalls.length, 0, "no issue writes should have occurred");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3: preflight ordering — git failure must abort before issue updates
+// ---------------------------------------------------------------------------
+
+test("sweep: --apply preflight failure aborts before any issue updates", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "thin issue", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    gitEnsureClean: (_dir) => { throw new Error("ROADMAP.md has uncommitted changes"); },
+  });
+
+  await assert.rejects(
+    () => runSweep({ apply: true }, DEFAULT_CFG, {}, deps),
+    /uncommitted changes/,
+  );
+  assert.equal(deps._updateCalls.length, 0, "no issue updates should have occurred after preflight failure");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4: issue-number prefix disambiguation (#15 vs #158)
+// ---------------------------------------------------------------------------
+
+test("isIssueInReleasePlanTable: #15 not falsely detected when only #158 present", () => {
+  const roadmap = [
+    "## Release plan (sem-ver)",
+    "| Release | Bump | Theme | Issues | Why this bump |",
+    "|---|---|---|---|---|",
+    "| **v1.0.0** | minor | test | #158 | reason |",
+    "| *(none)* | — | — | — | — |",
+  ].join("\n");
+  assert.ok(!isIssueInReleasePlanTable(roadmap, 15), "#15 should NOT be detected when only #158 is present");
+  assert.ok(isIssueInReleasePlanTable(roadmap, 158), "#158 should be detected");
+});
+
+test("isIssueInDetailSections: #15 not falsely detected when only #158 present", () => {
+  const roadmap = [
+    "### v1.0.0 — test (minor)",
+    "- **#158** — some feature.",
+  ].join("\n");
+  assert.ok(!isIssueInDetailSections(roadmap, 15), "#15 should NOT be detected when only #158 is present");
+  assert.ok(isIssueInDetailSections(roadmap, 158), "#158 should be detected");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 5: all issues returned by listIssues are processed (no 200-cap)
+// ---------------------------------------------------------------------------
+
+test("sweep: processes all issues returned by listIssues — no hard cap in orchestrator", async () => {
+  const manyIssues: SweepIssue[] = Array.from({ length: 201 }, (_, i) => ({
+    number: i + 1,
+    title: `issue ${i + 1}`,
+    body: "Short.",
+  }));
+  const deps = makeDeps({ listIssues: async () => manyIssues });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(deps._harnessCalls.length, 201, "all 201 thin issues should be passed to the harness");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("201 inspected"), "report should count all 201 issues");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 6: roadmap mutations are atomic — partial success is rolled back
+// ---------------------------------------------------------------------------
+
+test("sweep: roadmap mutation failure is atomic — release-plan row not committed when per-issue row fails", async () => {
+  // A ROADMAP with a release plan (so insertReleasePlanRow can succeed) but
+  // no per-issue table header (so insertPerIssueRow will throw). The atomicity
+  // fix ensures neither insertion appears in mutatedRoadmap on failure.
+  const partialRoadmap = [
+    "# Roadmap",
+    "",
+    "## Release plan (sem-ver)",
+    "",
+    "| Release | Bump | Theme | Issues | Why this bump |",
+    "|---|---|---|---|---|",
+    "| **v2.0.0** | minor | test | — | test |",
+    "| *(none)* | — | — | — | — |",
+    "",
+    "Per-issue sem-ver detail:",
+    "",
+    "_(no per-issue table — triggers insertPerIssueRow failure)_",
+    "",
+    "## Remaining work — detail",
+    "",
+    "### v2.0.0 — test (minor)",
+    "",
+    "nothing.",
+  ].join("\n");
+
+  const newIssue: SweepIssue = { number: 777, title: "new issue", body: "Short." };
+  const deps = makeDeps({
+    listIssues: async () => [newIssue],
+    readFileAtBase: (_dir, _ref, relPath) => {
+      if (relPath === "ROADMAP.md") return partialRoadmap;
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
+    },
+  });
+
+  await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
+
+  const allLog = deps._logLines.join("\n");
+  // The error must be reported.
+  assert.ok(allLog.includes("could not add #777"), "should report the roadmap mutation error for #777");
+  // With the atomic fix, mutatedRoadmap === roadmapAtBase when ANY mutation for an issue
+  // fails, so the diff is empty — the "no changes" message is logged instead of a diff.
+  assert.ok(allLog.includes("no changes"), "diff should be empty when atomic mutation is rolled back");
+});
+
+// ---------------------------------------------------------------------------
 // CLI: sweep dispatched correctly
 // ---------------------------------------------------------------------------
 
@@ -512,4 +636,32 @@ test("CLI: pipeline sweep is listed in recognized sub-commands on unrecognized c
   );
   assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
   assert.ok(result.stderr.includes("sweep"), `expected sweep listed in recognized sub-commands; stderr:\n${result.stderr}`);
+});
+
+// Finding 7: extra positional argument to sweep exits with usage error
+test("CLI: pipeline sweep 123 exits with usage error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "sweep", "123"],
+    { encoding: "utf8", env: { ...process.env } },
+  );
+  assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
+  assert.ok(
+    result.stderr.includes("unexpected argument") || result.stderr.includes("123"),
+    `expected usage error about unexpected argument; stderr:\n${result.stderr}`,
+  );
+});
+
+// Finding 1: --apply --dry-run combination exits with error
+test("CLI: pipeline sweep --apply --dry-run exits with error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "sweep", "--apply", "--dry-run"],
+    { encoding: "utf8", env: { ...process.env } },
+  );
+  assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
+  assert.ok(
+    result.stderr.includes("mutually exclusive"),
+    `expected mutually exclusive error; stderr:\n${result.stderr}`,
+  );
 });

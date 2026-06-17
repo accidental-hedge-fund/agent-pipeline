@@ -92,24 +92,34 @@ export interface SweepDeps {
 export function realSweepDeps(repoDir: string): SweepDeps {
   return {
     listIssues: async (repo) => {
-      const result = spawnSync(
-        "gh",
-        [
-          "issue", "list",
-          "--repo", repo,
-          "--state", "open",
-          "--limit", "200",
-          "--json", "number,title,body",
-        ],
-        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
-      );
-      if (result.status !== 0) {
-        throw new Error(
-          `[pipeline sweep] gh issue list failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+      // Paginate via gh api to fetch all open issues regardless of count.
+      const PAGE_SIZE = 100;
+      const all: Array<{ number: number; title: string; body: string }> = [];
+      let page = 1;
+      while (true) {
+        const result = spawnSync(
+          "gh",
+          [
+            "api",
+            `repos/${repo}/issues`,
+            "--method", "GET",
+            "-F", "state=open",
+            "-F", `per_page=${PAGE_SIZE}`,
+            "-F", `page=${page}`,
+          ],
+          { encoding: "utf8", stdio: "pipe", cwd: repoDir },
         );
+        if (result.status !== 0) {
+          throw new Error(
+            `[pipeline sweep] gh api issues failed (page ${page}, exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          );
+        }
+        const batch = JSON.parse(result.stdout.trim() || "[]") as Array<{ number: number; title: string; body: string | null }>;
+        all.push(...batch.map((i) => ({ number: i.number, title: i.title, body: i.body ?? "" })));
+        if (batch.length < PAGE_SIZE) break;
+        page++;
       }
-      const parsed = JSON.parse(result.stdout.trim() || "[]") as Array<{ number: number; title: string; body: string }>;
-      return parsed.map((i) => ({ number: i.number, title: i.title, body: i.body ?? "" }));
+      return all;
     },
     updateIssueBody: async (repo, issueNumber, body) => {
       const result = spawnSync(
@@ -290,12 +300,16 @@ export function isIssueInPerIssueTable(roadmapText: string, issueNum: number): b
 /**
  * Check if an issue number is referenced in the release-plan table (any row
  * with `| **v...` that contains `#N`).
+ *
+ * Uses a word-boundary regex so #15 does not false-positive when only #158 is
+ * present (the substring "#15" appears inside "#158").
  */
 export function isIssueInReleasePlanTable(roadmapText: string, issueNum: number): boolean {
+  const pattern = new RegExp(`#${issueNum}(?!\\d)`);
   const lines = roadmapText.split("\n");
   for (const line of lines) {
     if (!line.startsWith("| **v")) continue;
-    if (line.includes(`#${issueNum}`)) return true;
+    if (pattern.test(line)) return true;
   }
   return false;
 }
@@ -303,14 +317,18 @@ export function isIssueInReleasePlanTable(roadmapText: string, issueNum: number)
 /**
  * Check if an issue number appears in any detail-section bullet (lines starting
  * with "- " inside a `### v` section).
+ *
+ * Uses a word-boundary regex so #15 does not false-positive when only #158 is
+ * present (the substring "#15" appears inside "#158").
  */
 export function isIssueInDetailSections(roadmapText: string, issueNum: number): boolean {
+  const pattern = new RegExp(`#${issueNum}(?!\\d)`);
   const lines = roadmapText.split("\n");
   let inDetailSection = false;
   for (const line of lines) {
     if (line.startsWith("### v")) { inDetailSection = true; continue; }
     if (inDetailSection && line.startsWith("## ")) { inDetailSection = false; continue; }
-    if (inDetailSection && line.startsWith("- ") && line.includes(`#${issueNum}`)) {
+    if (inDetailSection && line.startsWith("- ") && pattern.test(line)) {
       return true;
     }
   }
@@ -360,9 +378,36 @@ export async function runSweep(
   const targetRepo = opts.repo ?? cfg.repo;
   const roadmapPath = path.join(repoDir, "ROADMAP.md");
 
+  // Finding 2: --repo must match the local checkout's repo. Sweep reads and commits
+  // ROADMAP.md from the local checkout; allowing a different --repo would rewrite
+  // issue bodies in one repo while opening the ROADMAP PR from another.
+  if (opts.repo && opts.repo !== cfg.repo) {
+    throw new Error(
+      `[pipeline sweep] --repo "${opts.repo}" differs from the configured repo "${cfg.repo}". ` +
+        `Sweep reads and commits ROADMAP.md from the local checkout, which belongs to "${cfg.repo}". ` +
+        `Omit --repo or run from a checkout of "${opts.repo}".`,
+    );
+  }
+
   if (!opts.apply) {
     d.log("[pipeline sweep] preview mode (dry-run) — no GitHub writes will occur.");
     d.log("  Pass --apply to update issue bodies and open the ROADMAP reconciliation PR.\n");
+  }
+
+  // Finding 3: --apply preflight — validate all roadmap git state BEFORE any issue
+  // writes so a git failure cannot leave issue bodies updated with no ROADMAP PR.
+  let preflightedBaseSha: string | undefined;
+  let preflightedRoadmapAtBase: string | null = null;
+  let roadmapSkippedInPreflight = false;
+
+  if (opts.apply) {
+    preflightedBaseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
+    try {
+      preflightedRoadmapAtBase = d.readFileAtBase(repoDir, preflightedBaseSha, "ROADMAP.md");
+    } catch (_err) {
+      roadmapSkippedInPreflight = true;
+    }
+    d.gitEnsureClean(repoDir);
   }
 
   // ---------------------------------------------------------------------------
@@ -439,8 +484,6 @@ export async function runSweep(
   // ---------------------------------------------------------------------------
 
   const toSpec = classified.filter((c) => c.action === "specced");
-  const leftAsIs = classified.filter((c) => c.action === "left-as-is");
-  const blocked = classified.filter((c) => c.action === "blocked");
 
   if (!opts.apply) {
     for (const c of toSpec) {
@@ -466,15 +509,30 @@ export async function runSweep(
   // Phase 2: Roadmap reconciliation
   // ---------------------------------------------------------------------------
 
-  // Pin the base SHA once for both the ROADMAP read and the branch fork point.
-  const baseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
+  // Resolve the base SHA and ROADMAP content. In --apply mode, reuse the
+  // preflighted values (already validated before issue writes). In dry-run mode,
+  // resolve now (no git state changes occur).
+  let baseSha: string;
   let roadmapAtBase: string;
-  try {
-    roadmapAtBase = d.readFileAtBase(repoDir, baseSha, "ROADMAP.md");
-  } catch (_err) {
-    d.log("[pipeline sweep] ROADMAP.md not found at base — skipping roadmap reconciliation.");
-    printSummaryReport(d, classified, null, opts.apply ?? false);
-    return;
+
+  if (opts.apply) {
+    if (roadmapSkippedInPreflight) {
+      d.log("[pipeline sweep] ROADMAP.md not found at base — skipping roadmap reconciliation.");
+      printSummaryReport(d, classified, null, true);
+      return;
+    }
+    baseSha = preflightedBaseSha!;
+    roadmapAtBase = preflightedRoadmapAtBase!;
+  } else {
+    const dryRunBaseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
+    try {
+      roadmapAtBase = d.readFileAtBase(repoDir, dryRunBaseSha, "ROADMAP.md");
+    } catch (_err) {
+      d.log("[pipeline sweep] ROADMAP.md not found at base — skipping roadmap reconciliation.");
+      printSummaryReport(d, classified, null, false);
+      return;
+    }
+    baseSha = dryRunBaseSha;
   }
 
   const version = inferReleaseSlot(roadmapAtBase);
@@ -503,19 +561,23 @@ export async function runSweep(
     deltas.push({ issue, oneLiner, missingInPerIssue, missingInReleasePlan, missingInDetail });
   }
 
-  // Apply ROADMAP mutations in memory.
+  // Finding 6: Apply ROADMAP mutations atomically per issue. Each issue's three
+  // mutations are applied to a temporary copy; only if ALL succeed is the copy
+  // promoted to the live roadmap. A partial success (e.g., release-plan row added
+  // but per-issue row missing) is rolled back so the roadmap stays consistent.
   let mutatedRoadmap = roadmapAtBase;
   const roadmapAdded: number[] = [];
   const roadmapErrors: Array<{ issueNum: number; error: string }> = [];
 
   for (const delta of deltas) {
+    let tempRoadmap = mutatedRoadmap;
     try {
       const issueRef = `#${delta.issue.number}`;
       const slugTitle = delta.issue.title.length > 40 ? delta.issue.title.slice(0, 40) + "…" : delta.issue.title;
 
       if (delta.missingInReleasePlan) {
-        mutatedRoadmap = insertReleasePlanRow(
-          mutatedRoadmap,
+        tempRoadmap = insertReleasePlanRow(
+          tempRoadmap,
           version,
           "minor",
           slugTitle,
@@ -524,8 +586,8 @@ export async function runSweep(
         );
       }
       if (delta.missingInPerIssue) {
-        mutatedRoadmap = insertPerIssueRow(
-          mutatedRoadmap,
+        tempRoadmap = insertPerIssueRow(
+          tempRoadmap,
           delta.issue.number,
           "minor",
           "—",
@@ -535,18 +597,21 @@ export async function runSweep(
         );
       }
       if (delta.missingInDetail) {
-        mutatedRoadmap = insertDetailSectionBullet(
-          mutatedRoadmap,
+        tempRoadmap = insertDetailSectionBullet(
+          tempRoadmap,
           version,
           `**${issueRef}** — ${delta.oneLiner}`,
         );
       }
+      // All mutations succeeded: promote the temporary copy.
+      mutatedRoadmap = tempRoadmap;
       roadmapAdded.push(delta.issue.number);
     } catch (err) {
       roadmapErrors.push({
         issueNum: delta.issue.number,
         error: err instanceof Error ? err.message : String(err),
       });
+      // mutatedRoadmap is unchanged (tempRoadmap was the only modified copy).
     }
   }
 
@@ -561,8 +626,7 @@ export async function runSweep(
     }
   } else if (mutatedRoadmap !== roadmapAtBase) {
     // --apply path: commit the mutated ROADMAP on a new branch and open a PR.
-    d.gitEnsureClean(repoDir);
-
+    // Note: gitEnsureClean was already called in the preflight above.
     const today = d.today();
     const branch = `sweep/${today}-roadmap-reconcile`;
     d.log(`[pipeline sweep] creating roadmap reconciliation branch ${branch}...`);
