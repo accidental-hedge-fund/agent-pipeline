@@ -731,13 +731,40 @@ export async function runRelease(
   };
   scaffoldRoadmap(roadmapText, validationCtx);  // throws on missing anchor; result discarded
 
+  // Refuse to start if any release-managed path already has uncommitted changes (tracked
+  // modifications OR untracked files). The pre-branch rollback below restores these paths
+  // from HEAD via `git checkout` + `git clean`, which would silently DISCARD a maintainer's
+  // pre-existing local edits and delete pre-existing untracked files. Requiring a clean slate
+  // up front makes the rollback provably lossless — the paths matched HEAD when we began, so
+  // restoring from HEAD restores exactly the pre-release state — and keeps the automated
+  // release commit free of unrelated edits (#170 review-2).
+  const releaseManagedPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"];
+  d.stdout("[pipeline release] checking working tree is clean in release-managed paths...");
+  const statusResult = d.runCommand("git", ["status", "--porcelain", "--", ...releaseManagedPaths], { cwd: repoDir });
+  if (statusResult.code !== 0) {
+    throw new Error(
+      `[pipeline release] could not verify working-tree cleanliness (git status exited ${statusResult.code}: ${statusResult.stderr.trim()})`,
+    );
+  }
+  if (statusResult.stdout.trim()) {
+    throw new Error(
+      `[pipeline release] working tree has uncommitted changes in release-managed paths:\n${statusResult.stdout.trimEnd()}\n` +
+      "Commit, stash, or discard them before cutting a release — the release command rewrites " +
+      "package.json, core/package.json, ROADMAP.md, and the plugin/ mirror, and its abort rollback " +
+      "restores those paths from HEAD (which would discard your local edits).",
+    );
+  }
+
   // Restore every file the version bump + mirror regen + ROADMAP write touch FROM HEAD on
   // ANY abort before the release branch is created (mirror-regen / CI / issue-discovery
   // failure, or an editor abort). `git checkout --` recovers package.json, core/package.json,
   // ROADMAP.md, AND the whole plugin/ mirror in one step — even if build.mjs deleted files
-  // mid-regen — so it does not depend on re-running the same (failing) build. Its exit code
-  // is checked so a failed rollback is surfaced loudly, not silently claimed as restored.
-  // Otherwise a stranded bump poisons a retry whose previousVersion reads the bumped core (#170).
+  // mid-regen — so it does not depend on re-running the same (failing) build; `git clean -fd`
+  // then removes any untracked mirror debris build.mjs may have generated (safe because the
+  // clean-tree precondition above guaranteed plugin/ and .claude-plugin/ held no untracked
+  // files when the run began). Both exit codes are checked so a failed rollback is surfaced
+  // loudly, not silently claimed as restored. Otherwise a stranded bump poisons a retry whose
+  // previousVersion reads the bumped core (#170).
   const branch = `release/v${resolvedVersion}`;
   const restoreCheckout = (): void => {
     const r = d.runCommand(
@@ -745,11 +772,13 @@ export async function runRelease(
       ["checkout", "--", "package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"],
       { cwd: repoDir },
     );
-    if (r.code !== 0) {
+    const clean = d.runCommand("git", ["clean", "-fd", "plugin", ".claude-plugin"], { cwd: repoDir });
+    if (r.code !== 0 || clean.code !== 0) {
       d.stderr(
-        `[pipeline release] ROLLBACK FAILED (git checkout exited ${r.code}: ${r.stderr.trim()}). ` +
+        `[pipeline release] ROLLBACK FAILED (git checkout exited ${r.code}: ${r.stderr.trim()}; ` +
+        `git clean exited ${clean.code}: ${clean.stderr.trim()}). ` +
         "The working tree may have a stranded version bump or partial mirror — run " +
-        "`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin` manually before retrying.",
+        "`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
       );
     } else {
       d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and the plugin/ mirror from HEAD.");

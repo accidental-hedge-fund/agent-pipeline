@@ -102,14 +102,23 @@ After the version bump and mirror regen, the command SHALL run `npm run ci` from
 
 ### Requirement: Aborts before branch creation SHALL leave the working tree unchanged
 
-Any abort after the version bump and mirror regen but before the release branch is created — mirror-regen failure, CI failure, or issue-discovery failure — SHALL restore `package.json`, `core/package.json`, `ROADMAP.md`, and the regenerated `plugin/` mirror to their pre-release state, so a retry reads the original `previousVersion` and is not poisoned by stranded version/mirror changes.
+The live release SHALL refuse to start if any release-managed path — `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, or `.claude-plugin/` — has uncommitted changes (tracked modifications or untracked files) when the command begins, failing fast with a non-zero exit before bumping the version, regenerating the mirror, or writing any file. This clean-tree precondition makes the rollback provably lossless.
+
+Any abort after the version bump and mirror regen but before the release branch is created — mirror-regen failure, CI failure, issue-discovery failure, or an editor abort — SHALL restore `package.json`, `core/package.json`, `ROADMAP.md`, and the regenerated `plugin/` mirror to their pre-release (HEAD) state and remove any untracked mirror debris generated during the run, so a retry reads the original `previousVersion` and is not poisoned by stranded version/mirror changes. Because the precondition guaranteed these paths matched HEAD at the start, the rollback restores exactly the pre-release working tree and never discards a maintainer's pre-existing edits.
+
+#### Scenario: A dirty release-managed path fails fast before any mutation
+
+- **WHEN** any of `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, or `.claude-plugin/` has uncommitted changes at the start of a live release
+- **THEN** the command SHALL exit non-zero naming the dirty paths and SHALL NOT bump the version, regenerate the mirror, or write any file
+- **AND** because nothing was mutated, no rollback is performed (there is nothing to restore and nothing to discard)
 
 #### Scenario: post-bump abort rolls back the bumped files
 
-- **WHEN** the command bumps the version, regenerates the mirror, then aborts (CI fails, or issue discovery fails) before creating the release branch
-- **THEN** `package.json` and `core/package.json` SHALL be restored to their pre-bump contents
-- **AND** the `plugin/` mirror SHALL be regenerated from the restored (un-bumped) core
+- **WHEN** the command bumps the version, regenerates the mirror, then aborts (CI fails, issue discovery fails, or the editor aborts) before creating the release branch
+- **THEN** `package.json` and `core/package.json` SHALL be restored to their pre-bump contents from HEAD
+- **AND** the `plugin/` mirror SHALL be restored to its pre-release state and any untracked build debris removed
 - **AND** `ROADMAP.md` SHALL NOT be left in a stamped or partially-patched state
+- **AND** because the clean-tree precondition held at the start, no pre-existing local edit in any release-managed path is discarded by the rollback
 
 ---
 

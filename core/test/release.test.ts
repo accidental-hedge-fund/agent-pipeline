@@ -972,6 +972,69 @@ test("runRelease: editor abort before branch creation aborts AND rolls back via 
   }
 });
 
+test("runRelease: aborts before any write when a release-managed path is dirty (#170 review-2)", async () => {
+  // A pre-existing unstaged edit to ROADMAP.md must make the live release fail fast BEFORE
+  // bumping anything, so the abort rollback (git checkout/clean from HEAD) can never discard
+  // the maintainer's local edits. This is the clean-tree precondition that makes the rollback
+  // provably lossless.
+  const commands: string[][] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      // Working tree is dirty in a release-managed path.
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: " M ROADMAP.md\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("uncommitted changes"), `got: ${err.message}`);
+      assert.ok(err.message.includes("ROADMAP.md"), `dirty path named, got: ${err.message}`);
+      return true;
+    },
+  );
+  // Fail-fast: nothing was bumped/written, build.mjs never ran, and no rollback was needed
+  // (we never mutated the tree, so there is nothing to restore and nothing to discard).
+  assert.equal(Object.keys(getWritten(deps)).length, 0, "no files written when tree is dirty");
+  assert.ok(!commands.some((c) => c[0] === "node" && c[1] === "scripts/build.mjs"), "build.mjs not run");
+  assert.ok(!restoreInvoked(commands), "no rollback issued — nothing was mutated");
+});
+
+test("runRelease: a clean working tree passes the precondition (status checked, no edits) (#170 review-2)", async () => {
+  // With a clean tree (git status --porcelain empty), the release proceeds past the
+  // precondition and reaches PR creation. Proves the precondition gates on real status output.
+  let statusChecked = false;
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") { statusChecked = true; return { code: 0, stdout: "", stderr: "" }; }
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "release: thing (#204)", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `Title #${n}`,
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158] : []),
+  });
+
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.ok(statusChecked, "git status --porcelain was checked before mutating the tree");
+});
+
 // ---------------------------------------------------------------------------
 // CLI-level: 'pipeline release' dispatch
 // ---------------------------------------------------------------------------
