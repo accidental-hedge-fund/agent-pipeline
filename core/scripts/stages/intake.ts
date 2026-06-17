@@ -35,19 +35,27 @@ export interface IntakeDeps {
   /** Create a GitHub issue and return its number. */
   createIssue(title: string, body: string, labels: string[]): Promise<number>;
   /**
-   * Read a file at a specific git ref (e.g. origin/<baseBranch>) without
-   * modifying the working tree. relPath is repo-relative (e.g. "ROADMAP.md").
-   * This ensures mutations are computed from the integration branch's content,
-   * not a potentially-stale caller checkout.
+   * Resolve origin/<baseBranch> to an immutable commit SHA. Also a preflight:
+   * throws if origin/<baseBranch> is not fetched. The SHA is pinned ONCE and
+   * reused for both the ROADMAP read and the branch fork point, so the two can
+   * never straddle a concurrent push to the moving origin/<base> ref.
    */
-  readFileAtBase(repoDir: string, baseBranch: string, relPath: string): string;
+  gitResolveBaseSha(repoDir: string, baseBranch: string): string;
+  /**
+   * Read a file at a specific immutable git ref/SHA without modifying the working
+   * tree. relPath is repo-relative (e.g. "ROADMAP.md"). Pass the pinned base SHA so
+   * the mutation is computed from exactly the commit the intake branch will fork
+   * from — not a moving ref or a potentially-stale caller checkout.
+   */
+  readFileAtBase(repoDir: string, ref: string, relPath: string): string;
   /** Generic local file read (for writes only — ROADMAP reads use readFileAtBase). */
   readFile(p: string): string;
   writeFile(p: string, content: string): void;
   /**
-   * Ensure a GitHub label exists (creates it with the given color when absent,
-   * idempotent via --force). Must be called before createIssue so that issue
-   * creation with that label never fails due to a missing label.
+   * Ensure a GitHub label exists, CREATE-ONLY: creates it with the given color
+   * when absent and leaves an existing label's color/description UNTOUCHED (never
+   * `--force`). Must be called before createIssue so issue creation never fails on
+   * a missing label, without clobbering label metadata the repo already curates.
    */
   ensureLabel(repoDir: string, name: string, color: string): Promise<void>;
   /**
@@ -56,8 +64,9 @@ export interface IntakeDeps {
    */
   gitEnsureClean(repoDir: string): void;
   /**
-   * Create and checkout a new branch starting from origin/<fromRef> so the
-   * roadmap PR is always based on the integration branch, not the caller's HEAD.
+   * Create and checkout a new branch starting from the given immutable ref/SHA
+   * (the pinned base SHA), so the roadmap PR forks from exactly the commit the
+   * ROADMAP mutation was computed against — not a moving ref or the caller's HEAD.
    */
   gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
   /** Stage the given files and commit. */
@@ -100,22 +109,37 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
       }
       return Number(m[1]);
     },
-    readFileAtBase: (dir, baseBranch, relPath) => {
-      // Read the file at origin/<baseBranch> without touching the working tree.
-      // This ensures mutations are computed from the integration branch's content
+    gitResolveBaseSha: (dir, baseBranch) => {
+      // Pin origin/<baseBranch> to an immutable SHA. Also a preflight: if the ref is
+      // not fetched, bail here before any irreversible GitHub write.
+      const result = spawnSync("git", ["rev-parse", "--verify", `origin/${baseBranch}`], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      const sha = result.stdout?.trim() ?? "";
+      if (result.status !== 0 || !/^[0-9a-f]{7,40}$/.test(sha)) {
+        throw new Error(
+          `[pipeline intake] could not resolve origin/${baseBranch} to a commit SHA (exit ${result.status}): ` +
+            `${result.stderr?.trim() ?? ""}.\n` +
+            `  Ensure origin/${baseBranch} is fetched: git fetch origin ${baseBranch}`,
+        );
+      }
+      return sha;
+    },
+    readFileAtBase: (dir, ref, relPath) => {
+      // Read the file at the pinned base SHA without touching the working tree, so the
+      // mutation is computed from exactly the commit the intake branch forks from —
       // even when intake is run from a feature worktree or a stale checkout.
-      // A failure here also serves as a preflight: if origin/<baseBranch> is not
-      // accessible, we bail before creating any irreversible GitHub issue.
-      const result = spawnSync("git", ["show", `origin/${baseBranch}:${relPath}`], {
+      const result = spawnSync("git", ["show", `${ref}:${relPath}`], {
         encoding: "utf8",
         stdio: "pipe",
         cwd: dir,
       });
       if (result.status !== 0) {
         throw new Error(
-          `[pipeline intake] could not read ${relPath} from origin/${baseBranch} (exit ${result.status}): ` +
-            `${result.stderr?.trim() ?? ""}.\n` +
-            `  Ensure origin/${baseBranch} is fetched: git fetch origin ${baseBranch}`,
+          `[pipeline intake] could not read ${relPath} at ${ref} (exit ${result.status}): ` +
+            `${result.stderr?.trim() ?? ""}.`,
         );
       }
       return result.stdout;
@@ -123,17 +147,19 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
     readFile: (p) => fs.readFileSync(p, "utf8"),
     writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
     ensureLabel: async (dir, name, color) => {
-      // gh label create --force is idempotent: creates if absent, updates if present.
-      const result = spawnSync("gh", ["label", "create", name, "--color", color, "--force"], {
+      // Create-only: NEVER `--force`, which would update (clobber) an existing label's
+      // color/description. Create when absent; tolerate the already-exists error and
+      // leave the existing label's metadata exactly as the repo curates it.
+      const result = spawnSync("gh", labelCreateArgs(name, color), {
         encoding: "utf8",
         stdio: "pipe",
         cwd: dir,
       });
-      if (result.status !== 0) {
-        throw new Error(
-          `[pipeline intake] could not ensure label "${name}" (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-        );
-      }
+      if (result.status === 0) return;
+      if (isLabelAlreadyExists(result.status ?? 1, result.stderr ?? "")) return;
+      throw new Error(
+        `[pipeline intake] could not ensure label "${name}" (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+      );
     },
     gitEnsureClean: (dir) => {
       const result = spawnSync("git", ["status", "--porcelain", "--", "ROADMAP.md"], {
@@ -155,14 +181,16 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
       }
     },
     gitCreateBranch: (dir, branch, fromRef) => {
-      const result = spawnSync("git", ["checkout", "-b", branch, `origin/${fromRef}`], {
+      // fromRef is the pinned base SHA — fork from exactly the commit the ROADMAP
+      // mutation was computed against, not a moving ref.
+      const result = spawnSync("git", ["checkout", "-b", branch, fromRef], {
         encoding: "utf8",
         stdio: "pipe",
         cwd: dir,
       });
       if (result.status !== 0) {
         throw new Error(
-          `[pipeline intake] git checkout -b ${branch} origin/${fromRef} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          `[pipeline intake] git checkout -b ${branch} ${fromRef} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
         );
       }
     },
@@ -213,6 +241,31 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
     },
     log: (msg) => process.stdout.write(msg + "\n"),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Label helpers (create-only — never clobber existing label metadata)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the `gh label create` args for create-only label creation. Deliberately
+ * omits `--force`: `--force` UPDATES an existing label's color/description, which
+ * would mutate label metadata the repo already curates. Drift-guard: a unit test
+ * asserts `--force` is absent.
+ */
+export function labelCreateArgs(name: string, color: string): string[] {
+  return ["label", "create", name, "--color", color];
+}
+
+/**
+ * Classify a `gh label create` result: true when the non-zero exit is the benign
+ * "label already exists" case (treat as present, leave its metadata untouched),
+ * false for success (status 0) or any other failure (which the caller rethrows).
+ * The error string is verified real: gh prints
+ * `label with name "X" already exists; use --force to update its color and description`.
+ */
+export function isLabelAlreadyExists(status: number, stderr: string): boolean {
+  return status !== 0 && /already exists/i.test(stderr);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,12 +389,15 @@ export async function runIntake(
     }
   }
 
-  // 2. Read ROADMAP from origin/<base_branch> — not the caller's working tree.
-  //    This ensures release-slot inference, context, and mutations are all based
-  //    on the integration branch's content, regardless of the caller's local
-  //    checkout state.  A failure here also acts as a preflight: if
-  //    origin/<base_branch> is inaccessible, we bail before any GitHub writes.
-  const roadmapAtBase = d.readFileAtBase(repoDir, cfg.base_branch, "ROADMAP.md");
+  // 2. Pin origin/<base_branch> to an immutable SHA, then read ROADMAP at THAT SHA —
+  //    not the caller's working tree, and not the moving ref. Pinning once and reusing
+  //    the SHA for both the read and the branch fork point is what makes the roadmap PR
+  //    safe: origin/<base> is a moving ref, so reading at the ref and later branching
+  //    from the ref can straddle a concurrent push, yielding a PR that rolls back roadmap
+  //    entries that landed in between. A failed resolve/read also preflights
+  //    origin/<base_branch> accessibility before any GitHub write (#158 review-2).
+  const baseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
+  const roadmapAtBase = d.readFileAtBase(repoDir, baseSha, "ROADMAP.md");
 
   // Normalize release slot — strip leading "v" for internal use.
   let version: string;
@@ -404,35 +460,41 @@ export async function runIntake(
   }
 
   // 8. Git preflight: ensure ROADMAP.md has no uncommitted local changes so we do
-  //    not silently lose in-progress edits when gitCreateBranch checks out the
-  //    base branch (git checkout rejects conflicting local changes).
+  //    not silently lose in-progress edits when gitCreateBranch switches branches
+  //    (git checkout rejects conflicting local changes).
   d.gitEnsureClean(repoDir);
 
-  // 9. Ensure both required labels exist before issue creation.  Intake bypasses
-  //    the normal `pipeline init` label-bootstrap path, so release:vX.Y.Z labels
-  //    (dynamically named) and pipeline:ready may be absent in a fresh repo.
+  // 9. Prepare the release branch FROM the pinned base SHA — BEFORE creating the issue.
+  //    This is the last failure-prone step that must never strand an orphaned issue: if
+  //    the checkout fails (missing ref, branch-name collision, dirty tree), we abort here
+  //    with NO GitHub issue created. Forking from the pinned SHA (not the moving
+  //    origin/<base>) means the ROADMAP we read and the branch we write onto share one
+  //    commit, so the PR's diff is exactly our three inserted rows — never a rollback of
+  //    roadmap entries that landed on the base branch after our read (#158 review-2).
+  const slug = slugifyTitle(title);
+  const branch = `intake/${slug}`;
+  d.log(`[pipeline intake] creating branch ${branch} from base ${baseSha.slice(0, 12)}...`);
+  d.gitCreateBranch(repoDir, branch, baseSha);
+
+  // 10. Ensure both required labels exist (create-only) before issue creation. Intake
+  //     bypasses the normal `pipeline init` label-bootstrap path, so release:vX.Y.Z
+  //     labels (dynamically named) and pipeline:ready may be absent in a fresh repo.
   await d.ensureLabel(repoDir, "pipeline:ready", "1D76DB");
   await d.ensureLabel(repoDir, `release:v${version}`, "e4e669");
 
-  // 10. Create the GitHub issue — only after all deterministic prerequisites pass.
+  // 11. Create the GitHub issue — only after branch prep + labels succeed. This is the
+  //     first irreversible action; everything that could fail before it has already run.
   d.log(`[pipeline intake] creating GitHub issue...`);
   const labels = [`pipeline:ready`, `release:v${version}`];
   const issueNumber = await d.createIssue(title, specBody, labels);
   d.log(`[pipeline intake] created issue #${issueNumber}: ${title}`);
 
-  // 11. Apply the three ROADMAP mutations with the real issue number.
+  // 12. Apply the three ROADMAP mutations with the real issue number, write onto the
+  //     prepared branch, commit, and open the PR. Past issue creation a failure here
+  //     leaves the issue + prepared branch live, so log a recovery command.
   const mutatedRoadmap = applyRoadmapMutations(roadmapAtBase, version, issueNumber, title, oneLiner);
-
-  // 12. Create a branch FROM the base branch, write ROADMAP, commit, and open PR.
-  //     Wrap in try-catch: if any post-issue step fails, the issue is already live
-  //     so log a recovery command so the user can complete the roadmap PR manually.
-  const slug = slugifyTitle(title);
-  const branch = `intake/issue-${issueNumber}-${slug}`;
   const prTitle = `intake: ROADMAP slot for #${issueNumber} — ${title}`;
   try {
-    d.log(`[pipeline intake] creating branch ${branch} from origin/${cfg.base_branch}...`);
-    d.gitCreateBranch(repoDir, branch, cfg.base_branch);
-
     d.writeFile(roadmapPath, mutatedRoadmap);
     d.log(`[pipeline intake] wrote ROADMAP.md`);
 
@@ -448,10 +510,8 @@ export async function runIntake(
     d.log(`[pipeline intake] done — issue #${issueNumber} created; roadmap PR: ${prUrl}`);
   } catch (err) {
     d.log(
-      `\n[pipeline intake] ERROR: issue #${issueNumber} was created but the roadmap PR step failed.\n` +
-        `  Recovery — complete the roadmap PR manually:\n` +
-        `    git checkout -b ${branch} origin/${cfg.base_branch}\n` +
-        `    # Add ROADMAP.md: release-plan row, per-issue row, detail bullet for #${issueNumber} at v${version}\n` +
+      `\n[pipeline intake] ERROR: issue #${issueNumber} was created and branch ${branch} prepared, but the roadmap PR step failed.\n` +
+        `  Recovery — finish the roadmap PR manually from the prepared branch:\n` +
         `    git add ROADMAP.md && git commit -m "docs: ROADMAP — intake #${issueNumber} (${title})"\n` +
         `    git push -u origin ${branch}\n` +
         `    gh pr create --title "${prTitle}" --base ${cfg.base_branch} --head ${branch}`,

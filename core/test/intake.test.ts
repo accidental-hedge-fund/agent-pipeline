@@ -12,6 +12,8 @@ import {
   parseSpec,
   extractOneLiner,
   validateSpecBody,
+  labelCreateArgs,
+  isLabelAlreadyExists,
   type IntakeDeps,
   type IntakeOpts,
 } from "../scripts/stages/intake.ts";
@@ -61,6 +63,10 @@ Per-issue sem-ver detail:
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Fixed fake base SHA returned by the gitResolveBaseSha seam. Tests assert this exact
+// value flows to BOTH readFileAtBase and gitCreateBranch (the SHA-pinning invariant).
+const FAKE_BASE_SHA = "0123456789abcdef0123456789abcdef01234567";
+
 function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
   _createIssueCalls: Array<{ title: string; body: string; labels: string[] }>;
   _createPRCalls: Array<{ title: string; body: string; base: string; head: string }>;
@@ -102,7 +108,8 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
       createIssueCalls.push({ title, body, labels });
       return 999;
     },
-    readFileAtBase: (_dir, _baseBranch, relPath) => {
+    gitResolveBaseSha: (_dir, _baseBranch) => FAKE_BASE_SHA,
+    readFileAtBase: (_dir, _ref, relPath) => {
       if (relPath === "ROADMAP.md") return ROADMAP_FIXTURE;
       throw new Error(`readFileAtBase not mocked for ${relPath}`);
     },
@@ -191,7 +198,9 @@ test("intake: happy path creates issue with correct labels and opens roadmap PR"
   const prCall = deps._createPRCalls[0];
   assert.ok(prCall.title.includes("#999"), "PR title should reference the issue number");
   assert.equal(prCall.base, "main", "PR base should be main");
-  assert.ok(prCall.head.startsWith("intake/issue-999-"), "PR head branch should follow intake/issue-N- convention");
+  // Branch is prepared BEFORE the issue exists, so its name is slug-based (not issue-N).
+  assert.ok(prCall.head.startsWith("intake/"), "PR head branch should follow intake/<slug> convention");
+  assert.ok(prCall.head.includes("retry"), "PR head branch slug derives from the spec title");
 });
 
 test("intake: happy path writes ROADMAP.md with all three mutations", async () => {
@@ -573,10 +582,10 @@ test("intake: no issue or PR created when gitEnsureClean throws", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// gitCreateBranch receives fromRef = cfg.base_branch (finding 1 regression)
+// SHA pinning: branch forks from the pinned base SHA, not the moving ref (#158 review-2)
 // ---------------------------------------------------------------------------
 
-test("intake: gitCreateBranch is called with cfg.base_branch as fromRef", async () => {
+test("intake: gitCreateBranch forks from the pinned base SHA (not the moving ref)", async () => {
   const branchCalls: Array<{ dir: string; branch: string; fromRef: string }> = [];
   const deps = makeDeps({
     gitCreateBranch: (dir, branch, fromRef) => { branchCalls.push({ dir, branch, fromRef }); },
@@ -584,7 +593,48 @@ test("intake: gitCreateBranch is called with cfg.base_branch as fromRef", async 
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
   await runIntake(opts, DEFAULT_CFG, deps);
   assert.equal(branchCalls.length, 1, "gitCreateBranch should be called once");
-  assert.equal(branchCalls[0].fromRef, "main", "fromRef should be cfg.base_branch");
+  assert.equal(branchCalls[0].fromRef, FAKE_BASE_SHA, "fromRef must be the immutable SHA from gitResolveBaseSha");
+});
+
+test("intake: the SAME pinned SHA flows to both the ROADMAP read and the branch fork point", async () => {
+  // The core anti-rollback invariant: read-at-SHA and branch-from-SHA must use ONE SHA,
+  // so a concurrent push to origin/<base> between them cannot make the PR roll back
+  // roadmap entries that landed in between.
+  const readRefs: string[] = [];
+  const branchRefs: string[] = [];
+  const deps = makeDeps({
+    gitResolveBaseSha: () => FAKE_BASE_SHA,
+    readFileAtBase: (_dir, ref, relPath) => {
+      if (relPath === "ROADMAP.md") { readRefs.push(ref); return ROADMAP_FIXTURE; }
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
+    },
+    gitCreateBranch: (_dir, _branch, fromRef) => { branchRefs.push(fromRef); },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  assert.deepEqual(readRefs, [FAKE_BASE_SHA], "ROADMAP is read at the pinned SHA");
+  assert.deepEqual(branchRefs, [FAKE_BASE_SHA], "branch forks from the pinned SHA");
+  assert.equal(readRefs[0], branchRefs[0], "read ref and branch ref are the identical pinned SHA");
+});
+
+test("intake: branch is prepared BEFORE the issue is created (orphan prevention)", async () => {
+  // Reorder fix: branch prep is the last failure-prone step before the irreversible
+  // issue creation, so a checkout failure can never strand a labeled issue.
+  const callOrder: string[] = [];
+  const deps = makeDeps({
+    gitCreateBranch: (_dir, _branch, _fromRef) => { callOrder.push("createBranch"); },
+    createIssue: async (title, body, labels) => {
+      callOrder.push("createIssue");
+      deps._createIssueCalls.push({ title, body, labels });
+      return 999;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  const branchIdx = callOrder.indexOf("createBranch");
+  const issueIdx = callOrder.indexOf("createIssue");
+  assert.ok(branchIdx !== -1 && issueIdx !== -1, "both branch and issue creation run");
+  assert.ok(branchIdx < issueIdx, "gitCreateBranch must run before createIssue");
 });
 
 // ---------------------------------------------------------------------------
@@ -604,27 +654,27 @@ test("intake: dry-run uses #TBD placeholder in per-issue table row (not #0)", as
 // Finding 1 (regression): readFileAtBase used for all ROADMAP reads
 // ---------------------------------------------------------------------------
 
-test("intake: readFileAtBase is called with cfg.base_branch for ROADMAP content", async () => {
-  const readAtBaseCalls: Array<{ baseBranch: string; relPath: string }> = [];
+test("intake: readFileAtBase reads ROADMAP at the pinned base SHA", async () => {
+  const readAtBaseCalls: Array<{ ref: string; relPath: string }> = [];
   const deps = makeDeps({
-    readFileAtBase: (_dir, baseBranch, relPath) => {
-      readAtBaseCalls.push({ baseBranch, relPath });
+    readFileAtBase: (_dir, ref, relPath) => {
+      readAtBaseCalls.push({ ref, relPath });
       return ROADMAP_FIXTURE;
     },
   });
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
   await runIntake(opts, DEFAULT_CFG, deps);
   assert.ok(
-    readAtBaseCalls.some((c) => c.baseBranch === "main" && c.relPath === "ROADMAP.md"),
-    "readFileAtBase must be called with cfg.base_branch='main' and relPath='ROADMAP.md'",
+    readAtBaseCalls.some((c) => c.ref === FAKE_BASE_SHA && c.relPath === "ROADMAP.md"),
+    "readFileAtBase must be called with the pinned SHA and relPath='ROADMAP.md'",
   );
 });
 
 test("intake: readFileAtBase is also called in dry-run mode", async () => {
-  const readAtBaseCalls: Array<{ baseBranch: string; relPath: string }> = [];
+  const readAtBaseCalls: Array<{ ref: string; relPath: string }> = [];
   const deps = makeDeps({
-    readFileAtBase: (_dir, baseBranch, relPath) => {
-      readAtBaseCalls.push({ baseBranch, relPath });
+    readFileAtBase: (_dir, ref, relPath) => {
+      readAtBaseCalls.push({ ref, relPath });
       return ROADMAP_FIXTURE;
     },
   });
@@ -715,32 +765,41 @@ test("intake: ensureLabel is NOT called in dry-run mode", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Label create-only: never clobber existing label metadata (#158 review-2)
+// ---------------------------------------------------------------------------
+
+test("labelCreateArgs: builds create-only args WITHOUT --force (no metadata clobber)", () => {
+  const args = labelCreateArgs("release:v1.6.0", "e4e669");
+  assert.deepEqual(args, ["label", "create", "release:v1.6.0", "--color", "e4e669"]);
+  // The bite: --force would update (clobber) an existing label's color/description.
+  assert.ok(!args.includes("--force"), "label create must NOT pass --force");
+});
+
+test("isLabelAlreadyExists: treats the gh already-exists error as benign, others as real", () => {
+  // Verified real gh stderr for an existing label.
+  const existsErr = 'label with name "pipeline:ready" already exists; use `--force` to update its color and description';
+  assert.equal(isLabelAlreadyExists(1, existsErr), true, "already-exists is benign (label present)");
+  assert.equal(isLabelAlreadyExists(0, ""), false, "success is not an already-exists case");
+  assert.equal(isLabelAlreadyExists(1, "HTTP 403: Resource not accessible"), false, "other failures are real errors");
+});
+
+// ---------------------------------------------------------------------------
 // Finding 4 (regression): recovery log emitted when post-issue step fails
 // ---------------------------------------------------------------------------
 
-test("intake: recovery log emitted when gitCreateBranch fails after issue creation", async () => {
+test("intake: gitCreateBranch failure aborts with NO issue created (orphan prevention) (#158 review-2)", async () => {
+  // After the reorder, branch prep runs BEFORE issue creation: a checkout failure must
+  // abort cleanly with no GitHub issue and no PR — never a stranded labeled issue.
   const deps = makeDeps({
     gitCreateBranch: () => {
-      throw new Error("[pipeline intake] git checkout failed: push permission denied");
+      throw new Error("[pipeline intake] git checkout -b failed: branch already exists");
     },
   });
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
 
-  let threw = false;
-  try {
-    await runIntake(opts, DEFAULT_CFG, deps);
-  } catch (_e) {
-    threw = true;
-  }
-  assert.ok(threw, "should re-throw the git error");
-  assert.equal(deps._createIssueCalls.length, 1, "issue should have been created before the failure");
-
-  const allLog = deps._logLines.join("\n");
-  assert.ok(allLog.includes("#999"), "recovery log must reference the created issue number");
-  assert.ok(
-    allLog.toLowerCase().includes("recovery") || allLog.toLowerCase().includes("manually"),
-    "recovery log must contain recovery instructions",
-  );
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /git checkout -b failed/);
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when branch prep fails");
+  assert.equal(deps._createPRCalls.length, 0, "no PR should be opened when branch prep fails");
 });
 
 test("intake: recovery log emitted when createPR fails after issue creation", async () => {

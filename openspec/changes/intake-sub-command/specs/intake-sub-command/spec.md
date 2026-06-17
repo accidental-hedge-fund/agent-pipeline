@@ -51,7 +51,9 @@ Given a short free-text description, the handler SHALL invoke exactly one model 
 
 ### Requirement: The `intake` sub-command SHALL create a GitHub issue from the generated spec
 
-After spec generation, the handler SHALL call the GitHub API to create an issue in the target repo. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
+The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation of the release branch from the pinned base SHA. A failure in any of those preparatory steps SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
+
+The handler SHALL ensure both required labels exist before issue creation in a CREATE-ONLY manner: it SHALL create a label that is absent but SHALL NOT modify (clobber) the color or description of a label that already exists. An "already exists" result from the create call SHALL be treated as success.
 
 #### Scenario: Issue created with correct labels
 
@@ -65,11 +67,21 @@ After spec generation, the handler SHALL call the GitHub API to create an issue 
 - **THEN** the handler proposes a release slot derived from the roadmap context (e.g., the next open minor version lane)
 - **AND** the issue is created with a `release:vX.Y.Z` label matching the proposed slot
 
+#### Scenario: Branch-preparation failure never strands a labeled issue
+
+- **WHEN** the release branch cannot be prepared (e.g., the base SHA is unresolvable, the branch name collides, or the working tree is dirty)
+- **THEN** the command SHALL abort with a non-zero exit and SHALL NOT create any GitHub issue or open any PR
+
+#### Scenario: Existing label metadata is not clobbered
+
+- **WHEN** intake ensures `pipeline:ready` or `release:vX.Y.Z` and that label already exists with a curated color/description
+- **THEN** the handler SHALL treat the label as present and SHALL NOT change its color or description (no `--force`)
+
 ---
 
 ### Requirement: The `intake` sub-command SHALL propose a ROADMAP.md update as a branch and PR
 
-After issue creation, the handler SHALL write three consistent mutations to `ROADMAP.md` — (1) a release-plan table row, (2) a per-issue sem-ver table row, (3) a detail-section bullet under the target release section — commit them on a new branch, and open a PR targeting the default branch. The handler SHALL NOT commit directly to the default branch. The PR body SHALL summarize the new issue and proposed release slot.
+The handler SHALL resolve the base branch to an immutable commit SHA once, read `ROADMAP.md` at that pinned SHA, and prepare the release branch by forking from the SAME pinned SHA — so the content the mutation is computed against and the branch the mutation is written onto are one commit. Because `origin/<base>` is a moving ref, reading at the ref and separately branching from the ref could straddle a concurrent push and yield a PR that rolls back roadmap entries that landed in between; pinning to one SHA SHALL prevent this. The handler SHALL write three consistent mutations to `ROADMAP.md` — (1) a release-plan table row, (2) a per-issue sem-ver table row, (3) a detail-section bullet under the target release section — commit them on the prepared branch, and open a PR targeting the default branch. The handler SHALL NOT commit directly to the default branch. The PR body SHALL summarize the new issue and proposed release slot.
 
 #### Scenario: ROADMAP PR opened for human review
 
@@ -77,6 +89,12 @@ After issue creation, the handler SHALL write three consistent mutations to `ROA
 - **THEN** a new branch is created with the roadmap edits
 - **AND** a PR is opened targeting the default branch
 - **AND** no commit is made directly to the default or main branch
+
+#### Scenario: Read and branch share one pinned base SHA
+
+- **WHEN** intake prepares the roadmap PR
+- **THEN** the same immutable base SHA is used both to read `ROADMAP.md` and to fork the release branch
+- **AND** a concurrent push to `origin/<base>` between the read and the branch creation does not cause the PR to remove roadmap entries that landed on the base after the read
 
 #### Scenario: All three ROADMAP structures updated consistently
 
