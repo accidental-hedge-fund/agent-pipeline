@@ -17,6 +17,7 @@ import {
   patchReleasePlanRow,
   prependShippedBlock,
   stampPerIssueTable,
+  countPerIssueRows,
   discoverShippedPRs,
   collectShippedIssueNumbers,
   buildPRBody,
@@ -1024,9 +1025,7 @@ test("CLI: 'pipeline release --status' exits non-zero with conflict message", ()
 // Finding 1: issue discovery failure aborts release in live mode
 // ---------------------------------------------------------------------------
 
-test("runRelease live: issue discovery failure aborts before writing ROADMAP", async () => {
-  const writes: string[] = [];
-
+test("runRelease live: issue discovery failure aborts and rolls back the bumped files (#170)", async () => {
   const deps = makeDeps({
     readFile: (p) => {
       if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
@@ -1034,7 +1033,6 @@ test("runRelease live: issue discovery failure aborts before writing ROADMAP", a
       if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
       throw new Error(`unexpected read: ${p}`);
     },
-    writeFile: (p) => { writes.push(p); },
     runCommand: (cmd, args) => {
       if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
       if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "Merge pull request #203 from foo/bar", stderr: "" };
@@ -1053,8 +1051,14 @@ test("runRelease live: issue discovery failure aborts before writing ROADMAP", a
       return true;
     },
   );
-  const roadmapWrites = writes.filter((p) => p.endsWith("ROADMAP.md"));
-  assert.equal(roadmapWrites.length, 0, "ROADMAP must not be written when issue discovery fails");
+  // Rollback: the bumped files are restored, and the ROADMAP is never left stamped —
+  // any ROADMAP write is the original content (restore), not a v1.6.0-stamped release.
+  const written = getWritten(deps);
+  assert.equal(written["/repo/package.json"], SAMPLE_ROOT_PKG, "root package.json restored after abort");
+  assert.equal(written["/repo/core/package.json"], SAMPLE_CORE_PKG, "core package.json restored after abort");
+  if (written["/repo/ROADMAP.md"] !== undefined) {
+    assert.equal(written["/repo/ROADMAP.md"], SAMPLE_ROADMAP, "ROADMAP restored to original (never stamped) on abort");
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1121,4 +1125,69 @@ test("resolveReleaseConfig: throws on schema-invalid config (not silently falls 
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// #170 review-2: empty/incomplete per-issue stamping + rollback-safe abort
+// ---------------------------------------------------------------------------
+
+test("countPerIssueRows: counts planned rows for a version and how many are stampable (#170)", () => {
+  // SAMPLE_ROADMAP plans #158 and #170 for v1.6.0.
+  assert.deepEqual(countPerIssueRows(SAMPLE_ROADMAP, "1.6.0", []), { planned: 2, stampable: 0 });
+  assert.deepEqual(countPerIssueRows(SAMPLE_ROADMAP, "1.6.0", [170]), { planned: 2, stampable: 1 });
+  assert.deepEqual(countPerIssueRows(SAMPLE_ROADMAP, "1.6.0", [158, 170]), { planned: 2, stampable: 2 });
+  // A version with no planned rows → planned 0 (so runRelease will NOT abort for it).
+  assert.deepEqual(countPerIssueRows(SAMPLE_ROADMAP, "1.9.0", [170]), { planned: 0, stampable: 0 });
+});
+
+function liveReleaseDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
+  return makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      // git log returns a squash-merge line so discoverShippedPRs finds PR #204.
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    ...overrides,
+  });
+}
+
+test("runRelease: aborts live release when shipped PRs resolve no stampable issue rows (#170)", async () => {
+  // PR #204 is shipped but closes no issue → shippedIssueNumbers empty → none of the
+  // 2 v1.6.0 rows can be stamped → would write an inconsistent ROADMAP → must abort.
+  const deps = liveReleaseDeps({ fetchPRClosingIssues: async () => [] });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /none could be stamped/,
+  );
+  // Rollback: the bumped package.json files must be restored to their originals.
+  const written = getWritten(deps);
+  assert.equal(written["/repo/package.json"], SAMPLE_ROOT_PKG, "root package.json restored after abort");
+  assert.equal(written["/repo/core/package.json"], SAMPLE_CORE_PKG, "core package.json restored after abort");
+});
+
+test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170)", async () => {
+  // CI fails AFTER the version bump + mirror regen. The checkout must be restored so a
+  // retry does not read the already-bumped version as previousVersion.
+  const deps = liveReleaseDeps({
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "npm" && args[0] === "run") return { code: 1, stdout: "", stderr: "tests failed" }; // CI fails
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /CI gate failed/,
+  );
+  const written = getWritten(deps);
+  assert.equal(written["/repo/package.json"], SAMPLE_ROOT_PKG, "root package.json restored after CI abort");
+  assert.equal(written["/repo/core/package.json"], SAMPLE_CORE_PKG, "core package.json restored after CI abort");
 });

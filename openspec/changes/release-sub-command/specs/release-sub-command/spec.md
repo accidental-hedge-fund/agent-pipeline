@@ -100,6 +100,19 @@ After the version bump and mirror regen, the command SHALL run `npm run ci` from
 
 ---
 
+### Requirement: Aborts before branch creation SHALL leave the working tree unchanged
+
+Any abort after the version bump and mirror regen but before the release branch is created — mirror-regen failure, CI failure, or issue-discovery failure — SHALL restore `package.json`, `core/package.json`, `ROADMAP.md`, and the regenerated `plugin/` mirror to their pre-release state, so a retry reads the original `previousVersion` and is not poisoned by stranded version/mirror changes.
+
+#### Scenario: post-bump abort rolls back the bumped files
+
+- **WHEN** the command bumps the version, regenerates the mirror, then aborts (CI fails, or issue discovery fails) before creating the release branch
+- **THEN** `package.json` and `core/package.json` SHALL be restored to their pre-bump contents
+- **AND** the `plugin/` mirror SHALL be regenerated from the restored (un-bumped) core
+- **AND** `ROADMAP.md` SHALL NOT be left in a stamped or partially-patched state
+
+---
+
 ### Requirement: The `release` sub-command SHALL scaffold `ROADMAP.md` at four locations
 
 After CI passes, the command SHALL patch `ROADMAP.md` in memory at these four sites:
@@ -120,6 +133,12 @@ Each site's anchor is located by a pattern match (e.g., `## Shipped`, the `| **v
 
 - **WHEN** no `| **vX.Y.Z** |` row matching the resolved version exists in ROADMAP.md
 - **THEN** the command SHALL exit non-zero naming the missing anchor and SHALL NOT write any file
+
+#### Scenario: Shipped PRs that resolve no stampable rows abort
+
+- **WHEN** shipped PRs exist and per-issue rows are planned for the resolved version, but none of those rows can be stamped because the shipped PRs resolve no matching closing issue numbers (e.g. empty `closingIssuesReferences`)
+- **THEN** the command SHALL abort with a non-zero exit code and a manual-resolution message rather than writing an unstamped, inconsistent release ROADMAP
+- **AND** when no per-issue rows are planned for the resolved version, the command SHALL NOT abort on this basis
 
 #### Scenario: Scaffolded PR/issue rows are derived from `git log` since the last tag
 

@@ -529,6 +529,40 @@ export function stampPerIssueTable(
 }
 
 /**
+ * Count per-issue ROADMAP rows planned for `version` (`→ Release == vX.Y.Z`) and how
+ * many of those would be stamped given `shippedIssueNumbers`. Used to block a live
+ * release that would otherwise write an inconsistent ROADMAP — shipped PRs exist and
+ * the table has rows for this version, but none can be stamped because the shipped
+ * PRs resolved no matching closing issues (e.g. empty `closingIssuesReferences`) (#170).
+ */
+export function countPerIssueRows(
+  text: string,
+  version: string,
+  shippedIssueNumbers: number[],
+): { planned: number; stampable: number } {
+  const tableHeader = "| # | Impact | Config | Theme | → Release | Depends on |";
+  if (!text.includes(tableHeader)) return { planned: 0, stampable: 0 };
+  const shippedSet = new Set(shippedIssueNumbers);
+  const lines = text.split("\n");
+  let inTable = false;
+  let planned = 0;
+  let stampable = 0;
+  for (const line of lines) {
+    if (line.includes(tableHeader)) { inTable = true; continue; }
+    if (!inTable) continue;
+    if (line.startsWith("#") || (line.trim() !== "" && !line.startsWith("|"))) { inTable = false; continue; }
+    if (!line.startsWith("| #")) continue;
+    const cols = line.split("|");
+    if (cols.length < 7) continue;
+    if (cols[5].trim() !== `v${version}`) continue;
+    planned++;
+    const m = cols[1].trim().match(/^#(\d+)$/);
+    if (m && shippedSet.has(Number(m[1]))) stampable++;
+  }
+  return { planned, stampable };
+}
+
+/**
  * Apply all four ROADMAP mutations atomically in memory.
  * Throws with a named-anchor error on the first missing site.
  * The optional `warn` callback is forwarded to stampPerIssueTable for
@@ -697,57 +731,99 @@ export async function runRelease(
   };
   scaffoldRoadmap(roadmapText, validationCtx);  // throws on missing anchor; result discarded
 
-  // 6. Bump version in both package.json files.
-  d.stdout("[pipeline release] bumping version in package.json files...");
-  bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, d);
-
-  // 7. Regenerate plugin/ mirror.
-  d.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
-  const buildResult = d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
-  if (buildResult.code !== 0) {
-    d.stderr(buildResult.stdout);
-    d.stderr(buildResult.stderr);
-    throw new Error(
-      `[pipeline release] mirror regen failed: node scripts/build.mjs exited ${buildResult.code}`,
-    );
-  }
-
-  // 8. CI gate — abort here if CI fails; no GitHub API has been called yet.
-  d.stdout("[pipeline release] running CI gate (npm run ci)...");
-  const ciResult = d.runCommand("npm", ["run", "ci"], { cwd: repoDir });
-  if (ciResult.code !== 0) {
-    d.stderr(ciResult.stdout);
-    d.stderr(ciResult.stderr);
-    throw new Error(
-      `[pipeline release] CI gate failed: npm run ci exited ${ciResult.code}`,
-    );
-  }
-  d.stdout("[pipeline release] CI passed.");
-
-  // 9. Discover shipped PRs with title enrichment (first GitHub API call; only reached after CI).
-  const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d);
-
-  // 10. Resolve shipped issue numbers from PR closing references (required for per-issue stamping).
-  const { issueNumbers: shippedIssueNumbers, hadFailures: issueDiscoveryFailed } =
-    await collectShippedIssueNumbers(shippedPRs, d);
-  if (issueDiscoveryFailed && shippedPRs.length > 0) {
-    throw new Error(
-      "[pipeline release] issue discovery failed for one or more PRs — cannot reliably stamp per-issue ROADMAP rows. " +
-      "Resolve the GitHub API errors above and retry, or use --dry-run to preview without per-issue stamping.",
-    );
-  }
-
-  // 11. Scaffold ROADMAP in memory and build PR body.
-  const ctx: ReleaseContext = {
-    version: resolvedVersion, previousVersion, date: today, theme,
-    shippedPRs, shippedIssueNumbers,
+  // Snapshot every file the version bump + mirror regen + ROADMAP write will modify,
+  // so ANY abort before branch creation restores the caller's checkout. Otherwise a
+  // failure after the bump/build (e.g. CI or issue-discovery error) strands the bumped
+  // package.json + regenerated plugin files, poisoning a retry whose previousVersion is
+  // then read from the already-bumped core/package.json (#170).
+  const rootPkgSnapshot = d.readFile(rootPkgPath);
+  const corePkgSnapshot = corePkgText;
+  const roadmapSnapshot = roadmapText;
+  let mirrorRegenerated = false;
+  const restoreCheckout = (): void => {
+    try {
+      d.writeFile(rootPkgPath, rootPkgSnapshot);
+      d.writeFile(corePkgPath, corePkgSnapshot);
+      d.writeFile(roadmapPath, roadmapSnapshot);
+      // Regenerate the mirror from the restored (un-bumped) core so plugin/ matches HEAD.
+      if (mirrorRegenerated) d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
+      d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and the plugin/ mirror to their pre-release state.");
+    } catch {
+      d.stderr("[pipeline release] warning: could not fully restore the working tree after abort; run `git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin` to discard release-prep changes.");
+    }
   };
-  const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
-  const prBody = buildPRBody(ctx, lastTag);
 
-  // 12. Write scaffolded ROADMAP to disk.
-  d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");
-  d.writeFile(roadmapPath, patchedRoadmap);
+  let prBody: string;
+  try {
+    // 6. Bump version in both package.json files.
+    d.stdout("[pipeline release] bumping version in package.json files...");
+    bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, d);
+
+    // 7. Regenerate plugin/ mirror.
+    d.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
+    mirrorRegenerated = true;
+    const buildResult = d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
+    if (buildResult.code !== 0) {
+      d.stderr(buildResult.stdout);
+      d.stderr(buildResult.stderr);
+      throw new Error(
+        `[pipeline release] mirror regen failed: node scripts/build.mjs exited ${buildResult.code}`,
+      );
+    }
+
+    // 8. CI gate — abort here if CI fails; no GitHub API has been called yet.
+    d.stdout("[pipeline release] running CI gate (npm run ci)...");
+    const ciResult = d.runCommand("npm", ["run", "ci"], { cwd: repoDir });
+    if (ciResult.code !== 0) {
+      d.stderr(ciResult.stdout);
+      d.stderr(ciResult.stderr);
+      throw new Error(
+        `[pipeline release] CI gate failed: npm run ci exited ${ciResult.code}`,
+      );
+    }
+    d.stdout("[pipeline release] CI passed.");
+
+    // 9. Discover shipped PRs with title enrichment (first GitHub API call; only reached after CI).
+    const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d);
+
+    // 10. Resolve shipped issue numbers from PR closing references (required for per-issue stamping).
+    const { issueNumbers: shippedIssueNumbers, hadFailures: issueDiscoveryFailed } =
+      await collectShippedIssueNumbers(shippedPRs, d);
+    if (issueDiscoveryFailed && shippedPRs.length > 0) {
+      throw new Error(
+        "[pipeline release] issue discovery failed for one or more PRs — cannot reliably stamp per-issue ROADMAP rows. " +
+        "Resolve the GitHub API errors above and retry, or use --dry-run to preview without per-issue stamping.",
+      );
+    }
+    // Finding 1 (#170): shipped PRs exist and the ROADMAP has rows planned for this
+    // version, but none can be stamped (the shipped PRs resolved no matching closing
+    // issues, e.g. empty closingIssuesReferences) → writing would produce an
+    // inconsistent release ROADMAP. Block for manual resolution. No abort when the
+    // ROADMAP simply has no rows planned for this version (planned === 0).
+    const { planned, stampable } = countPerIssueRows(roadmapText, resolvedVersion, shippedIssueNumbers);
+    if (shippedPRs.length > 0 && planned > 0 && stampable === 0) {
+      throw new Error(
+        `[pipeline release] found ${shippedPRs.length} shipped PR(s) and ${planned} ROADMAP row(s) planned for v${resolvedVersion}, ` +
+        `but none could be stamped — the shipped PRs resolved no matching closing issues (resolved: [${shippedIssueNumbers.join(", ") || "none"}]). ` +
+        `Verify the PR→issue links (gh pr view <n> --json closingIssuesReferences) and retry, or stamp the rows manually.`,
+      );
+    }
+
+    // 11. Scaffold ROADMAP in memory and build PR body.
+    const ctx: ReleaseContext = {
+      version: resolvedVersion, previousVersion, date: today, theme,
+      shippedPRs, shippedIssueNumbers,
+    };
+    const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
+    prBody = buildPRBody(ctx, lastTag);
+
+    // 12. Write scaffolded ROADMAP to disk.
+    d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");
+    d.writeFile(roadmapPath, patchedRoadmap);
+  } catch (err) {
+    restoreCheckout();
+    throw err;
+  }
 
   // 13. Open $EDITOR for human confirmation.
   if (!opts.noEdit) {
