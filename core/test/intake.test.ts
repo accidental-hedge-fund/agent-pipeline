@@ -126,8 +126,8 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
     gitEnsureClean: (dir) => {
       gitEnsureCleanCalls.push(dir);
     },
-    gitRemoteBranchExists: (_dir, _branch) => false,
     gitCreateBranch: (_dir, _branch, _fromRef) => {},
+    reserveRemoteBranch: (_dir, _branch, _sha) => {},
     gitPushBranch: (_dir, _branch) => {},
     gitCommit: (_dir, _files, _msg) => {},
     createPR: async (_dir, title, body, base, head) => {
@@ -805,14 +805,16 @@ test("intake: gitCreateBranch failure aborts with NO issue created (orphan preve
   assert.equal(deps._createPRCalls.length, 0, "no PR should be opened when branch prep fails");
 });
 
-test("intake: a remote branch collision aborts BEFORE issue creation (orphan prevention) (#158 review-2)", async () => {
-  // A stale origin/<branch> from a prior intake run must abort before the issue is created.
-  // Local `git checkout -b` only guards LOCAL collisions, so the remote must be preflighted —
-  // otherwise the issue is created and the later push fails, stranding a labeled issue.
+test("intake: an atomic-reservation collision aborts BEFORE issue creation (existing ref at ANY SHA) (#158 review-2)", async () => {
+  // The reservation is an ATOMIC create-only operation (create-ref), so a branch that already
+  // exists on origin — even at the same base SHA, where a plain push would no-op "up-to-date" —
+  // is detected as a collision and aborts before the issue is created. No orphan possible.
   const callOrder: string[] = [];
   const deps = makeDeps({
-    gitRemoteBranchExists: (_dir, _branch) => { callOrder.push("remoteCheck"); return true; },
-    gitCreateBranch: (_dir, _branch, _fromRef) => { callOrder.push("createBranch"); },
+    reserveRemoteBranch: (_dir, _branch, _sha) => {
+      callOrder.push("reserve");
+      throw new Error("[pipeline intake] branch ... already exists on origin — aborting before creating any issue.");
+    },
     createIssue: async (title, body, labels) => {
       callOrder.push("createIssue");
       deps._createIssueCalls.push({ title, body, labels });
@@ -822,12 +824,9 @@ test("intake: a remote branch collision aborts BEFORE issue creation (orphan pre
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
 
   await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /already exists on origin/);
-  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when the remote branch exists");
-  assert.equal(deps._createPRCalls.length, 0, "no PR should be opened when the remote branch exists");
-  // The remote check must precede both local branch creation and issue creation.
-  assert.equal(callOrder[0], "remoteCheck", "remote-branch preflight runs first");
-  assert.ok(!callOrder.includes("createBranch"), "local branch is not created when the remote already has it");
-  assert.ok(!callOrder.includes("createIssue"), "issue is not created when the remote already has it");
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when the reservation collides");
+  assert.equal(deps._createPRCalls.length, 0, "no PR should be opened when the reservation collides");
+  assert.ok(!callOrder.includes("createIssue"), "issue is never created once the reservation collides");
 });
 
 test("intake: branch name carries the short base SHA AND a random token (collision-resistant) (#158 review-2)", async () => {
@@ -851,15 +850,12 @@ test("intake: the random token disambiguates concurrent runs (different token �
   assert.notEqual(headA, headB, "two runs with the same title+base but different tokens get distinct branches");
 });
 
-test("intake: reservation push failure aborts BEFORE issue creation (no orphan via check-then-push race) (#158 review-2)", async () => {
-  // The remote ref is RESERVED by pushing it before createIssue. If that push fails — e.g.
-  // a concurrent run claimed the ref between the check and the push, or push capability is
-  // missing — the run must abort with NO issue created. This closes the check-then-push race
-  // and proves the reviewer's path: gitRemoteBranchExists=false, later push fails → no issue.
+test("intake: reservation failure aborts BEFORE issue creation (push capability / collision) (#158 review-2)", async () => {
+  // If the atomic reservation fails for any reason (collision, missing push/API capability),
+  // the run must abort with NO issue created.
   const callOrder: string[] = [];
   const deps = makeDeps({
-    gitRemoteBranchExists: (_d, _b) => false, // check passes...
-    gitPushBranch: (_d, _b) => { callOrder.push("push"); throw new Error("[pipeline intake] git push origin ... failed: reference already exists"); },
+    reserveRemoteBranch: (_d, _b, _s) => { callOrder.push("reserve"); throw new Error("[pipeline intake] could not reserve origin/... (exit 1): HTTP 403"); },
     createIssue: async (title, body, labels) => {
       callOrder.push("createIssue");
       deps._createIssueCalls.push({ title, body, labels });
@@ -868,15 +864,16 @@ test("intake: reservation push failure aborts BEFORE issue creation (no orphan v
   });
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
 
-  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /git push origin .* failed/);
-  assert.equal(deps._createIssueCalls.length, 0, "no issue when the reservation push fails");
-  assert.equal(deps._createPRCalls.length, 0, "no PR when the reservation push fails");
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /could not reserve/);
+  assert.equal(deps._createIssueCalls.length, 0, "no issue when the reservation fails");
+  assert.equal(deps._createPRCalls.length, 0, "no PR when the reservation fails");
   assert.ok(!callOrder.includes("createIssue"), "issue is never created once reservation fails");
 });
 
-test("intake: branch is reserved (pushed) BEFORE the issue is created", async () => {
+test("intake: branch is atomically reserved BEFORE the issue, roadmap pushed AFTER (#158 review-2)", async () => {
   const callOrder: string[] = [];
   const deps = makeDeps({
+    reserveRemoteBranch: (_d, _b, _s) => { callOrder.push("reserve"); },
     gitPushBranch: (_d, _b) => { callOrder.push("push"); },
     createIssue: async (title, body, labels) => {
       callOrder.push("createIssue");
@@ -886,12 +883,12 @@ test("intake: branch is reserved (pushed) BEFORE the issue is created", async ()
   });
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
   await runIntake(opts, DEFAULT_CFG, deps);
-  const firstPush = callOrder.indexOf("push");
+  const reserveIdx = callOrder.indexOf("reserve");
   const issueIdx = callOrder.indexOf("createIssue");
-  assert.ok(firstPush !== -1 && issueIdx !== -1, "both reservation push and issue creation run");
-  assert.ok(firstPush < issueIdx, "the reservation push must precede issue creation");
-  // And the roadmap commit is pushed again afterwards (fast-forward onto the reserved ref).
-  assert.ok(callOrder.lastIndexOf("push") > issueIdx, "roadmap commit is pushed after issue creation");
+  const pushIdx = callOrder.indexOf("push");
+  assert.ok(reserveIdx !== -1 && issueIdx !== -1 && pushIdx !== -1, "reserve, issue, and roadmap push all run");
+  assert.ok(reserveIdx < issueIdx, "the atomic reservation must precede issue creation");
+  assert.ok(pushIdx > issueIdx, "the roadmap commit is pushed (fast-forward) after issue creation");
 });
 
 test("intake: recovery log emitted when createPR fails after issue creation", async () => {
