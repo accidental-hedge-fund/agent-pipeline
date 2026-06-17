@@ -7,6 +7,9 @@ import {
   getHarnessLabel,
   getIssueLabelEvents,
   isBlocked,
+  mapRawIssue,
+  mapApiIssue,
+  type GhApiIssueRaw,
   normalizeClosingRefs,
   parseChecksAggregate,
   parseMergeable,
@@ -520,4 +523,173 @@ test("getIssueLabelEvents: a GitHub failure propagates (so the status JSON error
     throw new Error("GraphQL: rate limited");
   };
   await assert.rejects(() => getIssueLabelEvents(LABEL_CFG, 154, run), /rate limited/);
+});
+
+// ---------------------------------------------------------------------------
+// mapRawIssue (getOpenIssues pure parser, #171)
+// ---------------------------------------------------------------------------
+
+test("mapRawIssue: maps fields correctly for an open issue", () => {
+  const raw = {
+    number: 42,
+    title: "Add dark mode",
+    body: "As a user I want dark mode.",
+    labels: [{ name: "enhancement" }, { name: "p2" }],
+    url: "https://github.com/example/repo/issues/42",
+    state: "OPEN",
+    updatedAt: "2026-01-15T00:00:00Z",
+  };
+  const issue = mapRawIssue(raw);
+  assert.equal(issue.number, 42);
+  assert.equal(issue.title, "Add dark mode");
+  assert.equal(issue.body, "As a user I want dark mode.");
+  assert.deepEqual(issue.labels, ["enhancement", "p2"]);
+  assert.equal(issue.state, "open");
+  assert.equal(issue.updatedAt, "2026-01-15T00:00:00Z");
+});
+
+test("mapRawIssue: maps CLOSED state correctly", () => {
+  const raw = {
+    number: 1,
+    title: "Old issue",
+    body: "",
+    labels: [],
+    url: "https://github.com/example/repo/issues/1",
+    state: "closed",
+    updatedAt: undefined,
+  };
+  const issue = mapRawIssue(raw);
+  assert.equal(issue.state, "closed");
+});
+
+test("mapRawIssue: handles null/undefined body gracefully", () => {
+  const raw = {
+    number: 5,
+    title: "No body",
+    body: null as unknown as string,
+    labels: [],
+    url: "https://github.com/example/repo/issues/5",
+    state: "open",
+    updatedAt: undefined,
+  };
+  const issue = mapRawIssue(raw);
+  assert.equal(issue.body, "");
+});
+
+test("mapRawIssue: labels array is extracted from {name} objects", () => {
+  const raw = {
+    number: 7,
+    title: "Labeled issue",
+    body: "body",
+    labels: [{ name: "bug" }, { name: "needs-triage" }],
+    url: "",
+    state: "open",
+    updatedAt: undefined,
+  };
+  const issue = mapRawIssue(raw);
+  assert.deepEqual(issue.labels, ["bug", "needs-triage"]);
+});
+
+// ---------------------------------------------------------------------------
+// mapApiIssue (paginated getOpenIssues, finding #7 regression)
+// The gh api repos/<repo>/issues endpoint returns snake_case fields and
+// includes pull requests alongside issues. mapApiIssue must translate correctly.
+// ---------------------------------------------------------------------------
+
+test("mapApiIssue: maps html_url and updated_at correctly", () => {
+  const raw: GhApiIssueRaw = {
+    number: 42,
+    title: "Add dark mode",
+    body: "As a user I want dark mode.",
+    labels: [{ name: "enhancement" }],
+    html_url: "https://github.com/example/repo/issues/42",
+    state: "open",
+    updated_at: "2026-01-15T00:00:00Z",
+  };
+  const issue = mapApiIssue(raw);
+  assert.equal(issue.number, 42);
+  assert.equal(issue.url, "https://github.com/example/repo/issues/42", "url should map from html_url");
+  assert.equal(issue.updatedAt, "2026-01-15T00:00:00Z", "updatedAt should map from updated_at");
+  assert.equal(issue.state, "open");
+  assert.deepEqual(issue.labels, ["enhancement"]);
+});
+
+test("mapApiIssue: handles null body gracefully", () => {
+  const raw: GhApiIssueRaw = {
+    number: 5,
+    title: "No body",
+    body: null,
+    labels: [],
+    html_url: "https://github.com/example/repo/issues/5",
+    state: "open",
+  };
+  const issue = mapApiIssue(raw);
+  assert.equal(issue.body, "");
+});
+
+test("mapApiIssue: pull_request field is present — caller must filter PRs", () => {
+  // The GitHub API includes PRs under the issues endpoint. PRs have a pull_request field.
+  // getOpenIssues filters them via raw.filter(r => !r.pull_request).
+  // This test verifies mapApiIssue does NOT crash on a PR-shaped entry and that the
+  // pull_request field is detectable for filtering.
+  const pr: GhApiIssueRaw = {
+    number: 100,
+    title: "Add feature (PR)",
+    body: "PR body",
+    labels: [],
+    html_url: "https://github.com/example/repo/pull/100",
+    state: "open",
+    pull_request: { url: "https://api.github.com/repos/example/repo/pulls/100" },
+  };
+  // The caller filters: raw.filter(r => !r.pull_request)
+  assert.ok(pr.pull_request !== undefined, "PR entry should have pull_request field for filtering");
+  // mapApiIssue itself maps correctly even for PRs (the filter happens before this call)
+  const mapped = mapApiIssue(pr);
+  assert.equal(mapped.number, 100);
+});
+
+// ---------------------------------------------------------------------------
+// Multi-page pagination parsing regression (#171, finding 1 round 2)
+// gh api --paginate without --slurp emits each page as a separate JSON array
+// on stdout, producing "[...]\n[...]" which JSON.parse throws on.
+// With --slurp, gh wraps all pages into [[page1...], [page2...]] which is valid
+// JSON. The caller must .flat() before filtering PRs.
+// ---------------------------------------------------------------------------
+
+test("getOpenIssues pagination: --slurp output (array-of-arrays) round-trips via flat()+filter()", () => {
+  const page1: GhApiIssueRaw[] = [
+    { number: 1, title: "Issue one", body: "body", labels: [], html_url: "https://github.com/x/y/issues/1", state: "open" },
+    { number: 2, title: "Issue two", body: "body", labels: [], html_url: "https://github.com/x/y/issues/2", state: "open" },
+  ];
+  const page2: GhApiIssueRaw[] = [
+    { number: 3, title: "Issue three", body: "body", labels: [], html_url: "https://github.com/x/y/issues/3", state: "open" },
+    // A PR entry that must be filtered out
+    { number: 4, title: "A PR", body: "", labels: [], html_url: "https://github.com/x/y/pull/4", state: "open", pull_request: { url: "https://api.github.com/repos/x/y/pulls/4" } },
+  ];
+
+  // Simulate what gh api --paginate --slurp produces: [[...page1...], [...page2...]]
+  const slurpedStdout = JSON.stringify([page1, page2]);
+
+  // Verify the format is valid JSON (would throw without --slurp on multi-page responses)
+  const parsed = JSON.parse(slurpedStdout) as GhApiIssueRaw[][];
+  const flattened = parsed.flat();
+  const issues = flattened.filter((r) => !r.pull_request).map(mapApiIssue);
+
+  assert.equal(issues.length, 3, "should include all 3 issues across both pages");
+  assert.equal(issues[0].number, 1);
+  assert.equal(issues[1].number, 2);
+  assert.equal(issues[2].number, 3);
+});
+
+test("getOpenIssues pagination: non-slurped multi-page JSON is invalid and JSON.parse throws", () => {
+  // Without --slurp, gh api --paginate writes each page as a separate JSON array on stdout.
+  const page1Json = JSON.stringify([{ number: 1, title: "A", body: "", labels: [], html_url: "u", state: "open" }]);
+  const page2Json = JSON.stringify([{ number: 2, title: "B", body: "", labels: [], html_url: "u", state: "open" }]);
+  const nonSlurpedStdout = page1Json + "\n" + page2Json;
+
+  // This is what breaks without --slurp: two adjacent JSON documents are not valid JSON.
+  assert.throws(
+    () => JSON.parse(nonSlurpedStdout),
+    "multi-page non-slurped stdout must throw on JSON.parse to document why --slurp is required",
+  );
 });

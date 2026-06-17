@@ -992,3 +992,139 @@ export function parseMergeable(detail: PrDetail): "clean" | "conflict" | "unknow
   if (state === "DIRTY" || state === "BEHIND" || state === "BLOCKED") return "conflict";
   return "unknown";
 }
+
+// ---------------------------------------------------------------------------
+// Roadmap engine helpers (#171)
+// ---------------------------------------------------------------------------
+
+export interface OpenIssue {
+  number: number;
+  title: string;
+  body: string;
+  labels: string[];
+  url: string;
+  state: "open" | "closed";
+  updatedAt?: string;
+}
+
+interface GhIssueRaw {
+  number: number;
+  title: string;
+  body: string;
+  labels: { name: string }[];
+  url: string;
+  state: string;
+  updatedAt?: string;
+}
+
+/**
+ * Map a raw `gh issue list --json` entry to the typed `OpenIssue` shape.
+ * Exported for unit testing.
+ */
+export function mapRawIssue(issue: GhIssueRaw): OpenIssue {
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body ?? "",
+    labels: (issue.labels ?? []).map((l) => l.name),
+    url: issue.url,
+    state: (issue.state?.toLowerCase() === "closed" ? "closed" : "open") as "open" | "closed",
+    updatedAt: issue.updatedAt,
+  };
+}
+
+/**
+ * Shape returned by `gh api repos/<repo>/issues` (REST API).
+ * Field names differ from `gh issue list --json` (snake_case, html_url, etc.).
+ */
+export interface GhApiIssueRaw {
+  number: number;
+  title: string;
+  body: string | null;
+  labels: { name: string }[];
+  html_url: string;
+  state: string;
+  updated_at?: string;
+  /** Present on pull requests; absent on issues. Used to filter PRs out. */
+  pull_request?: unknown;
+}
+
+/**
+ * Map a raw `gh api repos/<repo>/issues` entry to the typed `OpenIssue` shape.
+ * Exported for unit testing.
+ */
+export function mapApiIssue(issue: GhApiIssueRaw): OpenIssue {
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body ?? "",
+    labels: (issue.labels ?? []).map((l) => l.name),
+    url: issue.html_url,
+    state: (issue.state?.toLowerCase() === "closed" ? "closed" : "open") as "open" | "closed",
+    updatedAt: issue.updated_at,
+  };
+}
+
+/**
+ * Fetch ALL open issues from a repo via paginated `gh api` calls.
+ * Uses `gh api repos/<repo>/issues --paginate` so repositories with more than
+ * 100 open issues are not silently truncated (the old `gh issue list --limit 500` cap).
+ * PRs are filtered out (the GitHub API includes them under the issues endpoint).
+ */
+export async function getOpenIssues(
+  repo: string,
+  opts: { labels?: string[] } = {},
+): Promise<OpenIssue[]> {
+  let apiPath = `repos/${repo}/issues?state=open&per_page=100`;
+  if (opts.labels && opts.labels.length > 0) {
+    apiPath += `&labels=${encodeURIComponent(opts.labels.join(","))}`;
+  }
+
+  const stdout = await ghRun(["api", apiPath, "--paginate", "--slurp"], { timeoutMs: 120_000 });
+  // --slurp wraps each page array into an outer array: [[page1...], [page2...]]. Flatten before filtering.
+  const raw = (JSON.parse(stdout) as GhApiIssueRaw[][]).flat();
+  // Filter PRs: the GitHub API lists PRs under the issues endpoint; PRs have a pull_request field.
+  return raw.filter((r) => !r.pull_request).map(mapApiIssue);
+}
+
+interface GhMilestoneRaw {
+  id: number;
+  number: number;
+  title: string;
+}
+
+/**
+ * Fetch all milestones for a repo.
+ * Uses `gh api repos/<repo>/milestones`.
+ */
+export async function getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>> {
+  const stdout = await ghRun(["api", `repos/${repo}/milestones`, "--paginate", "--slurp"], {
+    timeoutMs: 30_000,
+  });
+  // --slurp wraps each page array into an outer array. Flatten before mapping.
+  const raw = (JSON.parse(stdout) as GhMilestoneRaw[][]).flat();
+  return raw.map((m) => ({ id: m.id, number: m.number, title: m.title }));
+}
+
+/**
+ * Create a milestone in a repo and return its number.
+ */
+export async function createMilestone(
+  repo: string,
+  title: string,
+  dueOn?: string,
+): Promise<number> {
+  const args = [
+    "api",
+    `repos/${repo}/milestones`,
+    "--method",
+    "POST",
+    "--field",
+    `title=${title}`,
+  ];
+  if (dueOn) args.push("--field", `due_on=${dueOn}`);
+
+  const stdout = await ghRun(args, { timeoutMs: 30_000 });
+  const result = JSON.parse(stdout) as { number: number };
+  return result.number;
+}

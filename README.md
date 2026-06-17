@@ -206,6 +206,9 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
 /pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
+/pipeline roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run; no number)
+/pipeline roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
+/pipeline roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
