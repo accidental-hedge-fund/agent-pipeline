@@ -562,6 +562,113 @@ export function countPerIssueRows(
   return { planned, stampable };
 }
 
+// ---------------------------------------------------------------------------
+// Intake ROADMAP helpers (used by the `intake` sub-command, #158)
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a new row in the release-plan table before the `| *(none)* |`
+ * research-tracker sentinel row.
+ */
+export function insertReleasePlanRow(
+  text: string,
+  version: string,
+  bump: string,
+  theme: string,
+  issueRef: string,
+  why: string,
+): string {
+  const anchor = "| *(none)* |";
+  const lines = text.split("\n");
+  const idx = lines.findIndex((l) => l.startsWith(anchor));
+  if (idx === -1) {
+    throw new Error(
+      `ROADMAP anchor not found: release-plan-none-row` +
+        ` (expected "| *(none)* |" row in the release plan table)`,
+    );
+  }
+  const newRow = `| **v${version}** | ${bump} | ${theme} | ${issueRef} | ${why} |`;
+  lines.splice(idx, 0, newRow);
+  return lines.join("\n");
+}
+
+/**
+ * Insert a new row in the per-issue sem-ver table before the first row whose
+ * `→ Release` column is `*(none)*` (the research-tracker rows).
+ */
+export function insertPerIssueRow(
+  text: string,
+  issueNum: number | string,
+  impact: string,
+  config: string,
+  theme: string,
+  version: string,
+  dependsOn: string,
+): string {
+  const tableHeader = "| # | Impact | Config | Theme | → Release | Depends on |";
+  if (!text.includes(tableHeader)) {
+    throw new Error(
+      `ROADMAP anchor not found: per-issue-table` +
+        ` (expected "${tableHeader}" header in the per-issue detail table)`,
+    );
+  }
+  const lines = text.split("\n");
+  let inTable = false;
+  let insertIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(tableHeader)) {
+      inTable = true;
+      continue;
+    }
+    if (!inTable) continue;
+    if (lines[i].startsWith("#") || (lines[i].trim() !== "" && !lines[i].startsWith("|"))) {
+      inTable = false;
+      break;
+    }
+    const cols = lines[i].split("|");
+    if (cols.length >= 7 && cols[5].trim() === "*(none)*") {
+      insertIdx = i;
+      break;
+    }
+  }
+  if (insertIdx === -1) {
+    throw new Error(
+      `ROADMAP anchor not found: per-issue-none-row` +
+        ` (expected a row with "*(none)*" in → Release column in the per-issue detail table)`,
+    );
+  }
+  const newRow = `| #${issueNum} | ${impact} | ${config} | ${theme} | v${version} | ${dependsOn} |`;
+  lines.splice(insertIdx, 0, newRow);
+  return lines.join("\n");
+}
+
+/**
+ * Insert a bullet at the top of the `### vX.Y.Z` detail section, after the
+ * heading line and before any existing bullets.
+ */
+export function insertDetailSectionBullet(
+  text: string,
+  version: string,
+  bullet: string,
+): string {
+  const lines = text.split("\n");
+  const headingRe = new RegExp(`^### v${escapeRegex(version)}`);
+  const headingIdx = lines.findIndex((l) => headingRe.test(l));
+  if (headingIdx === -1) {
+    throw new Error(
+      `ROADMAP anchor not found: detail-section-v${version}` +
+        ` (expected "### v${version}" heading in the detail section)`,
+    );
+  }
+  // Insert after the heading and any immediately-following blank line.
+  let insertIdx = headingIdx + 1;
+  if (insertIdx < lines.length && lines[insertIdx].trim() === "") {
+    insertIdx++;
+  }
+  lines.splice(insertIdx, 0, `- ${bullet}`);
+  return lines.join("\n");
+}
+
 /**
  * Apply all four ROADMAP mutations atomically in memory.
  * Throws with a named-anchor error on the first missing site.

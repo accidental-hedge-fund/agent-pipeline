@@ -58,6 +58,9 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
 /pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
 /pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
+/pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
+/pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
+/pipeline intake --description "<text>" --dry-run  preview only; no writes
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -89,6 +92,20 @@ failure and exits `0`/`1`. Opt in to run it at the start of a real run with
 planning**, so no tokens are spent. `--fail-fast` (or `doctor.failFast: true`)
 stops at the first failure. The latest result is stored under `/tmp` and surfaced
 by `--status`.
+
+`intake` turns a rough one-line description into a decision-complete GitHub issue
+**and** a matching `ROADMAP.md` update — in one command:
+
+```bash
+/pipeline intake --description "add retry logic to the fix loop"
+/pipeline intake "add retry logic" --release v1.6.0
+/pipeline intake --description "add retry logic" --dry-run   # preview only
+```
+
+The spec-generation step is the only model call; issue creation and roadmap editing
+are deterministic. The roadmap update is opened as a PR for human review — the
+pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
+proposes the first open lane from `ROADMAP.md`.
 
 ## Setup (zero install after first run)
 

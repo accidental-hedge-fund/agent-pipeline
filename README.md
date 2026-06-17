@@ -203,12 +203,49 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
 /pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
 /pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
+/pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
+/pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
+/pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
 The number is auto-detected as an issue or PR. PRs resolve to their linked closing issue; PRs with no `Closes #N` are refused. Items must carry a `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
 
 `--cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
+
+## Intake sub-command
+
+`pipeline intake` is a no-issue-number front-door command that turns a rough one-line description into a decision-complete GitHub issue **and** proposes a matching `ROADMAP.md` update — all in one shot.
+
+```bash
+# Generate a spec, create the issue, and open a ROADMAP PR:
+/pipeline intake --description "add retry logic to the fix loop"
+
+# Pin the target release slot:
+/pipeline intake --description "add retry logic to the fix loop" --release v1.6.0
+
+# Or pass the description as a positional argument:
+/pipeline intake "add retry logic to the fix loop"
+
+# Preview without writing anything to GitHub:
+/pipeline intake --description "add retry logic to the fix loop" --dry-run
+```
+
+**What it does:**
+
+1. **Spec generation (only model-invoking step):** invokes the claude harness with the description to produce a structured spec — Summary, User story, Acceptance criteria (testable `- [ ]` items), Out of scope, and Open questions only when genuinely ambiguous. Follows the same WHAT-not-HOW contract as the `/pm` skill.
+2. **Issue creation (deterministic):** creates a GitHub issue with the generated spec body and two labels: `pipeline:ready` and `release:vX.Y.Z`.
+3. **ROADMAP PR (deterministic):** writes three mutations to `ROADMAP.md` — a release-plan table row, a per-issue sem-ver table row, and a detail-section bullet — commits them on a new branch (`intake/issue-N-<slug>`), and opens a PR targeting the default branch for human review.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--description "<text>"` | Free-text seed description (required unless passed as positional arg). |
+| `--release <vX.Y.Z>` | Pin the target release slot. When omitted, the first open lane in `ROADMAP.md` is proposed. |
+| `--dry-run` | Print the proposed issue body and ROADMAP diff; exit without writing to GitHub or the filesystem. |
+
+The pipeline never merges — the ROADMAP PR requires a human to review and merge the release-slot placement.
 
 ## Onboarding a new repo
 
