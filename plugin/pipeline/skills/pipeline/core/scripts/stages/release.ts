@@ -76,7 +76,15 @@ export function realReleaseDeps(): ReleaseDeps {
       };
     },
     spawnEditor: (editor, filePath) => {
-      spawnSync(editor, [filePath], { stdio: "inherit" });
+      // Run through shell so "code --wait", "subl -n -w", etc. work correctly.
+      const result = spawnSync("sh", ["-c", `${editor} "$1"`, "--", filePath], {
+        stdio: "inherit",
+      });
+      if ((result.status ?? 1) !== 0) {
+        throw new Error(
+          `[pipeline release] editor exited ${result.status ?? 1} (EDITOR="${editor}"). Aborting.`,
+        );
+      }
     },
     fetchPRTitle: async (num) => {
       const result = spawnSync(
@@ -120,8 +128,106 @@ export function resolveVersion(alias: string, currentVersion: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Unified diff helper (used for dry-run output — no file writes or gh calls)
+// ---------------------------------------------------------------------------
+
+function diffLines(
+  a: string[],
+  b: string[],
+): Array<{ kind: "eq" | "del" | "ins"; val: string }> {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] =
+        a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1] + 1
+          : Math.max(dp[i - 1][j], dp[i][j - 1]);
+
+  const ops: Array<{ kind: "eq" | "del" | "ins"; val: string }> = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
+      ops.push({ kind: "eq", val: a[i - 1] }); i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.push({ kind: "ins", val: b[j - 1] }); j--;
+    } else {
+      ops.push({ kind: "del", val: a[i - 1] }); i--;
+    }
+  }
+  ops.reverse();
+  return ops;
+}
+
+/** Generate a unified diff string comparing two text blocks. Returns "" when identical. */
+export function computeUnifiedDiff(
+  oldText: string,
+  newText: string,
+  oldLabel: string,
+  newLabel: string,
+  contextLines = 3,
+): string {
+  if (oldText === newText) return "";
+  const a = oldText.split("\n");
+  const b = newText.split("\n");
+  const edits = diffLines(a, b);
+
+  // Annotate edits with 1-based a/b side line numbers.
+  type Tagged = { kind: "eq" | "del" | "ins"; val: string; aLine?: number; bLine?: number };
+  const tagged: Tagged[] = [];
+  let aLine = 0, bLine = 0;
+  for (const e of edits) {
+    if (e.kind === "eq")       { aLine++; bLine++; tagged.push({ kind: "eq",  val: e.val, aLine, bLine }); }
+    else if (e.kind === "del") { aLine++;           tagged.push({ kind: "del", val: e.val, aLine }); }
+    else                       { bLine++;           tagged.push({ kind: "ins", val: e.val, bLine }); }
+  }
+
+  // Collect indices of changed edits and group into hunk ranges with context.
+  const changeIdxs = tagged.flatMap((t, idx) => (t.kind !== "eq" ? [idx] : []));
+  if (changeIdxs.length === 0) return "";
+
+  type HunkRange = { start: number; end: number };
+  const ranges: HunkRange[] = [];
+  let cur: HunkRange | null = null;
+  for (const ci of changeIdxs) {
+    const s = Math.max(0, ci - contextLines);
+    const e = Math.min(tagged.length - 1, ci + contextLines);
+    if (!cur) { cur = { start: s, end: e }; }
+    else if (s <= cur.end + 1) { cur.end = Math.max(cur.end, e); }
+    else { ranges.push(cur); cur = { start: s, end: e }; }
+  }
+  if (cur) ranges.push(cur);
+
+  // Format hunks.
+  const out: string[] = [`--- ${oldLabel}`, `+++ ${newLabel}`];
+  for (const r of ranges) {
+    const slice = tagged.slice(r.start, r.end + 1);
+    const aSlice = slice.filter((t) => t.aLine !== undefined);
+    const bSlice = slice.filter((t) => t.bLine !== undefined);
+    const oldStart = aSlice[0]?.aLine ?? 1;
+    const newStart = bSlice[0]?.bLine ?? 1;
+    out.push(`@@ -${oldStart},${aSlice.length} +${newStart},${bSlice.length} @@`);
+    for (const t of slice) {
+      if (t.kind === "eq")       out.push(` ${t.val}`);
+      else if (t.kind === "del") out.push(`-${t.val}`);
+      else                       out.push(`+${t.val}`);
+    }
+  }
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Version bump
 // ---------------------------------------------------------------------------
+
+/** Apply version bump in memory (no file write). Used by dry-run diff. */
+function bumpVersionInMemory(text: string, resolvedVersion: string): string {
+  const pkg = JSON.parse(text) as { version: string };
+  const indentMatch = text.match(/^(\s+)"/m);
+  const indent = indentMatch ? indentMatch[1] : "  ";
+  pkg.version = resolvedVersion;
+  return JSON.stringify(pkg, null, indent) + "\n";
+}
 
 export function bumpVersion(
   resolvedVersion: string,
@@ -151,6 +257,7 @@ export async function discoverShippedPRs(
   lastTag: string,
   repoDir: string,
   deps: Pick<ReleaseDeps, "runCommand" | "fetchPRTitle" | "stderr">,
+  localOnly = false,
 ): Promise<ShippedPR[]> {
   const range = lastTag ? `${lastTag}..HEAD` : "HEAD";
   const result = deps.runCommand("git", ["log", "--pretty=format:%s", range], { cwd: repoDir });
@@ -171,8 +278,14 @@ export async function discoverShippedPRs(
     return [];
   }
 
+  const sorted = [...prNums].sort((a, b) => a - b);
+  if (localOnly) {
+    // Dry-run path: return placeholder titles without calling any GitHub API.
+    return sorted.map((num) => ({ number: num, title: `PR #${num}` }));
+  }
+
   const prs: ShippedPR[] = [];
-  for (const num of [...prNums].sort((a, b) => a - b)) {
+  for (const num of sorted) {
     const title = await deps.fetchPRTitle(num);
     prs.push({ number: num, title });
   }
@@ -418,7 +531,7 @@ export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
 export async function runRelease(
   versionArg: string,
   opts: ReleaseOpts,
-  cfg: { repo_dir: string; repo: string },
+  cfg: { repo_dir: string; repo: string; base_branch?: string },
   deps: ReleaseDeps = realReleaseDeps(),
 ): Promise<void> {
   const repoDir = cfg.repo_dir;
@@ -434,7 +547,7 @@ export async function runRelease(
   const resolvedVersion = resolveVersion(versionArg, previousVersion);
   deps.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
 
-  // 3. Find last git tag for git-log range.
+  // 3. Find last git tag for git-log range (local git call, safe in all modes).
   const tagResult = deps.runCommand("git", ["describe", "--tags", "--abbrev=0"], { cwd: repoDir });
   const lastTag = tagResult.code === 0 ? tagResult.stdout.trim() : "";
   if (lastTag) {
@@ -443,36 +556,39 @@ export async function runRelease(
     deps.stdout("[pipeline release] no previous tag found; git log range: HEAD");
   }
 
-  // 4. Discover shipped PRs.
-  const shippedPRs = await discoverShippedPRs(lastTag, repoDir, deps);
-
-  // 5. Read ROADMAP and extract theme from the release plan row.
+  // 4. Read ROADMAP and extract theme (local, safe in all modes).
   const roadmapText = deps.readFile(roadmapPath);
   const theme = extractTheme(roadmapText, resolvedVersion);
   const today = deps.today();
 
-  const ctx: ReleaseContext = {
-    version: resolvedVersion,
-    previousVersion,
-    date: today,
-    theme,
-    shippedPRs,
-  };
-
-  // 6. Scaffold ROADMAP in memory (always — needed for dry-run diff too).
-  const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
-
-  // 7. Build PR body.
-  const prBody = buildPRBody(ctx, lastTag);
-
-  // --- Dry-run path: print and exit ---
+  // --- Dry-run path: local-only, no file writes, no GitHub API calls ---
   if (opts.dryRun) {
+    // Discover PR numbers from git log only (localOnly=true skips fetchPRTitle → gh).
+    const shippedPRs = await discoverShippedPRs(lastTag, repoDir, deps, /* localOnly= */ true);
+
+    const ctx: ReleaseContext = { version: resolvedVersion, previousVersion, date: today, theme, shippedPRs };
+
+    // Compute version-bump diffs in memory (no file writes).
+    const rootPkgOld = deps.readFile(rootPkgPath);
+    const rootPkgNew = bumpVersionInMemory(rootPkgOld, resolvedVersion);
+    const corePkgNew = bumpVersionInMemory(corePkgText, resolvedVersion);
+
+    const rootDiff = computeUnifiedDiff(rootPkgOld, rootPkgNew, "a/package.json", "b/package.json");
+    const coreDiff = computeUnifiedDiff(corePkgText, corePkgNew, "a/core/package.json", "b/core/package.json");
+
+    // Scaffold ROADMAP in memory and diff it.
+    const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
+    const roadmapDiff = computeUnifiedDiff(roadmapText, patchedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
+
+    const prBody = buildPRBody(ctx, lastTag);
+
     deps.stdout(`\n=== Resolved version: ${resolvedVersion} ===\n`);
-    deps.stdout(`=== package.json changes ===`);
-    deps.stdout(`  "version": "${previousVersion}" → "${resolvedVersion}" (root + core/package.json)`);
-    deps.stdout(`  + node scripts/build.mjs (mirror regen)\n`);
-    deps.stdout(`=== ROADMAP.md (scaffolded) ===`);
-    deps.stdout(patchedRoadmap);
+    deps.stdout(`=== package.json diff ===`);
+    deps.stdout(rootDiff || "(no changes)");
+    deps.stdout(`\n=== core/package.json diff ===`);
+    deps.stdout(coreDiff || "(no changes)");
+    deps.stdout(`\n=== ROADMAP.md diff ===`);
+    deps.stdout(roadmapDiff || "(no changes)");
     deps.stdout(`\n=== PR body ===`);
     deps.stdout(prBody);
     return;
@@ -480,11 +596,11 @@ export async function runRelease(
 
   // --- Live path ---
 
-  // 8. Bump version in both package.json files.
+  // 5. Bump version in both package.json files.
   deps.stdout("[pipeline release] bumping version in package.json files...");
   bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, deps);
 
-  // 9. Regenerate plugin/ mirror.
+  // 6. Regenerate plugin/ mirror.
   deps.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
   const buildResult = deps.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
   if (buildResult.code !== 0) {
@@ -495,7 +611,7 @@ export async function runRelease(
     );
   }
 
-  // 10. CI gate.
+  // 7. CI gate — abort here if CI fails; no GitHub API has been called yet.
   deps.stdout("[pipeline release] running CI gate (npm run ci)...");
   const ciResult = deps.runCommand("npm", ["run", "ci"], { cwd: repoDir });
   if (ciResult.code !== 0) {
@@ -507,11 +623,19 @@ export async function runRelease(
   }
   deps.stdout("[pipeline release] CI passed.");
 
-  // 11. Write scaffolded ROADMAP to disk.
+  // 8. Discover shipped PRs with title enrichment (first GitHub API call; only reached after CI).
+  const shippedPRs = await discoverShippedPRs(lastTag, repoDir, deps);
+
+  // 9. Scaffold ROADMAP in memory and build PR body.
+  const ctx: ReleaseContext = { version: resolvedVersion, previousVersion, date: today, theme, shippedPRs };
+  const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
+  const prBody = buildPRBody(ctx, lastTag);
+
+  // 10. Write scaffolded ROADMAP to disk.
   deps.stdout("[pipeline release] writing scaffolded ROADMAP.md...");
   deps.writeFile(roadmapPath, patchedRoadmap);
 
-  // 12. Open $EDITOR for human confirmation.
+  // 11. Open $EDITOR for human confirmation.
   if (!opts.noEdit) {
     const editor = process.env.EDITOR;
     if (!editor) {
@@ -524,7 +648,7 @@ export async function runRelease(
     }
   }
 
-  // 13. Create release branch, commit, and open PR.
+  // 12. Create release branch, commit, and open PR.
   const branch = `release/v${resolvedVersion}`;
   deps.stdout(`[pipeline release] creating branch ${branch}...`);
 
@@ -558,10 +682,12 @@ export async function runRelease(
     throw new Error(`[pipeline release] git push failed: ${pushResult.stderr.trim()}`);
   }
 
+  // Use configured base_branch (from .github/pipeline.yml or --base CLI flag), default "main".
+  const baseBranch = cfg.base_branch ?? "main";
   const prTitle = `release: ${resolvedVersion} — ${theme}`;
   const prResult = deps.runCommand(
     "gh",
-    ["pr", "create", "--title", prTitle, "--body", prBody, "--base", "main"],
+    ["pr", "create", "--title", prTitle, "--body", prBody, "--base", baseBranch],
     { cwd: repoDir },
   );
   if (prResult.code !== 0) {

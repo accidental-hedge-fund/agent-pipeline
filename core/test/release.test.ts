@@ -20,6 +20,8 @@ import {
   discoverShippedPRs,
   buildPRBody,
   extractTheme,
+  computeUnifiedDiff,
+  runRelease,
   type ReleaseDeps,
   type ReleaseContext,
   type CommandResult,
@@ -501,6 +503,263 @@ test("dry-run integration: scaffoldRoadmap is called but writeFile is never call
   assert.equal(Object.keys(written).length, 0, "no files written in dry-run simulation");
   const editorCalls = getEditorCalls(deps);
   assert.equal(editorCalls.length, 0, "no editor launched in dry-run simulation");
+});
+
+// ---------------------------------------------------------------------------
+// computeUnifiedDiff (finding 4)
+// ---------------------------------------------------------------------------
+
+test("computeUnifiedDiff: returns unified diff with --- +++ and @@ markers", () => {
+  const oldText = "a\nb\nc\n";
+  const newText = "a\nX\nc\n";
+  const diff = computeUnifiedDiff(oldText, newText, "a/file", "b/file");
+  assert.ok(diff.includes("--- a/file"), "has old label");
+  assert.ok(diff.includes("+++ b/file"), "has new label");
+  assert.ok(diff.includes("@@"), "has hunk header");
+  assert.ok(diff.includes("-b"), "shows deleted line");
+  assert.ok(diff.includes("+X"), "shows inserted line");
+});
+
+test("computeUnifiedDiff: returns empty string for identical texts", () => {
+  const diff = computeUnifiedDiff("same\n", "same\n", "a/f", "b/f");
+  assert.equal(diff, "");
+});
+
+test("computeUnifiedDiff: insertion-only diff is correct", () => {
+  const oldText = "a\nb\n";
+  const newText = "a\nnew\nb\n";
+  const diff = computeUnifiedDiff(oldText, newText, "a/f", "b/f");
+  assert.ok(diff.includes("+new"), "inserted line appears with +");
+  assert.ok(!diff.includes("-new"), "inserted line not shown as deleted");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1: dry-run and CI-failure paths must not call GitHub
+// ---------------------------------------------------------------------------
+
+test("discoverShippedPRs: localOnly=true returns placeholder titles without calling fetchPRTitle", async () => {
+  let fetchCalled = false;
+  const deps = makeDeps({
+    runCommand: () => ({
+      code: 0,
+      stdout: "Merge pull request #203 from user/branch",
+      stderr: "",
+    }),
+    fetchPRTitle: async (n) => { fetchCalled = true; return `Title #${n}`; },
+  });
+
+  const prs = await discoverShippedPRs("v1.5.0", "/repo", deps, true);
+
+  assert.ok(!fetchCalled, "fetchPRTitle must NOT be called in localOnly mode");
+  assert.equal(prs.length, 1);
+  assert.equal(prs[0].number, 203);
+  assert.equal(prs[0].title, "PR #203", "placeholder title used");
+});
+
+test("runRelease dry-run: no file writes and no fetchPRTitle calls", async () => {
+  let fetchCalled = false;
+  const writes: string[] = [];
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => { fetchCalled = true; return `PR #${n}`; },
+  });
+
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  assert.equal(writes.length, 0, "no files written in dry-run");
+  assert.ok(!fetchCalled, "fetchPRTitle (gh pr view) not called in dry-run");
+});
+
+test("runRelease dry-run: output contains unified diff markers (not full file content)", async () => {
+  const stdoutLines: string[] = [];
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    stdout: (msg) => { stdoutLines.push(msg); },
+  });
+
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  const output = stdoutLines.join("\n");
+  assert.ok(output.includes("---"), "output contains --- diff marker");
+  assert.ok(output.includes("+++"), "output contains +++ diff marker");
+  assert.ok(output.includes("@@"), "output contains @@ hunk header");
+  // The diff shows the version line as -/+ lines (with JSON quoting and indent)
+  assert.ok(output.includes("1.5.0") && output.includes("-"), "old version appears as deleted line");
+  assert.ok(output.includes("1.6.0") && output.includes("+"), "new version appears as inserted line");
+});
+
+test("runRelease live: CI failure aborts before any GitHub API call (no fetchPRTitle)", async () => {
+  let fetchCalled = false;
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "node" && args[0] === "scripts/build.mjs") return { code: 0, stdout: "", stderr: "" };
+      // CI gate fails
+      if (cmd === "npm") return { code: 1, stdout: "FAIL", stderr: "test failed" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => { fetchCalled = true; return `PR #${n}`; },
+  });
+
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    (err: Error) => err.message.includes("CI gate failed"),
+  );
+  assert.ok(!fetchCalled, "fetchPRTitle must NOT be called when CI fails");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2: configured base branch is used for PR creation
+// ---------------------------------------------------------------------------
+
+test("runRelease: uses cfg.base_branch for gh pr create", async () => {
+  const prCreateArgs: string[] = [];
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "checkout") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "add") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "commit") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "push") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") {
+        prCreateArgs.push(...args);
+        return { code: 0, stdout: "https://github.com/org/repo/pull/200", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `Title #${n}`,
+  });
+
+  await runRelease(
+    "1.6.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo", base_branch: "staging" },
+    deps,
+  );
+
+  const baseIdx = prCreateArgs.indexOf("--base");
+  assert.ok(baseIdx >= 0, "--base flag present in gh pr create call");
+  assert.equal(prCreateArgs[baseIdx + 1], "staging", "configured base_branch 'staging' is used");
+});
+
+test("runRelease: defaults to main when base_branch is not configured", async () => {
+  const prCreateArgs: string[] = [];
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "checkout") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "add") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "commit") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "push") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") {
+        prCreateArgs.push(...args);
+        return { code: 0, stdout: "https://github.com/org/repo/pull/201", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `Title #${n}`,
+  });
+
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  const baseIdx = prCreateArgs.indexOf("--base");
+  assert.ok(baseIdx >= 0, "--base flag present");
+  assert.equal(prCreateArgs[baseIdx + 1], "main", "defaults to 'main' when base_branch not set");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3: editor invocation with arguments, abort on non-zero exit
+// ---------------------------------------------------------------------------
+
+test("runRelease: propagates spawnEditor error to caller (editor failure aborts release)", async () => {
+  const origEditor = process.env.EDITOR;
+  process.env.EDITOR = "mock-editor-that-fails";
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `PR #${n}`,
+    spawnEditor: (_editor, _filePath) => {
+      throw new Error("editor exited with code 1");
+    },
+  });
+
+  try {
+    await assert.rejects(
+      () => runRelease("1.6.0", {}, { repo_dir: "/repo", repo: "org/repo" }, deps),
+      (err: Error) => {
+        assert.ok(
+          err.message.includes("editor"),
+          `error message should mention editor, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    if (origEditor === undefined) delete process.env.EDITOR;
+    else process.env.EDITOR = origEditor;
+  }
 });
 
 // ---------------------------------------------------------------------------
