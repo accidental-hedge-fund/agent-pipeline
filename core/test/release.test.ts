@@ -76,6 +76,25 @@ function getStderr(deps: ReleaseDeps): string[] {
   return (deps as unknown as { _stderr: string[] })._stderr;
 }
 
+/**
+ * True when the recorded runCommand calls include the rollback `git checkout -- ...`
+ * that restores package.json, core/package.json, ROADMAP.md, and the plugin/ mirror
+ * from HEAD on a pre-branch abort (#170). The branch-creation `git checkout -b` is
+ * distinguished by its `--` separator: the restore has `--` at index 2, `-b` does not.
+ */
+function restoreInvoked(commands: string[][]): boolean {
+  return commands.some(
+    (c) =>
+      c[0] === "git" &&
+      c[1] === "checkout" &&
+      c[2] === "--" &&
+      c.includes("package.json") &&
+      c.includes("core/package.json") &&
+      c.includes("ROADMAP.md") &&
+      c.includes("plugin"),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 10.2 resolveVersion
 // ---------------------------------------------------------------------------
@@ -899,9 +918,10 @@ test("runRelease: defaults to main when base_branch is not configured", async ()
 // Finding 3: editor invocation with arguments, abort on non-zero exit
 // ---------------------------------------------------------------------------
 
-test("runRelease: propagates spawnEditor error to caller (editor failure aborts release)", async () => {
+test("runRelease: editor abort before branch creation aborts AND rolls back via git checkout (#170 review-2)", async () => {
   const origEditor = process.env.EDITOR;
   process.env.EDITOR = "mock-editor-that-fails";
+  const commands: string[][] = [];
 
   const deps = makeDeps({
     readFile: (p) => {
@@ -911,13 +931,17 @@ test("runRelease: propagates spawnEditor error to caller (editor failure aborts 
       throw new Error(`unexpected read: ${p}`);
     },
     runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
       if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
-      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "release: thing (#204)", stderr: "" };
       if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
       if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     },
     fetchPRTitle: async (n) => `PR #${n}`,
+    // PR #204 closes issue #158 → one v1.6.0 row is stampable, so the run reaches the
+    // editor step (it does not short-circuit on the no-stampable-rows guard).
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158] : []),
     spawnEditor: (_editor, _filePath) => {
       throw new Error("editor exited with code 1");
     },
@@ -933,6 +957,14 @@ test("runRelease: propagates spawnEditor error to caller (editor failure aborts 
         );
         return true;
       },
+    );
+    // The editor launches AFTER the ROADMAP write but BEFORE `git checkout -b`. An editor
+    // abort there must restore the working tree (the round-2 finding) and must NOT have
+    // created the release branch.
+    assert.ok(restoreInvoked(commands), "git checkout rollback issued when the editor aborts");
+    assert.ok(
+      !commands.some((c) => c[0] === "git" && c[1] === "checkout" && c[2] === "-b"),
+      "release branch is not created when the editor aborts",
     );
   } finally {
     if (origEditor === undefined) delete process.env.EDITOR;
@@ -1025,7 +1057,8 @@ test("CLI: 'pipeline release --status' exits non-zero with conflict message", ()
 // Finding 1: issue discovery failure aborts release in live mode
 // ---------------------------------------------------------------------------
 
-test("runRelease live: issue discovery failure aborts and rolls back the bumped files (#170)", async () => {
+test("runRelease live: issue discovery failure aborts and rolls back via git checkout (#170)", async () => {
+  const commands: string[][] = [];
   const deps = makeDeps({
     readFile: (p) => {
       if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
@@ -1034,6 +1067,7 @@ test("runRelease live: issue discovery failure aborts and rolls back the bumped 
       throw new Error(`unexpected read: ${p}`);
     },
     runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
       if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
       if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "Merge pull request #203 from foo/bar", stderr: "" };
       if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
@@ -1051,14 +1085,14 @@ test("runRelease live: issue discovery failure aborts and rolls back the bumped 
       return true;
     },
   );
-  // Rollback: the bumped files are restored, and the ROADMAP is never left stamped —
-  // any ROADMAP write is the original content (restore), not a v1.6.0-stamped release.
-  const written = getWritten(deps);
-  assert.equal(written["/repo/package.json"], SAMPLE_ROOT_PKG, "root package.json restored after abort");
-  assert.equal(written["/repo/core/package.json"], SAMPLE_CORE_PKG, "core package.json restored after abort");
-  if (written["/repo/ROADMAP.md"] !== undefined) {
-    assert.equal(written["/repo/ROADMAP.md"], SAMPLE_ROADMAP, "ROADMAP restored to original (never stamped) on abort");
-  }
+  // Rollback is a `git checkout -- ...` from HEAD (not a writeFile): it restores the
+  // bumped package.json files, ROADMAP.md, and the plugin/ mirror in one step, so a
+  // retry reads the original previousVersion. The branch is never created.
+  assert.ok(restoreInvoked(commands), "git checkout rollback issued on abort");
+  assert.ok(
+    !commands.some((c) => c[0] === "git" && c[1] === "checkout" && c[2] === "-b"),
+    "release branch is not created when issue discovery fails",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1161,22 +1195,25 @@ function liveReleaseDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
 test("runRelease: aborts live release when shipped PRs resolve no stampable issue rows (#170)", async () => {
   // PR #204 is shipped but closes no issue → shippedIssueNumbers empty → none of the
   // 2 v1.6.0 rows can be stamped → would write an inconsistent ROADMAP → must abort.
+  const commands: string[][] = [];
   const deps = liveReleaseDeps({ fetchPRClosingIssues: async () => [] });
+  const inner = deps.runCommand;
+  deps.runCommand = (cmd, args, opts) => { commands.push([cmd, ...args]); return inner(cmd, args, opts); };
   await assert.rejects(
     () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
     /none could be stamped/,
   );
-  // Rollback: the bumped package.json files must be restored to their originals.
-  const written = getWritten(deps);
-  assert.equal(written["/repo/package.json"], SAMPLE_ROOT_PKG, "root package.json restored after abort");
-  assert.equal(written["/repo/core/package.json"], SAMPLE_CORE_PKG, "core package.json restored after abort");
+  // Rollback restores the bumped files + plugin/ mirror via `git checkout -- ...` from HEAD.
+  assert.ok(restoreInvoked(commands), "git checkout rollback issued on abort");
 });
 
 test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170)", async () => {
   // CI fails AFTER the version bump + mirror regen. The checkout must be restored so a
   // retry does not read the already-bumped version as previousVersion.
+  const commands: string[][] = [];
   const deps = liveReleaseDeps({
     runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
       if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d thing (#204)", stderr: "" };
       if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
       if (cmd === "npm" && args[0] === "run") return { code: 1, stdout: "", stderr: "tests failed" }; // CI fails
@@ -1187,7 +1224,7 @@ test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170
     () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
     /CI gate failed/,
   );
-  const written = getWritten(deps);
-  assert.equal(written["/repo/package.json"], SAMPLE_ROOT_PKG, "root package.json restored after CI abort");
-  assert.equal(written["/repo/core/package.json"], SAMPLE_CORE_PKG, "core package.json restored after CI abort");
+  // The bumped files are reverted by `git checkout -- ...` from HEAD (build.mjs is not
+  // re-run), so a retry reads the original previousVersion.
+  assert.ok(restoreInvoked(commands), "git checkout rollback issued after CI abort");
 });

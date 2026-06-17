@@ -731,25 +731,28 @@ export async function runRelease(
   };
   scaffoldRoadmap(roadmapText, validationCtx);  // throws on missing anchor; result discarded
 
-  // Snapshot every file the version bump + mirror regen + ROADMAP write will modify,
-  // so ANY abort before branch creation restores the caller's checkout. Otherwise a
-  // failure after the bump/build (e.g. CI or issue-discovery error) strands the bumped
-  // package.json + regenerated plugin files, poisoning a retry whose previousVersion is
-  // then read from the already-bumped core/package.json (#170).
-  const rootPkgSnapshot = d.readFile(rootPkgPath);
-  const corePkgSnapshot = corePkgText;
-  const roadmapSnapshot = roadmapText;
-  let mirrorRegenerated = false;
+  // Restore every file the version bump + mirror regen + ROADMAP write touch FROM HEAD on
+  // ANY abort before the release branch is created (mirror-regen / CI / issue-discovery
+  // failure, or an editor abort). `git checkout --` recovers package.json, core/package.json,
+  // ROADMAP.md, AND the whole plugin/ mirror in one step — even if build.mjs deleted files
+  // mid-regen — so it does not depend on re-running the same (failing) build. Its exit code
+  // is checked so a failed rollback is surfaced loudly, not silently claimed as restored.
+  // Otherwise a stranded bump poisons a retry whose previousVersion reads the bumped core (#170).
+  const branch = `release/v${resolvedVersion}`;
   const restoreCheckout = (): void => {
-    try {
-      d.writeFile(rootPkgPath, rootPkgSnapshot);
-      d.writeFile(corePkgPath, corePkgSnapshot);
-      d.writeFile(roadmapPath, roadmapSnapshot);
-      // Regenerate the mirror from the restored (un-bumped) core so plugin/ matches HEAD.
-      if (mirrorRegenerated) d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
-      d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and the plugin/ mirror to their pre-release state.");
-    } catch {
-      d.stderr("[pipeline release] warning: could not fully restore the working tree after abort; run `git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin` to discard release-prep changes.");
+    const r = d.runCommand(
+      "git",
+      ["checkout", "--", "package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"],
+      { cwd: repoDir },
+    );
+    if (r.code !== 0) {
+      d.stderr(
+        `[pipeline release] ROLLBACK FAILED (git checkout exited ${r.code}: ${r.stderr.trim()}). ` +
+        "The working tree may have a stranded version bump or partial mirror — run " +
+        "`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin` manually before retrying.",
+      );
+    } else {
+      d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and the plugin/ mirror from HEAD.");
     }
   };
 
@@ -761,7 +764,6 @@ export async function runRelease(
 
     // 7. Regenerate plugin/ mirror.
     d.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
-    mirrorRegenerated = true;
     const buildResult = d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
     if (buildResult.code !== 0) {
       d.stderr(buildResult.stdout);
@@ -820,33 +822,34 @@ export async function runRelease(
     // 12. Write scaffolded ROADMAP to disk.
     d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");
     d.writeFile(roadmapPath, patchedRoadmap);
+
+    // 13. Open $EDITOR for human confirmation — INSIDE the rollback guard: an editor
+    // abort (non-zero exit) before the branch exists must restore the checkout (#170).
+    if (!opts.noEdit) {
+      const editor = process.env.EDITOR;
+      if (!editor) {
+        d.stderr(
+          "[pipeline release] warning: $EDITOR is not set — proceeding as --no-edit (committing scaffolded ROADMAP as-is)",
+        );
+      } else {
+        d.stdout(`[pipeline release] opening ${roadmapPath} in $EDITOR (${editor}) for review...`);
+        d.spawnEditor(editor, roadmapPath);
+      }
+    }
+
+    // 14a. Create the release branch. This is the rollback point of no return: once the
+    // branch exists the bumped/scaffolded files live on it (not stranded on the base
+    // branch), so the rollback guard ends here. A checkout failure still restores.
+    d.stdout(`[pipeline release] creating branch ${branch}...`);
+    const checkoutResult = d.runCommand("git", ["checkout", "-b", branch], { cwd: repoDir });
+    if (checkoutResult.code !== 0) {
+      throw new Error(
+        `[pipeline release] git checkout -b ${branch} failed: ${checkoutResult.stderr.trim()}`,
+      );
+    }
   } catch (err) {
     restoreCheckout();
     throw err;
-  }
-
-  // 13. Open $EDITOR for human confirmation.
-  if (!opts.noEdit) {
-    const editor = process.env.EDITOR;
-    if (!editor) {
-      d.stderr(
-        "[pipeline release] warning: $EDITOR is not set — proceeding as --no-edit (committing scaffolded ROADMAP as-is)",
-      );
-    } else {
-      d.stdout(`[pipeline release] opening ${roadmapPath} in $EDITOR (${editor}) for review...`);
-      d.spawnEditor(editor, roadmapPath);
-    }
-  }
-
-  // 14. Create release branch, commit, and open PR.
-  const branch = `release/v${resolvedVersion}`;
-  d.stdout(`[pipeline release] creating branch ${branch}...`);
-
-  const checkoutResult = d.runCommand("git", ["checkout", "-b", branch], { cwd: repoDir });
-  if (checkoutResult.code !== 0) {
-    throw new Error(
-      `[pipeline release] git checkout -b ${branch} failed: ${checkoutResult.stderr.trim()}`,
-    );
   }
 
   d.stdout("[pipeline release] staging release files...");
