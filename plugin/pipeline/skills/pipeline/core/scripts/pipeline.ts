@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
+import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -67,6 +67,7 @@ import {
   type RunStoreDeps,
   type TerminalLogTee,
 } from "./run-store.ts";
+import { runRelease } from "./stages/release.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -133,6 +134,9 @@ export interface CliOpts {
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
   isOk?: boolean;
+  /** Release: skip opening $EDITOR for ROADMAP review (commit scaffolded ROADMAP as-is).
+   *  Commander's `--no-edit` sets `edit: false` here. */
+  edit?: boolean;
 }
 
 /**
@@ -148,7 +152,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -175,7 +179,8 @@ export function buildCmd(): Command {
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
     .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
-    .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)");
+    .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)")
+    .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -194,6 +199,8 @@ async function main(): Promise<void> {
   // preflight checks and exits, with no issue number. Distinct from the
   // `--doctor` flag, which gates a real advance run.
   const isDoctorCommand = numArg === "doctor";
+  // `pipeline release <version>` prepares a release PR — no issue number required.
+  const isReleaseCommand = numArg === "release";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -240,6 +247,39 @@ async function main(): Promise<void> {
     console.error(`pipeline: 'pipeline doctor' cannot be combined with ${flag}. These are separate commands.`);
     process.exit(2);
   }
+  // Reject 'pipeline release' combined with modes that imply an issue number or
+  // a different standalone command.
+  if (isReleaseCommand && (opts.cleanup || isInit || isDoctorCommand || opts.status)) {
+    const conflict = opts.cleanup
+      ? "--cleanup"
+      : isInit
+        ? "--init (or 'pipeline init')"
+        : isDoctorCommand
+          ? "doctor"
+          : "--status";
+    console.error(`pipeline: 'pipeline release' cannot be combined with ${conflict}. These are separate commands.`);
+    process.exit(2);
+  }
+  // Validate the release version argument early (before config resolution) so a
+  // malformed invocation fails cleanly without requiring gh auth or a valid config.
+  if (isReleaseCommand) {
+    const versionArgEarly = cmd.args[1];
+    if (!versionArgEarly) {
+      console.error(
+        "pipeline release: a version argument is required.\n" +
+          "  Usage: pipeline release <X.Y.Z | major | minor | patch>\n" +
+          "  Example: pipeline release 1.6.0  OR  pipeline release minor",
+      );
+      process.exit(2);
+    }
+    if (/^\d+$/.test(versionArgEarly)) {
+      console.error(
+        `pipeline release: "${versionArgEarly}" looks like an issue number, not a version.\n` +
+          `  Provide a semver string (e.g., 1.6.0) or an alias (major, minor, patch).`,
+      );
+      process.exit(2);
+    }
+  }
 
   // `pipeline config schema` and `pipeline config validate` — dispatch before
   // resolveConfig() so they work without gh auth or a fully resolvable repo.
@@ -282,14 +322,37 @@ async function main(): Promise<void> {
   }
 
   // Guard: extra positional arguments are a mistake for the remaining commands
-  // (plain `pipeline <N>`, doctor, init). `run <N>` legitimately has two positionals
-  // ("run" + number); `config`/`path` already returned above. Catches e.g.
-  // "pipeline 123 config validate", which would otherwise advance issue 123 (#156).
-  const maxPositionals = cmd.args[0] === "run" ? 2 : 1;
+  // (plain `pipeline <N>`, doctor, init). `run <N>` and `release <version>`
+  // legitimately have two positionals; `config`/`path` already returned above.
+  // Catches e.g. "pipeline 123 config validate" (#156).
+  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" ? 2 : 1;
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
     process.exit(2);
+  }
+
+  // Early release dispatch — derives repo_dir/base_branch from local git state
+  // only; no `gh` call. This means dry-run and CI-failure paths never call any
+  // GitHub API before runRelease itself gates on CI passing.
+  if (isReleaseCommand) {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir);
+    if (!repoDir) {
+      console.error(
+        `pipeline: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    const localCfg = resolveReleaseConfig(repoDir, opts.base);
+    const versionArg = cmd.args[1] as string;
+    try {
+      await runRelease(versionArg, { dryRun: opts.dryRun, noEdit: opts.edit === false }, localCfg);
+    } catch (err) {
+      console.error(`pipeline release: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
   }
 
   let cfg: PipelineConfig;

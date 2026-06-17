@@ -365,6 +365,46 @@ export function findGitRoot(start: string): string | null {
 }
 
 /**
+ * Resolve the minimal config needed by `pipeline release` without calling `gh`.
+ * Reads repo_dir from the provided git root and base_branch from pipeline.yml
+ * (local file only — no network calls).
+ *
+ * Uses the same YAML parse + Zod schema validation as resolveConfig, so a
+ * malformed or schema-violating config surfaces an error rather than silently
+ * falling back to "main". Falls back to the default branch only when the config
+ * file is absent or base_branch is genuinely unset.
+ */
+export function resolveReleaseConfig(
+  repoDir: string,
+  baseBranchOverride?: string,
+): { repo_dir: string; repo: string; base_branch: string } {
+  let baseBranch = DEFAULT_CONFIG.base_branch;
+  const configPath = path.join(repoDir, ".github", "pipeline.yml");
+  if (fs.existsSync(configPath)) {
+    const text = fs.readFileSync(configPath, "utf8");
+    // yaml.load throws YAMLException on malformed YAML — propagate to surface the config problem.
+    const parsed = yaml.load(text);
+    if (parsed && typeof parsed === "object") {
+      const result = PartialConfigSchema.safeParse(parsed);
+      if (!result.success) {
+        const errors = result.error.issues
+          .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+          .join("; ");
+        throw new Error(`Invalid ${configPath}: ${errors}`);
+      }
+      if (typeof result.data.base_branch === "string") {
+        baseBranch = result.data.base_branch;
+      }
+    }
+  }
+  return {
+    repo_dir: repoDir,
+    repo: "",
+    base_branch: baseBranchOverride ?? baseBranch,
+  };
+}
+
+/**
  * Read the conventions excerpt to embed in stage prompts. Falls back to a
  * stub if the configured path doesn't exist. Truncates to keep prompts
  * focused.
