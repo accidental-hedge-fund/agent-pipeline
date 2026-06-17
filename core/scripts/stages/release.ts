@@ -110,7 +110,12 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
         ],
         { encoding: "utf8", stdio: "pipe", cwd: repoDir },
       );
-      if (result.status !== 0 || !result.stdout.trim()) return [];
+      if (result.status !== 0) {
+        throw new Error(
+          `gh pr view #${num} --json closingIssuesReferences failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+        );
+      }
+      if (!result.stdout.trim()) return [];
       return result.stdout
         .trim()
         .split("\n")
@@ -580,25 +585,28 @@ export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
 
 /**
  * For each shipped PR, fetch the GitHub issue numbers it closes and return the
- * deduplicated union. Falls back gracefully: if `fetchPRClosingIssues` fails for
- * a PR, that PR is skipped (a warning is emitted) rather than aborting.
+ * deduplicated union plus a `hadFailures` flag. A failure means the GitHub API
+ * call returned non-zero — the caller should abort in live mode rather than
+ * silently producing an incomplete per-issue ROADMAP stamp.
  */
 export async function collectShippedIssueNumbers(
   prs: ShippedPR[],
   deps: Pick<ReleaseDeps, "fetchPRClosingIssues" | "stderr">,
-): Promise<number[]> {
+): Promise<{ issueNumbers: number[]; hadFailures: boolean }> {
   const issueNums = new Set<number>();
+  let hadFailures = false;
   for (const pr of prs) {
     try {
       const closing = await deps.fetchPRClosingIssues(pr.number);
       for (const n of closing) issueNums.add(n);
-    } catch {
+    } catch (err) {
+      hadFailures = true;
       deps.stderr(
-        `[pipeline release] warning: could not fetch closing issues for PR #${pr.number} — skipping`,
+        `[pipeline release] warning: could not fetch closing issues for PR #${pr.number} — ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  return [...issueNums].sort((a, b) => a - b);
+  return { issueNumbers: [...issueNums].sort((a, b) => a - b), hadFailures };
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +679,7 @@ export async function runRelease(
     d.stdout(coreDiff || "(no changes)");
     d.stdout(`\n=== ROADMAP.md diff ===`);
     d.stdout(roadmapDiff || "(no changes)");
+    d.stdout(`\nNOTE: per-issue ROADMAP table stamping is omitted in dry-run (requires GitHub API for closing-issue lookup).`);
     d.stdout(`\n=== PR body ===`);
     d.stdout(prBody);
     return;
@@ -719,7 +728,14 @@ export async function runRelease(
   const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d);
 
   // 10. Resolve shipped issue numbers from PR closing references (required for per-issue stamping).
-  const shippedIssueNumbers = await collectShippedIssueNumbers(shippedPRs, d);
+  const { issueNumbers: shippedIssueNumbers, hadFailures: issueDiscoveryFailed } =
+    await collectShippedIssueNumbers(shippedPRs, d);
+  if (issueDiscoveryFailed && shippedPRs.length > 0) {
+    throw new Error(
+      "[pipeline release] issue discovery failed for one or more PRs — cannot reliably stamp per-issue ROADMAP rows. " +
+      "Resolve the GitHub API errors above and retry, or use --dry-run to preview without per-issue stamping.",
+    );
+  }
 
   // 11. Scaffold ROADMAP in memory and build PR body.
   const ctx: ReleaseContext = {

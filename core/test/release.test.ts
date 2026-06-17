@@ -398,7 +398,8 @@ test("collectShippedIssueNumbers: fetches closing issues for each PR and returns
     [{ number: 203, title: "PR A" }, { number: 204, title: "PR B" }],
     deps,
   );
-  assert.deepEqual(result, [158, 170], "returns sorted issue numbers");
+  assert.deepEqual(result.issueNumbers, [158, 170], "returns sorted issue numbers");
+  assert.equal(result.hadFailures, false, "no failures");
 });
 
 test("collectShippedIssueNumbers: deduplicates issues referenced by multiple PRs", async () => {
@@ -413,13 +414,15 @@ test("collectShippedIssueNumbers: deduplicates issues referenced by multiple PRs
     [{ number: 203, title: "A" }, { number: 204, title: "B" }],
     deps,
   );
-  assert.deepEqual(result, [158, 170], "duplicates collapsed");
+  assert.deepEqual(result.issueNumbers, [158, 170], "duplicates collapsed");
+  assert.equal(result.hadFailures, false, "no failures");
 });
 
-test("collectShippedIssueNumbers: returns empty array when no closing issues are found", async () => {
+test("collectShippedIssueNumbers: returns empty issueNumbers when no closing issues are found", async () => {
   const deps = makeDeps({ fetchPRClosingIssues: async () => [] });
   const result = await collectShippedIssueNumbers([{ number: 203, title: "A" }], deps);
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.issueNumbers, []);
+  assert.equal(result.hadFailures, false, "no failures when gh succeeds with empty result");
 });
 
 test("collectShippedIssueNumbers: skips PRs where fetchPRClosingIssues throws and emits warning", async () => {
@@ -435,8 +438,27 @@ test("collectShippedIssueNumbers: skips PRs where fetchPRClosingIssues throws an
     [{ number: 203, title: "A" }, { number: 204, title: "B" }],
     deps,
   );
-  assert.deepEqual(result, [158], "failed PR skipped, others collected");
+  assert.deepEqual(result.issueNumbers, [158], "failed PR skipped, others collected");
+  assert.equal(result.hadFailures, true, "hadFailures is true when any fetch throws");
   assert.ok(warnings.some((w) => w.includes("#203")), "warning mentions the failed PR");
+});
+
+test("collectShippedIssueNumbers: hadFailures is false when all fetches succeed", async () => {
+  const deps = makeDeps({ fetchPRClosingIssues: async () => [42] });
+  const result = await collectShippedIssueNumbers([{ number: 1, title: "A" }], deps);
+  assert.equal(result.hadFailures, false);
+});
+
+test("collectShippedIssueNumbers: hadFailures is true when every fetch throws", async () => {
+  const deps = makeDeps({
+    fetchPRClosingIssues: async () => { throw new Error("auth error"); },
+  });
+  const result = await collectShippedIssueNumbers(
+    [{ number: 1, title: "A" }, { number: 2, title: "B" }],
+    deps,
+  );
+  assert.deepEqual(result.issueNumbers, []);
+  assert.equal(result.hadFailures, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -996,4 +1018,107 @@ test("CLI: 'pipeline release --status' exits non-zero with conflict message", ()
   assert.notEqual(result.status, 0, "should exit non-zero");
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
   assert.ok(combined.includes("cannot be combined"), `got: ${combined}`);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1: issue discovery failure aborts release in live mode
+// ---------------------------------------------------------------------------
+
+test("runRelease live: issue discovery failure aborts before writing ROADMAP", async () => {
+  const writes: string[] = [];
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "Merge pull request #203 from foo/bar", stderr: "" };
+      if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `PR #${n}`,
+    fetchPRClosingIssues: async () => { throw new Error("gh auth error"); },
+  });
+
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("issue discovery failed"), `got: ${err.message}`);
+      return true;
+    },
+  );
+  const roadmapWrites = writes.filter((p) => p.endsWith("ROADMAP.md"));
+  assert.equal(roadmapWrites.length, 0, "ROADMAP must not be written when issue discovery fails");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2: resolveReleaseConfig — strict local config parsing
+// ---------------------------------------------------------------------------
+
+import { resolveReleaseConfig } from "../scripts/config.ts";
+
+test("resolveReleaseConfig: uses default branch when config file is absent", () => {
+  const tmpDir = fs.mkdtempSync(path.join(CLI_TMP, "cfg-"));
+  fs.mkdirSync(path.join(tmpDir, ".git"), { recursive: true });
+  const result = resolveReleaseConfig(tmpDir);
+  assert.equal(result.base_branch, "main", "defaults to main when no pipeline.yml");
+  assert.equal(result.repo_dir, tmpDir);
+});
+
+test("resolveReleaseConfig: reads base_branch from valid config file", () => {
+  const tmpDir = fs.mkdtempSync(path.join(CLI_TMP, "cfg-"));
+  fs.mkdirSync(path.join(tmpDir, ".github"), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, ".github", "pipeline.yml"), "base_branch: staging\n", "utf8");
+  const result = resolveReleaseConfig(tmpDir);
+  assert.equal(result.base_branch, "staging", "reads base_branch from config");
+});
+
+test("resolveReleaseConfig: baseBranchOverride wins over file config", () => {
+  const tmpDir = fs.mkdtempSync(path.join(CLI_TMP, "cfg-"));
+  fs.mkdirSync(path.join(tmpDir, ".github"), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, ".github", "pipeline.yml"), "base_branch: staging\n", "utf8");
+  const result = resolveReleaseConfig(tmpDir, "custom-branch");
+  assert.equal(result.base_branch, "custom-branch", "override wins over file");
+});
+
+test("resolveReleaseConfig: throws on malformed YAML (not silently falls back to main)", () => {
+  const tmpDir = fs.mkdtempSync(path.join(CLI_TMP, "cfg-"));
+  fs.mkdirSync(path.join(tmpDir, ".github"), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmpDir, ".github", "pipeline.yml"),
+    "base_branch: [\nunclosed bracket\n",
+    "utf8",
+  );
+  assert.throws(
+    () => resolveReleaseConfig(tmpDir),
+    (err: Error) => {
+      // js-yaml throws a YAMLException; the message should indicate a parse error
+      assert.ok(err.message.length > 0, "throws with a message");
+      return true;
+    },
+  );
+});
+
+test("resolveReleaseConfig: throws on schema-invalid config (not silently falls back to main)", () => {
+  const tmpDir = fs.mkdtempSync(path.join(CLI_TMP, "cfg-"));
+  fs.mkdirSync(path.join(tmpDir, ".github"), { recursive: true });
+  // base_branch must be a string; providing a number violates PartialConfigSchema.
+  fs.writeFileSync(
+    path.join(tmpDir, ".github", "pipeline.yml"),
+    "base_branch: 42\n",
+    "utf8",
+  );
+  assert.throws(
+    () => resolveReleaseConfig(tmpDir),
+    (err: Error) => {
+      assert.ok(err.message.includes("Invalid") || err.message.includes("pipeline.yml"), `got: ${err.message}`);
+      return true;
+    },
+  );
 });
