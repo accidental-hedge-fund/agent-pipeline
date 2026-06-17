@@ -51,7 +51,7 @@ Given a short free-text description, the handler SHALL invoke exactly one model 
 
 ### Requirement: The `intake` sub-command SHALL create a GitHub issue from the generated spec
 
-The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation of the release branch from the pinned base SHA. A failure in any of those preparatory steps SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
+The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation of the release branch from the pinned base SHA. Branch preparation SHALL preflight branch-name availability on BOTH the local repo and `origin` (a local `checkout -b` guards only local collisions; a stale `origin/<branch>` from a prior run would otherwise fail the later push and strand the issue). A failure in any of those preparatory steps SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
 
 The handler SHALL ensure both required labels exist before issue creation in a CREATE-ONLY manner: it SHALL create a label that is absent but SHALL NOT modify (clobber) the color or description of a label that already exists. An "already exists" result from the create call SHALL be treated as success.
 
@@ -69,8 +69,14 @@ The handler SHALL ensure both required labels exist before issue creation in a C
 
 #### Scenario: Branch-preparation failure never strands a labeled issue
 
-- **WHEN** the release branch cannot be prepared (e.g., the base SHA is unresolvable, the branch name collides, or the working tree is dirty)
+- **WHEN** the release branch cannot be prepared (e.g., the base SHA is unresolvable, the branch name collides locally, or the working tree is dirty)
 - **THEN** the command SHALL abort with a non-zero exit and SHALL NOT create any GitHub issue or open any PR
+
+#### Scenario: A pre-existing remote branch aborts before issue creation
+
+- **WHEN** a branch with the chosen head name already exists on `origin` (e.g., a prior intake run pushed it)
+- **THEN** the command SHALL detect the remote branch and abort with a non-zero exit BEFORE creating the issue or the local branch
+- **AND** no GitHub issue is created and no PR is opened
 
 #### Scenario: Existing label metadata is not clobbered
 

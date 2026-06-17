@@ -64,6 +64,14 @@ export interface IntakeDeps {
    */
   gitEnsureClean(repoDir: string): void;
   /**
+   * Return true when a branch of the given name already exists on `origin`.
+   * Used as a preflight before issue creation: local `git checkout -b` only
+   * guards against a LOCAL name collision, so a stale `origin/<branch>` from a
+   * prior intake run would let the issue be created and then fail the later push,
+   * stranding a labeled issue. Checking the remote first prevents that orphan.
+   */
+  gitRemoteBranchExists(repoDir: string, branch: string): boolean;
+  /**
    * Create and checkout a new branch starting from the given immutable ref/SHA
    * (the pinned base SHA), so the roadmap PR forks from exactly the commit the
    * ROADMAP mutation was computed against — not a moving ref or the caller's HEAD.
@@ -179,6 +187,19 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
             `  Dirty: ${dirty}`,
         );
       }
+    },
+    gitRemoteBranchExists: (dir, branch) => {
+      // git ls-remote --exit-code --heads: exit 0 = ref found, exit 2 = no matching ref.
+      const result = spawnSync("git", ["ls-remote", "--exit-code", "--heads", "origin", branch], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (result.status === 0) return true;
+      if (result.status === 2) return false;
+      throw new Error(
+        `[pipeline intake] could not check remote branch origin/${branch} (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+      );
     },
     gitCreateBranch: (dir, branch, fromRef) => {
       // fromRef is the pinned base SHA — fork from exactly the commit the ROADMAP
@@ -466,13 +487,22 @@ export async function runIntake(
 
   // 9. Prepare the release branch FROM the pinned base SHA — BEFORE creating the issue.
   //    This is the last failure-prone step that must never strand an orphaned issue: if
-  //    the checkout fails (missing ref, branch-name collision, dirty tree), we abort here
-  //    with NO GitHub issue created. Forking from the pinned SHA (not the moving
-  //    origin/<base>) means the ROADMAP we read and the branch we write onto share one
-  //    commit, so the PR's diff is exactly our three inserted rows — never a rollback of
-  //    roadmap entries that landed on the base branch after our read (#158 review-2).
+  //    branch prep fails, we abort here with NO GitHub issue created. Forking from the
+  //    pinned SHA (not the moving origin/<base>) means the ROADMAP we read and the branch
+  //    we write onto share one commit, so the PR's diff is exactly our three inserted rows
+  //    — never a rollback of roadmap entries that landed on the base after our read.
+  //    The branch name carries the short base SHA for collision-resistance, and we preflight
+  //    BOTH the remote and (via checkout -b) the local ref: a stale origin/<branch> from a
+  //    prior intake run would otherwise let the issue be created and then fail the push,
+  //    re-stranding exactly the orphaned issue these guards prevent (#158 review-2).
   const slug = slugifyTitle(title);
-  const branch = `intake/${slug}`;
+  const branch = `intake/${slug}-${baseSha.slice(0, 7)}`;
+  if (d.gitRemoteBranchExists(repoDir, branch)) {
+    throw new Error(
+      `[pipeline intake] branch ${branch} already exists on origin — aborting before creating any issue.\n` +
+        `  A prior intake run likely pushed it. Merge or delete origin/${branch}, or retry once the base advances, then re-run.`,
+    );
+  }
   d.log(`[pipeline intake] creating branch ${branch} from base ${baseSha.slice(0, 12)}...`);
   d.gitCreateBranch(repoDir, branch, baseSha);
 

@@ -126,6 +126,7 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
     gitEnsureClean: (dir) => {
       gitEnsureCleanCalls.push(dir);
     },
+    gitRemoteBranchExists: (_dir, _branch) => false,
     gitCreateBranch: (_dir, _branch, _fromRef) => {},
     gitCommit: (_dir, _files, _msg) => {},
     createPR: async (_dir, title, body, base, head) => {
@@ -800,6 +801,39 @@ test("intake: gitCreateBranch failure aborts with NO issue created (orphan preve
   await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /git checkout -b failed/);
   assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when branch prep fails");
   assert.equal(deps._createPRCalls.length, 0, "no PR should be opened when branch prep fails");
+});
+
+test("intake: a remote branch collision aborts BEFORE issue creation (orphan prevention) (#158 review-2)", async () => {
+  // A stale origin/<branch> from a prior intake run must abort before the issue is created.
+  // Local `git checkout -b` only guards LOCAL collisions, so the remote must be preflighted —
+  // otherwise the issue is created and the later push fails, stranding a labeled issue.
+  const callOrder: string[] = [];
+  const deps = makeDeps({
+    gitRemoteBranchExists: (_dir, _branch) => { callOrder.push("remoteCheck"); return true; },
+    gitCreateBranch: (_dir, _branch, _fromRef) => { callOrder.push("createBranch"); },
+    createIssue: async (title, body, labels) => {
+      callOrder.push("createIssue");
+      deps._createIssueCalls.push({ title, body, labels });
+      return 999;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /already exists on origin/);
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when the remote branch exists");
+  assert.equal(deps._createPRCalls.length, 0, "no PR should be opened when the remote branch exists");
+  // The remote check must precede both local branch creation and issue creation.
+  assert.equal(callOrder[0], "remoteCheck", "remote-branch preflight runs first");
+  assert.ok(!callOrder.includes("createBranch"), "local branch is not created when the remote already has it");
+  assert.ok(!callOrder.includes("createIssue"), "issue is not created when the remote already has it");
+});
+
+test("intake: branch name carries the short base SHA for collision-resistance (#158 review-2)", async () => {
+  const deps = makeDeps();
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  const head = deps._createPRCalls[0].head;
+  assert.ok(head.endsWith(`-${FAKE_BASE_SHA.slice(0, 7)}`), `branch should end with short base SHA, got: ${head}`);
 });
 
 test("intake: recovery log emitted when createPR fails after issue creation", async () => {
