@@ -392,6 +392,19 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
+  // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
+  if (numArg && !/^\d+$/.test(numArg)) {
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake"];
+    if (!recognized.includes(numArg)) {
+      console.error(
+        `pipeline: unrecognized sub-command "${numArg}".\n` +
+          `  Recognized no-issue-number sub-commands: ${recognized.join(", ")}.`,
+      );
+      process.exit(2);
+    }
+  }
+
   let cfg: PipelineConfig;
   try {
     cfg = resolveConfig({

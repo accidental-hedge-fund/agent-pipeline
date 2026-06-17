@@ -11,6 +11,7 @@ import {
   inferReleaseSlot,
   parseSpec,
   extractOneLiner,
+  validateSpecBody,
   type IntakeDeps,
   type IntakeOpts,
 } from "../scripts/stages/intake.ts";
@@ -65,11 +66,13 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
   _createPRCalls: Array<{ title: string; body: string; base: string; head: string }>;
   _writtenFiles: Record<string, string>;
   _logLines: string[];
+  _gitEnsureCleanCalls: string[];
 } {
   const createIssueCalls: Array<{ title: string; body: string; labels: string[] }> = [];
   const createPRCalls: Array<{ title: string; body: string; base: string; head: string }> = [];
   const writtenFiles: Record<string, string> = {};
   const logLines: string[] = [];
+  const gitEnsureCleanCalls: string[] = [];
 
   const base: IntakeDeps = {
     runHarness: async (_prompt) => ({
@@ -104,7 +107,10 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
     writeFile: (p, content) => {
       writtenFiles[p] = content;
     },
-    gitCreateBranch: (_dir, _branch) => {},
+    gitEnsureClean: (dir) => {
+      gitEnsureCleanCalls.push(dir);
+    },
+    gitCreateBranch: (_dir, _branch, _fromRef) => {},
     gitCommit: (_dir, _files, _msg) => {},
     createPR: async (_dir, title, body, base, head) => {
       createPRCalls.push({ title, body, base, head });
@@ -118,6 +124,7 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
   (base as unknown as { _createPRCalls: typeof createPRCalls })._createPRCalls = createPRCalls;
   (base as unknown as { _writtenFiles: typeof writtenFiles })._writtenFiles = writtenFiles;
   (base as unknown as { _logLines: typeof logLines })._logLines = logLines;
+  (base as unknown as { _gitEnsureCleanCalls: typeof gitEnsureCleanCalls })._gitEnsureCleanCalls = gitEnsureCleanCalls;
   return base as ReturnType<typeof makeDeps>;
 }
 
@@ -318,6 +325,8 @@ test("intake: exits non-zero with anchor name when release-plan anchor is absent
     () => runIntake(opts, DEFAULT_CFG, deps),
     /ROADMAP anchor not found/,
   );
+  // Regression: anchor preflight must run BEFORE createIssue (finding 2).
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when roadmap anchor is missing");
 });
 
 test("intake: exits non-zero with anchor name when detail section is absent for version", async () => {
@@ -337,6 +346,8 @@ test("intake: exits non-zero with anchor name when detail section is absent for 
     () => runIntake(opts, DEFAULT_CFG, deps),
     /ROADMAP anchor not found.*detail-section/,
   );
+  // Regression: anchor preflight must run BEFORE createIssue (finding 2).
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when detail section is missing");
 });
 
 // ---------------------------------------------------------------------------
@@ -437,4 +448,164 @@ test("extractOneLiner: handles missing Summary section", () => {
   const body = "## User story\nAs a user...";
   const result = extractOneLiner(body);
   assert.ok(result.length > 0);
+});
+
+// ---------------------------------------------------------------------------
+// validateSpecBody (finding 3 regression)
+// ---------------------------------------------------------------------------
+
+test("validateSpecBody: accepts a well-formed spec with all required sections", () => {
+  const body = [
+    "# Some Feature",
+    "",
+    "## Summary",
+    "Does something useful.",
+    "",
+    "## User story",
+    "As a user, I want this, so that that.",
+    "",
+    "## Acceptance criteria",
+    "- [ ] It works.",
+    "",
+    "## Out of scope",
+    "- Nothing else.",
+  ].join("\n");
+  assert.doesNotThrow(() => validateSpecBody(body));
+});
+
+test("validateSpecBody: throws when a required section is missing", () => {
+  const bodyNoUserStory = [
+    "# Some Feature",
+    "",
+    "## Summary",
+    "Does something.",
+    "",
+    "## Acceptance criteria",
+    "- [ ] It works.",
+    "",
+    "## Out of scope",
+    "- Nothing.",
+  ].join("\n");
+  assert.throws(() => validateSpecBody(bodyNoUserStory), /missing required sections.*User story/);
+});
+
+test("validateSpecBody: throws when no checkable acceptance criterion", () => {
+  const bodyNoCheckbox = [
+    "# Feature",
+    "",
+    "## Summary",
+    "Does something.",
+    "",
+    "## User story",
+    "As a user...",
+    "",
+    "## Acceptance criteria",
+    "It should work.",
+    "",
+    "## Out of scope",
+    "- Nothing.",
+  ].join("\n");
+  assert.throws(() => validateSpecBody(bodyNoCheckbox), /no checkable acceptance criteria/);
+});
+
+test("intake: no issue created when harness returns a spec missing required sections", async () => {
+  const deps = makeDeps({
+    runHarness: async (_p) => ({
+      success: true,
+      output: "## Summary\nA thing.\n## Acceptance criteria\n- [ ] works.",
+    }),
+  });
+  const opts: IntakeOpts = { description: "some feature", release: "1.6.0" };
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /missing required sections/);
+  assert.equal(deps._createIssueCalls.length, 0, "issue must not be created when spec is invalid");
+});
+
+// ---------------------------------------------------------------------------
+// gitEnsureClean is called before createIssue (finding 1 regression)
+// ---------------------------------------------------------------------------
+
+test("intake: gitEnsureClean is called before createIssue in happy path", async () => {
+  const callOrder: string[] = [];
+  const deps = makeDeps({
+    gitEnsureClean: (_dir) => { callOrder.push("ensureClean"); },
+    createIssue: async (title, body, labels) => {
+      callOrder.push("createIssue");
+      deps._createIssueCalls.push({ title, body, labels });
+      return 999;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  const cleanIdx = callOrder.indexOf("ensureClean");
+  const issueIdx = callOrder.indexOf("createIssue");
+  assert.ok(cleanIdx !== -1, "gitEnsureClean should be called");
+  assert.ok(issueIdx !== -1, "createIssue should be called");
+  assert.ok(cleanIdx < issueIdx, "gitEnsureClean must be called before createIssue");
+});
+
+test("intake: gitEnsureClean is NOT called in dry-run mode", async () => {
+  const deps = makeDeps();
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", dryRun: true };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  assert.equal(deps._gitEnsureCleanCalls.length, 0, "gitEnsureClean should not be called in dry-run");
+});
+
+test("intake: no issue or PR created when gitEnsureClean throws", async () => {
+  const deps = makeDeps({
+    gitEnsureClean: (_dir) => {
+      throw new Error("[pipeline intake] ROADMAP.md has uncommitted local changes");
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /uncommitted local changes/);
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when working tree is dirty");
+  assert.equal(deps._createPRCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// gitCreateBranch receives fromRef = cfg.base_branch (finding 1 regression)
+// ---------------------------------------------------------------------------
+
+test("intake: gitCreateBranch is called with cfg.base_branch as fromRef", async () => {
+  const branchCalls: Array<{ dir: string; branch: string; fromRef: string }> = [];
+  const deps = makeDeps({
+    gitCreateBranch: (dir, branch, fromRef) => { branchCalls.push({ dir, branch, fromRef }); },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  assert.equal(branchCalls.length, 1, "gitCreateBranch should be called once");
+  assert.equal(branchCalls[0].fromRef, "main", "fromRef should be cfg.base_branch");
+});
+
+// ---------------------------------------------------------------------------
+// Dry-run shows #TBD not #0 in per-issue row (finding 5 regression)
+// ---------------------------------------------------------------------------
+
+test("intake: dry-run uses #TBD placeholder in per-issue table row (not #0)", async () => {
+  const deps = makeDeps();
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", dryRun: true };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  const allLog = deps._logLines.join("\n");
+  assert.ok(!allLog.includes("| #0 |"), "dry-run should not show #0 in the per-issue row");
+  assert.ok(allLog.includes("| #TBD |"), "dry-run should show #TBD in the per-issue row");
+});
+
+// ---------------------------------------------------------------------------
+// CLI: unknown subcommand exits 2 with usage listing (finding 4 regression)
+// ---------------------------------------------------------------------------
+
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
+
+test("CLI: unrecognized sub-command exits 2 with usage error listing recognized sub-commands", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "unknowncmd"],
+    { encoding: "utf8", env: { ...process.env } },
+  );
+  assert.equal(result.status, 2, `expected exit 2; stderr:\n${result.stderr}`);
+  assert.ok(result.stderr.includes("unrecognized sub-command"), `expected usage error; stderr:\n${result.stderr}`);
+  assert.ok(result.stderr.includes("intake"), `expected intake listed in recognized sub-commands; stderr:\n${result.stderr}`);
 });

@@ -598,7 +598,7 @@ export function insertReleasePlanRow(
  */
 export function insertPerIssueRow(
   text: string,
-  issueNum: number,
+  issueNum: number | string,
   impact: string,
   config: string,
   theme: string,

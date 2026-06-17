@@ -36,8 +36,16 @@ export interface IntakeDeps {
   createIssue(title: string, body: string, labels: string[]): Promise<number>;
   readFile(p: string): string;
   writeFile(p: string, content: string): void;
-  /** Create and checkout a new branch. */
-  gitCreateBranch(repoDir: string, branch: string): void;
+  /**
+   * Throw if ROADMAP.md has uncommitted local changes in the working tree.
+   * Prevents overwriting in-progress edits with the intake write.
+   */
+  gitEnsureClean(repoDir: string): void;
+  /**
+   * Create and checkout a new branch starting from origin/<fromRef> so the
+   * roadmap PR is always based on the integration branch, not the caller's HEAD.
+   */
+  gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
   /** Stage the given files and commit. */
   gitCommit(repoDir: string, files: string[], message: string): void;
   /** Push branch and open a PR. Returns the PR URL. */
@@ -80,15 +88,34 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
     },
     readFile: (p) => fs.readFileSync(p, "utf8"),
     writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
-    gitCreateBranch: (dir, branch) => {
-      const result = spawnSync("git", ["checkout", "-b", branch], {
+    gitEnsureClean: (dir) => {
+      const result = spawnSync("git", ["status", "--porcelain", "--", "ROADMAP.md"], {
         encoding: "utf8",
         stdio: "pipe",
         cwd: dir,
       });
       if (result.status !== 0) {
         throw new Error(
-          `[pipeline intake] git checkout -b ${branch} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          `[pipeline intake] git status failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+        );
+      }
+      const dirty = result.stdout.trim();
+      if (dirty) {
+        throw new Error(
+          `[pipeline intake] ROADMAP.md has uncommitted local changes — stash or commit them before running intake.\n` +
+            `  Dirty: ${dirty}`,
+        );
+      }
+    },
+    gitCreateBranch: (dir, branch, fromRef) => {
+      const result = spawnSync("git", ["checkout", "-b", branch, `origin/${fromRef}`], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `[pipeline intake] git checkout -b ${branch} origin/${fromRef} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
         );
       }
     },
@@ -193,6 +220,39 @@ export function extractOneLiner(body: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Spec validation
+// ---------------------------------------------------------------------------
+
+const REQUIRED_SPEC_SECTIONS = [
+  "## Summary",
+  "## User story",
+  "## Acceptance criteria",
+  "## Out of scope",
+];
+
+/**
+ * Validate that the harness-generated spec body contains the required sections
+ * and at least one checkable acceptance criterion. Throws a descriptive error
+ * so the caller can bail out before creating any GitHub issue.
+ */
+export function validateSpecBody(body: string): void {
+  const missing = REQUIRED_SPEC_SECTIONS.filter((s) => !body.includes(s));
+  if (missing.length > 0) {
+    throw new Error(
+      `[pipeline intake] generated spec is missing required sections: ${missing.join(", ")}.\n` +
+        `  Required: Summary, User story, Acceptance criteria, Out of scope.\n` +
+        `  Raw output (first 500 chars):\n${body.slice(0, 500)}`,
+    );
+  }
+  if (!body.includes("- [ ]")) {
+    throw new Error(
+      `[pipeline intake] generated spec has no checkable acceptance criteria (expected "- [ ]" items).\n` +
+        `  Raw output (first 500 chars):\n${body.slice(0, 500)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main orchestrator
 // ---------------------------------------------------------------------------
 
@@ -271,19 +331,18 @@ export async function runIntake(
 
   d.log(`[pipeline intake] spec generated: "${title}"`);
 
-  // 5. Build roadmap mutations in memory.
-  const originalRoadmap = d.readFile(roadmapPath);
-  let mutatedRoadmap = originalRoadmap;
-  // We insert placeholder mutations that will be updated with the real issue
-  // number after issue creation (dry-run uses a placeholder #TBD).
-  const ISSUE_PLACEHOLDER = 0; // will be replaced after creation
+  // 5. Validate the generated spec body — fail early before any irreversible action.
+  validateSpecBody(specBody);
 
-  // Dry-run path: print proposed body + diff and exit.
+  // 6. Precompute roadmap mutations with a placeholder issue number to validate all
+  //    ROADMAP anchors exist. This must succeed before creating any GitHub issue so
+  //    anchor drift never leaves behind an orphaned issue with no roadmap PR.
+  const originalRoadmap = d.readFile(roadmapPath);
+  const prevalidatedRoadmap = applyRoadmapMutations(originalRoadmap, version, 0, title, oneLiner);
+
+  // Dry-run path: print proposed body + diff and exit without any writes.
   if (opts.dryRun) {
-    const dryRoadmap = applyRoadmapMutations(
-      originalRoadmap, version, ISSUE_PLACEHOLDER, title, oneLiner,
-    );
-    const diff = computeUnifiedDiff(originalRoadmap, dryRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
+    const diff = computeUnifiedDiff(originalRoadmap, prevalidatedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
     d.log("\n=== Proposed issue body ===\n");
     d.log(specBody);
     d.log("\n=== Proposed ROADMAP.md diff ===\n");
@@ -291,22 +350,24 @@ export async function runIntake(
     return;
   }
 
-  // 6. Create the GitHub issue.
+  // 7. Git preflight: ensure ROADMAP.md has no uncommitted local changes so we do
+  //    not silently overwrite in-progress edits when we write the mutated roadmap.
+  d.gitEnsureClean(repoDir);
+
+  // 8. Create the GitHub issue — only after all deterministic prerequisites pass.
   d.log(`[pipeline intake] creating GitHub issue...`);
   const labels = [`pipeline:ready`, `release:v${version}`];
   const issueNumber = await d.createIssue(title, specBody, labels);
   d.log(`[pipeline intake] created issue #${issueNumber}: ${title}`);
 
-  // 7. Apply the three ROADMAP mutations with the real issue number.
-  mutatedRoadmap = applyRoadmapMutations(
-    originalRoadmap, version, issueNumber, title, oneLiner,
-  );
+  // 9. Apply the three ROADMAP mutations with the real issue number.
+  const mutatedRoadmap = applyRoadmapMutations(originalRoadmap, version, issueNumber, title, oneLiner);
 
-  // 8. Create a branch, write ROADMAP, commit, and open PR.
+  // 10. Create a branch FROM the base branch, write ROADMAP, commit, and open PR.
   const slug = slugifyTitle(title);
   const branch = `intake/issue-${issueNumber}-${slug}`;
-  d.log(`[pipeline intake] creating branch ${branch}...`);
-  d.gitCreateBranch(repoDir, branch);
+  d.log(`[pipeline intake] creating branch ${branch} from origin/${cfg.base_branch}...`);
+  d.gitCreateBranch(repoDir, branch, cfg.base_branch);
 
   d.writeFile(roadmapPath, mutatedRoadmap);
   d.log(`[pipeline intake] wrote ROADMAP.md`);
@@ -347,7 +408,7 @@ function applyRoadmapMutations(
   );
   mutated = insertPerIssueRow(
     mutated,
-    issueNumber > 0 ? issueNumber : 0,
+    issueNumber > 0 ? issueNumber : "TBD",
     "minor",
     "new sub-command",
     "intake",
