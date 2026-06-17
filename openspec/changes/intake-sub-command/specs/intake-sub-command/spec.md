@@ -51,7 +51,7 @@ Given a short free-text description, the handler SHALL invoke exactly one model 
 
 ### Requirement: The `intake` sub-command SHALL create a GitHub issue from the generated spec
 
-The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation of the release branch from the pinned base SHA. Branch preparation SHALL preflight branch-name availability on BOTH the local repo and `origin` (a local `checkout -b` guards only local collisions; a stale `origin/<branch>` from a prior run would otherwise fail the later push and strand the issue). A failure in any of those preparatory steps SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
+The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation AND reservation of the release branch. Branch preparation SHALL (1) derive a collision-resistant branch name that two concurrent runs with the same generated title and base SHA cannot share (e.g. by including a random token), (2) preflight branch-name availability on BOTH the local repo and `origin`, and (3) RESERVE the remote ref by pushing the branch to `origin` BEFORE the issue is created — so a check-then-push race or a missing push capability is surfaced as a pre-issue abort rather than a post-issue orphan. A failure in any of those preparatory steps SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The post-issue push of the roadmap commit is then a fast-forward onto the already-reserved ref. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
 
 The handler SHALL ensure both required labels exist before issue creation in a CREATE-ONLY manner: it SHALL create a label that is absent but SHALL NOT modify (clobber) the color or description of a label that already exists. An "already exists" result from the create call SHALL be treated as success.
 
@@ -77,6 +77,17 @@ The handler SHALL ensure both required labels exist before issue creation in a C
 - **WHEN** a branch with the chosen head name already exists on `origin` (e.g., a prior intake run pushed it)
 - **THEN** the command SHALL detect the remote branch and abort with a non-zero exit BEFORE creating the issue or the local branch
 - **AND** no GitHub issue is created and no PR is opened
+
+#### Scenario: Reservation-push failure aborts before issue creation
+
+- **WHEN** the pre-issue push that reserves `origin/<branch>` fails (e.g. a concurrent run claimed the ref between the check and the push, or push capability is missing)
+- **THEN** the command SHALL abort with a non-zero exit BEFORE creating the issue
+- **AND** no GitHub issue is created and no PR is opened
+
+#### Scenario: Concurrent identical specs cannot share a branch
+
+- **WHEN** two intake runs generate the same title against the same base SHA at the same time
+- **THEN** the collision-resistant branch names SHALL differ, so neither run's reservation push collides with the other and neither strands an issue
 
 #### Scenario: Existing label metadata is not clobbered
 

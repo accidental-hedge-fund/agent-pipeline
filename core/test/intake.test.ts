@@ -128,11 +128,13 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
     },
     gitRemoteBranchExists: (_dir, _branch) => false,
     gitCreateBranch: (_dir, _branch, _fromRef) => {},
+    gitPushBranch: (_dir, _branch) => {},
     gitCommit: (_dir, _files, _msg) => {},
     createPR: async (_dir, title, body, base, head) => {
       createPRCalls.push({ title, body, base, head });
       return "https://github.com/owner/repo/pull/42";
     },
+    randomToken: () => "tok123",
     log: (msg) => logLines.push(msg),
     ...overrides,
   };
@@ -828,12 +830,68 @@ test("intake: a remote branch collision aborts BEFORE issue creation (orphan pre
   assert.ok(!callOrder.includes("createIssue"), "issue is not created when the remote already has it");
 });
 
-test("intake: branch name carries the short base SHA for collision-resistance (#158 review-2)", async () => {
+test("intake: branch name carries the short base SHA AND a random token (collision-resistant) (#158 review-2)", async () => {
   const deps = makeDeps();
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
   await runIntake(opts, DEFAULT_CFG, deps);
   const head = deps._createPRCalls[0].head;
-  assert.ok(head.endsWith(`-${FAKE_BASE_SHA.slice(0, 7)}`), `branch should end with short base SHA, got: ${head}`);
+  // slug + short base SHA + random token: two concurrent identical specs cannot share a branch.
+  assert.ok(head.includes(`-${FAKE_BASE_SHA.slice(0, 7)}-`), `branch should carry short base SHA, got: ${head}`);
+  assert.ok(head.endsWith("-tok123"), `branch should end with the random token, got: ${head}`);
+});
+
+test("intake: the random token disambiguates concurrent runs (different token → different branch)", async () => {
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  const depsA = makeDeps({ randomToken: () => "aaa111" });
+  const depsB = makeDeps({ randomToken: () => "bbb222" });
+  await runIntake(opts, DEFAULT_CFG, depsA);
+  await runIntake(opts, DEFAULT_CFG, depsB);
+  const headA = depsA._createPRCalls[0].head;
+  const headB = depsB._createPRCalls[0].head;
+  assert.notEqual(headA, headB, "two runs with the same title+base but different tokens get distinct branches");
+});
+
+test("intake: reservation push failure aborts BEFORE issue creation (no orphan via check-then-push race) (#158 review-2)", async () => {
+  // The remote ref is RESERVED by pushing it before createIssue. If that push fails — e.g.
+  // a concurrent run claimed the ref between the check and the push, or push capability is
+  // missing — the run must abort with NO issue created. This closes the check-then-push race
+  // and proves the reviewer's path: gitRemoteBranchExists=false, later push fails → no issue.
+  const callOrder: string[] = [];
+  const deps = makeDeps({
+    gitRemoteBranchExists: (_d, _b) => false, // check passes...
+    gitPushBranch: (_d, _b) => { callOrder.push("push"); throw new Error("[pipeline intake] git push origin ... failed: reference already exists"); },
+    createIssue: async (title, body, labels) => {
+      callOrder.push("createIssue");
+      deps._createIssueCalls.push({ title, body, labels });
+      return 999;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /git push origin .* failed/);
+  assert.equal(deps._createIssueCalls.length, 0, "no issue when the reservation push fails");
+  assert.equal(deps._createPRCalls.length, 0, "no PR when the reservation push fails");
+  assert.ok(!callOrder.includes("createIssue"), "issue is never created once reservation fails");
+});
+
+test("intake: branch is reserved (pushed) BEFORE the issue is created", async () => {
+  const callOrder: string[] = [];
+  const deps = makeDeps({
+    gitPushBranch: (_d, _b) => { callOrder.push("push"); },
+    createIssue: async (title, body, labels) => {
+      callOrder.push("createIssue");
+      deps._createIssueCalls.push({ title, body, labels });
+      return 999;
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+  await runIntake(opts, DEFAULT_CFG, deps);
+  const firstPush = callOrder.indexOf("push");
+  const issueIdx = callOrder.indexOf("createIssue");
+  assert.ok(firstPush !== -1 && issueIdx !== -1, "both reservation push and issue creation run");
+  assert.ok(firstPush < issueIdx, "the reservation push must precede issue creation");
+  // And the roadmap commit is pushed again afterwards (fast-forward onto the reserved ref).
+  assert.ok(callOrder.lastIndexOf("push") > issueIdx, "roadmap commit is pushed after issue creation");
 });
 
 test("intake: recovery log emitted when createPR fails after issue creation", async () => {

@@ -8,6 +8,7 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
 import { buildIntakePrompt } from "../prompts/index.ts";
@@ -77,10 +78,21 @@ export interface IntakeDeps {
    * ROADMAP mutation was computed against — not a moving ref or the caller's HEAD.
    */
   gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
+  /**
+   * Push the current branch to `origin/<branch>`. Called twice: once to RESERVE
+   * the remote ref BEFORE issue creation (so a check-then-push race or a missing
+   * push capability aborts before the irreversible issue), and once after the
+   * roadmap commit (a fast-forward onto the reserved ref). A reservation-push
+   * failure SHALL abort before createIssue so no labeled issue is stranded.
+   */
+  gitPushBranch(repoDir: string, branch: string): void;
   /** Stage the given files and commit. */
   gitCommit(repoDir: string, files: string[], message: string): void;
-  /** Push branch and open a PR. Returns the PR URL. */
+  /** Open a PR (the branch is already pushed by gitPushBranch). Returns the PR URL. */
   createPR(repoDir: string, title: string, body: string, base: string, head: string): Promise<string>;
+  /** A short random token used to make intake branch names collision-resistant so two
+   *  concurrent runs with the same generated title + base SHA can never share a branch. */
+  randomToken(): string;
   log(msg: string): void;
 }
 
@@ -237,17 +249,20 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
         );
       }
     },
-    createPR: async (dir, title, body, base, head) => {
-      const pushResult = spawnSync("git", ["push", "-u", "origin", head], {
+    gitPushBranch: (dir, branch) => {
+      const result = spawnSync("git", ["push", "origin", branch], {
         encoding: "utf8",
         stdio: "pipe",
         cwd: dir,
       });
-      if (pushResult.status !== 0) {
+      if (result.status !== 0) {
         throw new Error(
-          `[pipeline intake] git push failed (exit ${pushResult.status}): ${pushResult.stderr?.trim() ?? ""}`,
+          `[pipeline intake] git push origin ${branch} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
         );
       }
+    },
+    createPR: async (dir, title, body, base, head) => {
+      // The branch is already pushed (reserved + roadmap commit) via gitPushBranch.
       const prResult = spawnSync(
         "gh",
         ["pr", "create", "--title", title, "--body", body, "--base", base, "--head", head],
@@ -260,6 +275,7 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
       }
       return prResult.stdout.trim();
     },
+    randomToken: () => crypto.randomBytes(3).toString("hex"),
     log: (msg) => process.stdout.write(msg + "\n"),
   };
 }
@@ -485,26 +501,32 @@ export async function runIntake(
   //    (git checkout rejects conflicting local changes).
   d.gitEnsureClean(repoDir);
 
-  // 9. Prepare the release branch FROM the pinned base SHA — BEFORE creating the issue.
-  //    This is the last failure-prone step that must never strand an orphaned issue: if
-  //    branch prep fails, we abort here with NO GitHub issue created. Forking from the
-  //    pinned SHA (not the moving origin/<base>) means the ROADMAP we read and the branch
-  //    we write onto share one commit, so the PR's diff is exactly our three inserted rows
-  //    — never a rollback of roadmap entries that landed on the base after our read.
-  //    The branch name carries the short base SHA for collision-resistance, and we preflight
-  //    BOTH the remote and (via checkout -b) the local ref: a stale origin/<branch> from a
-  //    prior intake run would otherwise let the issue be created and then fail the push,
-  //    re-stranding exactly the orphaned issue these guards prevent (#158 review-2).
+  // 9. Prepare AND RESERVE the release branch BEFORE creating the issue — the irreversible
+  //    action must come last, after every step that can fail. Three layers keep an orphaned
+  //    issue impossible:
+  //      (a) The branch name carries the short base SHA AND a random token, so two concurrent
+  //          intake runs with the same generated title + base can never derive the same branch
+  //          (closes the check-then-push race: distinct names cannot collide).
+  //      (b) A remote-existence preflight + local `checkout -b` reject a pre-existing ref.
+  //      (c) We RESERVE the remote ref by pushing it (at the pinned base SHA) BEFORE createIssue.
+  //          This both claims the ref and proves push capability (network/permissions); any
+  //          failure aborts here, before the issue exists. The post-issue push of the roadmap
+  //          commit is then a fast-forward onto the already-reserved ref.
+  //    Forking from the pinned SHA also means the ROADMAP we read and the branch we write onto
+  //    share one commit, so the PR diff is exactly our three inserted rows — never a rollback
+  //    of roadmap entries that landed on the base after our read (#158 review-2).
   const slug = slugifyTitle(title);
-  const branch = `intake/${slug}-${baseSha.slice(0, 7)}`;
+  const branch = `intake/${slug}-${baseSha.slice(0, 7)}-${d.randomToken()}`;
   if (d.gitRemoteBranchExists(repoDir, branch)) {
     throw new Error(
       `[pipeline intake] branch ${branch} already exists on origin — aborting before creating any issue.\n` +
-        `  A prior intake run likely pushed it. Merge or delete origin/${branch}, or retry once the base advances, then re-run.`,
+        `  Delete origin/${branch} or re-run to get a fresh branch name.`,
     );
   }
   d.log(`[pipeline intake] creating branch ${branch} from base ${baseSha.slice(0, 12)}...`);
   d.gitCreateBranch(repoDir, branch, baseSha);
+  d.log(`[pipeline intake] reserving origin/${branch} before issue creation...`);
+  d.gitPushBranch(repoDir, branch);
 
   // 10. Ensure both required labels exist (create-only) before issue creation. Intake
   //     bypasses the normal `pipeline init` label-bootstrap path, so release:vX.Y.Z
@@ -512,16 +534,17 @@ export async function runIntake(
   await d.ensureLabel(repoDir, "pipeline:ready", "1D76DB");
   await d.ensureLabel(repoDir, `release:v${version}`, "e4e669");
 
-  // 11. Create the GitHub issue — only after branch prep + labels succeed. This is the
-  //     first irreversible action; everything that could fail before it has already run.
+  // 11. Create the GitHub issue — only after the branch is reserved on origin and labels
+  //     exist. This is the first irreversible action; everything that could fail has run.
   d.log(`[pipeline intake] creating GitHub issue...`);
   const labels = [`pipeline:ready`, `release:v${version}`];
   const issueNumber = await d.createIssue(title, specBody, labels);
   d.log(`[pipeline intake] created issue #${issueNumber}: ${title}`);
 
   // 12. Apply the three ROADMAP mutations with the real issue number, write onto the
-  //     prepared branch, commit, and open the PR. Past issue creation a failure here
-  //     leaves the issue + prepared branch live, so log a recovery command.
+  //     prepared branch, commit, push (fast-forward onto the reserved ref), and open the PR.
+  //     Past issue creation a failure here leaves the issue + reserved branch live, so log a
+  //     recovery command.
   const mutatedRoadmap = applyRoadmapMutations(roadmapAtBase, version, issueNumber, title, oneLiner);
   const prTitle = `intake: ROADMAP slot for #${issueNumber} — ${title}`;
   try {
@@ -532,6 +555,7 @@ export async function runIntake(
       `docs: ROADMAP — intake #${issueNumber} (${title})\n\n` +
       `Issue: #158\nPipeline-Run: 158/2026-06-17T02:48:33Z`;
     d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
+    d.gitPushBranch(repoDir, branch);
 
     const prBody = buildPRBody(issueNumber, title, specBody, version);
     const prUrl = await d.createPR(repoDir, prTitle, prBody, cfg.base_branch, branch);
@@ -540,10 +564,10 @@ export async function runIntake(
     d.log(`[pipeline intake] done — issue #${issueNumber} created; roadmap PR: ${prUrl}`);
   } catch (err) {
     d.log(
-      `\n[pipeline intake] ERROR: issue #${issueNumber} was created and branch ${branch} prepared, but the roadmap PR step failed.\n` +
-        `  Recovery — finish the roadmap PR manually from the prepared branch:\n` +
+      `\n[pipeline intake] ERROR: issue #${issueNumber} was created and branch ${branch} reserved on origin, but the roadmap PR step failed.\n` +
+        `  Recovery — finish the roadmap PR manually from the reserved branch:\n` +
         `    git add ROADMAP.md && git commit -m "docs: ROADMAP — intake #${issueNumber} (${title})"\n` +
-        `    git push -u origin ${branch}\n` +
+        `    git push origin ${branch}\n` +
         `    gh pr create --title "${prTitle}" --base ${cfg.base_branch} --head ${branch}`,
     );
     throw err;
