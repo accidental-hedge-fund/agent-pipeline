@@ -850,12 +850,17 @@ test("intake: the random token disambiguates concurrent runs (different token �
   assert.notEqual(headA, headB, "two runs with the same title+base but different tokens get distinct branches");
 });
 
-test("intake: reservation failure aborts BEFORE issue creation (push capability / collision) (#158 review-2)", async () => {
-  // If the atomic reservation fails for any reason (collision, missing push/API capability),
-  // the run must abort with NO issue created.
+test("intake: a read-only/missing push credential fails the reservation BEFORE issue creation (#158 review-2)", async () => {
+  // The reservation uses the SAME git push transport as the later roadmap publish, so a
+  // read-only or missing origin push credential fails HERE — before the irreversible issue —
+  // rather than after it (where it would strand a labeled issue with no roadmap PR). This is
+  // the capability-gap regression: reservation fails → no issue created.
   const callOrder: string[] = [];
   const deps = makeDeps({
-    reserveRemoteBranch: (_d, _b, _s) => { callOrder.push("reserve"); throw new Error("[pipeline intake] could not reserve origin/... (exit 1): HTTP 403"); },
+    reserveRemoteBranch: (_d, _b, _s) => {
+      callOrder.push("reserve");
+      throw new Error("[pipeline intake] could not reserve origin/... via git push (exit 1): remote: Permission denied (read-only)");
+    },
     createIssue: async (title, body, labels) => {
       callOrder.push("createIssue");
       deps._createIssueCalls.push({ title, body, labels });
@@ -864,10 +869,10 @@ test("intake: reservation failure aborts BEFORE issue creation (push capability 
   });
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
 
-  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /could not reserve/);
-  assert.equal(deps._createIssueCalls.length, 0, "no issue when the reservation fails");
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /could not reserve .* via git push/);
+  assert.equal(deps._createIssueCalls.length, 0, "no issue when the push-capability reservation fails");
   assert.equal(deps._createPRCalls.length, 0, "no PR when the reservation fails");
-  assert.ok(!callOrder.includes("createIssue"), "issue is never created once reservation fails");
+  assert.ok(!callOrder.includes("createIssue"), "issue is never created once the reservation fails");
 });
 
 test("intake: branch is atomically reserved BEFORE the issue, roadmap pushed AFTER (#158 review-2)", async () => {

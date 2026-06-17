@@ -51,7 +51,7 @@ Given a short free-text description, the handler SHALL invoke exactly one model 
 
 ### Requirement: The `intake` sub-command SHALL create a GitHub issue from the generated spec
 
-The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation AND atomic reservation of the release branch. Branch preparation SHALL (1) derive a collision-resistant branch name that two concurrent runs with the same generated title and base SHA cannot share (e.g. by including a random token), and (2) RESERVE the remote ref with an ATOMIC create-only operation BEFORE the issue is created. The reservation SHALL fail when the ref already exists at ANY SHA (e.g. the GitHub create-ref API, which returns 422 "Reference already exists"); it SHALL NOT use a plain push, which exits successfully ("up-to-date") when the ref already points at the same base SHA and therefore cannot detect a colliding branch. A failure in any preparatory step SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The post-issue push of the roadmap commit is then a fast-forward onto the already-reserved ref. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
+The handler SHALL call the GitHub API to create an issue in the target repo as the FIRST irreversible action — only after every reversible prerequisite has succeeded: spec generation, spec validation, ROADMAP anchor pre-validation, the clean-working-tree check, and preparation AND atomic reservation of the release branch. Branch preparation SHALL (1) derive a collision-resistant branch name that two concurrent runs with the same generated title and base SHA cannot share (e.g. by including a random token), and (2) RESERVE the remote ref create-only BEFORE the issue is created. The reservation SHALL satisfy two properties: (a) it SHALL fail when the ref already exists at ANY SHA — including the same base SHA, where a plain push no-ops "up-to-date" — so a colliding branch is detected; and (b) it SHALL exercise the SAME push transport and credentials used to publish the roadmap commit afterwards, so a missing or read-only push credential fails during reservation (before the issue) rather than after it. The reference implementation uses `git push --porcelain` and treats only a newly-created ref status (`*`) as success. A failure in any preparatory step SHALL abort before issue creation so a labeled issue is never stranded without its roadmap PR. The post-issue push of the roadmap commit is then a fast-forward onto the already-reserved ref over the just-proven credential. The issue body SHALL be the full generated spec text. The issue SHALL receive at minimum two labels: one `pipeline:ready` triage label and one `release:vX.Y.Z` label whose value is either the `--release` argument or the proposed release slot.
 
 The handler SHALL ensure both required labels exist before issue creation in a CREATE-ONLY manner: it SHALL create a label that is absent but SHALL NOT modify (clobber) the color or description of a label that already exists. An "already exists" result from the create call SHALL be treated as success.
 
@@ -88,6 +88,12 @@ The handler SHALL ensure both required labels exist before issue creation in a C
 
 - **WHEN** `origin/<branch>` already exists and points at the same base SHA the reservation would use
 - **THEN** the reservation SHALL still be treated as a collision and abort before issue creation (it SHALL NOT succeed as a no-op "up-to-date" push that would let two runs both create issues)
+
+#### Scenario: A read-only or missing push credential aborts before issue creation
+
+- **WHEN** the checkout's `origin` push credential is missing or read-only
+- **THEN** the reservation (which uses the same push transport as the roadmap publish) SHALL fail and the command SHALL abort BEFORE creating the issue
+- **AND** no GitHub issue is created and no PR is opened
 
 #### Scenario: Concurrent identical specs cannot share a branch
 

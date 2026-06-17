@@ -71,18 +71,19 @@ export interface IntakeDeps {
    */
   gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
   /**
-   * ATOMICALLY reserve `origin/<branch>` at the given SHA, create-only, BEFORE issue
-   * creation. Unlike a plain `git push` — which exits 0 ("Everything up-to-date") when
-   * the ref already exists at the same SHA and so cannot detect a colliding branch — this
-   * SHALL fail when the ref already exists at ANY SHA (e.g. the GitHub create-ref API,
-   * which returns 422 "Reference already exists"). A failure SHALL abort before createIssue
-   * so a token collision can never strand an issue via a later non-fast-forward push.
+   * Reserve `origin/<branch>` at the given SHA, create-only, BEFORE issue creation. Two
+   * guarantees: (1) it SHALL fail when the ref already exists at ANY SHA — including the
+   * same SHA, where a plain push no-ops "up-to-date" — so a branch collision is caught;
+   * and (2) it SHALL exercise the SAME push transport/credentials that gitPushBranch uses
+   * to publish the roadmap commit, so a missing/read-only push credential fails HERE rather
+   * than after the irreversible issue creation. The reference implementation uses
+   * `git push --porcelain` and treats only a newly-created ref ('*') as success.
    */
   reserveRemoteBranch(repoDir: string, branch: string, sha: string): void;
   /**
    * Push the current branch to `origin/<branch>` — used AFTER the roadmap commit as a
-   * fast-forward onto the already-reserved ref. (Reservation is reserveRemoteBranch, not
-   * this, because a plain push is not create-only.)
+   * fast-forward onto the already-reserved ref. (Reservation is reserveRemoteBranch, which
+   * shares this transport so capability is proven before issue creation.)
    */
   gitPushBranch(repoDir: string, branch: string): void;
   /** Stage the given files and commit. */
@@ -200,26 +201,31 @@ export function realIntakeDeps(repoDir: string): IntakeDeps {
       }
     },
     reserveRemoteBranch: (dir, branch, sha) => {
-      // Atomic create-only reservation via the GitHub create-ref API: POST git/refs creates
-      // refs/heads/<branch> and returns HTTP 422 "Reference already exists" if it is already
-      // present (at any SHA). This is what makes the reservation race-safe — a plain push
-      // would no-op "up-to-date" when the ref already points at the same base SHA.
+      // Reserve via the SAME `git push` transport used later to publish the roadmap commit, so
+      // a missing/read-only origin push credential fails HERE — before the issue — instead of
+      // after it (which would strand a labeled issue). Create-only via --porcelain status flags
+      // (verified against the live remote): '*' = newly created ref → reserved; '=' = up-to-date
+      // (ref already exists at the same SHA) and '!' = rejected (exists at a different SHA) →
+      // collision. A plain push would no-op-succeed on the '=' case, so the flag parse is what
+      // makes this both race-safe AND a real proof of push capability.
       const result = spawnSync(
-        "gh",
-        ["api", "--method", "POST", "repos/{owner}/{repo}/git/refs",
-         "-f", `ref=refs/heads/${branch}`, "-f", `sha=${sha}`],
+        "git",
+        ["push", "--porcelain", "origin", `${sha}:refs/heads/${branch}`],
         { encoding: "utf8", stdio: "pipe", cwd: dir },
       );
-      if (result.status === 0) return;
-      const out = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
-      if (/already exists/i.test(out)) {
+      const out = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+      const statusLine = out.split("\n").find((l) => l.includes(`:refs/heads/${branch}`)) ?? "";
+      const flag = statusLine.charAt(0);
+      if (result.status === 0 && flag === "*") return; // newly created → reserved
+      if (flag === "=" || flag === "!") {
         throw new Error(
           `[pipeline intake] branch ${branch} already exists on origin — aborting before creating any issue.\n` +
             `  A concurrent or prior intake run reserved it; re-run to get a fresh branch name.`,
         );
       }
       throw new Error(
-        `[pipeline intake] could not reserve origin/${branch} (exit ${result.status}): ${(result.stderr || result.stdout || "").trim()}`,
+        `[pipeline intake] could not reserve origin/${branch} via git push (exit ${result.status}): ${(result.stderr || result.stdout || "").trim()}\n` +
+          `  The branch may already exist, or this checkout's origin push credentials are missing or read-only.`,
       );
     },
     gitCreateBranch: (dir, branch, fromRef) => {
@@ -510,18 +516,18 @@ export async function runIntake(
   //    (git checkout rejects conflicting local changes).
   d.gitEnsureClean(repoDir);
 
-  // 9. Prepare AND ATOMICALLY RESERVE the release branch BEFORE creating the issue — the
-  //    irreversible action must come last, after every step that can fail. Two layers keep
-  //    an orphaned issue impossible:
+  // 9. Prepare AND RESERVE the release branch BEFORE creating the issue — the irreversible
+  //    action must come last, after every step that can fail. Two layers keep an orphaned
+  //    issue impossible:
   //      (a) The branch name carries the short base SHA AND a random token, so two concurrent
   //          intake runs with the same generated title + base are very unlikely to derive the
   //          same branch.
-  //      (b) We RESERVE the remote ref with an ATOMIC create-only operation (create-ref) BEFORE
-  //          createIssue. Unlike a plain push — which no-ops "up-to-date" when the ref already
-  //          points at the same base SHA and so cannot detect a token collision — create-ref
-  //          fails if the ref exists at ANY SHA. So even a (vanishingly rare) token collision
-  //          aborts here, before the issue exists, instead of stranding the second issue on a
-  //          later non-fast-forward push. The reservation also proves push capability.
+  //      (b) We RESERVE the remote ref create-only BEFORE createIssue, over the SAME git push
+  //          transport that later publishes the roadmap commit. This catches a branch collision
+  //          even at the same SHA (where a plain push would no-op "up-to-date") AND proves the
+  //          push credential works — so a read-only/missing push credential fails HERE, not on
+  //          the post-issue push where it would strand the issue. The post-issue push is then a
+  //          fast-forward onto the reserved ref over the just-proven credential.
   //    Forking from the pinned SHA also means the ROADMAP we read and the branch we write onto
   //    share one commit, so the PR diff is exactly our three inserted rows — never a rollback
   //    of roadmap entries that landed on the base after our read (#158 review-2).
@@ -529,7 +535,7 @@ export async function runIntake(
   const branch = `intake/${slug}-${baseSha.slice(0, 7)}-${d.randomToken()}`;
   d.log(`[pipeline intake] creating branch ${branch} from base ${baseSha.slice(0, 12)}...`);
   d.gitCreateBranch(repoDir, branch, baseSha);
-  d.log(`[pipeline intake] atomically reserving origin/${branch} before issue creation...`);
+  d.log(`[pipeline intake] reserving origin/${branch} (proves push capability) before issue creation...`);
   d.reserveRemoteBranch(repoDir, branch, baseSha);
 
   // 10. Ensure both required labels exist (create-only) before issue creation. Intake
