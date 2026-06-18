@@ -60,6 +60,7 @@ $pipeline --cleanup                      sweep merged-PR worktrees, then exit (n
 $pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
 $pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
 $pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
+$pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -339,7 +340,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs — there is no merge stage, no merge command, and no `auto_merge` config key.
+- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `$pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

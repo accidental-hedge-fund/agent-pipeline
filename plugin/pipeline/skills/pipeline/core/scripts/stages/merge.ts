@@ -37,6 +37,11 @@ export interface MergeDeps {
   ghPrMerge(pr: number): Promise<void>;
   getIssueLabels(issueNumber: number): Promise<string[]>;
   getPrLinkedIssue(pr: number): Promise<number | null>;
+  /** Authoritative resolver: given an issue number, return the open same-repo PR
+   *  that closes it (mirrors gh.ts resolvePrForIssue logic). Used to cross-validate
+   *  that a closingIssuesReferences candidate actually maps back to the correct PR
+   *  in this repository, guarding against cross-repo reference mismatches. */
+  getPrForIssue(issueNumber: number): Promise<number | null>;
   log(msg: string): void;
 }
 
@@ -111,6 +116,54 @@ export function realMergeDeps(repo: string): MergeDeps {
       }
     },
 
+    async getPrForIssue(issueNumber) {
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          [
+            "pr", "list",
+            "--json", "number,headRefName,isCrossRepository,closingIssuesReferences",
+            "--state", "open",
+            "-L", "100",
+            "-R", repo,
+          ],
+          { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+        );
+        const prs = JSON.parse(stdout) as Array<{
+          number: number;
+          headRefName: string;
+          isCrossRepository?: boolean;
+          closingIssuesReferences?: Array<{
+            number: number;
+            repository?: { name: string; owner: { login: string } };
+          }>;
+        }>;
+        const branchPrefix = `pipeline/${issueNumber}-`;
+        const repoLower = repo.toLowerCase();
+        // Branch-name fast path (same-repo only), mirrors gh.ts resolvePrForIssue
+        for (const pr of prs) {
+          if (!pr.isCrossRepository && pr.headRefName.startsWith(branchPrefix)) {
+            return pr.number;
+          }
+        }
+        // Closing-reference check with repo-identity guard
+        for (const pr of prs) {
+          for (const ref of pr.closingIssuesReferences ?? []) {
+            if (ref.repository) {
+              const nameWithOwner =
+                `${ref.repository.owner.login}/${ref.repository.name}`.toLowerCase();
+              if (nameWithOwner === repoLower && ref.number === issueNumber) {
+                return pr.number;
+              }
+            }
+          }
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
     log(msg) {
       console.log(msg);
     },
@@ -149,6 +202,31 @@ function checkMergeability(
       `Resolve the blocking condition and retry.`
     );
   }
+  // mergeable === "MERGEABLE" — now require CLEAN mergeStateStatus
+  if (mergeStateStatus === "BEHIND") {
+    return (
+      `PR merge state is BEHIND (the PR branch is behind the base branch). ` +
+      `Rebase or merge the base branch into the PR branch, then retry.`
+    );
+  }
+  if (mergeStateStatus === "BLOCKED") {
+    return (
+      `PR merge state is BLOCKED (a branch protection rule is preventing the merge). ` +
+      `Check branch protection rules and required reviews, then retry.`
+    );
+  }
+  if (mergeStateStatus === "HAS_HOOKS") {
+    return (
+      `PR merge state is HAS_HOOKS (pre-receive hooks are preventing the merge). ` +
+      `Check repository hooks configuration, then retry.`
+    );
+  }
+  if (mergeStateStatus !== "CLEAN") {
+    return (
+      `PR merge state is ${mergeStateStatus} (expected CLEAN). ` +
+      `Resolve the blocking condition and retry.`
+    );
+  }
   return null;
 }
 
@@ -175,15 +253,12 @@ function checkStatusChecks(statusCheckRollup: unknown): string | null {
 
     if (status !== "COMPLETED") {
       // Still running or queued — pending
-      blocking.push(`${name} (${status.toLowerCase()})`);
+      blocking.push(`${name} (${status.toLowerCase() || "pending"})`);
       continue;
     }
-    if (
-      conclusion === "FAILURE" ||
-      conclusion === "TIMED_OUT" ||
-      conclusion === "CANCELLED"
-    ) {
-      blocking.push(`${name} (${conclusion.toLowerCase()})`);
+    // Completed: only SUCCESS and NEUTRAL are non-blocking; everything else blocks
+    if (conclusion !== "SUCCESS" && conclusion !== "NEUTRAL") {
+      blocking.push(`${name} (${conclusion.toLowerCase() || "unknown conclusion"})`);
     }
   }
 
@@ -209,6 +284,17 @@ async function checkIssueStage(
     return (
       `PR #${pr} has no linked pipeline issue (no closing-issue reference found). ` +
       `Add "Closes #<issue>" to the PR body and retry, or verify the issue link.`
+    );
+  }
+
+  // Cross-validate via the authoritative resolver: the issue must map back to this
+  // exact PR in the same repository, guarding against cross-repo reference mismatches.
+  const resolvedPr = await deps.getPrForIssue(linkedIssue);
+  if (resolvedPr !== pr) {
+    return (
+      `Linked issue #${linkedIssue} does not resolve back to PR #${pr} ` +
+      `(authoritative resolver returned ${resolvedPr ?? "null"}). ` +
+      `Verify the "Closes #<issue>" reference and that the issue is in the same repository.`
     );
   }
 

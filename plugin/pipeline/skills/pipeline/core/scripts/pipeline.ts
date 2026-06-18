@@ -500,6 +500,29 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Reject flags that are incompatible with the merge sub-command before dispatch.
+  // --dry-run and --status are advance-loop/read-only modes with no meaningful
+  // interpretation for an irreversible squash merge; the rest are advance-loop-only.
+  if (isMergeCommand) {
+    const mergeConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--status", opts.status],
+      ["--dry-run", opts.dryRun],
+      ["--once", opts.once],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+      ["--summary", opts.summary],
+    ];
+    for (const [flag, active] of mergeConflicts) {
+      if (active) {
+        console.error(
+          `pipeline: 'pipeline merge' cannot be combined with ${flag}. ` +
+            `'pipeline merge <pr>' is a human-invoked squash merge; ${flag} has no meaning here.`,
+        );
+        process.exit(2);
+      }
+    }
+  }
+
   // Early merge dispatch — human-invoked squash merge of a ready-to-deploy PR (#217).
   // This is the ONLY path that calls mergePr; the autonomous advance loop never reaches here.
   if (isMergeCommand) {
