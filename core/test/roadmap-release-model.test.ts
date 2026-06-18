@@ -20,7 +20,7 @@ import {
   runRelease,
   type ReleaseDeps,
 } from "../scripts/stages/release.ts";
-import { realRoadmapDeps } from "../scripts/stages/roadmap-deps.ts";
+import { realRoadmapDeps, unlinkMarkerLockIfSame, type MarkerLockId } from "../scripts/stages/roadmap-deps.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -435,31 +435,83 @@ describe("buildCalVerMarker", () => {
     }
   });
 
-  it("realRoadmapDeps.acquireMarkerLock throws a clear, actionable error when the lock is held (#214)", async () => {
-    // Simplified design: no auto-reclaim (every recovery race lived there). A held or
-    // crash-stranded lock surfaces a clear error that names the lock file and the one-line
-    // manual fix, and never auto-removes an existing lock.
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-held-lock-"));
+  it("realRoadmapDeps.acquireMarkerLock reclaims a lock held by a dead PID (#214 review-2)", async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-deadpid-"));
     const lockPath = path.join(outputDir, ".marker.lock");
     try {
-      fs.writeFileSync(lockPath, "2000000"); // a lock is present (held or stranded)
+      fs.writeFileSync(lockPath, "2000000"); // no live process for this PID → ESRCH → reclaimable
+      const deps = realRoadmapDeps({} as never);
+      const release = await deps.acquireMarkerLock(outputDir);
+      assert.equal(fs.readFileSync(lockPath, "utf8").trim(), String(process.pid),
+        "the dead-PID lock is reclaimed and re-acquired under our PID");
+      release();
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  it("realRoadmapDeps.acquireMarkerLock reclaims an old empty/unstamped lock (#214 review-2)", async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-empty-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, ""); // created but never PID-stamped (crash window)
+      const old = new Date(Date.now() - 5 * 60_000); // clearly stale
+      fs.utimesSync(lockPath, old, old);
+      const deps = realRoadmapDeps({} as never);
+      const release = await deps.acquireMarkerLock(outputDir);
+      assert.equal(fs.readFileSync(lockPath, "utf8").trim(), String(process.pid),
+        "the old empty lock is reclaimed and re-acquired under our PID");
+      release();
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  it("realRoadmapDeps.acquireMarkerLock does NOT steal a fresh empty lock (a live run mid-stamp) (#214 review-2)", async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-fresh-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, ""); // fresh empty lock (mtime = now)
+      const deps = realRoadmapDeps({} as never);
+      await assert.rejects(() => deps.acquireMarkerLock(outputDir), /could not acquire/,
+        "a fresh empty lock must not be stolen");
+      assert.ok(fs.existsSync(lockPath), "the fresh empty lock is left intact");
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  it("unlinkMarkerLockIfSame refuses to delete a lock another recoverer recreated (dev+ino guard) (#214 review-2)", async () => {
+    // The concurrent-reclaimer regression: recoverer B captured the OLD stale lock's identity,
+    // then recoverer A unlinked it and created a fresh lock at the same path (a NEW inode). B
+    // must NOT delete A's fresh lock — closing the content-only-guard TOCTOU from the prior round.
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-ident-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, ""); // the stale lock B is about to reclaim
+      const st = fs.lstatSync(lockPath);
+      const oldId: MarkerLockId = { dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
+      // A reclaims + recreates a fresh lock at the same path (different inode).
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(lockPath, String(process.pid));
+      const freshIno = fs.lstatSync(lockPath).ino;
+      const removed = unlinkMarkerLockIfSame(lockPath, oldId); // B, using the stale identity
+      assert.equal(removed, false, "must not unlink a recreated lock with a different inode");
+      assert.ok(fs.existsSync(lockPath), "A's fresh lock survives");
+      assert.equal(fs.lstatSync(lockPath).ino, freshIno, "the surviving lock is A's fresh one");
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  it("realRoadmapDeps.acquireMarkerLock surfaces a clear error when a LIVE owner holds the lock (#214)", async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-held-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, String(process.pid)); // our own PID is alive → never reclaimed
       const deps = realRoadmapDeps({} as never);
       await assert.rejects(
         () => deps.acquireMarkerLock(outputDir),
         (err: Error) => {
           assert.match(err.message, /could not acquire the continuous marker lock/);
-          assert.match(
-            err.message,
-            new RegExp(`rm "${lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`),
-            `error must name the remove-the-file remediation; got: ${err.message}`,
-          );
+          assert.match(err.message, new RegExp(`rm "${lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
           return true;
         },
       );
-      assert.ok(fs.existsSync(lockPath), "the existing lock is left intact (never auto-removed)");
-    } finally {
-      fs.rmSync(outputDir, { recursive: true, force: true });
-    }
+      assert.ok(fs.existsSync(lockPath), "a live-held lock is left intact (not reclaimed)");
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
   });
 
   it("marker is absent under semver model (validated via runRoadmap output)", async () => {

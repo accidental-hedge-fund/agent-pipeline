@@ -15,6 +15,70 @@ import type { PipelineConfig } from "../types.ts";
  * Build real RoadmapDeps from the resolved PipelineConfig.
  * All calls hit real gh CLI, real filesystem, and real harness invocations.
  */
+// A healthy continuous run holds the marker lock for well under a minute (read plan.json +
+// compute the marker + write). An empty/unstamped lock older than this is a crash remnant.
+const STALE_MARKER_LOCK_MS = 60_000;
+
+/** Stable identity + metadata of a lock file, captured at decision time. */
+export interface MarkerLockId { dev: number; ino: number; mtimeMs: number; size: number; }
+
+/**
+ * Reclaim a stale `.marker.lock`. Two stale cases, each identity-guarded:
+ *  - Recorded PID is no longer a live process (a crashed run) → reclaim.
+ *  - Empty/malformed content (a crash in the openSync→writeSync window left a never-stamped
+ *    lock); liveness can't be checked, so reclaim ONLY once the file is older than
+ *    STALE_MARKER_LOCK_MS — a live run mid-stamp is never stolen.
+ * Returns true when a stale lock was removed (the caller retries the acquire). The unlink is
+ * guarded by the file's dev+ino+mtime+size, so a lock another recoverer unlinked-and-recreated
+ * (a NEW inode) is never deleted — closing the content-only-guard TOCTOU (#214).
+ */
+function reclaimStaleMarkerLock(lockPath: string): boolean {
+  let content: string;
+  let id: MarkerLockId;
+  try {
+    content = fs.readFileSync(lockPath, "utf8").trim();
+    const st = fs.lstatSync(lockPath);
+    id = { dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return false; // vanished — the next openSync("wx") wins on its own
+  }
+  const pid = Number(content);
+  if (Number.isInteger(pid) && pid > 0) {
+    try {
+      process.kill(pid, 0); // throws ESRCH if the owner is gone
+      return false; // owner alive — not stale
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") return false; // EPERM etc → assume alive
+    }
+    return unlinkMarkerLockIfSame(lockPath, id);
+  }
+  if (Date.now() - id.mtimeMs < STALE_MARKER_LOCK_MS) return false;
+  return unlinkMarkerLockIfSame(lockPath, id);
+}
+
+/**
+ * Unlink the lock ONLY if the file still has the exact identity (dev+ino) and metadata we
+ * captured — so a lock another run unlinked-and-recreated (a new inode) is never removed.
+ * Returns true on removal. Exported for the concurrent-reclaimer regression test.
+ */
+export function unlinkMarkerLockIfSame(lockPath: string, expected: MarkerLockId): boolean {
+  try {
+    const st = fs.lstatSync(lockPath);
+    if (
+      st.dev === expected.dev &&
+      st.ino === expected.ino &&
+      st.mtimeMs === expected.mtimeMs &&
+      st.size === expected.size
+    ) {
+      fs.unlinkSync(lockPath);
+      return true;
+    }
+  } catch {
+    /* changed or vanished — let the caller retry the acquire */
+  }
+  return false;
+}
+
 export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
   return {
     getOpenIssues: (repo, opts) => getOpenIssues(repo, opts),
@@ -139,10 +203,6 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       // exist, and openSync(..., "wx") would ENOENT before any plan.json is written (#214).
       fs.mkdirSync(outputDir, { recursive: true });
       const lockPath = path.join(outputDir, ".marker.lock");
-      // The lock is just an atomic exclusive-create (openSync "wx"). We deliberately do NOT
-      // auto-reclaim a held lock: every recovery race lived in the reclaim path (#214), and the
-      // marker it guards is a cosmetic CalVer counter. A stranded lock (from a crashed run) is
-      // a clear one-line manual fix instead — far simpler and safer than racy auto-recovery.
       const poll = async (attemptsLeft: number): Promise<void> => {
         let fd: number;
         try {
@@ -150,14 +210,20 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
         } catch (err) {
           const e = err as NodeJS.ErrnoException;
           if (e.code === "EEXIST") {
+            // Reclaim a lock whose owner crashed (dead PID, or an old never-stamped empty lock),
+            // identity-guarded (dev+ino) so a lock another run unlinked-and-recreated is never
+            // removed — restores crash-recovery for unattended automation without the content-
+            // only-guard TOCTOU (#214).
+            if (reclaimStaleMarkerLock(lockPath)) return poll(attemptsLeft);
             if (attemptsLeft > 0) {
               await new Promise<void>((r) => setTimeout(r, 50));
               return poll(attemptsLeft - 1);
             }
+            // Held by a LIVE owner and never freed — surface a clear, actionable error.
             throw new Error(
               `[roadmap] could not acquire the continuous marker lock at ${lockPath} (held after ~1s). ` +
-                `Another \`pipeline roadmap\` run may hold it; if none is active, a previous run crashed — ` +
-                `remove the file to proceed: rm "${lockPath}"`,
+                `Another \`pipeline roadmap\` run may hold it; if none is active, remove the file to ` +
+                `proceed: rm "${lockPath}"`,
             );
           }
           throw err;
