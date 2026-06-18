@@ -69,6 +69,7 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run; no number)
 /pipeline roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
 /pipeline roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
+/pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -399,7 +400,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs — there is no merge stage, no merge command, and no `auto_merge` config key.
+- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `/pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.
