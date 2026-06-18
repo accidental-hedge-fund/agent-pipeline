@@ -134,6 +134,22 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
 
     getMilestones: (repo) => getMilestones(repo),
 
+    assignIssueMilestone: async (_repo, issueNumber, milestoneTitle) => {
+      const r = spawnSync(
+        "gh",
+        ["issue", "edit", String(issueNumber), "--milestone", milestoneTitle, "-R", cfg.repo],
+        { encoding: "utf8" },
+      );
+      if (r.status !== 0) throw new Error(`gh issue edit --milestone failed: ${r.stderr}`);
+    },
+
+    getLatestTag: async (repoDir) => {
+      const r = spawnSync("git", ["describe", "--tags", "--abbrev=0"], {
+        cwd: repoDir, encoding: "utf8",
+      });
+      return r.status === 0 ? r.stdout.trim() : "";
+    },
+
     closeIssue: async (_repo, issueNumber) => {
       const r = spawnSync("gh", ["issue", "close", String(issueNumber), "-R", cfg.repo], {
         encoding: "utf8",

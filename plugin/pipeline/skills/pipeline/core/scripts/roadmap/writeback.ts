@@ -5,6 +5,7 @@ import * as crypto from "node:crypto";
 import type {
   PlanJson,
   HygieneItem,
+  MilestoneSpec,
   RoadmapEntry,
   Tier,
   EffortSize,
@@ -24,6 +25,7 @@ export interface WritebackDeps {
   applyLabel(repo: string, issueNumber: number, label: string): Promise<void>;
   createMilestone(repo: string, title: string, dueOn?: string): Promise<number>;
   getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>>;
+  assignIssueMilestone(repo: string, issueNumber: number, milestoneTitle: string): Promise<void>;
   closeIssue(repo: string, issueNumber: number): Promise<void>;
   addComment(repo: string, issueNumber: number, body: string): Promise<void>;
   editIssue(repo: string, issueNumber: number, opts: { title?: string; body?: string }): Promise<void>;
@@ -220,6 +222,45 @@ export async function openRoadmapPr(
   const prUrl = await deps.createPr(repoDir, prTitle, prBody, baseBranch, branch);
   deps.log(`[roadmap] roadmap PR opened: ${prUrl}`);
   return prUrl;
+}
+
+/**
+ * Create GitHub milestones from plan.milestones[] and assign issues.
+ * Idempotent: reuses existing milestones with the same title rather than
+ * creating duplicates. Skipped when apply is false (dry-run).
+ */
+export async function applyMilestones(
+  milestones: MilestoneSpec[],
+  repo: string,
+  apply: boolean,
+  deps: WritebackDeps,
+): Promise<void> {
+  if (!apply) {
+    deps.log(`[roadmap] dry-run: ${milestones.length} milestone(s) would be created/assigned`);
+    for (const m of milestones) {
+      deps.log(`[roadmap] dry-run: milestone "${m.title}" — issues: ${m.issue_numbers.join(", ")}`);
+    }
+    return;
+  }
+
+  const existing = await deps.getMilestones(repo);
+  const byTitle = new Map(existing.map((m) => [m.title, m.number]));
+
+  for (const spec of milestones) {
+    let milestoneNumber = byTitle.get(spec.title);
+    if (milestoneNumber === undefined) {
+      const newNumber = await deps.createMilestone(repo, spec.title);
+      milestoneNumber = newNumber;
+      byTitle.set(spec.title, newNumber);
+      deps.log(`[roadmap] created milestone "${spec.title}" (#${milestoneNumber})`);
+    } else {
+      deps.log(`[roadmap] reusing existing milestone "${spec.title}" (#${milestoneNumber})`);
+    }
+    for (const issueNumber of spec.issue_numbers) {
+      await deps.assignIssueMilestone(repo, issueNumber, spec.title);
+      deps.log(`[roadmap] assigned #${issueNumber} to milestone "${spec.title}"`);
+    }
+  }
 }
 
 /**

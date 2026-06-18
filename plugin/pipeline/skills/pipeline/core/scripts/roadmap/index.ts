@@ -10,9 +10,11 @@ import type {
   PlanJson,
   DepEdge,
   HygieneItem,
+  MilestoneSpec,
   CritiqueEntry,
   OpenQuestion,
   RoadmapConfig,
+  RoadmapEntry,
   InventoryItem,
 } from "./types.ts";
 import { buildInventory, computeBacklogSha } from "./inventory.ts";
@@ -25,6 +27,7 @@ import {
   writeRoadmapMd,
   openRoadmapPr,
   applyHygiene,
+  applyMilestones,
 } from "./writeback.ts";
 import type { WritebackDeps } from "./writeback.ts";
 
@@ -38,6 +41,131 @@ export interface RoadmapOpts {
 export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps {
   /** Critique harness: must be the reviewer role (not implementer). */
   runCritiqueHarness(prompt: string): Promise<{ success: boolean; output: string }>;
+  /** Return the latest git tag (e.g. "v1.6.0") or "" if no tags exist. */
+  getLatestTag(repoDir: string): Promise<string>;
+}
+
+// ---------------------------------------------------------------------------
+// Milestone builders
+// ---------------------------------------------------------------------------
+
+const SEMVER_TITLE_RE = /^v\d+\.\d+\.\d+$/;
+const SEMVER_LANE_SIZE = 5;
+
+/**
+ * Parse a semver tag (e.g. "v1.6.0" or "1.6.0") into [major, minor, patch].
+ * Returns [0, 0, 0] when the tag is absent or unparseable.
+ */
+function parseSemverTag(tag: string): [number, number, number] {
+  const clean = tag.startsWith("v") ? tag.slice(1) : tag;
+  const parts = clean.split(".").map(Number);
+  if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
+    return [parts[0], parts[1], parts[2]];
+  }
+  return [0, 0, 0];
+}
+
+/**
+ * Bundle ranked, non-blocked roadmap issues into version-numbered release lanes.
+ * The first lane starts one minor version above the latest released tag.
+ * Each lane holds at most SEMVER_LANE_SIZE issues.
+ */
+export function buildSemverLanes(roadmap: RoadmapEntry[], latestTag: string): MilestoneSpec[] {
+  const unblocked = roadmap.filter((e) => e.blocked_by.length === 0);
+  if (unblocked.length === 0) return [];
+
+  const [major, minor] = parseSemverTag(latestTag);
+  const lanes: MilestoneSpec[] = [];
+  let laneMinor = minor + 1;
+
+  for (let i = 0; i < unblocked.length; i += SEMVER_LANE_SIZE) {
+    const slice = unblocked.slice(i, i + SEMVER_LANE_SIZE);
+    const title = `v${major}.${laneMinor}.0`;
+    lanes.push({
+      title,
+      issue_numbers: slice.map((e) => e.issue_number),
+      rationale: `Ranked issues ${slice[0].rank}–${slice[slice.length - 1].rank} bundled into ${title}`,
+    });
+    laneMinor++;
+  }
+  return lanes;
+}
+
+/**
+ * Group roadmap issues by epic/theme label, falling back to tier name.
+ * Titles are non-semver strings derived from label values or tier names.
+ */
+export function buildContinuousGroups(roadmap: RoadmapEntry[], items: InventoryItem[]): MilestoneSpec[] {
+  if (roadmap.length === 0) return [];
+
+  const labelByIssue = new Map<number, string[]>();
+  for (const item of items) {
+    labelByIssue.set(item.issue.number, item.issue.labels);
+  }
+
+  const EPIC_THEME_RE = /^(epic|theme):/;
+
+  function groupKey(entry: RoadmapEntry): string {
+    const labels = labelByIssue.get(entry.issue_number) ?? [];
+    const epicLabel = labels.find((l) => EPIC_THEME_RE.test(l));
+    if (epicLabel) return epicLabel;
+    // Fall back to a human-readable tier name
+    const tierNames: Record<string, string> = {
+      enablers: "Tier 1: Enablers",
+      "dependency-unlock": "Tier 2: Dependency Unlock",
+      "high-value/low-risk": "Tier 3: High-Value / Low-Risk",
+      "larger-bets": "Tier 4: Larger Bets",
+      cleanup: "Tier 5: Cleanup",
+    };
+    return tierNames[entry.tier] ?? entry.tier;
+  }
+
+  const groups = new Map<string, number[]>();
+  for (const entry of roadmap) {
+    const key = groupKey(entry);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(entry.issue_number);
+    } else {
+      groups.set(key, [entry.issue_number]);
+    }
+  }
+
+  return [...groups.entries()].map(([key, issue_numbers]) => ({
+    title: key,
+    issue_numbers,
+    rationale: `Grouped by ${EPIC_THEME_RE.test(key) ? "label" : "tier"}: ${key}`,
+  }));
+}
+
+/**
+ * Build a CalVer marker in YYYY.0M.MICRO format.
+ * MICRO is 0 on the first run of the month, 1 if a prior plan exists from the
+ * same calendar month, etc.
+ */
+export function buildCalVerMarker(now: string, existingPlanContent: string | null): string {
+  const date = new Date(now);
+  const yyyy = date.getUTCFullYear().toString();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+
+  let micro = 0;
+  if (existingPlanContent) {
+    try {
+      const existing = JSON.parse(existingPlanContent) as { generated_at?: string };
+      if (existing.generated_at) {
+        const existingDate = new Date(existing.generated_at);
+        const eYear = existingDate.getUTCFullYear().toString();
+        const eMon = String(existingDate.getUTCMonth() + 1).padStart(2, "0");
+        if (eYear === yyyy && eMon === mm) {
+          micro = 1;
+        }
+      }
+    } catch {
+      // malformed existing plan — start at 0
+    }
+  }
+
+  return `${yyyy}.${mm}.${micro}`;
 }
 
 interface CritiqueVerdict {
@@ -438,8 +566,26 @@ export async function runRoadmap(
     }
   }
 
-  // Build final plan.json
+  // Build milestones based on release_model (semver default)
+  deps.log("[roadmap] phase 8: building milestone groupings...");
+  const releaseModel = config.release_model ?? "semver";
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  let milestones: MilestoneSpec[];
+  let continuousVersionMarker: string | undefined;
+
+  if (releaseModel === "continuous") {
+    milestones = buildContinuousGroups(roadmap, items);
+    // Read existing plan.json to derive MICRO counter
+    const existingPlanContent = await deps.readFile(path.join(outputDir, "plan.json"));
+    continuousVersionMarker = buildCalVerMarker(now, existingPlanContent);
+    deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
+  } else {
+    const latestTag = await deps.getLatestTag(repoDir);
+    milestones = buildSemverLanes(roadmap, latestTag);
+    deps.log(`[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"})`);
+  }
+
+  // Build final plan.json
   const plan: PlanJson = {
     generated_at: now,
     backlog_sha: backlogSha,
@@ -448,10 +594,11 @@ export async function runRoadmap(
     scored,
     roadmap,
     hygiene,
-    milestones: [],
+    milestones,
     new_issue_drafts: [],
     critique: critiqueEntries,
     open_questions: openQuestions,
+    ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
   };
 
   // Ensure output dir exists, then write outputs
@@ -470,11 +617,18 @@ export async function runRoadmap(
         deps.log(`  - #${h.issue_number}: ${h.action}`);
       }
     }
+    if (plan.milestones.length > 0) {
+      deps.log(`\n[roadmap] dry-run: ${plan.milestones.length} milestone(s) (not applied):`);
+      for (const m of plan.milestones) {
+        deps.log(`  - "${m.title}": ${m.issue_numbers.join(", ")}`);
+      }
+    }
     deps.log(`\n[roadmap] dry-run complete. Run with --apply to execute GitHub write-backs.`);
     return;
   }
 
   await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
+  await applyMilestones(plan.milestones, repo, true, deps);
 
   if (config.pr_docs !== false) {
     await openRoadmapPr(plan, repoDir, baseBranch, deps);

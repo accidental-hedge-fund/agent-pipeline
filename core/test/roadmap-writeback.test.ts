@@ -55,6 +55,7 @@ function makeDeps(overrides: Partial<WritebackDeps> = {}): WritebackDeps {
     applyLabel: async () => {},
     createMilestone: async () => 1,
     getMilestones: async () => [],
+    assignIssueMilestone: async () => {},
     closeIssue: async () => {},
     addComment: async () => {},
     editIssue: async () => {},
