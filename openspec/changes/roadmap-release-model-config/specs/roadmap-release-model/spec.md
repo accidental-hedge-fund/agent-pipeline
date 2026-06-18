@@ -72,12 +72,13 @@ When `release_model` is `continuous`, the engine SHALL populate `plan.json.miles
 
 ### Requirement: Under `continuous`, the engine SHALL record a non-empty per-deploy version marker in `plan.json`
 
-When `release_model` is `continuous`, `plan.json` SHALL contain a non-empty `continuous_version_marker` field using CalVer format `YYYY.0M.MICRO` (where MICRO is a zero-based run index within the calendar month). This field SHALL NOT appear in `plan.json` when `release_model` is `semver` or absent.
+When `release_model` is `continuous`, `plan.json` SHALL contain a non-empty `continuous_version_marker` field using CalVer format `YYYY.0M.<short>`, where `<short>` is a short prefix of the backlog SHA the roadmap was generated against. The marker SHALL be **deterministic and lock-free**: it is a pure function of the calendar month and the backlog SHA, with no read-modify-write counter — so concurrent roadmap runs require no serializing lock and never strand one. This field SHALL NOT appear in `plan.json` when `release_model` is `semver` or absent.
 
-#### Scenario: Continuous version marker is present and non-empty
+#### Scenario: Continuous version marker is present, non-empty, and deterministic
 
 - **WHEN** `pipeline roadmap` runs with `release_model: continuous`
-- **THEN** `plan.json.continuous_version_marker` SHALL be a non-empty string matching the pattern `YYYY.0M.N` (e.g. `2026.06.0`)
+- **THEN** `plan.json.continuous_version_marker` SHALL be a non-empty string matching the pattern `YYYY.0M.<short>` (e.g. `2026.06.a1b2c3d`)
+- **AND** two runs in the same calendar month against the same backlog SHA SHALL produce the **same** marker (no counter, no lock)
 
 #### Scenario: Continuous version marker is absent under semver
 

@@ -20,7 +20,7 @@ import {
   runRelease,
   type ReleaseDeps,
 } from "../scripts/stages/release.ts";
-import { realRoadmapDeps, unlinkMarkerLockIfSame, type MarkerLockId } from "../scripts/stages/roadmap-deps.ts";
+import { realRoadmapDeps } from "../scripts/stages/roadmap-deps.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -89,7 +89,6 @@ function makeRoadmapDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
     getIssueState: async () => "open",
     getIssueComments: async () => [],
     getLatestTag: async () => "v1.6.0",
-    acquireMarkerLock: async () => () => {},
     log: () => {},
     ...overrides,
   };
@@ -332,186 +331,47 @@ describe("buildContinuousGroups", () => {
 
 describe("buildCalVerMarker", () => {
   it("marker is present and non-empty for a given timestamp", () => {
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", null);
+    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", "a1b2c3d4e5f6");
     assert.ok(marker.length > 0);
   });
 
-  it("marker matches CalVer format YYYY.0M.N", () => {
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", null);
-    assert.match(marker, /^\d{4}\.\d{2}\.\d+$/);
+  it("marker is CalVer YYYY.0M.<short backlog-sha> (lock-free, content-addressed)", () => {
+    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", "a1b2c3d4e5f6");
+    assert.match(marker, /^\d{4}\.\d{2}\.[0-9a-f]{1,7}$/);
+    assert.equal(marker, "2026.06.a1b2c3d");
   });
 
-  it("marker is 2026.06.0 on first run (no existing plan)", () => {
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", null);
-    assert.equal(marker, "2026.06.0");
+  it("marker is deterministic: same month + same backlog SHA → same marker (no counter)", () => {
+    const a = buildCalVerMarker("2026-06-17T10:00:00Z", "deadbeefcafe1234");
+    const b = buildCalVerMarker("2026-06-17T23:59:00Z", "deadbeefcafe1234");
+    assert.equal(a, b, "marker does not depend on time-of-day or a prior-run counter");
   });
 
-  it("marker increments MICRO to 1 when existing plan has continuous_version_marker 2026.06.0", () => {
-    const existingPlan = JSON.stringify({ continuous_version_marker: "2026.06.0" });
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
-    assert.equal(marker, "2026.06.1");
+  it("marker differs when the backlog SHA differs", () => {
+    const a = buildCalVerMarker("2026-06-17T10:00:00Z", "aaaaaaa0000");
+    const b = buildCalVerMarker("2026-06-17T10:00:00Z", "bbbbbbb0000");
+    assert.notEqual(a, b, "distinct backlog SHAs yield distinct markers");
   });
 
-  it("regression: marker increments MICRO to 2 when existing plan has continuous_version_marker 2026.06.1", () => {
-    const existingPlan = JSON.stringify({ continuous_version_marker: "2026.06.1" });
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
-    assert.equal(marker, "2026.06.2");
+  it("marker uses a placeholder segment when the backlog SHA is empty", () => {
+    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", "");
+    assert.match(marker, /^2026\.06\.[0-9a-f]{1,7}$/);
   });
 
-  it("marker resets MICRO to 0 when existing plan has continuous_version_marker from a different month", () => {
-    const existingPlan = JSON.stringify({ continuous_version_marker: "2026.05.3" });
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
-    assert.equal(marker, "2026.06.0");
-  });
-
-  it("marker starts at 0 when existing plan has no continuous_version_marker (e.g. semver plan)", () => {
-    const existingPlan = JSON.stringify({ generated_at: "2026-06-10T08:00:00Z" });
-    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
-    assert.equal(marker, "2026.06.0");
-  });
-
-  it("regression: acquireMarkerLock is called before readFile(plan.json) and released after writePlanJson in continuous mode", async () => {
-    // Guards against the concurrency gap where two overlapping runs both read the same
-    // plan.json before either writes the updated marker, causing duplicate MICRO values.
-    const callOrder: string[] = [];
-    const deps = makeRoadmapDeps({
-      acquireMarkerLock: async () => {
-        callOrder.push("lock-acquired");
-        return () => { callOrder.push("lock-released"); };
-      },
-      readFile: async (p) => {
-        if (typeof p === "string" && p.endsWith("plan.json")) callOrder.push("read-plan");
-        return null;
-      },
-      writeFile: async (p) => {
-        if (typeof p === "string" && p.endsWith("plan.json")) callOrder.push("write-plan");
-      },
-    });
-    await runRoadmap("example/repo", "/repo", "main", { release_model: "continuous" }, { apply: false }, deps);
-    const lockIdx = callOrder.indexOf("lock-acquired");
-    const readIdx = callOrder.indexOf("read-plan");
-    const writeIdx = callOrder.indexOf("write-plan");
-    const releaseIdx = callOrder.indexOf("lock-released");
-    assert.ok(lockIdx !== -1, "acquireMarkerLock must be called");
-    assert.ok(readIdx !== -1, "plan.json must be read");
-    assert.ok(writeIdx !== -1, "plan.json must be written");
-    assert.ok(releaseIdx !== -1, "lock must be released");
-    assert.ok(lockIdx < readIdx, `lock must be acquired before reading plan.json (got order: ${callOrder})`);
-    assert.ok(writeIdx < releaseIdx, `lock must be released after writing plan.json (got order: ${callOrder})`);
-  });
-
-  it("regression: marker lock is released even when the locked write fails (#214 review-2)", async () => {
-    // Finding 2: any throw between acquire and the success-path release leaked .marker.lock.
-    // The try/finally must release the lock even when writePlanJson throws.
-    let released = false;
-    const deps = makeRoadmapDeps({
-      acquireMarkerLock: async () => () => { released = true; },
-      readFile: async () => null,
-      writeFile: async (p) => {
-        if (typeof p === "string" && p.endsWith("plan.json")) throw new Error("disk full");
-      },
-    });
-    await assert.rejects(
-      () => runRoadmap("example/repo", "/repo", "main", { release_model: "continuous" }, { apply: false }, deps),
-      /disk full/,
-    );
-    assert.ok(released, "marker lock must be released (finally) even when the locked write throws");
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock creates a missing output dir before locking (#214 review-2)", async () => {
-    // Finding 1: on a clean first run the output dir does not exist yet; openSync('wx') would
-    // ENOENT. The real lock must mkdir -p the output dir before acquiring.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-marker-lock-"));
-    const outputDir = path.join(base, "does", "not", "exist", "yet");
+  it("realRoadmapDeps.writeFile writes atomically (temp + rename, no .tmp left behind) (#214)", async () => {
+    // No marker lock anymore: concurrent-write safety comes from atomic temp+rename instead.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-atomic-"));
     try {
       const deps = realRoadmapDeps({} as never);
-      const release = await deps.acquireMarkerLock(outputDir);
-      assert.ok(fs.existsSync(outputDir), "output dir is created before locking");
-      assert.ok(fs.existsSync(path.join(outputDir, ".marker.lock")), "lock acquired on the fresh dir");
-      release();
-      assert.ok(!fs.existsSync(path.join(outputDir, ".marker.lock")), "release removes the lock");
-    } finally {
-      fs.rmSync(base, { recursive: true, force: true });
-    }
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock reclaims a lock held by a dead PID (#214 review-2)", async () => {
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-deadpid-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, "2000000"); // no live process for this PID → ESRCH → reclaimable
-      const deps = realRoadmapDeps({} as never);
-      const release = await deps.acquireMarkerLock(outputDir);
-      assert.equal(fs.readFileSync(lockPath, "utf8").trim(), String(process.pid),
-        "the dead-PID lock is reclaimed and re-acquired under our PID");
-      release();
-    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock reclaims an old empty/unstamped lock (#214 review-2)", async () => {
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-empty-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, ""); // created but never PID-stamped (crash window)
-      const old = new Date(Date.now() - 5 * 60_000); // clearly stale
-      fs.utimesSync(lockPath, old, old);
-      const deps = realRoadmapDeps({} as never);
-      const release = await deps.acquireMarkerLock(outputDir);
-      assert.equal(fs.readFileSync(lockPath, "utf8").trim(), String(process.pid),
-        "the old empty lock is reclaimed and re-acquired under our PID");
-      release();
-    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock does NOT steal a fresh empty lock (a live run mid-stamp) (#214 review-2)", async () => {
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-fresh-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, ""); // fresh empty lock (mtime = now)
-      const deps = realRoadmapDeps({} as never);
-      await assert.rejects(() => deps.acquireMarkerLock(outputDir), /could not acquire/,
-        "a fresh empty lock must not be stolen");
-      assert.ok(fs.existsSync(lockPath), "the fresh empty lock is left intact");
-    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
-  });
-
-  it("unlinkMarkerLockIfSame refuses to delete a lock another recoverer recreated (dev+ino guard) (#214 review-2)", async () => {
-    // The concurrent-reclaimer regression: recoverer B captured the OLD stale lock's identity,
-    // then recoverer A unlinked it and created a fresh lock at the same path (a NEW inode). B
-    // must NOT delete A's fresh lock — closing the content-only-guard TOCTOU from the prior round.
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-ident-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, ""); // the stale lock B is about to reclaim
-      const st = fs.lstatSync(lockPath);
-      const oldId: MarkerLockId = { dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
-      // A reclaims + recreates a fresh lock at the same path (different inode).
-      fs.unlinkSync(lockPath);
-      fs.writeFileSync(lockPath, String(process.pid));
-      const freshIno = fs.lstatSync(lockPath).ino;
-      const removed = unlinkMarkerLockIfSame(lockPath, oldId); // B, using the stale identity
-      assert.equal(removed, false, "must not unlink a recreated lock with a different inode");
-      assert.ok(fs.existsSync(lockPath), "A's fresh lock survives");
-      assert.equal(fs.lstatSync(lockPath).ino, freshIno, "the surviving lock is A's fresh one");
-    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock surfaces a clear error when a LIVE owner holds the lock (#214)", async () => {
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-held-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, String(process.pid)); // our own PID is alive → never reclaimed
-      const deps = realRoadmapDeps({} as never);
-      await assert.rejects(
-        () => deps.acquireMarkerLock(outputDir),
-        (err: Error) => {
-          assert.match(err.message, /could not acquire the continuous marker lock/);
-          assert.match(err.message, new RegExp(`rm "${lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
-          return true;
-        },
+      const p = path.join(dir, "plan.json");
+      await deps.writeFile(p, '{"ok":true}');
+      assert.equal(fs.readFileSync(p, "utf8"), '{"ok":true}', "final content is written");
+      assert.deepEqual(
+        fs.readdirSync(dir).filter((f) => f.includes(".tmp")),
+        [],
+        "no temp file is left behind (atomic rename completed)",
       );
-      assert.ok(fs.existsSync(lockPath), "a live-held lock is left intact (not reclaimed)");
-    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it("marker is absent under semver model (validated via runRoadmap output)", async () => {

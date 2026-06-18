@@ -43,11 +43,6 @@ export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps 
   runCritiqueHarness(prompt: string): Promise<{ success: boolean; output: string }>;
   /** Return the latest git tag (e.g. "v1.6.0") or "" if no tags exist. */
   getLatestTag(repoDir: string): Promise<string>;
-  /** Acquire an exclusive lock on the continuous marker counter for outputDir.
-   *  Returns a release function. Only called when release_model is 'continuous'.
-   *  Guards the read-plan.json → compute-marker → write-plan.json window so that
-   *  concurrent roadmap runs cannot claim the same MICRO value. */
-  acquireMarkerLock(outputDir: string): Promise<() => void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,28 +143,15 @@ export function buildContinuousGroups(roadmap: RoadmapEntry[], items: InventoryI
  * MICRO is 0 on the first run of the month, 1 if a prior plan exists from the
  * same calendar month, etc.
  */
-export function buildCalVerMarker(now: string, existingPlanContent: string | null): string {
+export function buildCalVerMarker(now: string, backlogSha: string): string {
   const date = new Date(now);
   const yyyy = date.getUTCFullYear().toString();
   const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
-
-  let micro = 0;
-  if (existingPlanContent) {
-    try {
-      const existing = JSON.parse(existingPlanContent) as { continuous_version_marker?: string };
-      const prevMarker = existing.continuous_version_marker;
-      if (prevMarker) {
-        const match = /^(\d{4})\.(\d{2})\.(\d+)$/.exec(prevMarker);
-        if (match && match[1] === yyyy && match[2] === mm) {
-          micro = parseInt(match[3], 10) + 1;
-        }
-      }
-    } catch {
-      // malformed existing plan — start at 0
-    }
-  }
-
-  return `${yyyy}.${mm}.${micro}`;
+  // Lock-free, content-addressed: the third segment is a short prefix of the backlog SHA the
+  // roadmap was generated against. Deterministic per backlog state — no read-modify-write
+  // counter — so concurrent runs need no serializing lock and produce a correct marker (#214).
+  const short = (backlogSha || "").replace(/[^0-9a-fA-F]/g, "").slice(0, 7).toLowerCase() || "0000000";
+  return `${yyyy}.${mm}.${short}`;
 }
 
 interface CritiqueVerdict {
@@ -577,51 +559,39 @@ export async function runRoadmap(
   let milestones: MilestoneSpec[];
   let continuousVersionMarker: string | undefined;
 
-  let releaseLock: (() => void) | undefined;
   if (releaseModel === "continuous") {
     milestones = buildContinuousGroups(roadmap, items);
-    // Acquire the marker lock BEFORE reading plan.json so concurrent runs can't claim the
-    // same MICRO value. Everything from here through writePlanJson runs under the lock and
-    // is wrapped in the try/finally below, so the lock is ALWAYS released — even on a failed
-    // read / marker-compute / write — and can't strand subsequent runs (#214).
-    releaseLock = await deps.acquireMarkerLock(outputDir);
+    // Lock-free, content-addressed marker derived from the backlog SHA — no read-modify-write
+    // counter, so concurrent runs need no serializing lock and produce a correct, deterministic
+    // marker (#214). (The lock + stale-reclaim were removed: every recovery race lived there.)
+    continuousVersionMarker = buildCalVerMarker(now, backlogSha);
+    deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
   } else {
     const latestTag = await deps.getLatestTag(repoDir);
     milestones = buildSemverLanes(roadmap, latestTag);
     deps.log(`[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"})`);
   }
 
-  // Build final plan.json + write outputs under the marker lock (continuous). The finally
-  // releases the lock on every path; writeRoadmapMd runs after release (it needs no lock).
-  let plan: PlanJson;
-  try {
-    if (releaseModel === "continuous") {
-      const existingPlanContent = await deps.readFile(path.join(outputDir, "plan.json"));
-      continuousVersionMarker = buildCalVerMarker(now, existingPlanContent);
-      deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
-    }
-    plan = {
-      generated_at: now,
-      backlog_sha: backlogSha,
-      repo,
-      dependency_graph: depGraph,
-      scored,
-      roadmap,
-      hygiene,
-      milestones,
-      new_issue_drafts: [],
-      critique: critiqueEntries,
-      open_questions: openQuestions,
-      ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
-    };
+  // Build final plan.json.
+  const plan: PlanJson = {
+    generated_at: now,
+    backlog_sha: backlogSha,
+    repo,
+    dependency_graph: depGraph,
+    scored,
+    roadmap,
+    hygiene,
+    milestones,
+    new_issue_drafts: [],
+    critique: critiqueEntries,
+    open_questions: openQuestions,
+    ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
+  };
 
-    // Ensure output dir exists, then write outputs.
-    await deps.writeFile(path.join(outputDir, ".gitkeep"), "");
-    await writePlanJson(plan, outputDir, deps);
-  } finally {
-    releaseLock?.();
-    releaseLock = undefined;
-  }
+  // Ensure output dir exists, then write outputs. Writes are atomic (temp + rename in the real
+  // deps), so concurrent runs can't corrupt or partially clobber a shared plan.json.
+  await deps.writeFile(path.join(outputDir, ".gitkeep"), "");
+  await writePlanJson(plan, outputDir, deps);
   await writeRoadmapMd(plan, outputDir, deps);
 
   if (opts.dryRun || !opts.apply) {
