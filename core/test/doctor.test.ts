@@ -516,6 +516,24 @@ test("check install:version-coherence — fails with reinstall remediation when 
   assert.match(r.remediation!, /reinstall/i);
 });
 
+// Regression for the corrupt-install startup path (#186 review 2): if core/package.json
+// is unreadable at startup, loadVersion() in pipeline.ts returns "" rather than throwing
+// at module load. This test proves runPreflight still executes (does not crash) and that
+// install:version-coherence surfaces the reinstall remediation for that scenario.
+test("runPreflight — corrupt-install: VERSION='' + unreadable package.json → install:version-coherence fails with reinstall remediation", async () => {
+  const cfg = makeConfig();
+  const result = await runPreflight(
+    cfg,
+    fakeDeps({ readTextFile: () => null }),
+    {},
+    "", // empty sentinel — what loadVersion() returns when core/package.json is unreadable
+  );
+  assert.equal(result.ok, false);
+  const vc = result.checks.find((c) => c.id === "install:version-coherence");
+  assert.equal(vc?.status, "fail");
+  assert.match(vc!.remediation!, /reinstall/i);
+});
+
 // When config.repo is "" (gh was unavailable or the checkout cannot be resolved to a
 // GitHub repo during config resolution), repo-access must fail — not skip. The spec
 // requires a failing check with remediation, not a silent omission from the result set.

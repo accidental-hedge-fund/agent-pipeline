@@ -102,8 +102,16 @@ const MAX_ITERATIONS = 12;
 // automatically. The path is `../package.json` (core/package.json) and is mirror-safe:
 // build.mjs copies `package.json` alongside `scripts/` into the generated plugin, so the
 // same relative path resolves in both the dev and installed layouts.
+// Returns "" on missing/malformed file so `pipeline doctor` can execute and surface the
+// install:version-coherence failure instead of crashing before the command dispatches.
 const require = createRequire(import.meta.url);
-export const VERSION: string = (require("../package.json") as { version: string }).version;
+export const VERSION: string = (() => {
+  try {
+    return (require("../package.json") as { version: string }).version;
+  } catch {
+    return "";
+  }
+})();
 
 export interface CliOpts {
   status?: boolean;
