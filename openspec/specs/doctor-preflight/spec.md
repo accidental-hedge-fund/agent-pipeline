@@ -115,7 +115,7 @@ When `pipeline --status` is invoked, the output SHALL include the latest preflig
 
 ### Requirement: Preflight checks SHALL use injectable deps and be unit-testable without real I/O
 
-The doctor module SHALL accept a `DoctorDeps` parameter (or equivalent seam) providing thin I/O primitives (`execCheck`, `fsExists`, `readFile`, etc.). Unit tests SHALL inject fakes through this seam and SHALL perform no real subprocess, filesystem, or network calls.
+The doctor module SHALL accept a `DoctorDeps` parameter (or equivalent seam) providing thin I/O primitives (`execCheck`, `fsExists`, `readTextFile`, `fileMtime`). Unit tests SHALL inject fakes through this seam and SHALL perform no real subprocess, filesystem, or network calls. The `DoctorDeps` interface SHALL include `readTextFile(p: string): Promise<string | null>` returning file contents on success or `null` on any error.
 
 #### Scenario: All checks pass with fake deps returning success
 
@@ -126,6 +126,12 @@ The doctor module SHALL accept a `DoctorDeps` parameter (or equivalent seam) pro
 
 - **WHEN** one `DoctorDeps` fake returns a failing result for a single check
 - **THEN** `runPreflight` SHALL return a result object with that check marked as failing and the others as passing
+
+#### Scenario: readTextFile fake returns null — install:version-coherence fails
+
+- **WHEN** the `DoctorDeps.readTextFile` fake returns `null` (simulating an unreadable `core/package.json`)
+- **THEN** the `install:version-coherence` check SHALL have status `"fail"`
+- **AND** the remediation text SHALL instruct the user to reinstall
 
 ### Requirement: `pipeline doctor --json` SHALL emit a single unfenced JSON object with per-check records
 

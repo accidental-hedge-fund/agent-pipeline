@@ -1,0 +1,5 @@
+{"schema_version":1,"type":"run_start","at":"2026-06-18T05:09:20Z","run_id":"186-2026-06-18T05-09-20-608Z","issue":186,"repo":"accidental-hedge-fund/agent-pipeline"}
+{"schema_version":1,"type":"stage_start","at":"2026-06-18T05:09:22Z","stage":"review-2"}
+{"schema_version":1,"type":"review_verdict","at":"2026-06-18T05:14:14Z","round":2,"sha":"97feaaf70ef98a8c1f7e47f3a7cbaadae68af7c8","verdict":"needs-attention","finding_counts":{"critical":0,"high":0,"medium":1,"low":0}}
+{"schema_version":1,"type":"stage_complete","at":"2026-06-18T05:14:19Z","stage":"review-2","outcome":"advanced","commits":[]}
+{"schema_version":1,"type":"run_complete","at":"2026-06-18T05:14:21Z","final_state":"needs-human","elapsed_ms":301000}
