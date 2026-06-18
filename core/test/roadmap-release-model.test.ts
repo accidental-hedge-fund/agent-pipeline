@@ -146,7 +146,7 @@ describe("config: roadmap.release_model", () => {
     }
   });
 
-  it("absent release_model → roadmap config has no release_model (defaults to semver behavior)", async () => {
+  it("absent release_model → resolveConfig materializes release_model: 'semver'", async () => {
     const repo = makeFakeRepo(`roadmap:\n  pr_docs: false\n`);
     const binDir = makeFakeGh("acme/rm3");
     const oldPath = process.env.PATH;
@@ -154,7 +154,7 @@ describe("config: roadmap.release_model", () => {
     try {
       const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
       const cfg = cfgMod.resolveConfig({ repoPath: repo });
-      assert.equal(cfg.roadmap?.release_model, undefined);
+      assert.equal(cfg.roadmap?.release_model, "semver");
     } finally {
       process.env.PATH = oldPath;
     }
@@ -344,14 +344,26 @@ describe("buildCalVerMarker", () => {
     assert.equal(marker, "2026.06.0");
   });
 
-  it("marker increments MICRO to 1 when existing plan was generated in the same month", () => {
-    const existingPlan = JSON.stringify({ generated_at: "2026-06-10T08:00:00Z" });
+  it("marker increments MICRO to 1 when existing plan has continuous_version_marker 2026.06.0", () => {
+    const existingPlan = JSON.stringify({ continuous_version_marker: "2026.06.0" });
     const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
     assert.equal(marker, "2026.06.1");
   });
 
-  it("marker resets MICRO to 0 when existing plan was generated in a different month", () => {
-    const existingPlan = JSON.stringify({ generated_at: "2026-05-30T08:00:00Z" });
+  it("regression: marker increments MICRO to 2 when existing plan has continuous_version_marker 2026.06.1", () => {
+    const existingPlan = JSON.stringify({ continuous_version_marker: "2026.06.1" });
+    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
+    assert.equal(marker, "2026.06.2");
+  });
+
+  it("marker resets MICRO to 0 when existing plan has continuous_version_marker from a different month", () => {
+    const existingPlan = JSON.stringify({ continuous_version_marker: "2026.05.3" });
+    const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
+    assert.equal(marker, "2026.06.0");
+  });
+
+  it("marker starts at 0 when existing plan has no continuous_version_marker (e.g. semver plan)", () => {
+    const existingPlan = JSON.stringify({ generated_at: "2026-06-10T08:00:00Z" });
     const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
     assert.equal(marker, "2026.06.0");
   });

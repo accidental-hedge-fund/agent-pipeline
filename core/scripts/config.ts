@@ -349,7 +349,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     setup_command: fileConfig.setup_command,
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
-    roadmap: fileConfig.roadmap,
+    roadmap: fileConfig.roadmap
+      ? { ...fileConfig.roadmap, release_model: fileConfig.roadmap.release_model ?? "semver" }
+      : fileConfig.roadmap,
     sweep: fileConfig.sweep,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);

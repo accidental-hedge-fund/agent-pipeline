@@ -151,13 +151,12 @@ export function buildCalVerMarker(now: string, existingPlanContent: string | nul
   let micro = 0;
   if (existingPlanContent) {
     try {
-      const existing = JSON.parse(existingPlanContent) as { generated_at?: string };
-      if (existing.generated_at) {
-        const existingDate = new Date(existing.generated_at);
-        const eYear = existingDate.getUTCFullYear().toString();
-        const eMon = String(existingDate.getUTCMonth() + 1).padStart(2, "0");
-        if (eYear === yyyy && eMon === mm) {
-          micro = 1;
+      const existing = JSON.parse(existingPlanContent) as { continuous_version_marker?: string };
+      const prevMarker = existing.continuous_version_marker;
+      if (prevMarker) {
+        const match = /^(\d{4})\.(\d{2})\.(\d+)$/.exec(prevMarker);
+        if (match && match[1] === yyyy && match[2] === mm) {
+          micro = parseInt(match[3], 10) + 1;
         }
       }
     } catch {
