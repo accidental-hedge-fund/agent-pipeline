@@ -363,6 +363,72 @@ check("path --json exits 0 and emits valid JSON", () => {
 }
 
 // ---------------------------------------------------------------------------
+// 8. Valid JSON but an invalid package config (e.g. `type: 123`) parses fine yet
+//    Node rejects it with ERR_INVALID_PACKAGE_CONFIG when it loads the TypeScript
+//    entry. The launcher and host shim must classify this as corrupt up front and
+//    surface the coherent diagnostic. Regression for review-2 finding b13ab124.
+// ---------------------------------------------------------------------------
+{
+  const tmp = mkdtempSync(join(tmpdir(), "pipeline-launcher-invalidcfg-"));
+  try {
+    const { writeFileSync, readFileSync } = await import("node:fs");
+    mkdirSync(join(tmp, "scripts"), { recursive: true });
+    copyFileSync(LAUNCHER, join(tmp, "scripts", "pipeline-launcher.mjs"));
+    // host shim too, from the template (as build.mjs substitutes it)
+    const tmpl = readFileSync(join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
+    writeFileSync(join(tmp, "scripts", "pipeline.mjs"), tmpl.replaceAll("__PROFILE__", "claude"));
+    mkdirSync(join(tmp, "core", "scripts"), { recursive: true });
+    // Valid JSON, but `type: 123` is an invalid package config to Node.
+    writeFileSync(join(tmp, "core", "package.json"), JSON.stringify({ version: "0.0.0", type: 123 }));
+    writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "// stub\n");
+    writeFileSync(join(tmp, "core", "scripts", "path-cli.ts"), "console.log('{}');\n");
+    mkdirSync(join(tmp, "core", "node_modules"), { recursive: true });
+    const launcher = join(tmp, "scripts", "pipeline-launcher.mjs");
+    const shim = join(tmp, "scripts", "pipeline.mjs");
+
+    check("invalid package config (type:123): launcher `path --json` gives a coherent diagnostic", () => {
+      const r = spawnSync(NODE, [launcher, "path", "--json"], { stdio: "pipe" });
+      if (r.status === 0) throw new Error("expected non-zero exit for an invalid package config");
+      const out = r.stdout.toString() + r.stderr.toString();
+      if (out.includes("ERR_INVALID_PACKAGE_CONFIG")) {
+        throw new Error(`leaked a raw Node config error; got:\n${out.slice(0, 400)}`);
+      }
+      if (!out.includes("not valid JSON") && !out.includes("npm install")) {
+        throw new Error(`expected the corrupt-install diagnostic; got:\n${out.slice(0, 400)}`);
+      }
+    });
+
+    check("invalid package config (type:123): launcher `doctor --json` emits the stable envelope", () => {
+      const r = spawnSync(NODE, [launcher, "doctor", "--json"], { stdio: "pipe" });
+      if (r.status === 0) throw new Error("expected non-zero exit for an invalid package config");
+      let json;
+      try {
+        json = JSON.parse(r.stdout.toString());
+      } catch {
+        throw new Error(`doctor --json stdout is not valid JSON: ${r.stdout.toString().slice(0, 300)}`);
+      }
+      const vc = (json.checks ?? []).find((c) => c.name === "install:version-coherence");
+      if (!vc || vc.ok !== false) throw new Error(`expected failing install:version-coherence: ${JSON.stringify(json)}`);
+    });
+
+    check("invalid package config (type:123): host shim `doctor --json` emits the stable envelope", () => {
+      const r = spawnSync(NODE, [shim, "doctor", "--json"], { stdio: "pipe" });
+      if (r.status === 0) throw new Error("expected non-zero exit for an invalid package config");
+      let json;
+      try {
+        json = JSON.parse(r.stdout.toString());
+      } catch {
+        throw new Error(`shim doctor --json stdout is not valid JSON: ${r.stdout.toString().slice(0, 300)}`);
+      }
+      const vc = (json.checks ?? []).find((c) => c.name === "install:version-coherence");
+      if (!vc || vc.ok !== false) throw new Error(`expected failing install:version-coherence: ${JSON.stringify(json)}`);
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log(`\nlauncher smoke: ${passed} passed, ${failed} failed`);

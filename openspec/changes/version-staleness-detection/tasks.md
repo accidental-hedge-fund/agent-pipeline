@@ -26,9 +26,10 @@
 
 ## 5. Launcher corrupt-install fallback (review-2 hardening)
 
+- [x] 5.0 In both launchers, classify `core/package.json` as corrupt (`pkgReadable = false`) not only when read/parse throws, but also for valid JSON that Node rejects: a non-object, a non-string `version`, or a `type` other than absent/`"module"`/`"commonjs"` (e.g. `type: 123`) — these otherwise trip `ERR_INVALID_PACKAGE_CONFIG` after the guard
 - [x] 5.1 In `hosts/_shared/entry.template.mjs` and `scripts/pipeline-launcher.mjs`, factor the corrupt-install (`!pkgReadable`) doctor fallback into a `reportCorruptInstall(rawArgs, coreDir)` helper that honors `doctor --json` (stable JSON envelope), `doctor --is-ok` (zero output), and plain `doctor` (prose)
 - [x] 5.2 In `scripts/pipeline-launcher.mjs`, move the `!pkgReadable` guard ahead of BOTH the `path` discovery fast-path and the `core/node_modules` check (only `--version` keeps its own corrupt-install handling), so `path --json` and a deps-less corrupt install both report version-coherence instead of a raw `ERR_INVALID_PACKAGE_CONFIG` / generic deps error
-- [x] 5.3 Tests (`scripts/launcher-smoke.mjs`): malformed package.json with `doctor --json` (valid envelope), `doctor --is-ok` (silent, non-zero), `path --json` (coherent diagnostic, no raw Node error), malformed + no `node_modules` (version-coherence, not deps error), and the host shim's `--json`/`--is-ok` paths
+- [x] 5.3 Tests (`scripts/launcher-smoke.mjs`): malformed package.json with `doctor --json` (valid envelope), `doctor --is-ok` (silent, non-zero), `path --json` (coherent diagnostic, no raw Node error), malformed + no `node_modules` (version-coherence, not deps error), a valid-JSON-but-invalid config (`type: 123`) for both the launcher and host shim, and the host shim's `--json`/`--is-ok` paths
 - [x] 5.4 Prove the tests bite: each new smoke test fails without the launcher fix
 
 ## 6. Mirror regeneration and CI

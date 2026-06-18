@@ -85,8 +85,21 @@ const pkgPath = join(coreDir, "package.json");
 let pkgVersion = "";
 let pkgReadable = true;
 try {
-  const text = readFileSync(pkgPath, "utf8");
-  pkgVersion = (JSON.parse(text)).version ?? "";
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  // Accept only a shape Node itself will accept when it loads the TypeScript
+  // entry. A file that is valid JSON but an invalid package config — a non-object
+  // (e.g. `[]`), a non-string `version`, or a `type` that is neither "module" nor
+  // "commonjs" (e.g. `type: 123`) — does NOT throw here, yet trips
+  // ERR_INVALID_PACKAGE_CONFIG when Node loads pipeline.ts/path-cli.ts, leaking a
+  // raw stack before the guard below can report a coherent diagnostic. Treat any
+  // such config as corrupt.
+  const isObject = pkg !== null && typeof pkg === "object" && !Array.isArray(pkg);
+  const validType = isObject && (pkg.type === undefined || pkg.type === "module" || pkg.type === "commonjs");
+  if (isObject && typeof pkg.version === "string" && validType) {
+    pkgVersion = pkg.version;
+  } else {
+    pkgReadable = false;
+  }
 } catch {
   pkgReadable = false;
 }
