@@ -23,6 +23,34 @@ The `pipeline doctor` command SHALL include an `install:version-coherence` prefl
 - **THEN** the `install:version-coherence` check SHALL have status `"fail"`
 - **AND** the remediation text SHALL instruct the user to reinstall the pipeline skill
 
+### Requirement: The launcher SHALL surface the install:version-coherence failure for a corrupt install, honoring doctor's machine-output contracts
+
+When `core/package.json` at the install root is missing or malformed, Node throws `ERR_INVALID_PACKAGE_CONFIG` while loading the TypeScript entry — before `pipeline doctor` or any in-process check can run. The pipeline launcher (`scripts/pipeline-launcher.mjs`) and the generated host shim (from `hosts/_shared/entry.template.mjs`) SHALL detect this corrupt-install case up front and emit the `install:version-coherence` failure with reinstall remediation themselves, exiting non-zero. This guard SHALL run before the `core/node_modules` dependency check so that a corrupt install that also lacks dependencies still reports the version-coherence failure rather than a generic runtime-dependencies error. For the `doctor` command the launcher SHALL honor doctor's machine-output contracts: `--json` emits the stable JSON envelope, `--is-ok` emits zero output, and plain `doctor` emits human-readable prose.
+
+#### Scenario: Malformed core/package.json — plain `doctor` prose surfaces the failure
+
+- **WHEN** the launcher runs `doctor` and `core/package.json` at the install root is malformed
+- **THEN** it SHALL exit non-zero
+- **AND** stdout SHALL contain a human-readable report naming `install:version-coherence` and a reinstall remediation
+
+#### Scenario: Malformed core/package.json — `doctor --json` emits the stable envelope
+
+- **WHEN** the launcher runs `doctor --json` and `core/package.json` at the install root is malformed
+- **THEN** stdout SHALL be a single parseable JSON envelope with `schema_version` `"1"` and `status` `"error"`
+- **AND** the envelope SHALL include an `install:version-coherence` check whose `ok` is `false` and whose `fix` is a non-empty reinstall remediation
+
+#### Scenario: Malformed core/package.json — `doctor --is-ok` is a silent exit-code gate
+
+- **WHEN** the launcher runs `doctor --is-ok` and `core/package.json` at the install root is malformed
+- **THEN** it SHALL write zero bytes to stdout and stderr
+- **AND** it SHALL exit non-zero
+
+#### Scenario: Corrupt install also missing node_modules — version-coherence still reported
+
+- **WHEN** the launcher runs `doctor`, `core/package.json` at the install root is malformed, and `core/node_modules` is absent
+- **THEN** it SHALL report the `install:version-coherence` failure
+- **AND** it SHALL NOT report a generic runtime-dependencies error
+
 ### Requirement: The install:version-coherence check SHALL be unit-testable via injectable deps
 
 The check implementation SHALL derive the install root path from a parameter (not from a module-level `import.meta.url` call inlined into the check body), and SHALL read `core/package.json` via the `DoctorDeps.readTextFile` primitive. This allows unit tests to supply a fake install root and a fake file reader without touching the real filesystem.

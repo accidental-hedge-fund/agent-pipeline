@@ -28,6 +28,45 @@ const here = dirname(fileURLToPath(import.meta.url)); // <skill>/scripts
 const coreDir = resolve(here, "..", "core"); // <skill>/core
 const entry = join(coreDir, "scripts", "pipeline.ts");
 
+// Report a corrupt install (core/package.json missing or malformed) for the
+// pre-dispatch guard below. `doctor` has machine-output contracts that automated
+// consumers depend on, so honor them even on this error path — otherwise a
+// `doctor --json` / `doctor --is-ok` poller gets prose where it asked for a JSON
+// envelope / a silent 0-1 gate:
+//   • `doctor --is-ok` → zero output (the exit code carries the verdict)
+//   • `doctor --json`  → the stable doctor JSON envelope (schema_version "1")
+//   • `doctor`         → human-readable prose
+//   • any other command → a stderr reinstall hint
+// Mirrors formatDoctorJson() and the prose formatter in core/scripts/stages/doctor.ts.
+function reportCorruptInstall(rawArgs, coreDir) {
+  if (rawArgs[0] !== "doctor") {
+    process.stderr.write(
+      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
+      "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
+    );
+    return;
+  }
+  if (rawArgs.includes("--is-ok")) return; // silent 0/1 gate: exit code only
+  const reason = `core/package.json at ${coreDir} is missing or not valid JSON`;
+  const fix = `Reinstall the pipeline skill to restore a valid core/package.json at ${coreDir}.`;
+  if (rawArgs.includes("--json")) {
+    process.stdout.write(
+      JSON.stringify({
+        schema_version: "1",
+        status: "error",
+        checks: [{ name: "install:version-coherence", ok: false, reason, fix }],
+      }) + "\n",
+    );
+    return;
+  }
+  process.stdout.write(
+    `Pipeline doctor — 1 check (0 passed, 1 failed, 0 skipped)\n\n` +
+    `  ✗ install:version-coherence — ${reason}\n` +
+    `      → ${fix}\n\n` +
+    `Result: FAIL\n`,
+  );
+}
+
 if (!existsSync(entry)) {
   console.error(`pipeline: core not found at ${entry}. Re-run the installer.`);
   process.exit(1);
@@ -67,19 +106,7 @@ if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
 // when Node tries to load the TypeScript entry (before any pipeline code runs).
 // Surface a coherent failure here rather than a raw Node startup error.
 if (!pkgReadable) {
-  if (rawArgs[0] === "doctor") {
-    process.stdout.write(
-      `Pipeline doctor — 1 check (0 passed, 1 failed, 0 skipped)\n\n` +
-      `  ✗ install:version-coherence — core/package.json at ${coreDir} is missing or not valid JSON\n` +
-      `      → Reinstall the pipeline skill to restore a valid core/package.json at ${coreDir}.\n\n` +
-      `Result: FAIL\n`,
-    );
-  } else {
-    process.stderr.write(
-      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
-      "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
-    );
-  }
+  reportCorruptInstall(rawArgs, coreDir);
   process.exit(1);
 }
 

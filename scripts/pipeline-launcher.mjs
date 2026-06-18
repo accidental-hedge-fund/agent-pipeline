@@ -36,6 +36,45 @@ const entry = join(coreDir, "scripts", "pipeline.ts");
 
 const rawArgs = process.argv.slice(2);
 
+// Report a corrupt install (core/package.json missing or malformed) for the
+// pre-dispatch guard below. `doctor` has machine-output contracts that automated
+// consumers depend on, so honor them even on this error path — otherwise a
+// `doctor --json` / `doctor --is-ok` poller gets prose where it asked for a JSON
+// envelope / a silent 0-1 gate:
+//   • `doctor --is-ok` → zero output (the exit code carries the verdict)
+//   • `doctor --json`  → the stable doctor JSON envelope (schema_version "1")
+//   • `doctor`         → human-readable prose
+//   • any other command → a stderr reinstall hint
+// Mirrors formatDoctorJson() and the prose formatter in core/scripts/stages/doctor.ts.
+function reportCorruptInstall(rawArgs, coreDir) {
+  if (rawArgs[0] !== "doctor") {
+    process.stderr.write(
+      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
+      "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
+    );
+    return;
+  }
+  if (rawArgs.includes("--is-ok")) return; // silent 0/1 gate: exit code only
+  const reason = `core/package.json at ${coreDir} is missing or not valid JSON`;
+  const fix = `Reinstall the pipeline skill to restore a valid core/package.json at ${coreDir}.`;
+  if (rawArgs.includes("--json")) {
+    process.stdout.write(
+      JSON.stringify({
+        schema_version: "1",
+        status: "error",
+        checks: [{ name: "install:version-coherence", ok: false, reason, fix }],
+      }) + "\n",
+    );
+    return;
+  }
+  process.stdout.write(
+    `Pipeline doctor — 1 check (0 passed, 1 failed, 0 skipped)\n\n` +
+    `  ✗ install:version-coherence — ${reason}\n` +
+    `      → ${fix}\n\n` +
+    `Result: FAIL\n`,
+  );
+}
+
 // Read core/package.json once upfront.  Two reasons:
 //   (a) --version short-circuit needs it before dependency provisioning.
 //   (b) Node reads core/package.json to determine module type (ESM vs CJS)
@@ -97,6 +136,17 @@ if (!existsSync(entry)) {
   process.exit(1);
 }
 
+// Corrupt install: malformed/missing core/package.json makes Node throw
+// ERR_INVALID_PACKAGE_CONFIG when it loads the TypeScript entry, before any
+// pipeline code runs. Surface a coherent failure here — and crucially ahead of
+// the node_modules check below, so a corrupt install that ALSO lacks
+// node_modules still reports the version-coherence failure (with its reinstall
+// remediation) instead of a generic runtime-dependencies error.
+if (!pkgReadable) {
+  reportCorruptInstall(rawArgs, coreDir);
+  process.exit(1);
+}
+
 // Dependencies are provisioned by the package's best-effort postinstall script
 // at install time. They may be absent (or incomplete) if that provisioning could
 // not complete (transient registry/cache failure, offline, or a read-only global
@@ -111,26 +161,6 @@ if (!existsSync(join(coreDir, "node_modules"))) {
       "         the package so the postinstall script can provision them:\n" +
       "           npm install -g agent-pipeline",
   );
-  process.exit(1);
-}
-
-// Guard: malformed or missing core/package.json causes ERR_INVALID_PACKAGE_CONFIG
-// when Node tries to load the TypeScript entry (before any pipeline code runs).
-// Surface a coherent failure here rather than a raw Node startup error.
-if (!pkgReadable) {
-  if (rawArgs[0] === "doctor") {
-    process.stdout.write(
-      `Pipeline doctor — 1 check (0 passed, 1 failed, 0 skipped)\n\n` +
-      `  ✗ install:version-coherence — core/package.json at ${coreDir} is missing or not valid JSON\n` +
-      `      → Reinstall the pipeline skill to restore a valid core/package.json at ${coreDir}.\n\n` +
-      `Result: FAIL\n`,
-    );
-  } else {
-    process.stderr.write(
-      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
-      "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
-    );
-  }
   process.exit(1);
 }
 
