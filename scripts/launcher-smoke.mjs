@@ -380,8 +380,12 @@ check("path --json exits 0 and emits valid JSON", () => {
     mkdirSync(join(tmp, "core", "scripts"), { recursive: true });
     // Valid JSON, but `type: 123` is an invalid package config to Node.
     writeFileSync(join(tmp, "core", "package.json"), JSON.stringify({ version: "0.0.0", type: 123 }));
-    writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "// stub\n");
-    writeFileSync(join(tmp, "core", "scripts", "path-cli.ts"), "console.log('{}');\n");
+    // The .ts stubs use an ESM `import` so that, if a launcher wrongly lets a
+    // CommonJS-typed config through, Node fails to load them with "Cannot use
+    // import statement outside a module" — the failure mode the type:"commonjs"
+    // checks below guard against.
+    writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "import 'node:path';\n");
+    writeFileSync(join(tmp, "core", "scripts", "path-cli.ts"), "import 'node:path';\nconsole.log('{}');\n");
     mkdirSync(join(tmp, "core", "node_modules"), { recursive: true });
     const launcher = join(tmp, "scripts", "pipeline-launcher.mjs");
     const shim = join(tmp, "scripts", "pipeline.mjs");
@@ -414,6 +418,36 @@ check("path --json exits 0 and emits valid JSON", () => {
     check("invalid package config (type:123): host shim `doctor --json` emits the stable envelope", () => {
       const r = spawnSync(NODE, [shim, "doctor", "--json"], { stdio: "pipe" });
       if (r.status === 0) throw new Error("expected non-zero exit for an invalid package config");
+      let json;
+      try {
+        json = JSON.parse(r.stdout.toString());
+      } catch {
+        throw new Error(`shim doctor --json stdout is not valid JSON: ${r.stdout.toString().slice(0, 300)}`);
+      }
+      const vc = (json.checks ?? []).find((c) => c.name === "install:version-coherence");
+      if (!vc || vc.ok !== false) throw new Error(`expected failing install:version-coherence: ${JSON.stringify(json)}`);
+    });
+
+    // `type: "commonjs"` is a Node-valid type, but this package is ESM-only, so the
+    // .ts entries cannot load as CommonJS. Both launchers must classify it as
+    // corrupt rather than spawn an entry that crashes. Regression for finding 9acbd51f.
+    writeFileSync(join(tmp, "core", "package.json"), JSON.stringify({ version: "0.0.0", type: "commonjs" }));
+
+    check("incompatible package config (type:commonjs): launcher `path --json` gives a coherent diagnostic", () => {
+      const r = spawnSync(NODE, [launcher, "path", "--json"], { stdio: "pipe" });
+      if (r.status === 0) throw new Error("expected non-zero exit for an ESM-incompatible package config");
+      const out = r.stdout.toString() + r.stderr.toString();
+      if (out.includes("import statement outside a module") || out.includes("SyntaxError")) {
+        throw new Error(`leaked a raw Node module error; got:\n${out.slice(0, 400)}`);
+      }
+      if (!out.includes("not valid JSON") && !out.includes("npm install")) {
+        throw new Error(`expected the corrupt-install diagnostic; got:\n${out.slice(0, 400)}`);
+      }
+    });
+
+    check("incompatible package config (type:commonjs): host shim `doctor --json` emits the stable envelope", () => {
+      const r = spawnSync(NODE, [shim, "doctor", "--json"], { stdio: "pipe" });
+      if (r.status === 0) throw new Error("expected non-zero exit for an ESM-incompatible package config");
       let json;
       try {
         json = JSON.parse(r.stdout.toString());

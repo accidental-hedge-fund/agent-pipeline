@@ -86,15 +86,16 @@ let pkgVersion = "";
 let pkgReadable = true;
 try {
   const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-  // Accept only a shape Node itself will accept when it loads the TypeScript
-  // entry. A file that is valid JSON but an invalid package config — a non-object
-  // (e.g. `[]`), a non-string `version`, or a `type` that is neither "module" nor
-  // "commonjs" (e.g. `type: 123`) — does NOT throw here, yet trips
-  // ERR_INVALID_PACKAGE_CONFIG when Node loads pipeline.ts/path-cli.ts, leaking a
+  // Accept only a shape that lets Node load this ESM-only package's TypeScript
+  // entries. A file that is valid JSON but an invalid/incompatible package config
+  // — a non-object (e.g. `[]`), a non-string `version`, or an explicit `type`
+  // other than "module" (`type: 123` → ERR_INVALID_PACKAGE_CONFIG; `type:
+  // "commonjs"` → the ESM `import` entries fail to load as CommonJS) — does NOT
+  // throw here, yet crashes Node when it loads pipeline.ts/path-cli.ts, leaking a
   // raw stack before the guard below can report a coherent diagnostic. Treat any
-  // such config as corrupt.
+  // such config as corrupt. `type` absent is fine (the .ts entries load as ESM).
   const isObject = pkg !== null && typeof pkg === "object" && !Array.isArray(pkg);
-  const validType = isObject && (pkg.type === undefined || pkg.type === "module" || pkg.type === "commonjs");
+  const validType = isObject && (pkg.type === undefined || pkg.type === "module");
   if (isObject && typeof pkg.version === "string" && validType) {
     pkgVersion = pkg.version;
   } else {
