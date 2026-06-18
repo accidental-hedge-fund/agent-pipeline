@@ -17,6 +17,23 @@ The pipeline CLI SHALL accept `merge` as a positional sub-command keyword that t
 
 ---
 
+### Requirement: The `merge` sub-command SHALL reject every global flag outside its allowlist
+The `merge` handler resolves configuration from only `--repo-path`, `--base`, and `--profile`. The CLI SHALL therefore enforce these three as an explicit allowlist: any other CLI option that is explicitly provided on a `pipeline merge` invocation SHALL be rejected with exit code 2 and an error naming the offending flag(s), evaluated BEFORE the irreversible squash merge — and before any other mode-specific flag validation — is reached. The check SHALL be allowlist-based (reject everything not allowed) rather than denylist-based, so that a newly added global option cannot silently leak into the merge path.
+
+#### Scenario: An unsupported global flag is rejected
+- **WHEN** the user runs `pipeline merge 42` with any explicitly-provided option other than `--repo-path`, `--base`, or `--profile` (for example `--detach`, `--json`, `--is-ok`, `--timeout 60`, `--no-edit`, or `--domain d`)
+- **THEN** the command SHALL exit with code 2 and an error naming the offending flag and stating that `pipeline merge` does not support it, and SHALL NOT inspect, gate, or merge the PR
+
+#### Scenario: Allowlisted flags are accepted
+- **WHEN** the user runs `pipeline merge 42 --base main`, `pipeline merge 42 --profile claude`, or `pipeline merge 42 --repo-path <path>`
+- **THEN** the allowlist guard SHALL NOT reject the invocation and the command SHALL proceed to PR-number validation and the merge gates
+
+#### Scenario: New global options cannot leak by default
+- **WHEN** a new global CLI option is added to the pipeline and is not added to the merge allowlist
+- **THEN** providing that option to `pipeline merge` SHALL be rejected with exit code 2 without any code change to the merge guard
+
+---
+
 ### Requirement: The `merge` sub-command SHALL verify PR mergeability before merging
 The merge handler SHALL call `gh pr view <pr> --json mergeable,mergeStateStatus` and inspect the result before proceeding. It SHALL refuse to merge and exit non-zero with an actionable message if the PR is not `MERGEABLE` or its `mergeStateStatus` is not `CLEAN`.
 

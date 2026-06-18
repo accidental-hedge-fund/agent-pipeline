@@ -32,7 +32,13 @@
 - [x] 4.8 Write a test for no linked issue: `getPrLinkedIssue` returns null → non-zero exit, no merge call.
 - [x] 4.9 Write the loop-isolation assertion test: import all stage handlers and the advance loop entry point; assert that none of their module dependency graphs reference any export from `merge.ts`.
 
-## 5. Mirror regeneration and CI
+## 5. Unsupported-flag allowlist (review finding 2)
 
-- [x] 5.1 Run `node scripts/build.mjs` from the repo root to regenerate `plugin/`; commit the updated mirror alongside the new `core/` files.
-- [x] 5.2 Run `npm run ci` from the repo root; fix any failures before marking the change done.
+- [x] 5.1 Replace the ad-hoc flag denylist with an explicit allowlist (`repoPath`/`base`/`profile`) using commander's `getOptionValueSource(...) === "cli"`, so every other explicitly-provided global option is rejected before dispatch.
+- [x] 5.2 Run the allowlist guard before all other mode-specific flag validation (e.g. the `--json`/`--is-ok` checks) so `pipeline merge` reports a single consistent "does not support" error for every unsupported flag.
+- [x] 5.3 Add an exhaustive parametrized regression test over every non-allowlisted flag (asserting exit 2 + "does not support"), plus positive tests that `--base`/`--profile`/`--repo-path` pass the guard.
+
+## 6. Mirror regeneration and CI
+
+- [x] 6.1 Run `node scripts/build.mjs` from the repo root to regenerate `plugin/`; commit the updated mirror alongside the new `core/` files.
+- [x] 6.2 Run `npm run ci` from the repo root; fix any failures before marking the change done.

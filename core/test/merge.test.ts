@@ -480,77 +480,105 @@ test("merge: ghPrMerge error propagates — merge failure is not swallowed", asy
 
 // ---------------------------------------------------------------------------
 // 4.14 CLI flag rejections for merge (finding 2)
+//
+// `pipeline merge` is governed by an ALLOWLIST, not a denylist: it resolves
+// config with only --repo-path / --base / --profile, so EVERY other explicitly
+// provided global option must be rejected with exit 2 and a "does not support"
+// message — before the irreversible squash merge is reached. The old denylist
+// silently leaked newly-added global flags (--detach, --json, --timeout, …);
+// these parametrized cases assert the allowlist closes that gap exhaustively.
 // ---------------------------------------------------------------------------
 
-test("CLI: 'pipeline merge 42 --status' exits non-zero with incompatibility message", () => {
-  const result = spawnSync(
+function runMerge(flagArgs: string[]) {
+  return spawnSync(
     process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--status"],
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", ...flagArgs],
     { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
   );
-  assert.notEqual(result.status, 0, "should exit non-zero");
-  const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(
-    combined.includes("cannot be combined"),
-    `expected incompatibility message, got: ${combined}`,
-  );
-});
+}
 
-test("CLI: 'pipeline merge 42 --dry-run' exits non-zero with incompatibility message", () => {
-  const result = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--dry-run"],
-    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
-  );
-  assert.notEqual(result.status, 0, "should exit non-zero");
-  const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(
-    combined.includes("cannot be combined"),
-    `expected incompatibility message, got: ${combined}`,
-  );
-});
+// Every global option NOT on the merge allowlist (--repo-path/--base/--profile).
+// Boolean flags carry no value; value flags carry a throwaway argument. Each
+// entry's first element is the flag name asserted to appear in the error.
+const REJECTED_MERGE_FLAGS: string[][] = [
+  // boolean mode/global flags
+  ["--cleanup"],
+  ["--init"],
+  ["--doctor"],
+  ["--fail-fast"],
+  ["--is-ok"],
+  ["--status"],
+  ["--json"],
+  ["--summary"],
+  ["--once"],
+  ["--dry-run"],
+  ["--json-events"],
+  ["--follow"],
+  ["--detach"],
+  ["--no-edit"],
+  ["--apply"],
+  // value-carrying flags
+  ["--unblock", "answer"],
+  ["--override", "k: r"],
+  ["--domain", "d"],
+  ["--model", "sonnet"],
+  ["--timeout", "60"],
+  ["--flock-timeout", "1000"],
+  ["--run-id", "rid"],
+  ["--description", "x"],
+  ["--release", "1.7.0"],
+  ["--next", "3"],
+  ["--repo", "o/r"],
+];
 
-test("CLI: 'pipeline merge 42 --cleanup' exits non-zero with incompatibility message", () => {
-  const result = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--cleanup"],
-    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
-  );
-  assert.notEqual(result.status, 0, "should exit non-zero");
-  const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(
-    combined.includes("cannot be combined"),
-    `expected incompatibility message, got: ${combined}`,
-  );
-});
+for (const flagArgs of REJECTED_MERGE_FLAGS) {
+  const flag = flagArgs[0];
+  test(`CLI: 'pipeline merge 42 ${flag}' is rejected with exit 2 + "does not support"`, () => {
+    const result = runMerge(flagArgs);
+    assert.equal(result.status, 2, `${flag} should exit 2, got ${result.status}`);
+    const combined = (result.stdout ?? "") + (result.stderr ?? "");
+    assert.ok(
+      combined.includes("does not support"),
+      `expected "does not support" message for ${flag}, got: ${combined}`,
+    );
+    assert.ok(
+      combined.includes(flag),
+      `expected the offending flag ${flag} to be named, got: ${combined}`,
+    );
+  });
+}
 
-test("CLI: 'pipeline merge 42 --init' exits non-zero with incompatibility message", () => {
-  const result = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--init"],
-    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
-  );
-  assert.notEqual(result.status, 0, "should exit non-zero");
-  const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(
-    combined.includes("cannot be combined"),
-    `expected incompatibility message, got: ${combined}`,
-  );
-});
+// Positive cases: the three allowlisted flags must NOT be rejected. We pair each
+// with an invalid PR number so the run stops at the deterministic PR-number
+// validation (exit 2, "not a valid PR number") — proving the flag passed the
+// allowlist guard WITHOUT reaching any real `gh`/merge call.
+const ALLOWED_MERGE_FLAGS: string[][] = [
+  ["--base", "main"],
+  ["--profile", "claude"],
+  ["--repo-path", "."],
+];
 
-test("CLI: 'pipeline merge 42 --doctor' exits non-zero with incompatibility message", () => {
-  const result = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--doctor"],
-    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
-  );
-  assert.notEqual(result.status, 0, "should exit non-zero");
-  const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(
-    combined.includes("cannot be combined"),
-    `expected incompatibility message, got: ${combined}`,
-  );
-});
+for (const flagArgs of ALLOWED_MERGE_FLAGS) {
+  const flag = flagArgs[0];
+  test(`CLI: 'pipeline merge ${flag}' is NOT rejected by the allowlist guard`, () => {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "abc", ...flagArgs],
+      { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+    );
+    const combined = (result.stdout ?? "") + (result.stderr ?? "");
+    assert.ok(
+      !combined.includes("does not support"),
+      `allowlisted flag ${flag} must not trip the guard, got: ${combined}`,
+    );
+    // Stops at PR-number validation, never at a real gh/merge call.
+    assert.equal(result.status, 2, `expected exit 2 from PR validation, got ${result.status}`);
+    assert.ok(
+      combined.includes("not a valid PR number"),
+      `expected to reach PR-number validation past the guard, got: ${combined}`,
+    );
+  });
+}
 
 // ---------------------------------------------------------------------------
 // 4.16 Loop-isolation guarantee

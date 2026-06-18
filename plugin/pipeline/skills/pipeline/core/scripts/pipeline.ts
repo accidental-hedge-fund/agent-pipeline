@@ -244,6 +244,34 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Reject every flag the merge sub-command does not intentionally support, before ANY other
+  // flag validation or dispatch, so an irreversible squash merge is never reachable from an
+  // ambiguous or unintended invocation, AND so `pipeline merge` reports a single consistent
+  // error for every unsupported flag (rather than a grab-bag of mode-specific messages like
+  // the --json/--is-ok checks below). This is an ALLOWLIST, not a denylist: `pipeline merge`
+  // resolves config with only --repo-path / --base / --profile, so ANY other explicitly
+  // provided option (run, log, doctor, release, or machine-output modes such as --detach /
+  // --json / --is-ok / --no-edit / --domain) is rejected. A denylist would silently let any
+  // newly-added global flag through to the merge path — the exact gap that kept recurring
+  // (#217). Using commander's option-value source makes the guard exhaustive by construction:
+  // a new global option is rejected unless it is deliberately added to the allowlist.
+  if (isMergeCommand) {
+    const MERGE_ALLOWED_OPTS = new Set(["repoPath", "base", "profile"]);
+    const offending = cmd.options
+      .map((o) => o.attributeName())
+      .filter((key) => !MERGE_ALLOWED_OPTS.has(key) && cmd.getOptionValueSource(key) === "cli");
+    if (offending.length > 0) {
+      const flags = offending
+        .map((key) => cmd.options.find((o) => o.attributeName() === key)?.long ?? `--${key}`)
+        .join(", ");
+      console.error(
+        `pipeline: 'pipeline merge' does not support ${flags}. ` +
+          `'pipeline merge <pr>' is a human-invoked squash merge; only --repo-path, --base, and --profile apply.`,
+      );
+      process.exit(2);
+    }
+  }
+
   // Validate machine-mode flags immediately after parsing — before config
   // resolution or any dispatch — so a typo/construction bug can't silently
   // fall through to the mutating advance path.
@@ -498,39 +526,6 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     return;
-  }
-
-  // Reject ALL flags that are incompatible with the merge sub-command before
-  // dispatch. Every global mode flag that is not intentionally supported by
-  // `pipeline merge` must be rejected here so that irreversible squash-merge
-  // execution is never reachable from an ambiguous or unintended invocation.
-  if (isMergeCommand) {
-    const mergeConflicts: Array<[string, boolean | string | number | undefined]> = [
-      ["--status", opts.status],
-      ["--dry-run", opts.dryRun],
-      ["--once", opts.once],
-      ["--unblock", opts.unblock !== undefined],
-      ["--override", opts.override !== undefined],
-      ["--summary", opts.summary],
-      ["--cleanup", opts.cleanup],
-      ["--init (or 'pipeline init')", opts.init || numArg === "init"],
-      ["--doctor", opts.doctor],
-      ["--fail-fast", opts.failFast],
-      ["--apply", opts.apply],
-      ["--next", opts.next !== undefined],
-      ["--repo", opts.repo !== undefined],
-      ["--release", opts.release !== undefined],
-      ["--description", opts.description !== undefined],
-    ];
-    for (const [flag, active] of mergeConflicts) {
-      if (active) {
-        console.error(
-          `pipeline: 'pipeline merge' cannot be combined with ${flag}. ` +
-            `'pipeline merge <pr>' is a human-invoked squash merge; ${flag} has no meaning here.`,
-        );
-        process.exit(2);
-      }
-    }
   }
 
   // Early merge dispatch — human-invoked squash merge of a ready-to-deploy PR (#217).
