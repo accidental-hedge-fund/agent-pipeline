@@ -104,6 +104,19 @@ if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
   process.exit(0);
 }
 
+// Corrupt install: a missing/malformed core/package.json makes Node throw
+// ERR_INVALID_PACKAGE_CONFIG when it loads ANY TypeScript entry (path-cli.ts or
+// pipeline.ts), before that code can run. Surface a coherent diagnostic here —
+// ahead of the `path` fast-path, the entry check, AND the node_modules check —
+// so every command (including the desktop `path --json` discovery contract, and a
+// corrupt install that also lacks node_modules) reports the version-coherence
+// failure instead of a raw Node stack trace. `--version` is handled above with
+// its own pkgReadable branch and never reaches here.
+if (!pkgReadable) {
+  reportCorruptInstall(rawArgs, coreDir);
+  process.exit(1);
+}
+
 // `pipeline path` discovery only needs Node built-ins (discovery.ts has no
 // third-party imports), so it is routed through the dependency-free entry
 // UNCONDITIONALLY — before the node_modules check. This keeps the desktop
@@ -133,17 +146,6 @@ if (!existsSync(entry)) {
     `pipeline: core not found at ${entry}.\n` +
       "         Re-install with: npm install -g agent-pipeline",
   );
-  process.exit(1);
-}
-
-// Corrupt install: malformed/missing core/package.json makes Node throw
-// ERR_INVALID_PACKAGE_CONFIG when it loads the TypeScript entry, before any
-// pipeline code runs. Surface a coherent failure here — and crucially ahead of
-// the node_modules check below, so a corrupt install that ALSO lacks
-// node_modules still reports the version-coherence failure (with its reinstall
-// remediation) instead of a generic runtime-dependencies error.
-if (!pkgReadable) {
-  reportCorruptInstall(rawArgs, coreDir);
   process.exit(1);
 }
 

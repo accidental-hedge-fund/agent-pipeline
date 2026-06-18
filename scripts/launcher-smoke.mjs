@@ -193,6 +193,9 @@ check("path --json exits 0 and emits valid JSON", () => {
     // Deliberately write malformed JSON to core/package.json.
     writeFileSync(join(tmp, "core", "package.json"), "{ this is not valid json }");
     writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "// stub\n");
+    // A real-looking path-cli.ts so the `path` fast-path would reach its spawn
+    // (and trip ERR_INVALID_PACKAGE_CONFIG) unless the corrupt-install guard runs first.
+    writeFileSync(join(tmp, "core", "scripts", "path-cli.ts"), "console.log('{}');\n");
     mkdirSync(join(tmp, "core", "node_modules"), { recursive: true });
 
     check("malformed core/package.json: `doctor` exits non-zero with install:version-coherence failure", () => {
@@ -221,6 +224,25 @@ check("path --json exits 0 and emits valid JSON", () => {
       const err = r.stderr.toString();
       if (!err.includes("not valid JSON") && !err.includes("npm install")) {
         throw new Error(`expected reinstall hint in stderr; got:\n${err.slice(0, 400)}`);
+      }
+    });
+
+    // The `path` fast-path spawns core/scripts/path-cli.ts, which Node refuses to
+    // load under a malformed core/package.json (ERR_INVALID_PACKAGE_CONFIG). The
+    // corrupt-install guard must run BEFORE the `path` fast-path so desktop
+    // discovery gets a coherent diagnostic, not a raw Node stack. Regression for
+    // review-2 finding 2fa82126.
+    check("malformed core/package.json: `path --json` gives a coherent diagnostic, not a raw Node error", () => {
+      const r = spawnSync(NODE, [join(tmp, "scripts", "pipeline-launcher.mjs"), "path", "--json"], {
+        stdio: "pipe",
+      });
+      if (r.status === 0) throw new Error("expected non-zero exit when core/package.json is malformed");
+      const out = r.stdout.toString() + r.stderr.toString();
+      if (out.includes("ERR_INVALID_PACKAGE_CONFIG")) {
+        throw new Error(`path fast-path leaked a raw Node config error; got:\n${out.slice(0, 400)}`);
+      }
+      if (!out.includes("not valid JSON") && !out.includes("npm install")) {
+        throw new Error(`expected the corrupt-install diagnostic; got:\n${out.slice(0, 400)}`);
       }
     });
 

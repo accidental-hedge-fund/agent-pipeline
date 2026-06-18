@@ -25,7 +25,7 @@ The `pipeline doctor` command SHALL include an `install:version-coherence` prefl
 
 ### Requirement: The launcher SHALL surface the install:version-coherence failure for a corrupt install, honoring doctor's machine-output contracts
 
-When `core/package.json` at the install root is missing or malformed, Node throws `ERR_INVALID_PACKAGE_CONFIG` while loading the TypeScript entry — before `pipeline doctor` or any in-process check can run. The pipeline launcher (`scripts/pipeline-launcher.mjs`) and the generated host shim (from `hosts/_shared/entry.template.mjs`) SHALL detect this corrupt-install case up front and emit the `install:version-coherence` failure with reinstall remediation themselves, exiting non-zero. This guard SHALL run before the `core/node_modules` dependency check so that a corrupt install that also lacks dependencies still reports the version-coherence failure rather than a generic runtime-dependencies error. For the `doctor` command the launcher SHALL honor doctor's machine-output contracts: `--json` emits the stable JSON envelope, `--is-ok` emits zero output, and plain `doctor` emits human-readable prose.
+When `core/package.json` at the install root is missing or malformed, Node throws `ERR_INVALID_PACKAGE_CONFIG` while loading **any** TypeScript entry (`pipeline.ts` or the dependency-free `path-cli.ts`) — before that code can run. The pipeline launcher (`scripts/pipeline-launcher.mjs`) and the generated host shim (from `hosts/_shared/entry.template.mjs`) SHALL detect this corrupt-install case up front and emit the `install:version-coherence` failure with reinstall remediation themselves, exiting non-zero. This guard SHALL run before any path that spawns a TypeScript entry — specifically ahead of the `path` discovery fast-path and ahead of the `core/node_modules` dependency check — so that every command (including `path --json` and a corrupt install that also lacks dependencies) reports a coherent diagnostic rather than a raw Node stack trace or a generic runtime-dependencies error. The only command exempt from this guard is `--version`, which has its own corrupt-install handling. For the `doctor` command the launcher SHALL honor doctor's machine-output contracts: `--json` emits the stable JSON envelope, `--is-ok` emits zero output, and plain `doctor` emits human-readable prose.
 
 #### Scenario: Malformed core/package.json — plain `doctor` prose surfaces the failure
 
@@ -50,6 +50,12 @@ When `core/package.json` at the install root is missing or malformed, Node throw
 - **WHEN** the launcher runs `doctor`, `core/package.json` at the install root is malformed, and `core/node_modules` is absent
 - **THEN** it SHALL report the `install:version-coherence` failure
 - **AND** it SHALL NOT report a generic runtime-dependencies error
+
+#### Scenario: Malformed core/package.json — `path` fast-path yields a coherent diagnostic
+
+- **WHEN** the launcher runs `path --json` and `core/package.json` at the install root is malformed
+- **THEN** it SHALL exit non-zero with the corrupt-install reinstall diagnostic
+- **AND** it SHALL NOT leak a raw `ERR_INVALID_PACKAGE_CONFIG` Node error from spawning `path-cli.ts`
 
 ### Requirement: The install:version-coherence check SHALL be unit-testable via injectable deps
 
