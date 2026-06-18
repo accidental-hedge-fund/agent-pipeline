@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { mergePr, type MergeDeps } from "../scripts/stages/merge.ts";
+import { mergePr, type MergeDeps, type RequiredCheck } from "../scripts/stages/merge.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STAGES_DIR = path.join(__dirname, "..", "scripts", "stages");
@@ -21,28 +21,23 @@ const PIPELINE_SCRIPT = path.join(__dirname, "..", "scripts", "pipeline.ts");
 // Fixture helpers
 // ---------------------------------------------------------------------------
 
-type StatusCheck = {
-  name: string;
-  status: string;
-  conclusion: string | null;
-};
-
 function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
-  mergeCalls: number[];
+  mergeCalls: Array<{ pr: number; headRefOid: string }>;
 } {
-  const mergeCalls: number[] = [];
+  const mergeCalls: Array<{ pr: number; headRefOid: string }> = [];
   const base: MergeDeps = {
     async ghPrView(_pr, _fields) {
       return {
         mergeable: "MERGEABLE",
         mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "ci", status: "COMPLETED", conclusion: "SUCCESS" },
-        ] satisfies StatusCheck[],
+        headRefOid: "abc123def456",
       };
     },
-    async ghPrMerge(pr) {
-      mergeCalls.push(pr);
+    async ghPrChecksRequired(_pr): Promise<RequiredCheck[]> {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrMerge(pr, headRefOid) {
+      mergeCalls.push({ pr, headRefOid });
     },
     async getIssueLabels(_issueNumber) {
       return ["pipeline:ready-to-deploy"];
@@ -67,7 +62,9 @@ function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
 test("merge: happy path — mergeable/clean/passing PR at ready-to-deploy succeeds", async () => {
   const deps = makeDeps();
   await mergePr(42, deps);
-  assert.deepEqual(deps.mergeCalls, [42], "ghPrMerge should be called exactly once with the PR number");
+  assert.equal(deps.mergeCalls.length, 1, "ghPrMerge should be called exactly once");
+  assert.equal(deps.mergeCalls[0].pr, 42, "ghPrMerge should be called with the PR number");
+  assert.equal(deps.mergeCalls[0].headRefOid, "abc123def456", "ghPrMerge should receive the headRefOid from ghPrView");
 });
 
 // ---------------------------------------------------------------------------
@@ -80,7 +77,7 @@ test("merge: conflicted PR — refuses and does not merge", async () => {
       return {
         mergeable: "CONFLICTING",
         mergeStateStatus: "DIRTY",
-        statusCheckRollup: [],
+        headRefOid: "abc123def456",
       };
     },
   });
@@ -104,7 +101,7 @@ test("merge: dirty mergeStateStatus — refuses and does not merge", async () =>
       return {
         mergeable: "MERGEABLE",
         mergeStateStatus: "DIRTY",
-        statusCheckRollup: [],
+        headRefOid: "abc123def456",
       };
     },
   });
@@ -128,7 +125,7 @@ test("merge: unknown mergeability — refuses and does not merge", async () => {
       return {
         mergeable: "UNKNOWN",
         mergeStateStatus: "UNKNOWN",
-        statusCheckRollup: [],
+        headRefOid: "abc123def456",
       };
     },
   });
@@ -148,15 +145,11 @@ test("merge: unknown mergeability — refuses and does not merge", async () => {
 
 test("merge: failing required check — refuses, names the check, and does not merge", async () => {
   const deps = makeDeps({
-    async ghPrView(_pr, _fields) {
-      return {
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "build", status: "COMPLETED", conclusion: "FAILURE" },
-          { name: "ci", status: "COMPLETED", conclusion: "SUCCESS" },
-        ] satisfies StatusCheck[],
-      };
+    async ghPrChecksRequired(_pr) {
+      return [
+        { name: "build", bucket: "fail" },
+        { name: "ci", bucket: "pass" },
+      ];
     },
   });
   await assert.rejects(
@@ -175,14 +168,8 @@ test("merge: failing required check — refuses, names the check, and does not m
 
 test("merge: pending required check — refuses and does not merge", async () => {
   const deps = makeDeps({
-    async ghPrView(_pr, _fields) {
-      return {
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "slow-ci", status: "IN_PROGRESS", conclusion: null },
-        ] satisfies StatusCheck[],
-      };
+    async ghPrChecksRequired(_pr) {
+      return [{ name: "slow-ci", bucket: "pending" }];
     },
   });
   await assert.rejects(
@@ -249,7 +236,7 @@ test("merge: no linked issue — refuses and does not merge", async () => {
 test("merge: BEHIND mergeStateStatus — refuses and does not merge", async () => {
   const deps = makeDeps({
     async ghPrView(_pr, _fields) {
-      return { mergeable: "MERGEABLE", mergeStateStatus: "BEHIND", statusCheckRollup: [] };
+      return { mergeable: "MERGEABLE", mergeStateStatus: "BEHIND", headRefOid: "abc123def456" };
     },
   });
   await assert.rejects(
@@ -265,7 +252,7 @@ test("merge: BEHIND mergeStateStatus — refuses and does not merge", async () =
 test("merge: BLOCKED mergeStateStatus — refuses and does not merge", async () => {
   const deps = makeDeps({
     async ghPrView(_pr, _fields) {
-      return { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED", statusCheckRollup: [] };
+      return { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED", headRefOid: "abc123def456" };
     },
   });
   await assert.rejects(
@@ -281,7 +268,7 @@ test("merge: BLOCKED mergeStateStatus — refuses and does not merge", async () 
 test("merge: HAS_HOOKS mergeStateStatus — refuses and does not merge", async () => {
   const deps = makeDeps({
     async ghPrView(_pr, _fields) {
-      return { mergeable: "MERGEABLE", mergeStateStatus: "HAS_HOOKS", statusCheckRollup: [] };
+      return { mergeable: "MERGEABLE", mergeStateStatus: "HAS_HOOKS", headRefOid: "abc123def456" };
     },
   });
   await assert.rejects(
@@ -297,7 +284,7 @@ test("merge: HAS_HOOKS mergeStateStatus — refuses and does not merge", async (
 test("merge: UNKNOWN mergeStateStatus (with MERGEABLE) — refuses and does not merge", async () => {
   const deps = makeDeps({
     async ghPrView(_pr, _fields) {
-      return { mergeable: "MERGEABLE", mergeStateStatus: "UNKNOWN", statusCheckRollup: [] };
+      return { mergeable: "MERGEABLE", mergeStateStatus: "UNKNOWN", headRefOid: "abc123def456" };
     },
   });
   await assert.rejects(
@@ -311,19 +298,13 @@ test("merge: UNKNOWN mergeStateStatus (with MERGEABLE) — refuses and does not 
 });
 
 // ---------------------------------------------------------------------------
-// 4.10 Non-SUCCESS/NEUTRAL check conclusions are blocked (finding 3)
+// 4.10 Required check bucket values (finding 3 — filter to required checks only)
 // ---------------------------------------------------------------------------
 
-test("merge: ACTION_REQUIRED check conclusion — refuses and does not merge", async () => {
+test("merge: required check with 'fail' bucket — refuses and does not merge", async () => {
   const deps = makeDeps({
-    async ghPrView(_pr, _fields) {
-      return {
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "security-scan", status: "COMPLETED", conclusion: "ACTION_REQUIRED" },
-        ] satisfies StatusCheck[],
-      };
+    async ghPrChecksRequired(_pr) {
+      return [{ name: "security-scan", bucket: "fail" }];
     },
   });
   await assert.rejects(
@@ -339,23 +320,17 @@ test("merge: ACTION_REQUIRED check conclusion — refuses and does not merge", a
   assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
 });
 
-test("merge: SKIPPED check conclusion — refuses and does not merge", async () => {
+test("merge: required check with 'cancel' bucket — refuses and does not merge", async () => {
   const deps = makeDeps({
-    async ghPrView(_pr, _fields) {
-      return {
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "optional-check", status: "COMPLETED", conclusion: "SKIPPED" },
-        ] satisfies StatusCheck[],
-      };
+    async ghPrChecksRequired(_pr) {
+      return [{ name: "flaky-required", bucket: "cancel" }];
     },
   });
   await assert.rejects(
     () => mergePr(42, deps),
     (err: Error) => {
       assert.ok(
-        err.message.includes("optional-check"),
+        err.message.includes("flaky-required"),
         `expected check name in: ${err.message}`,
       );
       return true;
@@ -364,46 +339,33 @@ test("merge: SKIPPED check conclusion — refuses and does not merge", async () 
   assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
 });
 
-test("merge: null check conclusion — refuses and does not merge", async () => {
+test("merge: required check with 'skipping' bucket (NEUTRAL) — passes through", async () => {
+  // A required check that is intentionally skipped (e.g. via if: false) emits
+  // bucket=skipping; this should NOT block the merge.
   const deps = makeDeps({
-    async ghPrView(_pr, _fields) {
-      return {
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "mystery-check", status: "COMPLETED", conclusion: null },
-        ] satisfies StatusCheck[],
-      };
-    },
-  });
-  await assert.rejects(
-    () => mergePr(42, deps),
-    (err: Error) => {
-      assert.ok(
-        err.message.includes("mystery-check"),
-        `expected check name in: ${err.message}`,
-      );
-      return true;
-    },
-  );
-  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
-});
-
-test("merge: NEUTRAL check conclusion — passes through (not blocking)", async () => {
-  const deps = makeDeps({
-    async ghPrView(_pr, _fields) {
-      return {
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
-        statusCheckRollup: [
-          { name: "neutral-check", status: "COMPLETED", conclusion: "NEUTRAL" },
-          { name: "ci", status: "COMPLETED", conclusion: "SUCCESS" },
-        ] satisfies StatusCheck[],
-      };
+    async ghPrChecksRequired(_pr) {
+      return [
+        { name: "neutral-check", bucket: "skipping" },
+        { name: "ci", bucket: "pass" },
+      ];
     },
   });
   await mergePr(42, deps);
-  assert.deepEqual(deps.mergeCalls, [42], "ghPrMerge should be called for NEUTRAL conclusion");
+  assert.equal(deps.mergeCalls.length, 1, "ghPrMerge should be called for skipping bucket");
+});
+
+test("merge: optional non-passing check does not block (only required checks matter)", async () => {
+  // An optional check that fails/is skipped must not appear in ghPrChecksRequired
+  // (gh pr checks --required only returns required checks). With no required checks
+  // failing, the merge should proceed even if optional checks have other states.
+  const deps = makeDeps({
+    async ghPrChecksRequired(_pr) {
+      // No required checks (or only passing ones)
+      return [{ name: "ci", bucket: "pass" }];
+    },
+  });
+  await mergePr(42, deps);
+  assert.equal(deps.mergeCalls.length, 1, "ghPrMerge should be called when required checks pass");
 });
 
 // ---------------------------------------------------------------------------
@@ -449,7 +411,75 @@ test("merge: getPrForIssue returns null — refuses (issue not found in repo)", 
 });
 
 // ---------------------------------------------------------------------------
-// 4.12 CLI flag rejections for merge (finding 1)
+// 4.12 head-SHA threading prevents merge-after-new-commit race (finding 1)
+// ---------------------------------------------------------------------------
+
+test("merge: headRefOid from ghPrView is threaded to ghPrMerge (TOCTOU guard)", async () => {
+  const capturedHeadRefOid: string[] = [];
+  const deps = makeDeps({
+    async ghPrView(_pr, _fields) {
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "deadbeef1234",
+      };
+    },
+    async ghPrMerge(pr, headRefOid) {
+      capturedHeadRefOid.push(headRefOid);
+    },
+  });
+  await mergePr(42, deps);
+  assert.deepEqual(
+    capturedHeadRefOid,
+    ["deadbeef1234"],
+    "ghPrMerge must receive the headRefOid fetched from ghPrView",
+  );
+});
+
+test("merge: empty headRefOid aborts before merge (guards against missing SHA)", async () => {
+  const deps = makeDeps({
+    async ghPrView(_pr, _fields) {
+      return { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", headRefOid: "" };
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.toLowerCase().includes("head commit sha") ||
+          err.message.toLowerCase().includes("headrefoid"),
+        `expected headRefOid error, got: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called when headRefOid is empty");
+});
+
+// ---------------------------------------------------------------------------
+// 4.13 Branch-deletion error is surfaced (finding 4)
+// ---------------------------------------------------------------------------
+
+test("merge: ghPrMerge error propagates — merge failure is not swallowed", async () => {
+  const deps = makeDeps({
+    async ghPrMerge(_pr, _headRefOid) {
+      throw new Error("gh pr merge failed: some unexpected error");
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("some unexpected error"),
+        `expected error to propagate, got: ${err.message}`,
+      );
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 4.14 CLI flag rejections for merge (finding 2)
 // ---------------------------------------------------------------------------
 
 test("CLI: 'pipeline merge 42 --status' exits non-zero with incompatibility message", () => {
@@ -480,8 +510,50 @@ test("CLI: 'pipeline merge 42 --dry-run' exits non-zero with incompatibility mes
   );
 });
 
+test("CLI: 'pipeline merge 42 --cleanup' exits non-zero with incompatibility message", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--cleanup"],
+    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+  );
+  assert.notEqual(result.status, 0, "should exit non-zero");
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(
+    combined.includes("cannot be combined"),
+    `expected incompatibility message, got: ${combined}`,
+  );
+});
+
+test("CLI: 'pipeline merge 42 --init' exits non-zero with incompatibility message", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--init"],
+    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+  );
+  assert.notEqual(result.status, 0, "should exit non-zero");
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(
+    combined.includes("cannot be combined"),
+    `expected incompatibility message, got: ${combined}`,
+  );
+});
+
+test("CLI: 'pipeline merge 42 --doctor' exits non-zero with incompatibility message", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "merge", "42", "--doctor"],
+    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+  );
+  assert.notEqual(result.status, 0, "should exit non-zero");
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(
+    combined.includes("cannot be combined"),
+    `expected incompatibility message, got: ${combined}`,
+  );
+});
+
 // ---------------------------------------------------------------------------
-// 4.14 Loop-isolation guarantee
+// 4.16 Loop-isolation guarantee
 //
 // Reads every stage handler file and asserts none of them import from merge.ts.
 // Also reads pipeline.ts and verifies the dispatch() function body does not

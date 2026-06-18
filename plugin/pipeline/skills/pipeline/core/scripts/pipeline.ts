@@ -500,17 +500,27 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Reject flags that are incompatible with the merge sub-command before dispatch.
-  // --dry-run and --status are advance-loop/read-only modes with no meaningful
-  // interpretation for an irreversible squash merge; the rest are advance-loop-only.
+  // Reject ALL flags that are incompatible with the merge sub-command before
+  // dispatch. Every global mode flag that is not intentionally supported by
+  // `pipeline merge` must be rejected here so that irreversible squash-merge
+  // execution is never reachable from an ambiguous or unintended invocation.
   if (isMergeCommand) {
-    const mergeConflicts: Array<[string, boolean | string | undefined]> = [
+    const mergeConflicts: Array<[string, boolean | string | number | undefined]> = [
       ["--status", opts.status],
       ["--dry-run", opts.dryRun],
       ["--once", opts.once],
       ["--unblock", opts.unblock !== undefined],
       ["--override", opts.override !== undefined],
       ["--summary", opts.summary],
+      ["--cleanup", opts.cleanup],
+      ["--init (or 'pipeline init')", opts.init || numArg === "init"],
+      ["--doctor", opts.doctor],
+      ["--fail-fast", opts.failFast],
+      ["--apply", opts.apply],
+      ["--next", opts.next !== undefined],
+      ["--repo", opts.repo !== undefined],
+      ["--release", opts.release !== undefined],
+      ["--description", opts.description !== undefined],
     ];
     for (const [flag, active] of mergeConflicts) {
       if (active) {

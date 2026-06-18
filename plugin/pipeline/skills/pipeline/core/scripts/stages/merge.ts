@@ -11,17 +11,17 @@
 // gh pr view field shapes (confirmed 2026-06-17 against agent-pipeline PR #219):
 //   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN"
 //   mergeStateStatus: "CLEAN" | "DIRTY" | "UNKNOWN" | "BEHIND" | "BLOCKED" | "HAS_HOOKS"
-//   statusCheckRollup: Array<{
-//     name: string;
-//     status: "COMPLETED" | "IN_PROGRESS" | "QUEUED" | "WAITING";
-//     conclusion: "SUCCESS" | "FAILURE" | "TIMED_OUT" | "CANCELLED" | "NEUTRAL" |
-//                 "SKIPPED" | "ACTION_REQUIRED" | null;
-//     __typename: string;
-//   }> | null
+//   headRefOid: string  (the head commit SHA at inspection time, threaded to
+//                        --match-head-commit to prevent merging a different head)
 //
-// gh pr merge --squash --delete-branch: exits 0 on success; may emit a stderr
-// warning about the branch already being deleted (non-fatal). No structured output
-// is parsed — success is exit 0, failure is non-zero exit.
+// gh pr checks --required --json name,bucket (confirmed 2026-06-17):
+//   JSON fields available: bucket, completedAt, description, event, link, name, startedAt, state, workflow
+//   bucket: "pass" | "fail" | "pending" | "skipping" | "cancel"
+//   --required: only emit checks that are required by branch protection rules
+//
+// gh pr merge --squash --delete-branch --match-head-commit <sha>:
+//   Exits 0 on success; aborts if the PR head has advanced past <sha> since inspection.
+//   May emit a stderr warning about the branch already being deleted (non-fatal).
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -32,9 +32,21 @@ const execFileAsync = promisify(execFile);
 // Dependency-injection seam
 // ---------------------------------------------------------------------------
 
+export interface RequiredCheck {
+  name: string;
+  bucket: string;
+}
+
 export interface MergeDeps {
   ghPrView(pr: number, fields: string[]): Promise<Record<string, unknown>>;
-  ghPrMerge(pr: number): Promise<void>;
+  /** Calls `gh pr checks <pr> --required --json name,bucket` and returns only
+   *  required checks. This keeps optional pending/skipped/failed checks from
+   *  blocking a merge where all required checks have passed. */
+  ghPrChecksRequired(pr: number): Promise<RequiredCheck[]>;
+  /** Calls `gh pr merge --squash --delete-branch --match-head-commit <headRefOid>`.
+   *  The headRefOid is fetched from ghPrView and binds the merge to the inspected
+   *  head SHA, closing the TOCTOU race between gate inspection and merge execution. */
+  ghPrMerge(pr: number, headRefOid: string): Promise<void>;
   getIssueLabels(issueNumber: number): Promise<string[]>;
   getPrLinkedIssue(pr: number): Promise<number | null>;
   /** Authoritative resolver: given an issue number, return the open same-repo PR
@@ -56,11 +68,25 @@ export function realMergeDeps(repo: string): MergeDeps {
       return JSON.parse(stdout) as Record<string, unknown>;
     },
 
-    async ghPrMerge(pr) {
+    async ghPrChecksRequired(pr) {
+      const { stdout } = await execFileAsync(
+        "gh",
+        ["pr", "checks", String(pr), "--required", "--json", "name,bucket", "-R", repo],
+        { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+      );
+      return JSON.parse(stdout) as RequiredCheck[];
+    },
+
+    async ghPrMerge(pr, headRefOid) {
       try {
         await execFileAsync(
           "gh",
-          ["pr", "merge", String(pr), "--squash", "--delete-branch", "-R", repo],
+          [
+            "pr", "merge", String(pr),
+            "--squash", "--delete-branch",
+            "--match-head-commit", headRefOid,
+            "-R", repo,
+          ],
           { timeout: 60_000 },
         );
       } catch (err) {
@@ -68,11 +94,9 @@ export function realMergeDeps(repo: string): MergeDeps {
         const stderr = (String(e.stderr ?? "")).toLowerCase();
         // Treat "branch already deleted" as non-fatal: the merge succeeded but the
         // branch cleanup was a no-op (e.g. already removed by a prior attempt).
-        if (
-          stderr.includes("already deleted") ||
-          stderr.includes("branch not found") ||
-          stderr.includes("could not delete")
-        ) {
+        // Only match the specific already-deleted condition — "could not delete"
+        // alone can accompany a real failure (e.g. permissions) and must surface.
+        if (stderr.includes("already deleted") || stderr.includes("branch not found")) {
           return;
         }
         const raw = String(e.stderr ?? e.message).trim();
@@ -234,31 +258,24 @@ function checkMergeability(
 // Gate 2: required status checks
 // ---------------------------------------------------------------------------
 
-interface StatusCheck {
-  name?: string;
-  status?: string;
-  conclusion?: string | null;
-}
-
-function checkStatusChecks(statusCheckRollup: unknown): string | null {
-  if (!Array.isArray(statusCheckRollup) || statusCheckRollup.length === 0) {
+// Uses `gh pr checks --required --json name,bucket` to filter to only the
+// checks that branch protection marks as required. Optional checks (pending,
+// skipped, or failed) do not appear in this list and cannot block the merge.
+//
+// bucket values from `gh pr checks`: "pass" | "fail" | "pending" | "skipping" | "cancel"
+// "pass" and "skipping" are non-blocking; everything else is a blocking condition.
+function checkStatusChecks(requiredChecks: RequiredCheck[]): string | null {
+  if (requiredChecks.length === 0) {
     return null;
   }
 
   const blocking: string[] = [];
-  for (const check of statusCheckRollup as StatusCheck[]) {
+  for (const check of requiredChecks) {
     const name = check.name ?? "unknown";
-    const status = (check.status ?? "").toUpperCase();
-    const conclusion = (check.conclusion ?? "").toUpperCase();
-
-    if (status !== "COMPLETED") {
-      // Still running or queued — pending
-      blocking.push(`${name} (${status.toLowerCase() || "pending"})`);
-      continue;
-    }
-    // Completed: only SUCCESS and NEUTRAL are non-blocking; everything else blocks
-    if (conclusion !== "SUCCESS" && conclusion !== "NEUTRAL") {
-      blocking.push(`${name} (${conclusion.toLowerCase() || "unknown conclusion"})`);
+    const bucket = (check.bucket ?? "").toLowerCase();
+    // "pass" = SUCCESS; "skipping" = NEUTRAL/SKIPPED (intentionally skipped required check)
+    if (bucket !== "pass" && bucket !== "skipping") {
+      blocking.push(`${name} (${bucket || "unknown"})`);
     }
   }
 
@@ -319,10 +336,13 @@ async function checkIssueStage(
 export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
   deps.log(`[pipeline merge] #${pr}: checking mergeability...`);
 
+  // Fetch mergeable state and the head SHA together. headRefOid is threaded
+  // through to --match-head-commit so the merge is bound to the commit that
+  // was inspected, closing the TOCTOU race between gate inspection and merge.
   const prData = await deps.ghPrView(pr, [
     "mergeable",
     "mergeStateStatus",
-    "statusCheckRollup",
+    "headRefOid",
   ]);
 
   const mergeabilityError = checkMergeability(
@@ -333,8 +353,17 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
     throw new Error(mergeabilityError);
   }
 
+  const headRefOid = String(prData.headRefOid ?? "");
+  if (!headRefOid) {
+    throw new Error(
+      `PR #${pr}: could not determine head commit SHA (headRefOid was empty). ` +
+      `Retry or check gh authentication.`,
+    );
+  }
+
   deps.log(`[pipeline merge] #${pr}: checking required status checks...`);
-  const checksError = checkStatusChecks(prData.statusCheckRollup);
+  const requiredChecks = await deps.ghPrChecksRequired(pr);
+  const checksError = checkStatusChecks(requiredChecks);
   if (checksError) {
     throw new Error(checksError);
   }
@@ -346,6 +375,6 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
   }
 
   deps.log(`[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`);
-  await deps.ghPrMerge(pr);
+  await deps.ghPrMerge(pr, headRefOid);
   deps.log(`[pipeline merge] #${pr}: merged successfully.`);
 }

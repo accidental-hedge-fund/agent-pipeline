@@ -35,15 +35,19 @@ The merge handler SHALL call `gh pr view <pr> --json mergeable,mergeStateStatus`
 ---
 
 ### Requirement: The `merge` sub-command SHALL verify required status checks before merging
-After confirming mergeability, the handler SHALL inspect `statusCheckRollup` from `gh pr view` and refuse to merge if any required status check has not concluded in a success state.
+After confirming mergeability, the handler SHALL call `gh pr checks <pr> --required --json name,bucket` to obtain only the checks that branch protection marks as required, and SHALL refuse to merge if any required check has not passed. Optional checks (pending, skipped, or failed) are not returned by `--required` and SHALL NOT block the merge. The `bucket` field categorises each check as `pass`, `fail`, `pending`, `skipping`, or `cancel`; only `pass` and `skipping` are non-blocking.
 
 #### Scenario: All required checks passing
-- **WHEN** all required status check conclusions are SUCCESS or NEUTRAL
+- **WHEN** all required checks have bucket `pass` or `skipping`
 - **THEN** the handler proceeds to the issue-stage gate
 
 #### Scenario: Any required check failing or pending
-- **WHEN** any required status check has a conclusion of FAILURE, TIMED_OUT, CANCELLED, or is still in progress
+- **WHEN** any required check has bucket `fail`, `pending`, or `cancel`
 - **THEN** the handler SHALL exit non-zero with a message naming the failing or pending check(s) and SHALL NOT merge
+
+#### Scenario: Optional checks do not block
+- **WHEN** `gh pr checks --required` returns only passing required checks but optional checks have other states
+- **THEN** the handler SHALL proceed to the issue-stage gate and SHALL NOT block on optional check states
 
 ---
 
@@ -65,16 +69,20 @@ After confirming checks pass, the handler SHALL resolve the GitHub issue linked 
 ---
 
 ### Requirement: The `merge` sub-command SHALL squash-merge and delete the branch on success
-When all gates pass, the handler SHALL invoke `gh pr merge <pr> --squash --delete-branch` to squash-merge the PR and remove the head branch. It SHALL print the merge URL on success and exit 0.
+When all gates pass, the handler SHALL invoke `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>` where `headRefOid` is the PR head commit SHA fetched in the same `gh pr view` call used for the mergeability gate. The `--match-head-commit` flag binds the merge to the inspected head SHA and causes `gh` to abort if a new commit was pushed between gate inspection and merge execution, closing the TOCTOU race. The handler SHALL print a confirmation message on success and exit 0.
 
 #### Scenario: Successful squash merge
 - **WHEN** all three gates pass (mergeable, checks, issue stage)
-- **THEN** the handler invokes `gh pr merge <pr> --squash --delete-branch`
-- **AND** prints a confirmation message including the PR number and merged commit reference
+- **THEN** the handler invokes `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>`
+- **AND** prints a confirmation message including the PR number
 - **AND** exits 0
 
+#### Scenario: Head SHA is absent — merge is aborted
+- **WHEN** `gh pr view` returns an empty or missing `headRefOid`
+- **THEN** the handler SHALL exit non-zero with an error explaining that the head commit SHA could not be determined and SHALL NOT invoke `gh pr merge`
+
 #### Scenario: Branch already deleted is treated as a non-fatal warning
-- **WHEN** `gh pr merge --delete-branch` reports that the head branch was already deleted
+- **WHEN** `gh pr merge --delete-branch` reports that the head branch was already deleted (stderr contains "already deleted" or "branch not found")
 - **THEN** the handler SHALL NOT exit non-zero for this condition and SHALL continue to print the success confirmation
 
 #### Scenario: Merge API error is surfaced
@@ -84,10 +92,10 @@ When all gates pass, the handler SHALL invoke `gh pr merge <pr> --squash --delet
 ---
 
 ### Requirement: The `merge` sub-command logic SHALL be behind a `MergeDeps` dependency-injection seam
-All I/O (calls to `gh pr view`, `gh pr merge`, and issue-label inspection) SHALL be injected via a `MergeDeps` interface parameter. The real production deps call `gh`; test deps return fixtures. Unit tests SHALL NOT make any real network, git, or subprocess call.
+All I/O (calls to `gh pr view`, `gh pr checks --required`, `gh pr merge`, and issue-label inspection) SHALL be injected via a `MergeDeps` interface parameter. The real production deps call `gh`; test deps return fixtures. Unit tests SHALL NOT make any real network, git, or subprocess call.
 
 #### Scenario: Unit test uses fake deps
-- **WHEN** a unit test constructs a `MergeDeps` with stubbed `ghPrView`, `ghPrMerge`, and `getIssueLabels` implementations
+- **WHEN** a unit test constructs a `MergeDeps` with stubbed `ghPrView`, `ghPrChecksRequired`, `ghPrMerge`, and `getIssueLabels` implementations
 - **THEN** running `mergePr(prNumber, deps)` exercises the gate logic without any real `gh` subprocess
 
 #### Scenario: Production code uses real deps
