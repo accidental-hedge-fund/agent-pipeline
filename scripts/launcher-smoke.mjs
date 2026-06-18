@@ -179,6 +179,56 @@ check("path --json exits 0 and emits valid JSON", () => {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Malformed core/package.json: `pipeline doctor` must surface
+//    install:version-coherence failure instead of crashing with
+//    ERR_INVALID_PACKAGE_CONFIG.  Regression for review-2 finding 265eae52.
+// ---------------------------------------------------------------------------
+{
+  const tmp = mkdtempSync(join(tmpdir(), "pipeline-launcher-badpkg-"));
+  try {
+    const { writeFileSync } = await import("node:fs");
+    mkdirSync(join(tmp, "scripts"), { recursive: true });
+    copyFileSync(LAUNCHER, join(tmp, "scripts", "pipeline-launcher.mjs"));
+    mkdirSync(join(tmp, "core", "scripts"), { recursive: true });
+    // Deliberately write malformed JSON to core/package.json.
+    writeFileSync(join(tmp, "core", "package.json"), "{ this is not valid json }");
+    writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "// stub\n");
+    mkdirSync(join(tmp, "core", "node_modules"), { recursive: true });
+
+    check("malformed core/package.json: `doctor` exits non-zero with install:version-coherence failure", () => {
+      const r = spawnSync(NODE, [join(tmp, "scripts", "pipeline-launcher.mjs"), "doctor"], {
+        stdio: "pipe",
+      });
+      if (r.status === 0) throw new Error("expected non-zero exit when core/package.json is malformed");
+      const out = r.stdout.toString() + r.stderr.toString();
+      if (!out.includes("install:version-coherence")) {
+        throw new Error(
+          `expected install:version-coherence in output; got:\n${out.slice(0, 400)}`,
+        );
+      }
+      if (!out.includes("Reinstall")) {
+        throw new Error(
+          `expected reinstall remediation in output; got:\n${out.slice(0, 400)}`,
+        );
+      }
+    });
+
+    check("malformed core/package.json: non-doctor commands exit non-zero with error message", () => {
+      const r = spawnSync(NODE, [join(tmp, "scripts", "pipeline-launcher.mjs"), "run", "1"], {
+        stdio: "pipe",
+      });
+      if (r.status === 0) throw new Error("expected non-zero exit when core/package.json is malformed");
+      const err = r.stderr.toString();
+      if (!err.includes("not valid JSON") && !err.includes("npm install")) {
+        throw new Error(`expected reinstall hint in stderr; got:\n${err.slice(0, 400)}`);
+      }
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log(`\nlauncher smoke: ${passed} passed, ${failed} failed`);

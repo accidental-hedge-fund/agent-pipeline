@@ -33,13 +33,54 @@ if (!existsSync(entry)) {
   process.exit(1);
 }
 
-// Short-circuit for --version / -V: must work before dependency provisioning
-// because the version is available in core/package.json which is always present.
+// Read core/package.json once upfront.  Two reasons:
+//   (a) --version short-circuit needs it before dependency provisioning.
+//   (b) Node reads core/package.json to determine module type (ESM vs CJS)
+//       *before* executing any code in pipeline.ts, so a malformed file causes
+//       ERR_INVALID_PACKAGE_CONFIG before any try/catch or `doctor` check can
+//       run.  We detect the corrupt-install case here and surface it ourselves.
 const rawArgs = process.argv.slice(2);
+const pkgPath = join(coreDir, "package.json");
+let pkgVersion = "";
+let pkgReadable = true;
+try {
+  const text = readFileSync(pkgPath, "utf8");
+  pkgVersion = (JSON.parse(text)).version ?? "";
+} catch {
+  pkgReadable = false;
+}
+
+// Short-circuit for --version / -V: works before dependency provisioning.
 if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
-  const pkg = JSON.parse(readFileSync(join(coreDir, "package.json"), "utf8"));
-  process.stdout.write(pkg.version + "\n");
+  if (!pkgReadable) {
+    process.stderr.write(
+      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
+      "         Reinstall with: npm install -g agent-pipeline\n",
+    );
+    process.exit(1);
+  }
+  process.stdout.write(pkgVersion + "\n");
   process.exit(0);
+}
+
+// Guard: malformed or missing core/package.json causes ERR_INVALID_PACKAGE_CONFIG
+// when Node tries to load the TypeScript entry (before any pipeline code runs).
+// Surface a coherent failure here rather than a raw Node startup error.
+if (!pkgReadable) {
+  if (rawArgs[0] === "doctor") {
+    process.stdout.write(
+      `Pipeline doctor — 1 check (0 passed, 1 failed, 0 skipped)\n\n` +
+      `  ✗ install:version-coherence — core/package.json at ${coreDir} is missing or not valid JSON\n` +
+      `      → Reinstall the pipeline skill to restore a valid core/package.json at ${coreDir}.\n\n` +
+      `Result: FAIL\n`,
+    );
+  } else {
+    process.stderr.write(
+      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
+      "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
+    );
+  }
+  process.exit(1);
 }
 
 // First-run dependency provisioning. Skipped once core/node_modules exists, so
