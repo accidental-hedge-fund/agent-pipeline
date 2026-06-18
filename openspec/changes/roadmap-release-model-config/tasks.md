@@ -17,9 +17,9 @@
 
 ## 4. Per-Deploy Version Marker (Continuous)
 
-- [x] 4.1 Implement `buildCalVerMarker(outputDir)`: derive `YYYY.0M.MICRO` from the current date and the count of prior plan runs this month in the output directory
+- [x] 4.1 Implement `buildCalVerMarker(now, backlogSha)`: derive a lock-free, content-addressed `YYYY.0M.<short backlog-sha>` from the calendar month + the backlog SHA — no read-modify-write counter and no lock (concurrent runs are inherently safe; `plan.json` writes are atomic via temp+rename)
 - [x] 4.2 In the roadmap engine output, set `plan.continuous_version_marker` when `release_model === 'continuous'`; omit the field when `release_model === 'semver'`
-- [x] 4.3 Add unit tests: marker present and non-empty for `continuous`; marker absent for `semver`; CalVer format is correct
+- [x] 4.3 Add unit tests: marker present, non-empty, and deterministic from the backlog SHA for `continuous` (same SHA → same marker; different SHA → different); marker absent for `semver`; `YYYY.0M.<short>` format is correct
 
 ## 5. Release Model Dispatch
 
