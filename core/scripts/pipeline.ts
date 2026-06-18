@@ -70,6 +70,7 @@ import {
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
+import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
@@ -158,6 +159,8 @@ export interface CliOpts {
   next?: number;
   /** Sweep: override the target GitHub repository (owner/repo). */
   repo?: string;
+  /** Triage: target pre-pipeline stage label (ready or backlog). */
+  stage?: string;
 }
 
 /**
@@ -173,7 +176,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap | sweep | merge")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -206,7 +209,8 @@ export function buildCmd(): Command {
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
     .option("--apply", "roadmap/sweep: execute GitHub write-backs (issue updates, roadmap PR); default is dry-run")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
-    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)");
+    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
+    .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -231,6 +235,8 @@ async function main(): Promise<void> {
   const isIntakeCommand = numArg === "intake";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
   const isSweepCommand = numArg === "sweep";
+  // `pipeline triage <issue> --stage ready|backlog` — set an issue's pre-pipeline stage label.
+  const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
   const isMergeCommand = numArg === "merge";
 
@@ -412,6 +418,7 @@ async function main(): Promise<void> {
     cmd.args[0] === "run" ||
     cmd.args[0] === "release" ||
     cmd.args[0] === "intake" ||
+    cmd.args[0] === "triage" ||
     cmd.args[0] === "merge"
       ? 2
       : 1;
@@ -536,6 +543,53 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early triage dispatch — resolves config for cfg.repo so gh wrappers target the
+  // configured repository. The handler validates issue number and stage, then makes
+  // the gh calls to read/add/remove labels.
+  if (isTriageCommand) {
+    const triageConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--dry-run", opts.dryRun],
+      ["--status", opts.status],
+      ["--summary", opts.summary],
+      ["--cleanup", opts.cleanup],
+      ["--init (or 'pipeline init')", isInit],
+      ["doctor", isDoctorCommand],
+      ["--doctor", opts.doctor],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+      ["--detach", opts.detach],
+    ];
+    for (const [flag, active] of triageConflicts) {
+      if (active) {
+        console.error(
+          `pipeline: 'pipeline triage' cannot be combined with ${flag}. These are separate commands.`,
+        );
+        process.exit(2);
+      }
+    }
+    // Validate inputs before resolveConfig() so invalid commands never trigger
+    // a GitHub API call (resolveConfig calls gh repo view internally).
+    const inputError = validateTriageInput(cmd.args[1], opts.stage);
+    if (inputError) {
+      console.error(`pipeline triage: ${inputError}`);
+      process.exit(2);
+    }
+    let triageCfg: PipelineConfig;
+    try {
+      triageCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline triage: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    try {
+      await runTriage({ issueArg: cmd.args[1], stage: opts.stage }, realTriageDeps(triageCfg));
+    } catch (err) {
+      console.error(`pipeline triage: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early merge dispatch — human-invoked squash merge of a ready-to-deploy PR (#217).
   // This is the ONLY path that calls mergePr; the autonomous advance loop never reaches here.
   if (isMergeCommand) {
@@ -582,7 +636,7 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "merge"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "triage", "merge"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +

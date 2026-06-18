@@ -206,6 +206,8 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
 /pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
+/pipeline triage <N> --stage ready            set pipeline:ready on issue N; remove any other pipeline:* stage label
+/pipeline triage <N> --stage backlog          set pipeline:backlog on issue N; idempotent, no model call
 /pipeline sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
 /pipeline sweep --apply                       same, updating issue bodies and opening a ROADMAP reconciliation PR
 /pipeline sweep --apply --repo other/repo     sweep a different repository
@@ -296,6 +298,34 @@ sweep:
     - Acceptance criteria
     - Out of scope
 ```
+
+## Triage sub-command
+
+`pipeline triage <N> --stage <stage>` sets a pre-pipeline stage label on an issue without manual `gh issue edit`. It is the authoritative command for promoting an issue from `pipeline:backlog` to `pipeline:ready` (or the reverse). No model harness call — fully deterministic.
+
+```bash
+# Promote issue 42 from backlog to ready:
+/pipeline triage 42 --stage ready
+
+# Move issue 42 back to backlog:
+/pipeline triage 42 --stage backlog
+```
+
+**What it does:**
+
+1. Validates that `--stage` is one of the two allowed pre-pipeline values (`ready`, `backlog`). Any other value — including mid-flight stage names owned by the advance state machine — is rejected with a clear error before any GitHub call is made.
+2. Fetches the issue's current labels.
+3. Adds the target label, then removes all other `pipeline:*` labels (add-before-remove, so a partial failure never strands the issue without a stage label).
+4. Idempotent: when the issue already carries exactly the target label and no other `pipeline:*` label, logs "already set" and exits 0 without making any write API call.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--stage ready` | Set `pipeline:ready`; remove any other `pipeline:*` stage label. |
+| `--stage backlog` | Set `pipeline:backlog`; remove any other `pipeline:*` stage label. |
+
+Only `ready` and `backlog` are settable via `triage`. Mid-flight stages (`planning`, `review-1`, `review-2`, etc.) are owned by the `pipeline advance` state machine.
 
 ## Merge sub-command
 
