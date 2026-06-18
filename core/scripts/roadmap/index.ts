@@ -580,40 +580,48 @@ export async function runRoadmap(
   let releaseLock: (() => void) | undefined;
   if (releaseModel === "continuous") {
     milestones = buildContinuousGroups(roadmap, items);
-    // Acquire lock before reading plan.json to prevent concurrent runs from
-    // claiming the same MICRO value in the CalVer marker.
+    // Acquire the marker lock BEFORE reading plan.json so concurrent runs can't claim the
+    // same MICRO value. Everything from here through writePlanJson runs under the lock and
+    // is wrapped in the try/finally below, so the lock is ALWAYS released — even on a failed
+    // read / marker-compute / write — and can't strand subsequent runs (#214).
     releaseLock = await deps.acquireMarkerLock(outputDir);
-    const existingPlanContent = await deps.readFile(path.join(outputDir, "plan.json"));
-    continuousVersionMarker = buildCalVerMarker(now, existingPlanContent);
-    deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
   } else {
     const latestTag = await deps.getLatestTag(repoDir);
     milestones = buildSemverLanes(roadmap, latestTag);
     deps.log(`[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"})`);
   }
 
-  // Build final plan.json
-  const plan: PlanJson = {
-    generated_at: now,
-    backlog_sha: backlogSha,
-    repo,
-    dependency_graph: depGraph,
-    scored,
-    roadmap,
-    hygiene,
-    milestones,
-    new_issue_drafts: [],
-    critique: critiqueEntries,
-    open_questions: openQuestions,
-    ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
-  };
+  // Build final plan.json + write outputs under the marker lock (continuous). The finally
+  // releases the lock on every path; writeRoadmapMd runs after release (it needs no lock).
+  let plan: PlanJson;
+  try {
+    if (releaseModel === "continuous") {
+      const existingPlanContent = await deps.readFile(path.join(outputDir, "plan.json"));
+      continuousVersionMarker = buildCalVerMarker(now, existingPlanContent);
+      deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
+    }
+    plan = {
+      generated_at: now,
+      backlog_sha: backlogSha,
+      repo,
+      dependency_graph: depGraph,
+      scored,
+      roadmap,
+      hygiene,
+      milestones,
+      new_issue_drafts: [],
+      critique: critiqueEntries,
+      open_questions: openQuestions,
+      ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
+    };
 
-  // Ensure output dir exists, then write outputs
-  await deps.writeFile(path.join(outputDir, ".gitkeep"), "");
-  await writePlanJson(plan, outputDir, deps);
-  // Release the continuous marker lock after plan.json is written so the next
-  // concurrent run reads the updated marker before claiming its own MICRO value.
-  releaseLock?.();
+    // Ensure output dir exists, then write outputs.
+    await deps.writeFile(path.join(outputDir, ".gitkeep"), "");
+    await writePlanJson(plan, outputDir, deps);
+  } finally {
+    releaseLock?.();
+    releaseLock = undefined;
+  }
   await writeRoadmapMd(plan, outputDir, deps);
 
   if (opts.dryRun || !opts.apply) {

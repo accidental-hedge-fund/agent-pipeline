@@ -15,6 +15,40 @@ import type { PipelineConfig } from "../types.ts";
  * Build real RoadmapDeps from the resolved PipelineConfig.
  * All calls hit real gh CLI, real filesystem, and real harness invocations.
  */
+/**
+ * Reclaim a `.marker.lock` whose recorded PID is no longer a live process (e.g. a crashed
+ * roadmap run). Returns true when a dead-owner lock was removed (the caller should retry
+ * the acquire). A re-read guard before unlink avoids removing a lock another run acquired
+ * between our read and the unlink. Mirrors the PID-stale reclaim in `lock.ts`.
+ */
+function reclaimStaleMarkerLock(lockPath: string): boolean {
+  let content: string;
+  try {
+    content = fs.readFileSync(lockPath, "utf8").trim();
+  } catch {
+    return false; // vanished — the next openSync("wx") will win on its own
+  }
+  const pid = Number(content);
+  if (!Number.isInteger(pid) || pid <= 0) return false; // unrecognized content — don't guess
+  try {
+    process.kill(pid, 0); // throws ESRCH if the process is gone
+    return false; // owner alive — not stale
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") return false; // EPERM etc → assume alive
+  }
+  // Owner is dead — reclaim, but only if the lock still holds the same dead PID (guard
+  // against a concurrent fresh acquire between our read and the unlink).
+  try {
+    if (fs.readFileSync(lockPath, "utf8").trim() === content) {
+      fs.unlinkSync(lockPath);
+      return true;
+    }
+  } catch {
+    /* changed or vanished — let the caller retry the acquire */
+  }
+  return false;
+}
+
 export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
   return {
     getOpenIssues: (repo, opts) => getOpenIssues(repo, opts),
@@ -135,6 +169,9 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
     getMilestones: (repo) => getMilestones(repo),
 
     acquireMarkerLock: async (outputDir) => {
+      // Ensure the output dir exists before locking: on a clean first run it does not yet
+      // exist, and openSync(..., "wx") would ENOENT before any plan.json is written (#214).
+      fs.mkdirSync(outputDir, { recursive: true });
       const lockPath = path.join(outputDir, ".marker.lock");
       const poll = async (attemptsLeft: number): Promise<void> => {
         try {
@@ -143,9 +180,14 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
           fs.closeSync(fd);
         } catch (err) {
           const e = err as NodeJS.ErrnoException;
-          if (e.code === "EEXIST" && attemptsLeft > 0) {
-            await new Promise<void>((r) => setTimeout(r, 50));
-            return poll(attemptsLeft - 1);
+          if (e.code === "EEXIST") {
+            // Reclaim a lock whose recorded PID is no longer alive (a crashed run), so one
+            // hard crash mid-write can't strand the continuous path until manual cleanup (#214).
+            if (reclaimStaleMarkerLock(lockPath)) return poll(attemptsLeft);
+            if (attemptsLeft > 0) {
+              await new Promise<void>((r) => setTimeout(r, 50));
+              return poll(attemptsLeft - 1);
+            }
           }
           throw err;
         }

@@ -20,6 +20,7 @@ import {
   runRelease,
   type ReleaseDeps,
 } from "../scripts/stages/release.ts";
+import { realRoadmapDeps } from "../scripts/stages/roadmap-deps.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -397,6 +398,61 @@ describe("buildCalVerMarker", () => {
     assert.ok(releaseIdx !== -1, "lock must be released");
     assert.ok(lockIdx < readIdx, `lock must be acquired before reading plan.json (got order: ${callOrder})`);
     assert.ok(writeIdx < releaseIdx, `lock must be released after writing plan.json (got order: ${callOrder})`);
+  });
+
+  it("regression: marker lock is released even when the locked write fails (#214 review-2)", async () => {
+    // Finding 2: any throw between acquire and the success-path release leaked .marker.lock.
+    // The try/finally must release the lock even when writePlanJson throws.
+    let released = false;
+    const deps = makeRoadmapDeps({
+      acquireMarkerLock: async () => () => { released = true; },
+      readFile: async () => null,
+      writeFile: async (p) => {
+        if (typeof p === "string" && p.endsWith("plan.json")) throw new Error("disk full");
+      },
+    });
+    await assert.rejects(
+      () => runRoadmap("example/repo", "/repo", "main", { release_model: "continuous" }, { apply: false }, deps),
+      /disk full/,
+    );
+    assert.ok(released, "marker lock must be released (finally) even when the locked write throws");
+  });
+
+  it("realRoadmapDeps.acquireMarkerLock creates a missing output dir before locking (#214 review-2)", async () => {
+    // Finding 1: on a clean first run the output dir does not exist yet; openSync('wx') would
+    // ENOENT. The real lock must mkdir -p the output dir before acquiring.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-marker-lock-"));
+    const outputDir = path.join(base, "does", "not", "exist", "yet");
+    try {
+      const deps = realRoadmapDeps({} as never);
+      const release = await deps.acquireMarkerLock(outputDir);
+      assert.ok(fs.existsSync(outputDir), "output dir is created before locking");
+      assert.ok(fs.existsSync(path.join(outputDir, ".marker.lock")), "lock acquired on the fresh dir");
+      release();
+      assert.ok(!fs.existsSync(path.join(outputDir, ".marker.lock")), "release removes the lock");
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("realRoadmapDeps.acquireMarkerLock reclaims a lock held by a dead PID (#214 review-2)", async () => {
+    // A crashed run can leave .marker.lock behind; the lock records the PID so a dead-owner
+    // lock is reclaimed rather than stranding the continuous path until manual cleanup.
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-marker-stale-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, "2000000"); // a PID with no live process → ESRCH → reclaimable
+      const deps = realRoadmapDeps({} as never);
+      const release = await deps.acquireMarkerLock(outputDir); // must reclaim, not throw/hang
+      assert.equal(
+        fs.readFileSync(lockPath, "utf8").trim(),
+        String(process.pid),
+        "the stale lock is reclaimed and re-acquired under our PID",
+      );
+      release();
+    } finally {
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
   });
 
   it("marker is absent under semver model (validated via runRoadmap output)", async () => {
