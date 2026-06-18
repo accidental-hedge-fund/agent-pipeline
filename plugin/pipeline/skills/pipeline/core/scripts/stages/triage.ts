@@ -57,37 +57,51 @@ export function realTriageDeps(cfg: PipelineConfig): TriageDeps {
 }
 
 // ---------------------------------------------------------------------------
+// Pure validation helper (no deps — safe to call before config resolution)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates raw triage CLI inputs. Returns an error message string on the first
+ * violation, or null if both inputs are valid. Calling this before resolveConfig()
+ * ensures invalid commands never trigger a GitHub API call.
+ */
+export function validateTriageInput(
+  issueArg: string | undefined,
+  stage: string | undefined,
+): string | null {
+  // Full-string check rejects "42abc", "42.9", "1e2", "0", etc.
+  if (!issueArg || !/^[1-9]\d*$/.test(issueArg)) {
+    return (
+      `issue number is required and must be a positive integer` +
+      (issueArg ? ` (got: "${issueArg}")` : "")
+    );
+  }
+  if (!stage) {
+    return `--stage is required. Allowed values: ${ALLOWED_TRIAGE_STAGES.join(", ")}`;
+  }
+  if (!(ALLOWED_TRIAGE_STAGES as readonly string[]).includes(stage)) {
+    return (
+      `"${stage}" is not a valid triage stage. ` +
+      `Allowed values: ${ALLOWED_TRIAGE_STAGES.join(", ")}. ` +
+      `Mid-flight stages (planning, review-1, etc.) are owned by the advance state machine.`
+    );
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
 export async function runTriage(input: TriageInput, deps: TriageDeps): Promise<void> {
   const { issueArg, stage } = input;
 
-  // Validate issue number — full-string check rejects "42abc", "42.9", "1e2", etc.
-  if (!issueArg || !/^[1-9]\d*$/.test(issueArg)) {
-    throw new Error(
-      `issue number is required and must be a positive integer` +
-        (issueArg ? ` (got: "${issueArg}")` : ""),
-    );
-  }
-  const issueNumber = Number.parseInt(issueArg, 10);
-
-  // Validate --stage is present
-  if (!stage) {
-    throw new Error(
-      `--stage is required. Allowed values: ${ALLOWED_TRIAGE_STAGES.join(", ")}`,
-    );
+  const validationError = validateTriageInput(issueArg, stage);
+  if (validationError) {
+    throw new Error(validationError);
   }
 
-  // Validate --stage is a pre-pipeline stage
-  if (!(ALLOWED_TRIAGE_STAGES as readonly string[]).includes(stage)) {
-    throw new Error(
-      `"${stage}" is not a valid triage stage. ` +
-        `Allowed values: ${ALLOWED_TRIAGE_STAGES.join(", ")}. ` +
-        `Mid-flight stages (planning, review-1, etc.) are owned by the advance state machine.`,
-    );
-  }
-
+  const issueNumber = Number.parseInt(issueArg!, 10);
   const targetLabel = `${PIPELINE_LABEL_PREFIX}${stage}`;
 
   // Fetch current labels — first GitHub read; only reached after input validation.
@@ -100,15 +114,17 @@ export async function runTriage(input: TriageInput, deps: TriageDeps): Promise<v
     return;
   }
 
+  // Add-first: ensure the target label is present before removing stale ones.
+  // If the add succeeds but a later remove fails, the issue still carries the
+  // correct target label and is never left without a pipeline stage.
+  if (!currentPipelineLabels.includes(targetLabel)) {
+    await deps.addLabel(issueNumber, targetLabel);
+  }
+
   // Remove every pipeline:* label except the target.
   const toRemove = currentPipelineLabels.filter((l) => l !== targetLabel);
   for (const label of toRemove) {
     await deps.removeLabel(issueNumber, label);
-  }
-
-  // Add the target label if not already present.
-  if (!currentPipelineLabels.includes(targetLabel)) {
-    await deps.addLabel(issueNumber, targetLabel);
   }
 
   // Log the transition.

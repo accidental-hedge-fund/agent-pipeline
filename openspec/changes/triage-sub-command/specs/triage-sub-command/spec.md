@@ -57,7 +57,7 @@ The `triage` sub-command SHALL accept only `backlog` and `ready` as valid `--sta
 
 ### Requirement: The `triage` sub-command SHALL set exactly one `pipeline:<stage>` label on the target issue
 
-After validating inputs, the triage handler SHALL fetch the target issue's current labels, determine which `pipeline:*` labels it currently carries, and update the issue so it carries exactly the target `pipeline:<stage>` label and no other `pipeline:*` label. The handler SHALL remove all current `pipeline:*` labels that differ from the target, then add the target label if not already present.
+After validating inputs, the triage handler SHALL fetch the target issue's current labels, determine which `pipeline:*` labels it currently carries, and update the issue so it carries exactly the target `pipeline:<stage>` label and no other `pipeline:*` label. The handler SHALL add the target label first (if not already present), then remove all current `pipeline:*` labels that differ from the target. This ordering ensures the issue is never left without a `pipeline:*` label if the process is interrupted between writes.
 
 #### Scenario: Sets `pipeline:ready` and removes `pipeline:backlog`
 

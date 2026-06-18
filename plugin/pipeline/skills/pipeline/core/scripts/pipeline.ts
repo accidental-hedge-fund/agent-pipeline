@@ -70,7 +70,7 @@ import {
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
-import { runTriage, realTriageDeps } from "./stages/triage.ts";
+import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -504,6 +504,7 @@ async function main(): Promise<void> {
     const triageConflicts: Array<[string, boolean | string | undefined]> = [
       ["--dry-run", opts.dryRun],
       ["--status", opts.status],
+      ["--summary", opts.summary],
       ["--cleanup", opts.cleanup],
       ["--init (or 'pipeline init')", isInit],
       ["doctor", isDoctorCommand],
@@ -519,6 +520,13 @@ async function main(): Promise<void> {
         );
         process.exit(2);
       }
+    }
+    // Validate inputs before resolveConfig() so invalid commands never trigger
+    // a GitHub API call (resolveConfig calls gh repo view internally).
+    const inputError = validateTriageInput(cmd.args[1], opts.stage);
+    if (inputError) {
+      console.error(`pipeline triage: ${inputError}`);
+      process.exit(2);
     }
     let triageCfg: PipelineConfig;
     try {

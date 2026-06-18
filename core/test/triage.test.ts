@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runTriage, type TriageDeps, type TriageInput } from "../scripts/stages/triage.ts";
+import { runTriage, validateTriageInput, type TriageDeps, type TriageInput } from "../scripts/stages/triage.ts";
 
 // ---------------------------------------------------------------------------
 // Fake deps factory
@@ -261,4 +261,62 @@ test("triage: rejects '0' (zero) with a clear error", async () => {
   );
   assert.equal(deps._addCalls.length, 0);
   assert.equal(deps._removeCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression — validateTriageInput is a pure function (no deps/gh)
+// ---------------------------------------------------------------------------
+
+test("validateTriageInput: returns null for valid ready input", () => {
+  assert.equal(validateTriageInput("42", "ready"), null);
+});
+
+test("validateTriageInput: returns null for valid backlog input", () => {
+  assert.equal(validateTriageInput("1", "backlog"), null);
+});
+
+test("validateTriageInput: rejects invalid stage — no deps touched", () => {
+  const result = validateTriageInput("42", "planning");
+  assert.ok(result !== null, "should return an error string");
+  assert.ok(result.includes('"planning"'), "should name the rejected stage");
+  assert.ok(result.includes("backlog") && result.includes("ready"), "should list allowed values");
+});
+
+test("validateTriageInput: rejects missing issue arg — no deps touched", () => {
+  const result = validateTriageInput(undefined, "ready");
+  assert.ok(result !== null, "should return an error string");
+  assert.ok(result.includes("positive integer"), "should mention positive integer");
+});
+
+test("validateTriageInput: rejects missing stage — no deps touched", () => {
+  const result = validateTriageInput("42", undefined);
+  assert.ok(result !== null, "should return an error string");
+  assert.ok(result.includes("--stage"), "should mention --stage");
+  assert.ok(result.includes("required"), "should say it is required");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 regression — add-first order: addLabel throws → removeLabel skipped
+// ---------------------------------------------------------------------------
+
+test("triage: add-first order — if addLabel throws, removeLabel is never called", async () => {
+  const deps = makeDeps(["pipeline:backlog"], {
+    addLabel: async (_n, _l) => {
+      throw new Error("simulated network failure on add");
+    },
+  });
+  const input: TriageInput = { issueArg: "42", stage: "ready" };
+
+  await assert.rejects(
+    () => runTriage(input, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("simulated network failure on add"));
+      return true;
+    },
+  );
+  assert.equal(
+    deps._removeCalls.length,
+    0,
+    "removeLabel must not be called when addLabel fails (issue must not be left unstaged)",
+  );
 });
