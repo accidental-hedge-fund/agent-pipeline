@@ -12,7 +12,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -53,6 +53,87 @@ test("isDirtyResult: code≠0, empty stdout → true (fail closed)", () => {
 
 test("isDirtyResult: code≠0, non-empty stdout → true", () => {
   assert.equal(isDirtyResult(1, "some error text"), true);
+});
+
+// ---------------------------------------------------------------------------
+// parseWorktreePorcelain — worktree discovery (#223)
+//
+// Regression: a worktree in detached HEAD (no `branch` porcelain line) was
+// skipped entirely because matching keyed only on the branch. The fix stage's
+// getForIssue() then saw the worktree as missing and blocked a converging run
+// with a false "No worktree found." It must instead fall back to the on-disk
+// directory name `pipeline-<N>-<slug>` under the worktree root.
+// ---------------------------------------------------------------------------
+
+const ROOT = "/repo/.worktrees";
+
+test("parseWorktreePorcelain: on-branch worktree resolves by branch", () => {
+  const stdout = [
+    "worktree /repo",
+    "HEAD 1111111111111111111111111111111111111111",
+    "branch refs/heads/main",
+    "",
+    "worktree /repo/.worktrees/pipeline-216-triage-slug",
+    "HEAD 2222222222222222222222222222222222222222",
+    "branch refs/heads/pipeline/216-triage-slug",
+    "",
+  ].join("\n");
+  const recs = parseWorktreePorcelain(stdout, ROOT);
+  assert.deepEqual(
+    recs.map((r) => ({ n: r.issueNumber, slug: r.slug })),
+    [{ n: 216, slug: "triage-slug" }],
+  );
+});
+
+test("parseWorktreePorcelain: detached worktree under root still resolves by path (#223)", () => {
+  // No `branch` line — git emits `detached` for a checked-out SHA. Before the
+  // fix this record was dropped and getForIssue() returned null → false block.
+  const stdout = [
+    "worktree /repo/.worktrees/pipeline-216-triage-slug",
+    "HEAD 2222222222222222222222222222222222222222",
+    "detached",
+    "",
+  ].join("\n");
+  const recs = parseWorktreePorcelain(stdout, ROOT);
+  assert.deepEqual(
+    recs.map((r) => ({ n: r.issueNumber, slug: r.slug })),
+    [{ n: 216, slug: "triage-slug" }],
+    "a detached pipeline worktree must still be discoverable",
+  );
+});
+
+test("parseWorktreePorcelain: branch takes precedence over path basename", () => {
+  // Directory name and branch disagree → branch wins (it is authoritative when present).
+  const stdout = [
+    "worktree /repo/.worktrees/pipeline-216-old-slug",
+    "HEAD 2222222222222222222222222222222222222222",
+    "branch refs/heads/pipeline/216-new-slug",
+    "",
+  ].join("\n");
+  const recs = parseWorktreePorcelain(stdout, ROOT);
+  assert.deepEqual(recs.map((r) => r.slug), ["new-slug"]);
+});
+
+test("parseWorktreePorcelain: detached non-pipeline dir under root is ignored", () => {
+  const stdout = [
+    "worktree /repo/.worktrees/some-other-checkout",
+    "HEAD 2222222222222222222222222222222222222222",
+    "detached",
+    "",
+  ].join("\n");
+  assert.deepEqual(parseWorktreePorcelain(stdout, ROOT), []);
+});
+
+test("parseWorktreePorcelain: detached pipeline-named dir OUTSIDE root is ignored", () => {
+  // Off-branch fallback is scoped to the worktree root so unrelated checkouts
+  // that merely share the naming pattern are never misclassified.
+  const stdout = [
+    "worktree /somewhere/else/pipeline-216-triage-slug",
+    "HEAD 2222222222222222222222222222222222222222",
+    "detached",
+    "",
+  ].join("\n");
+  assert.deepEqual(parseWorktreePorcelain(stdout, ROOT), []);
 });
 
 // ---------------------------------------------------------------------------

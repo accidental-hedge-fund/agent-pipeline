@@ -257,11 +257,23 @@ export interface WorktreeRecord {
   slug?: string;
 }
 
-/** Raw on-disk listing — every git worktree whose branch starts with
- *  `pipeline/<N>-<slug>`. Includes worktrees for issues that are already
- *  closed or sitting at `pipeline:ready-to-deploy`. */
-export async function listOnDisk(cfg: PipelineConfig): Promise<WorktreeRecord[]> {
-  const { stdout } = await git(cfg, cfg.repo_dir, ["worktree", "list", "--porcelain"]);
+/** Parse `git worktree list --porcelain` output into pipeline worktree records.
+ *
+ *  A worktree is identified by issue + slug from its `pipeline/<N>-<slug>`
+ *  branch when it is checked out on that branch. When it is **off its branch**
+ *  — git emits no `branch` line for a detached HEAD, which happens while a
+ *  stage checks out a specific SHA inside the worktree (e.g. the review→fix
+ *  handoff) — we fall back to deriving the identity from the on-disk directory
+ *  name `pipeline-<N>-<slug>` under the configured worktree root. Without that
+ *  fallback a present, git-registered worktree is invisible the moment it is
+ *  not on its branch, so the fix stage's {@link getForIssue} falsely reports
+ *  "No worktree found" and blocks a converging run (#223).
+ *
+ *  Pure (no I/O) so the parsing + matching is unit-testable without real git. */
+export function parseWorktreePorcelain(
+  stdout: string,
+  worktreeRootAbs: string,
+): WorktreeRecord[] {
   const records: WorktreeRecord[] = [];
   let current: WorktreeRecord | null = null;
   for (const line of stdout.split("\n")) {
@@ -277,18 +289,46 @@ export async function listOnDisk(cfg: PipelineConfig): Promise<WorktreeRecord[]>
   }
   if (current?.path) records.push(current);
 
+  const root = path.resolve(worktreeRootAbs);
   const pipelineRecords: WorktreeRecord[] = [];
   for (const rec of records) {
-    if (!rec.branch?.startsWith("pipeline/")) continue;
-    const rest = rec.branch.slice("pipeline/".length);
-    const m = rest.match(/^(\d+)-(.+)$/);
-    if (m) {
-      rec.issueNumber = Number.parseInt(m[1], 10);
-      rec.slug = m[2];
+    let issueNumber: number | undefined;
+    let slug: string | undefined;
+
+    // Prefer the branch when the worktree is on its pipeline branch.
+    const branchMatch = rec.branch?.startsWith("pipeline/")
+      ? rec.branch.slice("pipeline/".length).match(/^(\d+)-(.+)$/)
+      : null;
+    if (branchMatch) {
+      issueNumber = Number.parseInt(branchMatch[1], 10);
+      slug = branchMatch[2];
+    } else if (path.resolve(path.dirname(rec.path)) === root) {
+      // Off-branch (detached) fallback: identify by the directory name, but
+      // only for worktrees directly under the configured worktree root so we
+      // never misclassify an unrelated checkout.
+      const pathMatch = path.basename(rec.path).match(/^pipeline-(\d+)-(.+)$/);
+      if (pathMatch) {
+        issueNumber = Number.parseInt(pathMatch[1], 10);
+        slug = pathMatch[2];
+      }
+    }
+
+    if (issueNumber !== undefined && slug !== undefined) {
+      rec.issueNumber = issueNumber;
+      rec.slug = slug;
       pipelineRecords.push(rec);
     }
   }
   return pipelineRecords;
+}
+
+/** Raw on-disk listing — every pipeline worktree (`pipeline/<N>-<slug>` branch
+ *  or `pipeline-<N>-<slug>` directory under the worktree root). Includes
+ *  worktrees for issues that are already closed or sitting at
+ *  `pipeline:ready-to-deploy`. */
+export async function listOnDisk(cfg: PipelineConfig): Promise<WorktreeRecord[]> {
+  const { stdout } = await git(cfg, cfg.repo_dir, ["worktree", "list", "--porcelain"]);
+  return parseWorktreePorcelain(stdout, worktreeRoot(cfg));
 }
 
 /** Worktrees backing issues that are still in-flight — open on GitHub AND
