@@ -74,11 +74,13 @@ interface FakeOverrides {
   exec?: (file: string, args: string[]) => ExecResult;
   fsExists?: (p: string) => boolean;
   fileMtime?: (p: string) => number | null;
+  readTextFile?: (p: string) => string | null;
   onCall?: (file: string, args: string[]) => void;
 }
 
 /** Build DoctorDeps fakes. Defaults: every command succeeds, every path exists,
- *  mtimes are equal — i.e. an all-pass environment. Override per test. */
+ *  mtimes are equal, readTextFile returns a v1.0.0 package.json — i.e. an all-pass
+ *  environment when version "1.0.0" is used. Override per test. */
 function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
   return {
     exec: async (f, a) => {
@@ -91,11 +93,15 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     },
     fsExists: async (p) => (o.fsExists ? o.fsExists(p) : true),
     fileMtime: async (p) => (o.fileMtime ? o.fileMtime(p) : 1000),
+    readTextFile: async (p) => (o.readTextFile ? o.readTextFile(p) : '{"version":"1.0.0"}'),
   };
 }
 
-function getCheck(config: PipelineConfig, id: string): PreflightCheck {
-  const c = buildPreflightChecks(config).find((x) => x.id === id);
+const FAKE_VERSION = "1.0.0";
+const FAKE_INSTALL_ROOT = "/fake/install/root";
+
+function getCheck(config: PipelineConfig, id: string, version = FAKE_VERSION): PreflightCheck {
+  const c = buildPreflightChecks(config, version, FAKE_INSTALL_ROOT).find((x) => x.id === id);
   assert.ok(c, `expected a check with id "${id}"`);
   return c!;
 }
@@ -221,14 +227,14 @@ test("check worktree-clean — fails when the branch cannot be determined", asyn
 // ---------------------------------------------------------------------------
 
 test("buildPreflightChecks — emits one check per distinct configured harness binary", () => {
-  const ids = buildPreflightChecks(makeConfig()).map((c) => c.id);
+  const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
   assert.ok(ids.includes("harness:codex"));
   assert.ok(ids.includes("harness:claude"));
 });
 
 test("buildPreflightChecks — de-dupes when implementer and reviewer share a binary", () => {
   const cfg = makeConfig({ harnesses: { implementer: "claude", reviewer: "claude" } });
-  const harnessChecks = buildPreflightChecks(cfg).filter((c) => c.id.startsWith("harness:"));
+  const harnessChecks = buildPreflightChecks(cfg, FAKE_VERSION, FAKE_INSTALL_ROOT).filter((c) => c.id.startsWith("harness:"));
   assert.equal(harnessChecks.length, 1);
   assert.equal(harnessChecks[0].id, "harness:claude");
 });
@@ -470,6 +476,64 @@ test("check plugin-mirror — fails with build.mjs remediation when the mirror i
   assert.match(r.remediation!, /build\.mjs/i);
 });
 
+// ---------------------------------------------------------------------------
+// install:version-coherence check (#186)
+// ---------------------------------------------------------------------------
+
+test("check install:version-coherence — passes and detail includes version and install path when versions match", async () => {
+  const r = await getCheck(makeConfig(), "install:version-coherence").run(
+    fakeDeps({ readTextFile: () => `{"version":"${FAKE_VERSION}"}` }),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, new RegExp(FAKE_VERSION));
+  assert.match(r.detail, new RegExp(FAKE_INSTALL_ROOT.replace(/\//g, "\\/")));
+});
+
+test("check install:version-coherence — fails naming both versions when on-disk version differs", async () => {
+  const r = await getCheck(makeConfig(), "install:version-coherence").run(
+    fakeDeps({ readTextFile: () => '{"version":"2.0.0"}' }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /1\.0\.0/);  // loaded (FAKE_VERSION)
+  assert.match(r.detail, /2\.0\.0/);  // on-disk
+  assert.match(r.detail, new RegExp(FAKE_INSTALL_ROOT.replace(/\//g, "\\/")));
+  assert.match(r.remediation!, /reinstall/i);
+});
+
+test("check install:version-coherence — fails with reinstall remediation when readTextFile returns null", async () => {
+  const r = await getCheck(makeConfig(), "install:version-coherence").run(
+    fakeDeps({ readTextFile: () => null }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.remediation!, /reinstall/i);
+});
+
+test("check install:version-coherence — fails with reinstall remediation when package.json is malformed JSON", async () => {
+  const r = await getCheck(makeConfig(), "install:version-coherence").run(
+    fakeDeps({ readTextFile: () => "not valid json {{{" }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.remediation!, /reinstall/i);
+});
+
+// Regression for the corrupt-install startup path (#186 review 2): if core/package.json
+// is unreadable at startup, loadVersion() in pipeline.ts returns "" rather than throwing
+// at module load. This test proves runPreflight still executes (does not crash) and that
+// install:version-coherence surfaces the reinstall remediation for that scenario.
+test("runPreflight — corrupt-install: VERSION='' + unreadable package.json → install:version-coherence fails with reinstall remediation", async () => {
+  const cfg = makeConfig();
+  const result = await runPreflight(
+    cfg,
+    fakeDeps({ readTextFile: () => null }),
+    {},
+    "", // empty sentinel — what loadVersion() returns when core/package.json is unreadable
+  );
+  assert.equal(result.ok, false);
+  const vc = result.checks.find((c) => c.id === "install:version-coherence");
+  assert.equal(vc?.status, "fail");
+  assert.match(vc!.remediation!, /reinstall/i);
+});
+
 // When config.repo is "" (gh was unavailable or the checkout cannot be resolved to a
 // GitHub repo during config resolution), repo-access must fail — not skip. The spec
 // requires a failing check with remediation, not a silent omission from the result set.
@@ -488,7 +552,7 @@ test("runPreflight — all checks pass → ok true, no failures", async () => {
   // Defaults: every command succeeds, every path exists; openspec active (auto+dir),
   // eval gate disabled (skip). worktree on default branch "" → feature → pass.
   const cfg = makeConfig({ openspec: { enabled: "auto", bootstrap: false } });
-  const result = await runPreflight(cfg, fakeDeps());
+  const result = await runPreflight(cfg, fakeDeps(), {}, FAKE_VERSION);
   assert.equal(result.ok, true);
   assert.ok(result.checks.length >= 8, `expected the full check set; got ${result.checks.length}`);
   assert.equal(result.checks.filter((c) => c.status === "fail").length, 0);
@@ -500,11 +564,12 @@ test("runPreflight — one failing check with failFast:false runs every check, o
   // plugin-mirror check also calls execCheck("node", ...) and would otherwise add
   // a second failure, obscuring the "exactly one failure" assertion.
   const cfg = makeConfig();
-  const allChecks = buildPreflightChecks(cfg).length;
+  const allChecks = buildPreflightChecks(cfg, FAKE_VERSION, FAKE_INSTALL_ROOT).length;
   const result = await runPreflight(
     cfg,
     fakeDeps({ execCheck: (f) => f !== "node", fsExists: (p) => !p.includes("build.mjs") }),
     { failFast: false },
+    FAKE_VERSION,
   );
   assert.equal(result.ok, false);
   assert.equal(result.checks.length, allChecks, "collect-all must run every check");
@@ -517,7 +582,7 @@ test("runPreflight — one failing check with failFast:false runs every check, o
 test("runPreflight — failFast:true stops after the first failing check", async () => {
   const cfg = makeConfig();
   // node is the 2nd check; with failFast we stop there.
-  const result = await runPreflight(cfg, fakeDeps({ execCheck: (f) => f !== "node" }), { failFast: true });
+  const result = await runPreflight(cfg, fakeDeps({ execCheck: (f) => f !== "node" }), { failFast: true }, FAKE_VERSION);
   assert.equal(result.ok, false);
   assert.equal(result.checks.length, 2, "failFast must stop after the first failure");
   assert.equal(result.checks[0].id, "cli:gh");
@@ -527,14 +592,14 @@ test("runPreflight — failFast:true stops after the first failing check", async
 
 test("runPreflight — skips the OpenSpec check when openspec is off", async () => {
   const cfg = makeConfig({ openspec: { enabled: "off", bootstrap: false } });
-  const result = await runPreflight(cfg, fakeDeps());
+  const result = await runPreflight(cfg, fakeDeps(), {}, FAKE_VERSION);
   const os = result.checks.find((c) => c.id === "openspec-cli");
   assert.equal(os?.status, "skip");
   assert.equal(result.ok, true);
 });
 
 test("runPreflight — skips the eval-command check when no command is configured", async () => {
-  const result = await runPreflight(makeConfig(), fakeDeps());
+  const result = await runPreflight(makeConfig(), fakeDeps(), {}, FAKE_VERSION);
   const ev = result.checks.find((c) => c.id === "eval-command");
   assert.equal(ev?.status, "skip");
 });
@@ -546,7 +611,7 @@ test("runPreflight — skips the eval-command check when no command is configure
 test("runPreflight — never invokes a language model (no harness model call)", async () => {
   const calls: Array<{ file: string; args: string[] }> = [];
   const cfg = makeConfig({ openspec: { enabled: "auto", bootstrap: false } });
-  await runPreflight(cfg, fakeDeps({ onCall: (file, args) => calls.push({ file, args }) }));
+  await runPreflight(cfg, fakeDeps({ onCall: (file, args) => calls.push({ file, args }) }), {}, FAKE_VERSION);
   for (const { file, args } of calls) {
     // A model invocation would look like `claude --print …` or `codex exec --full-auto …`.
     assert.ok(!(file === "claude" && args.includes("--print")), `model call detected: ${file} ${args.join(" ")}`);
@@ -1062,7 +1127,7 @@ test("runDoctor without --json: prose output is unchanged (regression guard #154
 test("runPreflight: result contains schema_version: 1", async () => {
   const deps = fakeDeps();
   const cfg = makeConfig();
-  const result = await runPreflight(cfg, deps);
+  const result = await runPreflight(cfg, deps, {}, FAKE_VERSION);
   assert.equal(result.schema_version, 1, "runPreflight must set schema_version: 1");
 });
 

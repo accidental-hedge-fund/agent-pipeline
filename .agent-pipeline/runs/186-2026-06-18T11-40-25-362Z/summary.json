@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "schemaVersion": 1,
+  "runId": "186/2026-06-18T11:40:25Z",
+  "issue": 186,
+  "pr": 224,
+  "branch": "pipeline/186-pipeline-version-can-report-a-stale-vers",
+  "harnesses": [
+    "claude",
+    "codex"
+  ],
+  "stages": [
+    {
+      "stage": "review-2",
+      "enteredAt": "2026-06-18T11:40:28Z",
+      "exitedAt": "2026-06-18T11:45:21Z",
+      "outcome": "advanced",
+      "commits": [],
+      "commands": [],
+      "prompts": [
+        {
+          "kind": "review-adversarial",
+          "harness": "codex",
+          "hash": "f005dda5",
+          "excerpt": "You are performing an adversarial software review for agent-pipeline, a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex).\nYour job is to break confidence in the change, not to validate it.\nRound role: targeted deep-dive on high-risk vectors not yet resolved by round-1 — spend your budget where the earlier rounds did not.\n\n# agent-pipeline — working conventions\n\nA self-contained TypeScript skill that advances a GitHub issue through a label-driven\nstate machine to `pipe"
+        }
+      ]
+    }
+  ],
+  "reviews": [
+    {
+      "round": 2,
+      "sha": "4a00164be6d3ad642ede8328ebb3eeb12ceed946",
+      "verdict": "needs-attention",
+      "findingCounts": {
+        "critical": 0,
+        "high": 0,
+        "medium": 1,
+        "low": 0
+      }
+    }
+  ],
+  "overrides": [],
+  "recoveries": [],
+  "finalState": "needs-human",
+  "finalizedAt": "2026-06-18T11:45:23Z",
+  "notifiedAt": null,
+  "run_id": "186-2026-06-18T11-40-25-362Z"
+}

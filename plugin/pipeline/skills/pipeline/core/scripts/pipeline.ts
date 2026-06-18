@@ -103,8 +103,16 @@ const MAX_ITERATIONS = 12;
 // automatically. The path is `../package.json` (core/package.json) and is mirror-safe:
 // build.mjs copies `package.json` alongside `scripts/` into the generated plugin, so the
 // same relative path resolves in both the dev and installed layouts.
+// Returns "" on missing/malformed file so `pipeline doctor` can execute and surface the
+// install:version-coherence failure instead of crashing before the command dispatches.
 const require = createRequire(import.meta.url);
-export const VERSION: string = (require("../package.json") as { version: string }).version;
+export const VERSION: string = (() => {
+  try {
+    return (require("../package.json") as { version: string }).version;
+  } catch {
+    return "";
+  }
+})();
 
 export interface CliOpts {
   status?: boolean;
@@ -896,7 +904,7 @@ export async function runDoctor(
     // Silent polling gate: run checks, set exit code, zero bytes of output.
     try {
       const failFast = opts.failFast ?? cfg.doctor.failFast;
-      const result = await deps.runPreflight(cfg, undefined, { failFast });
+      const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
       process.exitCode = result.ok ? 0 : 1;
     } catch {
       process.exitCode = 1;
@@ -905,7 +913,7 @@ export async function runDoctor(
   }
 
   const failFast = opts.failFast ?? cfg.doctor.failFast;
-  const result = await deps.runPreflight(cfg, undefined, { failFast });
+  const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
   await deps.storePreflightResult(cfg, result);
 
   if (opts.json) {
@@ -930,7 +938,7 @@ export async function runStartPreflightGate(
 
   console.log(`[pipeline] running preflight (doctor) before planning...`);
   const failFast = opts.failFast ?? cfg.doctor.failFast;
-  const result = await deps.runPreflight(cfg, undefined, { failFast });
+  const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
   await deps.storePreflightResult(cfg, result);
   console.log(formatDoctorSummary(result));
   if (!result.ok) {

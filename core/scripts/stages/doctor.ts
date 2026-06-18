@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { PipelineConfig } from "../types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
 
@@ -40,6 +41,8 @@ export interface DoctorDeps {
   fsExists(p: string): Promise<boolean>;
   /** mtime in ms since epoch, or null when the path does not exist. */
   fileMtime(p: string): Promise<number | null>;
+  /** Read a file as UTF-8 text; returns null on any error (missing, permission, etc). */
+  readTextFile(p: string): Promise<string | null>;
 }
 
 export type CheckStatus = "pass" | "fail" | "skip";
@@ -108,7 +111,14 @@ export function realDoctorDeps(): DoctorDeps {
       return null;
     }
   };
-  return { exec, execCheck, fsExists, fileMtime };
+  const readTextFile: DoctorDeps["readTextFile"] = async (p) => {
+    try {
+      return await fs.promises.readFile(p, "utf8");
+    } catch {
+      return null;
+    }
+  };
+  return { exec, execCheck, fsExists, fileMtime, readTextFile };
 }
 
 // ---------------------------------------------------------------------------
@@ -133,9 +143,16 @@ function protectedBranches(config: PipelineConfig): Set<string> {
 }
 
 /** Build the ordered list of preflight checks for the given resolved config.
- *  Conditional checks (OpenSpec, eval command, the harness set) are derived
- *  from config here, so the returned list is exactly what will run. */
-export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
+ *  `version` is the `VERSION` constant from `pipeline.ts` (loaded at startup) and is used
+ *  by the install:version-coherence check. `installRoot` overrides the auto-derived install
+ *  root path (for unit tests that need deterministic paths). */
+export function buildPreflightChecks(
+  config: PipelineConfig,
+  version: string,
+  installRoot?: string,
+): PreflightCheck[] {
+  // core/scripts/stages/doctor.ts → dirname×3 → core/
+  const root = installRoot ?? path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
   const checks: PreflightCheck[] = [];
 
   // 1. Required CLIs — one check per binary so remediation can name it.
@@ -260,7 +277,42 @@ export function buildPreflightChecks(config: PipelineConfig): PreflightCheck[] {
     });
   }
 
-  // 6. Package install state — only meaningful for npm-ci repos (those with a
+  // 6. Install version coherence — the VERSION constant loaded by pipeline.ts at startup
+  //    must match the version field in core/package.json at the install root. A mismatch
+  //    means the running binary is from a different (usually older) install than the code
+  //    on disk, making version-tagged bug reports unreliable.
+  checks.push({
+    id: "install:version-coherence",
+    description: "Installed core/package.json version matches the running pipeline version",
+    run: async (deps) => {
+      const pkgPath = path.join(root, "package.json");
+      const text = await deps.readTextFile(pkgPath);
+      if (text === null) {
+        return fail(
+          `core/package.json at ${root} could not be read`,
+          `Reinstall the pipeline skill to ensure core/package.json is present and readable at ${root}.`,
+        );
+      }
+      let pkg: { version?: string };
+      try {
+        pkg = JSON.parse(text) as { version?: string };
+      } catch {
+        return fail(
+          `core/package.json at ${root} is not valid JSON`,
+          `Reinstall the pipeline skill to restore a valid core/package.json at ${root}.`,
+        );
+      }
+      if (pkg.version !== version) {
+        return fail(
+          `version mismatch: running v${version} but core/package.json at ${root} reports v${pkg.version ?? "(missing)"}`,
+          `Reinstall the pipeline skill to bring the running code in sync with core/package.json at ${root}.`,
+        );
+      }
+      return pass(`v${version} at ${root}`);
+    },
+  });
+
+  // 7. Package install state — only meaningful for npm-ci repos (those with a
   //    package-lock.json at the repo root). Heuristic: node_modules must exist
   //    and not be older than the lock file. `npm ci` is the fix either way.
   checks.push({
@@ -384,13 +436,16 @@ export interface RunPreflightOptions {
 
 /** Run every applicable preflight check and collect per-check results.
  *  Deterministic and model-free. With `failFast`, stops after the first failure
- *  (later checks are simply absent from the result). */
+ *  (later checks are simply absent from the result). `version` is the `VERSION`
+ *  constant from `pipeline.ts` and is threaded into `buildPreflightChecks` for
+ *  the install:version-coherence check. */
 export async function runPreflight(
   config: PipelineConfig,
   deps: DoctorDeps = realDoctorDeps(),
   opts: RunPreflightOptions = {},
+  version = "",
 ): Promise<PreflightResult> {
-  const checks = buildPreflightChecks(config);
+  const checks = buildPreflightChecks(config, version);
   const outcomes: CheckOutcome[] = [];
   let ok = true;
   for (const check of checks) {

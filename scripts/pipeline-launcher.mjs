@@ -36,12 +36,99 @@ const entry = join(coreDir, "scripts", "pipeline.ts");
 
 const rawArgs = process.argv.slice(2);
 
-// Short-circuit for --version / -V: works before dependency provisioning
-// because the version lives in core/package.json which is always present.
+// Report a corrupt install (core/package.json missing or malformed) for the
+// pre-dispatch guard below. `doctor` has machine-output contracts that automated
+// consumers depend on, so honor them even on this error path — otherwise a
+// `doctor --json` / `doctor --is-ok` poller gets prose where it asked for a JSON
+// envelope / a silent 0-1 gate:
+//   • `doctor --is-ok` → zero output (the exit code carries the verdict)
+//   • `doctor --json`  → the stable doctor JSON envelope (schema_version "1")
+//   • `doctor`         → human-readable prose
+//   • any other command → a stderr reinstall hint
+// Mirrors formatDoctorJson() and the prose formatter in core/scripts/stages/doctor.ts.
+function reportCorruptInstall(rawArgs, coreDir) {
+  if (rawArgs[0] !== "doctor") {
+    process.stderr.write(
+      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
+      "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
+    );
+    return;
+  }
+  if (rawArgs.includes("--is-ok")) return; // silent 0/1 gate: exit code only
+  const reason = `core/package.json at ${coreDir} is missing or not valid JSON`;
+  const fix = `Reinstall the pipeline skill to restore a valid core/package.json at ${coreDir}.`;
+  if (rawArgs.includes("--json")) {
+    process.stdout.write(
+      JSON.stringify({
+        schema_version: "1",
+        status: "error",
+        checks: [{ name: "install:version-coherence", ok: false, reason, fix }],
+      }) + "\n",
+    );
+    return;
+  }
+  process.stdout.write(
+    `Pipeline doctor — 1 check (0 passed, 1 failed, 0 skipped)\n\n` +
+    `  ✗ install:version-coherence — ${reason}\n` +
+    `      → ${fix}\n\n` +
+    `Result: FAIL\n`,
+  );
+}
+
+// Read core/package.json once upfront.  Two reasons:
+//   (a) --version short-circuit needs it before dependency provisioning.
+//   (b) Node reads core/package.json to determine module type (ESM vs CJS)
+//       *before* executing any code in pipeline.ts, so a malformed file causes
+//       ERR_INVALID_PACKAGE_CONFIG before any try/catch or `doctor` check can
+//       run.  We detect the corrupt-install case here and surface it ourselves.
+const pkgPath = join(coreDir, "package.json");
+let pkgVersion = "";
+let pkgReadable = true;
+try {
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  // Accept only a shape that lets Node load this ESM-only package's TypeScript
+  // entries. A file that is valid JSON but an invalid/incompatible package config
+  // — a non-object (e.g. `[]`), a non-string `version`, or an explicit `type`
+  // other than "module" (`type: 123` → ERR_INVALID_PACKAGE_CONFIG; `type:
+  // "commonjs"` → the ESM `import` entries fail to load as CommonJS) — does NOT
+  // throw here, yet crashes Node when it loads pipeline.ts/path-cli.ts, leaking a
+  // raw stack before the guard below can report a coherent diagnostic. Treat any
+  // such config as corrupt. `type` absent is fine (the .ts entries load as ESM).
+  const isObject = pkg !== null && typeof pkg === "object" && !Array.isArray(pkg);
+  const validType = isObject && (pkg.type === undefined || pkg.type === "module");
+  if (isObject && typeof pkg.version === "string" && validType) {
+    pkgVersion = pkg.version;
+  } else {
+    pkgReadable = false;
+  }
+} catch {
+  pkgReadable = false;
+}
+
+// Short-circuit for --version / -V: works before dependency provisioning.
 if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
-  const pkg = JSON.parse(readFileSync(join(coreDir, "package.json"), "utf8"));
-  process.stdout.write(pkg.version + "\n");
+  if (!pkgReadable) {
+    process.stderr.write(
+      `pipeline: core/package.json at ${coreDir} is missing or not valid JSON.\n` +
+      "         Reinstall with: npm install -g agent-pipeline\n",
+    );
+    process.exit(1);
+  }
+  process.stdout.write(pkgVersion + "\n");
   process.exit(0);
+}
+
+// Corrupt install: a missing/malformed core/package.json makes Node throw
+// ERR_INVALID_PACKAGE_CONFIG when it loads ANY TypeScript entry (path-cli.ts or
+// pipeline.ts), before that code can run. Surface a coherent diagnostic here —
+// ahead of the `path` fast-path, the entry check, AND the node_modules check —
+// so every command (including the desktop `path --json` discovery contract, and a
+// corrupt install that also lacks node_modules) reports the version-coherence
+// failure instead of a raw Node stack trace. `--version` is handled above with
+// its own pkgReadable branch and never reaches here.
+if (!pkgReadable) {
+  reportCorruptInstall(rawArgs, coreDir);
+  process.exit(1);
 }
 
 // `pipeline path` discovery only needs Node built-ins (discovery.ts has no
