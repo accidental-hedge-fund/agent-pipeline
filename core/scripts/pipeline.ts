@@ -497,20 +497,38 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Early triage dispatch — derives repo_dir from local git state only; no gh auth needed
-  // for the dispatch itself. The handler validates issue number and stage, then makes
+  // Early triage dispatch — resolves config for cfg.repo so gh wrappers target the
+  // configured repository. The handler validates issue number and stage, then makes
   // the gh calls to read/add/remove labels.
   if (isTriageCommand) {
-    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
-    const repoDir = findGitRoot(startDir);
-    if (!repoDir) {
-      console.error(
-        `pipeline: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
-      );
-      process.exit(2);
+    const triageConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--dry-run", opts.dryRun],
+      ["--status", opts.status],
+      ["--cleanup", opts.cleanup],
+      ["--init (or 'pipeline init')", isInit],
+      ["doctor", isDoctorCommand],
+      ["--doctor", opts.doctor],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+      ["--detach", opts.detach],
+    ];
+    for (const [flag, active] of triageConflicts) {
+      if (active) {
+        console.error(
+          `pipeline: 'pipeline triage' cannot be combined with ${flag}. These are separate commands.`,
+        );
+        process.exit(2);
+      }
+    }
+    let triageCfg: PipelineConfig;
+    try {
+      triageCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline triage: config error: ${(err as Error).message}`);
+      process.exit(1);
     }
     try {
-      await runTriage({ issueArg: cmd.args[1], stage: opts.stage }, realTriageDeps(repoDir));
+      await runTriage({ issueArg: cmd.args[1], stage: opts.stage }, realTriageDeps(triageCfg));
     } catch (err) {
       console.error(`pipeline triage: ${(err as Error).message}`);
       process.exit(1);

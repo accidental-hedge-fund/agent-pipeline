@@ -4,7 +4,12 @@
 // Fully deterministic — no model harness call. All external I/O is injected
 // via TriageDeps so unit tests use no real network, git, or subprocess calls.
 
-import { spawnSync } from "node:child_process";
+import {
+  addLabel as ghAddLabel,
+  getIssueStateAndLabels,
+  removeLabel as ghRemoveLabel,
+} from "../gh.ts";
+import type { PipelineConfig } from "../types.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -32,44 +37,20 @@ export interface TriageInput {
 // Real deps
 // ---------------------------------------------------------------------------
 
-export function realTriageDeps(repoDir: string): TriageDeps {
+export function realTriageDeps(cfg: PipelineConfig): TriageDeps {
   return {
     getIssueLabels: async (issueNumber) => {
-      const result = spawnSync(
-        "gh",
-        ["issue", "view", String(issueNumber), "--json", "labels", "--jq", ".labels[].name"],
-        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
-      );
-      if (result.status !== 0) {
-        throw new Error(
-          `[pipeline triage] gh issue view failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-        );
+      const result = await getIssueStateAndLabels(cfg, issueNumber);
+      if (!result) {
+        throw new Error(`[pipeline triage] could not fetch labels for issue #${issueNumber}`);
       }
-      return result.stdout.trim().split("\n").filter(Boolean);
+      return result.labels;
     },
     addLabel: async (issueNumber, label) => {
-      const result = spawnSync(
-        "gh",
-        ["issue", "edit", String(issueNumber), "--add-label", label],
-        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
-      );
-      if (result.status !== 0) {
-        throw new Error(
-          `[pipeline triage] gh issue edit --add-label "${label}" failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-        );
-      }
+      await ghAddLabel(cfg, issueNumber, label);
     },
     removeLabel: async (issueNumber, label) => {
-      const result = spawnSync(
-        "gh",
-        ["issue", "edit", String(issueNumber), "--remove-label", label],
-        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
-      );
-      if (result.status !== 0) {
-        throw new Error(
-          `[pipeline triage] gh issue edit --remove-label "${label}" failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-        );
-      }
+      await ghRemoveLabel(cfg, issueNumber, label);
     },
     log: (msg) => process.stdout.write(msg + "\n"),
   };
@@ -82,14 +63,14 @@ export function realTriageDeps(repoDir: string): TriageDeps {
 export async function runTriage(input: TriageInput, deps: TriageDeps): Promise<void> {
   const { issueArg, stage } = input;
 
-  // Validate issue number
-  const issueNumber = Number.parseInt(issueArg ?? "", 10);
-  if (!issueArg || !Number.isFinite(issueNumber) || issueNumber <= 0) {
+  // Validate issue number — full-string check rejects "42abc", "42.9", "1e2", etc.
+  if (!issueArg || !/^[1-9]\d*$/.test(issueArg)) {
     throw new Error(
       `issue number is required and must be a positive integer` +
         (issueArg ? ` (got: "${issueArg}")` : ""),
     );
   }
+  const issueNumber = Number.parseInt(issueArg, 10);
 
   // Validate --stage is present
   if (!stage) {

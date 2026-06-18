@@ -205,3 +205,60 @@ test("triage: rejects non-numeric issue argument with a clear error", async () =
   assert.equal(deps._addCalls.length, 0);
   assert.equal(deps._removeCalls.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// 4.10 Regression — partial numeric strings must be rejected
+// ---------------------------------------------------------------------------
+
+test("triage: rejects '42abc' (partial numeric) with a clear error", async () => {
+  const deps = makeDeps([]);
+  await assert.rejects(
+    () => runTriage({ issueArg: "42abc", stage: "ready" }, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("positive integer"), "should mention positive integer");
+      assert.ok(err.message.includes("42abc"), "should echo the bad arg");
+      return true;
+    },
+  );
+  assert.equal(deps._addCalls.length, 0, "no write on bad issue arg");
+  assert.equal(deps._removeCalls.length, 0, "no write on bad issue arg");
+});
+
+test("triage: rejects '42.9' (decimal) with a clear error", async () => {
+  const deps = makeDeps([]);
+  await assert.rejects(
+    () => runTriage({ issueArg: "42.9", stage: "ready" }, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("positive integer"), "should mention positive integer");
+      return true;
+    },
+  );
+  assert.equal(deps._addCalls.length, 0);
+  assert.equal(deps._removeCalls.length, 0);
+});
+
+test("triage: rejects '1e2' (scientific notation) with a clear error", async () => {
+  const deps = makeDeps([]);
+  await assert.rejects(
+    () => runTriage({ issueArg: "1e2", stage: "ready" }, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("positive integer"), "should mention positive integer");
+      return true;
+    },
+  );
+  assert.equal(deps._addCalls.length, 0);
+  assert.equal(deps._removeCalls.length, 0);
+});
+
+test("triage: rejects '0' (zero) with a clear error", async () => {
+  const deps = makeDeps([]);
+  await assert.rejects(
+    () => runTriage({ issueArg: "0", stage: "ready" }, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("positive integer"), "should mention positive integer");
+      return true;
+    },
+  );
+  assert.equal(deps._addCalls.length, 0);
+  assert.equal(deps._removeCalls.length, 0);
+});
