@@ -322,13 +322,33 @@ export function parseWorktreePorcelain(
   return pipelineRecords;
 }
 
+export interface ListOnDiskDeps {
+  gitCmd?: (
+    cfg: PipelineConfig,
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; timeoutMs?: number },
+  ) => Promise<{ stdout: string; stderr: string; code: number }>;
+}
+
 /** Raw on-disk listing — every pipeline worktree (`pipeline/<N>-<slug>` branch
  *  or `pipeline-<N>-<slug>` directory under the worktree root). Includes
  *  worktrees for issues that are already closed or sitting at
  *  `pipeline:ready-to-deploy`. */
-export async function listOnDisk(cfg: PipelineConfig): Promise<WorktreeRecord[]> {
-  const { stdout } = await git(cfg, cfg.repo_dir, ["worktree", "list", "--porcelain"]);
-  return parseWorktreePorcelain(stdout, worktreeRoot(cfg));
+export async function listOnDisk(cfg: PipelineConfig, deps: ListOnDiskDeps = {}): Promise<WorktreeRecord[]> {
+  const gitFn = deps.gitCmd ?? git;
+  const { stdout } = await gitFn(cfg, cfg.repo_dir, ["worktree", "list", "--porcelain"]);
+  // Derive the pipeline worktree root from the FIRST "worktree <path>" line —
+  // git always lists the main (non-linked) worktree first. Using cfg.repo_dir
+  // directly is wrong when the CLI is launched from a linked worktree: cfg.repo_dir
+  // would be the linked worktree path, so path.resolve(cfg.repo_dir, cfg.worktree_root)
+  // would point to a non-existent nested .worktrees rather than the repo-level one,
+  // causing detached sibling worktrees to fall through the off-branch guard (#223).
+  const firstWorktreeLine = stdout.split("\n").find((l) => l.startsWith("worktree "));
+  const mainRepoRoot = firstWorktreeLine
+    ? firstWorktreeLine.slice("worktree ".length).trim()
+    : cfg.repo_dir;
+  return parseWorktreePorcelain(stdout, path.resolve(mainRepoRoot, cfg.worktree_root));
 }
 
 /** Worktrees backing issues that are still in-flight — open on GitHub AND

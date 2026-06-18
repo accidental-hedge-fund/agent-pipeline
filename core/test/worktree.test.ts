@@ -12,8 +12,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain } from "../scripts/worktree.ts";
-import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk } from "../scripts/worktree.ts";
+import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -134,6 +134,70 @@ test("parseWorktreePorcelain: detached pipeline-named dir OUTSIDE root is ignore
     "",
   ].join("\n");
   assert.deepEqual(parseWorktreePorcelain(stdout, ROOT), []);
+});
+
+// ---------------------------------------------------------------------------
+// listOnDisk — linked-worktree launch path (#223 regression)
+//
+// When cfg.repo_dir is a LINKED worktree path (e.g. the pipeline was started
+// from inside an existing pipeline worktree), the old code derived the worktree
+// root as path.resolve(cfg.repo_dir, cfg.worktree_root), which would be
+// /repo/.worktrees/pipeline-223-current/.worktrees — not the actual pipeline
+// worktree root /repo/.worktrees. Detached sibling worktrees then fell through
+// the off-branch guard in parseWorktreePorcelain and getForIssue returned null,
+// producing a false "No worktree found" blocker.
+//
+// Fix: listOnDisk now extracts the MAIN worktree path from the first "worktree"
+// line in the porcelain (git always lists the main worktree first), and resolves
+// worktree_root relative to that instead of cfg.repo_dir.
+// ---------------------------------------------------------------------------
+
+test("listOnDisk: detached sibling worktree found when launched from a linked worktree (#223 linked-launch regression)", async () => {
+  // cfg.repo_dir is the linked worktree path — simulates starting the pipeline
+  // from inside /repo/.worktrees/pipeline-223-current.
+  const linkedCfg: PipelineConfig = {
+    repo_dir: "/repo/.worktrees/pipeline-223-current",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    max_concurrent_worktrees: 4,
+  } as unknown as PipelineConfig;
+
+  const porcelain = [
+    // Main worktree — always first in git's output.
+    "worktree /repo",
+    "HEAD 1111111111111111111111111111111111111111",
+    "branch refs/heads/main",
+    "",
+    // The linked worktree the CLI was launched from (on its branch).
+    "worktree /repo/.worktrees/pipeline-223-current",
+    "HEAD 3333333333333333333333333333333333333333",
+    "branch refs/heads/pipeline/223-current",
+    "",
+    // A sibling pipeline worktree in detached HEAD (the bug: dropped before fix).
+    "worktree /repo/.worktrees/pipeline-216-triage-slug",
+    "HEAD 2222222222222222222222222222222222222222",
+    "detached",
+    "",
+  ].join("\n");
+
+  const deps: ListOnDiskDeps = {
+    gitCmd: async () => ({ code: 0, stdout: porcelain, stderr: "" }),
+  };
+
+  const recs = await listOnDisk(linkedCfg, deps);
+
+  // Issue 216 is detached and must be discoverable via the path-based fallback.
+  const issue216 = recs.find((r) => r.issueNumber === 216);
+  assert.ok(
+    issue216,
+    "detached sibling worktree (pipeline-216) must be discoverable when launched from a linked worktree",
+  );
+  assert.equal(issue216?.slug, "triage-slug");
+
+  // Issue 223 is on its branch and must resolve via the branch-based path.
+  const issue223 = recs.find((r) => r.issueNumber === 223);
+  assert.ok(issue223, "the current linked worktree on its branch must still resolve");
+  assert.equal(issue223?.slug, "current");
 });
 
 // ---------------------------------------------------------------------------
