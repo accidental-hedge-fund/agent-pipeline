@@ -455,6 +455,48 @@ describe("buildCalVerMarker", () => {
     }
   });
 
+  it("realRoadmapDeps.acquireMarkerLock reclaims an empty/unstamped lock once it is stale (#214 review-2)", async () => {
+    // A crash in the openSync→writeSync window leaves an empty (never PID-stamped) lock. It
+    // can't be checked for liveness, so it is reclaimed only once it is older than the
+    // stale threshold — fixing the "empty locks are never reclaimed" gap.
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-empty-lock-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, ""); // created but never PID-stamped
+      const old = new Date(Date.now() - 5 * 60_000); // 5 minutes ago — clearly stale
+      fs.utimesSync(lockPath, old, old);
+      const deps = realRoadmapDeps({} as never);
+      const release = await deps.acquireMarkerLock(outputDir); // must reclaim the stale empty lock
+      assert.equal(
+        fs.readFileSync(lockPath, "utf8").trim(),
+        String(process.pid),
+        "the stale empty lock is reclaimed and re-acquired under our PID",
+      );
+      release();
+    } finally {
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
+  });
+
+  it("realRoadmapDeps.acquireMarkerLock does NOT steal a fresh empty lock (a live run mid-stamp) (#214 review-2)", async () => {
+    // A fresh empty lock may belong to a live run that just created it and is about to stamp
+    // its PID — it must not be reclaimed; acquisition fails instead.
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-fresh-lock-"));
+    const lockPath = path.join(outputDir, ".marker.lock");
+    try {
+      fs.writeFileSync(lockPath, ""); // fresh empty lock (mtime = now)
+      const deps = realRoadmapDeps({} as never);
+      await assert.rejects(
+        () => deps.acquireMarkerLock(outputDir),
+        /EEXIST/,
+        "a fresh empty lock must not be stolen",
+      );
+      assert.ok(fs.existsSync(lockPath), "the fresh empty lock is left intact");
+    } finally {
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
+  });
+
   it("marker is absent under semver model (validated via runRoadmap output)", async () => {
     // buildCalVerMarker is only called when release_model === 'continuous'
     // This test validates the inverse: semver mode sets no continuous_version_marker
