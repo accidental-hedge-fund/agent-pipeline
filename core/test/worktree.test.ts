@@ -12,7 +12,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk, reattachIfDetached } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -1497,4 +1497,168 @@ test("realWriteNodeModulesExclude: idempotent — duplicate entry not added (#18
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// review-2 finding 1: reclaim must not force-delete worktrees outside the
+// managed root (#223)
+//
+// Regression: createWorktree passes rec.path from listActive into removeWorktree
+// for every matching record, including ones whose branch is pipeline/<N>-<slug>
+// but whose directory lives OUTSIDE cfg.worktree_root (e.g. a developer checkout
+// on the same branch). These must be skipped, not force-removed.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: reclaim skips worktree with underManagedRoot === false (#223 review-2 finding 1)", async () => {
+  const cfg = makeCreateCfg();
+  const externalRec: WorktreeRecord = {
+    path: "/home/dev/external/pipeline-42-some-slug",
+    branch: "pipeline/42-some-slug",
+    issueNumber: 42,
+    slug: "some-slug",
+    underManagedRoot: false, // outside the pipeline-managed root
+  };
+
+  const removedPaths: string[] = [];
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [externalRec],
+    existsSync: () => false,
+    removeWorktree: async (_cfg, _issueNumber, _slug, resolvedPath) => {
+      removedPaths.push(resolvedPath ?? "(computed)");
+    },
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+  };
+
+  await createWorktree(cfg, 42, "new-slug", deps);
+
+  assert.equal(
+    removedPaths.length,
+    0,
+    "a worktree with underManagedRoot === false must not be reclaimed (developer checkout outside .worktrees/)",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// review-2 finding 2: reattachIfDetached helper (#223)
+//
+// Regression: when the review stage checks out a specific SHA inside the
+// worktree (detached HEAD), harness commits land on detached HEAD rather than
+// the pipeline branch. The subsequent push silently no-ops ("Everything up-to-
+// date") while the remote PR branch remains unchanged. Fix: reattach before
+// invoking any harness.
+// ---------------------------------------------------------------------------
+
+test("reattachIfDetached: detached worktree → issues git checkout -B to pipeline branch (#223 review-2 finding 2)", async () => {
+  const detachedWt: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-42-test-slug",
+    // no branch field — detached HEAD
+    issueNumber: 42,
+    slug: "test-slug",
+  };
+  const issuedArgs: string[][] = [];
+  const gitFn = async (_cwd: string, args: string[], _opts?: unknown) => {
+    issuedArgs.push(args);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  const result = await reattachIfDetached(detachedWt, 42, gitFn);
+
+  assert.ok(result.ok, "reattach must succeed when git checkout -B exits 0");
+  assert.equal(issuedArgs.length, 1, "exactly one git command must be issued");
+  assert.deepEqual(
+    issuedArgs[0],
+    ["checkout", "-B", "pipeline/42-test-slug"],
+    "must issue 'git checkout -B pipeline/<N>-<slug>' to reattach detached HEAD to the pipeline branch",
+  );
+});
+
+test("reattachIfDetached: on-branch worktree → no git command issued", async () => {
+  const attachedWt: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-42-test-slug",
+    branch: "pipeline/42-test-slug",
+    issueNumber: 42,
+    slug: "test-slug",
+  };
+  const issuedArgs: string[][] = [];
+  const gitFn = async (_cwd: string, args: string[], _opts?: unknown) => {
+    issuedArgs.push(args);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  const result = await reattachIfDetached(attachedWt, 42, gitFn);
+
+  assert.ok(result.ok);
+  assert.equal(issuedArgs.length, 0, "no git command must be issued when already on the pipeline branch");
+});
+
+test("reattachIfDetached: git checkout -B failure → returns {ok: false} with stderr", async () => {
+  const detachedWt: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-42-test-slug",
+    issueNumber: 42,
+    slug: "test-slug",
+  };
+  const gitFn = async () => ({ code: 1, stdout: "", stderr: "fatal: checkout conflict" });
+
+  const result = await reattachIfDetached(detachedWt, 42, gitFn);
+
+  assert.ok(!result.ok);
+  assert.ok("stderr" in result && result.stderr.includes("checkout conflict"));
+});
+
+// ---------------------------------------------------------------------------
+// review-2 finding 3: sweep candidates filter uses underManagedRoot so that
+// a linked-launch does not drop sibling worktrees (#223)
+//
+// Regression: sweepMergedWorktrees computed `root` from cfg.repo_dir. When
+// the pipeline was started from a linked worktree (cfg.repo_dir =
+// /repo/.worktrees/pipeline-223-current), root became
+// /repo/.worktrees/pipeline-223-current/.worktrees — non-existent — so sibling
+// worktrees under /repo/.worktrees were excluded from cleanup candidates.
+// Fix: use rec.underManagedRoot (set by listOnDisk via parseWorktreePorcelain
+// using the canonical main-repo worktree root) when available.
+// ---------------------------------------------------------------------------
+
+test("sweep: linked-launch — sibling worktree with underManagedRoot:true is a sweep candidate (#223 review-2 finding 3)", async () => {
+  // cfg.repo_dir is the linked worktree path — not the main repo root.
+  const linkedCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo/.worktrees/pipeline-223-current",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    domain: "test",
+    max_concurrent_worktrees: 4,
+  } as unknown as PipelineConfig;
+
+  // listOnDisk (injected) returns a sibling with underManagedRoot: true, meaning
+  // parseWorktreePorcelain confirmed the path is under /repo/.worktrees.
+  const siblingRec: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-216-triage-slug",
+    branch: "pipeline/216-triage-slug",
+    issueNumber: 216,
+    slug: "triage-slug",
+    underManagedRoot: true,
+  };
+
+  const removeWorktreeCalls: WorktreeRecord[] = [];
+  const deps: Partial<SweepDeps> = {
+    listOnDisk: async () => [siblingRec],
+    getPrMergeState: async () => ({ merged: true, prNumber: 216, headSha: "abc" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "abc",
+    pathExists: () => true,
+    removeWorktree: async (_c, _n, _s, _pathOnDisk, _resolvedPath) => {
+      removeWorktreeCalls.push(siblingRec);
+      return { ok: true as const };
+    },
+  };
+
+  await sweepMergedWorktrees(linkedCfg, deps);
+
+  assert.equal(
+    removeWorktreeCalls.length,
+    1,
+    "sibling worktree with underManagedRoot:true must be a sweep candidate even when cfg.repo_dir is a linked path",
+  );
 });

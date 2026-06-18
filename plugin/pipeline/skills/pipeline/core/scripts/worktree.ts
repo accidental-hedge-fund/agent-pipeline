@@ -255,6 +255,12 @@ export interface WorktreeRecord {
   branch?: string;
   issueNumber?: number;
   slug?: string;
+  /** True when the record's path is directly under the pipeline-managed worktree
+   *  root as determined by parseWorktreePorcelain. False means the worktree shares
+   *  a pipeline branch name but lives outside the managed root (e.g. a developer's
+   *  checkout). Undefined means the record was constructed without parsing (test
+   *  injection) and the path-based fallback guard in sweepMergedWorktrees applies. */
+  underManagedRoot?: boolean;
 }
 
 /** Parse `git worktree list --porcelain` output into pipeline worktree records.
@@ -317,6 +323,11 @@ export function parseWorktreePorcelain(
     if (issueNumber !== undefined && slug !== undefined) {
       rec.issueNumber = issueNumber;
       rec.slug = slug;
+      // Mark whether the path is directly under the managed worktree root so
+      // callers can guard destructive operations (reclaim, sweep) to managed
+      // paths without recomputing the root from cfg.repo_dir (wrong for linked
+      // launches).
+      rec.underManagedRoot = path.resolve(path.dirname(rec.path)) === root;
       pipelineRecords.push(rec);
     }
   }
@@ -540,6 +551,15 @@ export async function createWorktree(
   const active = await listActiveFn(cfg);
   const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
   for (const rec of mine) {
+    // Only reclaim worktrees explicitly under the managed root. A record with
+    // underManagedRoot === false is a developer checkout that shares the pipeline
+    // branch name but lives outside .worktrees/ — force-removing it would destroy
+    // untracked work the pipeline never created. Records without underManagedRoot
+    // (test-injected, undefined) are allowed through for backwards compatibility.
+    if (rec.underManagedRoot === false) {
+      console.log(`[pipeline] #${issueNumber}: skipping reclaim of out-of-managed-root worktree ${rec.path}`);
+      continue;
+    }
     // Pass rec.path so removal targets the discovered path directly, not a path
     // recomputed from cfg.repo_dir (which is wrong when launched from a linked worktree).
     await removeFn(cfg, issueNumber, rec.slug!, rec.path);
@@ -658,6 +678,38 @@ export async function removeWorktree(
     await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath, "--force"], { ignoreFailure: true });
   }
   await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+}
+
+// ---------------------------------------------------------------------------
+// Detached HEAD recovery
+// ---------------------------------------------------------------------------
+
+/** Reattach a detached worktree to its pipeline branch before any mutating stage.
+ *
+ *  The review stage may check out a specific SHA for comparison, leaving the
+ *  worktree in detached HEAD. If the fix harness then commits, those commits
+ *  land on detached HEAD — not on the pipeline branch ref. The subsequent
+ *  `git push origin pipeline/<N>-<slug>` pushes the local branch ref (unchanged)
+ *  and exits 0 with "Everything up-to-date", so the PR branch never receives
+ *  the fix commits (#223 review-2 finding 2).
+ *
+ *  Call this before invoking any harness. No-op when the worktree already has a
+ *  branch; creates/resets the pipeline branch at the current HEAD otherwise. */
+export async function reattachIfDetached(
+  wt: WorktreeRecord,
+  issueNumber: number,
+  gitFn?: (
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; timeoutMs?: number },
+  ) => Promise<{ stdout: string; stderr: string; code: number }>,
+): Promise<{ ok: true } | { ok: false; stderr: string }> {
+  if (wt.branch !== undefined) return { ok: true };
+  const fn = gitFn ?? gitInWorktree;
+  const branch = branchName(issueNumber, wt.slug!);
+  const result = await fn(wt.path, ["checkout", "-B", branch], { ignoreFailure: true });
+  if (result.code !== 0) return { ok: false, stderr: result.stderr };
+  return { ok: true };
 }
 
 // Convenience helpers used by stage handlers.
@@ -814,11 +866,17 @@ export async function sweepMergedWorktrees(
   };
 
   const onDisk = await d.listOnDisk(cfg);
-  const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
 
-  const candidates = onDisk.filter(
-    (rec) => rec.path === root || rec.path.startsWith(root + path.sep),
-  );
+  // Use underManagedRoot when set by parseWorktreePorcelain (real discovery path)
+  // so that linked-launch sweeps use the canonical root rather than one derived
+  // from cfg.repo_dir (which would be /linked-wt/.worktrees — non-existent).
+  // When underManagedRoot is not set (test-injected records), fall back to the
+  // cfg.repo_dir path check for backwards compatibility with existing tests.
+  const candidates = onDisk.filter((rec) => {
+    if (rec.underManagedRoot !== undefined) return rec.underManagedRoot;
+    const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
+    return rec.path === root || rec.path.startsWith(root + path.sep);
+  });
 
   const removed: WorktreeRecord[] = [];
   const skipped: Array<{ rec: WorktreeRecord; reason: string }> = [];
