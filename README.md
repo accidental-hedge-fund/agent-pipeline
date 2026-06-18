@@ -212,6 +212,7 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run; no number)
 /pipeline roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
 /pipeline roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
+/pipeline merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
@@ -295,6 +296,26 @@ sweep:
     - Acceptance criteria
     - Out of scope
 ```
+
+## Merge sub-command
+
+`pipeline merge <pr>` is a **human-only** command that squash-merges a ready-to-deploy PR and deletes its head branch. It is never called by the autonomous advance loop — the loop stops at `pipeline:ready-to-deploy` and a human (or pipeline-desk on a human button click) decides when to merge.
+
+```bash
+/pipeline merge 42
+$pipeline merge 42
+```
+
+**What it does:**
+
+1. **Mergeability gate:** verifies the PR is `MERGEABLE` with a `CLEAN` merge state. Refuses with an actionable message when the PR has conflicts, is in a dirty state, or GitHub has not yet computed mergeability.
+2. **Status-checks gate:** verifies all required status checks have completed with a success or neutral conclusion. Names any failing or still-pending checks in the refusal message.
+3. **Issue-stage gate:** resolves the PR's linked closing issue and confirms it carries the label `pipeline:ready-to-deploy`. Refuses if the issue is at any other stage, or if no linked issue is found.
+4. **Squash merge:** invokes `gh pr merge --squash --delete-branch`; prints a confirmation and exits 0 on success.
+
+If any gate fails the command exits non-zero with a clear, actionable message identifying the specific blocker — no merge is attempted.
+
+**Invariant:** no `auto_merge` config key exists and the autonomous `advance` loop never invokes this handler. A unit test asserts the loop-isolation guarantee.
 
 ## Onboarding a new repo
 

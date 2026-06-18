@@ -70,6 +70,7 @@ import {
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
+import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -164,7 +165,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap | sweep")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap | sweep | merge")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -222,6 +223,8 @@ async function main(): Promise<void> {
   const isIntakeCommand = numArg === "intake";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
   const isSweepCommand = numArg === "sweep";
+  // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
+  const isMergeCommand = numArg === "merge";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -369,7 +372,13 @@ async function main(): Promise<void> {
   // `intake [description]` legitimately have two positionals; `config`/`path`
   // already returned above. `sweep` is a bulk command with no issue number —
   // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
-  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" ? 2 : 1;
+  const maxPositionals =
+    cmd.args[0] === "run" ||
+    cmd.args[0] === "release" ||
+    cmd.args[0] === "intake" ||
+    cmd.args[0] === "merge"
+      ? 2
+      : 1;
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
@@ -491,10 +500,53 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early merge dispatch — human-invoked squash merge of a ready-to-deploy PR (#217).
+  // This is the ONLY path that calls mergePr; the autonomous advance loop never reaches here.
+  if (isMergeCommand) {
+    const prArgStr = cmd.args[1];
+    if (!prArgStr || !/^\d+$/.test(prArgStr)) {
+      if (!prArgStr) {
+        console.error(
+          "pipeline merge: a PR number is required.\n" +
+            "  Usage: pipeline merge <pr-number>\n" +
+            "  Example: pipeline merge 42",
+        );
+      } else {
+        console.error(
+          `pipeline merge: "${prArgStr}" is not a valid PR number.\n` +
+            `  A positive integer is required.\n` +
+            `  Example: pipeline merge 42`,
+        );
+      }
+      process.exit(2);
+    }
+    const prNumber = Number.parseInt(prArgStr, 10);
+    if (prNumber <= 0) {
+      console.error(
+        `pipeline merge: PR number must be a positive integer (got ${prNumber}).`,
+      );
+      process.exit(2);
+    }
+    let mergeCfg: import("./types.ts").PipelineConfig;
+    try {
+      mergeCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline merge: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    try {
+      await mergePr(prNumber, realMergeDeps(mergeCfg.repo));
+    } catch (err) {
+      console.error(`pipeline merge: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "merge"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
