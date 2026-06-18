@@ -14,7 +14,7 @@ import {
   transition,
 } from "../gh.ts";
 import { invoke } from "../harness.ts";
-import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
+import { branchName, getForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
@@ -92,6 +92,20 @@ export async function advanceFix(
       to: round === 1 ? "review-2" : "pre-merge",
       summary: "[dry-run]",
     };
+  }
+
+  // Ensure the worktree is on its pipeline branch before the harness commits.
+  // The review stage may have checked out a specific SHA (detached HEAD); any
+  // commits made while detached don't move the branch ref, so the later push
+  // would silently leave the PR branch unchanged.
+  const reattach = await reattachIfDetached(wt, issueNumber);
+  if (!reattach.ok) {
+    await setBlocked(
+      cfg, issueNumber,
+      `Failed to reattach detached worktree to pipeline branch: ${reattach.stderr}`,
+      stage, "needs-human",
+    );
+    return { advanced: false, status: "blocked", reason: "reattach failed" };
   }
 
   // Capture HEAD before so we can detect non-commits.
