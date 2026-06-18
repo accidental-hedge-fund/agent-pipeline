@@ -152,6 +152,8 @@ export interface PlanJson {
   new_issue_drafts: NewIssueDraft[];
   critique: CritiqueEntry[];
   open_questions: OpenQuestion[];
+  /** Present only when release_model === 'continuous'. CalVer format: YYYY.0M.MICRO */
+  continuous_version_marker?: string;
 }
 
 export interface RoadmapConfig {
@@ -160,4 +162,7 @@ export interface RoadmapConfig {
   score_weights?: ScoreWeights;
   hygiene_auto_apply?: boolean;
   pr_docs?: boolean;
+  release_model?: 'semver' | 'continuous';
 }
+
+export type ReleaseModel = 'semver' | 'continuous';

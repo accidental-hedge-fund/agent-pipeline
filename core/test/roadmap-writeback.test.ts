@@ -9,9 +9,10 @@ import {
   renderRoadmapMd,
   writeRoadmapMd,
   applyHygiene,
+  applyMilestones,
   openRoadmapPr,
 } from "../scripts/roadmap/writeback.ts";
-import type { HygieneItem, PlanJson } from "../scripts/roadmap/types.ts";
+import type { HygieneItem, MilestoneSpec, PlanJson } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
 
 function makePlan(overrides: Partial<PlanJson> = {}): PlanJson {
@@ -55,6 +56,7 @@ function makeDeps(overrides: Partial<WritebackDeps> = {}): WritebackDeps {
     applyLabel: async () => {},
     createMilestone: async () => 1,
     getMilestones: async () => [],
+    assignIssueMilestone: async () => {},
     closeIssue: async () => {},
     addComment: async () => {},
     editIssue: async () => {},
@@ -213,6 +215,60 @@ describe("applyHygiene - idempotency", () => {
 
     await applyHygiene([item], "example/repo", { apply: true }, deps);
     assert.equal(commentCallCount, 1, "should post comment when sentinel is absent");
+  });
+});
+
+describe("applyMilestones - idempotency", () => {
+  it("dry-run logs without calling getMilestones or createMilestone", async () => {
+    let getMilestonesCount = 0;
+    let createCount = 0;
+    const deps = makeDeps({
+      getMilestones: async () => { getMilestonesCount++; return []; },
+      createMilestone: async () => { createCount++; return 1; },
+    });
+    const milestones: MilestoneSpec[] = [{ title: "v1.7.0", issue_numbers: [1], rationale: "test" }];
+    await applyMilestones(milestones, "example/repo", false, deps);
+    assert.equal(getMilestonesCount, 0, "dry-run must not call getMilestones");
+    assert.equal(createCount, 0, "dry-run must not call createMilestone");
+  });
+
+  it("creates a new milestone when none exists with that title", async () => {
+    let createCount = 0;
+    const deps = makeDeps({
+      getMilestones: async () => [],
+      createMilestone: async () => { createCount++; return 10; },
+    });
+    const milestones: MilestoneSpec[] = [{ title: "v1.7.0", issue_numbers: [5], rationale: "test" }];
+    await applyMilestones(milestones, "example/repo", true, deps);
+    assert.equal(createCount, 1, "should create milestone when none exists");
+  });
+
+  it("reuses an existing open milestone instead of creating a duplicate", async () => {
+    let createCount = 0;
+    let assignedTitle: string | undefined;
+    const deps = makeDeps({
+      getMilestones: async () => [{ id: 10, number: 10, title: "v1.7.0" }],
+      createMilestone: async () => { createCount++; return 99; },
+      assignIssueMilestone: async (_repo, _n, title) => { assignedTitle = title; },
+    });
+    const milestones: MilestoneSpec[] = [{ title: "v1.7.0", issue_numbers: [5], rationale: "test" }];
+    await applyMilestones(milestones, "example/repo", true, deps);
+    assert.equal(createCount, 0, "should not create milestone that already exists");
+    assert.equal(assignedTitle, "v1.7.0");
+  });
+
+  it("regression: reuses a closed milestone returned by getMilestones (state=all fix)", async () => {
+    // applyMilestones reuses any milestone returned by getMilestones regardless of state.
+    // The gh.ts fix (state=all) ensures closed milestones appear in that list so they
+    // are reused here instead of triggering a duplicate-creation failure on GitHub.
+    let createCount = 0;
+    const deps = makeDeps({
+      getMilestones: async () => [{ id: 99, number: 99, title: "epic:auth" }],
+      createMilestone: async () => { createCount++; return 100; },
+    });
+    const milestones: MilestoneSpec[] = [{ title: "epic:auth", issue_numbers: [1, 2], rationale: "auth group" }];
+    await applyMilestones(milestones, "example/repo", true, deps);
+    assert.equal(createCount, 0, "closed milestone in getMilestones result must be reused, not recreated");
   });
 });
 

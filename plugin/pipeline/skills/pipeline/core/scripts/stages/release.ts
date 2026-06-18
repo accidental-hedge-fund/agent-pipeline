@@ -757,7 +757,7 @@ export async function collectShippedIssueNumbers(
 export async function runRelease(
   versionArg: string,
   opts: ReleaseOpts,
-  cfg: { repo_dir: string; repo: string; base_branch?: string },
+  cfg: { repo_dir: string; repo: string; base_branch?: string; release_model?: 'semver' | 'continuous' },
   deps?: ReleaseDeps,
 ): Promise<void> {
   const d = deps ?? realReleaseDeps(cfg.repo_dir);
@@ -765,6 +765,20 @@ export async function runRelease(
   const rootPkgPath = path.join(repoDir, "package.json");
   const corePkgPath = path.join(repoDir, "core", "package.json");
   const roadmapPath = path.join(repoDir, "ROADMAP.md");
+
+  // Refusal gate: `pipeline release` is a semver-only operation. When the
+  // release_model is 'continuous', exit non-zero before any mutation. Named
+  // key `roadmap.release_model` so the maintainer knows exactly what to change.
+  if (cfg.release_model === 'continuous') {
+    d.stderr(
+      `[pipeline release] error: versioned release bundling is not available under the 'continuous' release model.\n` +
+      `Set \`roadmap.release_model: semver\` (or remove the key) in .github/pipeline.yml to cut versioned releases.`,
+    );
+    throw new Error(
+      `pipeline release is unavailable when roadmap.release_model is 'continuous'. ` +
+      `Change roadmap.release_model to 'semver' or remove it to use versioned releases.`,
+    );
+  }
 
   // 1. Read current version for alias expansion.
   const corePkgText = d.readFile(corePkgPath);

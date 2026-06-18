@@ -153,6 +153,7 @@ const PartialConfigSchema = z.object({
         .describe("Multiplier overrides for each scoring sub-factor (default: 1.0 each)."),
       hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
       pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
+      release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery."),
     })
     .strict()
     .optional()
@@ -348,7 +349,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     setup_command: fileConfig.setup_command,
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
-    roadmap: fileConfig.roadmap,
+    roadmap: fileConfig.roadmap
+      ? { ...fileConfig.roadmap, release_model: fileConfig.roadmap.release_model ?? "semver" }
+      : fileConfig.roadmap,
     sweep: fileConfig.sweep,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
@@ -412,8 +415,9 @@ export function findGitRoot(start: string): string | null {
 export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
-): { repo_dir: string; repo: string; base_branch: string } {
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous' } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
+  let releaseModel: 'semver' | 'continuous' | undefined;
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (fs.existsSync(configPath)) {
     const text = fs.readFileSync(configPath, "utf8");
@@ -430,12 +434,16 @@ export function resolveReleaseConfig(
       if (typeof result.data.base_branch === "string") {
         baseBranch = result.data.base_branch;
       }
+      if (result.data.roadmap?.release_model) {
+        releaseModel = result.data.roadmap.release_model;
+      }
     }
   }
   return {
     repo_dir: repoDir,
     repo: "",
     base_branch: baseBranchOverride ?? baseBranch,
+    release_model: releaseModel,
   };
 }
 

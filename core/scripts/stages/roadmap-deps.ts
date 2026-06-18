@@ -52,7 +52,12 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
     writeFile: async (p, content) => {
       const dir = path.dirname(p);
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(p, content, "utf8");
+      // Atomic write (temp + rename): the rename is atomic on a single filesystem, so two
+      // concurrent roadmap runs can't corrupt or partially clobber a shared output file such
+      // as plan.json (last writer wins cleanly) — no lock needed (#214).
+      const tmp = path.join(dir, `.${path.basename(p)}.${process.pid}.tmp`);
+      fs.writeFileSync(tmp, content, "utf8");
+      fs.renameSync(tmp, p);
     },
 
     gitBranchExists: async (repoDir, branch) => {
@@ -133,6 +138,22 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
     createMilestone: (repo, title, dueOn) => createMilestone(repo, title, dueOn),
 
     getMilestones: (repo) => getMilestones(repo),
+
+    assignIssueMilestone: async (_repo, issueNumber, milestoneTitle) => {
+      const r = spawnSync(
+        "gh",
+        ["issue", "edit", String(issueNumber), "--milestone", milestoneTitle, "-R", cfg.repo],
+        { encoding: "utf8" },
+      );
+      if (r.status !== 0) throw new Error(`gh issue edit --milestone failed: ${r.stderr}`);
+    },
+
+    getLatestTag: async (repoDir) => {
+      const r = spawnSync("git", ["describe", "--tags", "--abbrev=0"], {
+        cwd: repoDir, encoding: "utf8",
+      });
+      return r.status === 0 ? r.stdout.trim() : "";
+    },
 
     closeIssue: async (_repo, issueNumber) => {
       const r = spawnSync("gh", ["issue", "close", String(issueNumber), "-R", cfg.repo], {
