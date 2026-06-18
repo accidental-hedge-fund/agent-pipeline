@@ -61,6 +61,8 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
 /pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run  preview only; no writes
+/pipeline triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
+/pipeline triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
 /pipeline sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
 /pipeline sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
 /pipeline sweep --apply --repo other/r   sweep a different repository
@@ -112,6 +114,18 @@ The spec-generation step is the only model call; issue creation and roadmap edit
 are deterministic. The roadmap update is opened as a PR for human review — the
 pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
 proposes the first open lane from `ROADMAP.md`.
+
+`triage` sets a pre-pipeline stage label on an issue — no model call, fully
+deterministic:
+
+```bash
+/pipeline triage 42 --stage ready     # promote to pipeline:ready
+/pipeline triage 42 --stage backlog   # move back to pipeline:backlog
+```
+
+Only `ready` and `backlog` are settable via `triage`. The command is idempotent
+(re-running when already set is a no-op). Mid-flight stages owned by the advance
+state machine are rejected with a clear error.
 
 `sweep` is the **batch** companion to `intake`: it re-specs every thin issue in
 the existing backlog and reconciles `ROADMAP.md` in one pass:

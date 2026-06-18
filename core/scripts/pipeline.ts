@@ -70,6 +70,7 @@ import {
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
+import { runTriage, realTriageDeps } from "./stages/triage.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -149,6 +150,8 @@ export interface CliOpts {
   next?: number;
   /** Sweep: override the target GitHub repository (owner/repo). */
   repo?: string;
+  /** Triage: target pre-pipeline stage label (ready or backlog). */
+  stage?: string;
 }
 
 /**
@@ -164,7 +167,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | roadmap | sweep")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -197,7 +200,8 @@ export function buildCmd(): Command {
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
     .option("--apply", "roadmap/sweep: execute GitHub write-backs (issue updates, roadmap PR); default is dry-run")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
-    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)");
+    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
+    .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -222,6 +226,8 @@ async function main(): Promise<void> {
   const isIntakeCommand = numArg === "intake";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
   const isSweepCommand = numArg === "sweep";
+  // `pipeline triage <issue> --stage ready|backlog` — set an issue's pre-pipeline stage label.
+  const isTriageCommand = numArg === "triage";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -369,7 +375,7 @@ async function main(): Promise<void> {
   // `intake [description]` legitimately have two positionals; `config`/`path`
   // already returned above. `sweep` is a bulk command with no issue number —
   // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
-  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" ? 2 : 1;
+  const maxPositionals = cmd.args[0] === "run" || cmd.args[0] === "release" || cmd.args[0] === "intake" || cmd.args[0] === "triage" ? 2 : 1;
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
@@ -491,10 +497,31 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early triage dispatch — derives repo_dir from local git state only; no gh auth needed
+  // for the dispatch itself. The handler validates issue number and stage, then makes
+  // the gh calls to read/add/remove labels.
+  if (isTriageCommand) {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir);
+    if (!repoDir) {
+      console.error(
+        `pipeline: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    try {
+      await runTriage({ issueArg: cmd.args[1], stage: opts.stage }, realTriageDeps(repoDir));
+    } catch (err) {
+      console.error(`pipeline triage: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "triage"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
