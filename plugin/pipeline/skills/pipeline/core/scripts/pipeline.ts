@@ -816,7 +816,7 @@ export async function runDoctor(
     // Silent polling gate: run checks, set exit code, zero bytes of output.
     try {
       const failFast = opts.failFast ?? cfg.doctor.failFast;
-      const result = await deps.runPreflight(cfg, undefined, { failFast });
+      const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
       process.exitCode = result.ok ? 0 : 1;
     } catch {
       process.exitCode = 1;
@@ -825,7 +825,7 @@ export async function runDoctor(
   }
 
   const failFast = opts.failFast ?? cfg.doctor.failFast;
-  const result = await deps.runPreflight(cfg, undefined, { failFast });
+  const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
   await deps.storePreflightResult(cfg, result);
 
   if (opts.json) {
@@ -850,7 +850,7 @@ export async function runStartPreflightGate(
 
   console.log(`[pipeline] running preflight (doctor) before planning...`);
   const failFast = opts.failFast ?? cfg.doctor.failFast;
-  const result = await deps.runPreflight(cfg, undefined, { failFast });
+  const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
   await deps.storePreflightResult(cfg, result);
   console.log(formatDoctorSummary(result));
   if (!result.ok) {
