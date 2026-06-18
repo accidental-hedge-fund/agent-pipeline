@@ -30,6 +30,14 @@ test_gate:
   # max_attempts: 3 # fix-harness invocations before blocking
   # timeout: 300 # seconds per test/build run
 
+review_policy: # which review findings block progression vs. merely advise (#17)
+  # Tightened from the defaults (medium / 0.7): only high+ severity findings at
+  # >= 0.85 confidence block; everything below advises rather than routing to a
+  # fix round. Trims medium/low-confidence review-round churn ("severity is the dial").
+  block_threshold: high # critical|high|medium|low — findings below this advise, not block
+  min_confidence: 0.85 # 0..1 — findings below this confidence advise, not block
+  # max_adversarial_rounds: 3 # (default) cap review-round re-runs; after this, still-blocking findings go advisory → needs-human
+
 # --- Everything below is at its built-in default; shown for reference. ---
 
 # base_branch: main # branch PRs target and worktrees branch from
@@ -67,10 +75,8 @@ test_gate:
 #   timeout: 300 # stage-level budget in seconds (shared across attempts)
 #   max_attempts: 2 # total attempts before giving up (1 = no retry)
 
-# review_policy: # which review findings block progression vs. merely advise (#17)
-#   block_threshold: medium # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
-#   min_confidence: 0.7 # 0..1 — findings below this confidence advise, not block
-#   max_adversarial_rounds: 3 # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
+# review_policy is set as an active override above (block_threshold: high, min_confidence: 0.85).
+#   max_adversarial_rounds: 3 # default cap on review-round re-runs (left at default; uncomment under review_policy to change)
 
 # format_gate: [] # run formatter/linter commands after implementing and fix-round harnesses (#182)
 #   Entries run in the worktree root in declaration order. auto_fix: true commits any changes and
