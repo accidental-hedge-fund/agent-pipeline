@@ -15,60 +15,6 @@ import type { PipelineConfig } from "../types.ts";
  * Build real RoadmapDeps from the resolved PipelineConfig.
  * All calls hit real gh CLI, real filesystem, and real harness invocations.
  */
-// A healthy continuous run holds the marker lock for well under a minute (read plan.json +
-// compute the marker + write). An empty/unstamped lock older than this is certainly a crash
-// remnant, safe to reclaim.
-const STALE_MARKER_LOCK_MS = 60_000;
-
-/**
- * Reclaim a stale `.marker.lock`. Two stale cases, each guarded:
- *  - Recorded PID is no longer a live process (a crashed run) → reclaim.
- *  - Empty or malformed content (a crash in the openSync→writeSync window left a lock that
- *    was never PID-stamped) → reclaim ONLY when the file is older than STALE_MARKER_LOCK_MS,
- *    so a live run mid-stamp is never stolen.
- * Returns true when a stale lock was removed (the caller should retry the acquire). A
- * re-read guard before unlink avoids removing a lock another run acquired in the meantime.
- * Mirrors the PID-stale reclaim in `lock.ts`.
- */
-function reclaimStaleMarkerLock(lockPath: string): boolean {
-  let content: string;
-  let mtimeMs: number;
-  try {
-    content = fs.readFileSync(lockPath, "utf8").trim();
-    mtimeMs = fs.statSync(lockPath).mtimeMs;
-  } catch {
-    return false; // vanished — the next openSync("wx") will win on its own
-  }
-  const pid = Number(content);
-  if (Number.isInteger(pid) && pid > 0) {
-    try {
-      process.kill(pid, 0); // throws ESRCH if the process is gone
-      return false; // owner alive — not stale
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ESRCH") return false; // EPERM etc → assume alive
-    }
-    return unlinkMarkerLockIfUnchanged(lockPath, content);
-  }
-  // Empty/malformed content (never PID-stamped). Liveness can't be checked, so reclaim only
-  // when the lock is clearly old — never steal a fresh lock a live run is still stamping.
-  if (Date.now() - mtimeMs < STALE_MARKER_LOCK_MS) return false;
-  return unlinkMarkerLockIfUnchanged(lockPath, content);
-}
-
-/** Unlink the lock only if its content still matches what we inspected (guards against a
- *  concurrent fresh acquire between our read and the unlink). Returns true on removal. */
-function unlinkMarkerLockIfUnchanged(lockPath: string, expected: string): boolean {
-  try {
-    if (fs.readFileSync(lockPath, "utf8").trim() === expected) {
-      fs.unlinkSync(lockPath);
-      return true;
-    }
-  } catch {
-    /* changed or vanished — let the caller retry the acquire */
-  }
-  return false;
-}
-
 export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
   return {
     getOpenIssues: (repo, opts) => getOpenIssues(repo, opts),
@@ -193,6 +139,10 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       // exist, and openSync(..., "wx") would ENOENT before any plan.json is written (#214).
       fs.mkdirSync(outputDir, { recursive: true });
       const lockPath = path.join(outputDir, ".marker.lock");
+      // The lock is just an atomic exclusive-create (openSync "wx"). We deliberately do NOT
+      // auto-reclaim a held lock: every recovery race lived in the reclaim path (#214), and the
+      // marker it guards is a cosmetic CalVer counter. A stranded lock (from a crashed run) is
+      // a clear one-line manual fix instead — far simpler and safer than racy auto-recovery.
       const poll = async (attemptsLeft: number): Promise<void> => {
         let fd: number;
         try {
@@ -200,18 +150,20 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
         } catch (err) {
           const e = err as NodeJS.ErrnoException;
           if (e.code === "EEXIST") {
-            // Reclaim a lock whose owner is gone (dead PID, or an old empty/unstamped lock),
-            // so one crash can't strand the continuous path until manual cleanup (#214).
-            if (reclaimStaleMarkerLock(lockPath)) return poll(attemptsLeft);
             if (attemptsLeft > 0) {
               await new Promise<void>((r) => setTimeout(r, 50));
               return poll(attemptsLeft - 1);
             }
+            throw new Error(
+              `[roadmap] could not acquire the continuous marker lock at ${lockPath} (held after ~1s). ` +
+                `Another \`pipeline roadmap\` run may hold it; if none is active, a previous run crashed — ` +
+                `remove the file to proceed: rm "${lockPath}"`,
+            );
           }
           throw err;
         }
-        // Stamp the owner PID. If stamping fails, remove the just-created lock so an empty/
-        // unstamped lock can't strand future runs (it would be unreclaimable by PID liveness).
+        // Stamp the owner PID (informational, for diagnosing a stranded lock). If stamping
+        // fails, remove the just-created lock so this process never leaves an empty one behind.
         try {
           fs.writeSync(fd, String(process.pid));
           fs.closeSync(fd);

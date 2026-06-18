@@ -435,63 +435,28 @@ describe("buildCalVerMarker", () => {
     }
   });
 
-  it("realRoadmapDeps.acquireMarkerLock reclaims a lock held by a dead PID (#214 review-2)", async () => {
-    // A crashed run can leave .marker.lock behind; the lock records the PID so a dead-owner
-    // lock is reclaimed rather than stranding the continuous path until manual cleanup.
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-marker-stale-"));
+  it("realRoadmapDeps.acquireMarkerLock throws a clear, actionable error when the lock is held (#214)", async () => {
+    // Simplified design: no auto-reclaim (every recovery race lived there). A held or
+    // crash-stranded lock surfaces a clear error that names the lock file and the one-line
+    // manual fix, and never auto-removes an existing lock.
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-held-lock-"));
     const lockPath = path.join(outputDir, ".marker.lock");
     try {
-      fs.writeFileSync(lockPath, "2000000"); // a PID with no live process → ESRCH → reclaimable
-      const deps = realRoadmapDeps({} as never);
-      const release = await deps.acquireMarkerLock(outputDir); // must reclaim, not throw/hang
-      assert.equal(
-        fs.readFileSync(lockPath, "utf8").trim(),
-        String(process.pid),
-        "the stale lock is reclaimed and re-acquired under our PID",
-      );
-      release();
-    } finally {
-      fs.rmSync(outputDir, { recursive: true, force: true });
-    }
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock reclaims an empty/unstamped lock once it is stale (#214 review-2)", async () => {
-    // A crash in the openSync→writeSync window leaves an empty (never PID-stamped) lock. It
-    // can't be checked for liveness, so it is reclaimed only once it is older than the
-    // stale threshold — fixing the "empty locks are never reclaimed" gap.
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-empty-lock-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, ""); // created but never PID-stamped
-      const old = new Date(Date.now() - 5 * 60_000); // 5 minutes ago — clearly stale
-      fs.utimesSync(lockPath, old, old);
-      const deps = realRoadmapDeps({} as never);
-      const release = await deps.acquireMarkerLock(outputDir); // must reclaim the stale empty lock
-      assert.equal(
-        fs.readFileSync(lockPath, "utf8").trim(),
-        String(process.pid),
-        "the stale empty lock is reclaimed and re-acquired under our PID",
-      );
-      release();
-    } finally {
-      fs.rmSync(outputDir, { recursive: true, force: true });
-    }
-  });
-
-  it("realRoadmapDeps.acquireMarkerLock does NOT steal a fresh empty lock (a live run mid-stamp) (#214 review-2)", async () => {
-    // A fresh empty lock may belong to a live run that just created it and is about to stamp
-    // its PID — it must not be reclaimed; acquisition fails instead.
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "roadmap-fresh-lock-"));
-    const lockPath = path.join(outputDir, ".marker.lock");
-    try {
-      fs.writeFileSync(lockPath, ""); // fresh empty lock (mtime = now)
+      fs.writeFileSync(lockPath, "2000000"); // a lock is present (held or stranded)
       const deps = realRoadmapDeps({} as never);
       await assert.rejects(
         () => deps.acquireMarkerLock(outputDir),
-        /EEXIST/,
-        "a fresh empty lock must not be stolen",
+        (err: Error) => {
+          assert.match(err.message, /could not acquire the continuous marker lock/);
+          assert.match(
+            err.message,
+            new RegExp(`rm "${lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`),
+            `error must name the remove-the-file remediation; got: ${err.message}`,
+          );
+          return true;
+        },
       );
-      assert.ok(fs.existsSync(lockPath), "the fresh empty lock is left intact");
+      assert.ok(fs.existsSync(lockPath), "the existing lock is left intact (never auto-removed)");
     } finally {
       fs.rmSync(outputDir, { recursive: true, force: true });
     }
