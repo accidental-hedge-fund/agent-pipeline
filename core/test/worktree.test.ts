@@ -136,6 +136,25 @@ test("parseWorktreePorcelain: detached pipeline-named dir OUTSIDE root is ignore
   assert.deepEqual(parseWorktreePorcelain(stdout, ROOT), []);
 });
 
+// Regression (review-2 finding 1): the fallback must NOT fire for a worktree
+// that HAS a branch — just not a pipeline/* branch. A pipeline-named directory
+// checked out on refs/heads/main must be ignored, not returned as that issue.
+test("parseWorktreePorcelain: pipeline-named dir on non-pipeline branch is ignored", () => {
+  // Directory name looks like a pipeline worktree but the branch is `main`.
+  // The path fallback must only apply to records with NO branch line (detached).
+  const stdout = [
+    "worktree /repo/.worktrees/pipeline-216-triage-slug",
+    "HEAD 2222222222222222222222222222222222222222",
+    "branch refs/heads/main",
+    "",
+  ].join("\n");
+  assert.deepEqual(
+    parseWorktreePorcelain(stdout, ROOT),
+    [],
+    "a pipeline-named dir on a non-pipeline branch must not be matched by the path fallback",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // listOnDisk — linked-worktree launch path (#223 regression)
 //
@@ -198,6 +217,99 @@ test("listOnDisk: detached sibling worktree found when launched from a linked wo
   const issue223 = recs.find((r) => r.issueNumber === 223);
   assert.ok(issue223, "the current linked worktree on its branch must still resolve");
   assert.equal(issue223?.slug, "current");
+});
+
+// ---------------------------------------------------------------------------
+// Linked-launch removal path regression (review-2 finding 2)
+//
+// When cfg.repo_dir is a linked worktree (e.g. /repo/.worktrees/pipeline-223),
+// worktreePath(cfg, ...) computes the WRONG path for sibling worktrees:
+//   /repo/.worktrees/pipeline-223/.worktrees/pipeline-216-slug  ← wrong
+// The fix: callers pass rec.path from the discovered record so removal always
+// targets the correct absolute path.
+// ---------------------------------------------------------------------------
+
+// Note: sweepMergedWorktrees also has a candidates-filter that computes root
+// from cfg.repo_dir — that's a separate issue. This test uses cfg.repo_dir at
+// the actual main repo root so the filter passes, and proves that removeWorktree
+// receives rec.path as resolvedPath (the fix for the removal path bug).
+test("sweep: removal passes rec.path as resolvedPath to removeWorktree (#223 review-2 finding 2)", async () => {
+  const cfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    domain: "test",
+    max_concurrent_worktrees: 4,
+  } as unknown as PipelineConfig;
+
+  // The discovered record has the correct absolute path from porcelain.
+  const rec: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-216-triage-slug",
+    branch: "pipeline/216-triage-slug",
+    issueNumber: 216,
+    slug: "triage-slug",
+  };
+
+  const capturedPaths: string[] = [];
+  const deps: Partial<SweepDeps> = {
+    listOnDisk: async () => [rec],
+    getPrMergeState: async () => ({ merged: true, prNumber: 216, headSha: "abc" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "abc",
+    pathExists: () => true,
+    removeWorktree: async (_c, _n, _s, _pathOnDisk, resolvedPath) => {
+      capturedPaths.push(resolvedPath ?? "(none)");
+      return { ok: true as const };
+    },
+  };
+
+  await sweepMergedWorktrees(cfg, deps);
+
+  assert.equal(capturedPaths.length, 1);
+  assert.equal(
+    capturedPaths[0],
+    "/repo/.worktrees/pipeline-216-triage-slug",
+    "removal must receive the discovered rec.path as resolvedPath",
+  );
+});
+
+test("createWorktree: linked-launch reclaim receives discovered rec.path (#223 review-2 finding 2)", async () => {
+  const cfg = {
+    repo_dir: "/repo/.worktrees/pipeline-223-current",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    max_concurrent_worktrees: 4,
+  } as unknown as PipelineConfig;
+
+  const staleRec: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-42-old-slug",
+    branch: "pipeline/42-old-slug",
+    issueNumber: 42,
+    slug: "old-slug",
+  };
+
+  const capturedPaths: string[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [staleRec],
+    existsSync: () => false,
+    removeWorktree: async (_cfg, _issueNumber, _slug, resolvedPath) => {
+      capturedPaths.push(resolvedPath ?? "(none)");
+    },
+    mkdirSync: () => {},
+    gitCmd: async () => ({ code: 0, stdout: "", stderr: "" }),
+    ...noopMutexDeps,
+  };
+
+  await createWorktree(cfg, 42, "new-slug", deps);
+
+  assert.equal(capturedPaths.length, 1);
+  assert.equal(
+    capturedPaths[0],
+    "/repo/.worktrees/pipeline-42-old-slug",
+    "reclaim must receive the discovered rec.path so linked-launch removes the correct sibling",
+  );
 });
 
 // ---------------------------------------------------------------------------

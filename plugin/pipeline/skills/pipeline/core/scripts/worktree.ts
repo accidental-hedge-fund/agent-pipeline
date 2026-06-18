@@ -302,10 +302,11 @@ export function parseWorktreePorcelain(
     if (branchMatch) {
       issueNumber = Number.parseInt(branchMatch[1], 10);
       slug = branchMatch[2];
-    } else if (path.resolve(path.dirname(rec.path)) === root) {
-      // Off-branch (detached) fallback: identify by the directory name, but
-      // only for worktrees directly under the configured worktree root so we
-      // never misclassify an unrelated checkout.
+    } else if (rec.branch === undefined && path.resolve(path.dirname(rec.path)) === root) {
+      // Off-branch (detached) fallback: only for records with NO branch line in
+      // the porcelain output (rec.branch === undefined). A worktree that IS on a
+      // branch but not a pipeline/* branch must NOT be matched by directory name —
+      // that would misidentify e.g. a pipeline-named dir checked out on main.
       const pathMatch = path.basename(rec.path).match(/^pipeline-(\d+)-(.+)$/);
       if (pathMatch) {
         issueNumber = Number.parseInt(pathMatch[1], 10);
@@ -407,7 +408,7 @@ export async function branchExists(
 export interface CreateWorktreeDeps {
   listActive?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
   existsSync?: (p: string) => boolean;
-  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string) => Promise<void>;
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, resolvedPath?: string) => Promise<void>;
   mkdirSync?: (p: string, opts: { recursive: boolean }) => void;
   gitCmd?: (
     cfg: PipelineConfig,
@@ -539,7 +540,9 @@ export async function createWorktree(
   const active = await listActiveFn(cfg);
   const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
   for (const rec of mine) {
-    await removeFn(cfg, issueNumber, rec.slug!);
+    // Pass rec.path so removal targets the discovered path directly, not a path
+    // recomputed from cfg.repo_dir (which is wrong when launched from a linked worktree).
+    await removeFn(cfg, issueNumber, rec.slug!, rec.path);
   }
   // Also clear any directory left at the *current* slug path that listActive did
   // not classify as active (e.g. a closed/terminal lookup) so the
@@ -644,8 +647,12 @@ export async function removeWorktree(
   cfg: PipelineConfig,
   issueNumber: number,
   slug: string,
+  resolvedPath?: string,
 ): Promise<void> {
-  const wtPath = worktreePath(cfg, issueNumber, slug);
+  // Use the caller-supplied path when available so that linked-worktree launches
+  // (where cfg.repo_dir is a linked path) remove the correct sibling, not a
+  // non-existent nested path under the linked worktree's own directory.
+  const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
   if (fs.existsSync(wtPath)) {
     await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath, "--force"], { ignoreFailure: true });
@@ -737,12 +744,15 @@ export interface SweepDeps {
   hasDirtyWorkdir: (worktreePath: string) => Promise<boolean>;
   getWorktreeHeadSha: (worktreePath: string) => Promise<string>;
   /** Attempt to remove a worktree and its branch; returns ok/failure so the
-   *  caller can report partial success rather than silently claiming removal. */
+   *  caller can report partial success rather than silently claiming removal.
+   *  resolvedPath overrides the computed path so linked-launch sweeps remove
+   *  the correct sibling path rather than one derived from cfg.repo_dir. */
   removeWorktree: (
     cfg: PipelineConfig,
     issueNumber: number,
     slug: string,
     pathOnDisk: boolean,
+    resolvedPath?: string,
   ) => Promise<{ ok: true } | { ok: false; reason: string }>;
   pathExists: (p: string) => boolean;
 }
@@ -754,8 +764,9 @@ async function sweepRemoveWorktree(
   issueNumber: number,
   slug: string,
   pathOnDisk: boolean,
+  resolvedPath?: string,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const wtPath = worktreePath(cfg, issueNumber, slug);
+  const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
 
   if (pathOnDisk) {
@@ -825,7 +836,7 @@ export async function sweepMergedWorktrees(
 
     // Path gone on disk but still registered — deregister and clean branch.
     if (!d.pathExists(rec.path)) {
-      const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, false);
+      const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, false, rec.path);
       if (result.ok) {
         removed.push(rec);
       } else {
@@ -849,7 +860,7 @@ export async function sweepMergedWorktrees(
       continue;
     }
 
-    const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, true);
+    const result = await d.removeWorktree(cfg, rec.issueNumber, rec.slug, true, rec.path);
     if (result.ok) {
       removed.push(rec);
     } else {
