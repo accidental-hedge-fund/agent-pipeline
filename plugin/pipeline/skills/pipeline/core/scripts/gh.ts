@@ -1098,7 +1098,7 @@ interface GhMilestoneRaw {
  * Uses `gh api repos/<repo>/milestones`.
  */
 export async function getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>> {
-  const stdout = await ghRun(["api", `repos/${repo}/milestones`, "--paginate", "--slurp"], {
+  const stdout = await ghRun(["api", `repos/${repo}/milestones?state=all`, "--paginate", "--slurp"], {
     timeoutMs: 30_000,
   });
   // --slurp wraps each page array into an outer array. Flatten before mapping.

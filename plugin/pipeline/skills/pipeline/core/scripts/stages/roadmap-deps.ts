@@ -134,6 +134,28 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
 
     getMilestones: (repo) => getMilestones(repo),
 
+    acquireMarkerLock: async (outputDir) => {
+      const lockPath = path.join(outputDir, ".marker.lock");
+      const poll = async (attemptsLeft: number): Promise<void> => {
+        try {
+          const fd = fs.openSync(lockPath, "wx");
+          fs.writeSync(fd, String(process.pid));
+          fs.closeSync(fd);
+        } catch (err) {
+          const e = err as NodeJS.ErrnoException;
+          if (e.code === "EEXIST" && attemptsLeft > 0) {
+            await new Promise<void>((r) => setTimeout(r, 50));
+            return poll(attemptsLeft - 1);
+          }
+          throw err;
+        }
+      };
+      await poll(20); // retry up to ~1 second
+      return () => {
+        try { fs.unlinkSync(lockPath); } catch { /* ignore ENOENT */ }
+      };
+    },
+
     assignIssueMilestone: async (_repo, issueNumber, milestoneTitle) => {
       const r = spawnSync(
         "gh",

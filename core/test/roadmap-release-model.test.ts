@@ -88,6 +88,7 @@ function makeRoadmapDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
     getIssueState: async () => "open",
     getIssueComments: async () => [],
     getLatestTag: async () => "v1.6.0",
+    acquireMarkerLock: async () => () => {},
     log: () => {},
     ...overrides,
   };
@@ -366,6 +367,36 @@ describe("buildCalVerMarker", () => {
     const existingPlan = JSON.stringify({ generated_at: "2026-06-10T08:00:00Z" });
     const marker = buildCalVerMarker("2026-06-17T10:00:00Z", existingPlan);
     assert.equal(marker, "2026.06.0");
+  });
+
+  it("regression: acquireMarkerLock is called before readFile(plan.json) and released after writePlanJson in continuous mode", async () => {
+    // Guards against the concurrency gap where two overlapping runs both read the same
+    // plan.json before either writes the updated marker, causing duplicate MICRO values.
+    const callOrder: string[] = [];
+    const deps = makeRoadmapDeps({
+      acquireMarkerLock: async () => {
+        callOrder.push("lock-acquired");
+        return () => { callOrder.push("lock-released"); };
+      },
+      readFile: async (p) => {
+        if (typeof p === "string" && p.endsWith("plan.json")) callOrder.push("read-plan");
+        return null;
+      },
+      writeFile: async (p) => {
+        if (typeof p === "string" && p.endsWith("plan.json")) callOrder.push("write-plan");
+      },
+    });
+    await runRoadmap("example/repo", "/repo", "main", { release_model: "continuous" }, { apply: false }, deps);
+    const lockIdx = callOrder.indexOf("lock-acquired");
+    const readIdx = callOrder.indexOf("read-plan");
+    const writeIdx = callOrder.indexOf("write-plan");
+    const releaseIdx = callOrder.indexOf("lock-released");
+    assert.ok(lockIdx !== -1, "acquireMarkerLock must be called");
+    assert.ok(readIdx !== -1, "plan.json must be read");
+    assert.ok(writeIdx !== -1, "plan.json must be written");
+    assert.ok(releaseIdx !== -1, "lock must be released");
+    assert.ok(lockIdx < readIdx, `lock must be acquired before reading plan.json (got order: ${callOrder})`);
+    assert.ok(writeIdx < releaseIdx, `lock must be released after writing plan.json (got order: ${callOrder})`);
   });
 
   it("marker is absent under semver model (validated via runRoadmap output)", async () => {

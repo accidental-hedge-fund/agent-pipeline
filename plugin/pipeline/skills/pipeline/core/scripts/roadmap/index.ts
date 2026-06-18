@@ -43,6 +43,11 @@ export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps 
   runCritiqueHarness(prompt: string): Promise<{ success: boolean; output: string }>;
   /** Return the latest git tag (e.g. "v1.6.0") or "" if no tags exist. */
   getLatestTag(repoDir: string): Promise<string>;
+  /** Acquire an exclusive lock on the continuous marker counter for outputDir.
+   *  Returns a release function. Only called when release_model is 'continuous'.
+   *  Guards the read-plan.json → compute-marker → write-plan.json window so that
+   *  concurrent roadmap runs cannot claim the same MICRO value. */
+  acquireMarkerLock(outputDir: string): Promise<() => void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -572,9 +577,12 @@ export async function runRoadmap(
   let milestones: MilestoneSpec[];
   let continuousVersionMarker: string | undefined;
 
+  let releaseLock: (() => void) | undefined;
   if (releaseModel === "continuous") {
     milestones = buildContinuousGroups(roadmap, items);
-    // Read existing plan.json to derive MICRO counter
+    // Acquire lock before reading plan.json to prevent concurrent runs from
+    // claiming the same MICRO value in the CalVer marker.
+    releaseLock = await deps.acquireMarkerLock(outputDir);
     const existingPlanContent = await deps.readFile(path.join(outputDir, "plan.json"));
     continuousVersionMarker = buildCalVerMarker(now, existingPlanContent);
     deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
@@ -603,6 +611,9 @@ export async function runRoadmap(
   // Ensure output dir exists, then write outputs
   await deps.writeFile(path.join(outputDir, ".gitkeep"), "");
   await writePlanJson(plan, outputDir, deps);
+  // Release the continuous marker lock after plan.json is written so the next
+  // concurrent run reads the updated marker before claiming its own MICRO value.
+  releaseLock?.();
   await writeRoadmapMd(plan, outputDir, deps);
 
   if (opts.dryRun || !opts.apply) {
