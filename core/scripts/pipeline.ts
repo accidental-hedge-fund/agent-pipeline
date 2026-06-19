@@ -108,15 +108,18 @@ const MAX_ITERATIONS = 12;
 /**
  * A non-advancing outcome is auto-loop recoverable when it is `waiting` (the
  * stage explicitly signals a retriable temporary state) or `blocked` with a
- * pipeline-owned recovery (i.e. blockerKind is not `needs-human`).
+ * pipeline-owned recovery (i.e. blockerKind is set and is not `needs-human`).
  * Non-recoverable: `error`, `no-op`, `finalized`, and any `blocked` outcome
- * whose blockerKind is `needs-human` (requires human intervention).
+ * whose blockerKind is `needs-human` or absent (absent → treated as
+ * non-recoverable so unannotated stages cannot be silently auto-retried).
  */
 export function isAutoLoopRecoverable(out: Outcome): boolean {
   if (out.advanced) return false;
   if (out.status === "waiting") return true;
   if (out.status !== "blocked") return false;
-  // needs-human blockers require human intervention — not pipeline-recoverable.
+  // Missing blockerKind is treated as non-recoverable (same as needs-human):
+  // the pipeline cannot determine a recovery recipe for an unannotated blocker.
+  if (!out.blockerKind) return false;
   return out.blockerKind !== "needs-human";
 }
 
@@ -2044,7 +2047,7 @@ async function runAdvance(
           );
           if (!opts.dryRun) {
             await clearBlocked(cfg, issueNumber).catch(() => {});
-            await transition(cfg, issueNumber, stage, "needs-human", "auto-loop budget exhausted").catch(() => {});
+            await transition(cfg, issueNumber, stage, "needs-human", "auto-loop budget exhausted");
             finalStage = "needs-human";
             await postComment(
               cfg,

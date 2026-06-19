@@ -48,6 +48,7 @@ function makeAutoLoop(overrides: Partial<PipelineConfig["auto_loop"]> = {}): Pip
 
 const WAITING: Outcome = { advanced: false, status: "waiting", reason: "CI pending" };
 const BLOCKED: Outcome = { advanced: false, status: "blocked", reason: "eval failed" };
+const BLOCKED_WITH_KIND: Outcome = { advanced: false, status: "blocked", reason: "eval failed", blockerKind: "eval-gate-failed" as BlockerKind };
 const BLOCKED_NEEDS_HUMAN: Outcome = { advanced: false, status: "blocked", reason: "shipcheck fail verdict", blockerKind: "needs-human" as BlockerKind };
 const ERROR_OUT: Outcome = { advanced: false, status: "error", reason: "harness crash" };
 const NOOP: Outcome = { advanced: false, status: "no-op", reason: "nothing to do" };
@@ -179,9 +180,9 @@ test("isAutoLoopEligible: waiting at allowlisted stage → true", () => {
   assert.equal(isAutoLoopEligible(WAITING, "eval-gate", al), true);
 });
 
-test("isAutoLoopEligible: blocked at allowlisted stage → true", () => {
+test("isAutoLoopEligible: blocked with pipeline-owned kind at allowlisted stage → true", () => {
   const al = makeAutoLoop({ stages: ["eval-gate"] });
-  assert.equal(isAutoLoopEligible(BLOCKED, "eval-gate", al), true);
+  assert.equal(isAutoLoopEligible(BLOCKED_WITH_KIND, "eval-gate", al), true);
 });
 
 test("isAutoLoopEligible: waiting at non-allowlisted stage → false", () => {
@@ -320,7 +321,7 @@ test("isAutoLoopRecoverable: does not mutate or depend on review_policy", () => 
   // Calling the helper does not throw and returns the correct value regardless
   // of what review_policy or harness_sandbox say.
   assert.equal(isAutoLoopRecoverable(WAITING), true);
-  assert.equal(isAutoLoopRecoverable(BLOCKED), true);              // no kind → recoverable
+  assert.equal(isAutoLoopRecoverable(BLOCKED), false);             // no kind → non-recoverable (treated as needs-human)
   assert.equal(isAutoLoopRecoverable(BLOCKED_NEEDS_HUMAN), false); // needs-human → not recoverable
 });
 
@@ -340,8 +341,12 @@ test("isAutoLoopRecoverable: waiting → true", () => {
   assert.equal(isAutoLoopRecoverable(WAITING), true);
 });
 
-test("isAutoLoopRecoverable: blocked without blockerKind → true (pipeline can retry)", () => {
-  assert.equal(isAutoLoopRecoverable(BLOCKED), true);
+test("isAutoLoopRecoverable: blocked without blockerKind → false (non-recoverable; treated as needs-human)", () => {
+  assert.equal(isAutoLoopRecoverable(BLOCKED), false);
+});
+
+test("isAutoLoopRecoverable: blocked with pipeline-owned kind → true (has recovery recipe)", () => {
+  assert.equal(isAutoLoopRecoverable(BLOCKED_WITH_KIND), true);
 });
 
 test("isAutoLoopRecoverable: blocked with needs-human kind → false (requires human intervention)", () => {
