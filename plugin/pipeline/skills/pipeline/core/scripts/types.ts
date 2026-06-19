@@ -540,6 +540,9 @@ export interface StageRecord {
  *  Optional source fields mirror `ReviewFinding` — absent when the reviewer
  *  did not supply them. */
 export interface ReviewFindingRecord {
+  /** findingKey applied to the sanitized record fields at write time. When line_start
+   *  is absent the key hashes the title; sanitizing before computing prevents a
+   *  secret-bearing title from acting as a persisted oracle. */
   key: string;
   severity: "critical" | "high" | "medium" | "low";
   title: string;

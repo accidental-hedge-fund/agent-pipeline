@@ -1058,6 +1058,27 @@ test("4.13 payload_fingerprint_ambiguous: same-key findings whose secrets collap
     "second colliding record must be flagged ambiguous");
 });
 
+test("4.13 key: no-line finding title containing a secret produces the same persisted key after sanitization (oracle-resistant)", () => {
+  // When line_start is absent, findingKey hashes normalizeTitle(title). Two findings
+  // with titles differing only by a redacted secret must produce the same persisted key.
+  const makeRecord = (secret: string): ReviewFindingRecord => ({
+    key: "placeholder",
+    severity: "high",
+    title: `API key OPENAI_API_KEY="${secret}" is hard-coded`,
+    body: "Remove it.",
+    confidence: 0.9,
+    recommendation: "Fix it.",
+    effective_blocking: true,
+  });
+  const [sanitizedA] = sanitizeDeep([makeRecord("SecretA")]);
+  const [sanitizedB] = sanitizeDeep([makeRecord("SecretB")]);
+  // Recompute key from sanitized record (mirrors advanceReview)
+  const keyA = findingKey(sanitizedA as ReviewFinding);
+  const keyB = findingKey(sanitizedB as ReviewFinding);
+  assert.equal(keyA, keyB,
+    "persisted keys for titles differing only by redacted secret must be identical");
+});
+
 test("4.13 payload_fingerprint_ambiguous: distinct (non-colliding) findings are NOT flagged", () => {
   // Two findings with different titles that survive sanitization differently
   // must each get a distinct fingerprint and NOT be flagged ambiguous.

@@ -471,10 +471,13 @@ export async function advanceReview(
       return rec;
     }),
   );
-  // Compute payload_fingerprint from the sanitized record fields so the persisted
-  // fingerprint does not encode raw secret/injection text from reviewer output.
-  // Sanitization runs first; the fingerprint is derived from the redacted fields.
+  // Recompute key and payload_fingerprint from sanitized record fields so neither
+  // persisted value encodes raw secret/injection text from reviewer output.
+  // key uses normalizeTitle(title) when line_start is absent — if a title contains
+  // a secret, the pre-sanitization key would change with the raw secret value.
+  // Both are recomputed from the sanitized record after sanitizeDeep runs.
   for (let i = 0; i < findingRecords.length; i++) {
+    findingRecords[i].key = findingKey(findingRecords[i] as ReviewFinding);
     findingRecords[i].payload_fingerprint = findingPayloadFingerprint(findingRecords[i] as ReviewFinding);
   }
   // Detect redaction collisions: when two same-key findings in this round share
