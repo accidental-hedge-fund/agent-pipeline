@@ -377,7 +377,7 @@ export async function advanceReview(
   const review1RiskFromVerdict: Review1Risk | undefined =
     round === 1 ? classifyReview1Risk(verdict) : undefined;
   const review1Risk: Review1Risk =
-    round === 2 ? extractReview1Risk(detail.comments) : (review1RiskFromVerdict ?? "standard");
+    round === 2 ? extractReview1Risk(detail.comments, actor, cfgFooter(cfg)) : (review1RiskFromVerdict ?? "standard");
   const effectivePol = effectiveReviewPolicy(cfg.review_policy, { round, review1Risk });
 
   // Append `<!-- pipeline-review1-risk: ... -->` to every review-1 comment so
@@ -1452,12 +1452,24 @@ export function classifyReview1Risk(verdict: Pick<ReviewVerdict, "verdict" | "fi
 
 /**
  * Extract the review-1 risk tier from issue comments (#232). Reads the last
- * `<!-- pipeline-review1-risk: low|standard -->` sentinel across all comments.
- * Defaults to `"standard"` when absent or unrecognized — conservative fail-closed.
+ * `<!-- pipeline-review1-risk: low|standard -->` sentinel from trusted
+ * pipeline-authored Review 1 comments only. A comment is trusted when it starts
+ * with the Review 1 marker, was authored by `actor`, and contains the configured
+ * footer — matching the same triple-gate used for the diff-hash cache (#228).
+ * Defaults to `"standard"` when absent, unrecognized, or `actor` is null
+ * (unknown pipeline identity) — conservative fail-closed.
  */
-export function extractReview1Risk(comments: { body: string }[]): Review1Risk {
+export function extractReview1Risk(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+  footer: string,
+): Review1Risk {
+  if (actor === null) return "standard";
   let last: Review1Risk | null = null;
   for (const c of comments) {
+    if (!c.body.startsWith(REVIEW_MARKER_PREFIX_R1)) continue;
+    if (c.author !== actor) continue;
+    if (!c.body.includes(footer)) continue;
     REVIEW1_RISK_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = REVIEW1_RISK_RE.exec(c.body)) !== null) {
