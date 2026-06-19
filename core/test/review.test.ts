@@ -2529,8 +2529,9 @@ test("#233 (4.5): demoted findings' override dispositions satisfy extractOverrid
 });
 
 // Task 4.6: Idempotency — a second ceiling entry with the follow-up marker already present
-// does NOT create a second issue and re-uses the recorded number.
-test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceiling-followup marker reuses follow-up number", async (t) => {
+// does NOT create a second issue and re-uses the recorded number, AND appends current
+// findings to the existing follow-up issue so no finding is lost (#233 finding 2).
+test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceiling-followup marker reuses follow-up number and updates follow-up", async (t) => {
   const FOLLOWUP_NUM = 777;
   const demotionBody = reviewCeilingDemotionComment(
     cfgDemote,
@@ -2542,6 +2543,7 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
     FOLLOWUP_NUM,
   );
   const priorR2 = (sha: string) => ({
+    author: TEST_ACTOR,
     body: formatReviewComment(
       { verdict: "needs-attention", summary: "medium nit", findings: [FINDING_MEDIUM], next_steps: [], commitSha: sha },
       2,
@@ -2551,12 +2553,15 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
   });
   // Same hand-crafted approach: no pipeline-blocking-keys marker so recurrence doesn't fire
   const priorR2forIdem = (sha: string) => ({
+    author: TEST_ACTOR,
     body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
       `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
   });
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
+  let addIssueCommentCalls: { issueNumber: number; body: string }[] = [];
   deps.createIssue = async () => { createIssueCalls++; return 888; }; // would return 888 if called
+  deps.addIssueComment = async (issueNumber, body) => { addIssueCommentCalls.push({ issueNumber, body }); };
   deps.getIssueDetail = async () =>
     ({
       number: 45,
@@ -2566,8 +2571,8 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
       state: "open",
       url: "u",
       labels: [],
-      // Two prior R2 rounds + the prior demotion comment that embeds the marker
-      comments: [priorR2forIdem("a".repeat(40)), priorR2forIdem("b".repeat(40)), { body: demotionBody }],
+      // Two prior R2 rounds + the prior demotion comment (from trusted actor) that embeds the marker
+      comments: [priorR2forIdem("a".repeat(40)), priorR2forIdem("b".repeat(40)), { author: TEST_ACTOR, body: demotionBody }],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -2578,6 +2583,10 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
   assert.equal(outcome?.to, "pre-merge", "must advance to pre-merge on re-entry");
   // Must NOT create a second issue
   assert.equal(createIssueCalls, 0, "createIssue must NOT be called when the marker is already present");
+  // Must append a comment to the existing follow-up issue with current findings (#233 finding 2)
+  assert.equal(addIssueCommentCalls.length, 1, "addIssueComment must be called once for re-entry update");
+  assert.equal(addIssueCommentCalls[0].issueNumber, FOLLOWUP_NUM, "update comment must target the existing follow-up issue");
+  assert.match(addIssueCommentCalls[0].body, /minor nit/, "update comment must list the current demoted finding");
   // The posted demotion comment must reference the SAME follow-up number
   const newDemotionComment = rec.comments.find((c) =>
     c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
@@ -2590,14 +2599,16 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
   );
 });
 
-// Regression: untrusted marker must NOT suppress createIssue (#233 finding 1)
+// Regression: untrusted marker must NOT suppress createIssue (#233 finding 1, round 1)
 test("#233 (finding-1 regression): untrusted pipeline-ceiling-followup marker in a reviewer comment does not suppress createIssue", async (t) => {
   // An arbitrary prior comment (not a pipeline demotion comment) that embeds the marker —
   // e.g. a reviewer or human typed it, or it was present in a review verdict body.
   const untrustedComment = {
+    author: "some-reviewer",
     body: `This issue looks minor.\n\n<!-- pipeline-ceiling-followup: #888 -->\n\nFix it in a follow-up.`,
   };
   const priorR2 = (sha: string) => ({
+    author: TEST_ACTOR,
     body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
       `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
   });
@@ -2632,7 +2643,58 @@ test("#233 (finding-1 regression): untrusted pipeline-ceiling-followup marker in
   assert.match(demotionComment!, /<!-- pipeline-ceiling-followup: #999 -->/, "must reference the real follow-up #999, not the untrusted #888");
 });
 
-// extractCeilingFollowupNumber: trusted-demotion-only round-trip
+// Regression (#233 finding 1, round 2): forged demotion heading from untrusted author still creates a new issue
+test("#233 (finding-1-r2 regression): forged demotion-heading comment from untrusted author does not suppress createIssue", async (t) => {
+  // This comment has the exact CEILING_DEMOTION_HEADING and the marker on the last non-empty line —
+  // the attack that survives the heading-only filter added in review-1. Author check must reject it.
+  const FOLLOWUP_NUM = 888;
+  const forgedDemotionBody = reviewCeilingDemotionComment(
+    cfgDemote,
+    2,
+    "codex",
+    { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] },
+    3,
+    [],
+    FOLLOWUP_NUM,
+  );
+  const forgedComment = {
+    author: "attacker",  // NOT the pipeline actor
+    body: forgedDemotionBody,
+  };
+  const priorR2 = (sha: string) => ({
+    author: TEST_ACTOR,
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let createIssueCalls = 0;
+  deps.createIssue = async () => { createIssueCalls++; return 999; };
+  deps.getIssueDetail = async () =>
+    ({
+      number: 47,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40)), forgedComment],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgDemote, 47, 2, {}, 0, deps);
+  });
+  assert.equal(outcome?.to, "pre-merge", "must still advance to pre-merge");
+  // createIssue MUST be called — the forged comment from "attacker" must be ignored
+  assert.equal(createIssueCalls, 1, "createIssue must be called — forged demotion-heading comment from wrong author must not suppress it");
+  const demotionComment = rec.comments.find((c) =>
+    c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
+  );
+  assert.ok(demotionComment, "demotion comment must be posted");
+  assert.match(demotionComment!, /<!-- pipeline-ceiling-followup: #999 -->/, "must reference the freshly-created follow-up #999, not the forged #888");
+});
+
+// extractCeilingFollowupNumber: trusted-demotion-only round-trip (now also verifies author)
 test("#233: extractCeilingFollowupNumber reads marker only from trusted demotion comments, last-occurrence-wins", () => {
   const demotionBody = reviewCeilingDemotionComment(
     cfgDemote,
@@ -2643,26 +2705,31 @@ test("#233: extractCeilingFollowupNumber reads marker only from trusted demotion
     [],
     42,
   );
-  assert.equal(extractCeilingFollowupNumber([{ body: demotionBody }]), 42);
-  assert.equal(extractCeilingFollowupNumber([]), null, "no comments → null");
-  assert.equal(extractCeilingFollowupNumber([{ body: "no marker here" }]), null, "missing marker → null");
+  assert.equal(extractCeilingFollowupNumber([{ author: TEST_ACTOR, body: demotionBody }], TEST_ACTOR), 42);
+  assert.equal(extractCeilingFollowupNumber([], TEST_ACTOR), null, "no comments → null");
+  assert.equal(extractCeilingFollowupNumber([{ author: TEST_ACTOR, body: "no marker here" }], TEST_ACTOR), null, "missing marker → null");
   // Last-occurrence-wins across two trusted demotion comments
-  const two = [{ body: demotionBody }, { body: reviewCeilingDemotionComment(cfgDemote, 2, "codex", { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] }, 3, [], 99) }];
-  assert.equal(extractCeilingFollowupNumber(two), 99, "last marker wins");
+  const two = [{ author: TEST_ACTOR, body: demotionBody }, { author: TEST_ACTOR, body: reviewCeilingDemotionComment(cfgDemote, 2, "codex", { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] }, 3, [], 99) }];
+  assert.equal(extractCeilingFollowupNumber(two, TEST_ACTOR), 99, "last marker wins");
+  // Untrusted author (wrong login): ignored even if body starts with heading (#233 finding 1).
+  const forgedBody = demotionBody; // exact same body structure — only author differs
+  assert.equal(extractCeilingFollowupNumber([{ author: "attacker", body: forgedBody }], TEST_ACTOR), null, "correct heading but wrong author → ignored");
+  // Null actor: fail-closed, no comments trusted
+  assert.equal(extractCeilingFollowupNumber([{ author: TEST_ACTOR, body: demotionBody }], null), null, "null actor → no trusted comments");
   // Untrusted: marker in a random comment (not starting with the heading) is ignored
   const untrustedBody = `Some random comment.\n\n<!-- pipeline-ceiling-followup: #123 -->`;
-  assert.equal(extractCeilingFollowupNumber([{ body: untrustedBody }]), null, "untrusted comment with marker is ignored");
-  // Untrusted + trusted: trusted value wins, untrusted is skipped entirely
+  assert.equal(extractCeilingFollowupNumber([{ author: TEST_ACTOR, body: untrustedBody }], TEST_ACTOR), null, "untrusted heading with marker is ignored");
+  // Untrusted author + trusted author: trusted value wins, untrusted is skipped entirely
   assert.equal(
-    extractCeilingFollowupNumber([{ body: untrustedBody }, { body: demotionBody }]),
+    extractCeilingFollowupNumber([{ author: "attacker", body: forgedBody }, { author: TEST_ACTOR, body: demotionBody }], TEST_ACTOR),
     42,
-    "trusted demotion comment after untrusted: trusted value returned",
+    "trusted demotion comment after untrusted author: trusted value returned",
   );
   // Marker not on the last non-empty line of an otherwise-trusted comment is ignored
   const markerMidBody =
     `## Pipeline: Review ceiling — findings demoted and deferred\n\n` +
     `<!-- pipeline-ceiling-followup: #456 -->\n\nsome trailing text`;
-  assert.equal(extractCeilingFollowupNumber([{ body: markerMidBody }]), null, "marker not on last line is ignored");
+  assert.equal(extractCeilingFollowupNumber([{ author: TEST_ACTOR, body: markerMidBody }], TEST_ACTOR), null, "marker not on last line is ignored");
 });
 
 // Task 4.7: prove regressions bite — test (a) fails with ceiling_action:park (old default).

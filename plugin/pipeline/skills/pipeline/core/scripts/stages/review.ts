@@ -127,6 +127,10 @@ export interface AdvanceReviewDeps {
    *  path to file the single tracked follow-up issue for demoted findings. No pipeline:
    *  stage label is applied to the follow-up. Default: real `gh issue create` wrapper. */
   createIssue?: (title: string, body: string, labels: string[]) => Promise<number>;
+  /** Append a comment to an existing issue (#233 finding 2). Used when the demote-and-advance
+   *  path re-enters the ceiling and reuses a prior follow-up: appends current findings so
+   *  no finding is lost. Default: real `gh issue comment` wrapper. */
+  addIssueComment?: (issueNumber: number, body: string) => Promise<void>;
 }
 
 type RunReviewFn = (
@@ -654,13 +658,20 @@ export async function advanceReview(
     // ceiling_action is demote_and_advance. Auto-demote, file a follow-up issue, and
     // advance to pre-merge without human intervention.
     const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);
+    const addIssueCommentFn = deps.addIssueComment ?? defaultAddIssueComment(cfg);
 
     // Idempotency: check existing comments for a prior follow-up marker. Re-use
-    // the recorded follow-up number instead of creating a second issue.
-    const existingFollowup = extractCeilingFollowupNumber(detail.comments);
+    // the recorded follow-up number instead of creating a second issue. Author is
+    // verified inside extractCeilingFollowupNumber (#233 finding 1): only markers
+    // from the pipeline actor are trusted.
+    const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
     let followupNumber: number;
     if (existingFollowup !== null) {
       followupNumber = existingFollowup;
+      // Append the current findings to the existing follow-up so no finding is
+      // lost on re-entry (#233 finding 2).
+      const updateBody = buildFollowupUpdateComment(issueNumber, priorRoundComments.length + 1, belowHigh);
+      await addIssueCommentFn(followupNumber, updateBody);
     } else {
       // Build and create the single tracked follow-up issue.
       const followupBody = buildFollowupIssueBody(issueNumber, belowHigh);
@@ -1640,14 +1651,19 @@ const CEILING_FOLLOWUP_LINE_RE = /^<!-- pipeline-ceiling-followup: #(\d+) -->$/;
  * Scan issue comments for an existing `<!-- pipeline-ceiling-followup: #N -->`
  * marker, returning the recorded follow-up issue number or null when absent.
  * Only reads markers from pipeline-authored demotion comments (starting with
- * CEILING_DEMOTION_HEADING) where the marker is the last non-empty line —
- * the exact placement used by reviewCeilingDemotionComment. This prevents an
- * arbitrary comment body or reviewer-emitted text from suppressing createIssue.
+ * CEILING_DEMOTION_HEADING, authored by the authenticated pipeline actor) where
+ * the marker is the last non-empty line — the exact placement used by
+ * reviewCeilingDemotionComment. Fail-closed: null actor → no trusted comments.
  * Last-occurrence-wins. Exported for tests.
  */
-export function extractCeilingFollowupNumber(comments: { body: string }[]): number | null {
+export function extractCeilingFollowupNumber(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+): number | null {
   let last: number | null = null;
   for (const c of comments) {
+    // Fail-closed: unknown actor means no trusted comments (#233 finding 1).
+    if (actor === null || c.author !== actor) continue;
     // Trust only pipeline-authored demotion comments.
     if (!c.body.startsWith(CEILING_DEMOTION_HEADING)) continue;
     // Accept the marker only when it is the last non-empty line of the comment.
@@ -1697,6 +1713,40 @@ function buildFollowupIssueBody(
     "",
     `> Deferred from #${originalIssue} at review ceiling. Do not add a \`pipeline:\` label — ` +
       `this issue tracks follow-up work, not an in-progress pipeline run.`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Build the body of a follow-up issue update comment posted when demote-and-advance
+ * re-enters the ceiling and reuses an existing follow-up (#233 finding 2). Lists every
+ * current demoted finding so no finding is omitted from the tracked work item.
+ */
+function buildFollowupUpdateComment(
+  originalIssue: number,
+  roundNumber: number,
+  demotedFindings: ReviewFinding[],
+): string {
+  const lines = [
+    `Additional deferred findings from #${originalIssue} (re-entry at ceiling round ${roundNumber})`,
+    "",
+    "The item re-entered the review ceiling. The following below-high findings were demoted to advisory in this run:",
+    "",
+    "## Additional deferred findings",
+  ];
+  for (const f of demotedFindings) {
+    const key = findingKey(f);
+    const loc = f.file
+      ? ` — \`${f.file}${f.line_start ? `:${f.line_start}` : ""}\``
+      : "";
+    const cat = f.category ? ` (category: ${f.category})` : "";
+    lines.push(
+      `- \`${key}\` **[${(f.severity ?? "medium").toUpperCase()}]** ${f.title}${cat}${loc}`,
+    );
+  }
+  lines.push(
+    "",
+    `> Re-entered from #${originalIssue} at round ${roundNumber} ceiling. Do not add a \`pipeline:\` label.`,
   );
   return lines.join("\n");
 }
@@ -1777,6 +1827,29 @@ function defaultCreateIssue(
       throw new Error(`[pipeline review] could not parse issue number from gh output: ${url}`);
     }
     return Number(m[1]);
+  };
+}
+
+/**
+ * Default `addIssueComment` dep for {@link advanceReview}. Posts a comment on an
+ * existing issue via `gh issue comment`. Used to append re-entry findings to the
+ * existing follow-up issue (#233 finding 2).
+ */
+function defaultAddIssueComment(
+  cfg: PipelineConfig,
+): (issueNumber: number, body: string) => Promise<void> {
+  return async (issueNumber: number, body: string): Promise<void> => {
+    const args = ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo];
+    const result = spawnSync("gh", args, {
+      encoding: "utf8",
+      stdio: "pipe",
+      cwd: cfg.repo_dir,
+    });
+    if (result.status !== 0) {
+      throw new Error(
+        `[pipeline review] gh issue comment failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+      );
+    }
   };
 }
 
