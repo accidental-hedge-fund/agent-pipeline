@@ -51,6 +51,7 @@ import {
   printSummary,
   readBundle,
   recordOverride,
+  recordRecovery,
   recordStage,
 } from "./evidence-bundle.ts";
 import {
@@ -99,6 +100,65 @@ import {
 } from "./types.ts";
 
 const MAX_ITERATIONS = 12;
+
+// ---------------------------------------------------------------------------
+// Bounded auto-loop helpers (#149) — pure functions, exported for unit tests.
+// ---------------------------------------------------------------------------
+
+/**
+ * A non-advancing outcome is auto-loop recoverable when it is `waiting` (the
+ * stage explicitly signals a retriable temporary state) or `blocked` with a
+ * pipeline-owned recovery (i.e. blockerKind is set and is not `needs-human`).
+ * Non-recoverable: `error`, `no-op`, `finalized`, and any `blocked` outcome
+ * whose blockerKind is `needs-human` or absent (absent → treated as
+ * non-recoverable so unannotated stages cannot be silently auto-retried).
+ */
+export function isAutoLoopRecoverable(out: Outcome): boolean {
+  if (out.advanced) return false;
+  if (out.status === "waiting") return true;
+  if (out.status !== "blocked") return false;
+  // Missing blockerKind is treated as non-recoverable (same as needs-human):
+  // the pipeline cannot determine a recovery recipe for an unannotated blocker.
+  if (!out.blockerKind) return false;
+  return out.blockerKind !== "needs-human";
+}
+
+/**
+ * Decide whether the auto-loop should continue past this outcome at this stage.
+ * `plan-review` is a human-feedback checkpoint and is never eligible even when
+ * allowlisted, because its `waiting` return means "a human must review the plan".
+ */
+export function isAutoLoopEligible(
+  out: Outcome,
+  stage: Stage,
+  autoLoop: PipelineConfig["auto_loop"],
+): boolean {
+  if (!autoLoop.enabled) return false;
+  if (!isAutoLoopRecoverable(out)) return false;
+  if (stage === "plan-review") return false;
+  return (autoLoop.stages as string[]).includes(stage);
+}
+
+/**
+ * Check whether both the round and wall-clock budgets allow another continuation.
+ * `startMs` and `nowMs` are millisecond timestamps injected so tests use a fake clock.
+ */
+export function canAutoLoopContinue(
+  autoLoop: PipelineConfig["auto_loop"],
+  roundsSpent: number,
+  startMs: number,
+  nowMs: number,
+): boolean {
+  if (roundsSpent >= autoLoop.max_rounds) return false;
+  const elapsedMinutes = (nowMs - startMs) / 60_000;
+  if (elapsedMinutes >= autoLoop.max_wallclock_minutes) return false;
+  return true;
+}
+
+/** IO seam for {@link runAdvance}: inject a fake clock for wall-clock budgeting in tests. */
+export interface AdvanceDeps {
+  now?: () => number;
+}
 
 // Package version, single-sourced from package.json so a version bump is reflected
 // automatically. The path is `../package.json` (core/package.json) and is mirror-safe:
@@ -1629,7 +1689,9 @@ async function runAdvance(
   cfg: PipelineConfig,
   issueNumber: number,
   opts: CliOpts,
+  deps: AdvanceDeps = {},
 ): Promise<void> {
+  const nowFn = deps.now ?? (() => Date.now());
   await withLock(
     cfg.domain,
     async () => {
@@ -1652,8 +1714,10 @@ async function runAdvance(
     // console.log so that terminal.log captures the full run output (finding #6).
     let lastStage: Stage = startStage;
     let transitions = 0;
-    const t0 = Date.now();
+    const t0 = nowFn();
     const runStartedAt = new Date(t0);
+    // Auto-loop budget tracking (#149): rounds spent and wall-clock start.
+    let autoLoopRoundsSpent = 0;
     const runStartedAtIso = runStartedAt.toISOString().replace(/\.\d+Z$/, "Z");
 
     // Evidence bundle (#147): a write-only, per-run audit artifact. Skipped
@@ -1929,9 +1993,95 @@ async function runAdvance(
         lastStage = (out as { to: Stage }).to;
         finalStage = lastStage; // keep final-state accurate when --once breaks after an advance
       } else {
-        // Blocked: emit blocker_set so consumers can reconstruct blocking state.
-        if (out.status === "blocked" && runDir) {
-          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+        // Non-advancing: check auto-loop eligibility before stopping (#149).
+        const eligible = isAutoLoopEligible(out, stage, cfg.auto_loop);
+        if (eligible && canAutoLoopContinue(cfg.auto_loop, autoLoopRoundsSpent, t0, nowFn())) {
+          // Auto-loop: perform recovery and continue within budget.
+          autoLoopRoundsSpent++;
+          if (!opts.dryRun && out.status === "blocked") {
+            await clearBlocked(cfg, issueNumber).catch(() => {});
+          }
+          const nowMs = nowFn();
+          const roundsRemaining = cfg.auto_loop.max_rounds - autoLoopRoundsSpent;
+          const minutesRemaining = Math.max(
+            0,
+            cfg.auto_loop.max_wallclock_minutes - (nowMs - t0) / 60_000,
+          );
+          console.log(
+            `[pipeline] #${issueNumber}: auto-loop round ${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds}: ` +
+            `continuing past ${out.status} at ${stage} ` +
+            `(${roundsRemaining} rounds, ${minutesRemaining.toFixed(1)}m remaining)`,
+          );
+          if (!opts.dryRun) {
+            await postComment(
+              cfg,
+              issueNumber,
+              [
+                `## Pipeline: Auto-Loop Continuation (${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds})`,
+                "",
+                `Automatically continuing past recoverable stop at \`${stage}\`:`,
+                `- **Reason**: ${out.reason}`,
+                `- **Rounds remaining**: ${roundsRemaining}`,
+                `- **Wall-clock remaining**: ${minutesRemaining.toFixed(1)} minutes`,
+                "",
+                "---",
+                cfg.marker_footer,
+              ].join("\n"),
+            ).catch(() => {});
+            if (stateDir) {
+              await recordRecovery(stateDir, issueNumber, {
+                trigger: `bounded-auto-loop:${out.status}:${stage}`,
+                round: autoLoopRoundsSpent,
+                at: evidenceTimestamp(),
+              }).catch(() => {});
+            }
+          }
+          if (opts.once) break;
+          continue;
+        } else if (eligible && autoLoopRoundsSpent > 0) {
+          // Budget exhausted after at least one continuation: park at needs-human.
+          const elapsedMinutes = (nowFn() - t0) / 60_000;
+          console.log(
+            `[pipeline] #${issueNumber}: auto-loop budget exhausted after ${autoLoopRoundsSpent} ` +
+            `continuation(s) — parking at needs-human`,
+          );
+          if (!opts.dryRun) {
+            await transition(cfg, issueNumber, stage, "needs-human", "auto-loop budget exhausted");
+            await clearBlocked(cfg, issueNumber).catch(() => {});
+            finalStage = "needs-human";
+            await postComment(
+              cfg,
+              issueNumber,
+              [
+                "## Pipeline: Auto-Loop Budget Exhausted",
+                "",
+                `The bounded auto-loop ran ${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds} round(s) and cannot continue:`,
+                `- **Stage**: \`${stage}\``,
+                `- **Last outcome**: ${out.status} — ${out.reason}`,
+                `- **Rounds used**: ${autoLoopRoundsSpent} / ${cfg.auto_loop.max_rounds}`,
+                `- **Time used**: ${elapsedMinutes.toFixed(1)} / ${cfg.auto_loop.max_wallclock_minutes} minutes`,
+                "",
+                "The issue is parked at `needs-human`. To resume:",
+                "- Fix the underlying issue and re-run `pipeline <N>` after relabeling to the appropriate stage.",
+                "- Or record an audited disposition with `--override \"<key>: <reason>\"` if applicable.",
+                "",
+                "---",
+                cfg.marker_footer,
+              ].join("\n"),
+            ).catch(() => {});
+            if (stateDir) {
+              await recordRecovery(stateDir, issueNumber, {
+                trigger: "bounded-auto-loop:exhausted",
+                round: autoLoopRoundsSpent + 1,
+                at: evidenceTimestamp(),
+              }).catch(() => {});
+            }
+          }
+        } else {
+          // Not eligible or no rounds spent: stop as today.
+          if (out.status === "blocked" && runDir) {
+            await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+          }
         }
         break;
       }
@@ -1975,7 +2125,7 @@ async function runAdvance(
       }
     }
 
-    const elapsed = Math.round((Date.now() - t0) / 1000);
+    const elapsed = Math.round((nowFn() - t0) / 1000);
     console.log(
       `\n[pipeline] #${issueNumber}: done — ${startStage} → ${lastStage} (${transitions} transitions, ${elapsed}s)`,
     );
@@ -2139,7 +2289,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 // Internal exports for tests (state-transition table tests).
 // ---------------------------------------------------------------------------
 
-export const _internals = { dispatch, runInit };
+export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
 
 // Suppress unused import warnings for test-only helpers.
 void addLabel;

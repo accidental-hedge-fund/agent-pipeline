@@ -128,7 +128,7 @@ export async function advanceEval(
       "eval-gate",
       "eval-gate-misconfigured",
     );
-    return { advanced: false, status: "blocked", reason: "eval_gate.command not set" };
+    return { advanced: false, status: "blocked", reason: "eval_gate.command not set", blockerKind: "eval-gate-misconfigured" };
   }
 
   // Resolve worktree (evals run inside the issue's code).
@@ -141,7 +141,7 @@ export async function advanceEval(
       "eval-gate",
       "worktree-missing",
     );
-    return { advanced: false, status: "blocked", reason: "no worktree" };
+    return { advanced: false, status: "blocked", reason: "no worktree", blockerKind: "worktree-missing" };
   }
 
   const maxAttempts = cfg.eval_gate.max_attempts;
@@ -236,7 +236,7 @@ export async function advanceEval(
       "eval-gate",
       "harness-failure",
     );
-    return { advanced: false, status: "blocked", reason: `eval gate timed out${attempts}` };
+    return { advanced: false, status: "blocked", reason: `eval gate timed out${attempts}`, blockerKind: "harness-failure" };
   }
 
   if (result.spawnError) {
@@ -248,7 +248,7 @@ export async function advanceEval(
       "eval-gate",
       "harness-failure",
     );
-    return { advanced: false, status: "blocked", reason: `eval gate runner error${attempts}` };
+    return { advanced: false, status: "blocked", reason: `eval gate runner error${attempts}`, blockerKind: "harness-failure" };
   }
 
   // Ordinary harness-owned failure (non-zero exit). Advisory mode records and advances.
@@ -267,7 +267,7 @@ export async function advanceEval(
     "eval-gate",
     "eval-gate-failed",
   );
-  return { advanced: false, status: "blocked", reason: `eval gate failed${attempts}` };
+  return { advanced: false, status: "blocked", reason: `eval gate failed${attempts}`, blockerKind: "eval-gate-failed" };
 }
 
 // ---------------------------------------------------------------------------

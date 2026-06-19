@@ -317,6 +317,17 @@ export interface PipelineConfig {
   // pipeline actor (#229). Useful for multi-actor setups (e.g., a CI bot and a
   // human operator share the same pipeline installation). Default: [] (actor-only).
   trusted_override_actors?: string[];
+  // Bounded auto-loop mode (#149). When enabled, recoverable stops at allowlisted
+  // pipeline-owned stages convert from stop to automatic continuation within
+  // explicit round and wall-clock budgets, recording rationale per continuation,
+  // then park at `needs-human` with evidence on exhaustion — without granting any
+  // new shipping authority. Default: disabled.
+  auto_loop: {
+    enabled: boolean;
+    max_rounds: number;
+    max_wallclock_minutes: number;
+    stages: Stage[];
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -360,6 +371,7 @@ export const DEFAULT_CONFIG: Omit<
   doctor: { runOnStart: false, failFast: false },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,
+  auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] as Stage[] },
 };
 
 // ---------------------------------------------------------------------------
@@ -378,7 +390,7 @@ export function reviewStageSkipTarget(cfg: Pick<PipelineConfig, "steps">, stage:
 // One transition outcome from a stage advance call.
 export type Outcome =
   | { advanced: true; from: Stage; to: Stage; summary: string }
-  | { advanced: false; status: "blocked"; reason: string }
+  | { advanced: false; status: "blocked"; reason: string; blockerKind?: BlockerKind }
   | { advanced: false; status: "waiting"; reason: string }
   | { advanced: false; status: "no-op"; reason: string }
   | { advanced: false; status: "finalized"; reason: string }
