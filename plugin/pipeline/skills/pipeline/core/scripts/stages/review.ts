@@ -32,6 +32,7 @@ import { getForIssue } from "../worktree.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import {
+  buildTrustedOverrideComments,
   categoryMarker,
   extractOverrides,
   extractScopedOverrides,
@@ -263,8 +264,10 @@ export async function advanceReview(
         // Apply current overrides: a human may have recorded an override after the
         // last review on an unchanged diff. Filter out overridden keys before
         // deciding whether to route to fix (#228 fix-1).
-        // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
-        const trustedForScopes = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+        // Trust overrides from the current actor + any review-round comment author
+        // so dispositions recorded by one authorized runner survive identity changes
+        // (#229 Findings 1, 4, 5).
+        const trustedForScopes = buildTrustedOverrideComments(detail.comments, actor);
         const currentOverrides = extractOverrides(trustedForScopes);
         const remainingBlockers = [...cachedBlockingKeys].filter((k) => !currentOverrides.has(k));
         // If scoped overrides are active and key-only blockers remain, the scope may cover
@@ -462,8 +465,9 @@ export async function advanceReview(
   // advisory (below threshold/confidence), and operator-overridden. Only
   // blocking findings route to a fix round. When none remain, the review still
   // ran and its findings are on the record — the item advances as if approved.
-  // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
-  const trustedComments = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+  // Trust override/scope sentinels from the current actor + any review-round comment
+  // author so dispositions survive identity changes (#229 Findings 1, 4, 5).
+  const trustedComments = buildTrustedOverrideComments(detail.comments, actor);
   const overrides = extractOverrides(trustedComments);
   const scopes = extractScopedOverrides(trustedComments);
   const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides, scopes);

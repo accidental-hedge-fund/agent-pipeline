@@ -39,6 +39,7 @@ import {
   parseStructuredVerdict,
 } from "./review.ts";
 import {
+  buildTrustedOverrideComments,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
@@ -463,7 +464,11 @@ export async function enforceReviewShaGate(
       reason: "pre-merge: actor lookup failed — cannot verify review provenance",
     };
   }
+  // Actor-only for review-SHA extraction (pipeline-authored review comments only).
   const trustedComments = detail.comments.filter((c) => c.author === actor);
+  // Expanded set for override/scope extraction: also trust any account that has
+  // posted a review-round comment, so dispositions survive identity changes (#229 Finding 5).
+  const trustedOverrideComments = buildTrustedOverrideComments(detail.comments, actor);
 
   const reviewed = extractReviewedSha(trustedComments);
   // No prior review comment (e.g. review steps disabled, or first run) → nothing
@@ -489,15 +494,14 @@ export async function enforceReviewShaGate(
   ): Promise<Outcome | null> => {
     const recorded = commentBody ? extractBlockingKeysMarker(commentBody) : null;
     if (!recorded || recorded.size === 0) return null;
-    // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
-    const overrides = extractOverrides(trustedComments);
+    // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
+    const overrides = extractOverrides(trustedOverrideComments);
     const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
     // Scoped overrides may cover the remaining key-only blockers, but we can't verify
     // without the actual finding objects. Force a fresh review so partitionFindings
     // can be called with live findings and scopes (#229).
-    // Only honor scoped override sentinels from pipeline-authored comments (#229 Finding 1).
-    const activeScopes = extractScopedOverrides(trustedComments);
+    const activeScopes = extractScopedOverrides(trustedOverrideComments);
     if (activeScopes.length > 0) {
       const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
       await postCommentFn(
@@ -638,9 +642,9 @@ export async function enforceReviewShaGate(
           `summary: ${deltaResult.summary || "(none)"}`,
         );
       }
-      // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
-      const overrides = extractOverrides(trustedComments);
-      const scopes = extractScopedOverrides(trustedComments);
+      // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
+      const overrides = extractOverrides(trustedOverrideComments);
+      const scopes = extractScopedOverrides(trustedOverrideComments);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes);
 
       const newHash = computeDiffHash(currentDiff);

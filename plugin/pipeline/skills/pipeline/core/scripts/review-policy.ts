@@ -314,6 +314,32 @@ export function partitionFindings(
   return result;
 }
 
+/**
+ * Build the set of issue/PR comments that are trusted sources for override and
+ * scoped-override sentinels (#229 Findings 4 + 5).
+ *
+ * Trust model: honor override comments authored by:
+ *   1. The current pipeline actor (whoever is running this invocation), AND
+ *   2. Any account that has already posted a `## Review 1` or `## Review 2`
+ *      pipeline review-round comment — so dispositions recorded by one authorized
+ *      runner survive a subsequent invocation under a different identity.
+ *
+ * Returns [] when `actor` is null (auth failure → fail-closed).
+ */
+export function buildTrustedOverrideComments<T extends { body: string; author?: string | null }>(
+  comments: T[],
+  actor: string | null,
+): T[] {
+  if (actor === null) return [];
+  const reviewActors = new Set<string>(
+    comments
+      .filter((c) => c.author != null && (c.body.startsWith("## Review 1") || c.body.startsWith("## Review 2")))
+      .map((c) => c.author as string),
+  );
+  reviewActors.add(actor);
+  return comments.filter((c) => c.author != null && reviewActors.has(c.author as string));
+}
+
 // Machine-readable override sentinel, mirroring the `reviewed-sha` precedent
 // (#16). Anchored to line-start; the disposition token is recorded for display.
 const OVERRIDE_RE = /^<!-- pipeline-override: ([0-9a-f]{8}) (.+?) -->$/m;

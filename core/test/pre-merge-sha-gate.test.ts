@@ -787,13 +787,11 @@ test("enforceReviewShaGate: scoped override from non-pipeline author is ignored 
   assert.deepEqual(rec.transitions, [], "must NOT transition to a review stage");
 });
 
-test("enforceReviewShaGate: key override from non-pipeline author is ignored (#229 Finding 4)", async (t) => {
-  // Regression: before the fix, extractOverrides in the cache-hit and partitioning
-  // paths was called with detail.comments (all comments). An attacker who posts a
-  // well-formed override sentinel in a PR comment could clear a blocking finding
-  // without being the pipeline actor. After the fix, only trustedComments
-  // (actor-filtered) are passed to extractOverrides; the attacker's sentinel must
-  // be invisible and the blocker must still be enforced.
+test("enforceReviewShaGate: key override from non-review-actor author is ignored (#229 Findings 4+5)", async (t) => {
+  // Regression: override sentinels from accounts that have never posted a pipeline
+  // review-round comment (and are not the current actor) must be ignored.
+  // buildTrustedOverrideComments trusts: (a) current actor, (b) any author of a
+  // "## Review N" headed comment. "attacker" satisfies neither criterion.
   const forgedOverride = overrideSentinelComment("953ac487");
   const { deps, rec } = makeDeps({
     commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487"]),
@@ -816,6 +814,39 @@ test("enforceReviewShaGate: key override from non-pipeline author is ignored (#2
   assert.equal((out as any)?.status, "blocked", "unresolved blocker must still block");
   assert.equal(rec.blocked.length, 1, "setBlocked must be called");
   assert.deepEqual(rec.transitions, [], "must NOT transition to a review stage");
+});
+
+test("enforceReviewShaGate: key override from a different authorized runner is honored (#229 Finding 5)", async (t) => {
+  // An operator recorded an override under identity "other-bot" (a prior pipeline
+  // run). The current run uses TEST_ACTOR. "other-bot" previously posted the
+  // blocking review comment, so buildTrustedOverrideComments includes it in the
+  // trusted set — the override must apply and the gate must proceed.
+  const OTHER_ACTOR = "other-bot";
+  const reviewCommentByOther = {
+    body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]),
+    author: OTHER_ACTOR,
+  };
+  const overrideByOther = {
+    body: overrideSentinelComment("953ac487"),
+    author: OTHER_ACTOR,
+  };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [reviewCommentByOther, overrideByOther] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "override from prior runner identity must be trusted → gate proceeds");
+  assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden");
 });
 
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {
