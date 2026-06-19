@@ -411,11 +411,22 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
   // those optional sections are not accidentally discarded with an advisory block.
   const blocks = findingsContent.split(/\n\n(?=\*\*\d+\.|\#\#)/);
 
+  // Per-finding advisory marker emitted by formatReviewComment for reviewer-marked
+  // non-blocking findings (#236 fix 2). Takes precedence over the key-set check so
+  // a blocking:false finding that shares a key with a genuine blocker is still excluded.
+  const ADVISORY_FINDING_MARKER = "<!-- pipeline-advisory-finding -->";
+
   const blocking: string[] = [];
   let advisoryCount = 0;
 
   for (const block of blocks) {
     if (!block.trim()) continue;
+    // Per-finding marker beats key-set: a reviewer-marked advisory finding is
+    // excluded even when its override-key collides with a blocking finding's key.
+    if (block.includes(ADVISORY_FINDING_MARKER)) {
+      advisoryCount++;
+      continue;
+    }
     const keyMatch = block.match(OVERRIDE_KEY_RE);
     const key = keyMatch?.[1];
     if (!key || blockingKeys.has(key)) {

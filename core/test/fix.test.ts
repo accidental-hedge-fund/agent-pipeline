@@ -335,3 +335,54 @@ test("extractBlockingReviewFindings: mixed verdict — fix prompt receives only 
   assert.ok(!filtered.includes(advisoryFinding.title), "advisory finding must be stripped from fix prompt");
   assert.ok(filtered.includes("advisory finding was omitted"), "omission note must be present");
 });
+
+// Regression: same-key blocking + blocking:false sibling — advisory must still be excluded (#236 fix 2)
+test("filterToBlockingFindings: same-key blocking + blocking:false sibling — advisory excluded despite shared key (#236)", () => {
+  // Both findings share the same findingKey (HIGH + same file + same 5-line bucket).
+  // Lines 46 and 48 both fall in bucket 46 (Math.floor((L-1)/5)*5+1 = 46).
+  const sameKeyBlocker: ReviewFinding = {
+    severity: "high",
+    title: "Blocking issue at same location",
+    file: "core/x.ts",
+    line_start: 46,
+    body: "Must be fixed.",
+    confidence: 0.9,
+  };
+  const sameKeyAdvisory: ReviewFinding = {
+    severity: "high",
+    title: "Advisory sibling at same location",
+    file: "core/x.ts",
+    line_start: 48,
+    body: "Out of scope — informational only.",
+    confidence: 0.9,
+    blocking: false,
+  };
+
+  // Precondition: keys must collide
+  assert.equal(
+    findingKey(sameKeyBlocker),
+    findingKey(sameKeyAdvisory),
+    "precondition: same bucket → same key",
+  );
+
+  const sharedKey = findingKey(sameKeyBlocker);
+  const body = formatReviewComment(
+    minCfg,
+    {
+      verdict: "needs-attention",
+      summary: "one blocker, one advisory sibling sharing the same key",
+      findings: [sameKeyBlocker, sameKeyAdvisory],
+      next_steps: [],
+    },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+
+  // Both keys are the same — the key-set check alone cannot distinguish them.
+  // The per-finding marker (<!-- pipeline-advisory-finding -->) is the tiebreaker.
+  const filtered = filterToBlockingFindings(body, new Set([sharedKey]));
+
+  assert.ok(filtered.includes(sameKeyBlocker.title), "blocking finding must be present");
+  assert.ok(!filtered.includes(sameKeyAdvisory.title), "advisory sibling must be excluded despite shared key");
+  assert.ok(filtered.includes("1 advisory finding was omitted"), "omission note must be present");
+});

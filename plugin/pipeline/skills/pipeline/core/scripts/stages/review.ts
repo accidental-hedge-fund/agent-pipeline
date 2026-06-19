@@ -1048,6 +1048,10 @@ export function formatReviewComment(
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
+      // Per-finding advisory marker: emitted when the reviewer explicitly marks a
+      // finding non-blocking (blocking:false). Lets filterToBlockingFindings exclude
+      // this finding even when it shares a findingKey with a genuine blocker (#236).
+      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
     });
   }
   if (verdict._raw) {
@@ -1116,6 +1120,7 @@ export function formatDeltaReviewComment(
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
+      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
     }
   }
   if (verdict.next_steps?.length) {
