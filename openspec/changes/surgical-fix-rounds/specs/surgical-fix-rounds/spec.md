@@ -28,17 +28,20 @@ permits bringing a stale spec delta back into agreement with the fix).
 when a fix would touch a destructive or irreversible operation. The prompt SHALL name the
 guarded operations concretely — at minimum force worktree removal (`git worktree remove
 --force`), force push (`git push --force` / `--force-with-lease`), branch or worktree
-deletion, and the merge surface. The guard SHALL require any such destructive path to be
-scoped to the **managed worktree root** or the **reviewed head**, so a fix cannot widen
-the blast radius of a destructive operation while resolving an unrelated finding. If a
-finding's correct fix genuinely requires touching a guarded operation, the harness SHALL
-state an explicit justification in its output.
+deletion, and the merge surface. The guard SHALL split the scope requirement by operation type: worktree deletion and
+removal operations SHALL be constrained to the **managed worktree root** only (the
+`reviewed head` alternative does NOT apply — a git commit reference is not a filesystem
+boundary); force push and merge-surface operations MAY be scoped to the **managed
+worktree root** or the **reviewed head**. A fix cannot widen the blast radius of a
+destructive operation while resolving an unrelated finding. If a finding's correct fix
+genuinely requires touching a guarded operation, the harness SHALL state an explicit
+justification in its output.
 
 #### Scenario: destructive-operation guard is present and scoped
 
 - **WHEN** `buildFixPrompt` is called for any fix round
 - **THEN** the returned prompt string SHALL name at least one destructive operation (e.g. force worktree removal or force push)
-- **AND** it SHALL require that operation to be scoped to the managed worktree root or the reviewed head, or accompanied by an explicit justification
+- **AND** for worktree deletion/removal it SHALL require managed worktree root scoping only; for force push/merge it SHALL require managed worktree root or reviewed head scoping; or accompanied by an explicit justification
 
 #### Scenario: guard targets the #223 data-loss pattern
 

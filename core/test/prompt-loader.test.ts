@@ -1332,6 +1332,23 @@ test("fix prompt: destructive-operation guard names guarded operations and requi
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("fix prompt: worktree-deletion guard requires managed-root only — reviewed-head alternative excluded (#235)", () => {
+  const out = buildSampleFixPrompt();
+  // worktree deletion must be tied to managed worktree root specifically
+  assert.match(
+    out,
+    /worktree.*managed worktree root|managed worktree root.*worktree/is,
+    "fix prompt must tie worktree deletion to managed worktree root specifically",
+  );
+  // The reviewed-head alternative must be explicitly excluded for worktree deletion
+  // (reviewed-head is a git commit reference, not a filesystem boundary)
+  assert.match(
+    out,
+    /does NOT apply|not a filesystem boundary|not.*filesystem boundary/i,
+    "guard must state that reviewed-head does not apply to worktree deletion (not a filesystem boundary)",
+  );
+});
+
 test("fix prompt: pre-commit self-check instructs comparing diff against findings before pushing (#235)", () => {
   const out = buildSampleFixPrompt();
   // Must instruct comparing own diff against findings
