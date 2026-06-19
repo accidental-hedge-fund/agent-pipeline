@@ -349,30 +349,36 @@ const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
  * for the same `<type>:<value>` wins (lets a human revise a scoped disposition).
  * The returned array is ready to pass as the `scopes` argument of `partitionFindings`.
  *
- * Only comments with the controlled `## Pipeline: Scope override` heading are
- * processed — pipeline-authored review comments may contain raw reviewer finding
- * text that could embed sentinel-shaped lines (#229 Finding 1 fix).
+ * Security invariants (#229 Finding 1 + Finding 2):
+ * 1. Only comments with the controlled `## Pipeline: Scope override` heading are
+ *    processed — pipeline-authored review comments may contain raw reviewer finding
+ *    text that could embed sentinel-shaped lines.
+ * 2. Only the last non-empty line of each qualifying comment is parsed as the machine
+ *    sentinel — free-form reason text in the comment body cannot inject additional
+ *    scope records even if it contains a sentinel-shaped line.
  */
 export function extractScopedOverrides(comments: { body: string }[]): ScopedOverride[] {
   const map = new Map<string, ScopedOverride>(); // key: "${type}:${value}" → last wins
   for (const c of comments) {
     if (!c.body.startsWith(SCOPE_OVERRIDE_HEADING)) continue;
+    // Only examine the last non-empty line — scopedOverrideComment always places the
+    // machine sentinel there; free-form reason text earlier in the body is ignored.
+    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
     SCOPE_OVERRIDE_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = SCOPE_OVERRIDE_RE.exec(c.body)) !== null) {
-      const type = m[1] as "category" | "file";
-      // Decode percent-encoded scope values (#229 fix 2). Old sentinels without
-      // encoding round-trip safely; malformed sequences fall back to the raw string.
-      let value: string;
-      try { value = decodeURIComponent(m[2]); } catch { value = m[2]; }
-      // Sentinel format: "disposition | human reason" (new, #229 fix) or "disposition" (old).
-      // The " | " delimiter separates the normalized token from the operator-supplied text.
-      const captured = m[3].trim();
-      const pipeIdx = captured.indexOf(" | ");
-      const disposition = pipeIdx >= 0 ? captured.slice(0, pipeIdx).trim() : captured;
-      const reason = pipeIdx >= 0 ? captured.slice(pipeIdx + 3).trim() : captured;
-      map.set(`${type}:${value}`, { type, value, disposition, reason });
-    }
+    const m = SCOPE_OVERRIDE_RE.exec(lastLine);
+    if (!m) continue;
+    const type = m[1] as "category" | "file";
+    // Decode percent-encoded scope values (#229 fix 2). Old sentinels without
+    // encoding round-trip safely; malformed sequences fall back to the raw string.
+    let value: string;
+    try { value = decodeURIComponent(m[2]); } catch { value = m[2]; }
+    // Sentinel format: "disposition | human reason" (new, #229 fix) or "disposition" (old).
+    // The " | " delimiter separates the normalized token from the operator-supplied text.
+    const captured = m[3].trim();
+    const pipeIdx = captured.indexOf(" | ");
+    const disposition = pipeIdx >= 0 ? captured.slice(0, pipeIdx).trim() : captured;
+    const reason = pipeIdx >= 0 ? captured.slice(pipeIdx + 3).trim() : captured;
+    map.set(`${type}:${value}`, { type, value, disposition, reason });
   }
   SCOPE_OVERRIDE_RE.lastIndex = 0;
   return [...map.values()];
@@ -445,6 +451,10 @@ export function scopedOverrideComment(args: {
   footer?: string;
 }): string {
   const { scopeType, scopeValue, disposition, reason, stage, timestamp, footer } = args;
+  // Sanitize the reason before embedding in the machine sentinel: strip newlines and
+  // escape HTML comment close sequences so reason text cannot contain a sentinel-shaped
+  // line or close the comment early (#229 Finding 2).
+  const safeReason = reason.replace(/[\r\n]/g, " ").replace(/-->/g, "—>");
   return [
     "## Pipeline: Scope override",
     "",
@@ -458,7 +468,7 @@ export function scopedOverrideComment(args: {
     "",
     (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
     "",
-    `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${reason} -->`,
+    `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${safeReason} -->`,
   ].join("\n");
 }
 

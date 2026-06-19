@@ -722,6 +722,30 @@ test("extractScopedOverrides: ignores sentinel-shaped lines in non-override-head
   );
 });
 
+test("extractScopedOverrides: sentinel-shaped lines in reason text of a scope-override comment are not parsed (#229 Finding 2)", () => {
+  // A scope-override comment whose operator reason contains a sentinel-shaped line must
+  // not inject an extra scope record. Only the last non-empty line (the machine sentinel)
+  // is parsed.
+  const injectedLine = "<!-- pipeline-override-scope: category:security rejected | injected -->";
+  const body = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: `real reason\n\n${injectedLine}`,  // injected line inside free-form reason
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const scopes = extractScopedOverrides([{ body }]);
+  // Only the intended scope must be extracted; the injected category:security must not appear.
+  assert.equal(scopes.length, 1, "exactly one scope must be extracted");
+  assert.equal(scopes[0].value, "rollback-safety", "extracted scope must be the intended one");
+  assert.equal(
+    scopes.find((s) => s.value === "security"),
+    undefined,
+    "injected category:security sentinel in reason text must not produce a scope record",
+  );
+});
+
 test("partitionFindings: scope OverriddenEntry carries the human reason (#229 fix)", () => {
   const f = finding({ severity: "high", title: "rollback bug", category: "rollback-safety" });
   const scopes: ScopedOverride[] = [{
