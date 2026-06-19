@@ -720,3 +720,66 @@ test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker)
   assert.equal(out, null, "an advisory-only round records an empty marker → no blockers → proceed");
   assert.deepEqual(rec.blocked, [], "must not block on an advisory-only verdict");
 });
+
+// ---------------------------------------------------------------------------
+// Reuse guard applies to ALL three verdict-reuse paths, not just exact-SHA
+// (#228 review-2 round 4): diff-hash-unchanged and pipeline-internal-only
+// short-circuits must also re-check recorded blockers, or a no-op / archive
+// commit that preserves the verdict could bypass unresolved blocking findings.
+// ---------------------------------------------------------------------------
+
+function blockingReviewCommentWithHash(round: 1 | 2, sha: string, hash: string, keys: string[]): string {
+  return blockingReviewComment(round, sha, keys) + `\n<!-- verdict-diff-hash: ${hash} -->`;
+}
+
+test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op commit cannot bypass (#228)", async (t) => {
+  const DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const hash = computeDiffHash(DIFF);
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewCommentWithHash(2, SHA_REVIEWED, hash, ["c8091c93"]),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => DIFF,
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "diff-hash reuse must NOT proceed while a blocker is unresolved");
+  assert.equal((out as any)?.status, "blocked");
+  assert.equal(rec.blocked.length, 1);
+  assert.deepEqual(rec.transitions, []);
+});
+
+test("enforceReviewShaGate: diff-hash reuse path proceeds once the blocker is overridden (#228)", async (t) => {
+  const DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const hash = computeDiffHash(DIFF);
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewCommentWithHash(2, SHA_REVIEWED, hash, ["c8091c93"]),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => DIFF,
+    extraCommentBodies: [overrideSentinelComment("c8091c93")],
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = { advanced: false } as any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "blocker overridden → diff-hash reuse is a valid approval");
+  assert.match(rec.comments[0], /Diff unchanged since last review/);
+});
+
+test("enforceReviewShaGate: pipeline-internal-only commits cannot reuse a blocking verdict (#228)", async (t) => {
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_REVIEWED, ["953ac487"]),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, ARCHIVE_COMMIT_AT_HEAD],
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "an archive commit must NOT let a blocking verdict be reused");
+  assert.equal((out as any)?.status, "blocked");
+  assert.equal(rec.blocked.length, 1);
+});

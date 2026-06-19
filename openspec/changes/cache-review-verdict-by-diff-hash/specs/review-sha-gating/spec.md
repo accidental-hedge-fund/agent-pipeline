@@ -2,7 +2,7 @@
 
 ### Requirement: Gate transition reads and validates the reviewed SHA
 
-Before the pipeline acts on a prior review verdict (advancing from a review stage to the next gate), it SHALL extract the `reviewed-sha` sentinel from the most recent review comment for that round and compare it to the current HEAD commit SHA. When the SHAs differ with non-pipeline-internal commits present, the gate SHALL additionally check the diff-hash cache (`verdict-diff-hash` sentinel) before triggering any re-review. A SHA mismatch with an unchanged diff hash SHALL reuse the verdict; a SHA mismatch with a changed diff hash SHALL trigger a focused delta review rather than a full review-stage re-run. On an exact SHA match, the gate SHALL treat the verdict as a valid approval only when the recorded review left no unresolved blocking findings — it SHALL re-evaluate the comment's `pipeline-blocking-keys` marker against current overrides before advancing.
+Before the pipeline acts on a prior review verdict (advancing from a review stage to the next gate), it SHALL extract the `reviewed-sha` sentinel from the most recent review comment for that round and compare it to the current HEAD commit SHA. When the SHAs differ with non-pipeline-internal commits present, the gate SHALL additionally check the diff-hash cache (`verdict-diff-hash` sentinel) before triggering any re-review. A SHA mismatch with an unchanged diff hash SHALL reuse the verdict; a SHA mismatch with a changed diff hash SHALL trigger a focused delta review rather than a full review-stage re-run. On EVERY verdict-reuse short-circuit — exact-SHA match, pipeline-internal-only commits since the review, or an unchanged diff hash — the gate SHALL treat the verdict as a valid approval only when the recorded review left no unresolved blocking findings: it SHALL re-evaluate the most recent review/delta comment's `pipeline-blocking-keys` marker against current overrides, and if any listed key remains un-overridden it SHALL keep the issue blocked at `pipeline:pre-merge` instead of reusing the verdict.
 
 #### Scenario: SHA matches current HEAD with no unresolved blockers — verdict is trusted
 
@@ -35,9 +35,18 @@ This closes a bypass introduced with the pre-merge delta review: a blocking delt
 - **AND** the `reviewed-sha` sentinel does NOT match the current HEAD SHA
 - **AND** at least one non-pipeline-internal commit is present since the reviewed SHA
 - **AND** the current PR diff hash matches the `verdict-diff-hash` sentinel in the prior review comment
+- **AND** the prior review comment's `pipeline-blocking-keys` marker has no key, or every key is currently overridden
 - **THEN** the pipeline SHALL treat the verdict as valid and SHALL NOT invoke the reviewer
 - **AND** SHALL post a brief notice: "Diff unchanged since last review; verdict reused."
 - **AND** SHALL NOT route the issue to a review stage
+
+#### Scenario: Diff hash unchanged but recorded blockers remain — gate holds (no-op-commit bypass closed)
+
+- **WHEN** the gate transition reads the most recent review comment for round N
+- **AND** the `reviewed-sha` sentinel does NOT match HEAD (e.g. a no-op commit moved HEAD)
+- **AND** the current PR diff hash matches the `verdict-diff-hash` sentinel in that comment
+- **AND** that comment's `pipeline-blocking-keys` marker lists one or more keys that are NOT all currently overridden
+- **THEN** the pipeline SHALL keep the issue blocked at `pipeline:pre-merge` (`needs-human`) and SHALL NOT reuse the verdict, post the reuse notice, or advance
 
 #### Scenario: SHA does not match, diff hash changed — delta review runs (not full re-review)
 

@@ -439,30 +439,31 @@ export async function enforceReviewShaGate(
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 
-  // Exact match → the verdict still covers HEAD. BUT a matching SHA is only a
-  // valid approval if the recorded review left NO unresolved blockers. A blocking
-  // pre-merge delta review (#228) posts its comment carrying `reviewed-sha == HEAD`
-  // and then `setBlocked`s at `pipeline:pre-merge` — so on re-entry the SHA matches
-  // even though the verdict was a no-ship. Returning null here unconditionally let
-  // clearing the blocked label, or overriding only some of several blockers, resume
-  // pre-merge and advance toward ready-to-deploy with unresolved blocking findings
-  // (a review-gate bypass — #228 review-2 finding). Re-check the recorded blocking
-  // keys against current overrides before accepting the SHA. (Marker-only lookup:
-  // an approve / advisory-only comment carries no marker or an empty one and is
-  // correctly read as "no blockers" → proceed, preserving prior behavior.)
-  if (reviewed.sha && reviewed.sha === head) {
-    const latestReviewBody = findLatestReviewCommentBody(detail.comments, reviewed.round);
-    const recordedBlocking = latestReviewBody ? extractBlockingKeysMarker(latestReviewBody) : null;
-    if (!recordedBlocking || recordedBlocking.size === 0) return null;
+  // Shared guard for the verdict-REUSE short-circuits below (exact-SHA match,
+  // pipeline-internal-only commits, diff-hash unchanged). A recorded verdict may
+  // only be REUSED as an approval if it left no unresolved blocking findings.
+  // A blocking pre-merge delta review (#228) records `reviewed-sha`/`verdict-diff-hash`
+  // and `setBlocked`s at `pipeline:pre-merge`, so EVERY reuse path must re-check the
+  // recorded `pipeline-blocking-keys` marker against current overrides — otherwise
+  // clearing the blocked label (optionally plus a no-op commit that preserves the
+  // diff hash, or an OpenSpec archive commit) would advance pre-merge with
+  // unresolved blocking findings (a review-gate bypass — #228 review-2 findings).
+  // Marker-only lookup: an approve / advisory-only verdict has no marker or an empty
+  // one → "no blockers" → returns null (caller proceeds), preserving prior behavior.
+  const reuseBlockedBy = async (
+    commentBody: string | null,
+    via: string,
+  ): Promise<Outcome | null> => {
+    const recorded = commentBody ? extractBlockingKeysMarker(commentBody) : null;
+    if (!recorded || recorded.size === 0) return null;
     const overrides = extractOverrides(detail.comments);
-    const unresolved = [...recordedBlocking].filter((k) => !overrides.has(k));
+    const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
-    // Blockers remain at the reviewed HEAD → keep pre-merge blocked; never advance.
     await setBlockedFn(
       cfg,
       issueNumber,
       `Pre-merge: the last review recorded ${unresolved.length} unresolved blocking finding(s) ` +
-        `at HEAD (${unresolved.join(", ")}). Fix them (push a commit) or \`--override\` each ` +
+        `at HEAD (${unresolved.join(", ")})${via}. Fix them (push a commit) or \`--override\` each ` +
         `before pre-merge can proceed.`,
       "pre-merge",
       "needs-human",
@@ -470,8 +471,18 @@ export async function enforceReviewShaGate(
     return {
       advanced: false,
       status: "blocked",
-      reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) at reviewed HEAD`,
+      reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) at reviewed HEAD${via}`,
     };
+  };
+
+  // Exact match → the verdict still covers HEAD, but only as an approval when no
+  // recorded blockers remain unresolved (a blocking delta review leaves
+  // reviewed-sha == HEAD; see reuseBlockedBy).
+  if (reviewed.sha && reviewed.sha === head) {
+    return (
+      (await reuseBlockedBy(findLatestReviewCommentBody(detail.comments, reviewed.round), "")) ??
+      null
+    );
   }
 
   // HEAD moved past the reviewed commit. Re-review ONLY when a developer/fix
@@ -493,7 +504,14 @@ export async function enforceReviewShaGate(
         ) {
           // Task 5.8: Only archive commits landed since the review → verdict valid.
           // No diff-hash check needed: the pipeline-internal exemption takes precedence.
-          return null;
+          // Reuse guard: a recorded verdict with unresolved blockers is not a valid
+          // approval even across pipeline-internal commits (#228).
+          return (
+            (await reuseBlockedBy(
+              findLatestReviewCommentBody(detail.comments, reviewed.round),
+              " (verdict reused across pipeline-internal commits)",
+            )) ?? null
+          );
         }
       }
       // reviewed.sha absent from history (rebased/squashed) or a developer
@@ -513,7 +531,14 @@ export async function enforceReviewShaGate(
       const cachedHash = priorCommentBody ? extractDiffHashFromComment(priorCommentBody) : null;
 
       if (cachedHash !== null && cachedHash === currentHash) {
-        // Diff unchanged despite SHA mismatch: verdict is still valid.
+        // Diff unchanged despite SHA mismatch: verdict still covers the code. Reuse
+        // guard (#228 review-2): a no-op commit moves HEAD while leaving the diff hash
+        // identical, so this reuse path must also re-check recorded blockers — else
+        // clearing the blocked label + a no-op commit would advance with unresolved
+        // blocking findings.
+        const blocked = await reuseBlockedBy(priorCommentBody, " (diff unchanged)");
+        if (blocked) return blocked;
+        // Diff unchanged and no unresolved blockers: verdict is still valid.
         await postCommentFn(cfg, issueNumber, diffUnchangedNotice(reviewed.sha, head));
         console.log(
           `[pipeline] #${issueNumber}: diff hash unchanged (${currentHash}); verdict reused (SHA ${reviewed.sha?.slice(0, 7)} → ${head.slice(0, 7)})`,
