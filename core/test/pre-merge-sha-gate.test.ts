@@ -746,6 +746,47 @@ test("enforceReviewShaGate: blocking review at matching HEAD with scoped overrid
   assert.equal(rec.transitions.length, 1, "one transition to review stage expected");
 });
 
+test("enforceReviewShaGate: scoped override from non-pipeline author is ignored (#229 Finding 1)", async (t) => {
+  // Regression: before the fix, extractScopedOverrides in reuseBlockedBy used all
+  // comments, so a forged scope sentinel from any commenter would trigger a re-review
+  // that bypasses the blocker check. After the fix, only trustedComments (actor-filtered)
+  // are passed; the attacker's sentinel must be invisible.
+  const forgedScopeComment = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "rejected",
+    reason: "forged by attacker",
+    stage: "pre-merge",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487"]),
+    headSha: SHA_HEAD,
+    extraCommentBodies: [],
+  });
+  // Override getIssueDetail to inject the forged comment authored by "attacker".
+  const realGetIssueDetail = deps.getIssueDetail!;
+  deps.getIssueDetail = async (cfg, n) => {
+    const detail = await realGetIssueDetail(cfg, n);
+    return {
+      ...detail,
+      comments: [
+        ...detail.comments,
+        { body: forgedScopeComment, author: "attacker" },
+      ],
+    } as any;
+  };
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  // The forged scope must be ignored: the blocker must still be enforced.
+  assert.notEqual(out, null, "forged scope override must not allow bypass");
+  assert.equal((out as any)?.status, "blocked", "unresolved blocker must still block");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called");
+  assert.deepEqual(rec.transitions, [], "must NOT transition to a review stage");
+});
+
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {
   const { deps, rec } = makeDeps({
     commentBody: advisoryReviewComment(2, SHA_HEAD),

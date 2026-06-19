@@ -145,6 +145,12 @@ export async function advanceReview(
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const runReviewFn = deps.runReview ?? defaultRunReview;
+  // Fetch the authenticated actor once for the whole function. Used both to
+  // verify cache-comment provenance (#228) and to restrict scoped override
+  // extraction to pipeline-authored comments (#229 Finding 1). Fail-closed:
+  // null means actor is unknown — no trusted comments, scoped overrides ignored.
+  const getGhActorFn = deps.getGhActor ?? getGhActor;
+  const actor = await getGhActorFn();
 
   const stage: Stage = round === 1 ? "review-1" : "review-2";
   // The configured cross-harness reviewer (the one we attempt first). After the
@@ -237,10 +243,8 @@ export async function advanceReview(
     // Require BOTH the pipeline footer AND the pipeline author to reject forged review
     // comments (#228 Finding 6 + 8): any commenter can copy the footer and diff hash;
     // only the authenticated gh user who runs the pipeline can have authored a real review.
-    // Fail-closed: if the actor lookup fails (network error, not authenticated), produce
-    // an empty trusted set so the cache is bypassed and the reviewer runs fresh (#228 Finding 8).
-    const getGhActorFn = deps.getGhActor ?? getGhActor;
-    const actor = await getGhActorFn();
+    // Fail-closed: actor was fetched above; null → empty trusted set → cache bypassed,
+    // reviewer runs fresh (#228 Finding 8).
     const footer = cfgFooter(cfg);
     const priorRoundCommentsForCache = detail.comments.filter(
       (c) =>
@@ -264,7 +268,9 @@ export async function advanceReview(
         // If scoped overrides are active and key-only blockers remain, the scope may cover
         // them — but we can't verify without the actual finding objects. Bypass the cache
         // and run a fresh review so partitionFindings can be called with live findings (#229).
-        const activeScopes = extractScopedOverrides(detail.comments);
+        // Only honor scoped overrides from pipeline-authored comments (#229 Finding 1).
+        const trustedForScopes = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+        const activeScopes = extractScopedOverrides(trustedForScopes);
         if (remainingBlockers.length > 0 && activeScopes.length > 0) {
           console.log(
             `[pipeline] #${issueNumber}: Scoped overrides active with cached blockers; ` +
@@ -457,7 +463,9 @@ export async function advanceReview(
   // blocking findings route to a fix round. When none remain, the review still
   // ran and its findings are on the record — the item advances as if approved.
   const overrides = extractOverrides(detail.comments);
-  const scopes = extractScopedOverrides(detail.comments);
+  // Only honor scoped override sentinels authored by the pipeline actor (#229 Finding 1).
+  const trustedComments = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+  const scopes = extractScopedOverrides(trustedComments);
   const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides, scopes);
   // Blocking keys set: derived here after policy partitioning so the review
   // comment can embed the pipeline-blocking-keys marker (#133 fix). Only

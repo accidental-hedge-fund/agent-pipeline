@@ -495,7 +495,8 @@ export async function enforceReviewShaGate(
     // Scoped overrides may cover the remaining key-only blockers, but we can't verify
     // without the actual finding objects. Force a fresh review so partitionFindings
     // can be called with live findings and scopes (#229).
-    const activeScopes = extractScopedOverrides(detail.comments);
+    // Only honor scoped override sentinels from pipeline-authored comments (#229 Finding 1).
+    const activeScopes = extractScopedOverrides(trustedComments);
     if (activeScopes.length > 0) {
       const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
       await postCommentFn(
@@ -637,7 +638,8 @@ export async function enforceReviewShaGate(
         );
       }
       const overrides = extractOverrides(detail.comments);
-      const scopes = extractScopedOverrides(detail.comments);
+      // Only honor scoped override sentinels from pipeline-authored comments (#229 Finding 1).
+      const scopes = extractScopedOverrides(trustedComments);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes);
 
       const newHash = computeDiffHash(currentDiff);

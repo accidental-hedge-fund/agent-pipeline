@@ -354,7 +354,10 @@ export function extractScopedOverrides(comments: { body: string }[]): ScopedOver
     let m: RegExpExecArray | null;
     while ((m = SCOPE_OVERRIDE_RE.exec(c.body)) !== null) {
       const type = m[1] as "category" | "file";
-      const value = m[2];
+      // Decode percent-encoded scope values (#229 fix 2). Old sentinels without
+      // encoding round-trip safely; malformed sequences fall back to the raw string.
+      let value: string;
+      try { value = decodeURIComponent(m[2]); } catch { value = m[2]; }
       // Sentinel format: "disposition | human reason" (new, #229 fix) or "disposition" (old).
       // The " | " delimiter separates the normalized token from the operator-supplied text.
       const captured = m[3].trim();
@@ -448,7 +451,7 @@ export function scopedOverrideComment(args: {
     "",
     (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
     "",
-    `<!-- pipeline-override-scope: ${scopeType}:${scopeValue} ${disposition} | ${reason} -->`,
+    `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${reason} -->`,
   ].join("\n");
 }
 

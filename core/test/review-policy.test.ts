@@ -675,6 +675,29 @@ test("extractScopedOverrides: file scope sentinel round-trips", () => {
   assert.equal(scopes[0].value, "src-tauri/src/repo.rs");
 });
 
+test("extractScopedOverrides: file scope with space in path round-trips (#229 Finding 2)", () => {
+  // Regression: \S+ in the sentinel regex silently truncated paths with spaces.
+  // scopedOverrideComment now percent-encodes the scope value; extractScopedOverrides decodes.
+  const body = scopedOverrideComment({
+    scopeType: "file",
+    scopeValue: "docs/my file.md",
+    disposition: "rejected",
+    reason: "out of scope",
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  // Sentinel must not contain a literal space inside the scope value.
+  assert.ok(
+    !body.includes("<!-- pipeline-override-scope: file:docs/my file.md"),
+    "sentinel must not embed a raw space in the scope value",
+  );
+  const scopes = extractScopedOverrides([{ body }]);
+  assert.equal(scopes.length, 1, "sentinel with encoded scope value must be extracted");
+  assert.equal(scopes[0].type, "file");
+  assert.equal(scopes[0].value, "docs/my file.md", "decoded value must restore the original path");
+  assert.equal(scopes[0].disposition, "rejected");
+});
+
 test("extractScopedOverrides: ignores non-scope sentinels and unrelated comments", () => {
   const comments = [
     { body: "<!-- pipeline-override: a1b2c3d4 rejected -->" }, // key sentinel, not scope
