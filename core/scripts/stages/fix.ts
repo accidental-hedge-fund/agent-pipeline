@@ -29,6 +29,7 @@ import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
+import { extractBlockingKeysMarker } from "./review.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -70,7 +71,7 @@ export async function advanceFix(
   }
 
   const detail = await getIssueDetail(cfg, issueNumber);
-  const findings = extractReviewFindings(detail.comments, round);
+  const findings = extractBlockingReviewFindings(detail.comments, round);
   if (!findings) {
     // No findings → just advance.
     const next: Stage = round === 1 ? "review-2" : "pre-merge";
@@ -351,6 +352,112 @@ export function extractAllReviewFindingsHistory(
     .slice(0, -1)
     .map((c, i) => `--- Prior review ${round} attempt ${i + 1} ---\n${c.body}`)
     .join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-verdict filtering: strip advisory findings from the fix prompt (#236)
+// ---------------------------------------------------------------------------
+
+/**
+ * Removes non-blocking (advisory) findings from a review comment body so the
+ * fix prompt's "Address EACH finding" instruction applies only to genuine
+ * blockers. Advisory findings are identified by their `override-key` NOT
+ * appearing in `blockingKeys`.
+ *
+ * Findings that carry no `override-key` token pass through unchanged (safety).
+ * Returns the body unchanged when no advisory findings are present.
+ * Exported for direct unit testing.
+ */
+export function filterToBlockingFindings(body: string, blockingKeys: Set<string>): string {
+  const FINDINGS_HEADER = "\n### Findings";
+  const OVERRIDE_KEY_RE = /`override-key: ([0-9a-f]{8})`/;
+  // The pipeline-blocking-keys comment is a reliable footer boundary marker —
+  // it is always emitted when blockingKeys is supplied to formatReviewComment,
+  // and the footer text line immediately precedes it (separated by a single \n,
+  // not \n\n, so the \n\n-based section-end detection below would miss it).
+  const PK_MARKER = "\n<!-- pipeline-blocking-keys:";
+
+  const findingsIdx = body.indexOf(FINDINGS_HEADER);
+  if (findingsIdx === -1) return body;
+
+  const beforeFindings = body.slice(0, findingsIdx);
+  const afterFindingsLine = body.slice(findingsIdx + FINDINGS_HEADER.length);
+
+  // Separate findings content from the footer. The cfgFooter text is preceded
+  // by only a single \n (not \n\n) so it ends up attached to the last finding's
+  // block when splitting by blank lines. To avoid discarding the footer along
+  // with an advisory finding, locate the pipeline-blocking-keys comment and
+  // back up one line to find the footer boundary.
+  let findingsContent: string;
+  let footer: string;
+
+  const pkIdx = afterFindingsLine.indexOf(PK_MARKER);
+  if (pkIdx !== -1) {
+    // footerLineStart: one \n back from the \n that starts the PK comment.
+    const footerLineStart = afterFindingsLine.lastIndexOf("\n", pkIdx - 1);
+    const splitAt = footerLineStart !== -1 ? footerLineStart + 1 : pkIdx;
+    findingsContent = afterFindingsLine.slice(0, splitAt);
+    footer = afterFindingsLine.slice(splitAt);
+  } else {
+    // No PK marker (should not happen when called via extractBlockingReviewFindings
+    // but handled as a safe fallback).
+    const nextIdx = afterFindingsLine.search(/\n\n###|\n\n\*/);
+    findingsContent = nextIdx !== -1 ? afterFindingsLine.slice(0, nextIdx) : afterFindingsLine;
+    footer = nextIdx !== -1 ? afterFindingsLine.slice(nextIdx) : "";
+  }
+
+  // Split on blank-line + "**N." (finding boundary) OR blank-line + "##"
+  // (section boundary like "### Raw Review Output" or "### Next Steps"), so
+  // those optional sections are not accidentally discarded with an advisory block.
+  const blocks = findingsContent.split(/\n\n(?=\*\*\d+\.|\#\#)/);
+
+  const blocking: string[] = [];
+  let advisoryCount = 0;
+
+  for (const block of blocks) {
+    if (!block.trim()) continue;
+    const keyMatch = block.match(OVERRIDE_KEY_RE);
+    const key = keyMatch?.[1];
+    if (!key || blockingKeys.has(key)) {
+      blocking.push(block);
+    } else {
+      advisoryCount++;
+    }
+  }
+
+  if (advisoryCount === 0) return body;
+
+  const note = advisoryCount === 1
+    ? "Note: 1 advisory finding was omitted (marked non-blocking by the reviewer — not required work for this fix round)."
+    : `Note: ${advisoryCount} advisory findings were omitted (marked non-blocking by the reviewer — not required work for this fix round).`;
+
+  return [
+    beforeFindings,
+    FINDINGS_HEADER,
+    ...blocking.map(b => "\n\n" + b),
+    "\n\n" + note + "\n",
+    footer,
+  ].join("");
+}
+
+/**
+ * Like {@link extractReviewFindings} but filters advisory (non-blocking) findings
+ * out of the returned body so the fix harness only sees blocking findings (#236).
+ * Relies on the `pipeline-blocking-keys` marker in the review comment. Returns
+ * the body unchanged when no marker is present (legacy comments) or when all
+ * findings are blocking.
+ */
+export function extractBlockingReviewFindings(
+  comments: { body: string }[],
+  round: 1 | 2,
+): string {
+  const body = extractReviewFindings(comments, round);
+  if (!body) return body;
+
+  const blockingKeys = extractBlockingKeysMarker(body);
+  if (!blockingKeys || blockingKeys.size === 0) return body;
+
+  return filterToBlockingFindings(body, blockingKeys);
 }
 
 // ---------------------------------------------------------------------------
