@@ -48,7 +48,6 @@ import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
-const AUTO_FORMAT_PREFIX = "chore: auto-format (#";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
@@ -63,10 +62,7 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
  * come from a developer. Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return (
-    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
-    messageHeadline.startsWith(AUTO_FORMAT_PREFIX)
-  );
+  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
 }
 
 export interface AdvancePreMergeOpts {
@@ -486,6 +482,16 @@ export async function enforceReviewShaGate(
         ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head)
         : currentDiff; // reviewed SHA missing → review the full diff as the delta
       const deltaResult = await runDeltaReviewFn(cfg, issueNumber, detail, deltaDiff);
+      // Guard: needs-attention with zero findings indicates unparseable reviewer output
+      // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
+      // conservative catch path (full re-review) rather than treating zero findings as
+      // an implicit approval.
+      if (deltaResult.verdict === "needs-attention" && deltaResult.findings.length === 0) {
+        throw new Error(
+          `delta review returned needs-attention with zero findings (likely unparseable output); ` +
+          `summary: ${deltaResult.summary || "(none)"}`,
+        );
+      }
       const overrides = extractOverrides(detail.comments);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides);
 
@@ -573,9 +579,22 @@ async function defaultGetCommitDeltaDiff(
   baseSha: string,
   headSha: string,
 ): Promise<string> {
+  const label = `${baseSha.slice(0, 7)}...${headSha.slice(0, 7)}`;
   const result = await gitInWorktree(cfg.repo_dir, ["diff", `${baseSha}...${headSha}`], {
     ignoreFailure: true,
   });
+  if (result.code !== 0) {
+    throw new Error(
+      `git diff ${label} failed (exit ${result.code}): ` +
+      `${result.stderr.trim() || "no error output — objects may not be present locally"}`,
+    );
+  }
+  if (!result.stdout.trim()) {
+    throw new Error(
+      `git diff ${label} produced empty output despite a diff-hash mismatch; ` +
+      `refusing to delta-review an empty range`,
+    );
+  }
   return result.stdout;
 }
 

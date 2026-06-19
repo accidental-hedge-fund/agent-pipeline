@@ -1619,3 +1619,53 @@ test("advanceReview: posted review comment embeds verdict-diff-hash sentinel (5.
   assert.ok(comment, "review comment must be posted");
   assert.match(comment!, /<!-- verdict-diff-hash: [0-9a-f]{16} -->/, "comment must embed diff-hash sentinel");
 });
+
+// ---------------------------------------------------------------------------
+// Cache hit + operator override (#228 fix-round-1 finding #1)
+// ---------------------------------------------------------------------------
+
+test("advanceReview: cache hit with all blocking keys overridden → advances instead of routing to fix", async (t) => {
+  // Regression: cached blocking verdict with a human override recorded after the
+  // review must advance on a cache hit, not re-route to fix (the override never
+  // applied before because the cached path didn't read current overrides).
+  const blockingKey = "aabbccdd";
+  const blockingComment = [
+    `## Review 2 (Adversarial) — needs-attention (commit ${"a".repeat(7)})`,
+    "",
+    "**Reviewer**: codex",
+    "",
+    "one blocker",
+    "",
+    `<!-- pipeline-blocking-keys: ${blockingKey} -->`,
+    "",
+    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
+  ].join("\n");
+  const overrideComment = `<!-- pipeline-override: ${blockingKey} wontfix — out of scope -->`;
+
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      // Both the prior blocking review comment and the override sentinel are in the issue.
+      comments: [{ body: blockingComment }, { body: overrideComment }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  deps.getPrDiff = async () => REVIEW_DIFF;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 2, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 0, "reviewer must NOT be called on a cache hit");
+  assert.ok(outcome.advanced, "overridden blocker → issue must advance");
+  assert.equal(outcome.to, "pre-merge", "all blockers overridden → advance to pre-merge (round 2)");
+  assert.match(outcome.summary, /cached verdict/);
+  assert.deepEqual(rec.blocked, [], "must NOT call setBlocked");
+});

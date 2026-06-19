@@ -42,13 +42,15 @@ test("isPipelineInternalCommit: recognizes archive commits only, not developer c
 });
 
 // ---------------------------------------------------------------------------
-// isPipelineInternalCommit — auto-format commits (#182)
+// isPipelineInternalCommit — auto-format commits (#228 spec alignment)
 // ---------------------------------------------------------------------------
 
-test("isPipelineInternalCommit: auto-format commit is pipeline-internal", () => {
-  assert.equal(isPipelineInternalCommit("chore: auto-format (#182)"), true);
-  assert.equal(isPipelineInternalCommit("chore: auto-format (#1)"), true);
-  // Must be an exact prefix — a developer's own chore with different text must NOT match.
+test("isPipelineInternalCommit: auto-format commit is NOT pipeline-internal (#228)", () => {
+  // The spec (review-sha-gating/spec.md) now restricts the pipeline-internal
+  // exemption to OpenSpec archive commits only. Auto-format commits proceed to the
+  // diff-hash check; if the diff changed they trigger a delta review.
+  assert.equal(isPipelineInternalCommit("chore: auto-format (#182)"), false);
+  assert.equal(isPipelineInternalCommit("chore: auto-format (#1)"), false);
   assert.equal(isPipelineInternalCommit("chore: auto-format dependencies"), false);
   assert.equal(isPipelineInternalCommit("chore: auto-format"), false);
   assert.equal(isPipelineInternalCommit("fix: address review 1 findings (#182)"), false);
@@ -404,4 +406,60 @@ test("enforceReviewShaGate: only pipeline-internal commits → exempted before d
   assert.equal(getPrDiffCalled, false, "diff-hash check must NOT run for pipeline-internal commits");
   assert.deepEqual(rec.transitions, [], "no transition");
   assert.deepEqual(rec.comments, [], "no notice");
+});
+
+// ---------------------------------------------------------------------------
+// enforceReviewShaGate — regression tests for fix-round-1 findings (#228)
+// ---------------------------------------------------------------------------
+
+test("enforceReviewShaGate: delta review returns needs-attention+0-findings → falls back to full re-review (fix-2)", async (t) => {
+  // Regression: an unparseable delta review output (needs-attention, zero findings)
+  // must NOT be treated as an implicit approval. The gate should throw and fall
+  // back to the conservative full re-review path.
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const unparseable: DeltaReviewResult = {
+    verdict: "needs-attention",
+    findings: [],
+    summary: "prose output that could not be parsed into findings",
+  };
+  const runDeltaReview: RunDeltaReviewFn = async () => unparseable;
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  // Expect full re-review (transition to review-2), not approval and not blocked.
+  assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "review-2" }], "falls back to full re-review");
+  assert.deepEqual(rec.blocked, [], "must NOT call setBlocked on a parse failure");
+});
+
+test("enforceReviewShaGate: getCommitDeltaDiff throws → falls back to full re-review (fix-3)", async (t) => {
+  // Regression: if local delta diff generation fails (git error or empty output),
+  // the catch block must trigger the conservative full re-review rather than silently
+  // reviewing an empty diff.
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => { throw new Error("git diff failed: object not found"); },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "review-2" }], "delta diff failure → full re-review");
+  assert.deepEqual(rec.blocked, [], "must NOT call setBlocked on a diff failure");
 });

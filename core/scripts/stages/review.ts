@@ -231,7 +231,12 @@ export async function advanceReview(
         console.log(`[pipeline] #${issueNumber}: Diff hash unchanged; reusing cached verdict for round ${round}`);
         const cachedVerdict = extractVerdictFromComment(latestPriorComment.body);
         const cachedBlockingKeys = extractBlockingKeysFromComment(latestPriorComment.body);
-        const isBlocking = cachedVerdict === "needs-attention" && cachedBlockingKeys.size > 0;
+        // Apply current overrides: a human may have recorded an override after the
+        // last review on an unchanged diff. Filter out overridden keys before
+        // deciding whether to route to fix (#228 fix-1).
+        const currentOverrides = extractOverrides(detail.comments);
+        const remainingBlockers = [...cachedBlockingKeys].filter((k) => !currentOverrides.has(k));
+        const isBlocking = cachedVerdict === "needs-attention" && remainingBlockers.length > 0;
         const toStage: Stage = isBlocking
           ? (round === 1 ? "fix-1" : "fix-2")
           : (round === 1 ? "review-2" : "pre-merge");
