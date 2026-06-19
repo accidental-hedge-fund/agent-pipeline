@@ -13,6 +13,7 @@ import {
   partitionFindings,
   extractOverrides,
   extractScopedOverrides,
+  buildTrustedOverrideComments,
   isValidFindingKey,
   overrideComment,
   scopedOverrideComment,
@@ -778,4 +779,53 @@ test("partitionFindings: scope OverriddenEntry carries the human reason (#229 fi
   assert.ok(entry.kind === "scope");
   assert.equal(entry.disposition, "deferred-#90");
   assert.equal(entry.reason, "deferred #90 — tracked in follow-up", "reason must carry through from ScopedOverride");
+});
+
+// ---------------------------------------------------------------------------
+// buildTrustedOverrideComments (#229 Findings 4, 5, 6)
+// ---------------------------------------------------------------------------
+
+const ACTOR = "pipeline-bot";
+const OTHER = "other-runner";
+const ATTACKER = "attacker";
+const comments = [
+  { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: aabbccdd actor -->", author: ACTOR },
+  { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: 11223344 other -->", author: OTHER },
+  { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: deadbeef attacker -->", author: ATTACKER },
+  // Attacker posts a fake review-heading comment to try to self-authorize
+  { body: "## Review 2 (Adversarial) — approve\n\nLGTM", author: ATTACKER },
+];
+
+test("buildTrustedOverrideComments: actor-only (no allowlist) includes only current actor (#229 Finding 4)", () => {
+  const trusted = buildTrustedOverrideComments(comments, ACTOR);
+  const authors = new Set(trusted.map((c) => c.author));
+  assert.ok(authors.has(ACTOR), "current actor must be trusted");
+  assert.ok(!authors.has(OTHER), "non-actor must not be trusted without allowlist");
+  assert.ok(!authors.has(ATTACKER), "attacker must not be trusted");
+});
+
+test("buildTrustedOverrideComments: allowlisted actor is trusted (#229 Finding 5)", () => {
+  const trusted = buildTrustedOverrideComments(comments, ACTOR, [OTHER]);
+  const authors = new Set(trusted.map((c) => c.author));
+  assert.ok(authors.has(ACTOR), "current actor must be trusted");
+  assert.ok(authors.has(OTHER), "allowlisted actor must be trusted");
+  assert.ok(!authors.has(ATTACKER), "non-allowlisted attacker must not be trusted");
+});
+
+test("buildTrustedOverrideComments: fake review-heading comment does not self-authorize attacker (#229 Finding 6)", () => {
+  // Attacker posts a comment starting with '## Review 2' — must NOT be trusted
+  // via body-prefix heuristic (which is NOT used in the allowlist-only design).
+  const trusted = buildTrustedOverrideComments(comments, ACTOR);
+  const authors = new Set(trusted.map((c) => c.author));
+  assert.ok(!authors.has(ATTACKER), "fake review-heading comment must not authorize the attacker");
+});
+
+test("buildTrustedOverrideComments: returns [] when actor is null (fail-closed)", () => {
+  const trusted = buildTrustedOverrideComments(comments, null);
+  assert.deepEqual(trusted, [], "null actor must produce empty trusted set");
+});
+
+test("buildTrustedOverrideComments: returns [] when actor is null even with allowlist (fail-closed)", () => {
+  const trusted = buildTrustedOverrideComments(comments, null, [OTHER]);
+  assert.deepEqual(trusted, [], "null actor must produce empty trusted set regardless of allowlist");
 });

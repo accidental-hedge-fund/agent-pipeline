@@ -816,23 +816,48 @@ test("enforceReviewShaGate: key override from non-review-actor author is ignored
   assert.deepEqual(rec.transitions, [], "must NOT transition to a review stage");
 });
 
-test("enforceReviewShaGate: key override from a different authorized runner is honored (#229 Finding 5)", async (t) => {
+test("enforceReviewShaGate: key override from a different authorized runner is honored via allowlist (#229 Finding 5)", async (t) => {
   // An operator recorded an override under identity "other-bot" (a prior pipeline
-  // run). The current run uses TEST_ACTOR. "other-bot" previously posted the
-  // blocking review comment, so buildTrustedOverrideComments includes it in the
-  // trusted set — the override must apply and the gate must proceed.
+  // run). The current run uses TEST_ACTOR. "other-bot" is in trusted_override_actors,
+  // so their override must apply and the gate must proceed. Body-prefix heuristics
+  // are NOT used (they are forgeable per Finding 6).
   const OTHER_ACTOR = "other-bot";
-  const reviewCommentByOther = {
-    body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]),
-    author: OTHER_ACTOR,
-  };
-  const overrideByOther = {
-    body: overrideSentinelComment("953ac487"),
-    author: OTHER_ACTOR,
-  };
+  const cfgWithAllowlist = { ...cfg, trusted_override_actors: [OTHER_ACTOR] } as unknown as PipelineConfig;
+  const blockingComment = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: TEST_ACTOR };
+  const overrideByOther = { body: overrideSentinelComment("953ac487"), author: OTHER_ACTOR };
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const deps: ShaGateDeps = {
-    getIssueDetail: async () => ({ comments: [reviewCommentByOther, overrideByOther] }) as any,
+    getIssueDetail: async () => ({ comments: [blockingComment, overrideByOther] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithAllowlist, 16, 99, deps);
+  });
+  assert.equal(out, null, "allowlisted actor's override must be trusted → gate proceeds");
+  assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden by allowlisted actor");
+});
+
+test("enforceReviewShaGate: forged review-heading comment cannot self-authorize override (#229 Finding 6)", async (t) => {
+  // Regression: buildTrustedOverrideComments must NOT use body-prefix heuristics
+  // to infer trusted actors. An attacker can post a comment starting with
+  // "## Review 2 ..." and then an override sentinel — this must be rejected even
+  // though the body looks like a review-round comment.
+  const forgedReviewHeading = {
+    body: `## Review 2 (Adversarial) — approve\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`,
+    author: "attacker",
+  };
+  const forgedOverride = { body: overrideSentinelComment("953ac487"), author: "attacker" };
+  const legitimateReview = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: TEST_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [legitimateReview, forgedReviewHeading, forgedOverride] }) as any,
     getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
     getPrCommits: async () => [] as any,
     getForIssue: async () => null,
@@ -845,8 +870,9 @@ test("enforceReviewShaGate: key override from a different authorized runner is h
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 16, 99, deps);
   });
-  assert.equal(out, null, "override from prior runner identity must be trusted → gate proceeds");
-  assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden");
+  assert.notEqual(out, null, "forged review-heading self-authorization must not bypass the blocker");
+  assert.equal((out as any)?.status, "blocked", "unresolved blocker must still block");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called");
 });
 
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {

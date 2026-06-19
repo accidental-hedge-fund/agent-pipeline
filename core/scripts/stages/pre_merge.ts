@@ -466,9 +466,9 @@ export async function enforceReviewShaGate(
   }
   // Actor-only for review-SHA extraction (pipeline-authored review comments only).
   const trustedComments = detail.comments.filter((c) => c.author === actor);
-  // Expanded set for override/scope extraction: also trust any account that has
-  // posted a review-round comment, so dispositions survive identity changes (#229 Finding 5).
-  const trustedOverrideComments = buildTrustedOverrideComments(detail.comments, actor);
+  // Expanded set for override/scope extraction: current actor + configured allowlist
+  // (#229 Findings 4, 5, 6). Body-prefix heuristics are NOT used (forgeable).
+  const trustedOverrideComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
 
   const reviewed = extractReviewedSha(trustedComments);
   // No prior review comment (e.g. review steps disabled, or first run) → nothing

@@ -299,6 +299,11 @@ export interface PipelineConfig {
     min_body_length?: number;
     required_sections?: string[];
   };
+  // Additional GitHub identities whose `## Pipeline: Finding override` and
+  // `## Pipeline: Scope override` comments are trusted in addition to the current
+  // pipeline actor (#229). Useful for multi-actor setups (e.g., a CI bot and a
+  // human operator share the same pipeline installation). Default: [] (actor-only).
+  trusted_override_actors?: string[];
 }
 
 // Keys resolved from the active profile at config time, never from defaults
