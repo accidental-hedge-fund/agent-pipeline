@@ -439,14 +439,30 @@ export async function enforceReviewShaGate(
   const detail = await getIssueDetailFn(cfg, issueNumber);
 
   // Only trust review comments authored by the authenticated pipeline actor (#228
-  // Finding 9). Any commenter can post a forged `## Review 2 — approve` body with
-  // a matching `reviewed-sha`; filtering to the gh user who runs the pipeline makes
-  // forged verdicts invisible to the SHA/diff-hash reuse checks. Fail-closed: when
-  // the actor is unavailable (network error), treat all review comments as untrusted
-  // and fall through to a normal full re-review rather than short-circuiting.
+  // Findings 8 & 9). Any commenter can post a forged `## Review 2 — approve` body;
+  // filtering to the gh user makes forged verdicts invisible to all reuse checks.
+  // Fail-closed (#228 Finding 8): if the actor cannot be determined (network error,
+  // expired token), block rather than silently proceeding — a transient auth failure
+  // must not disable stale-verdict or unresolved-blocker enforcement.
   const actor = await getGhActorFn();
-  const trustedComments =
-    actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+  if (actor === null) {
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Pre-merge: cannot verify review-comment provenance — authenticated gh actor ` +
+        `unavailable (\`getGhActor\` returned null). This is typically an expired gh ` +
+        `token or a transient network error. Restore gh authentication (\`gh auth ` +
+        `status\`) and re-run the pipeline to resume.`,
+      "pre-merge",
+      "needs-human",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: "pre-merge: actor lookup failed — cannot verify review provenance",
+    };
+  }
+  const trustedComments = detail.comments.filter((c) => c.author === actor);
 
   const reviewed = extractReviewedSha(trustedComments);
   // No prior review comment (e.g. review steps disabled, or first run) → nothing

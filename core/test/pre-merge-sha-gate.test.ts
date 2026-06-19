@@ -872,11 +872,11 @@ test("enforceReviewShaGate: forged review comment (wrong author) is ignored — 
   assert.deepEqual(rec.transitions, [], "must not attempt a spurious re-review transition");
 });
 
-test("enforceReviewShaGate: actor lookup failure (gh unavailable) → fail-closed, gate proceeds without trusting any comment (Finding 8)", async (t) => {
-  // If getGhActor() returns null (network error or not authenticated), the gate
-  // must fail-closed: treat all review comments as untrusted → no trusted SHA found
-  // → returns null (same as no prior review → proceeds). This prevents the gate
-  // from approving a verdict it cannot verify authorship for.
+test("enforceReviewShaGate: actor lookup failure (gh unavailable) → blocked with needs-human, NOT proceed (Finding 8)", async (t) => {
+  // If getGhActor() returns null (expired token, network error), the gate must
+  // fail-closed by blocking with needs-human — NOT by silently returning null (which
+  // would disable stale-verdict and unresolved-blocker enforcement for the run).
+  // A transient auth failure must never open the gate.
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const approvalComment = { body: reviewComment(2, SHA_HEAD), author: TEST_ACTOR };
   const deps: ShaGateDeps = {
@@ -894,8 +894,10 @@ test("enforceReviewShaGate: actor lookup failure (gh unavailable) → fail-close
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 16, 99, deps);
   });
-  // Actor unavailable → trustedComments is empty → no trusted SHA → returns null.
-  assert.equal(out, null, "actor lookup failure → no trusted comments → gate proceeds (fail-closed: no bypass)");
+  // Actor unavailable → must block, not proceed.
+  assert.notEqual(out, null, "actor lookup failure must NOT return null (proceed)");
+  assert.equal((out as any)?.status, "blocked", "must return blocked outcome");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called");
+  assert.match(rec.blocked[0].reason, /actor/, "block reason must mention actor");
   assert.deepEqual(rec.transitions, [], "must not transition on auth failure");
-  assert.deepEqual(rec.blocked, [], "must not block on auth failure");
 });
