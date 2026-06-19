@@ -18,6 +18,8 @@ const PartialConfigSchema = z.object({
   implementation_timeout: z.number().int().positive().optional().describe("Seconds for the implementation harness before timing out."),
   review_timeout: z.number().int().positive().optional().describe("Seconds per review stage."),
   fix_timeout: z.number().int().positive().optional().describe("Seconds per fix stage."),
+  intake_timeout: z.number().int().positive().optional().describe("Seconds for the intake harness call before timing out."),
+  sweep_timeout: z.number().int().positive().optional().describe("Seconds for the sweep harness call before timing out."),
   ci_timeout: z.number().int().positive().optional().describe("Seconds to wait for CI at pre-merge."),
   ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
   // Each alias is independently optional so a partial `models:` block (e.g.
@@ -303,6 +305,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       fileConfig.implementation_timeout ?? DEFAULT_CONFIG.implementation_timeout,
     review_timeout: fileConfig.review_timeout ?? DEFAULT_CONFIG.review_timeout,
     fix_timeout: fileConfig.fix_timeout ?? DEFAULT_CONFIG.fix_timeout,
+    intake_timeout: fileConfig.intake_timeout ?? DEFAULT_CONFIG.intake_timeout,
+    sweep_timeout: fileConfig.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout,
     ci_timeout: fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout,
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
     // Harness roles are profile-relative; the implementer can never be set by
@@ -455,12 +459,13 @@ export function findGitRoot(start: string): string | null {
 export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
-): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string } {
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_timeout: number } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
   let releaseModel: 'semver' | 'continuous' | undefined;
   // Intake always runs through the claude harness (see stages/intake.ts), so this
   // alias is never inert; default it here and let pipeline.yml's models.intake override.
   let intakeModel: string = DEFAULT_CONFIG.models.intake;
+  let intakeTimeout: number = DEFAULT_CONFIG.intake_timeout;
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (fs.existsSync(configPath)) {
     const text = fs.readFileSync(configPath, "utf8");
@@ -483,6 +488,9 @@ export function resolveReleaseConfig(
       if (result.data.models?.intake) {
         intakeModel = result.data.models.intake;
       }
+      if (typeof result.data.intake_timeout === "number") {
+        intakeTimeout = result.data.intake_timeout;
+      }
     }
   }
   return {
@@ -491,6 +499,7 @@ export function resolveReleaseConfig(
     base_branch: baseBranchOverride ?? baseBranch,
     release_model: releaseModel,
     intake_model: intakeModel,
+    intake_timeout: intakeTimeout,
   };
 }
 
@@ -907,6 +916,8 @@ auto_recovery_max_retries: ${d.auto_recovery_max_retries} # auto-recovery attemp
 implementation_timeout: ${d.implementation_timeout} # seconds for the implementation harness
 review_timeout: ${d.review_timeout} # seconds per review stage
 fix_timeout: ${d.fix_timeout} # seconds per fix stage
+intake_timeout: ${d.intake_timeout} # seconds for the intake harness call before timing out
+sweep_timeout: ${d.sweep_timeout} # seconds for the sweep harness call before timing out
 ci_timeout: ${d.ci_timeout} # seconds to wait for CI at pre-merge
 ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
 

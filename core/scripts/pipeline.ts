@@ -592,7 +592,7 @@ async function main(): Promise<void> {
     try {
       await runSweep(
         { apply: !!opts.apply, repo: opts.repo },
-        { repo_dir: sweepCfg.repo_dir, repo: sweepCfg.repo, base_branch: sweepCfg.base_branch },
+        { repo_dir: sweepCfg.repo_dir, repo: sweepCfg.repo, base_branch: sweepCfg.base_branch, sweep_timeout: sweepCfg.sweep_timeout },
         sweepConfig,
         realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep),
       );

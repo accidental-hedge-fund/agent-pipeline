@@ -89,7 +89,7 @@ function makeDeps(overrides: Partial<IntakeDeps> = {}): IntakeDeps & {
   const ensureLabelCalls: Array<{ name: string; color: string }> = [];
 
   const base: IntakeDeps = {
-    runHarness: async (_prompt) => ({
+    runHarness: async (_prompt, _timeoutSec) => ({
       success: true,
       output: [
         "# Add retry logic to the fix loop",
@@ -989,4 +989,70 @@ test("intake: recovery log emitted when createPR fails after issue creation", as
 
   const allLog = deps._logLines.join("\n");
   assert.ok(allLog.includes("#999"), "recovery log must reference the created issue number");
+});
+
+// ---------------------------------------------------------------------------
+// intake_timeout forwarding (#248)
+// ---------------------------------------------------------------------------
+
+test("intake: runHarness receives the configured intake_timeout", async () => {
+  let capturedTimeoutSec: number | undefined;
+  const deps = makeDeps({
+    runHarness: async (_prompt, timeoutSec) => {
+      capturedTimeoutSec = timeoutSec;
+      return {
+        success: true,
+        output: [
+          "# Add retry logic to the fix loop",
+          "",
+          "## Summary",
+          "A retry mechanism for the fix loop.",
+          "",
+          "## User story",
+          "As a pipeline operator, I want retries.",
+          "",
+          "## Acceptance criteria",
+          "- [ ] Retries up to 3 times.",
+          "",
+          "## Out of scope",
+          "- Retry logic for planning.",
+        ].join("\n"),
+      };
+    },
+  });
+
+  const cfg = { repo_dir: "/fake/repo", repo: "owner/repo", base_branch: "main", intake_timeout: 300 };
+  await runIntake({ description: "add retry logic to the fix loop", release: "1.6.0" }, cfg, deps);
+  assert.equal(capturedTimeoutSec, 300, "runHarness must receive intake_timeout from cfg");
+});
+
+test("intake: runHarness falls back to DEFAULT_CONFIG.intake_timeout when cfg omits it", async () => {
+  let capturedTimeoutSec: number | undefined;
+  const deps = makeDeps({
+    runHarness: async (_prompt, timeoutSec) => {
+      capturedTimeoutSec = timeoutSec;
+      return {
+        success: true,
+        output: [
+          "# Add retry logic to the fix loop",
+          "",
+          "## Summary",
+          "A retry mechanism for the fix loop.",
+          "",
+          "## User story",
+          "As a pipeline operator, I want retries.",
+          "",
+          "## Acceptance criteria",
+          "- [ ] Retries up to 3 times.",
+          "",
+          "## Out of scope",
+          "- Retry logic for planning.",
+        ].join("\n"),
+      };
+    },
+  });
+
+  // DEFAULT_CFG has no intake_timeout — should fall back to DEFAULT_CONFIG.intake_timeout (600).
+  await runIntake({ description: "add retry logic to the fix loop", release: "1.6.0" }, DEFAULT_CFG, deps);
+  assert.equal(capturedTimeoutSec, DEFAULT_CONFIG.intake_timeout, "runHarness must fall back to DEFAULT_CONFIG.intake_timeout");
 });

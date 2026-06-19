@@ -63,7 +63,7 @@ export interface SweepDeps {
   /** Update an issue's body on GitHub. */
   updateIssueBody(repo: string, issueNumber: number, body: string): Promise<void>;
   /** Invoke the spec-generation model harness. */
-  runHarness(prompt: string): Promise<{ success: boolean; output: string }>;
+  runHarness(prompt: string, timeoutSec: number): Promise<{ success: boolean; output: string; timed_out?: boolean }>;
   /** Read a local file. */
   readFile(p: string): string;
   /** Write a local file. */
@@ -146,12 +146,12 @@ export function realSweepDeps(
         );
       }
     },
-    runHarness: async (prompt) => {
+    runHarness: async (prompt, timeoutSec) => {
       // Sweep re-specs thin issues from their existing title/body injected into the
       // prompt — a self-contained transform like intake. Pin a fast model and run
       // lean (no built-in tools, no MCP). See harness.ts InvokeOptions.lean.
-      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true });
-      return { success: result.success, output: result.stdout };
+      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true, timeoutSec });
+      return { success: result.success, output: result.stdout, timed_out: result.timed_out };
     },
     readFile: (p) => fs.readFileSync(p, "utf8"),
     writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
@@ -426,7 +426,7 @@ export function validateSweepSpecBody(body: string): void {
 
 export async function runSweep(
   opts: SweepOpts,
-  cfg: { repo_dir: string; repo: string; base_branch: string },
+  cfg: { repo_dir: string; repo: string; base_branch: string; sweep_timeout?: number },
   sweepConfig: SweepConfig,
   deps?: SweepDeps,
 ): Promise<void> {
@@ -511,7 +511,7 @@ export async function runSweep(
 
     let harnessResult: { success: boolean; output: string };
     try {
-      harnessResult = await d.runHarness(prompt);
+      harnessResult = await d.runHarness(prompt, cfg.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout);
     } catch (err) {
       classified.push({
         issue,
@@ -521,6 +521,11 @@ export async function runSweep(
       continue;
     }
 
+    if (harnessResult.timed_out) {
+      throw new Error(
+        `[pipeline sweep] harness timed out after ${cfg.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout}s — aborting sweep.`,
+      );
+    }
     if (!harnessResult.success) {
       classified.push({
         issue,

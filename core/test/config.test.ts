@@ -1313,3 +1313,71 @@ test("resolveConfig: quiet suppresses inert-model-alias config warnings (#154)",
     process.env.PATH = oldPath;
   }
 });
+
+// ---------------------------------------------------------------------------
+// intake_timeout / sweep_timeout (#248)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: intake_timeout and sweep_timeout default to 600 when absent", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/timeout-defaults");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.intake_timeout, 600);
+    assert.equal(cfg.sweep_timeout, 600);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: file intake_timeout overrides default; sweep_timeout stays 600", async () => {
+  const repo = makeFakeRepo(`intake_timeout: 300\n`);
+  const binDir = makeFakeGh("acme/timeout-file");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.intake_timeout, 300);
+    assert.equal(cfg.sweep_timeout, 600);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: intake_timeout: 0 is rejected (non-positive)", async () => {
+  const repo = makeFakeRepo(`intake_timeout: 0\n`);
+  const binDir = makeFakeGh("acme/timeout-zero");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("intake_timeout"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: sweep_timeout: 'fast' is rejected (non-integer)", async () => {
+  const repo = makeFakeRepo(`sweep_timeout: fast\n`);
+  const binDir = makeFakeGh("acme/timeout-str");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("sweep_timeout"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
