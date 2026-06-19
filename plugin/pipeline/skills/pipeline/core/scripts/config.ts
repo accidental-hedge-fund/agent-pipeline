@@ -98,6 +98,7 @@ const PartialConfigSchema = z.object({
       max_adversarial_rounds: z.number().int().positive().optional().describe("Maximum adversarial review re-runs before routing still-blocking findings to needs-human."),
       risk_proportional: z.boolean().optional().describe("When true and review-1 approved with zero findings (low-risk), review-2 evaluates findings against a raised effective threshold (stricter of configured and 'high'), so medium/low findings advise rather than block. Default false — review-2 blocking unchanged."),
       ceiling_action: z.enum(["park", "demote_and_advance"]).optional().describe("Action at the max_adversarial_rounds round-budget ceiling. park (default): hard-park at needs-human. demote_and_advance: auto-demote below-high findings to advisory, file a follow-up issue, and advance to pre-merge. High/critical findings always park regardless."),
+      surface_recurrence_rounds: z.number().int().min(0).optional().describe("Consecutive-round threshold N for the (file + category) surface-recurrence guard (#234). When N same-surface new-key blocking findings appear in N consecutive rounds, the guard fires and routes the cluster through ceiling_action. 0 disables the guard. Default 3."),
     })
     .strict()
     .optional()
@@ -348,6 +349,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig.review_policy?.risk_proportional ?? DEFAULT_CONFIG.review_policy.risk_proportional,
       ceiling_action:
         fileConfig.review_policy?.ceiling_action ?? DEFAULT_CONFIG.review_policy.ceiling_action,
+      surface_recurrence_rounds:
+        fileConfig.review_policy?.surface_recurrence_rounds ??
+        DEFAULT_CONFIG.review_policy.surface_recurrence_rounds,
     },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
@@ -589,6 +593,7 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_policy.max_adversarial_rounds",
   "review_policy.risk_proportional",
   "review_policy.ceiling_action",
+  "review_policy.surface_recurrence_rounds",
   "steps.plan_review",
   "steps.standard_review",
   "steps.adversarial_review",
@@ -921,6 +926,7 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
   # risk_proportional: ${d.review_policy.risk_proportional} # when true and review-1 approved with 0 findings (low risk), review-2 only blocks on high/critical findings (#232)
   # ceiling_action: ${d.review_policy.ceiling_action} # park (default): hard-park at needs-human at the round ceiling; demote_and_advance: auto-demote below-high findings to advisory, file a follow-up issue, and advance to pre-merge (high/critical always park) (#233)
+  # surface_recurrence_rounds: ${d.review_policy.surface_recurrence_rounds} # (file+category) surface-recurrence guard: after N consecutive rounds of new-key blocking findings on the same surface, routes the cluster through ceiling_action; 0 disables (#234)
 
 doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
   runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure

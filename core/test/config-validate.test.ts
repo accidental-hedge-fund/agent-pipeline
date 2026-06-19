@@ -12,6 +12,7 @@ import {
   type ValidateConfigDeps,
   type Diagnostic,
 } from "../scripts/config.ts";
+import { DEFAULT_CONFIG } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,6 +149,7 @@ test("RIGOR_GATING_PATHS: contains expected minimum set of paths", () => {
     "review_policy.block_threshold",
     "review_policy.min_confidence",
     "review_policy.max_adversarial_rounds",
+    "review_policy.surface_recurrence_rounds",
     "steps.plan_review",
     "steps.standard_review",
     "steps.adversarial_review",
@@ -550,6 +552,51 @@ test("RIGOR_GATING_PATHS: includes shipcheck_gate.max_rounds and shipcheck_gate.
     "RIGOR_GATING_PATHS must include shipcheck_gate.max_rounds");
   assert.ok(RIGOR_GATING_PATHS.includes("shipcheck_gate.block_on_partial"),
     "RIGOR_GATING_PATHS must include shipcheck_gate.block_on_partial");
+});
+
+// ---------------------------------------------------------------------------
+// 5.16 review_policy.surface_recurrence_rounds (#234)
+// ---------------------------------------------------------------------------
+
+test("DEFAULT_CONFIG: surface_recurrence_rounds defaults to 3", () => {
+  assert.equal(DEFAULT_CONFIG.review_policy.surface_recurrence_rounds, 3);
+});
+
+test("validateConfig: surface_recurrence_rounds accepts declared value → valid", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  surface_recurrence_rounds: 5\n"));
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.filter((d) => d.path === "review_policy.surface_recurrence_rounds").length, 0);
+});
+
+test("validateConfig: surface_recurrence_rounds accepts 0 (disabled) → valid", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  surface_recurrence_rounds: 0\n"));
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.filter((d) => d.path === "review_policy.surface_recurrence_rounds").length, 0);
+});
+
+test("validateConfig: surface_recurrence_rounds rejects negative value → error with rigorGating:true", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  surface_recurrence_rounds: -1\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_policy.surface_recurrence_rounds");
+  assert.ok(d, `expected diagnostic for review_policy.surface_recurrence_rounds, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("validateConfig: surface_recurrence_rounds rejects non-integer (float) → error with rigorGating:true", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  surface_recurrence_rounds: 1.5\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_policy.surface_recurrence_rounds");
+  assert.ok(d, `expected diagnostic for review_policy.surface_recurrence_rounds, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("RIGOR_GATING_PATHS: includes review_policy.surface_recurrence_rounds", () => {
+  assert.ok(
+    RIGOR_GATING_PATHS.includes("review_policy.surface_recurrence_rounds"),
+    "RIGOR_GATING_PATHS must include review_policy.surface_recurrence_rounds",
+  );
 });
 
 // ---------------------------------------------------------------------------
