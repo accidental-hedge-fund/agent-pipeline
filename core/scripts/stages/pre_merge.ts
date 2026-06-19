@@ -518,8 +518,11 @@ export async function enforceReviewShaGate(
             )
             .at(-1);
           if (priorReviewComment) {
-            const recorded = extractBlockingKeysMarker(priorReviewComment.body);
-            if (recorded && recorded.size > 0) {
+            // Use the legacy-aware extractor: falls back to override-key token scraping
+            // for comments that predate the pipeline-blocking-keys marker (#229 Finding 11).
+            // An explicit empty marker (advisory-only) is preserved as "no blockers".
+            const recorded = extractBlockingKeysFromComment(priorReviewComment.body);
+            if (recorded.size > 0) {
               const overrides = extractOverrides(trustedOverrideComments);
               const unresolved = [...recorded].filter((k) => !overrides.has(k));
               if (unresolved.length > 0) {

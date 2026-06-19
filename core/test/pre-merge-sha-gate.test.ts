@@ -670,6 +670,20 @@ function advisoryReviewComment(round: 1 | 2, sha: string): string {
   ].join("\n");
 }
 
+function legacyBlockingReviewComment(round: 1 | 2, sha: string, keys: string[]): string {
+  // Pre-marker format: override-key tokens in body, no pipeline-blocking-keys marker.
+  const keyLines = keys.map((k) => `**[high] Finding title** \`override-key: ${k}\``);
+  return [
+    `## Review ${round} (Adversarial) — needs-attention`,
+    "",
+    "No-ship: blocking findings remain.",
+    "",
+    ...keyLines,
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+  ].join("\n");
+}
+
 function overrideSentinelComment(key: string): string {
   return `## Pipeline: Finding override\n\n<!-- pipeline-override: ${key} deferred -->`;
 }
@@ -1031,6 +1045,39 @@ test("enforceReviewShaGate: allowlisted prior-runner blocking review + all keys 
   });
   assert.equal(out, null, "all blocking keys overridden → must proceed (fall through)");
   assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden");
+  assert.deepEqual(rec.transitions, [], "must not transition");
+});
+
+test("enforceReviewShaGate: legacy markerless blocking review from allowlisted prior runner + reviews disabled → blocks (#229 Finding 11)", async (t) => {
+  // Regression: comments that predate the pipeline-blocking-keys marker carry
+  // override-key tokens in the body. extractBlockingKeysMarker returns null
+  // for those; only the legacy-aware extractBlockingKeysFromComment finds the keys.
+  // The disabled-review path must use the legacy-aware extractor.
+  const OTHER_ACTOR = "other-bot";
+  const cfgReviewsDisabled = {
+    ...cfg,
+    trusted_override_actors: [OTHER_ACTOR],
+    steps: { standard_review: false, adversarial_review: false, plan_review: false, docs: false },
+  } as unknown as PipelineConfig;
+  const legacyBlocking = { body: legacyBlockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [legacyBlocking] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgReviewsDisabled, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "legacy blocking comment must NOT silently proceed");
+  assert.equal((out as any)?.status, "blocked", "must block on legacy override-key tokens");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called once");
   assert.deepEqual(rec.transitions, [], "must not transition");
 });
 
