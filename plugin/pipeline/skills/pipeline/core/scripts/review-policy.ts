@@ -41,6 +41,40 @@ export interface ReviewPolicy {
   min_confidence: number;
 }
 
+/** Risk tier derived from the review-1 verdict (#232). */
+export type Review1Risk = "low" | "standard";
+
+/**
+ * Returns the effective ReviewPolicy for a given review round and review-1 risk
+ * context (#232). When round===2, risk_proportional is true, and the captured
+ * review-1 risk is low, the effective block_threshold is raised to the stricter
+ * of the configured threshold and "high" — so only high/critical findings block
+ * in review-2 for low-risk changes. min_confidence is never altered. In all
+ * other cases returns a ReviewPolicy with the configured values unchanged.
+ *
+ * "Stricter of configured and high" = higher severity rank = the one that blocks
+ * FEWER findings (e.g. "critical" > "high" > "medium" > "low"). A configured
+ * "critical" threshold is already above "high" and is left unchanged; "medium"
+ * or "low" are raised to "high".
+ */
+export function effectiveReviewPolicy(
+  policy: ReviewPolicy & { risk_proportional?: boolean },
+  context: { round: 1 | 2; review1Risk: Review1Risk },
+): ReviewPolicy {
+  if (
+    context.round !== 2 ||
+    !policy.risk_proportional ||
+    context.review1Risk !== "low"
+  ) {
+    return { block_threshold: policy.block_threshold, min_confidence: policy.min_confidence };
+  }
+  // Low-risk review-2: raise threshold to max(configured, "high") by severity rank.
+  const configuredRank = severityRank(policy.block_threshold);
+  const highRank = severityRank("high");
+  const effectiveThreshold = SEVERITY_ORDER[Math.max(configuredRank, highRank)] as Severity;
+  return { block_threshold: effectiveThreshold, min_confidence: policy.min_confidence };
+}
+
 /**
  * Fixed-partition line band for a finding's `line_start` (#144). Lines 1–5 map to
  * bucket 1, 6–10 to bucket 6, etc. — `Math.floor((L - 1) / 5) * 5 + 1` for `L >= 1`.

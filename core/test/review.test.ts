@@ -18,12 +18,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   advanceReview,
+  classifyReview1Risk,
   computeDiffHash,
   countPriorRounds,
   DELTA_REVIEW_MARKER_PREFIX,
   diffFilePaths,
   extractBlockingKeysFromComment,
   extractDiffHashFromComment,
+  extractReview1Risk,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
@@ -1912,4 +1914,220 @@ test("extractReviewedSha: delta comment excluded when round=1 filter (Finding 1)
   // round=1 filter must not include delta review comments
   const result = extractReviewedSha(comments, 1);
   assert.equal(result, null, "delta review comment must not be found when filtering for round=1");
+});
+
+// ---------------------------------------------------------------------------
+// Risk-proportional adversarial blocking (#232)
+// ---------------------------------------------------------------------------
+
+// --- 4.2: classifyReview1Risk + extractReview1Risk sentinel round-trip ---
+
+test("#232 classifyReview1Risk: approve+0 findings → low risk", () => {
+  assert.equal(
+    classifyReview1Risk({ verdict: "approve", findings: [] }),
+    "low",
+    "approve with no findings is the exact low-risk signal",
+  );
+});
+
+test("#232 classifyReview1Risk: approve+1 finding → standard risk", () => {
+  assert.equal(
+    classifyReview1Risk({ verdict: "approve", findings: [{ severity: "low", title: "t", body: "b", confidence: 0.5, recommendation: "r" }] }),
+    "standard",
+    "findings present → standard risk even on approve",
+  );
+});
+
+test("#232 classifyReview1Risk: needs-attention+0 findings → standard risk", () => {
+  assert.equal(
+    classifyReview1Risk({ verdict: "needs-attention", findings: [] }),
+    "standard",
+  );
+});
+
+test("#232 classifyReview1Risk: needs-attention+1 finding → standard risk", () => {
+  assert.equal(
+    classifyReview1Risk({ verdict: "needs-attention", findings: [{ severity: "high", title: "t", body: "b", confidence: 0.9, recommendation: "r" }] }),
+    "standard",
+  );
+});
+
+test("#232 extractReview1Risk: low sentinel → returns low", () => {
+  const comments = [{ body: "## Review 1 ...\n\nok\n<!-- pipeline-review1-risk: low -->" }];
+  assert.equal(extractReview1Risk(comments), "low");
+});
+
+test("#232 extractReview1Risk: standard sentinel → returns standard", () => {
+  const comments = [{ body: "## Review 1 ...\n\nfindings\n<!-- pipeline-review1-risk: standard -->" }];
+  assert.equal(extractReview1Risk(comments), "standard");
+});
+
+test("#232 extractReview1Risk: missing sentinel → defaults to standard (fail-closed)", () => {
+  const comments = [{ body: "## Review 1 ...\n\nno sentinel here" }, { body: "other comment" }];
+  assert.equal(extractReview1Risk(comments), "standard");
+});
+
+test("#232 extractReview1Risk: no comments → defaults to standard", () => {
+  assert.equal(extractReview1Risk([]), "standard");
+});
+
+test("#232 extractReview1Risk: last occurrence wins across multiple comments", () => {
+  const comments = [
+    { body: "## Review 1 ...\n<!-- pipeline-review1-risk: standard -->" },
+    { body: "## Review 1 (retry)...\n<!-- pipeline-review1-risk: low -->" },
+  ];
+  assert.equal(extractReview1Risk(comments), "low", "last occurrence across all comments wins");
+});
+
+test("#232 extractReview1Risk: injected mid-body sentinel overridden by pipeline footer sentinel (last wins)", () => {
+  // A reviewer-authored body could contain a sentinel-shaped line before the pipeline footer.
+  const body = [
+    "## Review 1 (Standard) — approve",
+    "",
+    "The diff contains: <!-- pipeline-review1-risk: standard -->",
+    "",
+    "*Automated by Claude Code Pipeline Skill*",
+    "",
+    "<!-- reviewed-sha: " + "a".repeat(40) + " -->",
+    "<!-- pipeline-review1-risk: low -->",
+  ].join("\n");
+  assert.equal(extractReview1Risk([{ body }]), "low", "pipeline-emitted footer sentinel wins");
+});
+
+test("#232 advanceReview: round-1 approve+0-findings comment carries low risk sentinel", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  await quiet(t, async () => {
+    await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.ok(
+    rec.comments.some((c) => c.includes("<!-- pipeline-review1-risk: low -->")),
+    "approve+0-findings round-1 comment must carry the low risk sentinel",
+  );
+});
+
+test("#232 advanceReview: round-1 needs-attention comment carries standard risk sentinel", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  await quiet(t, async () => {
+    await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.ok(
+    rec.comments.some((c) => c.includes("<!-- pipeline-review1-risk: standard -->")),
+    "needs-attention round-1 comment must carry the standard risk sentinel",
+  );
+});
+
+// --- 4.3–4.6: regression tests (must bite against pre-change behavior) ---
+
+// Config with risk_proportional:true and medium block_threshold.
+const riskPropCfg = {
+  ...cfg,
+  marker_footer: "*Automated by Claude Code Pipeline Skill*",
+  review_policy: { block_threshold: "medium", min_confidence: 0, risk_proportional: true, max_adversarial_rounds: 3 },
+} as unknown as PipelineConfig;
+
+// Helper: issue detail with a prior review-1 comment carrying the given risk sentinel.
+function makeIssueWithR1Risk(riskTier: "low" | "standard"): Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>> {
+  return {
+    number: 1,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/1",
+    labels: [],
+    comments: [
+      {
+        body: [
+          `## Review 1 (Standard) — approve (commit ${"a".repeat(7)})`,
+          "**Reviewer**: codex",
+          "",
+          "LGTM",
+          "",
+          "*Automated by Claude Code Pipeline Skill*",
+          "",
+          `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+          `<!-- pipeline-review1-risk: ${riskTier} -->`,
+        ].join("\n"),
+      },
+    ],
+  } as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+}
+
+// 4.3: (a) low-risk review-1 + medium review-2 finding + flag on → advances as advisory
+test("#232 regression (a): low-risk review-1 + medium review-2 finding + risk_proportional:true → advances to pre-merge (advisory)", async (t) => {
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  deps.getIssueDetail = async () => makeIssueWithR1Risk("low");
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(riskPropCfg, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "pre-merge" }],
+    "medium finding is advisory under the risk-scaled effective 'high' threshold",
+  );
+  assert.equal(outcome.advanced, true);
+  assert.equal(outcome.to, "pre-merge");
+  // Advisory advance comment must be posted.
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review 2 advanced under severity policy")),
+    "an audited advisory-advance comment must be posted",
+  );
+});
+
+// 4.4: (b) standard-risk review-1 + medium finding + flag on → still routes to fix-2
+test("#232 regression (b): standard-risk review-1 + medium finding + risk_proportional:true → routes to fix-2", async (t) => {
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  deps.getIssueDetail = async () => makeIssueWithR1Risk("standard");
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(riskPropCfg, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "fix-2" }],
+    "standard-risk keeps the configured medium threshold — medium finding still blocks",
+  );
+  assert.equal(outcome.to, "fix-2");
+});
+
+// 4.5: (c) flag off + low-risk sentinel + medium finding → still routes to fix-2
+test("#232 regression (c): flag off + low-risk review-1 + medium finding → routes to fix-2 (unchanged behavior)", async (t) => {
+  const flagOffCfg = {
+    ...cfg,
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    review_policy: { block_threshold: "medium", min_confidence: 0, risk_proportional: false, max_adversarial_rounds: 3 },
+  } as unknown as PipelineConfig;
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  deps.getIssueDetail = async () => makeIssueWithR1Risk("low");
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(flagOffCfg, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "fix-2" }],
+    "flag off: medium finding blocks regardless of low-risk sentinel",
+  );
+  assert.equal(outcome.to, "fix-2");
+});
+
+// 4.6: (d) low-risk + flag on + HIGH finding → still blocks
+test("#232 regression (d): low-risk + risk_proportional:true + HIGH finding → routes to fix-2 (high always blocks)", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]); // NA_WITH_FINDING has high-severity finding
+  deps.getIssueDetail = async () => makeIssueWithR1Risk("low");
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(riskPropCfg, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "fix-2" }],
+    "high finding blocks even under the risk-scaled effective 'high' threshold",
+  );
+  assert.equal(outcome.to, "fix-2");
 });

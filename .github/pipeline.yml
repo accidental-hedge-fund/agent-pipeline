@@ -37,6 +37,7 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   block_threshold: high # critical|high|medium|low — findings below this advise, not block
   min_confidence: 0.85 # 0..1 — findings below this confidence advise, not block
   # max_adversarial_rounds: 3 # (default) cap review-round re-runs; after this, still-blocking findings go advisory → needs-human
+  risk_proportional: true # (#232) when true and review-1 approved with 0 findings (low risk), review-2 only blocks on high/critical findings
 
 # --- Everything below is at its built-in default; shown for reference. ---
 

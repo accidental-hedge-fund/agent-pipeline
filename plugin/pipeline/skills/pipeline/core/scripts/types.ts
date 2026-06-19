@@ -233,10 +233,14 @@ export interface PipelineConfig {
   // how many times a review round may re-run before still-blocking findings are
   // recorded as advisory and the item is routed to the `needs-human` terminal
   // instead of looping to the iteration cap.
+  // `risk_proportional` (#232): when true, review-2 scales its effective
+  // block_threshold by the review-1 risk tier — low-risk changes (approved
+  // with 0 findings) only block on high/critical findings in review-2.
   review_policy: {
     block_threshold: "critical" | "high" | "medium" | "low";
     min_confidence: number; // 0..1; findings below this advise rather than block
     max_adversarial_rounds: number; // cap review-round re-runs before needs-human
+    risk_proportional: boolean; // scale review-2 threshold by review-1 risk tier (#232)
   };
   // Doctor / preflight (#146). Opt-in, deterministic capability check that runs
   // before any autonomous work. `runOnStart` (default false) makes the checks run
@@ -343,7 +347,7 @@ export const DEFAULT_CONFIG: Omit<
     rubric_path: ".github/shipcheck-rubric.md",
     block_on_partial: false,
   },
-  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3 },
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false },
   doctor: { runOnStart: false, failFast: false },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,
