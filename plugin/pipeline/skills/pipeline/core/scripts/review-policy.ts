@@ -301,12 +301,16 @@ export function findingPayloadFingerprint(f: ReviewFinding): string {
   // so `{46}` and `{46, line_end: 46}` must produce the same range (else an exact
   // duplicate with one form omitted falsely reads as a distinct candidate).
   const effectiveEnd = f.line_end ?? f.line_start;
-  return [
+  const raw = [
     normalizeTitle(f.title),
     norm(f.body),
     norm(f.recommendation),
     `${f.line_start ?? ""}-${effectiveEnd ?? ""}`,
-  ].join("␟"); // unit separator — won't appear in finding text
+  ].join("␟");
+  // Hash the normalized payload so the returned fingerprint is an opaque digest —
+  // the raw fields (body, recommendation) can contain secrets or injection text
+  // that must not leak into persisted run artifacts via payload_fingerprint.
+  return createHash("sha1").update(raw).digest("hex").slice(0, 16);
 }
 
 /**

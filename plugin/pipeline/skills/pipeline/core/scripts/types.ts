@@ -534,12 +534,53 @@ export interface StageRecord {
   prompts: PromptRecord[];
 }
 
-/** Summary of one review round's verdict. `findingCounts` maps severity → count. */
+/** A structured per-finding record persisted into the run directory (#209).
+ *  Carries the stable `findingKey` as the cross-round correlation handle plus
+ *  the full `ReviewFinding` field set (text fields sanitized at write time).
+ *  Optional source fields mirror `ReviewFinding` — absent when the reviewer
+ *  did not supply them. */
+export interface ReviewFindingRecord {
+  /** findingKey applied to the sanitized record fields at write time. When line_start
+   *  is absent the key hashes the title; sanitizing before computing prevents a
+   *  secret-bearing title from acting as a persisted oracle. */
+  key: string;
+  severity: "critical" | "high" | "medium" | "low";
+  title: string;
+  body: string;
+  file?: string;
+  line_start?: number;
+  line_end?: number;
+  confidence: number;
+  recommendation: string;
+  category?: string;
+  blocking?: boolean;
+  /** Effective blocking status from partitionFindings: true when the finding
+   *  landed in partition.blocking, false when advisory or overridden. Absent
+   *  on records written before #209 fix-2. */
+  effective_blocking?: boolean;
+  /** findingPayloadFingerprint applied to the sanitized record fields at write time —
+   *  disambiguates distinct findings that share the same findingKey within a round.
+   *  Absent on records written before #209. */
+  payload_fingerprint?: string;
+  /** True when sanitization collapsed two or more distinct same-key findings in this
+   *  round to the same key+payload_fingerprint pair. Consumers MUST NOT claim
+   *  per-finding resolution for these records; use aggregate counts only. Absent
+   *  (treat as false) on records without redaction collisions. */
+  payload_fingerprint_ambiguous?: boolean;
+}
+
+/** Summary of one review round's verdict. `findingCounts` maps severity → count.
+ *  `findings`, `harness`, `model`, and `selfReview` are additive optional fields
+ *  (#209) — present on new records, absent on records written before #209. */
 export interface ReviewRecord {
   round: number;
   sha: string;
   verdict: string;
   findingCounts: Record<string, number>;
+  findings?: ReviewFindingRecord[];
+  harness?: string;
+  model?: string;
+  selfReview?: boolean;
 }
 
 /** An operator `--override` disposition applied during the run. */

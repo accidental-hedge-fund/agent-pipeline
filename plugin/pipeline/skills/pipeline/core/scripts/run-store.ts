@@ -12,7 +12,7 @@
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { EvidenceBundle } from "./types.ts";
+import type { EvidenceBundle, ReviewFindingRecord } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
@@ -91,6 +91,12 @@ export interface ReviewVerdictEvent extends RunEventBase {
   sha: string;
   verdict: string;
   finding_counts: Record<string, number>;
+  /** Per-finding records (#209). Additive optional — absent on pre-#209 events. */
+  findings?: ReviewFindingRecord[];
+  /** Harness that actually reviewed this round (#209, #39 fallback). */
+  reviewer_harness?: string;
+  reviewer_model?: string;
+  self_review?: boolean;
 }
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
