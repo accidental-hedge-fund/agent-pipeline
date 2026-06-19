@@ -502,8 +502,45 @@ export async function enforceReviewShaGate(
             ? "review-1"
             : null;
         if (reviewStage === null) {
-          // Reviews are fully disabled for this repo — no review baseline is possible.
-          // Fall through and let pre-merge proceed as if no prior review existed.
+          // Reviews are fully disabled — cannot re-run review. If the prior allowlisted
+          // runner's comment carried unresolved blocking keys, block rather than silently
+          // skip blocker enforcement (#229 Finding 10). Only proceed when the prior review
+          // was approve/advisory-only or all keys are explicitly overridden.
+          const priorReviewComment = detail.comments
+            .filter(
+              (c) =>
+                c.author != null &&
+                c.author !== actor &&
+                allowlist.includes(c.author as string) &&
+                (c.body.startsWith("## Review 1") ||
+                  c.body.startsWith("## Review 2") ||
+                  c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)),
+            )
+            .at(-1);
+          if (priorReviewComment) {
+            const recorded = extractBlockingKeysMarker(priorReviewComment.body);
+            if (recorded && recorded.size > 0) {
+              const overrides = extractOverrides(trustedOverrideComments);
+              const unresolved = [...recorded].filter((k) => !overrides.has(k));
+              if (unresolved.length > 0) {
+                await setBlockedFn(
+                  cfg,
+                  issueNumber,
+                  `Pre-merge: prior runner recorded ${unresolved.length} unresolved blocking ` +
+                    `finding(s) (${unresolved.join(", ")}). Reviews are disabled, so ` +
+                    `\`--override\` each key before pre-merge can proceed.`,
+                  "pre-merge",
+                  "needs-human",
+                );
+                return {
+                  advanced: false,
+                  status: "blocked",
+                  reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) from prior allowlisted runner (reviews disabled)`,
+                };
+              }
+            }
+          }
+          // Prior review was approve/advisory-only or all keys overridden — fall through.
         } else {
           await postCommentFn(
             cfg,

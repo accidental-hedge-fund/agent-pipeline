@@ -970,6 +970,70 @@ test("enforceReviewShaGate: allowlisted prior-runner review with adversarial_rev
   assert.deepEqual(rec.blocked, []);
 });
 
+test("enforceReviewShaGate: allowlisted prior-runner blocking review + reviews disabled → blocks, not silent proceed (#229 Finding 10)", async (t) => {
+  // When all reviews are disabled (livelock guard) but the allowlisted prior runner's
+  // comment carried unresolved blocking keys, the gate must block rather than silently
+  // skip blocker enforcement. The Finding 9 test covers the advisory-only case.
+  const OTHER_ACTOR = "other-bot";
+  const cfgReviewsDisabled = {
+    ...cfg,
+    trusted_override_actors: [OTHER_ACTOR],
+    steps: { standard_review: false, adversarial_review: false, plan_review: false, docs: false },
+  } as unknown as PipelineConfig;
+  const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [blockingByOther] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgReviewsDisabled, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "blocking prior review must NOT silently proceed when reviews are disabled");
+  assert.equal((out as any)?.status, "blocked", "must block on unresolved keys from prior runner");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called once");
+  assert.deepEqual(rec.transitions, [], "must not transition — block, not re-review");
+});
+
+test("enforceReviewShaGate: allowlisted prior-runner blocking review + all keys overridden + reviews disabled → proceeds (#229 Finding 10)", async (t) => {
+  // Same scenario as above but with the key fully overridden. All keys accounted for →
+  // fall through as if no blockers (Finding 10 approve/override path).
+  const OTHER_ACTOR = "other-bot";
+  const cfgReviewsDisabled = {
+    ...cfg,
+    trusted_override_actors: [OTHER_ACTOR],
+    steps: { standard_review: false, adversarial_review: false, plan_review: false, docs: false },
+  } as unknown as PipelineConfig;
+  const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
+  // Override posted by TEST_ACTOR (current actor), covering the blocking key
+  const overrideByActor = { body: overrideSentinelComment("953ac487"), author: TEST_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [blockingByOther, overrideByActor] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgReviewsDisabled, 16, 99, deps);
+  });
+  assert.equal(out, null, "all blocking keys overridden → must proceed (fall through)");
+  assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden");
+  assert.deepEqual(rec.transitions, [], "must not transition");
+});
+
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {
   const { deps, rec } = makeDeps({
     commentBody: advisoryReviewComment(2, SHA_HEAD),
