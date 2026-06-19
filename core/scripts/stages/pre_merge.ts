@@ -464,18 +464,50 @@ export async function enforceReviewShaGate(
       reason: "pre-merge: actor lookup failed — cannot verify review provenance",
     };
   }
-  // Trust the current actor + configured allowlist for ALL pipeline comment types
-  // (SHA extraction, override/scope sentinels). Allowlisted actors may be the
-  // author of both the last review comment and the override — actor-only would make
-  // their review invisible and skip blocker enforcement (#229 Findings 4, 5, 6, 7).
-  const trustedComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
-  // Override/scope extraction uses the same trusted set.
-  const trustedOverrideComments = trustedComments;
+  // SHA extraction uses actor-only trust: allowlisted actors must NOT be trusted
+  // for review verdict comments as any allowlisted identity could otherwise post a
+  // forged approval header and bypass the SHA gate (#229 Finding 8).
+  const trustedComments = detail.comments.filter((c) => c.author === actor);
+  // Override/scope extraction uses the broader allowlist set (#229 Findings 4, 5, 6).
+  const trustedOverrideComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
 
   const reviewed = extractReviewedSha(trustedComments);
-  // No prior review comment (e.g. review steps disabled, or first run) → nothing
-  // to validate; let pre-merge proceed as normal.
-  if (!reviewed) return null;
+  // No prior review from the current actor found. Three sub-cases:
+  // (a) No review comments at all (review disabled, first run) → proceed normally.
+  // (b) Review comments from arbitrary commenters (e.g. forged headers) → proceed; do
+  //     not trigger re-review on arbitrary non-actor comments (DoS risk: any commenter
+  //     could post a review-headed comment to cause endless re-reviews).
+  // (c) Review comments from an explicitly trusted prior runner (in trusted_override_actors)
+  //     — DO NOT silently proceed, that skips blocker enforcement (#229 Finding 7).
+  //     Route to re-review so the current actor establishes its own verified baseline.
+  if (!reviewed) {
+    const allowlist = cfg.trusted_override_actors ?? [];
+    if (allowlist.length > 0) {
+      const hasAllowlistedReview = detail.comments.some(
+        (c) =>
+          c.author != null &&
+          c.author !== actor &&
+          allowlist.includes(c.author) &&
+          (c.body.startsWith("## Review 1") ||
+            c.body.startsWith("## Review 2") ||
+            c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)),
+      );
+      if (hasAllowlistedReview) {
+        await postCommentFn(
+          cfg,
+          issueNumber,
+          `## Pipeline: Re-running review — prior runner identity differs\n\n` +
+            `Review comments exist from an allowlisted prior runner (not \`${actor}\`). ` +
+            `Re-running review under the current identity to establish a verified baseline ` +
+            `before proceeding to pre-merge.`,
+        );
+        const reviewStage: Stage = "review-2";
+        await transitionFn(cfg, issueNumber, "pre-merge", reviewStage);
+        return { advanced: true, to: reviewStage };
+      }
+    }
+    return null;
+  }
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 

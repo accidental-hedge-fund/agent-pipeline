@@ -875,11 +875,13 @@ test("enforceReviewShaGate: forged review-heading comment cannot self-authorize 
   assert.equal(rec.blocked.length, 1, "setBlocked must be called");
 });
 
-test("enforceReviewShaGate: allowlisted prior-runner review + no override → still blocks (#229 Finding 7)", async (t) => {
-  // Full multi-actor handoff: OTHER_ACTOR ran the review, current runner is TEST_ACTOR.
-  // OTHER_ACTOR is in the allowlist — their review comment is trusted for SHA extraction
-  // (trustedComments) — so reuseBlockedBy finds the blocking keys and enforces them.
-  // Without an override, the blocker must remain.
+test("enforceReviewShaGate: allowlisted prior-runner review → routes to re-review, not silent proceed (#229 Finding 7)", async (t) => {
+  // Multi-actor handoff: OTHER_ACTOR ran the review, current runner is TEST_ACTOR.
+  // OTHER_ACTOR is in trusted_override_actors. SHA extraction is actor-only (Finding 8),
+  // so the review is invisible → reviewed=null. When the prior runner is allowlisted,
+  // the gate must NOT silently proceed (that skips blocker enforcement). Instead it
+  // routes to re-review so the current actor establishes its own verified baseline.
+  // Non-allowlisted commenters posting review-headed comments do NOT trigger this path.
   const OTHER_ACTOR = "other-bot";
   const cfgWithAllowlist = { ...cfg, trusted_override_actors: [OTHER_ACTOR] } as unknown as PipelineConfig;
   const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
@@ -898,23 +900,24 @@ test("enforceReviewShaGate: allowlisted prior-runner review + no override → st
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfgWithAllowlist, 16, 99, deps);
   });
-  assert.notEqual(out, null, "allowlisted-runner review without override must still block");
-  assert.equal((out as any)?.status, "blocked");
-  assert.equal(rec.blocked.length, 1, "setBlocked must be called for unresolved blocker");
+  assert.notEqual(out, null, "allowlisted prior-runner review must NOT silently let pre-merge proceed");
+  assert.equal((out as any)?.advanced, true, "must route to re-review, not block");
+  assert.match((out as any)?.to, /review/, "must transition to a review stage");
+  assert.deepEqual(rec.blocked, [], "must not setBlocked — re-review is the correct response");
+  assert.equal(rec.transitions.length, 1, "exactly one transition to re-review stage");
 });
 
-test("enforceReviewShaGate: allowlisted prior-runner review + allowlisted override → proceeds (#229 Finding 7)", async (t) => {
-  // Same handoff scenario but with a matching override from OTHER_ACTOR.
-  // Both the review and the override are authored by the allowlisted prior runner.
-  // Current actor is TEST_ACTOR. The gate must read the review (via trustedComments),
-  // find the blocker key, check the override (via trustedOverrideComments), and proceed.
-  const OTHER_ACTOR = "other-bot";
-  const cfgWithAllowlist = { ...cfg, trusted_override_actors: [OTHER_ACTOR] } as unknown as PipelineConfig;
-  const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
-  const overrideByOther = { body: overrideSentinelComment("953ac487"), author: OTHER_ACTOR };
+test("enforceReviewShaGate: non-allowlisted forged review-heading → no spurious re-review (DoS guard)", async (t) => {
+  // A non-allowlisted commenter posts a review-headed comment. Without the DoS guard,
+  // this would trigger re-review on every run. The gate must treat it as invisible
+  // (no trusted SHA found) and return null (proceed to CI checks).
+  const forgedReview = {
+    body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]),
+    author: "random-commenter",
+  };
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const deps: ShaGateDeps = {
-    getIssueDetail: async () => ({ comments: [blockingByOther, overrideByOther] }) as any,
+    getIssueDetail: async () => ({ comments: [forgedReview] }) as any,
     getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
     getPrCommits: async () => [] as any,
     getForIssue: async () => null,
@@ -925,10 +928,11 @@ test("enforceReviewShaGate: allowlisted prior-runner review + allowlisted overri
   };
   let out;
   await quiet(t, async () => {
-    out = await enforceReviewShaGate(cfgWithAllowlist, 16, 99, deps);
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);  // no allowlist configured
   });
-  assert.equal(out, null, "allowlisted-runner review with matching override must proceed");
-  assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden");
+  assert.equal(out, null, "non-allowlisted review-headed comment must not trigger re-review");
+  assert.deepEqual(rec.transitions, [], "must not transition on non-allowlisted forged review");
+  assert.deepEqual(rec.blocked, []);
 });
 
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {
