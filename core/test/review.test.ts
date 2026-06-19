@@ -37,7 +37,7 @@ import {
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
-import { extractOverrides, findingKey, overrideComment, scopedOverrideComment, severityRank } from "../scripts/review-policy.ts";
+import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, formatBlockingSurfacesMarker, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -2844,4 +2844,348 @@ test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete de
     rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred")),
     "demotion comment must be posted on completion",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Surface-recurrence guard (#234): (file + category) cluster-based diminishing-
+// returns detection that catches new-key-each-round whack-a-mole.
+// ---------------------------------------------------------------------------
+
+/** Config with surface_recurrence_rounds=3 and ceiling_action=park (default). */
+const cfgSurface = {
+  ...cfgConverge,
+  review_policy: {
+    block_threshold: "medium",
+    min_confidence: 0.7,
+    max_adversarial_rounds: 10, // high cap so the ceiling doesn't interfere
+    ceiling_action: "park",
+    surface_recurrence_rounds: 3,
+  },
+} as unknown as PipelineConfig;
+
+/** Config with surface_recurrence_rounds=3 and ceiling_action=demote_and_advance. */
+const cfgSurfaceDemote = {
+  ...cfgSurface,
+  review_policy: {
+    ...cfgSurface.review_policy,
+    ceiling_action: "demote_and_advance",
+  },
+} as unknown as PipelineConfig;
+
+/**
+ * Build a prior-round verdict comment via the real formatter (emit↔read round-trip
+ * exercised), with the `pipeline-blocking-keys` and `pipeline-blocking-surfaces`
+ * markers filled in, so the surface-recurrence check can read prior surfaces.
+ * The blockingKeysSet is derived from the given findings (all are blocking).
+ */
+function priorSurfaceComment(round: 1 | 2, findings: ReviewFinding[]): { body: string } {
+  const blockingKeysSet = new Set(findings.map((f) => findingKey(f)));
+  return {
+    body: formatReviewComment(
+      cfgSurface,
+      { verdict: "needs-attention", summary: "prior round", findings, next_steps: [], commitSha: SHA_A },
+      round,
+      "codex",
+      blockingKeysSet,
+    ),
+  };
+}
+
+/**
+ * Acceptance scenario (a) — whack-a-mole: 3 rounds of new keys on the same
+ * (file, category) surface → guard fires. Each round has a different finding key
+ * but the same file+category surface. This test bites without the guard (routes
+ * to fix-2 instead of needs-human on the 3rd round).
+ */
+test("surface-recurrence (#234): 3 rounds of new keys on the same surface → guard fires (park)", async (t) => {
+  // Round 1: finding A on src/pkg.ts / correctness.
+  const findingA: ReviewFinding = {
+    severity: "medium",
+    title: "Package.json field X missing",
+    file: "src/pkg.ts",
+    category: "correctness",
+    body: "missing field",
+    confidence: 0.9,
+    recommendation: "add field",
+    line_start: 10,
+  };
+  // Round 2: finding B on same surface, different key (different line band).
+  const findingB: ReviewFinding = {
+    ...findingA,
+    title: "Package.json field Y also missing",
+    line_start: 20,
+  };
+  // Round 3 (current): finding C on same surface, again different key.
+  const findingC: ReviewFinding = {
+    ...findingA,
+    title: "Package.json field Z still missing",
+    line_start: 30,
+  };
+
+  // Verify the three findings are on the same surface but have different keys
+  // (the exact-key guard must NOT be the one that fires here — it's the surface guard).
+  assert.equal(surfaceKey(findingA), surfaceKey(findingB), "precondition: same surface");
+  assert.equal(surfaceKey(findingB), surfaceKey(findingC), "precondition: same surface all 3");
+  assert.notEqual(findingKey(findingA), findingKey(findingB), "precondition: different finding keys");
+  assert.notEqual(findingKey(findingB), findingKey(findingC), "precondition: different finding keys");
+
+  const naC = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "still surface issue",
+    findings: [findingC],
+    next_steps: [],
+  });
+
+  const { deps, rec } = makeDeps([naC]);
+  // Two prior rounds: findingA in round 1, findingB in round 2.
+  deps.getIssueDetail = async () => detailWithComments([
+    priorSurfaceComment(2, [findingA]),
+    priorSurfaceComment(2, [findingB]),
+  ]);
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
+  });
+
+  // Guard fired → should park at needs-human, NOT route to fix-2.
+  assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "surface guard must NOT consume another fix round");
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }], "surface guard must park at needs-human");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "must post the ceiling punch-list comment",
+  );
+  assert.equal(outcome.to, "needs-human");
+  assert.match(outcome.summary, /surface-recurrence/);
+});
+
+/**
+ * Acceptance scenario (b) — distinct surfaces: 3 rounds, each on a different
+ * (file, category) surface → guard does NOT fire. Each surface has streak=1,
+ * which is below the threshold of 3.
+ */
+test("surface-recurrence (#234): distinct surfaces across 3 rounds → guard does NOT fire", async (t) => {
+  const findingX: ReviewFinding = {
+    severity: "medium", title: "issue on X", file: "src/x.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  const findingY: ReviewFinding = {
+    severity: "medium", title: "issue on Y", file: "src/y.ts", category: "security",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  // Current round: a third distinct surface.
+  const findingZ: ReviewFinding = {
+    severity: "medium", title: "issue on Z", file: "src/z.ts", category: "perf",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+
+  // Verify all three are on different surfaces.
+  assert.notEqual(surfaceKey(findingX), surfaceKey(findingY), "precondition: different surfaces");
+  assert.notEqual(surfaceKey(findingY), surfaceKey(findingZ), "precondition: different surfaces");
+
+  const naZ = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "new surface issue",
+    findings: [findingZ],
+    next_steps: [],
+  });
+
+  const { deps, rec } = makeDeps([naZ]);
+  deps.getIssueDetail = async () => detailWithComments([
+    priorSurfaceComment(2, [findingX]),
+    priorSurfaceComment(2, [findingY]),
+  ]);
+
+  await quiet(t, async () => {
+    await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
+  });
+
+  // Guard must NOT fire — all surfaces have streak=1.
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "distinct surfaces must NOT trigger surface guard");
+  assert.ok(
+    !rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "no ceiling comment when guard does not fire",
+  );
+});
+
+test("surface-recurrence (#234): exact-key repeat parks before the surface guard runs", async (t) => {
+  // An exact finding-key repeat must be caught by the exact-key recurrence guard,
+  // not by the surface guard. The outcome and comment style is the recurrence path.
+  const findingA: ReviewFinding = {
+    severity: "medium", title: "exact repeat", file: "src/a.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 10,
+  };
+  const naA = JSON.stringify({ verdict: "needs-attention", summary: "repeat", findings: [findingA], next_steps: [] });
+  const { deps, rec } = makeDeps([naA]);
+  // One prior round with the exact same finding (same key) — triggers exact-key recurrence guard.
+  deps.getIssueDetail = async () => detailWithComments([priorSurfaceComment(2, [findingA])]);
+
+  await quiet(t, async () => {
+    await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
+  });
+
+  // The exact-key guard parks at needs-human before the surface guard evaluates.
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "exact-key recurrence must post the ceiling comment",
+  );
+});
+
+test("surface-recurrence (#234): streak below threshold → guard does not fire", async (t) => {
+  // Two rounds (streak=2) when surface_recurrence_rounds=3 → guard must NOT fire.
+  const findingA: ReviewFinding = {
+    severity: "medium", title: "issue round 1", file: "src/a.ts", category: "bug",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  const findingB: ReviewFinding = {
+    ...findingA, title: "issue round 2", line_start: 15,
+  };
+  assert.notEqual(findingKey(findingA), findingKey(findingB), "precondition: different keys");
+  assert.equal(surfaceKey(findingA), surfaceKey(findingB), "precondition: same surface");
+
+  const naB = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingB], next_steps: [] });
+  const { deps, rec } = makeDeps([naB]);
+  // Only ONE prior round (streak would be 2 after current round — below threshold 3).
+  deps.getIssueDetail = async () => detailWithComments([priorSurfaceComment(2, [findingA])]);
+
+  await quiet(t, async () => {
+    await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
+  });
+
+  // Streak is 2 < 3 — must route to fix, not park.
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "streak below threshold must not trigger guard");
+});
+
+test("surface-recurrence (#234): surface_recurrence_rounds=0 disables the guard", async (t) => {
+  const cfgDisabled = {
+    ...cfgSurface,
+    review_policy: { ...cfgSurface.review_policy, surface_recurrence_rounds: 0 },
+  } as unknown as PipelineConfig;
+
+  const findingA: ReviewFinding = {
+    severity: "medium", title: "round 1", file: "src/x.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  const findingB: ReviewFinding = { ...findingA, title: "round 2", line_start: 15 };
+  const findingC: ReviewFinding = { ...findingA, title: "round 3", line_start: 25 };
+  const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
+
+  const { deps, rec } = makeDeps([naC]);
+  deps.getIssueDetail = async () => detailWithComments([
+    priorSurfaceComment(2, [findingA]),
+    priorSurfaceComment(2, [findingB]),
+  ]);
+
+  await quiet(t, async () => {
+    await advanceReview(cfgDisabled, 1, 2, {}, 0, deps);
+  });
+
+  // Guard is disabled — must route to fix-2, not park.
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }], "disabled guard must not fire");
+});
+
+test("surface-recurrence (#234): demote_and_advance — below-high cluster demoted and advanced", async (t) => {
+  // 3 rounds on the same surface, all below-high → guard fires with demote_and_advance.
+  const findingA: ReviewFinding = {
+    severity: "medium", title: "nit round 1", file: "src/p.ts", category: "style",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  const findingB: ReviewFinding = { ...findingA, title: "nit round 2", line_start: 15 };
+  const findingC: ReviewFinding = { ...findingA, title: "nit round 3", line_start: 25 };
+  assert.notEqual(findingKey(findingA), findingKey(findingC), "precondition: different keys");
+
+  const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
+  let createIssueCalls = 0;
+  const { deps, rec } = makeDeps([naC]);
+  deps.getIssueDetail = async () => detailWithComments([
+    priorSurfaceComment(2, [findingA]),
+    priorSurfaceComment(2, [findingB]),
+  ]);
+  deps.createIssue = async () => { createIssueCalls++; return 999; };
+  deps.addIssueComment = async () => {};
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgSurfaceDemote, 1, 2, {}, 0, deps);
+  });
+
+  // Guard fires with demote_and_advance → must advance to pre-merge.
+  assert.equal(outcome.to, "pre-merge", "below-high cluster must be demoted and advanced");
+  assert.match(outcome.summary, /surface-recurrence/);
+  assert.equal(createIssueCalls, 1, "follow-up issue must be created");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred")),
+    "demotion comment must be posted",
+  );
+});
+
+test("surface-recurrence (#234): high finding in fired cluster is never auto-demoted", async (t) => {
+  // 3 rounds on the same surface, but this round has a HIGH finding → must park, not demote.
+  const findingA: ReviewFinding = {
+    severity: "medium", title: "nit round 1", file: "src/p.ts", category: "style",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  const findingB: ReviewFinding = { ...findingA, title: "nit round 2", line_start: 15 };
+  // Current round: HIGH severity on same surface.
+  const findingC: ReviewFinding = {
+    ...findingA, title: "critical bug round 3", severity: "high", line_start: 25,
+  };
+  const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
+  let createIssueCalls = 0;
+  const { deps, rec } = makeDeps([naC]);
+  deps.getIssueDetail = async () => detailWithComments([
+    priorSurfaceComment(2, [findingA]),
+    priorSurfaceComment(2, [findingB]),
+  ]);
+  deps.createIssue = async () => { createIssueCalls++; return 998; };
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgSurfaceDemote, 1, 2, {}, 0, deps);
+  });
+
+  // High finding must NOT be auto-demoted → park at needs-human.
+  assert.equal(outcome.to, "needs-human", "high finding in fired cluster must park, not advance");
+  assert.equal(createIssueCalls, 0, "no follow-up issue when high finding prevents demotion");
+});
+
+test("surface-recurrence (#234): formatReviewComment emits the surfaces marker alongside blocking-keys marker", () => {
+  const f: ReviewFinding = {
+    severity: "high", title: "bug", file: "src/x.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const blockingKeysSet = new Set([findingKey(f)]);
+  const body = formatReviewComment(
+    cfgSurface,
+    { verdict: "needs-attention", summary: "s", findings: [f], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    blockingKeysSet,
+  );
+  // Both markers must be present.
+  assert.match(body, /<!-- pipeline-blocking-keys: [0-9a-f]+ -->/);
+  assert.match(body, /<!-- pipeline-blocking-surfaces: /);
+  // Extract and verify the surfaces marker.
+  const surfacesMap = extractBlockingSurfacesFromComment(body);
+  assert.equal(surfacesMap.get(findingKey(f)), surfaceKey(f));
+});
+
+test("surface-recurrence (#234): advisory-only round emits empty surfaces marker", () => {
+  // When blockingKeys is an empty Set, the surfaces marker should be empty too.
+  const f: ReviewFinding = {
+    severity: "low", title: "nit", file: "src/x.ts", category: "style",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const body = formatReviewComment(
+    cfgSurface,
+    { verdict: "needs-attention", summary: "s", findings: [f], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set<string>(), // empty — all advisory
+  );
+  // Empty marker must be present (not absent).
+  assert.match(body, /<!-- pipeline-blocking-surfaces:  -->/);
+  const surfacesMap = extractBlockingSurfacesFromComment(body);
+  assert.equal(surfacesMap.size, 0, "advisory-only round must produce empty surfaces map");
 });

@@ -246,6 +246,10 @@ export interface PipelineConfig {
     // below-high findings to advisory, file a follow-up issue, and advance to
     // pre-merge — high/critical findings continue to hard-park regardless.
     ceiling_action: "park" | "demote_and_advance";
+    // Consecutive-round threshold N for the (file + category) surface-recurrence
+    // guard (#234). When N consecutive rounds each raise a new-key blocking finding
+    // on the same (file + category) surface, the guard fires. 0 disables the guard.
+    surface_recurrence_rounds: number;
   };
   // Doctor / preflight (#146). Opt-in, deterministic capability check that runs
   // before any autonomous work. `runOnStart` (default false) makes the checks run
@@ -352,7 +356,7 @@ export const DEFAULT_CONFIG: Omit<
     rubric_path: ".github/shipcheck-rubric.md",
     block_on_partial: false,
   },
-  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const },
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,

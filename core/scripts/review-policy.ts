@@ -142,6 +142,81 @@ export function findingKey(
 }
 
 /**
+ * Stable surface key for a finding: `normalize(file) + "|" + (category ?? "")`.
+ * Two findings sharing the same normalized file and the same category share a
+ * surface key regardless of their individual findingKey, severity, line, or title
+ * (#234). Returns null when the finding has no `file` (or an empty `file`) —
+ * such findings are excluded from surface clustering.
+ */
+export function surfaceKey(f: Pick<ReviewFinding, "file" | "category">): string | null {
+  const file = normalizeFile(f.file);
+  if (!file) return null;
+  return `${file}|${f.category ?? ""}`;
+}
+
+// Machine-readable per-round blocking-surfaces marker (#234).
+// Format: <!-- pipeline-blocking-surfaces: <findingKey>~<encodedSurfaceKey>,... -->
+// Full-line-anchored; global flag lets extractBlockingSurfacesFromComment pick
+// the LAST occurrence, guarding against a spoofed earlier marker in reviewer prose.
+const PIPELINE_BLOCKING_SURFACES_RE = /^<!-- pipeline-blocking-surfaces: (.*?) -->$/gm;
+
+/**
+ * Emit the machine-readable `pipeline-blocking-surfaces` marker for a set of
+ * blocking findings. Each pair `<findingKey>~<surfaceKey>` records one finding's
+ * surface. Findings without a surface key (no `file`) are omitted. The surface
+ * key is URI-percent-encoded to handle file paths and category names that contain
+ * commas, tildes, or other separator characters. Emits an empty marker when no
+ * finding carries a surface, so a prior advisory-only round cannot seed a false
+ * surface streak. Pure (no network/git/subprocess).
+ */
+export function formatBlockingSurfacesMarker(findings: ReviewFinding[]): string {
+  const pairs: string[] = [];
+  const seenFindingKeys = new Set<string>();
+  for (const f of findings) {
+    const sk = surfaceKey(f);
+    if (sk === null) continue;
+    const fk = findingKey(f);
+    if (seenFindingKeys.has(fk)) continue;
+    seenFindingKeys.add(fk);
+    pairs.push(`${fk}~${encodeURIComponent(sk)}`);
+  }
+  return `<!-- pipeline-blocking-surfaces: ${pairs.join(",")} -->`;
+}
+
+/**
+ * Extract the `pipeline-blocking-surfaces` mapping (findingKey → surfaceKey)
+ * from a review comment body (#234). Full-line-anchored regex; picks the LAST
+ * occurrence (guards against a spoofed marker placed before the real pipeline-
+ * emitted footer marker by reviewer-authored content). Returns an empty mapping
+ * for a body with no marker, an empty marker, or malformed content — never throws.
+ * Pure (no network, git, or subprocess calls).
+ */
+export function extractBlockingSurfacesFromComment(body: string): Map<string, string> {
+  PIPELINE_BLOCKING_SURFACES_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = PIPELINE_BLOCKING_SURFACES_RE.exec(body)) !== null) {
+    lastMatch = cur;
+  }
+  PIPELINE_BLOCKING_SURFACES_RE.lastIndex = 0;
+  const map = new Map<string, string>();
+  if (lastMatch === null || !lastMatch[1].trim()) return map;
+  for (const pair of lastMatch[1].split(",")) {
+    const tildeIdx = pair.indexOf("~");
+    if (tildeIdx === -1) continue;
+    const fk = pair.slice(0, tildeIdx).trim();
+    const encodedSk = pair.slice(tildeIdx + 1).trim();
+    if (!/^[0-9a-f]{8}$/.test(fk)) continue;
+    try {
+      map.set(fk, decodeURIComponent(encodedSk));
+    } catch {
+      map.set(fk, encodedSk);
+    }
+  }
+  return map;
+}
+
+/**
  * Structured finding category (#106) that flags a divergence between the code and
  * the OpenSpec spec delta. The pre-merge consistency guard keys on THIS — emitted
  * into the review comment by `formatReviewComment` from the reviewer's structured

@@ -36,12 +36,15 @@ import {
   buildTrustedOverrideComments,
   categoryMarker,
   effectiveReviewPolicy,
+  extractBlockingSurfacesFromComment,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  formatBlockingSurfacesMarker,
   overrideComment,
   partitionFindings,
   severityRank,
+  surfaceKey,
   type PartitionResult,
   type Review1Risk,
 } from "../review-policy.ts";
@@ -637,6 +640,177 @@ export async function advanceReview(
       };
     }
     // At ceiling with demote_and_advance: fall through to the ceiling check below.
+  }
+
+  // Surface-recurrence guard (#234): detect new-key-each-round whack-a-mole by
+  // clustering blocking findings across rounds by (file + category). Only runs
+  // when the knob is non-zero and there are blocking findings, and only after the
+  // exact-key recurrence guard (above) has been evaluated and did not park.
+  const surfaceRounds = cfg.review_policy.surface_recurrence_rounds ?? 3;
+  if (surfaceRounds > 0 && partition.blocking.length > 0) {
+    // Build a map from surfaceKey → Set<findingKey> for the current round's blocking findings.
+    const currentSurfaceToKeys = new Map<string, Set<string>>();
+    for (const f of partition.blocking) {
+      const sk = surfaceKey(f);
+      if (sk === null) continue;
+      const fk = findingKey(f);
+      if (!currentSurfaceToKeys.has(sk)) currentSurfaceToKeys.set(sk, new Set());
+      currentSurfaceToKeys.get(sk)!.add(fk);
+    }
+
+    // Get the immediately-prior round's surface map for the new-key condition.
+    const lastPriorSurfaceMap = lastPriorRound
+      ? extractBlockingSurfacesFromComment(lastPriorRound.body)
+      : new Map<string, string>();
+
+    // Determine which surfaces have fired: streak >= threshold AND at least one new key.
+    const firedSurfaces = new Set<string>();
+    for (const [sk, currentKeys] of currentSurfaceToKeys) {
+      // Compute the consecutive-round streak for this surface.
+      let streak = 1; // current round
+      for (let i = priorRoundComments.length - 1; i >= 0; i--) {
+        const priorMap = extractBlockingSurfacesFromComment(priorRoundComments[i].body);
+        const inPrior = [...priorMap.values()].some((s) => s === sk);
+        if (inPrior) {
+          streak++;
+        } else {
+          break; // consecutive chain broken
+        }
+      }
+      if (streak < surfaceRounds) continue;
+
+      // New-key condition: at least one current key is NOT in the immediately-prior
+      // round's mapping for this surface (the exact-repeat case is owned by the
+      // exact-key guard above).
+      const priorKeysForSurface = new Set<string>(
+        [...lastPriorSurfaceMap.entries()]
+          .filter(([, sv]) => sv === sk)
+          .map(([fk]) => fk),
+      );
+      const hasNewKey = [...currentKeys].some((fk) => !priorKeysForSurface.has(fk));
+      if (hasNewKey) firedSurfaces.add(sk);
+    }
+
+    if (firedSurfaces.size > 0) {
+      // Guard fired. Split the fired cluster into high/critical vs. below-high.
+      // Non-fired blocking findings are treated as separate from the cluster.
+      const firedFindings = partition.blocking.filter((f) => {
+        const sk = surfaceKey(f);
+        return sk !== null && firedSurfaces.has(sk);
+      });
+      const nonFiredBlockers = partition.blocking.filter((f) => {
+        const sk = surfaceKey(f);
+        return sk === null || !firedSurfaces.has(sk);
+      });
+      const highOrCriticalInFired = firedFindings.filter(
+        (f) => severityRank(f.severity) >= severityRank("high"),
+      );
+      const belowHighInFired = firedFindings.filter(
+        (f) => severityRank(f.severity) < severityRank("high"),
+      );
+
+      // Demote-and-advance is only viable when ALL remaining blockers are below-high
+      // findings in the fired cluster (no non-fired blockers, no high/critical in fired).
+      const shouldSurfaceDemote =
+        cfg.review_policy.ceiling_action === "demote_and_advance" &&
+        highOrCriticalInFired.length === 0 &&
+        nonFiredBlockers.length === 0 &&
+        belowHighInFired.length > 0;
+
+      if (!shouldSurfaceDemote) {
+        // Park: high/critical in fired cluster, non-fired blockers present, or ceiling_action=park.
+        await postCommentFn(
+          cfg,
+          issueNumber,
+          reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
+        );
+        await transitionFn(
+          cfg,
+          issueNumber,
+          stage,
+          "needs-human",
+          `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
+            `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
+            `same (file + category) cluster. Parked at needs-human early without consuming ` +
+            `the remaining round budget.`,
+        );
+        return {
+          advanced: true,
+          from: stage,
+          to: "needs-human",
+          summary: `surface-recurrence: ${firedSurfaces.size} surface(s) hit ${surfaceRounds}-round streak → needs-human`,
+        };
+      }
+
+      // Demote-and-advance: all fired findings are below-high, no non-fired blockers.
+      // Reuse the #233 demote-and-advance primitives.
+      const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);
+      const addIssueCommentFn = deps.addIssueComment ?? defaultAddIssueComment(cfg);
+
+      const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
+      let surfaceFollowupNumber: number;
+      if (existingFollowup !== null) {
+        surfaceFollowupNumber = existingFollowup;
+        const updateBody = buildFollowupUpdateComment(issueNumber, priorRoundComments.length + 1, belowHighInFired);
+        await addIssueCommentFn(surfaceFollowupNumber, updateBody);
+      } else {
+        const followupBody = buildFollowupIssueBody(issueNumber, belowHighInFired);
+        surfaceFollowupNumber = await createIssueFn(
+          `[Deferred] Review ceiling findings from #${issueNumber}`,
+          followupBody,
+          [],
+        );
+      }
+
+      const surfaceDemotionBody = reviewCeilingDemotionComment(
+        cfg,
+        round,
+        reviewer,
+        { ...partition, blocking: belowHighInFired },
+        surfaceRounds,
+        priorRoundComments,
+        surfaceFollowupNumber,
+      );
+      const surfaceDemotionComment = reviewComment(surfaceDemotionBody);
+      await postCommentFn(cfg, issueNumber, surfaceDemotionComment);
+      try {
+        await postPrCommentFn(cfg, prNumber, surfaceDemotionComment);
+      } catch (err) {
+        console.warn(
+          `[pipeline] #${issueNumber}: could not mirror surface-recurrence demotion comment to PR #${prNumber}: ${(err as Error).message}`,
+        );
+      }
+
+      const surfaceTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      for (const f of belowHighInFired) {
+        const key = findingKey(f);
+        const disposition = `deferred-#${surfaceFollowupNumber}`;
+        const body = overrideComment({
+          key,
+          disposition,
+          reason: `auto-demoted at surface-recurrence guard (${surfaceRounds} consecutive rounds on same (file+category) surface); deferred to #${surfaceFollowupNumber}`,
+          stage,
+          timestamp: surfaceTimestamp,
+          footer: cfg.marker_footer,
+        });
+        await postCommentFn(cfg, issueNumber, body);
+      }
+
+      await transitionFn(
+        cfg,
+        issueNumber,
+        stage,
+        "pre-merge",
+        `Surface-recurrence guard fired: ${belowHighInFired.length} below-high finding(s) ` +
+          `auto-demoted to advisory and deferred to #${surfaceFollowupNumber}. Advancing to pre-merge.`,
+      );
+      return {
+        advanced: true,
+        from: stage,
+        to: "pre-merge",
+        summary: `surface-recurrence: ${belowHighInFired.length} below-high findings demoted → pre-merge (follow-up #${surfaceFollowupNumber})`,
+      };
+    }
   }
 
   // Bounded rounds: cap how many times this review round may re-run before we
@@ -1249,6 +1423,12 @@ export function formatReviewComment(
   // Omitted when no `blockingKeys` arg is provided (approve and 0-findings paths).
   if (blockingKeys !== undefined) {
     lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
+    // Surface-recurrence marker (#234): records (findingKey → surfaceKey) pairs for
+    // the blocking findings so future rounds can compute per-surface consecutive-round
+    // streaks. Emitted alongside the blocking-keys marker (same condition) so an
+    // advisory-only round's empty marker cannot seed a false surface streak.
+    const blockingFindings = verdict.findings.filter((f) => blockingKeys!.has(findingKey(f)));
+    lines.push(formatBlockingSurfacesMarker(blockingFindings));
   }
   // Advisory-ordinals marker (#236): records 1-indexed positions of advisory
   // (blocking:false) findings in a formatter-controlled footer so filterToBlockingFindings

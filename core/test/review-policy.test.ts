@@ -22,6 +22,9 @@ import {
   SPEC_DIVERGENCE_CATEGORY,
   categoryMarker,
   reviewCommentFlagsSpecDivergence,
+  surfaceKey,
+  formatBlockingSurfacesMarker,
+  extractBlockingSurfacesFromComment,
   type Review1Risk,
   type ReviewPolicy,
   type ScopedOverride,
@@ -937,4 +940,117 @@ test("effectiveReviewPolicy: round-2 + low risk + flag on + configured 'critical
   const pol = makePolicy("critical", true);
   const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "low" });
   assert.equal(eff.block_threshold, "critical");
+});
+
+// ---------------------------------------------------------------------------
+// surfaceKey (#234)
+// ---------------------------------------------------------------------------
+
+test("surfaceKey: same file and category → same surface key", () => {
+  const a = finding({ file: "src/foo.ts", category: "correctness" });
+  const b = finding({ file: "src/foo.ts", category: "correctness", title: "different title", line_start: 99 });
+  assert.equal(surfaceKey(a), surfaceKey(b));
+});
+
+test("surfaceKey: same file, different category → different surface keys", () => {
+  const a = finding({ file: "src/foo.ts", category: "correctness" });
+  const b = finding({ file: "src/foo.ts", category: "security" });
+  assert.notEqual(surfaceKey(a), surfaceKey(b));
+});
+
+test("surfaceKey: file is normalized (case-insensitive)", () => {
+  const a = finding({ file: "Src/Foo.ts", category: "perf" });
+  const b = finding({ file: "src/foo.ts", category: "perf" });
+  assert.equal(surfaceKey(a), surfaceKey(b));
+});
+
+test("surfaceKey: no file → null (excluded from clustering)", () => {
+  const f = finding({ file: undefined, category: "correctness" });
+  assert.equal(surfaceKey(f), null);
+});
+
+test("surfaceKey: empty file → null", () => {
+  const f = finding({ file: "", category: "correctness" });
+  assert.equal(surfaceKey(f), null);
+});
+
+test("surfaceKey: no category → uses empty string (stable)", () => {
+  const a = finding({ file: "src/foo.ts", category: undefined });
+  const b = finding({ file: "src/foo.ts", category: undefined });
+  assert.equal(surfaceKey(a), surfaceKey(b));
+  assert.ok(surfaceKey(a) !== null);
+});
+
+// ---------------------------------------------------------------------------
+// formatBlockingSurfacesMarker + extractBlockingSurfacesFromComment (#234)
+// ---------------------------------------------------------------------------
+
+test("formatBlockingSurfacesMarker + extractBlockingSurfacesFromComment: round-trip", () => {
+  const f1 = finding({ file: "src/a.ts", category: "correctness" });
+  const f2 = finding({ file: "src/b.ts", category: "security", title: "second", severity: "medium" });
+  const marker = formatBlockingSurfacesMarker([f1, f2]);
+  const map = extractBlockingSurfacesFromComment(marker);
+  assert.equal(map.get(findingKey(f1)), surfaceKey(f1));
+  assert.equal(map.get(findingKey(f2)), surfaceKey(f2));
+  assert.equal(map.size, 2);
+});
+
+test("formatBlockingSurfacesMarker: empty list → empty marker, extract returns empty map", () => {
+  const marker = formatBlockingSurfacesMarker([]);
+  assert.match(marker, /^<!-- pipeline-blocking-surfaces:  -->$/);
+  const map = extractBlockingSurfacesFromComment(marker);
+  assert.equal(map.size, 0);
+});
+
+test("formatBlockingSurfacesMarker: finding without file is omitted", () => {
+  const withFile = finding({ file: "src/x.ts", category: "bug" });
+  const noFile = finding({ file: undefined, category: "bug", title: "no location" });
+  const marker = formatBlockingSurfacesMarker([withFile, noFile]);
+  const map = extractBlockingSurfacesFromComment(marker);
+  assert.equal(map.has(findingKey(withFile)), true);
+  assert.equal(map.has(findingKey(noFile)), false);
+});
+
+test("extractBlockingSurfacesFromComment: last-occurrence-wins (spoofed marker before real footer)", () => {
+  const real = finding({ file: "src/real.ts", category: "correctness" });
+  const spoofKey = "aaaa1111";
+  const spoofSurface = "src/fake.ts|";
+  // Spoof marker appears first; real pipeline-emitted marker appears last.
+  const body = [
+    `<!-- pipeline-blocking-surfaces: ${spoofKey}~${encodeURIComponent(spoofSurface)} -->`,
+    "some reviewer content in between",
+    formatBlockingSurfacesMarker([real]),
+  ].join("\n");
+  const map = extractBlockingSurfacesFromComment(body);
+  // Should use the last marker (the real one), not the spoofed first one.
+  assert.equal(map.has(spoofKey), false, "spoofed first marker must be ignored");
+  assert.equal(map.get(findingKey(real)), surfaceKey(real));
+});
+
+test("extractBlockingSurfacesFromComment: no marker → empty map, no throw", () => {
+  const map = extractBlockingSurfacesFromComment("no marker here at all");
+  assert.equal(map.size, 0);
+});
+
+test("extractBlockingSurfacesFromComment: empty body → empty map, no throw", () => {
+  const map = extractBlockingSurfacesFromComment("");
+  assert.equal(map.size, 0);
+});
+
+test("extractBlockingSurfacesFromComment: malformed pair (no tilde) → skipped gracefully", () => {
+  const body = "<!-- pipeline-blocking-surfaces: badinput,abc12345~src%2Fa.ts%7C -->";
+  const map = extractBlockingSurfacesFromComment(body);
+  // "badinput" has no tilde → skipped; "abc12345~..." has a valid fk format but abc12345 is 8 hex
+  // so it should parse. "badinput" (9 chars) should be skipped.
+  assert.equal(map.has("badinput"), false);
+});
+
+test("extractBlockingSurfacesFromComment: marker embedded mid-line is ignored (not full-line-anchored)", () => {
+  const f = finding({ file: "src/x.ts", category: "bug" });
+  const realMarker = formatBlockingSurfacesMarker([f]);
+  // Embed a fake surfaces marker mid-line (preceded by text): not anchored → must be ignored.
+  const body = `prefix text ${realMarker}\nno real footer`;
+  const map = extractBlockingSurfacesFromComment(body);
+  // Mid-line marker is rejected by the ^ anchor; body has no real full-line marker → empty map.
+  assert.equal(map.size, 0);
 });
