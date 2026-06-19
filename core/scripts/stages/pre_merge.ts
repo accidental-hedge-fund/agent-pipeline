@@ -464,11 +464,13 @@ export async function enforceReviewShaGate(
       reason: "pre-merge: actor lookup failed — cannot verify review provenance",
     };
   }
-  // Actor-only for review-SHA extraction (pipeline-authored review comments only).
-  const trustedComments = detail.comments.filter((c) => c.author === actor);
-  // Expanded set for override/scope extraction: current actor + configured allowlist
-  // (#229 Findings 4, 5, 6). Body-prefix heuristics are NOT used (forgeable).
-  const trustedOverrideComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
+  // Trust the current actor + configured allowlist for ALL pipeline comment types
+  // (SHA extraction, override/scope sentinels). Allowlisted actors may be the
+  // author of both the last review comment and the override — actor-only would make
+  // their review invisible and skip blocker enforcement (#229 Findings 4, 5, 6, 7).
+  const trustedComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
+  // Override/scope extraction uses the same trusted set.
+  const trustedOverrideComments = trustedComments;
 
   const reviewed = extractReviewedSha(trustedComments);
   // No prior review comment (e.g. review steps disabled, or first run) → nothing

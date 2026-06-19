@@ -875,6 +875,62 @@ test("enforceReviewShaGate: forged review-heading comment cannot self-authorize 
   assert.equal(rec.blocked.length, 1, "setBlocked must be called");
 });
 
+test("enforceReviewShaGate: allowlisted prior-runner review + no override → still blocks (#229 Finding 7)", async (t) => {
+  // Full multi-actor handoff: OTHER_ACTOR ran the review, current runner is TEST_ACTOR.
+  // OTHER_ACTOR is in the allowlist — their review comment is trusted for SHA extraction
+  // (trustedComments) — so reuseBlockedBy finds the blocking keys and enforces them.
+  // Without an override, the blocker must remain.
+  const OTHER_ACTOR = "other-bot";
+  const cfgWithAllowlist = { ...cfg, trusted_override_actors: [OTHER_ACTOR] } as unknown as PipelineConfig;
+  const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [blockingByOther] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithAllowlist, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "allowlisted-runner review without override must still block");
+  assert.equal((out as any)?.status, "blocked");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called for unresolved blocker");
+});
+
+test("enforceReviewShaGate: allowlisted prior-runner review + allowlisted override → proceeds (#229 Finding 7)", async (t) => {
+  // Same handoff scenario but with a matching override from OTHER_ACTOR.
+  // Both the review and the override are authored by the allowlisted prior runner.
+  // Current actor is TEST_ACTOR. The gate must read the review (via trustedComments),
+  // find the blocker key, check the override (via trustedOverrideComments), and proceed.
+  const OTHER_ACTOR = "other-bot";
+  const cfgWithAllowlist = { ...cfg, trusted_override_actors: [OTHER_ACTOR] } as unknown as PipelineConfig;
+  const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
+  const overrideByOther = { body: overrideSentinelComment("953ac487"), author: OTHER_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [blockingByOther, overrideByOther] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithAllowlist, 16, 99, deps);
+  });
+  assert.equal(out, null, "allowlisted-runner review with matching override must proceed");
+  assert.deepEqual(rec.blocked, [], "must not block when all keys are overridden");
+});
+
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {
   const { deps, rec } = makeDeps({
     commentBody: advisoryReviewComment(2, SHA_HEAD),
