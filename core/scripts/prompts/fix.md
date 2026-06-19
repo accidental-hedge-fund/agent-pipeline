@@ -28,12 +28,11 @@ Guarded operations (at minimum):
 For **worktree deletion and removal** (`git worktree remove --force`, any worktree deletion):
 1. The operation MUST be scoped to the **managed worktree root** only. The `reviewed head` alternative does NOT apply — a git commit reference is not a filesystem boundary and cannot constrain which directories are deleted.
 2. Confirm the managed-root path explicitly in your output before committing.
+3. If the fix cannot remain scoped to the managed worktree root, stop and surface a blocker — do not proceed.
 
 For **force push and merge-surface operations** (`git push --force`, `git push --force-with-lease`, merge operations):
 1. Confirm the operation is scoped to the **managed worktree root** or the **reviewed head** — not the broader repo or remote.
-
-For any guarded operation:
-- If the correct fix genuinely requires widening the blast radius beyond these constraints, state an explicit written justification before committing.
+2. If the correct fix genuinely requires widening the blast radius beyond these constraints, state an explicit written justification before committing.
 
 A fix may NOT widen the blast radius of a destructive path while resolving an unrelated finding.
 
