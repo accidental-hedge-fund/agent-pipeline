@@ -1,0 +1,75 @@
+## MODIFIED Requirements
+
+### Requirement: Gate transition reads and validates the reviewed SHA
+
+Before the pipeline acts on a prior review verdict (advancing from a review stage to the next gate), it SHALL extract the `reviewed-sha` sentinel from the most recent review comment for that round and compare it to the current HEAD commit SHA. When the SHAs differ with non-pipeline-internal commits present, the gate SHALL additionally check the diff-hash cache (`verdict-diff-hash` sentinel) before triggering any re-review. A SHA mismatch with an unchanged diff hash SHALL reuse the verdict; a SHA mismatch with a changed diff hash SHALL trigger a focused delta review rather than a full review-stage re-run.
+
+#### Scenario: SHA matches current HEAD — verdict is trusted
+
+- **WHEN** the gate transition reads the most recent review comment for round N
+- **AND** the `reviewed-sha` sentinel in that comment matches the current HEAD SHA
+- **THEN** the pipeline SHALL act on the verdict as normal (approve advances; needs-attention routes to fix)
+
+#### Scenario: SHA does not match — pipeline-internal commits only — verdict is trusted
+
+- **WHEN** the gate transition reads the most recent review comment for round N
+- **AND** the `reviewed-sha` sentinel does NOT match the current HEAD SHA
+- **AND** every commit since the reviewed SHA is a pipeline-internal commit
+- **THEN** the prior verdict SHALL remain valid and the pipeline SHALL act on it as normal
+
+#### Scenario: SHA does not match, non-internal commits present, diff hash unchanged — verdict reused
+
+- **WHEN** the gate transition reads the most recent review comment for round N
+- **AND** the `reviewed-sha` sentinel does NOT match the current HEAD SHA
+- **AND** at least one non-pipeline-internal commit is present since the reviewed SHA
+- **AND** the current PR diff hash matches the `verdict-diff-hash` sentinel in the prior review comment
+- **THEN** the pipeline SHALL treat the verdict as valid and SHALL NOT invoke the reviewer
+- **AND** SHALL post a brief notice: "Diff unchanged since last review; verdict reused."
+- **AND** SHALL NOT route the issue to a review stage
+
+#### Scenario: SHA does not match, diff hash changed — delta review runs (not full re-review)
+
+- **WHEN** the gate transition reads the most recent review comment for round N
+- **AND** the `reviewed-sha` sentinel does NOT match the current HEAD SHA
+- **AND** at least one non-pipeline-internal commit is present since the reviewed SHA
+- **AND** the current PR diff hash does NOT match the `verdict-diff-hash` sentinel (or no sentinel is present)
+- **THEN** the pipeline SHALL NOT route the issue back to the review-N stage
+- **AND** SHALL run a focused adversarial delta review of `last-reviewed-sha...HEAD`
+- **AND** SHALL post a delta-review comment embedding updated `reviewed-sha` and `verdict-diff-hash` sentinels
+- **AND** on delta-review approve: SHALL proceed with the gate transition as normal
+- **AND** on delta-review blocking findings: SHALL block with reason "Pre-merge delta review found blocking findings; fix required before merging."
+
+#### Scenario: Review comment has no SHA sentinel — treated as stale
+
+- **WHEN** the gate transition reads the most recent review comment for round N
+- **AND** the comment contains no `<!-- reviewed-sha: ... -->` sentinel
+- **THEN** the pipeline SHALL treat the verdict as unverifiable and SHALL run the review stage normally (same as before this change)
+- **AND** SHALL NOT advance or block based on the unverified verdict
+
+#### Scenario: No prior review comment exists — normal first-run review
+
+- **WHEN** the gate transition finds no prior review comment for round N
+- **THEN** the pipeline SHALL run review as normal (no stale-check needed)
+- **AND** the new review comment SHALL include both the `reviewed-sha` and `verdict-diff-hash` sentinels
+
+### Requirement: Pipeline-internal commit exemption covers only OpenSpec archive commits
+
+When the SHA gate detects that HEAD has moved past the reviewed commit, it SHALL classify commits since the review as either "pipeline-internal" or "developer/fix". A commit is pipeline-internal if and only if its message headline starts with the OpenSpec archive prefix (`chore: archive OpenSpec change(s) for #`). If every commit since the review is pipeline-internal, the prior verdict SHALL remain valid without any further checks. A docs-update commit (`docs: update documentation for #`) SHALL NOT be treated as pipeline-internal, because the pre-merge docs step no longer exists and no such commits are produced by the pipeline. When non-pipeline-internal commits are present, the gate SHALL continue to the diff-hash cache check (not immediately trigger a review stage re-run).
+
+#### Scenario: Only OpenSpec archive commits since review — verdict valid
+
+- **WHEN** HEAD has moved past the reviewed SHA
+- **AND** every commit since the review has the message prefix `chore: archive OpenSpec change(s) for #`
+- **THEN** the SHA gate SHALL treat the prior verdict as valid and SHALL NOT trigger a re-review or diff-hash check
+
+#### Scenario: A docs-prefix commit present — treated as developer commit
+
+- **WHEN** a commit with message prefix `docs: update documentation for #` is present since the review
+- **THEN** the SHA gate SHALL treat that commit as a developer commit
+- **AND** SHALL proceed to the diff-hash cache check (not immediately trigger re-review)
+
+#### Scenario: Mix of archive and developer commits — diff-hash check required
+
+- **WHEN** commits since the review include at least one commit that is not an OpenSpec archive commit
+- **THEN** the SHA gate SHALL NOT immediately trigger a full review re-run
+- **AND** SHALL proceed to the diff-hash cache check; if the diff hash is unchanged, the verdict is reused; if the diff hash changed, a delta review runs
