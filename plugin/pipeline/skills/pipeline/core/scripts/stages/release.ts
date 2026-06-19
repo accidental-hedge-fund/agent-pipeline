@@ -297,7 +297,10 @@ export async function discoverShippedPRs(
   const prNums = new Set<number>();
   for (const line of result.stdout.split("\n")) {
     for (const m of line.matchAll(MERGE_PR_RE)) prNums.add(Number(m[1]));
-    for (const m of line.matchAll(SQUASH_PR_RE)) prNums.add(Number(m[1]));
+    // Pipeline squash commits carry both issue and PR numbers: "...title (#issue) (#pr)".
+    // Only the last (# N) on the line is the actual squash-merge PR number.
+    const squashMatches = [...line.matchAll(SQUASH_PR_RE)];
+    if (squashMatches.length > 0) prNums.add(Number(squashMatches[squashMatches.length - 1][1]));
   }
 
   if (prNums.size === 0) {
