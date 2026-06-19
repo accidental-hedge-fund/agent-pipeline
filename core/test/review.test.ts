@@ -405,6 +405,34 @@ test("advanceReview: HEAD moves between SHA capture and diff fetch → blocked (
   assert.equal(rec.comments.length, 0, "no review comment may be posted when the diff/SHA race is detected");
 });
 
+test("advanceReview: post-diff getPrDetail throws → blocked (not silently continued) (#232 delta)", async (t) => {
+  // Regression: when the post-diff SHA verification threw, advanceReview previously
+  // continued with the pre-diff commitSha. A legacy hashless Review 1 comment with
+  // that stale SHA would pass extractReview1Risk and relax review-2 for a different diff.
+  // Now we fail closed: block immediately so no stale-SHA artifact is handed to review-2.
+  const sha1 = "a".repeat(40);
+  const { deps, rec } = makeDeps([APPROVE]);
+  let getPrDetailCalls = 0;
+  const throwingDeps: AdvanceReviewDeps = {
+    ...deps,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      if (getPrDetailCalls === 1) return { head_sha: sha1 } as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getPrDetail"]>>>;
+      throw new Error("network error during post-diff check");
+    },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 1, 1, {}, 0, throwingDeps);
+  });
+  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "post-diff SHA verification failed" });
+  assert.ok(
+    rec.blocked.some((b) => b.includes("Could not verify PR HEAD after diff fetch")),
+    "must block with a clear message when post-diff verification throws",
+  );
+  assert.equal(rec.comments.length, 0, "no review comment may be posted when post-diff check throws");
+});
+
 // ---------------------------------------------------------------------------
 // advanceReview — verdict normalization gate
 // ---------------------------------------------------------------------------

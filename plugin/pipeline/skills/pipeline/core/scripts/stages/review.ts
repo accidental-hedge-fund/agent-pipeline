@@ -226,9 +226,20 @@ export async function advanceReview(
       );
       return { advanced: false, status: "blocked", reason: "HEAD moved during diff fetch" };
     }
-  } catch {
-    // If the post-diff check fails, continue: the pre-merge gate will detect
-    // staleness when it compares the stamped SHA against HEAD.
+  } catch (postDiffErr) {
+    // If the post-diff check fails we cannot confirm the diff/SHA binding is
+    // correct. A stale SHA would let a legacy hashless Review 1 sentinel relax
+    // review-2's threshold for a different diff — fail closed instead of
+    // continuing with an unverified artifact (#232 delta).
+    const e = postDiffErr as Error;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Could not verify PR HEAD after diff fetch (${e.message}). Re-run the review stage to evaluate a stable HEAD.`,
+      stage,
+      "harness-failure",
+    );
+    return { advanced: false, status: "blocked", reason: "post-diff SHA verification failed" };
   }
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
