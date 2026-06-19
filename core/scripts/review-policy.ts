@@ -342,14 +342,21 @@ export function extractOverrides(comments: { body: string }[]): Map<string, stri
 // sentinels in one comment can be read; callers reset lastIndex before/after.
 const SCOPE_OVERRIDE_RE = /^<!-- pipeline-override-scope: (category|file):(\S+) (.+?) -->$/gm;
 
+const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
+
 /**
  * Collect active scoped overrides (#229) from issue/PR comments. A later sentinel
  * for the same `<type>:<value>` wins (lets a human revise a scoped disposition).
  * The returned array is ready to pass as the `scopes` argument of `partitionFindings`.
+ *
+ * Only comments with the controlled `## Pipeline: Scope override` heading are
+ * processed — pipeline-authored review comments may contain raw reviewer finding
+ * text that could embed sentinel-shaped lines (#229 Finding 1 fix).
  */
 export function extractScopedOverrides(comments: { body: string }[]): ScopedOverride[] {
   const map = new Map<string, ScopedOverride>(); // key: "${type}:${value}" → last wins
   for (const c of comments) {
+    if (!c.body.startsWith(SCOPE_OVERRIDE_HEADING)) continue;
     SCOPE_OVERRIDE_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = SCOPE_OVERRIDE_RE.exec(c.body)) !== null) {

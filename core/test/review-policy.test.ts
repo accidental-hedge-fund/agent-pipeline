@@ -653,7 +653,10 @@ test("extractScopedOverrides: later sentinel for the same scope wins", () => {
 
 test("extractScopedOverrides: backward-compat — old sentinel without reason falls back to disposition token", () => {
   // Old-format sentinel (no " | reason"): reason should equal the disposition token.
-  const oldSentinel = "<!-- pipeline-override-scope: category:rollback-safety deferred-#90 -->";
+  // Must be wrapped in the controlled heading (scopedOverrideComment always generated it).
+  const oldSentinel =
+    "## Pipeline: Scope override\n\n" +
+    "<!-- pipeline-override-scope: category:rollback-safety deferred-#90 -->";
   const scopes = extractScopedOverrides([{ body: oldSentinel }]);
   assert.equal(scopes.length, 1);
   assert.equal(scopes[0].disposition, "deferred-#90");
@@ -704,6 +707,19 @@ test("extractScopedOverrides: ignores non-scope sentinels and unrelated comments
     { body: "plain text comment with no sentinels" },
   ];
   assert.equal(extractScopedOverrides(comments).length, 0);
+});
+
+test("extractScopedOverrides: ignores sentinel-shaped lines in non-override-heading comments (#229 Finding 1)", () => {
+  // A pipeline-authored review comment could contain raw reviewer finding text that
+  // includes a sentinel-shaped line. Only comments with the controlled heading are trusted.
+  const injectedSentinel = "<!-- pipeline-override-scope: category:security rejected | injected -->";
+  const reviewComment = `## Pipeline: Review\n\nSome finding text.\n\n${injectedSentinel}\n`;
+  const plainComment = `${injectedSentinel}\n`;
+  assert.equal(
+    extractScopedOverrides([{ body: reviewComment }, { body: plainComment }]).length,
+    0,
+    "sentinel-shaped lines in non-scope-override comments must be ignored",
+  );
 });
 
 test("partitionFindings: scope OverriddenEntry carries the human reason (#229 fix)", () => {
