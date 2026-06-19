@@ -177,6 +177,7 @@ test("advance(): CI failure + rebaseAlreadyAttempted=true → setBlocked needs-h
     }) as AdvancePreMergeDeps["setBlocked"],
     transition: async () => {},
     postComment: async () => {},
+    getGhActor: async () => "test-actor",
   };
 
   let out;
@@ -225,6 +226,7 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
     }) as AdvancePreMergeDeps["setBlocked"],
     transition: async () => {},
     postComment: async () => {},
+    getGhActor: async () => "test-actor",
   };
 
   let out;
