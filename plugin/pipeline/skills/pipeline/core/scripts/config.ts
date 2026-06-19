@@ -6,7 +6,7 @@ import { parseDocument } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DEFAULT_CONFIG, type Harness, type PipelineConfig } from "./types.ts";
+import { DEFAULT_CONFIG, STAGES, type Harness, type PipelineConfig } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 
 const PartialConfigSchema = z.object({
@@ -175,6 +175,21 @@ const PartialConfigSchema = z.object({
   // `## Pipeline: Finding override` and `## Pipeline: Scope override` comments
   // are trusted in addition to the current actor. Default: [] (actor-only).
   trusted_override_actors: z.array(z.string()).optional().describe("Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor."),
+  // Bounded auto-loop mode (#149). Opt-in; disabled by default. When enabled,
+  // recoverable stops at allowlisted pipeline-owned stages convert from stop to
+  // automatic continuation within explicit round/wall-clock budgets. Parks at
+  // `needs-human` with an evidence-backed handoff on exhaustion. Does not grant
+  // merge/deploy/publish authority or bypass any human checkpoint.
+  auto_loop: z
+    .object({
+      enabled: z.boolean().optional().describe("Enable bounded auto-loop mode (default false)."),
+      max_rounds: z.number().int().positive().optional().describe("Maximum automatic continuations per run before parking at needs-human."),
+      max_wallclock_minutes: z.number().int().positive().optional().describe("Wall-clock budget in minutes; independent of max_rounds."),
+      stages: z.array(z.enum(STAGES)).optional().describe("Pipeline stages eligible for automatic continuation when a recoverable stop occurs."),
+    })
+    .strict()
+    .optional()
+    .describe("Bounded auto-loop mode: continue recoverable stops at allowlisted stages within explicit budgets, then park at needs-human on exhaustion (#149)."),
 }).strict();
 
 export interface ResolveOptions {
@@ -364,6 +379,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
     trusted_override_actors: fileConfig.trusted_override_actors,
+    auto_loop: {
+      enabled: fileConfig.auto_loop?.enabled ?? DEFAULT_CONFIG.auto_loop.enabled,
+      max_rounds: fileConfig.auto_loop?.max_rounds ?? DEFAULT_CONFIG.auto_loop.max_rounds,
+      max_wallclock_minutes: fileConfig.auto_loop?.max_wallclock_minutes ?? DEFAULT_CONFIG.auto_loop.max_wallclock_minutes,
+      stages: fileConfig.auto_loop?.stages ?? DEFAULT_CONFIG.auto_loop.stages,
+    },
     roadmap: fileConfig.roadmap
       ? { ...fileConfig.roadmap, release_model: fileConfig.roadmap.release_model ?? "semver" }
       : fileConfig.roadmap,
@@ -931,6 +952,15 @@ review_policy: # which review findings block progression vs. merely advise (#17)
 doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
   runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure
   failFast: ${d.doctor.failFast} # if true, stop at the first failing check instead of collecting all failures
+
+# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default
+#   enabled: false # set true to enable; when false (default) the advance loop is byte-for-byte unchanged
+#   max_rounds: 3 # maximum automatic continuations per run before parking at needs-human
+#   max_wallclock_minutes: 60 # wall-clock budget in minutes (independent of max_rounds)
+#   # stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation
+#   #   Known stages: backlog, ready, planning, plan-review, implementing,
+#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,
+#   #                 shipcheck-gate, ready-to-deploy, needs-human
 
 # setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)
 #   Auto-detected from lockfile when absent (pnpm-lock.yaml → pnpm install, yarn.lock → yarn install, package-lock.json → npm ci)
