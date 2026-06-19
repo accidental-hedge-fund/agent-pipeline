@@ -604,8 +604,15 @@ export async function enforceReviewShaGate(
         blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
         newHash,
       );
+      // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
+      // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).
       const deltaComment = deltaIsSelfReview
-        ? `${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}\n\n${deltaCommentBody}`
+        ? (() => {
+            const nl = deltaCommentBody.indexOf("\n");
+            return nl >= 0
+              ? `${deltaCommentBody.slice(0, nl)}\n\n${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}${deltaCommentBody.slice(nl)}`
+              : `${deltaCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}`;
+          })()
         : deltaCommentBody;
       await postCommentFn(cfg, issueNumber, deltaComment);
 
