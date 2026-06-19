@@ -1010,3 +1010,18 @@ test("sweep: runHarness falls back to DEFAULT_CONFIG.sweep_timeout when cfg omit
   await runSweep({ apply: false }, DEFAULT_CFG, {}, deps);
   assert.equal(capturedTimeoutSec, DEFAULT_CONFIG.sweep_timeout, "runHarness must fall back to DEFAULT_CONFIG.sweep_timeout");
 });
+
+// sweep_timeout terminal failure (#248 regression)
+test("sweep: timed_out harness result throws terminal error with configured timeout, not blocked-issue", async () => {
+  const deps = makeDeps({
+    listIssues: async () => [{ number: 42, title: "Thin issue", body: "short" }],
+    runHarness: async (_prompt, _timeoutSec) => ({ success: false, output: "", timed_out: true }),
+  });
+  const cfg = { repo_dir: "/fake/repo", repo: "owner/repo", base_branch: "main", sweep_timeout: 120 };
+  await assert.rejects(
+    () => runSweep({ apply: false }, cfg, {}, deps),
+    /timed out after 120s/,
+  );
+  // Must not classify as a mere BLOCKED issue — the whole run is terminal.
+  assert.ok(!deps._logLines.join("\n").includes("BLOCKED"));
+});

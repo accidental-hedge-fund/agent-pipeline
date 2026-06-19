@@ -33,7 +33,7 @@ export interface IntakeOpts {
 
 export interface IntakeDeps {
   /** Invoke the spec-generation model harness with the given prompt. Returns the raw output. */
-  runHarness(prompt: string, timeoutSec: number): Promise<{ success: boolean; output: string }>;
+  runHarness(prompt: string, timeoutSec: number): Promise<{ success: boolean; output: string; timed_out?: boolean }>;
   /** Create a GitHub issue and return its number. */
   createIssue(title: string, body: string, labels: string[]): Promise<number>;
   /**
@@ -114,7 +114,7 @@ export function realIntakeDeps(
       // MCP) to stop the call from cold-starting MCP servers or burning agentic
       // turns exploring the repo. See harness.ts InvokeOptions.lean.
       const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true, timeoutSec });
-      return { success: result.success, output: result.stdout };
+      return { success: result.success, output: result.stdout, timed_out: result.timed_out };
     },
     createIssue: async (title, body, labels) => {
       const args = ["issue", "create", "--title", title, "--body", body];
@@ -511,8 +511,11 @@ export async function runIntake(
 
   const harnessResult = await d.runHarness(prompt, cfg.intake_timeout ?? DEFAULT_CONFIG.intake_timeout);
   if (!harnessResult.success) {
+    const timeoutMsg = harnessResult.timed_out
+      ? ` (timed out after ${cfg.intake_timeout ?? DEFAULT_CONFIG.intake_timeout}s)`
+      : "";
     throw new Error(
-      `[pipeline intake] spec-generation harness failed — check the output above for details.`,
+      `[pipeline intake] spec-generation harness failed${timeoutMsg} — check the output above for details.`,
     );
   }
 

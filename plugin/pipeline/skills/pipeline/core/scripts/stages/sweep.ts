@@ -63,7 +63,7 @@ export interface SweepDeps {
   /** Update an issue's body on GitHub. */
   updateIssueBody(repo: string, issueNumber: number, body: string): Promise<void>;
   /** Invoke the spec-generation model harness. */
-  runHarness(prompt: string, timeoutSec: number): Promise<{ success: boolean; output: string }>;
+  runHarness(prompt: string, timeoutSec: number): Promise<{ success: boolean; output: string; timed_out?: boolean }>;
   /** Read a local file. */
   readFile(p: string): string;
   /** Write a local file. */
@@ -151,7 +151,7 @@ export function realSweepDeps(
       // prompt — a self-contained transform like intake. Pin a fast model and run
       // lean (no built-in tools, no MCP). See harness.ts InvokeOptions.lean.
       const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true, timeoutSec });
-      return { success: result.success, output: result.stdout };
+      return { success: result.success, output: result.stdout, timed_out: result.timed_out };
     },
     readFile: (p) => fs.readFileSync(p, "utf8"),
     writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
@@ -521,6 +521,11 @@ export async function runSweep(
       continue;
     }
 
+    if (harnessResult.timed_out) {
+      throw new Error(
+        `[pipeline sweep] harness timed out after ${cfg.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout}s — aborting sweep.`,
+      );
+    }
     if (!harnessResult.success) {
       classified.push({
         issue,
