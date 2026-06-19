@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import {
   findLatestCommentMatching,
+  getGhActor,
   getIssueDetail,
   getPrDetail,
   getPrDiff,
@@ -107,6 +108,9 @@ export interface AdvanceReviewDeps {
   /** Runs one review round and returns the harness result plus which harness
    *  actually reviewed (the same-harness fallback when the reviewer is missing, #39). */
   runReview?: RunReviewFn;
+  /** Returns the authenticated GitHub username for comment-author verification (#228).
+   *  Returns null when unavailable (network error / not authenticated). */
+  getGhActor?: () => Promise<string | null>;
 }
 
 type RunReviewFn = (
@@ -229,13 +233,19 @@ export async function advanceReview(
   // invoking the reviewer (avoids non-deterministic re-reviews of frozen code).
   // Skipped in dry-run so testing harnesses don't see unexpected early returns.
   if (!opts.dryRun) {
-    // Require the pipeline footer in cache candidates to reject forged comments (#228
-    // Finding 6): any commenter can post a syntactically valid `## Review N` body with
-    // the current diff hash, bypassing the reviewer. The footer is present in every
-    // pipeline-emitted review comment via cfgFooter; a comment without it is a cache miss.
+    // Require BOTH the pipeline footer AND the pipeline author to reject forged review
+    // comments (#228 Finding 6): any commenter can copy the footer and diff hash; only
+    // the authenticated gh user who runs the pipeline can have authored a real review.
+    // If the actor lookup fails (not authenticated, network error) we fall back to the
+    // footer-only check rather than skipping caching entirely.
+    const getGhActorFn = deps.getGhActor ?? getGhActor;
+    const actor = await getGhActorFn();
     const footer = cfgFooter(cfg);
     const priorRoundCommentsForCache = detail.comments.filter(
-      (c) => c.body.startsWith(roundPfx) && c.body.includes(footer)
+      (c) =>
+        c.body.startsWith(roundPfx) &&
+        c.body.includes(footer) &&
+        (actor === null || c.author === actor)
     );
     const latestPriorComment = priorRoundCommentsForCache[priorRoundCommentsForCache.length - 1];
     if (latestPriorComment) {
