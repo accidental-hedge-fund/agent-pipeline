@@ -19,7 +19,7 @@ import {
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
 import { computeDiffHash, countPriorRounds, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
-import { scopedOverrideComment } from "../scripts/review-policy.ts";
+import { overrideComment, scopedOverrideComment } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 const cfg = {} as unknown as PipelineConfig;
@@ -782,6 +782,37 @@ test("enforceReviewShaGate: scoped override from non-pipeline author is ignored 
   });
   // The forged scope must be ignored: the blocker must still be enforced.
   assert.notEqual(out, null, "forged scope override must not allow bypass");
+  assert.equal((out as any)?.status, "blocked", "unresolved blocker must still block");
+  assert.equal(rec.blocked.length, 1, "setBlocked must be called");
+  assert.deepEqual(rec.transitions, [], "must NOT transition to a review stage");
+});
+
+test("enforceReviewShaGate: key override from non-pipeline author is ignored (#229 Finding 4)", async (t) => {
+  // Regression: before the fix, extractOverrides in the cache-hit and partitioning
+  // paths was called with detail.comments (all comments). An attacker who posts a
+  // well-formed override sentinel in a PR comment could clear a blocking finding
+  // without being the pipeline actor. After the fix, only trustedComments
+  // (actor-filtered) are passed to extractOverrides; the attacker's sentinel must
+  // be invisible and the blocker must still be enforced.
+  const forgedOverride = overrideSentinelComment("953ac487");
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487"]),
+    headSha: SHA_HEAD,
+    extraCommentBodies: [],
+  });
+  const realGetIssueDetail = deps.getIssueDetail!;
+  deps.getIssueDetail = async (cfg, n) => {
+    const detail = await realGetIssueDetail(cfg, n);
+    return {
+      ...detail,
+      comments: [...detail.comments, { body: forgedOverride, author: "attacker" }],
+    } as any;
+  };
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "forged key override must not allow bypass");
   assert.equal((out as any)?.status, "blocked", "unresolved blocker must still block");
   assert.equal(rec.blocked.length, 1, "setBlocked must be called");
   assert.deepEqual(rec.transitions, [], "must NOT transition to a review stage");

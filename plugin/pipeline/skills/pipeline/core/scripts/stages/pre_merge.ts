@@ -489,7 +489,8 @@ export async function enforceReviewShaGate(
   ): Promise<Outcome | null> => {
     const recorded = commentBody ? extractBlockingKeysMarker(commentBody) : null;
     if (!recorded || recorded.size === 0) return null;
-    const overrides = extractOverrides(detail.comments);
+    // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
+    const overrides = extractOverrides(trustedComments);
     const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
     // Scoped overrides may cover the remaining key-only blockers, but we can't verify
@@ -637,8 +638,8 @@ export async function enforceReviewShaGate(
           `summary: ${deltaResult.summary || "(none)"}`,
         );
       }
-      const overrides = extractOverrides(detail.comments);
-      // Only honor scoped override sentinels from pipeline-authored comments (#229 Finding 1).
+      // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
+      const overrides = extractOverrides(trustedComments);
       const scopes = extractScopedOverrides(trustedComments);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes);
 

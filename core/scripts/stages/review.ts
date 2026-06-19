@@ -263,13 +263,13 @@ export async function advanceReview(
         // Apply current overrides: a human may have recorded an override after the
         // last review on an unchanged diff. Filter out overridden keys before
         // deciding whether to route to fix (#228 fix-1).
-        const currentOverrides = extractOverrides(detail.comments);
+        // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
+        const trustedForScopes = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+        const currentOverrides = extractOverrides(trustedForScopes);
         const remainingBlockers = [...cachedBlockingKeys].filter((k) => !currentOverrides.has(k));
         // If scoped overrides are active and key-only blockers remain, the scope may cover
         // them — but we can't verify without the actual finding objects. Bypass the cache
         // and run a fresh review so partitionFindings can be called with live findings (#229).
-        // Only honor scoped overrides from pipeline-authored comments (#229 Finding 1).
-        const trustedForScopes = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
         const activeScopes = extractScopedOverrides(trustedForScopes);
         if (remainingBlockers.length > 0 && activeScopes.length > 0) {
           console.log(
@@ -462,9 +462,9 @@ export async function advanceReview(
   // advisory (below threshold/confidence), and operator-overridden. Only
   // blocking findings route to a fix round. When none remain, the review still
   // ran and its findings are on the record — the item advances as if approved.
-  const overrides = extractOverrides(detail.comments);
-  // Only honor scoped override sentinels authored by the pipeline actor (#229 Finding 1).
+  // Only honor override sentinels from pipeline-authored comments (#229 Findings 1+4).
   const trustedComments = actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+  const overrides = extractOverrides(trustedComments);
   const scopes = extractScopedOverrides(trustedComments);
   const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides, scopes);
   // Blocking keys set: derived here after policy partitioning so the review

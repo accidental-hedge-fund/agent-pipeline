@@ -725,7 +725,7 @@ test("advanceReview (#17): an operator override on a blocking finding advances i
       state: "open",
       url: "https://example.test/1",
       labels: [],
-      comments: [{ body: `## Pipeline: Finding override\n\n<!-- pipeline-override: ${key} rejected -->` }],
+      comments: [{ body: `## Pipeline: Finding override\n\n<!-- pipeline-override: ${key} rejected -->`, author: TEST_ACTOR }],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
