@@ -3191,6 +3191,45 @@ test("surface-recurrence (#234): advisory-only round emits empty surfaces marker
   assert.equal(surfacesMap.size, 0, "advisory-only round must produce empty surfaces map");
 });
 
+test("surface-recurrence (#234): demote_and_advance from review-1 routes to review-2 not pre-merge", async (t) => {
+  // Regression for fix-2 finding: the surface demote branch hard-coded "pre-merge"
+  // regardless of round. When round=1, it must route to "review-2" (adversarial), not skip it.
+  const findingA: ReviewFinding = {
+    severity: "medium", title: "nit round 1", file: "src/q.ts", category: "style",
+    body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
+  };
+  const findingB: ReviewFinding = { ...findingA, title: "nit round 2", line_start: 15 };
+  const findingC: ReviewFinding = { ...findingA, title: "nit round 3", line_start: 25 };
+  assert.notEqual(findingKey(findingA), findingKey(findingC), "precondition: different keys");
+  assert.equal(surfaceKey(findingA), surfaceKey(findingC), "precondition: same surface");
+
+  const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
+  let createIssueCalls = 0;
+  const { deps, rec } = makeDeps([naC]);
+  // Prior comments are round-1 comments so they are found by the round=1 filter.
+  deps.getIssueDetail = async () => detailWithComments([
+    priorSurfaceComment(1, [findingA]),
+    priorSurfaceComment(1, [findingB]),
+  ]);
+  deps.createIssue = async () => { createIssueCalls++; return 997; };
+  deps.addIssueComment = async () => {};
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgSurfaceDemote, 1, 1, {}, 0, deps);
+  });
+
+  // round=1 surface demote must go to review-2, NOT skip adversarial review and go to pre-merge.
+  assert.equal(outcome.to, "review-2", "surface demote from round-1 must route to review-2 not pre-merge");
+  assert.match(outcome.summary, /surface-recurrence/);
+  assert.equal(createIssueCalls, 1, "follow-up issue must be created");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred")),
+    "demotion comment must be posted",
+  );
+  assert.ok(!rec.transitions.some((x) => x.to === "pre-merge"), "must NOT advance to pre-merge from round-1");
+});
+
 test("surface-recurrence (#234): spoofed prior-round comments from non-pipeline actor are ignored", async (t) => {
   // Regression: a non-pipeline-authored issue comment that starts with "## Review 2"
   // and carries a `pipeline-blocking-surfaces` marker must NOT seed the streak.

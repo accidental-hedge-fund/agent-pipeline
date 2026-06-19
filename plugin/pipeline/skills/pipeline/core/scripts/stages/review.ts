@@ -804,19 +804,20 @@ export async function advanceReview(
         await postCommentFn(cfg, issueNumber, body);
       }
 
+      const surfaceNextStage: Stage = round === 1 ? "review-2" : "pre-merge";
       await transitionFn(
         cfg,
         issueNumber,
         stage,
-        "pre-merge",
+        surfaceNextStage,
         `Surface-recurrence guard fired: ${belowHighInFired.length} below-high finding(s) ` +
-          `auto-demoted to advisory and deferred to #${surfaceFollowupNumber}. Advancing to pre-merge.`,
+          `auto-demoted to advisory and deferred to #${surfaceFollowupNumber}. Advancing to ${surfaceNextStage}.`,
       );
       return {
         advanced: true,
         from: stage,
-        to: "pre-merge",
-        summary: `surface-recurrence: ${belowHighInFired.length} below-high findings demoted → pre-merge (follow-up #${surfaceFollowupNumber})`,
+        to: surfaceNextStage,
+        summary: `surface-recurrence: ${belowHighInFired.length} below-high findings demoted → ${surfaceNextStage} (follow-up #${surfaceFollowupNumber})`,
       };
     }
   }
