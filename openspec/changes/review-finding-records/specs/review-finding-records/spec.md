@@ -61,21 +61,37 @@ different round (matching `key`).
 
 The persisted per-round finding records SHALL carry sufficient information to derive each
 finding's resolution status (resolved / still-open) across fix rounds without scraping GitHub.
-A consumer SHALL derive resolution by comparing finding `key` sets between consecutive review
-rounds: a `key` that is blocking in an earlier round and absent from a later round's finding
-records is **resolved**; a `key` that remains present in the later round is **still-open**. The
-engine SHALL NOT store a mutable per-finding status field, because the per-round records are
-append-only and resolution is a function of them.
+Each finding record SHALL carry an `effective_blocking` boolean, computed after
+`partitionFindings` runs, that is `true` when the finding landed in `partition.blocking` and
+`false` when advisory or overridden. Each finding record SHALL also carry a `payload_fingerprint`
+string (equal to `findingPayloadFingerprint(finding)`) that disambiguates distinct findings
+that share the same `findingKey` within a round. A consumer SHALL derive resolution by comparing
+the `key`+`payload_fingerprint` sets for `effective_blocking=true` records between consecutive
+review rounds: a pair absent from a later round is **resolved**; a pair still present is
+**still-open**. The engine SHALL NOT store a mutable per-finding status field, because the
+per-round records are append-only and resolution is a function of them.
 
 #### Scenario: dropped key is resolved
 
-- **WHEN** a finding `key` blocks in round N and no record with that `key` appears in round N+1
+- **WHEN** a finding `key` has `effective_blocking=true` in round N and no record with that `key` appears in round N+1
 - **THEN** a consumer SHALL classify that finding as resolved
 
 #### Scenario: persisted key is still-open
 
-- **WHEN** a finding `key` blocks in round N and a record with that `key` also appears in round N+1
+- **WHEN** a finding `key` has `effective_blocking=true` in round N and a record with that `key` also appears in round N+1
 - **THEN** a consumer SHALL classify that finding as still-open
+
+#### Scenario: advisory finding has effective_blocking false
+
+- **WHEN** a finding is classified advisory (below the policy block_threshold or below min_confidence) by partitionFindings
+- **THEN** its persisted `effective_blocking` SHALL be `false`
+- **AND** a consumer filtering by `effective_blocking=true` SHALL correctly exclude it from the blocking resolution set
+
+#### Scenario: same-key distinct findings are disambiguated by payload_fingerprint
+
+- **WHEN** two findings in a round share the same `findingKey` (same file+severity+line-bucket) but differ in body, title, or recommendation
+- **THEN** their persisted `payload_fingerprint` values SHALL differ
+- **AND** a consumer SHALL use `key`+`payload_fingerprint` pairs to identify which individual finding was resolved across rounds
 
 #### Scenario: derivation needs no network
 

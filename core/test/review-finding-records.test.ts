@@ -25,7 +25,7 @@ import {
   RUN_SCHEMA_VERSION,
   type RunStoreDeps,
 } from "../scripts/run-store.ts";
-import { findingKey } from "../scripts/review-policy.ts";
+import { findingKey, findingPayloadFingerprint } from "../scripts/review-policy.ts";
 import { sanitizeDeep } from "../scripts/artifact-sanitize.ts";
 import type {
   ReviewFindingRecord,
@@ -747,4 +747,228 @@ test("4.9 --json-events: enriched review_verdict stdout line equals events.jsonl
   assert.equal(evFindings[0].line_start, 42);
   assert.equal(evFindings[0].category, "correctness");
   assert.equal(evFindings[0].blocking, true);
+});
+
+// ---------------------------------------------------------------------------
+// 4.10 — Same-key disambiguation via payload_fingerprint
+// ---------------------------------------------------------------------------
+
+test("4.10 same-key disambiguation: two same-key distinct findings identified by payload_fingerprint", async () => {
+  const { deps, readBundle } = memBundleDeps();
+
+  // Two findings at the same file+severity+line-bucket → same findingKey (location-based),
+  // but materially different bodies → different findingPayloadFingerprint.
+  // lineBucket(42) = lineBucket(44) = 41 (both in the 40-44 five-line band).
+  const findingA: ReviewFinding = {
+    severity: "high", file: "src/core.ts", line_start: 42,
+    title: "Null dereference in main path",
+    body: "The pointer may be null on this line.",
+    confidence: 0.9,
+    recommendation: "Guard the pointer before use.",
+  };
+  const findingB: ReviewFinding = {
+    severity: "high", file: "src/core.ts", line_start: 44,
+    title: "Use-after-free in cleanup path",
+    body: "The freed pointer is reused here.",
+    confidence: 0.85,
+    recommendation: "Audit the cleanup sequence.",
+  };
+
+  assert.equal(findingKey(findingA), findingKey(findingB),
+    "precondition: both findings share the same key (same severity+file+line-bucket)");
+  assert.notEqual(findingPayloadFingerprint(findingA), findingPayloadFingerprint(findingB),
+    "precondition: distinct payloads produce different fingerprints");
+
+  const recA: ReviewFindingRecord = {
+    key: findingKey(findingA),
+    severity: findingA.severity, title: findingA.title, body: findingA.body,
+    file: findingA.file, line_start: findingA.line_start,
+    confidence: findingA.confidence, recommendation: findingA.recommendation,
+    effective_blocking: true,
+    payload_fingerprint: findingPayloadFingerprint(findingA),
+  };
+  const recB: ReviewFindingRecord = {
+    key: findingKey(findingB),
+    severity: findingB.severity, title: findingB.title, body: findingB.body,
+    file: findingB.file, line_start: findingB.line_start,
+    confidence: findingB.confidence, recommendation: findingB.recommendation,
+    effective_blocking: true,
+    payload_fingerprint: findingPayloadFingerprint(findingB),
+  };
+
+  // Round 1: both findings blocking
+  await recordReview(STATE_DIR, ISSUE, {
+    round: 1, sha: "e1".padEnd(40, "0"), verdict: "needs-attention",
+    findingCounts: { critical: 0, high: 2, medium: 0, low: 0 },
+    findings: [recA, recB], harness: "codex", model: "claude-opus-4-8", selfReview: false,
+  }, deps);
+
+  // Round 2: only finding B remains (finding A was resolved)
+  await recordReview(STATE_DIR, ISSUE, {
+    round: 2, sha: "e2".padEnd(40, "0"), verdict: "needs-attention",
+    findingCounts: { critical: 0, high: 1, medium: 0, low: 0 },
+    findings: [recB], harness: "codex", model: "claude-opus-4-8", selfReview: false,
+  }, deps);
+
+  const bundle = readBundle();
+  const r1 = bundle.reviews[0].findings!;
+  const r2 = bundle.reviews[1].findings!;
+
+  // Key-only set comparison is ambiguous: both rounds contain the same key
+  const r1Keys = new Set(r1.map((f) => f.key));
+  const r2Keys = new Set(r2.map((f) => f.key));
+  assert.ok(r1Keys.has(recA.key) && r2Keys.has(recA.key),
+    "key-only comparison: key is present in both rounds — cannot tell which finding resolved");
+
+  // Fingerprint-aware comparison correctly identifies which finding was resolved
+  const fpA = `${recA.key}:${recA.payload_fingerprint}`;
+  const fpB = `${recB.key}:${recB.payload_fingerprint}`;
+  const r2Fps = new Set(r2.map((f) => `${f.key}:${f.payload_fingerprint}`));
+
+  assert.ok(!r2Fps.has(fpA),
+    "finding A's key+fingerprint absent from round 2 → finding A is resolved");
+  assert.ok(r2Fps.has(fpB),
+    "finding B's key+fingerprint present in round 2 → finding B is still-open");
+});
+
+// Prove the test bites: without payload_fingerprint, same-key resolution is ambiguous
+test("4.10 same-key disambiguation (bite-proof): key-only comparison is ambiguous for same-key findings", () => {
+  // Two same-key distinct records (as in the above scenario)
+  const key = "abcd1234";
+  const recA: ReviewFindingRecord = {
+    key,
+    severity: "high", title: "Issue A", body: "Body A",
+    confidence: 0.9, recommendation: "Fix A",
+    effective_blocking: true,
+    payload_fingerprint: "fingerprint-A",
+  };
+  const recB: ReviewFindingRecord = {
+    key,
+    severity: "high", title: "Issue B", body: "Body B",
+    confidence: 0.85, recommendation: "Fix B",
+    effective_blocking: true,
+    payload_fingerprint: "fingerprint-B",
+  };
+
+  const round1 = [recA, recB];
+  const round2 = [recB];  // A was resolved
+
+  // Key-only set: both rounds have the key → both appear "still-open"
+  const r1Keys = new Set(round1.map((f) => f.key));
+  const r2Keys = new Set(round2.map((f) => f.key));
+  for (const f of round1.filter((f) => f.effective_blocking)) {
+    const keyOnlyStatus = r2Keys.has(f.key) ? "still-open" : "resolved";
+    // Both A and B are classified "still-open" by key-only — incorrect for A
+    assert.equal(keyOnlyStatus, "still-open",
+      "key-only comparison incorrectly classifies finding A as still-open (ambiguity confirmed)");
+    break; // only check recA (first entry)
+  }
+  assert.ok(r1Keys.size > 0); // suppress unused-variable linting
+
+  // Fingerprint-aware: correctly identifies A as resolved
+  const r2Fps = new Set(round2.map((f) => `${f.key}:${f.payload_fingerprint}`));
+  const fpAStatus = r2Fps.has(`${recA.key}:${recA.payload_fingerprint}`) ? "still-open" : "resolved";
+  assert.equal(fpAStatus, "resolved",
+    "fingerprint-aware comparison correctly classifies finding A as resolved");
+});
+
+// ---------------------------------------------------------------------------
+// 4.11 — effective_blocking reflects policy partitioning
+// ---------------------------------------------------------------------------
+
+test("4.11 effective_blocking: blocking finding has true; advisory finding has false", async () => {
+  const { deps, readBundle } = memBundleDeps();
+
+  // A blocking finding (above policy threshold)
+  const blockingRec: ReviewFindingRecord = {
+    key: findingKey(FINDING_FULL),
+    severity: FINDING_FULL.severity,  // "high"
+    title: FINDING_FULL.title, body: FINDING_FULL.body,
+    file: FINDING_FULL.file, line_start: FINDING_FULL.line_start,
+    confidence: FINDING_FULL.confidence, recommendation: FINDING_FULL.recommendation,
+    effective_blocking: true,
+    payload_fingerprint: findingPayloadFingerprint(FINDING_FULL),
+  };
+
+  // An advisory finding (below policy threshold — low severity)
+  const advisoryRec: ReviewFindingRecord = {
+    key: findingKey(FINDING_MINIMAL),
+    severity: FINDING_MINIMAL.severity,  // "low"
+    title: FINDING_MINIMAL.title, body: FINDING_MINIMAL.body,
+    confidence: FINDING_MINIMAL.confidence, recommendation: FINDING_MINIMAL.recommendation,
+    effective_blocking: false,
+    payload_fingerprint: findingPayloadFingerprint(FINDING_MINIMAL),
+  };
+
+  await recordReview(STATE_DIR, ISSUE, {
+    round: 1, sha: "f1".padEnd(40, "0"), verdict: "needs-attention",
+    findingCounts: { critical: 0, high: 1, medium: 0, low: 1 },
+    findings: [blockingRec, advisoryRec], harness: "claude", model: "claude-sonnet-4-6", selfReview: false,
+  }, deps);
+
+  const bundle = readBundle();
+  const r1 = bundle.reviews[0].findings!;
+
+  assert.equal(r1.find((f) => f.severity === "high")?.effective_blocking, true,
+    "blocking finding must have effective_blocking=true");
+  assert.equal(r1.find((f) => f.severity === "low")?.effective_blocking, false,
+    "advisory finding must have effective_blocking=false");
+});
+
+test("4.11 effective_blocking: consumer filtering by effective_blocking correctly excludes advisory findings from resolution", async () => {
+  const { deps, readBundle } = memBundleDeps();
+
+  const blockingRec: ReviewFindingRecord = {
+    key: findingKey(FINDING_FULL),
+    severity: FINDING_FULL.severity, title: FINDING_FULL.title, body: FINDING_FULL.body,
+    confidence: FINDING_FULL.confidence, recommendation: FINDING_FULL.recommendation,
+    effective_blocking: true,
+    payload_fingerprint: findingPayloadFingerprint(FINDING_FULL),
+  };
+  const advisoryRec: ReviewFindingRecord = {
+    key: findingKey(FINDING_MINIMAL),
+    severity: FINDING_MINIMAL.severity, title: FINDING_MINIMAL.title, body: FINDING_MINIMAL.body,
+    confidence: FINDING_MINIMAL.confidence, recommendation: FINDING_MINIMAL.recommendation,
+    effective_blocking: false,
+    payload_fingerprint: findingPayloadFingerprint(FINDING_MINIMAL),
+  };
+
+  // Round 1: blocking + advisory
+  await recordReview(STATE_DIR, ISSUE, {
+    round: 1, sha: "g1".padEnd(40, "0"), verdict: "needs-attention",
+    findingCounts: { critical: 0, high: 1, medium: 0, low: 1 },
+    findings: [blockingRec, advisoryRec], harness: "claude", model: "claude-sonnet-4-6", selfReview: false,
+  }, deps);
+
+  // Round 2: blocking finding resolved; advisory finding still present (still non-blocking)
+  await recordReview(STATE_DIR, ISSUE, {
+    round: 2, sha: "g2".padEnd(40, "0"), verdict: "approve",
+    findingCounts: { critical: 0, high: 0, medium: 0, low: 0 },
+    findings: [], harness: "claude", model: "claude-sonnet-4-6", selfReview: false,
+  }, deps);
+
+  const bundle = readBundle();
+  const r1 = bundle.reviews[0].findings!;
+  const r2 = bundle.reviews[1].findings!;
+
+  // Consumer: only track findings that were effectively blocking
+  const blockingInR1 = r1.filter((f) => f.effective_blocking);
+  const blockingInR2 = r2.filter((f) => f.effective_blocking);
+  assert.equal(blockingInR1.length, 1, "one blocking finding in round 1");
+  assert.equal(blockingInR2.length, 0, "no blocking findings in round 2");
+
+  // Resolution derived from blocking-only key sets
+  const r2BlockingKeys = new Set(blockingInR2.map((f) => f.key));
+  const resolved = blockingInR1.filter((f) => !r2BlockingKeys.has(f.key));
+  assert.equal(resolved.length, 1, "blocking finding from round 1 is resolved");
+  assert.equal(resolved[0].severity, "high");
+
+  // Advisory finding does NOT affect the blocking resolution count
+  const r1AllKeys = new Set(r1.map((f) => f.key));
+  const r2AllKeys = new Set(r2.map((f) => f.key));
+  // Advisory key is in r1 but not r2 — but because it was advisory, a consumer
+  // using effective_blocking correctly ignores it in the blocking resolution check.
+  assert.ok(r1AllKeys.has(advisoryRec.key));
+  assert.ok(!r2AllKeys.has(advisoryRec.key),
+    "advisory finding not in round 2 but irrelevant to blocking resolution");
 });

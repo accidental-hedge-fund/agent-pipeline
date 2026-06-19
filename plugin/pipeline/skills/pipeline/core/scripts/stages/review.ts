@@ -40,6 +40,7 @@ import {
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  findingPayloadFingerprint,
   formatBlockingSurfacesMarker,
   overrideComment,
   partitionFindings,
@@ -444,8 +445,11 @@ export async function advanceReview(
   // Build per-finding records for run-directory persistence (#209). sanitizeDeep
   // screens title/body/recommendation at the field level before they reach disk,
   // consistent with the write-time injection-denylist + secret-redaction convention
-  // (#161). The same `reviewer` variable is used here — it was reassigned above to
-  // the effective harness (post #39 same-harness fallback reassignment).
+  // (#161). payload_fingerprint is computed from the original finding (before
+  // sanitization) so it is stable across rounds even when finding text is redacted.
+  // effective_blocking is set after partitionFindings runs (below) — it is
+  // initialised to false here and overwritten for blocking findings on the
+  // needs-attention path; approve/zero-findings paths leave it false throughout.
   const findingRecords: ReviewFindingRecord[] = sanitizeDeep(
     verdict.findings.map((f): ReviewFindingRecord => {
       const rec: ReviewFindingRecord = {
@@ -455,6 +459,8 @@ export async function advanceReview(
         body: f.body,
         confidence: f.confidence,
         recommendation: f.recommendation,
+        payload_fingerprint: findingPayloadFingerprint(f),
+        effective_blocking: false,
       };
       if (f.file !== undefined) rec.file = f.file;
       if (f.line_start !== undefined) rec.line_start = f.line_start;
@@ -464,38 +470,32 @@ export async function advanceReview(
       return rec;
     }),
   );
+  // Restore payload_fingerprint from original findings — sanitizeDeep may corrupt
+  // it when finding text contains an injection-denylist pattern, breaking cross-round
+  // disambiguation. The fingerprint is a computed identifier, not free text, and
+  // must survive sanitization unchanged.
+  for (let i = 0; i < findingRecords.length; i++) {
+    findingRecords[i].payload_fingerprint = findingPayloadFingerprint(verdict.findings[i]);
+  }
   const reviewerModel = opts.model ?? cfg.models.review;
-  if (opts.stateDir) {
-    await recordReview(opts.stateDir, issueNumber, {
-      round,
-      sha: commitSha,
-      verdict: verdict.verdict,
-      findingCounts,
-      findings: findingRecords,
-      harness: reviewer,
-      model: reviewerModel,
-      selfReview,
-    }).catch(() => {});
-  }
-  // JSONL event log (#155): emit review_verdict for Pipeline Desk stage timeline.
-  if (opts.runDir) {
-    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, {
-      schema_version: RUN_SCHEMA_VERSION,
-      type: "review_verdict",
-      at,
-      round,
-      sha: commitSha,
-      verdict: verdict.verdict,
-      finding_counts: findingCounts,
-      findings: findingRecords,
-      reviewer_harness: reviewer,
-      reviewer_model: reviewerModel,
-      self_review: selfReview,
-    }, opts.runStoreDeps).catch(() => {});
-  }
 
   if (verdict.verdict === "approve") {
+    // On approve all findings are non-blocking — effective_blocking already false.
+    if (opts.stateDir) {
+      await recordReview(opts.stateDir, issueNumber, {
+        round, sha: commitSha, verdict: verdict.verdict, findingCounts,
+        findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+      }).catch(() => {});
+    }
+    if (opts.runDir) {
+      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      await appendEvent(opts.runDir, {
+        schema_version: RUN_SCHEMA_VERSION, type: "review_verdict", at,
+        round, sha: commitSha, verdict: verdict.verdict, finding_counts: findingCounts,
+        findings: findingRecords, reviewer_harness: reviewer,
+        reviewer_model: reviewerModel, self_review: selfReview,
+      }, opts.runStoreDeps).catch(() => {});
+    }
     await postCommentFn(cfg, issueNumber, withR1Sentinel(reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash))));
     if (round === 1) {
       await transitionFn(
@@ -544,6 +544,22 @@ export async function advanceReview(
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
     await postCommentFn(cfg, issueNumber, withR1Sentinel(reviewComment(formatReviewComment(cfg, verdict, round, reviewer))));
+    // findingRecords is empty here (zero findings). effective_blocking already false.
+    if (opts.stateDir) {
+      await recordReview(opts.stateDir, issueNumber, {
+        round, sha: commitSha, verdict: verdict.verdict, findingCounts,
+        findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+      }).catch(() => {});
+    }
+    if (opts.runDir) {
+      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      await appendEvent(opts.runDir, {
+        schema_version: RUN_SCHEMA_VERSION, type: "review_verdict", at,
+        round, sha: commitSha, verdict: verdict.verdict, finding_counts: findingCounts,
+        findings: findingRecords, reviewer_harness: reviewer,
+        reviewer_model: reviewerModel, self_review: selfReview,
+      }, opts.runStoreDeps).catch(() => {});
+    }
     const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
     await setBlockedFn(
       cfg,
@@ -572,6 +588,28 @@ export async function advanceReview(
   const scopes = extractScopedOverrides(trustedComments);
   // Use the effective policy (risk-scaled for round-2 low-risk changes, #232).
   const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes);
+  // Enrich finding records with effective_blocking from policy partitioning (#209 fix-2).
+  // partition.blocking contains the same ReviewFinding object references from
+  // verdict.findings, so identity comparison against verdict.findings[i] is safe.
+  const blockingFindingSet = new Set<ReviewFinding>(partition.blocking);
+  for (let i = 0; i < findingRecords.length; i++) {
+    findingRecords[i].effective_blocking = blockingFindingSet.has(verdict.findings[i]);
+  }
+  if (opts.stateDir) {
+    await recordReview(opts.stateDir, issueNumber, {
+      round, sha: commitSha, verdict: verdict.verdict, findingCounts,
+      findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+    }).catch(() => {});
+  }
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, {
+      schema_version: RUN_SCHEMA_VERSION, type: "review_verdict", at,
+      round, sha: commitSha, verdict: verdict.verdict, finding_counts: findingCounts,
+      findings: findingRecords, reviewer_harness: reviewer,
+      reviewer_model: reviewerModel, self_review: selfReview,
+    }, opts.runStoreDeps).catch(() => {});
+  }
   // Blocking keys set: derived here after policy partitioning so the review
   // comment can embed the pipeline-blocking-keys marker (#133 fix). Only
   // computed once; shared by all blocking-path branches below.

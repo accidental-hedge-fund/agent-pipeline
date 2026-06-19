@@ -551,6 +551,14 @@ export interface ReviewFindingRecord {
   recommendation: string;
   category?: string;
   blocking?: boolean;
+  /** Effective blocking status from partitionFindings: true when the finding
+   *  landed in partition.blocking, false when advisory or overridden. Absent
+   *  on records written before #209 fix-2. */
+  effective_blocking?: boolean;
+  /** findingPayloadFingerprint(finding) at write time — disambiguates distinct
+   *  findings that share the same findingKey within a round (same-key ambiguity
+   *  guard). Absent on records written before #209 fix-2. */
+  payload_fingerprint?: string;
 }
 
 /** Summary of one review round's verdict. `findingCounts` maps severity → count.
