@@ -2039,6 +2039,77 @@ test("#232 extractReview1Risk spoof: comment without footer is ignored → stand
   assert.equal(extractReview1Risk(comments, TEST_ACTOR, R1_FOOTER), "standard", "Review 1 comment without footer must be ignored");
 });
 
+// --- staleness check (finding 1, #232 review-2): stale review-1 sentinel must not relax review-2 ---
+
+const SHA_CURRENT = "f".repeat(40);
+const SHA_OLD     = "a".repeat(40);
+const DIFF_CURRENT = "deadbeef12345678";
+const DIFF_OLD     = "cafebabe87654321";
+
+function r1Comment(sha: string, risk: "low" | "standard", diffHash?: string): string {
+  const lines = [
+    `## Review 1 (Standard) — approve (commit ${sha.slice(0, 7)})`,
+    "",
+    "LGTM",
+    "",
+    R1_FOOTER,
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+  ];
+  if (diffHash) lines.push(`<!-- verdict-diff-hash: ${diffHash} -->`);
+  lines.push(`<!-- pipeline-review1-risk: ${risk} -->`);
+  return lines.join("\n");
+}
+
+test("#232 extractReview1Risk staleness: matching SHA → returns low (sentinel is fresh)", () => {
+  const comments = [{ author: TEST_ACTOR, body: r1Comment(SHA_CURRENT, "low") }];
+  assert.equal(
+    extractReview1Risk(comments, TEST_ACTOR, R1_FOOTER, { diffHash: DIFF_CURRENT, sha: SHA_CURRENT }),
+    "low",
+    "sentinel reviewed same SHA → fresh → low returned",
+  );
+});
+
+test("#232 extractReview1Risk staleness: SHA mismatch → returns standard (stale sentinel)", () => {
+  // review-1 ran on SHA_OLD; review-2 is now evaluating SHA_CURRENT (new commits pushed).
+  const comments = [{ author: TEST_ACTOR, body: r1Comment(SHA_OLD, "low") }];
+  assert.equal(
+    extractReview1Risk(comments, TEST_ACTOR, R1_FOOTER, { diffHash: DIFF_CURRENT, sha: SHA_CURRENT }),
+    "standard",
+    "sentinel reviewed a different SHA → stale → must default to standard",
+  );
+});
+
+test("#232 extractReview1Risk staleness: matching diff-hash → returns low (hash-based freshness)", () => {
+  const comments = [{ author: TEST_ACTOR, body: r1Comment(SHA_OLD, "low", DIFF_CURRENT) }];
+  assert.equal(
+    extractReview1Risk(comments, TEST_ACTOR, R1_FOOTER, { diffHash: DIFF_CURRENT, sha: SHA_CURRENT }),
+    "low",
+    "diff-hash matches current diff → fresh → low returned (even SHA differs)",
+  );
+});
+
+test("#232 extractReview1Risk staleness: diff-hash mismatch → returns standard (stale by content)", () => {
+  // Comment has a diff-hash but it doesn't match the current diff.
+  const comments = [{ author: TEST_ACTOR, body: r1Comment(SHA_OLD, "low", DIFF_OLD) }];
+  assert.equal(
+    extractReview1Risk(comments, TEST_ACTOR, R1_FOOTER, { diffHash: DIFF_CURRENT, sha: SHA_CURRENT }),
+    "standard",
+    "diff-hash mismatch → diff content changed → stale → standard",
+  );
+});
+
+test("#232 extractReview1Risk staleness: no currentArtifact → no staleness check (backward compat)", () => {
+  // When currentArtifact is omitted the staleness check is skipped (unit tests
+  // for the trust model don't need to supply artifact context).
+  const comments = [{ author: TEST_ACTOR, body: r1Comment(SHA_OLD, "low") }];
+  assert.equal(
+    extractReview1Risk(comments, TEST_ACTOR, R1_FOOTER),
+    "low",
+    "no currentArtifact → staleness check skipped → low returned",
+  );
+});
+
 test("#232 advanceReview: round-1 approve+0-findings comment carries low risk sentinel", async (t) => {
   const { deps, rec } = makeDeps([APPROVE]);
   await quiet(t, async () => {
@@ -2070,8 +2141,18 @@ const riskPropCfg = {
   review_policy: { block_threshold: "medium", min_confidence: 0, risk_proportional: true, max_adversarial_rounds: 3 },
 } as unknown as PipelineConfig;
 
+// SHA used by makeDeps' getPrDetail. The review-1 comment must carry this SHA
+// so the staleness check in extractReview1Risk accepts the sentinel.
+const TEST_PR_HEAD_SHA = "f".repeat(40);
+
 // Helper: issue detail with a prior review-1 comment carrying the given risk sentinel.
-function makeIssueWithR1Risk(riskTier: "low" | "standard"): Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>> {
+// `reviewedSha` defaults to TEST_PR_HEAD_SHA so the staleness check passes for
+// the happy-path regression tests (4.3–4.6); pass a different SHA to simulate a
+// stale sentinel (new commits pushed after review-1 ran).
+function makeIssueWithR1Risk(
+  riskTier: "low" | "standard",
+  reviewedSha = TEST_PR_HEAD_SHA,
+): Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>> {
   return {
     number: 1,
     type: "issue",
@@ -2084,14 +2165,14 @@ function makeIssueWithR1Risk(riskTier: "low" | "standard"): Awaited<ReturnType<N
       {
         author: TEST_ACTOR,
         body: [
-          `## Review 1 (Standard) — approve (commit ${"a".repeat(7)})`,
+          `## Review 1 (Standard) — approve (commit ${reviewedSha.slice(0, 7)})`,
           "**Reviewer**: codex",
           "",
           "LGTM",
           "",
           "*Automated by Claude Code Pipeline Skill*",
           "",
-          `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+          `<!-- reviewed-sha: ${reviewedSha} -->`,
           `<!-- pipeline-review1-risk: ${riskTier} -->`,
         ].join("\n"),
       },
@@ -2174,6 +2255,27 @@ test("#232 regression (d): low-risk + risk_proportional:true + HIGH finding → 
     rec.transitions,
     [{ to: "fix-2" }],
     "high finding blocks even under the risk-scaled effective 'high' threshold",
+  );
+  assert.equal(outcome.to, "fix-2");
+});
+
+// 4.7: stale review-1 sentinel (new commits pushed after review-1 ran) must NOT relax review-2
+// Regression for #232 finding 1: stale low-risk sentinel must be rejected.
+test("#232 regression (e): stale low-risk review-1 sentinel (SHA mismatch) → review-2 treats as standard → routes to fix-2", async (t) => {
+  // The review-1 comment carries a SHA different from the current PR head,
+  // simulating new commits pushed after review-1 approved with zero findings.
+  const STALE_SHA = "a".repeat(40); // differs from makeDeps' "f".repeat(40)
+  const { deps, rec } = makeDeps([NA_MEDIUM]);
+  deps.getIssueDetail = async () => makeIssueWithR1Risk("low", STALE_SHA);
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(riskPropCfg, 1, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "fix-2" }],
+    "stale low-risk sentinel must not relax review-2: medium finding should block at the configured threshold",
   );
   assert.equal(outcome.to, "fix-2");
 });

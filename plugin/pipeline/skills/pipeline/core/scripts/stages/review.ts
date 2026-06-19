@@ -377,7 +377,7 @@ export async function advanceReview(
   const review1RiskFromVerdict: Review1Risk | undefined =
     round === 1 ? classifyReview1Risk(verdict) : undefined;
   const review1Risk: Review1Risk =
-    round === 2 ? extractReview1Risk(detail.comments, actor, cfgFooter(cfg)) : (review1RiskFromVerdict ?? "standard");
+    round === 2 ? extractReview1Risk(detail.comments, actor, cfgFooter(cfg), { diffHash, sha: commitSha }) : (review1RiskFromVerdict ?? "standard");
   const effectivePol = effectiveReviewPolicy(cfg.review_policy, { round, review1Risk });
 
   // Append `<!-- pipeline-review1-risk: ... -->` to every review-1 comment so
@@ -1458,26 +1458,58 @@ export function classifyReview1Risk(verdict: Pick<ReviewVerdict, "verdict" | "fi
  * footer — matching the same triple-gate used for the diff-hash cache (#228).
  * Defaults to `"standard"` when absent, unrecognized, or `actor` is null
  * (unknown pipeline identity) — conservative fail-closed.
+ *
+ * When `currentArtifact` is supplied the recovered sentinel is validated against
+ * the current PR artifact: prefers `verdict-diff-hash` (content-based); falls
+ * back to `reviewed-sha` when no diff-hash is present. A mismatch on either
+ * means the sentinel is stale (new commits landed after review-1 ran) and the
+ * function returns `"standard"` — fail-closed (#232 finding 1).
  */
 export function extractReview1Risk(
   comments: { author: string; body: string }[],
   actor: string | null,
   footer: string,
+  currentArtifact?: { diffHash: string; sha: string },
 ): Review1Risk {
   if (actor === null) return "standard";
-  let last: Review1Risk | null = null;
+  let lastRisk: Review1Risk | null = null;
+  let lastRiskBody: string | null = null;
   for (const c of comments) {
     if (!c.body.startsWith(REVIEW_MARKER_PREFIX_R1)) continue;
     if (c.author !== actor) continue;
     if (!c.body.includes(footer)) continue;
     REVIEW1_RISK_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
+    let found: Review1Risk | null = null;
     while ((m = REVIEW1_RISK_RE.exec(c.body)) !== null) {
-      last = m[1] as Review1Risk;
+      found = m[1] as Review1Risk;
     }
     REVIEW1_RISK_RE.lastIndex = 0;
+    if (found !== null) {
+      lastRisk = found;
+      lastRiskBody = c.body;
+    }
   }
-  return last ?? "standard";
+  if (lastRisk === null || lastRiskBody === null) return "standard";
+  // Staleness check: the recovered sentinel must describe the artifact review-2
+  // is currently evaluating. Prefer the content-based diff-hash; fall back to
+  // the commit SHA. Either mismatch → the sentinel is stale → fail-closed.
+  if (currentArtifact !== undefined) {
+    const commentDiffHash = extractDiffHashFromComment(lastRiskBody);
+    if (commentDiffHash !== null) {
+      if (commentDiffHash !== currentArtifact.diffHash) return "standard";
+    } else {
+      REVIEWED_SHA_RE.lastIndex = 0;
+      let shaCur: RegExpExecArray | null;
+      let lastSha: string | null = null;
+      while ((shaCur = REVIEWED_SHA_RE.exec(lastRiskBody)) !== null) {
+        lastSha = shaCur[1];
+      }
+      REVIEWED_SHA_RE.lastIndex = 0;
+      if (lastSha !== currentArtifact.sha) return "standard";
+    }
+  }
+  return lastRisk;
 }
 
 // Internal export for tests, so review.test isn't needed.
