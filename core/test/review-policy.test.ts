@@ -14,6 +14,7 @@ import {
   extractOverrides,
   extractScopedOverrides,
   buildTrustedOverrideComments,
+  effectiveReviewPolicy,
   isValidFindingKey,
   overrideComment,
   scopedOverrideComment,
@@ -21,6 +22,7 @@ import {
   SPEC_DIVERGENCE_CATEGORY,
   categoryMarker,
   reviewCommentFlagsSpecDivergence,
+  type Review1Risk,
   type ReviewPolicy,
   type ScopedOverride,
 } from "../scripts/review-policy.ts";
@@ -880,4 +882,59 @@ test("partition: blocking:false sharing a key with a real blocker does NOT make 
   assert.equal(p.blocking.length, 0, "blocker must be overridden (non-blocking sibling must not cause ambiguity)");
   assert.equal(p.overridden.length, 1, "only the blocker is overridden");
   assert.equal(p.advisory.length, 1, "non-blocking sibling is advisory");
+});
+
+// ---------------------------------------------------------------------------
+// effectiveReviewPolicy (#232): risk-proportional adversarial blocking
+// ---------------------------------------------------------------------------
+
+function makePolicy(
+  block_threshold: ReviewPolicy["block_threshold"],
+  risk_proportional = false,
+): ReviewPolicy & { risk_proportional: boolean } {
+  return { block_threshold, min_confidence: 0, risk_proportional };
+}
+
+test("effectiveReviewPolicy: flag off → policy returned unchanged for round-2 low-risk", () => {
+  const pol = makePolicy("medium", false);
+  const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "low" });
+  assert.equal(eff.block_threshold, "medium");
+  assert.equal(eff.min_confidence, 0);
+});
+
+test("effectiveReviewPolicy: round-1 → policy returned unchanged regardless of risk and flag", () => {
+  const pol = makePolicy("medium", true);
+  const eff = effectiveReviewPolicy(pol, { round: 1, review1Risk: "low" });
+  assert.equal(eff.block_threshold, "medium");
+});
+
+test("effectiveReviewPolicy: round-2 + standard risk → policy returned unchanged", () => {
+  const pol = makePolicy("medium", true);
+  const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "standard" });
+  assert.equal(eff.block_threshold, "medium");
+});
+
+test("effectiveReviewPolicy: round-2 + low risk + flag on + configured 'low' → raises to 'high'", () => {
+  const pol = makePolicy("low", true);
+  const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "low" });
+  assert.equal(eff.block_threshold, "high");
+  assert.equal(eff.min_confidence, 0, "min_confidence must not be altered");
+});
+
+test("effectiveReviewPolicy: round-2 + low risk + flag on + configured 'medium' → raises to 'high'", () => {
+  const pol = makePolicy("medium", true);
+  const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "low" });
+  assert.equal(eff.block_threshold, "high");
+});
+
+test("effectiveReviewPolicy: round-2 + low risk + flag on + configured 'high' → stays 'high'", () => {
+  const pol = makePolicy("high", true);
+  const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "low" });
+  assert.equal(eff.block_threshold, "high");
+});
+
+test("effectiveReviewPolicy: round-2 + low risk + flag on + configured 'critical' → stays 'critical' (stricter threshold never loosened)", () => {
+  const pol = makePolicy("critical", true);
+  const eff = effectiveReviewPolicy(pol, { round: 2, review1Risk: "low" });
+  assert.equal(eff.block_threshold, "critical");
 });

@@ -96,6 +96,7 @@ const PartialConfigSchema = z.object({
       block_threshold: z.enum(["critical", "high", "medium", "low"]).optional().describe("Findings at or above this severity block progression; below advise only."),
       min_confidence: z.number().min(0).max(1).optional().describe("Findings below this confidence score (0–1) advise rather than block."),
       max_adversarial_rounds: z.number().int().positive().optional().describe("Maximum adversarial review re-runs before routing still-blocking findings to needs-human."),
+      risk_proportional: z.boolean().optional().describe("When true and review-1 approved with zero findings (low-risk), review-2 evaluates findings against a raised effective threshold (stricter of configured and 'high'), so medium/low findings advise rather than block. Default false — review-2 blocking unchanged."),
     })
     .strict()
     .optional()
@@ -342,6 +343,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       max_adversarial_rounds:
         fileConfig.review_policy?.max_adversarial_rounds ??
         DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
+      risk_proportional:
+        fileConfig.review_policy?.risk_proportional ?? DEFAULT_CONFIG.review_policy.risk_proportional,
     },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
@@ -581,6 +584,7 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_policy.block_threshold",
   "review_policy.min_confidence",
   "review_policy.max_adversarial_rounds",
+  "review_policy.risk_proportional",
   "steps.plan_review",
   "steps.standard_review",
   "steps.adversarial_review",
@@ -911,6 +915,7 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
   min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
   max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
+  # risk_proportional: ${d.review_policy.risk_proportional} # when true and review-1 approved with 0 findings (low risk), review-2 only blocks on high/critical findings (#232)
 
 doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
   runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure

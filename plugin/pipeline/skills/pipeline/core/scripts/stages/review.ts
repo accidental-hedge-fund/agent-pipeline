@@ -34,11 +34,13 @@ import { openspecContextFromDiff } from "../openspec.ts";
 import {
   buildTrustedOverrideComments,
   categoryMarker,
+  effectiveReviewPolicy,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
   partitionFindings,
   type PartitionResult,
+  type Review1Risk,
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
@@ -71,6 +73,11 @@ const PIPELINE_BLOCKING_KEYS_RE = /^<!-- pipeline-blocking-keys: ([0-9a-f,]*) --
 // so extractDiffHashFromComment picks the LAST occurrence, guarding against an
 // injected sentinel appearing earlier in the comment body.
 const VERDICT_DIFF_HASH_RE = /^<!-- verdict-diff-hash: ([0-9a-f]{16}) -->$/gm;
+
+// Machine-readable review-1 risk tier sentinel (#232). Anchored to full line;
+// global flag picks the LAST occurrence, guarding against injected sentinel
+// content appearing earlier in the reviewer-authored comment body.
+const REVIEW1_RISK_RE = /^<!-- pipeline-review1-risk: (low|standard) -->$/gm;
 
 // Distinct heading prefix for pre-merge delta review comments (#228 fix-2). Must NOT
 // start with "## Review 1" or "## Review 2" so delta reviews are excluded from
@@ -219,9 +226,20 @@ export async function advanceReview(
       );
       return { advanced: false, status: "blocked", reason: "HEAD moved during diff fetch" };
     }
-  } catch {
-    // If the post-diff check fails, continue: the pre-merge gate will detect
-    // staleness when it compares the stamped SHA against HEAD.
+  } catch (postDiffErr) {
+    // If the post-diff check fails we cannot confirm the diff/SHA binding is
+    // correct. A stale SHA would let a legacy hashless Review 1 sentinel relax
+    // review-2's threshold for a different diff — fail closed instead of
+    // continuing with an unverified artifact (#232 delta).
+    const e = postDiffErr as Error;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Could not verify PR HEAD after diff fetch (${e.message}). Re-run the review stage to evaluate a stable HEAD.`,
+      stage,
+      "harness-failure",
+    );
+    return { advanced: false, status: "blocked", reason: "post-diff SHA verification failed" };
   }
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
@@ -363,6 +381,23 @@ export async function advanceReview(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );
 
+  // Risk-proportional adversarial blocking (#232).
+  // For round-1: classify the risk tier from the verdict so we can emit the
+  // sentinel on the review comment and review-2 can recover it.
+  // For round-2: read the sentinel back and compute the effective policy.
+  const review1RiskFromVerdict: Review1Risk | undefined =
+    round === 1 ? classifyReview1Risk(verdict) : undefined;
+  const review1Risk: Review1Risk =
+    round === 2 ? extractReview1Risk(detail.comments, actor, cfgFooter(cfg), { diffHash, sha: commitSha }) : (review1RiskFromVerdict ?? "standard");
+  const effectivePol = effectiveReviewPolicy(cfg.review_policy, { round, review1Risk });
+
+  // Append `<!-- pipeline-review1-risk: ... -->` to every review-1 comment so
+  // review-2 can recover the tier without parsing reviewer prose.
+  const withR1Sentinel = (body: string): string =>
+    round === 1 && review1RiskFromVerdict !== undefined
+      ? `${body}\n<!-- pipeline-review1-risk: ${review1RiskFromVerdict} -->`
+      : body;
+
   // Evidence bundle (#147): record this round's verdict summary (round, reviewed
   // SHA, verdict, per-severity finding counts) — no raw reviewer prose. Best-effort
   // + gated on opts.stateDir, so unit tests have no filesystem side effects.
@@ -393,7 +428,7 @@ export async function advanceReview(
   }
 
   if (verdict.verdict === "approve") {
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash)));
+    await postCommentFn(cfg, issueNumber, withR1Sentinel(reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash))));
     if (round === 1) {
       await transitionFn(
         cfg,
@@ -440,7 +475,7 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer)));
+    await postCommentFn(cfg, issueNumber, withR1Sentinel(reviewComment(formatReviewComment(cfg, verdict, round, reviewer))));
     const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
     await setBlockedFn(
       cfg,
@@ -467,7 +502,8 @@ export async function advanceReview(
   const trustedComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
   const overrides = extractOverrides(trustedComments);
   const scopes = extractScopedOverrides(trustedComments);
-  const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides, scopes);
+  // Use the effective policy (risk-scaled for round-2 low-risk changes, #232).
+  const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes);
   // Blocking keys set: derived here after policy partitioning so the review
   // comment can embed the pipeline-blocking-keys marker (#133 fix). Only
   // computed once; shared by all blocking-path branches below.
@@ -478,7 +514,7 @@ export async function advanceReview(
     // empty marker (#133 fix 2): prevents extractBlockingKeysFromComment from
     // falling back to all override-key tokens on a re-review where an advisory
     // finding later crosses the policy threshold.
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash)));
+    await postCommentFn(cfg, issueNumber, withR1Sentinel(reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash))));
     const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     // Also surface on the PR: review bookkeeping lives on the issue, but a human
@@ -512,7 +548,7 @@ export async function advanceReview(
 
   // Post the verdict comment WITH the pipeline-blocking-keys marker so future
   // recurrence checks can distinguish prior blocking findings from advisory ones.
-  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash)));
+  await postCommentFn(cfg, issueNumber, withR1Sentinel(reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash))));
 
   // Prior verdict comments for THIS round, oldest → newest. `detail.comments`
   // was snapshotted before the current verdict was posted, so the last entry is
@@ -1412,6 +1448,79 @@ function extractVerdictFromComment(body: string): "approve" | "needs-attention" 
   const m = body.match(/^## Review \d+ \([^)]+\) — (approve|needs-attention)/m);
   if (!m) return null;
   return m[1] as "approve" | "needs-attention";
+}
+
+/**
+ * Classify the review-1 risk tier from its structured verdict (#232).
+ * Returns `"low"` when the verdict is `approve` with zero findings (the exact
+ * signal the adversarial round's blocking is disproportionate to); `"standard"`
+ * otherwise. Derived purely from the structured `ReviewVerdict` — never from
+ * the reviewer's free-text `summary` or any prose field.
+ */
+export function classifyReview1Risk(verdict: Pick<ReviewVerdict, "verdict" | "findings">): Review1Risk {
+  return verdict.verdict === "approve" && verdict.findings.length === 0 ? "low" : "standard";
+}
+
+/**
+ * Extract the review-1 risk tier from issue comments (#232). Reads the last
+ * `<!-- pipeline-review1-risk: low|standard -->` sentinel from trusted
+ * pipeline-authored Review 1 comments only. A comment is trusted when it starts
+ * with the Review 1 marker, was authored by `actor`, and contains the configured
+ * footer — matching the same triple-gate used for the diff-hash cache (#228).
+ * Defaults to `"standard"` when absent, unrecognized, or `actor` is null
+ * (unknown pipeline identity) — conservative fail-closed.
+ *
+ * When `currentArtifact` is supplied the recovered sentinel is validated against
+ * the current PR artifact: prefers `verdict-diff-hash` (content-based); falls
+ * back to `reviewed-sha` when no diff-hash is present. A mismatch on either
+ * means the sentinel is stale (new commits landed after review-1 ran) and the
+ * function returns `"standard"` — fail-closed (#232 finding 1).
+ */
+export function extractReview1Risk(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+  footer: string,
+  currentArtifact?: { diffHash: string; sha: string },
+): Review1Risk {
+  if (actor === null) return "standard";
+  let lastRisk: Review1Risk | null = null;
+  let lastRiskBody: string | null = null;
+  for (const c of comments) {
+    if (!c.body.startsWith(REVIEW_MARKER_PREFIX_R1)) continue;
+    if (c.author !== actor) continue;
+    if (!c.body.includes(footer)) continue;
+    REVIEW1_RISK_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let found: Review1Risk | null = null;
+    while ((m = REVIEW1_RISK_RE.exec(c.body)) !== null) {
+      found = m[1] as Review1Risk;
+    }
+    REVIEW1_RISK_RE.lastIndex = 0;
+    if (found !== null) {
+      lastRisk = found;
+      lastRiskBody = c.body;
+    }
+  }
+  if (lastRisk === null || lastRiskBody === null) return "standard";
+  // Staleness check: the recovered sentinel must describe the artifact review-2
+  // is currently evaluating. Prefer the content-based diff-hash; fall back to
+  // the commit SHA. Either mismatch → the sentinel is stale → fail-closed.
+  if (currentArtifact !== undefined) {
+    const commentDiffHash = extractDiffHashFromComment(lastRiskBody);
+    if (commentDiffHash !== null) {
+      if (commentDiffHash !== currentArtifact.diffHash) return "standard";
+    } else {
+      REVIEWED_SHA_RE.lastIndex = 0;
+      let shaCur: RegExpExecArray | null;
+      let lastSha: string | null = null;
+      while ((shaCur = REVIEWED_SHA_RE.exec(lastRiskBody)) !== null) {
+        lastSha = shaCur[1];
+      }
+      REVIEWED_SHA_RE.lastIndex = 0;
+      if (lastSha !== currentArtifact.sha) return "standard";
+    }
+  }
+  return lastRisk;
 }
 
 // Internal export for tests, so review.test isn't needed.
