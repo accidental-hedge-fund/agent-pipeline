@@ -2046,8 +2046,8 @@ async function runAdvance(
             `continuation(s) — parking at needs-human`,
           );
           if (!opts.dryRun) {
-            await clearBlocked(cfg, issueNumber).catch(() => {});
             await transition(cfg, issueNumber, stage, "needs-human", "auto-loop budget exhausted");
+            await clearBlocked(cfg, issueNumber).catch(() => {});
             finalStage = "needs-human";
             await postComment(
               cfg,
