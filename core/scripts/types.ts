@@ -390,7 +390,7 @@ export function reviewStageSkipTarget(cfg: Pick<PipelineConfig, "steps">, stage:
 // One transition outcome from a stage advance call.
 export type Outcome =
   | { advanced: true; from: Stage; to: Stage; summary: string }
-  | { advanced: false; status: "blocked"; reason: string }
+  | { advanced: false; status: "blocked"; reason: string; blockerKind?: BlockerKind }
   | { advanced: false; status: "waiting"; reason: string }
   | { advanced: false; status: "no-op"; reason: string }
   | { advanced: false; status: "finalized"; reason: string }

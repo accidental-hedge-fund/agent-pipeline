@@ -30,7 +30,7 @@ import {
 } from "../scripts/pipeline.ts";
 import { validateConfig } from "../scripts/config.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import type { Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
+import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -48,6 +48,7 @@ function makeAutoLoop(overrides: Partial<PipelineConfig["auto_loop"]> = {}): Pip
 
 const WAITING: Outcome = { advanced: false, status: "waiting", reason: "CI pending" };
 const BLOCKED: Outcome = { advanced: false, status: "blocked", reason: "eval failed" };
+const BLOCKED_NEEDS_HUMAN: Outcome = { advanced: false, status: "blocked", reason: "shipcheck fail verdict", blockerKind: "needs-human" as BlockerKind };
 const ERROR_OUT: Outcome = { advanced: false, status: "error", reason: "harness crash" };
 const NOOP: Outcome = { advanced: false, status: "no-op", reason: "nothing to do" };
 const FINALIZED: Outcome = { advanced: false, status: "finalized", reason: "done" };
@@ -213,6 +214,12 @@ test("isAutoLoopEligible: advanced outcome → false (not non-advancing)", () =>
   assert.equal(isAutoLoopEligible(ADVANCED, "eval-gate", al), false);
 });
 
+test("isAutoLoopEligible: blocked with needs-human kind at allowlisted stage → false (non-recoverable)", () => {
+  // shipcheck-gate failures set needs-human; the auto-loop must not retry them
+  const al = makeAutoLoop({ stages: ["shipcheck-gate"] });
+  assert.equal(isAutoLoopEligible(BLOCKED_NEEDS_HUMAN, "shipcheck-gate", al), false);
+});
+
 // ---------------------------------------------------------------------------
 // 7.4  Budget accounting
 // ---------------------------------------------------------------------------
@@ -313,7 +320,8 @@ test("isAutoLoopRecoverable: does not mutate or depend on review_policy", () => 
   // Calling the helper does not throw and returns the correct value regardless
   // of what review_policy or harness_sandbox say.
   assert.equal(isAutoLoopRecoverable(WAITING), true);
-  assert.equal(isAutoLoopRecoverable(BLOCKED), true);
+  assert.equal(isAutoLoopRecoverable(BLOCKED), true);              // no kind → recoverable
+  assert.equal(isAutoLoopRecoverable(BLOCKED_NEEDS_HUMAN), false); // needs-human → not recoverable
 });
 
 test("canAutoLoopContinue: does not depend on review_policy.max_adversarial_rounds", () => {
@@ -332,8 +340,12 @@ test("isAutoLoopRecoverable: waiting → true", () => {
   assert.equal(isAutoLoopRecoverable(WAITING), true);
 });
 
-test("isAutoLoopRecoverable: blocked → true (all blocker kinds have BLOCKER_RECIPES recipes)", () => {
+test("isAutoLoopRecoverable: blocked without blockerKind → true (pipeline can retry)", () => {
   assert.equal(isAutoLoopRecoverable(BLOCKED), true);
+});
+
+test("isAutoLoopRecoverable: blocked with needs-human kind → false (requires human intervention)", () => {
+  assert.equal(isAutoLoopRecoverable(BLOCKED_NEEDS_HUMAN), false);
 });
 
 test("isAutoLoopRecoverable: error → false", () => {

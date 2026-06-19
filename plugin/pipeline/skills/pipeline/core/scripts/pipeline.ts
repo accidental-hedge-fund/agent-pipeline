@@ -107,13 +107,17 @@ const MAX_ITERATIONS = 12;
 
 /**
  * A non-advancing outcome is auto-loop recoverable when it is `waiting` (the
- * stage explicitly signals a retriable temporary state) or `blocked` (all
- * blocker kinds have a pipeline-owned recovery recipe in BLOCKER_RECIPES).
- * Non-recoverable: `error`, `no-op`, `finalized`.
+ * stage explicitly signals a retriable temporary state) or `blocked` with a
+ * pipeline-owned recovery (i.e. blockerKind is not `needs-human`).
+ * Non-recoverable: `error`, `no-op`, `finalized`, and any `blocked` outcome
+ * whose blockerKind is `needs-human` (requires human intervention).
  */
 export function isAutoLoopRecoverable(out: Outcome): boolean {
   if (out.advanced) return false;
-  return out.status === "waiting" || out.status === "blocked";
+  if (out.status === "waiting") return true;
+  if (out.status !== "blocked") return false;
+  // needs-human blockers require human intervention — not pipeline-recoverable.
+  return out.blockerKind !== "needs-human";
 }
 
 /**
