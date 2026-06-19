@@ -316,24 +316,25 @@ export function partitionFindings(
 
 // Machine-readable override sentinel, mirroring the `reviewed-sha` precedent
 // (#16). Anchored to line-start; the disposition token is recorded for display.
-// Global flag so a single comment can carry several overrides; callers reset
-// lastIndex before/after iterating.
-const OVERRIDE_RE = /^<!-- pipeline-override: ([0-9a-f]{8}) (.+?) -->$/gm;
+const OVERRIDE_RE = /^<!-- pipeline-override: ([0-9a-f]{8}) (.+?) -->$/m;
+const OVERRIDE_HEADING = "## Pipeline: Finding override";
 
 /**
  * Collect active overrides from issue/PR comments as key → disposition text.
  * A later override for the same key wins (lets a human revise a disposition).
+ *
+ * Security invariants (parallel to extractScopedOverrides, #229 Finding 3):
+ * 1. Only comments with the `## Pipeline: Finding override` heading are processed.
+ * 2. Only the last non-empty line is parsed as the machine sentinel.
  */
 export function extractOverrides(comments: { body: string }[]): Map<string, string> {
   const map = new Map<string, string>();
   for (const c of comments) {
-    OVERRIDE_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = OVERRIDE_RE.exec(c.body)) !== null) {
-      map.set(m[1], m[2].trim());
-    }
+    if (!c.body.startsWith(OVERRIDE_HEADING)) continue;
+    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    const m = OVERRIDE_RE.exec(lastLine);
+    if (m) map.set(m[1], m[2].trim());
   }
-  OVERRIDE_RE.lastIndex = 0;
   return map;
 }
 

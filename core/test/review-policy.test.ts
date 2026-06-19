@@ -315,18 +315,19 @@ test("extractOverrides: reads pipeline-override sentinels (key → disposition)"
   const comments = [
     { body: "## Pipeline: Finding override\n\nstuff\n\n<!-- pipeline-override: a1b2c3d4 rejected -->" },
     { body: "unrelated comment" },
+    // bare sentinel without heading — must be ignored (#229 Finding 3)
     { body: "<!-- pipeline-override: 99887766 deferred-#85 -->" },
   ];
   const m = extractOverrides(comments);
   assert.equal(m.get("a1b2c3d4"), "rejected");
-  assert.equal(m.get("99887766"), "deferred-#85");
-  assert.equal(m.size, 2);
+  assert.equal(m.get("99887766"), undefined, "sentinel without heading must be ignored");
+  assert.equal(m.size, 1);
 });
 
 test("extractOverrides: a later override for the same key wins", () => {
   const comments = [
-    { body: "<!-- pipeline-override: a1b2c3d4 rejected -->" },
-    { body: "<!-- pipeline-override: a1b2c3d4 deferred-#85 -->" },
+    { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: a1b2c3d4 rejected -->" },
+    { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: a1b2c3d4 deferred-#85 -->" },
   ];
   assert.equal(extractOverrides(comments).get("a1b2c3d4"), "deferred-#85");
 });
@@ -334,10 +335,27 @@ test("extractOverrides: a later override for the same key wins", () => {
 test("extractOverrides: ignores prose mentions and malformed sentinels", () => {
   const comments = [
     { body: "I think override a1b2c3d4 should apply" }, // not a sentinel
-    { body: "<!-- pipeline-override: SHORT rejected -->" }, // bad key
-    { body: "<!-- pipeline-override: a1b2c3d4 -->" }, // missing disposition
+    { body: "<!-- pipeline-override: SHORT rejected -->" }, // bad key, no heading
+    { body: "<!-- pipeline-override: a1b2c3d4 -->" }, // missing disposition, no heading
   ];
   assert.equal(extractOverrides(comments).size, 0);
+});
+
+test("extractOverrides: sentinel-shaped line in reason text of a finding-override comment is not parsed (#229 Finding 3)", () => {
+  // A finding-override reason could contain a pipeline-override sentinel-shaped line.
+  // Only the last non-empty line (the machine sentinel) is parsed.
+  const injectedKey = "deadbeef";
+  const body = overrideComment({
+    key: "a1b2c3d4",
+    disposition: "rejected",
+    reason: `real reason\n\n<!-- pipeline-override: ${injectedKey} rejected -->`,
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const m = extractOverrides([{ body }]);
+  assert.equal(m.get("a1b2c3d4"), "rejected", "intended key must be extracted");
+  assert.equal(m.get(injectedKey), undefined, "injected key in reason text must not be extracted");
+  assert.equal(m.size, 1);
 });
 
 test("overrideComment round-trips through extractOverrides", () => {

@@ -725,7 +725,7 @@ test("advanceReview (#17): an operator override on a blocking finding advances i
       state: "open",
       url: "https://example.test/1",
       labels: [],
-      comments: [{ body: `<!-- pipeline-override: ${key} rejected -->` }],
+      comments: [{ body: `## Pipeline: Finding override\n\n<!-- pipeline-override: ${key} rejected -->` }],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -1650,7 +1650,7 @@ test("advanceReview: cache hit with all blocking keys overridden → advances in
     `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
     `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
   ].join("\n");
-  const overrideComment = `<!-- pipeline-override: ${blockingKey} wontfix — out of scope -->`;
+  const overrideComment = `## Pipeline: Finding override\n\n<!-- pipeline-override: ${blockingKey} wontfix — out of scope -->`;
 
   const { deps, rec } = makeDeps([APPROVE]);
   deps.getIssueDetail = async () =>
