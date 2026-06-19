@@ -24,18 +24,20 @@ import {
   DELTA_REVIEW_MARKER_PREFIX,
   diffFilePaths,
   extractBlockingKeysFromComment,
+  extractCeilingFollowupNumber,
   extractDiffHashFromComment,
   extractReview1Risk,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
   reviewCeilingComment,
+  reviewCeilingDemotionComment,
   type AdvanceReviewDeps,
 } from "../scripts/stages/review.ts";
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
-import { findingKey, scopedOverrideComment } from "../scripts/review-policy.ts";
+import { extractOverrides, findingKey, overrideComment, scopedOverrideComment, severityRank } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -2306,4 +2308,341 @@ test("#232 regression (e): stale low-risk review-1 sentinel (SHA mismatch) → r
     "stale low-risk sentinel must not relax review-2: medium finding should block at the configured threshold",
   );
   assert.equal(outcome.to, "fix-2");
+});
+
+// ---------------------------------------------------------------------------
+// Review ceiling demote-and-advance (#233)
+// ---------------------------------------------------------------------------
+
+// Config used for demote-and-advance tests (medium threshold, cap 3)
+const cfgDemote = {
+  ...cfgConverge,
+  review_policy: {
+    ...cfgConverge.review_policy,
+    ceiling_action: "demote_and_advance",
+  },
+} as unknown as PipelineConfig;
+
+// A medium-severity finding (below "high") that is demotable at the ceiling.
+const FINDING_MEDIUM: ReviewFinding = {
+  severity: "medium",
+  title: "minor nit",
+  body: "b",
+  confidence: 0.9,
+  recommendation: "tidy",
+};
+const NA_MEDIUM_ONLY =
+  '{"verdict":"needs-attention","summary":"minor issues","findings":' +
+  '[{"severity":"medium","title":"minor nit","body":"b","confidence":0.9,"recommendation":"tidy"}],' +
+  '"next_steps":[]}';
+
+// Task 4.1: severity-split helper — high/critical park; medium/low demote; unknown is medium.
+test("#233 (4.1): severityRank — high/critical ≥ high rank, medium/low < high rank, unknown treated as medium", () => {
+  const highRank = severityRank("high");
+  assert.ok(severityRank("high") >= highRank, "high >= high");
+  assert.ok(severityRank("critical") >= highRank, "critical >= high");
+  assert.ok(severityRank("medium") < highRank, "medium < high (demotable)");
+  assert.ok(severityRank("low") < highRank, "low < high (demotable)");
+  // Unknown/garbled severity falls to medium (demotable) per severityRank contract
+  assert.ok(severityRank("garbled") < highRank, "unknown severity treated as medium (demotable)");
+  assert.ok(severityRank("") < highRank, "empty severity treated as medium (demotable)");
+});
+
+// Task 4.7 for (a): bites — this test fails without the #233 fix (ceiling always parks).
+// We prove it bites by asserting the PRE-#233 behavior (hard-park) is now ABSENT.
+
+// Task 4.2 / Regression (a): ceiling with only medium findings + demote_and_advance
+// → demotion comment posted, one createIssue call, override dispositions recorded, pre-merge.
+test("#233 regression (a): ceiling + only-medium findings + demote_and_advance → demote + follow-up + pre-merge", async (t) => {
+  // Use hand-crafted prior comments WITHOUT the pipeline-blocking-keys marker so
+  // the recurrence check sees empty priorKeys and the ceiling branch fires instead.
+  // (Same technique as the existing convergence ceiling tests above.)
+  const priorR2 = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  // Inject createIssue seam
+  let createIssueCalls = 0;
+  let capturedIssueBody = "";
+  deps.createIssue = async (_title, body, _labels) => {
+    createIssueCalls++;
+    capturedIssueBody = body;
+    return 999; // mock follow-up issue number
+  };
+  deps.getIssueDetail = async () =>
+    ({
+      number: 42,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      // Two prior review-2 rounds; this is the 3rd (ceiling = 3)
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgDemote, 42, 2, {}, 0, deps);
+  });
+
+  // Must advance to pre-merge, NOT needs-human
+  assert.equal(outcome?.advanced, true, "must advance");
+  assert.equal(outcome?.to, "pre-merge", "must transition to pre-merge, not needs-human");
+  assert.deepEqual(rec.blocked, [], "must not block");
+  assert.ok(
+    rec.transitions.some((x) => x.to === "pre-merge"),
+    "transition to pre-merge must be recorded",
+  );
+  assert.ok(!rec.transitions.some((x) => x.to === "needs-human"), "must NOT park at needs-human");
+
+  // Exactly one follow-up issue created
+  assert.equal(createIssueCalls, 1, "exactly one follow-up issue must be created");
+  assert.match(capturedIssueBody, /minor nit/, "follow-up body must list the demoted finding");
+  assert.match(capturedIssueBody, /#42/, "follow-up body must back-link the original issue");
+
+  // A demotion comment must be posted
+  const demotionComment = rec.comments.find((c) =>
+    c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
+  );
+  assert.ok(demotionComment, "demotion comment must be posted");
+  assert.match(demotionComment!, /minor nit/, "demotion comment must list the demoted finding");
+  assert.match(demotionComment!, /<!-- pipeline-ceiling-followup: #999 -->/, "demotion comment must embed the follow-up marker");
+
+  // Override dispositions must be recorded for the demoted key
+  const demotedKey = findingKey(FINDING_MEDIUM);
+  const overrideComments = rec.comments.filter((c) =>
+    c.startsWith("## Pipeline: Finding override"),
+  );
+  assert.ok(overrideComments.length >= 1, "at least one override comment must be posted for demoted findings");
+  const overrides = extractOverrides(overrideComments.map((b) => ({ body: b })));
+  assert.ok(overrides.has(demotedKey), `override must be recorded for demoted key ${demotedKey}`);
+  assert.match(overrides.get(demotedKey)!, /deferred/, "override disposition must reference deferral");
+});
+
+// Task 4.3 / Regression (b): ceiling with a high finding present + demote_and_advance → needs-human.
+test("#233 regression (b): ceiling + high finding present + demote_and_advance → hard-park at needs-human", async (t) => {
+  // NA_WITH_FINDING has a high-severity finding — must always park
+  const priorR2 = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  let createIssueCalls = 0;
+  deps.createIssue = async () => { createIssueCalls++; return 0; };
+  deps.getIssueDetail = async () =>
+    ({
+      number: 43,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgDemote, 43, 2, {}, 0, deps);
+  });
+
+  assert.equal(outcome?.to, "needs-human", "high finding must still park at needs-human");
+  assert.equal(createIssueCalls, 0, "no follow-up issue must be created when a high finding is present");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "standard ceiling punch-list must be posted",
+  );
+  assert.ok(
+    !rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted")),
+    "demotion comment must NOT be posted when a high finding is present",
+  );
+});
+
+// Task 4.4 / Regression (c): ceiling + only medium findings + ceiling_action:park (default) → needs-human.
+test("#233 regression (c): ceiling + only medium findings + ceiling_action:park (default) → hard-park at needs-human", async (t) => {
+  const priorR2 = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let createIssueCalls = 0;
+  deps.createIssue = async () => { createIssueCalls++; return 0; };
+  deps.getIssueDetail = async () =>
+    ({
+      number: 44,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    // cfgConverge has no ceiling_action (defaults to park)
+    outcome = await advanceReview(cfgConverge, 44, 2, {}, 0, deps);
+  });
+
+  assert.equal(outcome?.to, "needs-human", "default park ceiling_action must hard-park at needs-human");
+  assert.equal(createIssueCalls, 0, "no follow-up issue with ceiling_action:park");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "standard ceiling punch-list must be posted",
+  );
+  assert.ok(
+    !rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted")),
+    "demotion comment must NOT be posted with ceiling_action:park",
+  );
+});
+
+// Task 4.5: Override dispositions recorded at the ceiling cover the demoted keys so
+// pre-merge does not re-park. This validates the full override round-trip.
+test("#233 (4.5): demoted findings' override dispositions satisfy extractOverrides so pre-merge sees no unresolved blockers", () => {
+  // Build a ceiling demotion comment with an override comment appended.
+  // Validate that extractOverrides produces an entry for the demoted key.
+  const partition = { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] };
+  const key = findingKey(FINDING_MEDIUM);
+  const dispositionComment = overrideComment({
+    key,
+    disposition: "deferred-#999",
+    reason: "auto-demoted at review ceiling (round 3/3); deferred to #999",
+    stage: "review-2",
+    timestamp: "2026-01-01T00:00:00Z",
+  });
+  // extractOverrides reads the pipeline-override sentinel on the last line
+  const overrides = extractOverrides([{ body: dispositionComment }]);
+  assert.ok(overrides.has(key), `override for demoted key ${key} must be recoverable by extractOverrides`);
+  assert.match(overrides.get(key)!, /deferred/, "disposition token must indicate deferral");
+  // Confirm: the demoted key NOT appearing in overrides would re-park the item.
+  const emptyOverrides = extractOverrides([]);
+  assert.ok(!emptyOverrides.has(key), "without override: key is unresolved (confirms the test is meaningful)");
+});
+
+// Task 4.6: Idempotency — a second ceiling entry with the follow-up marker already present
+// does NOT create a second issue and re-uses the recorded number.
+test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceiling-followup marker reuses follow-up number", async (t) => {
+  const FOLLOWUP_NUM = 777;
+  const demotionBody = reviewCeilingDemotionComment(
+    cfgDemote,
+    2,
+    "codex",
+    { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] },
+    3,
+    [],
+    FOLLOWUP_NUM,
+  );
+  const priorR2 = (sha: string) => ({
+    body: formatReviewComment(
+      { verdict: "needs-attention", summary: "medium nit", findings: [FINDING_MEDIUM], next_steps: [], commitSha: sha },
+      2,
+      "codex",
+      new Set([findingKey(FINDING_MEDIUM)]),
+    ),
+  });
+  // Same hand-crafted approach: no pipeline-blocking-keys marker so recurrence doesn't fire
+  const priorR2forIdem = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let createIssueCalls = 0;
+  deps.createIssue = async () => { createIssueCalls++; return 888; }; // would return 888 if called
+  deps.getIssueDetail = async () =>
+    ({
+      number: 45,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      // Two prior R2 rounds + the prior demotion comment that embeds the marker
+      comments: [priorR2forIdem("a".repeat(40)), priorR2forIdem("b".repeat(40)), { body: demotionBody }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgDemote, 45, 2, {}, 0, deps);
+  });
+
+  // Must still advance to pre-merge
+  assert.equal(outcome?.to, "pre-merge", "must advance to pre-merge on re-entry");
+  // Must NOT create a second issue
+  assert.equal(createIssueCalls, 0, "createIssue must NOT be called when the marker is already present");
+  // The posted demotion comment must reference the SAME follow-up number
+  const newDemotionComment = rec.comments.find((c) =>
+    c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
+  );
+  assert.ok(newDemotionComment, "a new demotion comment is still posted");
+  assert.match(
+    newDemotionComment!,
+    new RegExp(`<!-- pipeline-ceiling-followup: #${FOLLOWUP_NUM} -->`),
+    "re-entry demotion comment must reference the ORIGINAL follow-up number",
+  );
+});
+
+// extractCeilingFollowupNumber: basic round-trip
+test("#233: extractCeilingFollowupNumber reads the marker from any comment, last-occurrence-wins", () => {
+  const demotionBody = reviewCeilingDemotionComment(
+    cfgDemote,
+    2,
+    "codex",
+    { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] },
+    3,
+    [],
+    42,
+  );
+  assert.equal(extractCeilingFollowupNumber([{ body: demotionBody }]), 42);
+  assert.equal(extractCeilingFollowupNumber([]), null, "no comments → null");
+  assert.equal(extractCeilingFollowupNumber([{ body: "no marker here" }]), null, "missing marker → null");
+  // Last-occurrence-wins
+  const two = [{ body: demotionBody }, { body: reviewCeilingDemotionComment(cfgDemote, 2, "codex", { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] }, 3, [], 99) }];
+  assert.equal(extractCeilingFollowupNumber(two), 99, "last marker wins");
+});
+
+// Task 4.7: prove regressions bite — test (a) fails with ceiling_action:park (old default).
+// The "regression bites" property is inherent: regression (a) asserts `outcome.to === "pre-merge"`,
+// which is false under the old code (which always parks). Regression (b) asserts `needs-human`
+// for a high finding — that was already the old behavior so it bites in the opposite direction
+// (bites when a new path wrongly demotes a high finding). Regression (c) asserts park for the
+// default, which is the old behavior — bites if the default is changed. All three are already
+// covered above. This standalone test confirms the ceiling_action:park code path still parks
+// even when a demote cfg is absent from review_policy.
+test("#233 (4.7): missing ceiling_action key (undefined) defaults to park — medium finding hard-parks", async (t) => {
+  // Simulate a config where ceiling_action is not set (e.g. an old config).
+  const cfgNoCeilingAction = {
+    ...cfgConverge,
+    review_policy: {
+      block_threshold: "medium",
+      min_confidence: 0.7,
+      max_adversarial_rounds: 3,
+      risk_proportional: false,
+      // ceiling_action deliberately absent — should default to park
+    },
+  } as unknown as PipelineConfig;
+  const priorR2 = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let createIssueCalls = 0;
+  deps.createIssue = async () => { createIssueCalls++; return 0; };
+  deps.getIssueDetail = async () =>
+    ({
+      number: 46,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgNoCeilingAction, 46, 2, {}, 0, deps);
+  });
+  assert.equal(outcome?.to, "needs-human", "undefined ceiling_action must default to park");
+  assert.equal(createIssueCalls, 0, "no follow-up issue must be created with park default");
 });

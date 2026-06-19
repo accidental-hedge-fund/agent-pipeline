@@ -97,6 +97,7 @@ const PartialConfigSchema = z.object({
       min_confidence: z.number().min(0).max(1).optional().describe("Findings below this confidence score (0–1) advise rather than block."),
       max_adversarial_rounds: z.number().int().positive().optional().describe("Maximum adversarial review re-runs before routing still-blocking findings to needs-human."),
       risk_proportional: z.boolean().optional().describe("When true and review-1 approved with zero findings (low-risk), review-2 evaluates findings against a raised effective threshold (stricter of configured and 'high'), so medium/low findings advise rather than block. Default false — review-2 blocking unchanged."),
+      ceiling_action: z.enum(["park", "demote_and_advance"]).optional().describe("Action at the max_adversarial_rounds round-budget ceiling. park (default): hard-park at needs-human. demote_and_advance: auto-demote below-high findings to advisory, file a follow-up issue, and advance to pre-merge. High/critical findings always park regardless."),
     })
     .strict()
     .optional()
@@ -345,6 +346,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
       risk_proportional:
         fileConfig.review_policy?.risk_proportional ?? DEFAULT_CONFIG.review_policy.risk_proportional,
+      ceiling_action:
+        fileConfig.review_policy?.ceiling_action ?? DEFAULT_CONFIG.review_policy.ceiling_action,
     },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
@@ -585,6 +588,7 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_policy.min_confidence",
   "review_policy.max_adversarial_rounds",
   "review_policy.risk_proportional",
+  "review_policy.ceiling_action",
   "steps.plan_review",
   "steps.standard_review",
   "steps.adversarial_review",
@@ -916,6 +920,7 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
   max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
   # risk_proportional: ${d.review_policy.risk_proportional} # when true and review-1 approved with 0 findings (low risk), review-2 only blocks on high/critical findings (#232)
+  # ceiling_action: ${d.review_policy.ceiling_action} # park (default): hard-park at needs-human at the round ceiling; demote_and_advance: auto-demote below-high findings to advisory, file a follow-up issue, and advance to pre-merge (high/critical always park) (#233)
 
 doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
   runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure

@@ -241,6 +241,11 @@ export interface PipelineConfig {
     min_confidence: number; // 0..1; findings below this advise rather than block
     max_adversarial_rounds: number; // cap review-round re-runs before needs-human
     risk_proportional: boolean; // scale review-2 threshold by review-1 risk tier (#232)
+    // Action taken at the max_adversarial_rounds ceiling (#233). "park" (default):
+    // hard-park at needs-human unchanged. "demote_and_advance": auto-demote
+    // below-high findings to advisory, file a follow-up issue, and advance to
+    // pre-merge — high/critical findings continue to hard-park regardless.
+    ceiling_action: "park" | "demote_and_advance";
   };
   // Doctor / preflight (#146). Opt-in, deterministic capability check that runs
   // before any autonomous work. `runOnStart` (default false) makes the checks run
@@ -347,7 +352,7 @@ export const DEFAULT_CONFIG: Omit<
     rubric_path: ".github/shipcheck-rubric.md",
     block_on_partial: false,
   },
-  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false },
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const },
   doctor: { runOnStart: false, failFast: false },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,

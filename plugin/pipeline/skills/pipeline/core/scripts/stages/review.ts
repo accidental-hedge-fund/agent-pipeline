@@ -10,6 +10,7 @@
 // detection is conservative and defaults to "needs-attention".
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   findLatestCommentMatching,
   getGhActor,
@@ -38,7 +39,9 @@ import {
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  overrideComment,
   partitionFindings,
+  severityRank,
   type PartitionResult,
   type Review1Risk,
 } from "../review-policy.ts";
@@ -120,6 +123,10 @@ export interface AdvanceReviewDeps {
   /** Returns the authenticated GitHub username for comment-author verification (#228).
    *  Returns null when unavailable (network error / not authenticated). */
   getGhActor?: () => Promise<string | null>;
+  /** Create a GitHub issue and return its number (#233). Used by the demote-and-advance
+   *  path to file the single tracked follow-up issue for demoted findings. No pipeline:
+   *  stage label is applied to the follow-up. Default: real `gh issue create` wrapper. */
+  createIssue?: (title: string, body: string, labels: string[]) => Promise<number>;
 }
 
 type RunReviewFn = (
@@ -604,25 +611,110 @@ export async function advanceReview(
   // cycle to the iteration cap. `detail.comments` excludes the current round's
   // verdict (posted after the snapshot was fetched), so prior+1 = this round's number.
   if (roundCap > 0 && priorRoundComments.length + 1 >= roundCap) {
-    await postCommentFn(
-      cfg,
-      issueNumber,
-      reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments)),
+    // (#233) Split blocking findings into high/critical vs. below-high. High/critical
+    // always park at needs-human regardless of ceiling_action. Below-high may be
+    // demoted and the item advanced when ceiling_action is demote_and_advance.
+    const highOrCritical = partition.blocking.filter(
+      (f) => severityRank(f.severity) >= severityRank("high"),
     );
+    const belowHigh = partition.blocking.filter(
+      (f) => severityRank(f.severity) < severityRank("high"),
+    );
+
+    const shouldDemote =
+      highOrCritical.length === 0 &&
+      belowHigh.length > 0 &&
+      cfg.review_policy.ceiling_action === "demote_and_advance";
+
+    if (!shouldDemote) {
+      // Hard-park: any high/critical present, or ceiling_action is park (default).
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments)),
+      );
+      await transitionFn(
+        cfg,
+        issueNumber,
+        stage,
+        "needs-human",
+        `Review ${round} hit the ${roundCap}-round ceiling with ` +
+          `${partition.blocking.length} finding(s) still blocking. Recorded as advisory; parked at ` +
+          `needs-human for a human to override or fix (will NOT auto-advance to ready-to-deploy).`,
+      );
+      return {
+        advanced: true,
+        from: stage,
+        to: "needs-human",
+        summary: `review ceiling: ${partition.blocking.length} unresolved blocking → needs-human`,
+      };
+    }
+
+    // Demote-and-advance path (#233): all blocking findings are below high/critical,
+    // ceiling_action is demote_and_advance. Auto-demote, file a follow-up issue, and
+    // advance to pre-merge without human intervention.
+    const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);
+
+    // Idempotency: check existing comments for a prior follow-up marker. Re-use
+    // the recorded follow-up number instead of creating a second issue.
+    const existingFollowup = extractCeilingFollowupNumber(detail.comments);
+    let followupNumber: number;
+    if (existingFollowup !== null) {
+      followupNumber = existingFollowup;
+    } else {
+      // Build and create the single tracked follow-up issue.
+      const followupBody = buildFollowupIssueBody(issueNumber, belowHigh);
+      followupNumber = await createIssueFn(
+        `[Deferred] Review ceiling findings from #${issueNumber}`,
+        followupBody,
+        [],
+      );
+    }
+
+    // Post the audited demotion comment with the follow-up marker for idempotency.
+    const demotionBody = reviewCeilingDemotionComment(
+      cfg,
+      round,
+      reviewer,
+      partition,
+      roundCap,
+      priorRoundComments,
+      followupNumber,
+    );
+    await postCommentFn(cfg, issueNumber, reviewComment(demotionBody));
+
+    // Record an audited override disposition for each demoted finding so the
+    // pre-merge review-SHA gate's unresolved = recorded − overrides yields ∅
+    // for the demoted keys and the item advances through pre-merge.
+    const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    for (const f of belowHigh) {
+      const key = findingKey(f);
+      const disposition = `deferred-#${followupNumber}`;
+      const body = overrideComment({
+        key,
+        disposition,
+        reason: `auto-demoted at review ceiling (round ${priorRoundComments.length + 1}/${roundCap}); deferred to #${followupNumber}`,
+        stage: stage,
+        timestamp,
+        footer: cfg.marker_footer,
+      });
+      await postCommentFn(cfg, issueNumber, body);
+    }
+
+    const toStage: Stage = "pre-merge";
     await transitionFn(
       cfg,
       issueNumber,
       stage,
-      "needs-human",
-      `Review ${round} hit the ${roundCap}-round ceiling with ` +
-        `${partition.blocking.length} finding(s) still blocking. Recorded as advisory; parked at ` +
-        `needs-human for a human to override or fix (will NOT auto-advance to ready-to-deploy).`,
+      toStage,
+      `Review ${round} hit the ${roundCap}-round ceiling; ${belowHigh.length} below-high finding(s) ` +
+        `auto-demoted to advisory and deferred to #${followupNumber}. Advancing to pre-merge.`,
     );
     return {
       advanced: true,
       from: stage,
-      to: "needs-human",
-      summary: `review ceiling: ${partition.blocking.length} unresolved blocking → needs-human`,
+      to: toStage,
+      summary: `review ceiling: ${belowHigh.length} below-high findings demoted → pre-merge (follow-up #${followupNumber})`,
     };
   }
 
@@ -1521,6 +1613,149 @@ export function extractReview1Risk(
     }
   }
   return lastRisk;
+}
+
+// ---------------------------------------------------------------------------
+// Demote-and-advance helpers (#233)
+// ---------------------------------------------------------------------------
+
+// Machine-readable marker embedded in the demotion comment for idempotency.
+// Anchored to full line; global flag picks the last occurrence.
+const CEILING_FOLLOWUP_RE = /^<!-- pipeline-ceiling-followup: #(\d+) -->$/gm;
+
+/**
+ * Scan issue comments for an existing `<!-- pipeline-ceiling-followup: #N -->`
+ * marker, returning the recorded follow-up issue number or null when absent.
+ * Last-occurrence-wins (mirrors the reviewed-sha guard). Exported for tests.
+ */
+export function extractCeilingFollowupNumber(comments: { body: string }[]): number | null {
+  let last: number | null = null;
+  for (const c of comments) {
+    CEILING_FOLLOWUP_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = CEILING_FOLLOWUP_RE.exec(c.body)) !== null) {
+      last = Number(m[1]);
+    }
+  }
+  CEILING_FOLLOWUP_RE.lastIndex = 0;
+  return last;
+}
+
+/**
+ * Build the body of the single tracked follow-up issue filed when findings are
+ * demoted at the review ceiling (#233). Lists every demoted finding with its
+ * title, severity, category, override-key, and location, and back-links the
+ * original issue.
+ */
+function buildFollowupIssueBody(
+  originalIssue: number,
+  demotedFindings: ReviewFinding[],
+): string {
+  const lines = [
+    `Deferred review findings from #${originalIssue}`,
+    "",
+    `These findings were demoted to advisory at the adversarial review ceiling ` +
+      `(\`review_policy.max_adversarial_rounds\`) because they are all below high severity ` +
+      `and the pipeline is configured with \`ceiling_action: demote_and_advance\`. ` +
+      `They should be reviewed and addressed in a follow-up change.`,
+    "",
+    "## Deferred findings",
+  ];
+  for (const f of demotedFindings) {
+    const key = findingKey(f);
+    const loc = f.file
+      ? ` — \`${f.file}${f.line_start ? `:${f.line_start}` : ""}\``
+      : "";
+    const cat = f.category ? ` (category: ${f.category})` : "";
+    lines.push(
+      `- \`${key}\` **[${(f.severity ?? "medium").toUpperCase()}]** ${f.title}${cat}${loc}`,
+    );
+  }
+  lines.push(
+    "",
+    `> Deferred from #${originalIssue} at review ceiling. Do not add a \`pipeline:\` label — ` +
+      `this issue tracks follow-up work, not an in-progress pipeline run.`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Audited demotion comment posted at the review ceiling when ceiling_action is
+ * demote_and_advance and all remaining blocking findings are below high severity.
+ * Embeds the `<!-- pipeline-ceiling-followup: #N -->` marker for idempotency.
+ * Exported for tests.
+ */
+export function reviewCeilingDemotionComment(
+  cfg: PipelineConfig,
+  round: 1 | 2,
+  reviewer: string,
+  partition: PartitionResult,
+  cap: number,
+  priorReviewComments: { body: string }[],
+  followupNumber: number,
+): string {
+  const priorKeySets = priorReviewComments.map((c) => extractAllKeysFromComment(c.body));
+  const lines = [
+    `## Pipeline: Review ceiling — findings demoted and deferred`,
+    "",
+    `**Reviewer**: ${reviewer}`,
+    `Review ${round} re-ran ${cap} times and still has ${partition.blocking.length} blocking ` +
+      `finding(s), all below **high** severity. Per \`review_policy.ceiling_action: demote_and_advance\`, ` +
+      `these findings are demoted to **advisory** and captured in follow-up issue #${followupNumber}. ` +
+      `This item advances to pre-merge without human intervention.`,
+    "",
+    "### Demoted findings (advisory — tracked in follow-up)",
+  ];
+  for (const f of partition.blocking) {
+    const key = findingKey(f);
+    const loc = f.file ? ` — \`${f.file}${f.line_start ? `:${f.line_start}` : ""}\`` : "";
+    lines.push(
+      `- **${recurrenceTag(key, priorKeySets)}** \`${key}\` ` +
+        `**[${(f.severity ?? "medium").toUpperCase()}]** ${f.title}${loc}`,
+    );
+  }
+  lines.push(
+    "",
+    `See #${followupNumber} for the complete deferred finding list.`,
+    "",
+    "⚠️ The demoted findings were **not fixed** — review them before merging this PR.",
+    "",
+    (cfg.marker_footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
+    "",
+    `<!-- pipeline-ceiling-followup: #${followupNumber} -->`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Default `createIssue` dep for {@link advanceReview}. Uses `gh issue create`
+ * in the repo's directory, matching the pattern from intake.ts's real dep.
+ */
+function defaultCreateIssue(
+  cfg: PipelineConfig,
+): (title: string, body: string, labels: string[]) => Promise<number> {
+  return async (title: string, body: string, labels: string[]): Promise<number> => {
+    const args = ["issue", "create", "--title", title, "--body", body, "-R", cfg.repo];
+    for (const label of labels) {
+      args.push("--label", label);
+    }
+    const result = spawnSync("gh", args, {
+      encoding: "utf8",
+      stdio: "pipe",
+      cwd: cfg.repo_dir,
+    });
+    if (result.status !== 0) {
+      throw new Error(
+        `[pipeline review] gh issue create failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+      );
+    }
+    const url = result.stdout.trim();
+    const m = url.match(/\/(\d+)$/);
+    if (!m) {
+      throw new Error(`[pipeline review] could not parse issue number from gh output: ${url}`);
+    }
+    return Number(m[1]);
+  };
 }
 
 // Internal export for tests, so review.test isn't needed.
