@@ -234,10 +234,10 @@ export async function advanceReview(
   // Skipped in dry-run so testing harnesses don't see unexpected early returns.
   if (!opts.dryRun) {
     // Require BOTH the pipeline footer AND the pipeline author to reject forged review
-    // comments (#228 Finding 6): any commenter can copy the footer and diff hash; only
-    // the authenticated gh user who runs the pipeline can have authored a real review.
-    // If the actor lookup fails (not authenticated, network error) we fall back to the
-    // footer-only check rather than skipping caching entirely.
+    // comments (#228 Finding 6 + 8): any commenter can copy the footer and diff hash;
+    // only the authenticated gh user who runs the pipeline can have authored a real review.
+    // Fail-closed: if the actor lookup fails (network error, not authenticated), produce
+    // an empty trusted set so the cache is bypassed and the reviewer runs fresh (#228 Finding 8).
     const getGhActorFn = deps.getGhActor ?? getGhActor;
     const actor = await getGhActorFn();
     const footer = cfgFooter(cfg);
@@ -245,7 +245,8 @@ export async function advanceReview(
       (c) =>
         c.body.startsWith(roundPfx) &&
         c.body.includes(footer) &&
-        (actor === null || c.author === actor)
+        actor !== null &&
+        c.author === actor
     );
     const latestPriorComment = priorRoundCommentsForCache[priorRoundCommentsForCache.length - 1];
     if (latestPriorComment) {

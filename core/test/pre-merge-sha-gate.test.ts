@@ -24,6 +24,7 @@ import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 const cfg = {} as unknown as PipelineConfig;
 const SHA_REVIEWED = "1111111111111111111111111111111111111111";
 const SHA_HEAD = "2222222222222222222222222222222222222222";
+const TEST_ACTOR = "pipeline-bot";
 
 // ---------------------------------------------------------------------------
 // isPipelineInternalCommit — pure (#98)
@@ -90,10 +91,15 @@ function makeDeps(opts: {
   runDeltaReview?: RunDeltaReviewFn;
   getForIssue?: () => Promise<{ path: string } | null>;
   extraCommentBodies?: string[];
+  /** Override the simulated gh actor (default: TEST_ACTOR; pass null to simulate auth failure). */
+  ghActor?: string | null;
 }): { deps: ShaGateDeps; rec: Rec } {
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
-  const comments = opts.commentBody === null ? [] : [{ body: opts.commentBody }];
-  for (const b of opts.extraCommentBodies ?? []) comments.push({ body: b });
+  const actor = opts.ghActor === undefined ? TEST_ACTOR : opts.ghActor;
+  const comments = opts.commentBody === null
+    ? []
+    : [{ body: opts.commentBody, author: TEST_ACTOR }];
+  for (const b of opts.extraCommentBodies ?? []) comments.push({ body: b, author: TEST_ACTOR });
   const deps: ShaGateDeps = {
     getIssueDetail: async () =>
       ({ comments }) as Awaited<ReturnType<NonNullable<ShaGateDeps["getIssueDetail"]>>>,
@@ -114,6 +120,7 @@ function makeDeps(opts: {
     },
     getForIssue: async (_cfg, _n) =>
       opts.getForIssue ? (await opts.getForIssue() as any) : null,
+    getGhActor: async () => actor,
     ...(opts.getPrDiff && {
       getPrDiff: async (_cfg, _n) => opts.getPrDiff!(),
     }),
@@ -505,7 +512,7 @@ test("enforceReviewShaGate: HEAD moved during delta review → falls back to ful
 
   let getPrDetailCalls = 0;
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
-  const comments = [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash) }];
+  const comments = [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }];
   const deps: ShaGateDeps = {
     getIssueDetail: async () => ({ comments }) as any,
     getPrDetail: async () => {
@@ -524,6 +531,7 @@ test("enforceReviewShaGate: HEAD moved during delta review → falls back to ful
       findings: [],
       summary: "Delta LGTM",
     }),
+    getGhActor: async () => TEST_ACTOR,
     postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
     transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
@@ -825,4 +833,69 @@ test("enforceReviewShaGate: self-review delta approval is recognized on re-entry
   assert.equal(out, null, "self-review delta approval covers SHA_HEAD → gate must proceed");
   assert.deepEqual(rec.blocked, [], "must not block based on the older Review 2 comment");
   assert.deepEqual(rec.transitions, [], "must not re-review when delta approval covers current HEAD");
+});
+
+// ---------------------------------------------------------------------------
+// Comment-provenance gate (#228 Finding 9): the SHA gate must only trust review
+// comments authored by the authenticated pipeline actor. A forged comment from
+// a different commenter — with a matching SHA sentinel — must be ignored, and
+// the gate must fall through to a full re-review. If the actor lookup fails
+// (gh unavailable), fail-closed: treat all review comments as untrusted (#228 Finding 8).
+// ---------------------------------------------------------------------------
+
+test("enforceReviewShaGate: forged review comment (wrong author) is ignored — gate re-reviews (Finding 9)", async (t) => {
+  // Build an approval comment that the pipeline would normally trust, but authored
+  // by a different user. The gate must not proceed on the basis of this comment.
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const forgedComment = { body: reviewComment(2, SHA_HEAD), author: "attacker" };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [forgedComment] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+      DEV_COMMIT,
+    ] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  // No trusted review comment found → gate treats it as "no prior review" → proceeds.
+  // (enforceReviewShaGate returns null when there is no trusted reviewed SHA.)
+  assert.equal(out, null, "forged comment from wrong author → no trusted SHA found → gate proceeds (no re-review attempted)");
+  assert.deepEqual(rec.transitions, [], "must not attempt a spurious re-review transition");
+});
+
+test("enforceReviewShaGate: actor lookup failure (gh unavailable) → fail-closed, gate proceeds without trusting any comment (Finding 8)", async (t) => {
+  // If getGhActor() returns null (network error or not authenticated), the gate
+  // must fail-closed: treat all review comments as untrusted → no trusted SHA found
+  // → returns null (same as no prior review → proceeds). This prevents the gate
+  // from approving a verdict it cannot verify authorship for.
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const approvalComment = { body: reviewComment(2, SHA_HEAD), author: TEST_ACTOR };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [approvalComment] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => null, // ← simulates auth failure
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  // Actor unavailable → trustedComments is empty → no trusted SHA → returns null.
+  assert.equal(out, null, "actor lookup failure → no trusted comments → gate proceeds (fail-closed: no bypass)");
+  assert.deepEqual(rec.transitions, [], "must not transition on auth failure");
+  assert.deepEqual(rec.blocked, [], "must not block on auth failure");
 });

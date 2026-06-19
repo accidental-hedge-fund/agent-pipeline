@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   findLatestCommentMatching,
+  getGhActor,
   getIssueDetail,
   getPrChecks,
   getPrCommits,
@@ -404,6 +405,9 @@ export interface ShaGateDeps {
   setBlocked?: typeof setBlocked;
   /** Looks up the issue worktree path and slug for the delta reviewer's CWD and OpenSpec context (#228). */
   getForIssue?: typeof getForIssue;
+  /** Returns the authenticated GitHub username so the SHA gate only trusts
+   *  pipeline-authored review comments (#228 Finding 9). */
+  getGhActor?: () => Promise<string | null>;
 }
 
 /**
@@ -430,9 +434,21 @@ export async function enforceReviewShaGate(
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getGhActorFn = deps.getGhActor ?? getGhActor;
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
-  const reviewed = extractReviewedSha(detail.comments);
+
+  // Only trust review comments authored by the authenticated pipeline actor (#228
+  // Finding 9). Any commenter can post a forged `## Review 2 — approve` body with
+  // a matching `reviewed-sha`; filtering to the gh user who runs the pipeline makes
+  // forged verdicts invisible to the SHA/diff-hash reuse checks. Fail-closed: when
+  // the actor is unavailable (network error), treat all review comments as untrusted
+  // and fall through to a normal full re-review rather than short-circuiting.
+  const actor = await getGhActorFn();
+  const trustedComments =
+    actor !== null ? detail.comments.filter((c) => c.author === actor) : [];
+
+  const reviewed = extractReviewedSha(trustedComments);
   // No prior review comment (e.g. review steps disabled, or first run) → nothing
   // to validate; let pre-merge proceed as normal.
   if (!reviewed) return null;
@@ -480,7 +496,7 @@ export async function enforceReviewShaGate(
   // reviewed-sha == HEAD; see reuseBlockedBy).
   if (reviewed.sha && reviewed.sha === head) {
     return (
-      (await reuseBlockedBy(findLatestReviewCommentBody(detail.comments, reviewed.round), "")) ??
+      (await reuseBlockedBy(findLatestReviewCommentBody(trustedComments, reviewed.round), "")) ??
       null
     );
   }
@@ -508,7 +524,7 @@ export async function enforceReviewShaGate(
           // approval even across pipeline-internal commits (#228).
           return (
             (await reuseBlockedBy(
-              findLatestReviewCommentBody(detail.comments, reviewed.round),
+              findLatestReviewCommentBody(trustedComments, reviewed.round),
               " (verdict reused across pipeline-internal commits)",
             )) ?? null
           );
@@ -527,7 +543,7 @@ export async function enforceReviewShaGate(
     try {
       const currentDiff = await getPrDiffFn(cfg, prNumber);
       const currentHash = computeDiffHash(currentDiff);
-      const priorCommentBody = findLatestReviewCommentBody(detail.comments, reviewed.round);
+      const priorCommentBody = findLatestReviewCommentBody(trustedComments, reviewed.round);
       const cachedHash = priorCommentBody ? extractDiffHashFromComment(priorCommentBody) : null;
 
       if (cachedHash !== null && cachedHash === currentHash) {
