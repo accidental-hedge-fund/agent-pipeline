@@ -57,6 +57,8 @@ The orchestrator SHALL append a `stage_start` event when a stage handler is ente
 ### Requirement: Key run lifecycle events are recorded in events.jsonl
 The orchestrator SHALL append a `run_start` event immediately after the run directory is created and a `run_complete` event at finalization. Additional events SHALL be appended for significant state changes: `pr_created` (PR opened), `pr_updated` (PR updated), `worktree_created`, `worktree_removed`, `review_verdict` (per review round), `blocker_set`, and `blocker_cleared`. Each event type SHALL carry its type-specific fields in addition to the base `schema_version`, `type`, and `at` fields.
 
+The `review_verdict` event SHALL additionally carry a `findings` array — one record per finding enumerated by the round — and the reviewer identity for the round (`reviewer_harness`, `reviewer_model`, `self_review`). Each finding record SHALL contain `key` (the stable `findingKey`), `severity`, `title`, `body`, `confidence`, and `recommendation`, and SHALL contain `file`, `line_start`, `line_end`, `category`, and `blocking` when the finding carries them. Each finding record SHALL also carry `effective_blocking` (boolean, computed from `partitionFindings` after the active policy is applied) and `payload_fingerprint` (`findingPayloadFingerprint(finding)` — disambiguates same-key distinct findings within a round). The `findings` array and reviewer-identity fields are additive optional fields, so `schema_version` SHALL remain `1`; their text fields SHALL be screened by the write-time injection denylist and secret redaction before the line is appended.
+
 #### Scenario: run_start event appended at init
 - **WHEN** `initRunDir(...)` completes successfully
 - **THEN** a `run_start` event SHALL be appended to `events.jsonl`
@@ -72,13 +74,26 @@ The orchestrator SHALL append a `run_start` event immediately after the run dire
 - **THEN** a `review_verdict` event SHALL be appended to `events.jsonl`
 - **AND** the event SHALL contain `round` (integer), `sha` (string), `verdict` (string), and `finding_counts` (object)
 
+#### Scenario: review_verdict event carries per-finding records
+- **WHEN** a review round enumerates one or more findings
+- **THEN** the `review_verdict` event SHALL contain a `findings` array with one record per finding
+- **AND** each record SHALL contain `key`, `severity`, `title`, `body`, `confidence`, and `recommendation`
+- **AND** `file`, `line_start`, `line_end`, `category`, and `blocking` SHALL be present when the finding carries them
+
+#### Scenario: review_verdict event carries reviewer identity
+- **WHEN** a review round completes
+- **THEN** the `review_verdict` event SHALL contain `reviewer_harness` (the harness that actually reviewed), `reviewer_model`, and `self_review` (boolean)
+
+#### Scenario: review_verdict with zero findings carries an empty array
+- **WHEN** a review round produces a verdict with no enumerated findings
+- **THEN** the `review_verdict` event SHALL contain `findings: []`
+- **AND** SHALL still contain `round`, `sha`, `verdict`, and `finding_counts`
+
 #### Scenario: blocker_set and blocker_cleared events enable blocking state reconstruction
 - **WHEN** the pipeline sets a blocking condition
 - **THEN** a `blocker_set` event SHALL be appended with a `reason` string
 - **WHEN** the blocking condition is cleared
 - **THEN** a `blocker_cleared` event SHALL be appended
-
----
 
 ### Requirement: --json-events flag streams lifecycle events to stdout
 When the pipeline CLI is invoked with `--json-events`, each event appended to `events.jsonl` SHALL also be written to stdout as the same JSON line (identical content). Human-readable pipeline output SHALL continue to be written to `terminal.log` (and stderr where applicable). The `--json-events` flag SHALL NOT suppress, redirect, or modify the content written to `terminal.log`.
