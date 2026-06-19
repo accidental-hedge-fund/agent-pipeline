@@ -783,3 +783,46 @@ test("enforceReviewShaGate: pipeline-internal-only commits cannot reuse a blocki
   assert.equal((out as any)?.status, "blocked");
   assert.equal(rec.blocked.length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Self-review banner placement (#228 Finding 5): the banner must appear AFTER
+// the heading so isDeltaReviewComment (startsWith) still recognizes the comment
+// on subsequent pre-merge re-entries. A banner prepended before the heading
+// made the self-review delta comment invisible — the gate fell back to an
+// older Review 2 comment and triggered a spurious re-review or stale-blocker
+// re-check.
+// ---------------------------------------------------------------------------
+
+test("enforceReviewShaGate: self-review delta approval is recognized on re-entry (Finding 5)", async (t) => {
+  // Build a correctly-formatted self-review delta approval: banner AFTER heading.
+  // This mirrors what the fixed code posts (heading first, banner second line).
+  const selfReviewDeltaApproval = [
+    `${DELTA_REVIEW_MARKER_PREFIX} — approve (commit ${SHA_HEAD.slice(0, 7)})`,
+    "",
+    "> ⚠️ **Same-harness self-review (#39).** The cross-harness reviewer `codex` is not installed.",
+    "",
+    "**Reviewer**: claude (self-review)",
+    "",
+    "Delta LGTM: no new issues introduced.",
+    "",
+    `<!-- reviewed-sha: ${SHA_HEAD} -->`,
+    `<!-- verdict-diff-hash: abcd1234abcd1234 -->`,
+  ].join("\n");
+
+  // Older Review 2 blocking comment — must NOT be selected if the delta comment is visible.
+  const olderBlockingR2 = blockingReviewComment(2, SHA_REVIEWED, ["stalekey"]);
+
+  const { deps, rec } = makeDeps({
+    commentBody: olderBlockingR2,
+    headSha: SHA_HEAD,
+    extraCommentBodies: [selfReviewDeltaApproval],
+  });
+
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "self-review delta approval covers SHA_HEAD → gate must proceed");
+  assert.deepEqual(rec.blocked, [], "must not block based on the older Review 2 comment");
+  assert.deepEqual(rec.transitions, [], "must not re-review when delta approval covers current HEAD");
+});
