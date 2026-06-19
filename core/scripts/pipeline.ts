@@ -39,7 +39,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
-import { overrideComment, parseOverrideArg } from "./review-policy.ts";
+import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
 import {
@@ -1554,14 +1554,32 @@ export async function runOverride(
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   const stage = pickStage(detail.labels) ?? "(unknown)";
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-  const body = overrideComment({
-    key: parsed.key,
-    disposition: parsed.disposition,
-    reason: parsed.reason,
-    stage,
-    timestamp: ts,
-    footer: cfg.marker_footer,
-  });
+  // Branch on kind: scope dispositions use a distinct sentinel so extractScopedOverrides
+  // can read them back; key dispositions keep the existing pipeline-override sentinel.
+  let body: string;
+  let overrideLogMsg: string;
+  if (parsed.kind === "scope") {
+    body = scopedOverrideComment({
+      scopeType: parsed.scopeType,
+      scopeValue: parsed.scopeValue,
+      disposition: parsed.disposition,
+      reason: parsed.reason,
+      stage,
+      timestamp: ts,
+      footer: cfg.marker_footer,
+    });
+    overrideLogMsg = `recorded scoped override for ${parsed.scopeType}:${parsed.scopeValue} (${parsed.disposition}).`;
+  } else {
+    body = overrideComment({
+      key: parsed.key,
+      disposition: parsed.disposition,
+      reason: parsed.reason,
+      stage,
+      timestamp: ts,
+      footer: cfg.marker_footer,
+    });
+    overrideLogMsg = `recorded override for finding ${parsed.key} (${parsed.disposition}).`;
+  }
   await deps.postComment(cfg, issueNumber, body);
   // If the item is blocked (e.g. a review round blocked on this finding), clear
   // the blocker so the resumed run can re-evaluate with the override applied.
@@ -1569,9 +1587,7 @@ export async function runOverride(
     await deps.clearBlocked(cfg, issueNumber);
     await appendBlockerCleared(cfg.repo_dir, issueNumber);
   }
-  console.log(
-    `[pipeline] #${issueNumber}: recorded override for finding ${parsed.key} (${parsed.disposition}).`,
-  );
+  console.log(`[pipeline] #${issueNumber}: ${overrideLogMsg}`);
 
   // #135: the human's judgment WAS the key+reason — everything from here is
   // deterministic (the advance loop re-runs partitionFindings against the

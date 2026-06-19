@@ -1,4 +1,4 @@
-// Unit tests for the review severity policy + audited overrides (#17).
+// Unit tests for the review severity policy + audited overrides (#17, #229).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -12,13 +12,16 @@ import {
   findingPayloadFingerprint,
   partitionFindings,
   extractOverrides,
+  extractScopedOverrides,
   isValidFindingKey,
   overrideComment,
+  scopedOverrideComment,
   parseOverrideArg,
   SPEC_DIVERGENCE_CATEGORY,
   categoryMarker,
   reviewCommentFlagsSpecDivergence,
   type ReviewPolicy,
+  type ScopedOverride,
 } from "../scripts/review-policy.ts";
 import type { ReviewFinding } from "../scripts/types.ts";
 
@@ -412,4 +415,259 @@ test("reviewCommentFlagsSpecDivergence: matches the emitted marker, not prose", 
 
 test("categoryMarker: single-sources the exact emitted token", () => {
   assert.equal(categoryMarker(SPEC_DIVERGENCE_CATEGORY), "`category: spec-divergence`");
+});
+
+// ---------------------------------------------------------------------------
+// Scoped overrides (#229)
+// ---------------------------------------------------------------------------
+
+// ---- 6.1: parseOverrideArg — scope type parsing ----
+
+test("parseOverrideArg: category scope parses to kind=scope with normalized value", () => {
+  const r = parseOverrideArg("category:rollback-safety: deferred #90");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  assert.equal(r.kind, "scope");
+  if (r.kind !== "scope") return;
+  assert.equal(r.scopeType, "category");
+  assert.equal(r.scopeValue, "rollback-safety");
+  assert.equal(r.disposition, "deferred-#90");
+  assert.equal(r.reason, "deferred #90");
+});
+
+test("parseOverrideArg: file scope parses to kind=scope", () => {
+  const r = parseOverrideArg("file:src-tauri/src/repo.rs: deferred #90");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  assert.equal(r.kind, "scope");
+  if (r.kind !== "scope") return;
+  assert.equal(r.scopeType, "file");
+  assert.equal(r.scopeValue, "src-tauri/src/repo.rs");
+  assert.equal(r.disposition, "deferred-#90");
+});
+
+test("parseOverrideArg: category scope value is normalized to lowercase", () => {
+  const r = parseOverrideArg("category:Rollback-Safety: rejected — handled");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  if (r.kind !== "scope") return;
+  assert.equal(r.scopeValue, "rollback-safety");
+  assert.equal(r.disposition, "rejected");
+});
+
+test("parseOverrideArg: bare 8-hex key still parses to kind=key (backward compat)", () => {
+  const r = parseOverrideArg("a1b2c3d4: rejected — false positive");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  assert.equal(r.kind, "key");
+  if (r.kind !== "key") return;
+  assert.equal(r.key, "a1b2c3d4");
+  assert.equal(r.disposition, "rejected");
+});
+
+test("parseOverrideArg: rejects empty scope value (category: with no name)", () => {
+  // "category: reason" — the ": " separator is found but the value before it is empty
+  // after trim (actually " reason" has no ": " so it errors on no-separator).
+  // Either way it must fail.
+  const r = parseOverrideArg("category:: reason");
+  assert.ok("error" in r, "empty scope value must be rejected");
+});
+
+test("parseOverrideArg: rejects missing reason separator in scoped arg", () => {
+  // "category:name" with no ": " separating value from reason
+  const r = parseOverrideArg("category:rollback-safety");
+  assert.ok("error" in r, "scope arg without ': <reason>' must be rejected");
+});
+
+test("parseOverrideArg: rejects empty reason in scoped arg", () => {
+  // "category:name:   " — value is present but reason is blank after trim
+  // Parsing: rest = "name:   ", sep at index 4 (colon-space "e:  " no...).
+  // Actually "name:   " contains ": " at index 4 → value = "name", reason = "  ".trim() = "" → error
+  const r = parseOverrideArg("category:rollback-safety:   ");
+  assert.ok("error" in r, "empty reason must be rejected");
+});
+
+// ---- 6.2: partitionFindings — category scope ----
+
+test("partitionFindings: category scope overrides all matching findings regardless of key", () => {
+  // Two HIGH findings with category "rollback-safety", different keys.
+  const f1 = finding({ severity: "high", title: "missing rollback A", file: "a.ts", line_start: 1, category: "rollback-safety" });
+  const f2 = finding({ severity: "high", title: "missing rollback B", file: "b.ts", line_start: 1, category: "rollback-safety" });
+  assert.notEqual(findingKey(f1), findingKey(f2), "precondition: different keys");
+
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "deferred-#90", reason: "deferred #90" }];
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+
+  assert.equal(p.blocking.length, 0, "no findings should block");
+  assert.equal(p.overridden.length, 2, "both findings should be overridden");
+  assert.ok(p.overridden.every((e) => e.kind === "scope"), "entries are kind=scope");
+  assert.ok(p.overridden.every((e) => e.kind === "scope" && e.scopeType === "category" && e.scopeValue === "rollback-safety"), "scope info preserved");
+});
+
+test("partitionFindings: category scope does not affect non-matching category", () => {
+  const f1 = finding({ severity: "high", title: "rollback missing", category: "rollback-safety" });
+  const f2 = finding({ severity: "high", title: "auth missing", category: "security" });
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+
+  assert.equal(p.overridden.length, 1);
+  assert.equal(p.overridden[0].kind === "scope" && p.overridden[0].scopeValue, "rollback-safety");
+  assert.equal(p.blocking.length, 1, "security finding still blocks");
+  assert.equal(p.blocking[0].category, "security");
+});
+
+test("partitionFindings: category scope ignores findings without a category", () => {
+  const f = finding({ severity: "high", title: "no category" }); // no category field
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 0, "finding without category must not match");
+  assert.equal(p.blocking.length, 1);
+});
+
+// ---- 6.3: partitionFindings — file scope ----
+
+test("partitionFindings: file scope matches exact path", () => {
+  const f = finding({ severity: "high", title: "T", file: "src/repo.rs" });
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src/repo.rs", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 1);
+  assert.equal(p.blocking.length, 0);
+});
+
+test("partitionFindings: file scope matches directory prefix (directory-boundary-aware)", () => {
+  const f1 = finding({ severity: "high", title: "A", file: "src-tauri/src/repo.rs" });
+  const f2 = finding({ severity: "high", title: "B", file: "src-tauri/src/lib.rs" });
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src-tauri/src", disposition: "deferred-#90", reason: "deferred #90" }];
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 2, "both files under the prefix should match");
+  assert.equal(p.blocking.length, 0);
+});
+
+test("partitionFindings: file scope respects directory boundary — non-boundary prefix does NOT match", () => {
+  // scope "src/repo" must NOT match "src/report.rs" (starts with "src/repo" but not "src/repo/")
+  const f = finding({ severity: "high", title: "T", file: "src/report.rs" });
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src/repo", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 0, "non-boundary prefix match must not override");
+  assert.equal(p.blocking.length, 1, "finding should still block normally");
+});
+
+test("partitionFindings: file scope ignores findings without a file", () => {
+  const f = finding({ severity: "high", title: "no file" }); // no file field
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src/repo.rs", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 0, "finding without file must not match");
+  assert.equal(p.blocking.length, 1);
+});
+
+// ---- 6.4: key-independence across a simulated re-review ----
+
+test("partitionFindings: scoped override survives key drift across a simulated re-review", () => {
+  // Round N: finding with key K1, category "rollback-safety".
+  const roundNFinding = finding({ severity: "high", title: "rollback issue A", file: "x.ts", line_start: 10, category: "rollback-safety" });
+  // Round N+1: reviewer re-emits the SAME concern at a different line band → new key K2.
+  const roundNPlus1Finding = finding({ severity: "high", title: "rollback issue A — rephrased", file: "x.ts", line_start: 100, category: "rollback-safety" });
+  assert.notEqual(findingKey(roundNFinding), findingKey(roundNPlus1Finding), "precondition: key drift between rounds");
+
+  // The scoped override remains active regardless of key drift.
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "deferred-#90", reason: "deferred #90" }];
+  const pN = partitionFindings([roundNFinding], DEFAULT_POLICY, new Map(), scopes);
+  const pN1 = partitionFindings([roundNPlus1Finding], DEFAULT_POLICY, new Map(), scopes);
+
+  assert.equal(pN.overridden.length, 1, "round N: scope overrides finding with old key");
+  assert.equal(pN1.overridden.length, 1, "round N+1: scope still overrides finding with new (drifted) key");
+  assert.equal(pN1.blocking.length, 0, "round N+1: no blocker despite key drift");
+});
+
+// ---- 6.5: ambiguity-guard bypass ----
+
+test("partitionFindings: scope overrides bypass the per-key ambiguity guard", () => {
+  // Two materially distinct findings in the same 5-line bucket → same key.
+  // A KEY override would be withheld by the ambiguity guard (two distinct blocking candidates).
+  // A SCOPE override must override both — it is explicitly intended to match more than one.
+  const f1 = finding({ severity: "high", file: "x.ts", title: "missing rollback check A", line_start: 46, body: "body A", category: "rollback-safety" });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "missing rollback check B", line_start: 48, body: "body B", category: "rollback-safety" });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same key (ambiguous for key override)");
+
+  // Key override withheld by ambiguity guard:
+  const keyOverrides = new Map([[findingKey(f1), "rejected"]]);
+  const pKey = partitionFindings([f1, f2], DEFAULT_POLICY, keyOverrides);
+  assert.equal(pKey.overridden.length, 0, "key override must be withheld for ambiguous findings");
+  assert.equal(pKey.blocking.length, 2, "both remain blocking under key override");
+
+  // Scope override bypasses the guard and overrides both:
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "rejected", reason: "handled" }];
+  const pScope = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(pScope.overridden.length, 2, "scope must override both findings (bypass ambiguity guard)");
+  assert.equal(pScope.blocking.length, 0, "no finding should block");
+});
+
+// ---- 6.6: sentinel round-trip ----
+
+test("scopedOverrideComment round-trips through extractScopedOverrides", () => {
+  const body = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "deferred #90 — tracked in follow-up",
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+
+  // Verify human-readable fields are in the body.
+  assert.match(body, /Scope.*category:rollback-safety/);
+  assert.match(body, /deferred #90 — tracked in follow-up/);
+
+  // Round-trip: extraction recovers the scope.
+  const scopes = extractScopedOverrides([{ body }]);
+  assert.equal(scopes.length, 1);
+  assert.equal(scopes[0].type, "category");
+  assert.equal(scopes[0].value, "rollback-safety");
+  assert.equal(scopes[0].disposition, "deferred-#90");
+});
+
+test("extractScopedOverrides: later sentinel for the same scope wins", () => {
+  const first = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "first",
+    stage: "review-1",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const second = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "rejected",
+    reason: "later revision",
+    stage: "review-2",
+    timestamp: "2026-06-19T01:00:00Z",
+  });
+
+  const scopes = extractScopedOverrides([{ body: first }, { body: second }]);
+  assert.equal(scopes.length, 1, "later sentinel for same scope wins — still one entry");
+  assert.equal(scopes[0].disposition, "rejected", "later disposition wins");
+});
+
+test("extractScopedOverrides: file scope sentinel round-trips", () => {
+  const body = scopedOverrideComment({
+    scopeType: "file",
+    scopeValue: "src-tauri/src/repo.rs",
+    disposition: "deferred-#90",
+    reason: "deferred",
+    stage: "needs-human",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const scopes = extractScopedOverrides([{ body }]);
+  assert.equal(scopes.length, 1);
+  assert.equal(scopes[0].type, "file");
+  assert.equal(scopes[0].value, "src-tauri/src/repo.rs");
+});
+
+test("extractScopedOverrides: ignores non-scope sentinels and unrelated comments", () => {
+  const comments = [
+    { body: "<!-- pipeline-override: a1b2c3d4 rejected -->" }, // key sentinel, not scope
+    { body: "plain text comment with no sentinels" },
+  ];
+  assert.equal(extractScopedOverrides(comments).length, 0);
 });

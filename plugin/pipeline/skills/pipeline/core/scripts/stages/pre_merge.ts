@@ -40,6 +40,7 @@ import {
 } from "./review.ts";
 import {
   extractOverrides,
+  extractScopedOverrides,
   findingKey,
   partitionFindings,
   reviewCommentFlagsSpecDivergence,
@@ -609,7 +610,8 @@ export async function enforceReviewShaGate(
         );
       }
       const overrides = extractOverrides(detail.comments);
-      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides);
+      const scopes = extractScopedOverrides(detail.comments);
+      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes);
 
       const newHash = computeDiffHash(currentDiff);
       const deltaCommentVerdict = {

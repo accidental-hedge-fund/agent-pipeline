@@ -34,6 +34,7 @@ import { openspecContextFromDiff } from "../openspec.ts";
 import {
   categoryMarker,
   extractOverrides,
+  extractScopedOverrides,
   findingKey,
   partitionFindings,
   type PartitionResult,
@@ -444,7 +445,8 @@ export async function advanceReview(
   // blocking findings route to a fix round. When none remain, the review still
   // ran and its findings are on the record — the item advances as if approved.
   const overrides = extractOverrides(detail.comments);
-  const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides);
+  const scopes = extractScopedOverrides(detail.comments);
+  const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides, scopes);
   // Blocking keys set: derived here after policy partitioning so the review
   // comment can embed the pipeline-blocking-keys marker (#133 fix). Only
   // computed once; shared by all blocking-path branches below.
@@ -592,6 +594,10 @@ export async function advanceReview(
  * Audited comment posted when a review produced findings but none block under
  * the active policy — the item advances, with the advisory/overridden findings
  * recorded so the decision is visible later (#17).
+ *
+ * Scope-overridden findings (#229) are itemized under the scope that swept them
+ * (not just "a scope was active"), so the audit trail shows exactly what each
+ * scope dispositioned.
  */
 function advisoryAdvanceComment(
   cfg: PipelineConfig,
@@ -615,8 +621,16 @@ function advisoryAdvanceComment(
   }
   if (partition.overridden.length) {
     lines.push("", "### Overridden (operator-dispositioned — not blocking)");
-    for (const { finding, key, disposition } of partition.overridden) {
-      lines.push(`- \`${key}\` **[${(finding.severity ?? "medium").toUpperCase()}]** ${finding.title} — ${disposition}`);
+    for (const entry of partition.overridden) {
+      const sev = `**[${(entry.finding.severity ?? "medium").toUpperCase()}]**`;
+      if (entry.kind === "scope") {
+        // Itemize under the scope that swept this finding (#229 task 5.1).
+        lines.push(
+          `- [${entry.scopeType}:${entry.scopeValue}] ${sev} ${entry.finding.title} — ${entry.disposition}`,
+        );
+      } else {
+        lines.push(`- \`${entry.key}\` ${sev} ${entry.finding.title} — ${entry.disposition}`);
+      }
     }
   }
   if (partition.advisory.length) {

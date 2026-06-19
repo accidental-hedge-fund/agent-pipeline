@@ -1,4 +1,4 @@
-// Review severity policy + audited overrides (#17).
+// Review severity policy + audited overrides (#17, #229).
 //
 // The pipeline historically treated EVERY `needs-attention` finding as a hard
 // block that routes to a fix round. That makes a medium-severity scope-creep
@@ -12,6 +12,9 @@
 //   2. Audited operator overrides: a human can mark a specific blocking finding
 //      (by its stable key) as dispositioned, recorded as a `pipeline-override`
 //      comment sentinel that the gate reads back and respects.
+//   3. Scoped overrides (#229): `category:<name>` and `file:<path>` dispositions
+//      that survive finding-key drift across re-reviews, applied by
+//      `partitionFindings` on every round.
 //
 // Default policy (`block_threshold: "low"`, `min_confidence: 0`) reproduces the
 // pre-#17 behavior exactly: every finding blocks.
@@ -126,13 +129,49 @@ export function reviewCommentFlagsSpecDivergence(reviewBody: string): boolean {
   return reviewBody.includes(categoryMarker(SPEC_DIVERGENCE_CATEGORY));
 }
 
+// ---------------------------------------------------------------------------
+// Scoped overrides (#229)
+// ---------------------------------------------------------------------------
+
+/**
+ * An active scope disposition recovered from `<!-- pipeline-override-scope: ... -->`
+ * sentinels (#229). A scope matches all findings in a category or under a file path
+ * prefix, regardless of each finding's per-finding key.
+ */
+export interface ScopedOverride {
+  /** Match axis: "category" matches `finding.category`, "file" matches `finding.file`. */
+  type: "category" | "file";
+  /** Normalized value: lowercase for both types, trimmed for category names. */
+  value: string;
+  /** Normalized disposition token: "deferred-#N" or "rejected". */
+  disposition: string;
+  /** Human-supplied reason text as originally recorded. */
+  reason: string;
+}
+
+/**
+ * An entry in `PartitionResult.overridden`. Discriminated by `kind`:
+ * - `"key"`: overridden by a per-finding key override (`pipeline-override` sentinel).
+ * - `"scope"`: overridden by a scoped override (`pipeline-override-scope` sentinel, #229).
+ */
+export type OverriddenEntry =
+  | { kind: "key"; finding: ReviewFinding; key: string; disposition: string }
+  | {
+      kind: "scope";
+      finding: ReviewFinding;
+      scopeType: "category" | "file";
+      scopeValue: string;
+      disposition: string;
+    };
+
 export interface PartitionResult {
   /** Findings that block: at/above threshold, at/above confidence, not overridden. */
   blocking: ReviewFinding[];
   /** Below the severity threshold or confidence floor — recorded, not blocking. */
   advisory: { finding: ReviewFinding; reason: string }[];
-  /** Operator-dispositioned via a `pipeline-override` sentinel — not blocking. */
-  overridden: { finding: ReviewFinding; key: string; disposition: string }[];
+  /** Operator-dispositioned via a `pipeline-override` or `pipeline-override-scope`
+   *  sentinel — not blocking. Discriminated by `kind`. */
+  overridden: OverriddenEntry[];
 }
 
 /**
@@ -160,23 +199,56 @@ export function findingPayloadFingerprint(f: ReviewFinding): string {
 }
 
 /**
+ * True when finding `f` matches scope `s` by the scope's axis:
+ * - category: `finding.category`, lowercased and trimmed, equals the scope value.
+ *   A finding without a category does NOT match.
+ * - file: `normalizeFile(finding.file)` equals the scope value OR begins with
+ *   `scopeValue + "/"` (directory-boundary-aware prefix, #229).
+ *   A finding without a file does NOT match.
+ */
+function matchFindingScope(f: ReviewFinding, s: ScopedOverride): boolean {
+  if (s.type === "category") {
+    const cat = (f.category ?? "").toLowerCase().trim();
+    return cat !== "" && cat === s.value;
+  }
+  const nf = normalizeFile(f.file);
+  return nf !== "" && (nf === s.value || nf.startsWith(s.value + "/"));
+}
+
+/**
  * Partition review findings into blocking / advisory / overridden under the
- * given policy and the set of active operator overrides (key → disposition).
+ * given policy and the set of active operator overrides (key → disposition) and
+ * active scoped overrides (#229: category/file scopes).
+ *
+ * Evaluation order:
+ *   1. Scope match (#229): any finding that matches an active scope is moved to
+ *      `overridden` (kind: "scope") immediately, WITHOUT the per-key ambiguity
+ *      guard. Scopes are re-evaluated on every round so they survive key drift.
+ *   2. Key override: a finding not scope-matched is moved to `overridden`
+ *      (kind: "key") when its stable key appears in `overrides` AND it is a
+ *      blocking candidate AND its key is NOT ambiguous (at most one distinct
+ *      blocking payload for that key).
+ *   3. Advisory / blocking: the remaining findings are classified by the severity
+ *      threshold and confidence floor.
+ *
  * Override takes precedence over the severity/confidence test so an explicit
  * human disposition always wins.
  *
- * Ambiguity guard (#144): an override is only applied when the current verdict
+ * Ambiguity guard (#144): a key override is only applied when the current verdict
  * has exactly one *distinct blocking candidate* for that key. A "blocking
  * candidate" meets the severity threshold and confidence floor; "distinct" is
  * measured by findingPayloadFingerprint — so exact-duplicate payloads (and
  * same-key advisory duplicates, which are never counted) collapse to one, but
  * two materially different findings that share a key + normalized title do NOT,
  * and correctly withhold the override so a real blocker cannot advance under it.
+ * Scoped overrides bypass this guard by design (#229): a scope is explicitly
+ * intended to match more than one finding.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
   policy: ReviewPolicy,
   overrides: Map<string, string> = new Map(),
+  scopes: ScopedOverride[] = [],
 ): PartitionResult {
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
@@ -197,6 +269,20 @@ export function partitionFindings(
   }
 
   for (const f of findings) {
+    // 1. Scope match (#229): no ambiguity guard, re-evaluated every round.
+    const matchedScope = scopes.find((s) => matchFindingScope(f, s));
+    if (matchedScope) {
+      result.overridden.push({
+        kind: "scope",
+        finding: f,
+        scopeType: matchedScope.type,
+        scopeValue: matchedScope.value,
+        disposition: matchedScope.disposition,
+      });
+      continue;
+    }
+
+    // 2. Key override: only for blocking candidates, with ambiguity guard.
     const key = findingKey(f);
     const isBlockingCandidate =
       severityRank(f.severity) >= threshold &&
@@ -205,9 +291,11 @@ export function partitionFindings(
     const isAmbiguous = distinctBlockers > 1;
 
     if (overrides.has(key) && isBlockingCandidate && !isAmbiguous) {
-      result.overridden.push({ finding: f, key, disposition: overrides.get(key)! });
+      result.overridden.push({ kind: "key", finding: f, key, disposition: overrides.get(key)! });
       continue;
     }
+
+    // 3. Advisory / blocking classification.
     const belowSeverity = severityRank(f.severity) < threshold;
     const belowConfidence =
       typeof f.confidence === "number" && f.confidence < policy.min_confidence;
@@ -246,9 +334,49 @@ export function extractOverrides(comments: { body: string }[]): Map<string, stri
   return map;
 }
 
+// Machine-readable scope override sentinel (#229). Anchored to line-start; the
+// scope type+value and disposition token are recorded. Global flag so multiple
+// sentinels in one comment can be read; callers reset lastIndex before/after.
+const SCOPE_OVERRIDE_RE = /^<!-- pipeline-override-scope: (category|file):(\S+) (.+?) -->$/gm;
+
+/**
+ * Collect active scoped overrides (#229) from issue/PR comments. A later sentinel
+ * for the same `<type>:<value>` wins (lets a human revise a scoped disposition).
+ * The returned array is ready to pass as the `scopes` argument of `partitionFindings`.
+ */
+export function extractScopedOverrides(comments: { body: string }[]): ScopedOverride[] {
+  const map = new Map<string, ScopedOverride>(); // key: "${type}:${value}" → last wins
+  for (const c of comments) {
+    SCOPE_OVERRIDE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = SCOPE_OVERRIDE_RE.exec(c.body)) !== null) {
+      const type = m[1] as "category" | "file";
+      const value = m[2];
+      const disposition = m[3].trim();
+      map.set(`${type}:${value}`, { type, value, disposition, reason: disposition });
+    }
+  }
+  SCOPE_OVERRIDE_RE.lastIndex = 0;
+  return [...map.values()];
+}
+
 /** Validate an operator-supplied finding key (8 lowercase hex chars). */
 export function isValidFindingKey(key: string): boolean {
   return /^[0-9a-f]{8}$/.test(key);
+}
+
+/**
+ * Normalize a disposition token from an operator-supplied reason string:
+ * "deferred" (optionally "deferred-#N") or "rejected"; defaults to "rejected"
+ * when the reason doesn't lead with one of those words.
+ */
+function normalizeDisposition(reason: string): string {
+  const lower = reason.toLowerCase();
+  if (lower.startsWith("deferred")) {
+    const ref = reason.match(/#(\d+)/);
+    return ref ? `deferred-#${ref[1]}` : "deferred";
+  }
+  return "rejected";
 }
 
 /**
@@ -283,14 +411,85 @@ export function overrideComment(args: {
 }
 
 /**
- * Parse a `--override` CLI argument of the form `<key>: <reason>` where the
- * reason may begin with a disposition word (`rejected` / `deferred [#N]`).
- * Returns the key, a normalized one-word disposition token for the sentinel,
- * and the full human reason for the audit comment.
+ * The audited scoped override comment body (#229). Records a `category:<name>` or
+ * `file:<path>` scope disposition that partitionFindings re-evaluates on every
+ * (re-)review against the live verdict, regardless of per-finding key drift.
+ * The `<!-- pipeline-override-scope: ... -->` sentinel is what `extractScopedOverrides`
+ * reads back; the visible block is the human audit trail.
+ */
+export function scopedOverrideComment(args: {
+  scopeType: "category" | "file";
+  scopeValue: string;
+  disposition: string;
+  reason: string;
+  stage: string;
+  timestamp: string;
+  footer?: string;
+}): string {
+  const { scopeType, scopeValue, disposition, reason, stage, timestamp, footer } = args;
+  return [
+    "## Pipeline: Scope override",
+    "",
+    `**Scope**: \`${scopeType}:${scopeValue}\``,
+    `**Disposition**: ${disposition}`,
+    `**Stage**: ${stage}`,
+    `**Recorded at**: ${timestamp}`,
+    "",
+    "### Reason",
+    reason,
+    "",
+    (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
+    "",
+    `<!-- pipeline-override-scope: ${scopeType}:${scopeValue} ${disposition} -->`,
+  ].join("\n");
+}
+
+/**
+ * Parse a `--override` CLI argument. Accepts three forms:
+ *
+ *   "<key>: <reason>"                    → key disposition (existing behavior)
+ *   "category:<name>: <reason>"          → category scope disposition (#229)
+ *   "file:<path>: <reason>"              → file/path-prefix scope disposition (#229)
+ *
+ * For key dispositions, the key must be exactly 8 lowercase hex chars.
+ * For scoped dispositions, the scope value must be non-empty and the reason
+ * must be non-empty; the scope value is normalized (lowercase, trimmed).
+ * An empty scope value or empty reason is rejected with a usage error.
+ * Reason strings are normalized to a sentinel disposition token:
+ * "deferred" (optionally "deferred-#N") or "rejected" (the default).
  */
 export function parseOverrideArg(
   arg: string,
-): { key: string; disposition: string; reason: string } | { error: string } {
+):
+  | { kind: "key"; key: string; disposition: string; reason: string }
+  | { kind: "scope"; scopeType: "category" | "file"; scopeValue: string; disposition: string; reason: string }
+  | { error: string } {
+  // Detect scope prefix: "category:" or "file:"
+  const scopeType: "category" | "file" | null =
+    arg.startsWith("category:") ? "category" : arg.startsWith("file:") ? "file" : null;
+
+  if (scopeType !== null) {
+    // Everything after "category:" / "file:"
+    const rest = arg.slice(scopeType.length + 1);
+    // Split on the first ": " to separate scope value from reason.
+    const sep = rest.indexOf(": ");
+    if (sep === -1) {
+      return {
+        error: `Scoped override must be "${scopeType}:<value>: <reason>" — got: ${arg}`,
+      };
+    }
+    const scopeValue = rest.slice(0, sep).trim().toLowerCase();
+    const reason = rest.slice(sep + 2).trim();
+    if (!scopeValue) {
+      return { error: `Scope value must not be empty — expected "${scopeType}:<name>: <reason>".` };
+    }
+    if (!reason) {
+      return { error: "Override reason must not be empty." };
+    }
+    return { kind: "scope", scopeType, scopeValue, disposition: normalizeDisposition(reason), reason };
+  }
+
+  // Existing key logic: "<key>: <reason>"
   const colon = arg.indexOf(":");
   if (colon === -1) {
     return { error: `Override must be "<key>: <reason>" — got: ${arg}` };
@@ -303,15 +502,5 @@ export function parseOverrideArg(
   if (!reason) {
     return { error: "Override reason must not be empty." };
   }
-  // Normalize a sentinel disposition token: "deferred" (optionally "deferred-#N")
-  // or "rejected"; default to "rejected" when the reason doesn't lead with one.
-  const lower = reason.toLowerCase();
-  let disposition = "rejected";
-  if (lower.startsWith("deferred")) {
-    const ref = reason.match(/#(\d+)/);
-    disposition = ref ? `deferred-#${ref[1]}` : "deferred";
-  } else if (lower.startsWith("rejected")) {
-    disposition = "rejected";
-  }
-  return { key, disposition, reason };
+  return { kind: "key", key, disposition: normalizeDisposition(reason), reason };
 }
