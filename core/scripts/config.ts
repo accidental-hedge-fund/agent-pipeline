@@ -168,6 +168,10 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Sweep backlog maintenance pass settings (#168)."),
+  // Multi-actor override trust list (#229). GitHub identities whose
+  // `## Pipeline: Finding override` and `## Pipeline: Scope override` comments
+  // are trusted in addition to the current actor. Default: [] (actor-only).
+  trusted_override_actors: z.array(z.string()).optional().describe("Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor."),
 }).strict();
 
 export interface ResolveOptions {
@@ -349,6 +353,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     setup_command: fileConfig.setup_command,
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
+    trusted_override_actors: fileConfig.trusted_override_actors,
     roadmap: fileConfig.roadmap
       ? { ...fileConfig.roadmap, release_model: fileConfig.roadmap.release_model ?? "semver" }
       : fileConfig.roadmap,

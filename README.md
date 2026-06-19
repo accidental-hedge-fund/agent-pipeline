@@ -802,6 +802,15 @@ When a review produces findings but **none block** under the policy, the item ad
 
 This posts an audited `## Pipeline: Finding override` comment (the recording account is the *who*, your reason the *why*), clears the `blocked` label, and **automatically resumes the advance loop** with the override applied — no second invocation needed. From `needs-human`, the label is first flipped back to the review round recorded in the ceiling comment; if other blocking findings remain, the run re-parks at `needs-human` (it never advances past an unresolved blocker, and still stops at `ready-to-deploy`). The key is **location-based and title-stable** (`severity | file | 5-line band`, falling back to a normalized title when the reviewer emits no line), so a finding the reviewer re-emits on a later round keeps the same key — even if it rewords the title or drifts a couple of lines — and the override keeps applying instead of silently lapsing and re-parking the item (#144). **Rollback** to the pre-1.0.1 block-on-everything behavior is `review_policy: { block_threshold: low, min_confidence: 0 }`.
 
+**Scoped overrides** address the remaining drift case: when a finding changes severity, file, or line band across rounds (minting a new key each time), a per-key override silently lapses. Use a *scope* — `category:<name>` or `file:<path>` — to match an entire class of findings on every re-review, regardless of key:
+
+```
+/pipeline N --override "category:rollback-safety: deferred #90 — tracked separately"
+/pipeline N --override "file:src/db: rejected — reviewed offline, no risk in this PR"
+```
+
+`category:` matches findings whose `category` field equals the given name (case-insensitive). `file:` matches findings whose `file` path equals the given path or has it as a directory prefix (`src/db` matches `src/db/schema.ts` but not `src/dbreport.ts`). Scoped overrides are recorded with a `<!-- pipeline-override-scope: … -->` sentinel (distinct from the per-key sentinel), re-read on every re-review, and shown in the advance comment beside key overrides — so the audit trail is identical. Because scopes are designed to cover multiple findings, they bypass the single-candidate ambiguity guard that protects per-key overrides.
+
 ### OpenSpec integration
 
 If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/` directory), the pipeline runs a spec-first flow:

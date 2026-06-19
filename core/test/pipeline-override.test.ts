@@ -201,6 +201,9 @@ function makeReviewDeps(
     setBlocked: async (_cfg, _n, reason) => {
       rec.blocked.push(reason);
     },
+    // Must match the author that makeOverrideDeps uses when posting the override
+    // comment so actor-provenance filtering in advanceReview trusts it (#229 Finding 4).
+    getGhActor: async () => "operator",
     // Mirror invokeReviewer's ReviewerInvocation shape (#39): a normal
     // cross-harness review by the configured reviewer.
     runReview: async () => ({

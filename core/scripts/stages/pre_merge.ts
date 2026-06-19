@@ -39,7 +39,9 @@ import {
   parseStructuredVerdict,
 } from "./review.ts";
 import {
+  buildTrustedOverrideComments,
   extractOverrides,
+  extractScopedOverrides,
   findingKey,
   partitionFindings,
   reviewCommentFlagsSpecDivergence,
@@ -462,12 +464,102 @@ export async function enforceReviewShaGate(
       reason: "pre-merge: actor lookup failed — cannot verify review provenance",
     };
   }
+  // SHA extraction uses actor-only trust: allowlisted actors must NOT be trusted
+  // for review verdict comments as any allowlisted identity could otherwise post a
+  // forged approval header and bypass the SHA gate (#229 Finding 8).
   const trustedComments = detail.comments.filter((c) => c.author === actor);
+  // Override/scope extraction uses the broader allowlist set (#229 Findings 4, 5, 6).
+  const trustedOverrideComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
 
   const reviewed = extractReviewedSha(trustedComments);
-  // No prior review comment (e.g. review steps disabled, or first run) → nothing
-  // to validate; let pre-merge proceed as normal.
-  if (!reviewed) return null;
+  // No prior review from the current actor found. Three sub-cases:
+  // (a) No review comments at all (review disabled, first run) → proceed normally.
+  // (b) Review comments from arbitrary commenters (e.g. forged headers) → proceed; do
+  //     not trigger re-review on arbitrary non-actor comments (DoS risk: any commenter
+  //     could post a review-headed comment to cause endless re-reviews).
+  // (c) Review comments from an explicitly trusted prior runner (in trusted_override_actors)
+  //     — DO NOT silently proceed, that skips blocker enforcement (#229 Finding 7).
+  //     Route to re-review so the current actor establishes its own verified baseline.
+  if (!reviewed) {
+    const allowlist = cfg.trusted_override_actors ?? [];
+    if (allowlist.length > 0) {
+      const hasAllowlistedReview = detail.comments.some(
+        (c) =>
+          c.author != null &&
+          c.author !== actor &&
+          allowlist.includes(c.author) &&
+          (c.body.startsWith("## Review 1") ||
+            c.body.startsWith("## Review 2") ||
+            c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)),
+      );
+      if (hasAllowlistedReview) {
+        // Select the highest-enabled review stage to re-run. If all review steps are
+        // disabled, do not route to a review stage that will be immediately skipped back
+        // to pre-merge (livelock — #229 Finding 9). In that case just proceed.
+        const reviewStage: Stage | null = cfg.steps.adversarial_review
+          ? "review-2"
+          : cfg.steps.standard_review
+            ? "review-1"
+            : null;
+        if (reviewStage === null) {
+          // Reviews are fully disabled — cannot re-run review. If the prior allowlisted
+          // runner's comment carried unresolved blocking keys, block rather than silently
+          // skip blocker enforcement (#229 Finding 10). Only proceed when the prior review
+          // was approve/advisory-only or all keys are explicitly overridden.
+          const priorReviewComment = detail.comments
+            .filter(
+              (c) =>
+                c.author != null &&
+                c.author !== actor &&
+                allowlist.includes(c.author as string) &&
+                (c.body.startsWith("## Review 1") ||
+                  c.body.startsWith("## Review 2") ||
+                  c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)),
+            )
+            .at(-1);
+          if (priorReviewComment) {
+            // Use the legacy-aware extractor: falls back to override-key token scraping
+            // for comments that predate the pipeline-blocking-keys marker (#229 Finding 11).
+            // An explicit empty marker (advisory-only) is preserved as "no blockers".
+            const recorded = extractBlockingKeysFromComment(priorReviewComment.body);
+            if (recorded.size > 0) {
+              const overrides = extractOverrides(trustedOverrideComments);
+              const unresolved = [...recorded].filter((k) => !overrides.has(k));
+              if (unresolved.length > 0) {
+                await setBlockedFn(
+                  cfg,
+                  issueNumber,
+                  `Pre-merge: prior runner recorded ${unresolved.length} unresolved blocking ` +
+                    `finding(s) (${unresolved.join(", ")}). Reviews are disabled, so ` +
+                    `\`--override\` each key before pre-merge can proceed.`,
+                  "pre-merge",
+                  "needs-human",
+                );
+                return {
+                  advanced: false,
+                  status: "blocked",
+                  reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) from prior allowlisted runner (reviews disabled)`,
+                };
+              }
+            }
+          }
+          // Prior review was approve/advisory-only or all keys overridden — fall through.
+        } else {
+          await postCommentFn(
+            cfg,
+            issueNumber,
+            `## Pipeline: Re-running review — prior runner identity differs\n\n` +
+              `Review comments exist from an allowlisted prior runner (not \`${actor}\`). ` +
+              `Re-running review under the current identity to establish a verified baseline ` +
+              `before proceeding to pre-merge.`,
+          );
+          await transitionFn(cfg, issueNumber, "pre-merge", reviewStage);
+          return { advanced: true, to: reviewStage };
+        }
+      }
+    }
+    return null;
+  }
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 
@@ -488,9 +580,37 @@ export async function enforceReviewShaGate(
   ): Promise<Outcome | null> => {
     const recorded = commentBody ? extractBlockingKeysMarker(commentBody) : null;
     if (!recorded || recorded.size === 0) return null;
-    const overrides = extractOverrides(detail.comments);
+    // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
+    const overrides = extractOverrides(trustedOverrideComments);
     const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
+    // Scoped overrides may cover the remaining key-only blockers, but we can't verify
+    // without the actual finding objects. Force a fresh review so partitionFindings
+    // can be called with live findings and scopes (#229).
+    const activeScopes = extractScopedOverrides(trustedOverrideComments);
+    if (activeScopes.length > 0) {
+      const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        `## Pipeline: Re-running review — scoped override active\n\n` +
+          `Active scoped override(s) may cover the ${unresolved.length} cached blocking ` +
+          `finding(s). Re-running review with live findings to apply scoped dispositions.`,
+      );
+      await transitionFn(
+        cfg,
+        issueNumber,
+        "pre-merge",
+        reviewStage,
+        `Scoped overrides active; re-running review ${reviewed.round} to apply scoped dispositions to live findings.`,
+      );
+      return {
+        advanced: true,
+        from: "pre-merge",
+        to: reviewStage,
+        summary: `re-review: scoped overrides may cover cached blockers`,
+      };
+    }
     await setBlockedFn(
       cfg,
       issueNumber,
@@ -608,8 +728,10 @@ export async function enforceReviewShaGate(
           `summary: ${deltaResult.summary || "(none)"}`,
         );
       }
-      const overrides = extractOverrides(detail.comments);
-      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides);
+      // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
+      const overrides = extractOverrides(trustedOverrideComments);
+      const scopes = extractScopedOverrides(trustedOverrideComments);
+      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes);
 
       const newHash = computeDiffHash(currentDiff);
       const deltaCommentVerdict = {

@@ -64,6 +64,9 @@ function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps;
     markRebaseAttempted: (wtPath) => {
       rec.marked.push(wtPath);
     },
+    // In CI, gh api user fails with machine tokens → inject mock so the SHA gate
+    // doesn't hit the real gh CLI and return null (#229).
+    getGhActor: async () => "test-actor",
   };
   return { deps, rec };
 }

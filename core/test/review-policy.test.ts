@@ -1,4 +1,4 @@
-// Unit tests for the review severity policy + audited overrides (#17).
+// Unit tests for the review severity policy + audited overrides (#17, #229).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -12,13 +12,17 @@ import {
   findingPayloadFingerprint,
   partitionFindings,
   extractOverrides,
+  extractScopedOverrides,
+  buildTrustedOverrideComments,
   isValidFindingKey,
   overrideComment,
+  scopedOverrideComment,
   parseOverrideArg,
   SPEC_DIVERGENCE_CATEGORY,
   categoryMarker,
   reviewCommentFlagsSpecDivergence,
   type ReviewPolicy,
+  type ScopedOverride,
 } from "../scripts/review-policy.ts";
 import type { ReviewFinding } from "../scripts/types.ts";
 
@@ -312,18 +316,19 @@ test("extractOverrides: reads pipeline-override sentinels (key → disposition)"
   const comments = [
     { body: "## Pipeline: Finding override\n\nstuff\n\n<!-- pipeline-override: a1b2c3d4 rejected -->" },
     { body: "unrelated comment" },
+    // bare sentinel without heading — must be ignored (#229 Finding 3)
     { body: "<!-- pipeline-override: 99887766 deferred-#85 -->" },
   ];
   const m = extractOverrides(comments);
   assert.equal(m.get("a1b2c3d4"), "rejected");
-  assert.equal(m.get("99887766"), "deferred-#85");
-  assert.equal(m.size, 2);
+  assert.equal(m.get("99887766"), undefined, "sentinel without heading must be ignored");
+  assert.equal(m.size, 1);
 });
 
 test("extractOverrides: a later override for the same key wins", () => {
   const comments = [
-    { body: "<!-- pipeline-override: a1b2c3d4 rejected -->" },
-    { body: "<!-- pipeline-override: a1b2c3d4 deferred-#85 -->" },
+    { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: a1b2c3d4 rejected -->" },
+    { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: a1b2c3d4 deferred-#85 -->" },
   ];
   assert.equal(extractOverrides(comments).get("a1b2c3d4"), "deferred-#85");
 });
@@ -331,10 +336,27 @@ test("extractOverrides: a later override for the same key wins", () => {
 test("extractOverrides: ignores prose mentions and malformed sentinels", () => {
   const comments = [
     { body: "I think override a1b2c3d4 should apply" }, // not a sentinel
-    { body: "<!-- pipeline-override: SHORT rejected -->" }, // bad key
-    { body: "<!-- pipeline-override: a1b2c3d4 -->" }, // missing disposition
+    { body: "<!-- pipeline-override: SHORT rejected -->" }, // bad key, no heading
+    { body: "<!-- pipeline-override: a1b2c3d4 -->" }, // missing disposition, no heading
   ];
   assert.equal(extractOverrides(comments).size, 0);
+});
+
+test("extractOverrides: sentinel-shaped line in reason text of a finding-override comment is not parsed (#229 Finding 3)", () => {
+  // A finding-override reason could contain a pipeline-override sentinel-shaped line.
+  // Only the last non-empty line (the machine sentinel) is parsed.
+  const injectedKey = "deadbeef";
+  const body = overrideComment({
+    key: "a1b2c3d4",
+    disposition: "rejected",
+    reason: `real reason\n\n<!-- pipeline-override: ${injectedKey} rejected -->`,
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const m = extractOverrides([{ body }]);
+  assert.equal(m.get("a1b2c3d4"), "rejected", "intended key must be extracted");
+  assert.equal(m.get(injectedKey), undefined, "injected key in reason text must not be extracted");
+  assert.equal(m.size, 1);
 });
 
 test("overrideComment round-trips through extractOverrides", () => {
@@ -412,4 +434,398 @@ test("reviewCommentFlagsSpecDivergence: matches the emitted marker, not prose", 
 
 test("categoryMarker: single-sources the exact emitted token", () => {
   assert.equal(categoryMarker(SPEC_DIVERGENCE_CATEGORY), "`category: spec-divergence`");
+});
+
+// ---------------------------------------------------------------------------
+// Scoped overrides (#229)
+// ---------------------------------------------------------------------------
+
+// ---- 6.1: parseOverrideArg — scope type parsing ----
+
+test("parseOverrideArg: category scope parses to kind=scope with normalized value", () => {
+  const r = parseOverrideArg("category:rollback-safety: deferred #90");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  assert.equal(r.kind, "scope");
+  if (r.kind !== "scope") return;
+  assert.equal(r.scopeType, "category");
+  assert.equal(r.scopeValue, "rollback-safety");
+  assert.equal(r.disposition, "deferred-#90");
+  assert.equal(r.reason, "deferred #90");
+});
+
+test("parseOverrideArg: file scope parses to kind=scope", () => {
+  const r = parseOverrideArg("file:src-tauri/src/repo.rs: deferred #90");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  assert.equal(r.kind, "scope");
+  if (r.kind !== "scope") return;
+  assert.equal(r.scopeType, "file");
+  assert.equal(r.scopeValue, "src-tauri/src/repo.rs");
+  assert.equal(r.disposition, "deferred-#90");
+});
+
+test("parseOverrideArg: category scope value is normalized to lowercase", () => {
+  const r = parseOverrideArg("category:Rollback-Safety: rejected — handled");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  if (r.kind !== "scope") return;
+  assert.equal(r.scopeValue, "rollback-safety");
+  assert.equal(r.disposition, "rejected");
+});
+
+test("parseOverrideArg: bare 8-hex key still parses to kind=key (backward compat)", () => {
+  const r = parseOverrideArg("a1b2c3d4: rejected — false positive");
+  assert.ok(!("error" in r));
+  if ("error" in r) return;
+  assert.equal(r.kind, "key");
+  if (r.kind !== "key") return;
+  assert.equal(r.key, "a1b2c3d4");
+  assert.equal(r.disposition, "rejected");
+});
+
+test("parseOverrideArg: rejects empty scope value (category: with no name)", () => {
+  // "category: reason" — the ": " separator is found but the value before it is empty
+  // after trim (actually " reason" has no ": " so it errors on no-separator).
+  // Either way it must fail.
+  const r = parseOverrideArg("category:: reason");
+  assert.ok("error" in r, "empty scope value must be rejected");
+});
+
+test("parseOverrideArg: rejects missing reason separator in scoped arg", () => {
+  // "category:name" with no ": " separating value from reason
+  const r = parseOverrideArg("category:rollback-safety");
+  assert.ok("error" in r, "scope arg without ': <reason>' must be rejected");
+});
+
+test("parseOverrideArg: rejects empty reason in scoped arg", () => {
+  // "category:name:   " — value is present but reason is blank after trim
+  // Parsing: rest = "name:   ", sep at index 4 (colon-space "e:  " no...).
+  // Actually "name:   " contains ": " at index 4 → value = "name", reason = "  ".trim() = "" → error
+  const r = parseOverrideArg("category:rollback-safety:   ");
+  assert.ok("error" in r, "empty reason must be rejected");
+});
+
+// ---- 6.2: partitionFindings — category scope ----
+
+test("partitionFindings: category scope overrides all matching findings regardless of key", () => {
+  // Two HIGH findings with category "rollback-safety", different keys.
+  const f1 = finding({ severity: "high", title: "missing rollback A", file: "a.ts", line_start: 1, category: "rollback-safety" });
+  const f2 = finding({ severity: "high", title: "missing rollback B", file: "b.ts", line_start: 1, category: "rollback-safety" });
+  assert.notEqual(findingKey(f1), findingKey(f2), "precondition: different keys");
+
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "deferred-#90", reason: "deferred #90" }];
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+
+  assert.equal(p.blocking.length, 0, "no findings should block");
+  assert.equal(p.overridden.length, 2, "both findings should be overridden");
+  assert.ok(p.overridden.every((e) => e.kind === "scope"), "entries are kind=scope");
+  assert.ok(p.overridden.every((e) => e.kind === "scope" && e.scopeType === "category" && e.scopeValue === "rollback-safety"), "scope info preserved");
+});
+
+test("partitionFindings: category scope does not affect non-matching category", () => {
+  const f1 = finding({ severity: "high", title: "rollback missing", category: "rollback-safety" });
+  const f2 = finding({ severity: "high", title: "auth missing", category: "security" });
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+
+  assert.equal(p.overridden.length, 1);
+  assert.equal(p.overridden[0].kind === "scope" && p.overridden[0].scopeValue, "rollback-safety");
+  assert.equal(p.blocking.length, 1, "security finding still blocks");
+  assert.equal(p.blocking[0].category, "security");
+});
+
+test("partitionFindings: category scope ignores findings without a category", () => {
+  const f = finding({ severity: "high", title: "no category" }); // no category field
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 0, "finding without category must not match");
+  assert.equal(p.blocking.length, 1);
+});
+
+// ---- 6.3: partitionFindings — file scope ----
+
+test("partitionFindings: file scope matches exact path", () => {
+  const f = finding({ severity: "high", title: "T", file: "src/repo.rs" });
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src/repo.rs", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 1);
+  assert.equal(p.blocking.length, 0);
+});
+
+test("partitionFindings: file scope matches directory prefix (directory-boundary-aware)", () => {
+  const f1 = finding({ severity: "high", title: "A", file: "src-tauri/src/repo.rs" });
+  const f2 = finding({ severity: "high", title: "B", file: "src-tauri/src/lib.rs" });
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src-tauri/src", disposition: "deferred-#90", reason: "deferred #90" }];
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 2, "both files under the prefix should match");
+  assert.equal(p.blocking.length, 0);
+});
+
+test("partitionFindings: file scope respects directory boundary — non-boundary prefix does NOT match", () => {
+  // scope "src/repo" must NOT match "src/report.rs" (starts with "src/repo" but not "src/repo/")
+  const f = finding({ severity: "high", title: "T", file: "src/report.rs" });
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src/repo", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 0, "non-boundary prefix match must not override");
+  assert.equal(p.blocking.length, 1, "finding should still block normally");
+});
+
+test("partitionFindings: file scope ignores findings without a file", () => {
+  const f = finding({ severity: "high", title: "no file" }); // no file field
+  const scopes: ScopedOverride[] = [{ type: "file", value: "src/repo.rs", disposition: "rejected", reason: "handled" }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 0, "finding without file must not match");
+  assert.equal(p.blocking.length, 1);
+});
+
+// ---- 6.4: key-independence across a simulated re-review ----
+
+test("partitionFindings: scoped override survives key drift across a simulated re-review", () => {
+  // Round N: finding with key K1, category "rollback-safety".
+  const roundNFinding = finding({ severity: "high", title: "rollback issue A", file: "x.ts", line_start: 10, category: "rollback-safety" });
+  // Round N+1: reviewer re-emits the SAME concern at a different line band → new key K2.
+  const roundNPlus1Finding = finding({ severity: "high", title: "rollback issue A — rephrased", file: "x.ts", line_start: 100, category: "rollback-safety" });
+  assert.notEqual(findingKey(roundNFinding), findingKey(roundNPlus1Finding), "precondition: key drift between rounds");
+
+  // The scoped override remains active regardless of key drift.
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "deferred-#90", reason: "deferred #90" }];
+  const pN = partitionFindings([roundNFinding], DEFAULT_POLICY, new Map(), scopes);
+  const pN1 = partitionFindings([roundNPlus1Finding], DEFAULT_POLICY, new Map(), scopes);
+
+  assert.equal(pN.overridden.length, 1, "round N: scope overrides finding with old key");
+  assert.equal(pN1.overridden.length, 1, "round N+1: scope still overrides finding with new (drifted) key");
+  assert.equal(pN1.blocking.length, 0, "round N+1: no blocker despite key drift");
+});
+
+// ---- 6.5: ambiguity-guard bypass ----
+
+test("partitionFindings: scope overrides bypass the per-key ambiguity guard", () => {
+  // Two materially distinct findings in the same 5-line bucket → same key.
+  // A KEY override would be withheld by the ambiguity guard (two distinct blocking candidates).
+  // A SCOPE override must override both — it is explicitly intended to match more than one.
+  const f1 = finding({ severity: "high", file: "x.ts", title: "missing rollback check A", line_start: 46, body: "body A", category: "rollback-safety" });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "missing rollback check B", line_start: 48, body: "body B", category: "rollback-safety" });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same key (ambiguous for key override)");
+
+  // Key override withheld by ambiguity guard:
+  const keyOverrides = new Map([[findingKey(f1), "rejected"]]);
+  const pKey = partitionFindings([f1, f2], DEFAULT_POLICY, keyOverrides);
+  assert.equal(pKey.overridden.length, 0, "key override must be withheld for ambiguous findings");
+  assert.equal(pKey.blocking.length, 2, "both remain blocking under key override");
+
+  // Scope override bypasses the guard and overrides both:
+  const scopes: ScopedOverride[] = [{ type: "category", value: "rollback-safety", disposition: "rejected", reason: "handled" }];
+  const pScope = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(pScope.overridden.length, 2, "scope must override both findings (bypass ambiguity guard)");
+  assert.equal(pScope.blocking.length, 0, "no finding should block");
+});
+
+// ---- 6.6: sentinel round-trip ----
+
+test("scopedOverrideComment round-trips through extractScopedOverrides", () => {
+  const body = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "deferred #90 — tracked in follow-up",
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+
+  // Verify human-readable fields are in the body.
+  assert.match(body, /Scope.*category:rollback-safety/);
+  assert.match(body, /deferred #90 — tracked in follow-up/);
+
+  // Round-trip: extraction recovers the scope including the human reason (#229 fix).
+  const scopes = extractScopedOverrides([{ body }]);
+  assert.equal(scopes.length, 1);
+  assert.equal(scopes[0].type, "category");
+  assert.equal(scopes[0].value, "rollback-safety");
+  assert.equal(scopes[0].disposition, "deferred-#90");
+  assert.equal(scopes[0].reason, "deferred #90 — tracked in follow-up", "reason must round-trip through sentinel");
+});
+
+test("extractScopedOverrides: later sentinel for the same scope wins", () => {
+  const first = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "first",
+    stage: "review-1",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const second = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "rejected",
+    reason: "later revision",
+    stage: "review-2",
+    timestamp: "2026-06-19T01:00:00Z",
+  });
+
+  const scopes = extractScopedOverrides([{ body: first }, { body: second }]);
+  assert.equal(scopes.length, 1, "later sentinel for same scope wins — still one entry");
+  assert.equal(scopes[0].disposition, "rejected", "later disposition wins");
+  assert.equal(scopes[0].reason, "later revision", "later reason wins");
+});
+
+test("extractScopedOverrides: backward-compat — old sentinel without reason falls back to disposition token", () => {
+  // Old-format sentinel (no " | reason"): reason should equal the disposition token.
+  // Must be wrapped in the controlled heading (scopedOverrideComment always generated it).
+  const oldSentinel =
+    "## Pipeline: Scope override\n\n" +
+    "<!-- pipeline-override-scope: category:rollback-safety deferred-#90 -->";
+  const scopes = extractScopedOverrides([{ body: oldSentinel }]);
+  assert.equal(scopes.length, 1);
+  assert.equal(scopes[0].disposition, "deferred-#90");
+  assert.equal(scopes[0].reason, "deferred-#90", "old sentinel: reason falls back to disposition token");
+});
+
+test("extractScopedOverrides: file scope sentinel round-trips", () => {
+  const body = scopedOverrideComment({
+    scopeType: "file",
+    scopeValue: "src-tauri/src/repo.rs",
+    disposition: "deferred-#90",
+    reason: "deferred",
+    stage: "needs-human",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const scopes = extractScopedOverrides([{ body }]);
+  assert.equal(scopes.length, 1);
+  assert.equal(scopes[0].type, "file");
+  assert.equal(scopes[0].value, "src-tauri/src/repo.rs");
+});
+
+test("extractScopedOverrides: file scope with space in path round-trips (#229 Finding 2)", () => {
+  // Regression: \S+ in the sentinel regex silently truncated paths with spaces.
+  // scopedOverrideComment now percent-encodes the scope value; extractScopedOverrides decodes.
+  const body = scopedOverrideComment({
+    scopeType: "file",
+    scopeValue: "docs/my file.md",
+    disposition: "rejected",
+    reason: "out of scope",
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  // Sentinel must not contain a literal space inside the scope value.
+  assert.ok(
+    !body.includes("<!-- pipeline-override-scope: file:docs/my file.md"),
+    "sentinel must not embed a raw space in the scope value",
+  );
+  const scopes = extractScopedOverrides([{ body }]);
+  assert.equal(scopes.length, 1, "sentinel with encoded scope value must be extracted");
+  assert.equal(scopes[0].type, "file");
+  assert.equal(scopes[0].value, "docs/my file.md", "decoded value must restore the original path");
+  assert.equal(scopes[0].disposition, "rejected");
+});
+
+test("extractScopedOverrides: ignores non-scope sentinels and unrelated comments", () => {
+  const comments = [
+    { body: "<!-- pipeline-override: a1b2c3d4 rejected -->" }, // key sentinel, not scope
+    { body: "plain text comment with no sentinels" },
+  ];
+  assert.equal(extractScopedOverrides(comments).length, 0);
+});
+
+test("extractScopedOverrides: ignores sentinel-shaped lines in non-override-heading comments (#229 Finding 1)", () => {
+  // A pipeline-authored review comment could contain raw reviewer finding text that
+  // includes a sentinel-shaped line. Only comments with the controlled heading are trusted.
+  const injectedSentinel = "<!-- pipeline-override-scope: category:security rejected | injected -->";
+  const reviewComment = `## Pipeline: Review\n\nSome finding text.\n\n${injectedSentinel}\n`;
+  const plainComment = `${injectedSentinel}\n`;
+  assert.equal(
+    extractScopedOverrides([{ body: reviewComment }, { body: plainComment }]).length,
+    0,
+    "sentinel-shaped lines in non-scope-override comments must be ignored",
+  );
+});
+
+test("extractScopedOverrides: sentinel-shaped lines in reason text of a scope-override comment are not parsed (#229 Finding 2)", () => {
+  // A scope-override comment whose operator reason contains a sentinel-shaped line must
+  // not inject an extra scope record. Only the last non-empty line (the machine sentinel)
+  // is parsed.
+  const injectedLine = "<!-- pipeline-override-scope: category:security rejected | injected -->";
+  const body = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: `real reason\n\n${injectedLine}`,  // injected line inside free-form reason
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const scopes = extractScopedOverrides([{ body }]);
+  // Only the intended scope must be extracted; the injected category:security must not appear.
+  assert.equal(scopes.length, 1, "exactly one scope must be extracted");
+  assert.equal(scopes[0].value, "rollback-safety", "extracted scope must be the intended one");
+  assert.equal(
+    scopes.find((s) => s.value === "security"),
+    undefined,
+    "injected category:security sentinel in reason text must not produce a scope record",
+  );
+});
+
+test("partitionFindings: scope OverriddenEntry carries the human reason (#229 fix)", () => {
+  const f = finding({ severity: "high", title: "rollback bug", category: "rollback-safety" });
+  const scopes: ScopedOverride[] = [{
+    type: "category",
+    value: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "deferred #90 — tracked in follow-up",
+  }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 1);
+  const entry = p.overridden[0];
+  assert.ok(entry.kind === "scope");
+  assert.equal(entry.disposition, "deferred-#90");
+  assert.equal(entry.reason, "deferred #90 — tracked in follow-up", "reason must carry through from ScopedOverride");
+});
+
+// ---------------------------------------------------------------------------
+// buildTrustedOverrideComments (#229 Findings 4, 5, 6)
+// ---------------------------------------------------------------------------
+
+const ACTOR = "pipeline-bot";
+const OTHER = "other-runner";
+const ATTACKER = "attacker";
+const comments = [
+  { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: aabbccdd actor -->", author: ACTOR },
+  { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: 11223344 other -->", author: OTHER },
+  { body: "## Pipeline: Finding override\n\n<!-- pipeline-override: deadbeef attacker -->", author: ATTACKER },
+  // Attacker posts a fake review-heading comment to try to self-authorize
+  { body: "## Review 2 (Adversarial) — approve\n\nLGTM", author: ATTACKER },
+];
+
+test("buildTrustedOverrideComments: actor-only (no allowlist) includes only current actor (#229 Finding 4)", () => {
+  const trusted = buildTrustedOverrideComments(comments, ACTOR);
+  const authors = new Set(trusted.map((c) => c.author));
+  assert.ok(authors.has(ACTOR), "current actor must be trusted");
+  assert.ok(!authors.has(OTHER), "non-actor must not be trusted without allowlist");
+  assert.ok(!authors.has(ATTACKER), "attacker must not be trusted");
+});
+
+test("buildTrustedOverrideComments: allowlisted actor is trusted (#229 Finding 5)", () => {
+  const trusted = buildTrustedOverrideComments(comments, ACTOR, [OTHER]);
+  const authors = new Set(trusted.map((c) => c.author));
+  assert.ok(authors.has(ACTOR), "current actor must be trusted");
+  assert.ok(authors.has(OTHER), "allowlisted actor must be trusted");
+  assert.ok(!authors.has(ATTACKER), "non-allowlisted attacker must not be trusted");
+});
+
+test("buildTrustedOverrideComments: fake review-heading comment does not self-authorize attacker (#229 Finding 6)", () => {
+  // Attacker posts a comment starting with '## Review 2' — must NOT be trusted
+  // via body-prefix heuristic (which is NOT used in the allowlist-only design).
+  const trusted = buildTrustedOverrideComments(comments, ACTOR);
+  const authors = new Set(trusted.map((c) => c.author));
+  assert.ok(!authors.has(ATTACKER), "fake review-heading comment must not authorize the attacker");
+});
+
+test("buildTrustedOverrideComments: returns [] when actor is null (fail-closed)", () => {
+  const trusted = buildTrustedOverrideComments(comments, null);
+  assert.deepEqual(trusted, [], "null actor must produce empty trusted set");
+});
+
+test("buildTrustedOverrideComments: returns [] when actor is null even with allowlist (fail-closed)", () => {
+  const trusted = buildTrustedOverrideComments(comments, null, [OTHER]);
+  assert.deepEqual(trusted, [], "null actor must produce empty trusted set regardless of allowlist");
 });

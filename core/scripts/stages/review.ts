@@ -32,8 +32,10 @@ import { getForIssue } from "../worktree.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import {
+  buildTrustedOverrideComments,
   categoryMarker,
   extractOverrides,
+  extractScopedOverrides,
   findingKey,
   partitionFindings,
   type PartitionResult,
@@ -144,6 +146,12 @@ export async function advanceReview(
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const runReviewFn = deps.runReview ?? defaultRunReview;
+  // Fetch the authenticated actor once for the whole function. Used both to
+  // verify cache-comment provenance (#228) and to restrict scoped override
+  // extraction to pipeline-authored comments (#229 Finding 1). Fail-closed:
+  // null means actor is unknown — no trusted comments, scoped overrides ignored.
+  const getGhActorFn = deps.getGhActor ?? getGhActor;
+  const actor = await getGhActorFn();
 
   const stage: Stage = round === 1 ? "review-1" : "review-2";
   // The configured cross-harness reviewer (the one we attempt first). After the
@@ -236,10 +244,8 @@ export async function advanceReview(
     // Require BOTH the pipeline footer AND the pipeline author to reject forged review
     // comments (#228 Finding 6 + 8): any commenter can copy the footer and diff hash;
     // only the authenticated gh user who runs the pipeline can have authored a real review.
-    // Fail-closed: if the actor lookup fails (network error, not authenticated), produce
-    // an empty trusted set so the cache is bypassed and the reviewer runs fresh (#228 Finding 8).
-    const getGhActorFn = deps.getGhActor ?? getGhActor;
-    const actor = await getGhActorFn();
+    // Fail-closed: actor was fetched above; null → empty trusted set → cache bypassed,
+    // reviewer runs fresh (#228 Finding 8).
     const footer = cfgFooter(cfg);
     const priorRoundCommentsForCache = detail.comments.filter(
       (c) =>
@@ -258,21 +264,35 @@ export async function advanceReview(
         // Apply current overrides: a human may have recorded an override after the
         // last review on an unchanged diff. Filter out overridden keys before
         // deciding whether to route to fix (#228 fix-1).
-        const currentOverrides = extractOverrides(detail.comments);
+        // Trust overrides from the current actor + configured allowlist (#229 Findings 1, 4, 5, 6).
+        const trustedForScopes = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
+        const currentOverrides = extractOverrides(trustedForScopes);
         const remainingBlockers = [...cachedBlockingKeys].filter((k) => !currentOverrides.has(k));
-        const isBlocking = cachedVerdict === "needs-attention" && remainingBlockers.length > 0;
-        const toStage: Stage = isBlocking
-          ? (round === 1 ? "fix-1" : "fix-2")
-          : (round === 1 ? "review-2" : "pre-merge");
-        const verb = isBlocking ? "blocking findings" : "advance";
-        await transitionFn(
-          cfg,
-          issueNumber,
-          stage,
-          toStage,
-          `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
-        );
-        return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+        // If scoped overrides are active and key-only blockers remain, the scope may cover
+        // them — but we can't verify without the actual finding objects. Bypass the cache
+        // and run a fresh review so partitionFindings can be called with live findings (#229).
+        const activeScopes = extractScopedOverrides(trustedForScopes);
+        if (remainingBlockers.length > 0 && activeScopes.length > 0) {
+          console.log(
+            `[pipeline] #${issueNumber}: Scoped overrides active with cached blockers; ` +
+            `bypassing cache to run fresh review`,
+          );
+          // Fall through to the full review path below — do NOT return.
+        } else {
+          const isBlocking = cachedVerdict === "needs-attention" && remainingBlockers.length > 0;
+          const toStage: Stage = isBlocking
+            ? (round === 1 ? "fix-1" : "fix-2")
+            : (round === 1 ? "review-2" : "pre-merge");
+          const verb = isBlocking ? "blocking findings" : "advance";
+          await transitionFn(
+            cfg,
+            issueNumber,
+            stage,
+            toStage,
+            `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
+          );
+          return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+        }
       }
     }
   }
@@ -443,8 +463,11 @@ export async function advanceReview(
   // advisory (below threshold/confidence), and operator-overridden. Only
   // blocking findings route to a fix round. When none remain, the review still
   // ran and its findings are on the record — the item advances as if approved.
-  const overrides = extractOverrides(detail.comments);
-  const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides);
+  // Trust override/scope sentinels from current actor + configured allowlist (#229 Findings 1, 4, 5, 6).
+  const trustedComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
+  const overrides = extractOverrides(trustedComments);
+  const scopes = extractScopedOverrides(trustedComments);
+  const partition = partitionFindings(verdict.findings, cfg.review_policy, overrides, scopes);
   // Blocking keys set: derived here after policy partitioning so the review
   // comment can embed the pipeline-blocking-keys marker (#133 fix). Only
   // computed once; shared by all blocking-path branches below.
@@ -592,6 +615,10 @@ export async function advanceReview(
  * Audited comment posted when a review produced findings but none block under
  * the active policy — the item advances, with the advisory/overridden findings
  * recorded so the decision is visible later (#17).
+ *
+ * Scope-overridden findings (#229) are itemized under the scope that swept them
+ * (not just "a scope was active"), so the audit trail shows exactly what each
+ * scope dispositioned.
  */
 function advisoryAdvanceComment(
   cfg: PipelineConfig,
@@ -615,8 +642,17 @@ function advisoryAdvanceComment(
   }
   if (partition.overridden.length) {
     lines.push("", "### Overridden (operator-dispositioned — not blocking)");
-    for (const { finding, key, disposition } of partition.overridden) {
-      lines.push(`- \`${key}\` **[${(finding.severity ?? "medium").toUpperCase()}]** ${finding.title} — ${disposition}`);
+    for (const entry of partition.overridden) {
+      const sev = `**[${(entry.finding.severity ?? "medium").toUpperCase()}]**`;
+      if (entry.kind === "scope") {
+        // Itemize under the scope that swept this finding (#229 task 5.1). Display the
+        // operator-supplied reason so the audit trail shows why the finding was overridden.
+        lines.push(
+          `- [${entry.scopeType}:${entry.scopeValue}] ${sev} ${entry.finding.title} — ${entry.reason}`,
+        );
+      } else {
+        lines.push(`- \`${entry.key}\` ${sev} ${entry.finding.title} — ${entry.disposition}`);
+      }
     }
   }
   if (partition.advisory.length) {
