@@ -6,6 +6,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import {
   isSufficient,
   isIssueInPerIssueTable,
@@ -14,6 +18,7 @@ import {
   validateSweepSpecBody,
   filterOutPullRequests,
   runSweep,
+  realSweepDeps,
   type SweepDeps,
   type SweepIssue,
   type SweepOpts,
@@ -923,4 +928,51 @@ test("sweep: reconciliation does not add release-plan row for issue already in *
     allLog.includes("no changes") || !allLog.includes("| #14 |"),
     "should not add a release-plan row for #14 already in *(none)* row",
   );
+});
+
+// ---------------------------------------------------------------------------
+// realSweepDeps harness wiring (#220) — sweep re-specs thin issues from their
+// own title/body, a self-contained transform, so its real runHarness must
+// invoke claude with a PINNED model and the lean flags (no tools / no MCP).
+// Proven against a fake `claude` on PATH (no real network/model call).
+// ---------------------------------------------------------------------------
+
+test("sweep: realSweepDeps.runHarness forwards the pinned model and lean flags to claude (#220)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
+  const cli = path.join(binDir, "claude");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realSweepDeps(tmp, "test-model-xyz").runHarness("SPEC-PROMPT");
+    assert.equal(result.success, true);
+    assert.match(result.output, /--model\ntest-model-xyz/, "the pinned sweep model must reach claude");
+    assert.match(result.output, /--tools/, "lean mode must pass --tools");
+    assert.match(result.output, /--strict-mcp-config/, "lean mode must pass --strict-mcp-config");
+    assert.doesNotMatch(result.output, /--bare/, "must NOT use --bare (would break OAuth auth)");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("sweep: realSweepDeps defaults the model to DEFAULT_CONFIG.models.sweep when unset (#220)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
+  const cli = path.join(binDir, "claude");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realSweepDeps(tmp).runHarness("X");
+    assert.match(
+      result.output,
+      new RegExp(`--model\\n${DEFAULT_CONFIG.models.sweep}`),
+      "default model must be DEFAULT_CONFIG.models.sweep",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });

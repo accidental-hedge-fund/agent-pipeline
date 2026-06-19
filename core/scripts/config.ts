@@ -29,6 +29,8 @@ const PartialConfigSchema = z.object({
       implementing: z.string().optional().describe("Model alias for the implementing phase (implementer harness)."),
       review: z.string().optional().describe("Model alias for the review phase (reviewer harness)."),
       fix: z.string().optional().describe("Model alias for the fix phase (implementer harness)."),
+      intake: z.string().optional().describe("Model alias for the intake spec-generation step (always the claude harness, regardless of profile — never inert)."),
+      sweep: z.string().optional().describe("Model alias for the sweep spec-generation step (always the claude harness, regardless of profile — never inert)."),
     })
     .strict()
     .optional()
@@ -317,6 +319,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       implementing: fileConfig.models?.implementing ?? DEFAULT_CONFIG.models.implementing,
       review: fileConfig.models?.review ?? DEFAULT_CONFIG.models.review,
       fix: fileConfig.models?.fix ?? DEFAULT_CONFIG.models.fix,
+      intake: fileConfig.models?.intake ?? DEFAULT_CONFIG.models.intake,
+      sweep: fileConfig.models?.sweep ?? DEFAULT_CONFIG.models.sweep,
     },
     openspec: {
       enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
@@ -451,9 +455,12 @@ export function findGitRoot(start: string): string | null {
 export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
-): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous' } {
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
   let releaseModel: 'semver' | 'continuous' | undefined;
+  // Intake always runs through the claude harness (see stages/intake.ts), so this
+  // alias is never inert; default it here and let pipeline.yml's models.intake override.
+  let intakeModel: string = DEFAULT_CONFIG.models.intake;
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (fs.existsSync(configPath)) {
     const text = fs.readFileSync(configPath, "utf8");
@@ -473,6 +480,9 @@ export function resolveReleaseConfig(
       if (result.data.roadmap?.release_model) {
         releaseModel = result.data.roadmap.release_model;
       }
+      if (result.data.models?.intake) {
+        intakeModel = result.data.models.intake;
+      }
     }
   }
   return {
@@ -480,6 +490,7 @@ export function resolveReleaseConfig(
     repo: "",
     base_branch: baseBranchOverride ?? baseBranch,
     release_model: releaseModel,
+    intake_model: intakeModel,
   };
 }
 
@@ -904,6 +915,8 @@ ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
 #   implementing: ${d.models.implementing} # implementer harness
 #   review: ${d.models.review} # reviewer harness
 #   fix: ${d.models.fix} # implementer harness
+#   intake: ${d.models.intake} # intake spec-generation — always the claude harness (never inert)
+#   sweep: ${d.models.sweep} # sweep spec-generation — always the claude harness (never inert)
 
 # review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
 

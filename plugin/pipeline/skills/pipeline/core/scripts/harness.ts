@@ -54,6 +54,16 @@ export interface InvokeOptions {
    * of bypassPermissions (#21). Ignored for codex (already sandboxed via --full-auto).
    */
   sandbox?: boolean;
+  /**
+   * When true and harness is "claude", run a lean single-shot generation: append
+   * `--tools ""` (disable all built-in tools, so the agent cannot spend turns
+   * exploring the cwd) and `--strict-mcp-config` (load zero MCP servers, since no
+   * `--mcp-config` is passed). For self-contained prompts (intake/sweep spec
+   * generation) this removes the agentic-exploration tail and the MCP-server cold
+   * start. Deliberately does NOT use `--bare`, which also skips keychain reads and
+   * would break OAuth auth. Ignored for codex and custom reviewer CLIs.
+   */
+  lean?: boolean;
 }
 
 export async function invoke(
@@ -72,6 +82,13 @@ export async function invoke(
     cmd = "claude";
     const permMode = opts.sandbox ? "default" : "bypassPermissions";
     args = ["--print", "--permission-mode", permMode, "--output-format", "text"];
+    if (opts.lean) {
+      // Lean single-shot generation. `--tools` is variadic, so its empty value
+      // ("" = disable all tools) is placed immediately before `--strict-mcp-config`
+      // (a flag) — never before the trailing prompt positional, which the variadic
+      // would otherwise swallow.
+      args.push("--tools", "", "--strict-mcp-config");
+    }
     if (opts.model) args.push("--model", opts.model);
     args.push(prompt);
   } else if (harness === "codex") {

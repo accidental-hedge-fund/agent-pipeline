@@ -6,8 +6,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import {
   runIntake,
+  realIntakeDeps,
   inferReleaseSlot,
   parseSpec,
   extractOneLiner,
@@ -766,6 +771,54 @@ test("intake: ensureLabel is NOT called in dry-run mode", async () => {
   const opts: IntakeOpts = { description: "add retry logic to the fix loop", dryRun: true };
   await runIntake(opts, DEFAULT_CFG, deps);
   assert.equal(deps._ensureLabelCalls.length, 0, "ensureLabel should not be called in dry-run");
+});
+
+// ---------------------------------------------------------------------------
+// realIntakeDeps harness wiring (#220) — intake is a self-contained spec
+// transform, so its real runHarness must invoke claude with a PINNED model and
+// the lean flags (no tools / no MCP). Proven against a fake `claude` on PATH so
+// the test does no real network/model call.
+// ---------------------------------------------------------------------------
+
+function makeFakeClaudeOnPath(): { restore: () => void } {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "intake-claude-"));
+  const cli = path.join(binDir, "claude");
+  // Echo each received arg on its own line so the test can assert the argv.
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  return { restore: () => { process.env.PATH = oldPath; } };
+}
+
+test("intake: realIntakeDeps.runHarness forwards the pinned model and lean flags to claude (#220)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intake-wt-"));
+  const fake = makeFakeClaudeOnPath();
+  try {
+    const result = await realIntakeDeps(tmp, "test-model-xyz").runHarness("SPEC-PROMPT");
+    assert.equal(result.success, true);
+    assert.match(result.output, /--model\ntest-model-xyz/, "the pinned intake model must reach claude");
+    assert.match(result.output, /--tools/, "lean mode must pass --tools to disable the tool set");
+    assert.match(result.output, /--strict-mcp-config/, "lean mode must pass --strict-mcp-config (zero MCP servers)");
+    assert.doesNotMatch(result.output, /--bare/, "must NOT use --bare (would break OAuth auth)");
+  } finally {
+    fake.restore();
+  }
+});
+
+test("intake: realIntakeDeps defaults the model to DEFAULT_CONFIG.models.intake when unset (#220)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intake-wt-"));
+  const fake = makeFakeClaudeOnPath();
+  try {
+    const result = await realIntakeDeps(tmp).runHarness("X");
+    assert.match(
+      result.output,
+      new RegExp(`--model\\n${DEFAULT_CONFIG.models.intake}`),
+      "default model must be DEFAULT_CONFIG.models.intake",
+    );
+  } finally {
+    fake.restore();
+  }
 });
 
 // ---------------------------------------------------------------------------

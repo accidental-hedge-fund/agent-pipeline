@@ -1210,6 +1210,78 @@ test("findGitRoot: returns null when no .git ancestor exists", () => {
   assert.equal(findGitRoot(isolated), null);
 });
 
+// ---------------------------------------------------------------------------
+// models.intake / models.sweep (#220) — intake & sweep ALWAYS run the claude
+// harness (hardcoded in their stages), independent of the active profile, so
+// these aliases are always honored and must NEVER be reported inert — even under
+// the default codex implementer profile (regression guard against a false
+// "ignored because the harness is codex" warning).
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: models.intake/models.sweep default to DEFAULT_CONFIG when unset (#220)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.models.intake, DEFAULT_CONFIG.models.intake);
+    assert.equal(cfg.models.sweep, DEFAULT_CONFIG.models.sweep);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.intake/models.sweep overrides from pipeline.yml win (#220)", async () => {
+  const repo = makeFakeRepo("models:\n  intake: haiku\n  sweep: opus\n");
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.models.intake, "haiku");
+    assert.equal(cfg.models.sweep, "opus");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.intake/models.sweep are NEVER inert under the default codex profile (#220)", async () => {
+  const repo = makeFakeRepo("models:\n  intake: haiku\n  sweep: haiku\n");
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  const origWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    cfgMod.resolveConfig({ repoPath: repo });
+    assert.ok(
+      !warnings.some((w) => w.includes("models.intake")),
+      `models.intake is hardcoded to the claude harness and must never warn inert; got: ${JSON.stringify(warnings)}`,
+    );
+    assert.ok(
+      !warnings.some((w) => w.includes("models.sweep")),
+      `models.sweep is hardcoded to the claude harness and must never warn inert; got: ${JSON.stringify(warnings)}`,
+    );
+  } finally {
+    console.warn = origWarn;
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveReleaseConfig: returns intake_model — default when unset, pipeline.yml override when set (#220)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+  // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
+  const dflt = cfgMod.resolveReleaseConfig(makeFakeRepo(null));
+  assert.equal(dflt.intake_model, DEFAULT_CONFIG.models.intake, "default intake_model must be DEFAULT_CONFIG.models.intake");
+  const over = cfgMod.resolveReleaseConfig(makeFakeRepo("models:\n  intake: haiku\n"));
+  assert.equal(over.intake_model, "haiku", "models.intake in pipeline.yml must override");
+});
+
 // #154 regression: `doctor --is-ok` is a zero-output 0/1 polling gate, but config
 // resolution runs first and can emit non-fatal warnings (e.g. an inert models.*
 // alias under the default codex implementer). resolveConfig({ quiet: true }) must
