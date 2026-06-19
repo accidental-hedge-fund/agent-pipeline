@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
+import { DEFAULT_CONFIG } from "../types.ts";
 import { buildSweepPrompt } from "../prompts/index.ts";
 import {
   insertReleasePlanRow,
@@ -98,7 +99,10 @@ export interface SweepDeps {
 // Real deps
 // ---------------------------------------------------------------------------
 
-export function realSweepDeps(repoDir: string): SweepDeps {
+export function realSweepDeps(
+  repoDir: string,
+  model: string = DEFAULT_CONFIG.models.sweep,
+): SweepDeps {
   return {
     listIssues: async (repo) => {
       // Paginate via gh api to fetch all open issues regardless of count.
@@ -143,7 +147,10 @@ export function realSweepDeps(repoDir: string): SweepDeps {
       }
     },
     runHarness: async (prompt) => {
-      const result = await invoke("claude", repoDir, prompt, { stream: true });
+      // Sweep re-specs thin issues from their existing title/body injected into the
+      // prompt — a self-contained transform like intake. Pin a fast model and run
+      // lean (no built-in tools, no MCP). See harness.ts InvokeOptions.lean.
+      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true });
       return { success: result.success, output: result.stdout };
     },
     readFile: (p) => fs.readFileSync(p, "utf8"),

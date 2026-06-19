@@ -150,6 +150,54 @@ test("invoke(): codex with sandbox:true produces args identical to sandbox:false
 });
 
 // ---------------------------------------------------------------------------
+// lean flag (#220) — single-shot, tool-free, no-MCP generation for the claude
+// harness. Used by self-contained spec-generation stages (intake/sweep) so the
+// call cannot cold-start MCP servers or spend agentic turns exploring the repo.
+// We assert the argv routing via the same fake-claude-on-PATH approach.
+// ---------------------------------------------------------------------------
+
+test("invoke(): claude with lean:true appends --tools \"\" and --strict-mcp-config, keeps model, and never swallows the prompt (#220)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", { stream: false, lean: true, model: "sonnet" });
+    assert.match(result.stdout, /--tools/, "lean must pass --tools to restrict the tool set");
+    assert.match(result.stdout, /--strict-mcp-config/, "lean must pass --strict-mcp-config so zero MCP servers load");
+    assert.match(result.stdout, /--model\nsonnet/, "model must still be threaded in lean mode");
+    // --tools is variadic: its value must be the empty string ("" = disable all
+    // tools), immediately followed by a FLAG (never the trailing prompt, which the
+    // variadic would otherwise consume).
+    const lines = result.stdout.split("\n");
+    const toolsIdx = lines.indexOf("--tools");
+    assert.ok(toolsIdx !== -1, "--tools must be present");
+    assert.equal(lines[toolsIdx + 1], "", "--tools value must be the empty string (disable all built-in tools)");
+    assert.equal(lines[toolsIdx + 2], "--strict-mcp-config", "--tools \"\" must be immediately followed by a flag, not the prompt");
+    // The prompt must survive as the trailing positional.
+    const args = result.stdout.replace(/\n$/, "").split("\n");
+    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must reach the CLI as the trailing positional, un-swallowed");
+    // Lean must NOT touch auth: --bare (which would disable keychain reads) is forbidden.
+    assert.doesNotMatch(result.stdout, /--bare/, "lean must NOT use --bare (it disables keychain reads and breaks OAuth auth)");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): claude WITHOUT lean is unchanged — no --tools/--strict-mcp-config/--bare (#220)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "test-prompt", { stream: false });
+    assert.doesNotMatch(result.stdout, /--tools/, "non-lean must NOT pass --tools");
+    assert.doesNotMatch(result.stdout, /--strict-mcp-config/, "non-lean must NOT pass --strict-mcp-config");
+    assert.doesNotMatch(result.stdout, /--bare/, "non-lean must NOT pass --bare");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // formatStderrExcerpt — shared helper used by review and plan-review (#40)
 // ---------------------------------------------------------------------------
 

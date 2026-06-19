@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
+import { DEFAULT_CONFIG } from "../types.ts";
 import { buildIntakePrompt } from "../prompts/index.ts";
 import {
   insertReleasePlanRow,
@@ -102,10 +103,17 @@ export interface IntakeDeps {
 // Real deps
 // ---------------------------------------------------------------------------
 
-export function realIntakeDeps(repoDir: string): IntakeDeps {
+export function realIntakeDeps(
+  repoDir: string,
+  model: string = DEFAULT_CONFIG.models.intake,
+): IntakeDeps {
   return {
     runHarness: async (prompt) => {
-      const result = await invoke("claude", repoDir, prompt, { stream: true });
+      // Intake is a self-contained description->spec transform: the prompt injects
+      // all needed context, so pin a fast model and run lean (no built-in tools, no
+      // MCP) to stop the call from cold-starting MCP servers or burning agentic
+      // turns exploring the repo. See harness.ts InvokeOptions.lean.
+      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true });
       return { success: result.success, output: result.stdout };
     },
     createIssue: async (title, body, labels) => {
@@ -563,8 +571,12 @@ export async function runIntake(
   // 10. Ensure both required labels exist (create-only) before issue creation. Intake
   //     bypasses the normal `pipeline init` label-bootstrap path, so release:vX.Y.Z
   //     labels (dynamically named) and pipeline:ready may be absent in a fresh repo.
-  await d.ensureLabel(repoDir, "pipeline:ready", "1D76DB");
-  await d.ensureLabel(repoDir, `release:v${version}`, "e4e669");
+  //     The two creates are independent and both must precede createIssue, so run
+  //     them concurrently.
+  await Promise.all([
+    d.ensureLabel(repoDir, "pipeline:ready", "1D76DB"),
+    d.ensureLabel(repoDir, `release:v${version}`, "e4e669"),
+  ]);
 
   // 11. Create the GitHub issue — only after the branch is reserved on origin and labels
   //     exist. This is the first irreversible action; everything that could fail has run.
