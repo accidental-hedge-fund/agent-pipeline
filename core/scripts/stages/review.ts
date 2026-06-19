@@ -229,7 +229,14 @@ export async function advanceReview(
   // invoking the reviewer (avoids non-deterministic re-reviews of frozen code).
   // Skipped in dry-run so testing harnesses don't see unexpected early returns.
   if (!opts.dryRun) {
-    const priorRoundCommentsForCache = detail.comments.filter((c) => c.body.startsWith(roundPfx));
+    // Require the pipeline footer in cache candidates to reject forged comments (#228
+    // Finding 6): any commenter can post a syntactically valid `## Review N` body with
+    // the current diff hash, bypassing the reviewer. The footer is present in every
+    // pipeline-emitted review comment via cfgFooter; a comment without it is a cache miss.
+    const footer = cfgFooter(cfg);
+    const priorRoundCommentsForCache = detail.comments.filter(
+      (c) => c.body.startsWith(roundPfx) && c.body.includes(footer)
+    );
     const latestPriorComment = priorRoundCommentsForCache[priorRoundCommentsForCache.length - 1];
     if (latestPriorComment) {
       const cachedHash = extractDiffHashFromComment(latestPriorComment.body);
@@ -285,11 +292,19 @@ export async function advanceReview(
   // same-harness fallback that is the implementer, and `selfReview` is true.
   reviewer = invocation.effectiveReviewer;
   const selfReview = invocation.selfReview;
-  // Prepend the same-harness disclosure to every review comment this round posts
+  // Inject the same-harness disclosure into every review comment this round posts
   // (verdict, advisory, ceiling) so a self-review is never mistaken for an
-  // independent one. A no-op on a normal cross-harness review.
-  const reviewComment = (text: string) =>
-    selfReview ? `${selfReviewBanner(configuredReviewer, reviewer)}\n\n${text}` : text;
+  // independent one. The banner is placed AFTER the first line (the ## heading)
+  // so the comment still starts with the heading — required for the diff-hash
+  // cache lookup (startsWith(roundPfx)) to recognize a self-review comment on
+  // the next re-entry (#228 Finding 7). A no-op on a normal cross-harness review.
+  const reviewComment = (text: string) => {
+    if (!selfReview) return text;
+    const nl = text.indexOf("\n");
+    return nl >= 0
+      ? `${text.slice(0, nl)}\n\n${selfReviewBanner(configuredReviewer, reviewer)}${text.slice(nl)}`
+      : `${text}\n\n${selfReviewBanner(configuredReviewer, reviewer)}`;
+  };
   // Visibly distinct stage-transition label for a self-review.
   const reviewerLabel = selfReview ? `${reviewer} (self-review)` : reviewer;
 
