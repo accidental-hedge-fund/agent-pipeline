@@ -2777,3 +2777,77 @@ test("#233 (4.7): missing ceiling_action key (undefined) defaults to park — me
   assert.equal(outcome?.to, "needs-human", "undefined ceiling_action must default to park");
   assert.equal(createIssueCalls, 0, "no follow-up issue must be created with park default");
 });
+
+// (#233 delta) Regression: cache hit at ceiling with demote_and_advance must NOT route to fix.
+// Scenario: first attempt posted the blocking verdict (diffHash cached) but failed before
+// completing demotion. On re-entry the diff-hash cache would route to fix-2 — bypass it.
+test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete demotion → bypass cache, complete demotion, pre-merge (not fix-2)", async (t) => {
+  // Use cap=1 so a single cached blocking verdict places us at/over the ceiling.
+  const cfgDemoteCap1 = {
+    ...cfgDemote,
+    review_policy: { ...cfgDemote.review_policy, max_adversarial_rounds: 1 },
+  } as unknown as PipelineConfig;
+
+  // The prior blocking verdict: authored by pipeline actor, includes footer + diffHash +
+  // pipeline-blocking-keys. This is what the first (failed) attempt left behind.
+  const cachedBlockingComment = {
+    author: TEST_ACTOR,
+    body: [
+      `## Review 2 (Adversarial) — needs-attention (commit ${"f".repeat(7)})`,
+      "",
+      "**Reviewer**: codex",
+      "",
+      "minor nit found.",
+      "",
+      "*Automated by Claude Code Pipeline Skill*",
+      `<!-- pipeline-blocking-keys: ${findingKey(FINDING_MEDIUM)} -->`,
+      `<!-- reviewed-sha: ${"f".repeat(40)} -->`,
+      `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
+    ].join("\n"),
+  };
+  // A bare R2 comment after the cached blocking verdict — no footer/actor, no blocking-keys.
+  // This becomes the `lastPriorRound` for the recurrence check, ensuring priorKeys = {}
+  // so recurrence does not fire and the ceiling check runs instead.
+  const bareAfter = {
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${"b".repeat(7)})\n\n` +
+      `<!-- reviewed-sha: ${"b".repeat(40)} -->`,
+  };
+
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let createIssueCalls = 0;
+  deps.createIssue = async (_title, _body, _labels) => { createIssueCalls++; return 999; };
+  deps.getPrDiff = async () => REVIEW_DIFF; // same diff → same hash → cache hit candidate
+  deps.getIssueDetail = async () =>
+    ({
+      number: 48,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      // cachedBlockingComment: 1 comment in the cache filter (>= cap=1) → at ceiling.
+      // bareAfter: last in the broad filter → priorKeys = {} → recurrence silent.
+      // No demotion comment: first attempt failed before posting it.
+      comments: [cachedBlockingComment, bareAfter],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgDemoteCap1, 48, 2, {}, 0, deps);
+  });
+
+  // Cache was bypassed: reviewer must have been called.
+  assert.ok(rec.runReviewCalls >= 1, "reviewer must be called when cache is bypassed at ceiling");
+  // Must NOT route to fix-2 (the regression this test guards against).
+  assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "must NOT route to fix-2 via cache at ceiling with demote_and_advance");
+  // Demotion completes: advance to pre-merge.
+  assert.equal(outcome?.to, "pre-merge", "must advance to pre-merge via demotion after cache bypass");
+  // Follow-up issue must be created (demotion ran to completion).
+  assert.equal(createIssueCalls, 1, "follow-up issue must be created when demotion completes");
+  // Demotion comment must be posted.
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred")),
+    "demotion comment must be posted on completion",
+  );
+});

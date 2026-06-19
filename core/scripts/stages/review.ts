@@ -309,18 +309,38 @@ export async function advanceReview(
           // Fall through to the full review path below — do NOT return.
         } else {
           const isBlocking = cachedVerdict === "needs-attention" && remainingBlockers.length > 0;
-          const toStage: Stage = isBlocking
-            ? (round === 1 ? "fix-1" : "fix-2")
-            : (round === 1 ? "review-2" : "pre-merge");
-          const verb = isBlocking ? "blocking findings" : "advance";
-          await transitionFn(
-            cfg,
-            issueNumber,
-            stage,
-            toStage,
-            `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
-          );
-          return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+          // (#233 delta) Ceiling demotion re-entry guard: if a prior run posted the
+          // blocking verdict at/over the round cap but failed before completing demotion
+          // (follow-up issue, demotion comment, override comments), the cache would route
+          // back to fix instead of re-running the demotion. Bypass the cache so the
+          // demotion path can complete atomically on re-entry.
+          const roundCapForCache = cfg.review_policy.max_adversarial_rounds;
+          const atCeilingDemote =
+            isBlocking &&
+            roundCapForCache > 0 &&
+            priorRoundCommentsForCache.length >= roundCapForCache &&
+            cfg.review_policy.ceiling_action === "demote_and_advance";
+          if (atCeilingDemote) {
+            console.log(
+              `[pipeline] #${issueNumber}: At ceiling with demote_and_advance; ` +
+              `bypassing cache to complete demotion path`,
+            );
+            // Fall through to the full review path — reviewer re-runs on the same diff
+            // and the demotion logic completes atomically this time.
+          } else {
+            const toStage: Stage = isBlocking
+              ? (round === 1 ? "fix-1" : "fix-2")
+              : (round === 1 ? "review-2" : "pre-merge");
+            const verb = isBlocking ? "blocking findings" : "advance";
+            await transitionFn(
+              cfg,
+              issueNumber,
+              stage,
+              toStage,
+              `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
+            );
+            return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+          }
         }
       }
     }
