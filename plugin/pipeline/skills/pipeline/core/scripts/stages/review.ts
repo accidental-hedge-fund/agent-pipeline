@@ -261,19 +261,31 @@ export async function advanceReview(
         // deciding whether to route to fix (#228 fix-1).
         const currentOverrides = extractOverrides(detail.comments);
         const remainingBlockers = [...cachedBlockingKeys].filter((k) => !currentOverrides.has(k));
-        const isBlocking = cachedVerdict === "needs-attention" && remainingBlockers.length > 0;
-        const toStage: Stage = isBlocking
-          ? (round === 1 ? "fix-1" : "fix-2")
-          : (round === 1 ? "review-2" : "pre-merge");
-        const verb = isBlocking ? "blocking findings" : "advance";
-        await transitionFn(
-          cfg,
-          issueNumber,
-          stage,
-          toStage,
-          `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
-        );
-        return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+        // If scoped overrides are active and key-only blockers remain, the scope may cover
+        // them — but we can't verify without the actual finding objects. Bypass the cache
+        // and run a fresh review so partitionFindings can be called with live findings (#229).
+        const activeScopes = extractScopedOverrides(detail.comments);
+        if (remainingBlockers.length > 0 && activeScopes.length > 0) {
+          console.log(
+            `[pipeline] #${issueNumber}: Scoped overrides active with cached blockers; ` +
+            `bypassing cache to run fresh review`,
+          );
+          // Fall through to the full review path below — do NOT return.
+        } else {
+          const isBlocking = cachedVerdict === "needs-attention" && remainingBlockers.length > 0;
+          const toStage: Stage = isBlocking
+            ? (round === 1 ? "fix-1" : "fix-2")
+            : (round === 1 ? "review-2" : "pre-merge");
+          const verb = isBlocking ? "blocking findings" : "advance";
+          await transitionFn(
+            cfg,
+            issueNumber,
+            stage,
+            toStage,
+            `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
+          );
+          return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+        }
       }
     }
   }
@@ -624,9 +636,10 @@ function advisoryAdvanceComment(
     for (const entry of partition.overridden) {
       const sev = `**[${(entry.finding.severity ?? "medium").toUpperCase()}]**`;
       if (entry.kind === "scope") {
-        // Itemize under the scope that swept this finding (#229 task 5.1).
+        // Itemize under the scope that swept this finding (#229 task 5.1). Display the
+        // operator-supplied reason so the audit trail shows why the finding was overridden.
         lines.push(
-          `- [${entry.scopeType}:${entry.scopeValue}] ${sev} ${entry.finding.title} — ${entry.disposition}`,
+          `- [${entry.scopeType}:${entry.scopeValue}] ${sev} ${entry.finding.title} — ${entry.reason}`,
         );
       } else {
         lines.push(`- \`${entry.key}\` ${sev} ${entry.finding.title} — ${entry.disposition}`);

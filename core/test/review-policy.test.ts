@@ -618,12 +618,13 @@ test("scopedOverrideComment round-trips through extractScopedOverrides", () => {
   assert.match(body, /Scope.*category:rollback-safety/);
   assert.match(body, /deferred #90 — tracked in follow-up/);
 
-  // Round-trip: extraction recovers the scope.
+  // Round-trip: extraction recovers the scope including the human reason (#229 fix).
   const scopes = extractScopedOverrides([{ body }]);
   assert.equal(scopes.length, 1);
   assert.equal(scopes[0].type, "category");
   assert.equal(scopes[0].value, "rollback-safety");
   assert.equal(scopes[0].disposition, "deferred-#90");
+  assert.equal(scopes[0].reason, "deferred #90 — tracked in follow-up", "reason must round-trip through sentinel");
 });
 
 test("extractScopedOverrides: later sentinel for the same scope wins", () => {
@@ -647,6 +648,16 @@ test("extractScopedOverrides: later sentinel for the same scope wins", () => {
   const scopes = extractScopedOverrides([{ body: first }, { body: second }]);
   assert.equal(scopes.length, 1, "later sentinel for same scope wins — still one entry");
   assert.equal(scopes[0].disposition, "rejected", "later disposition wins");
+  assert.equal(scopes[0].reason, "later revision", "later reason wins");
+});
+
+test("extractScopedOverrides: backward-compat — old sentinel without reason falls back to disposition token", () => {
+  // Old-format sentinel (no " | reason"): reason should equal the disposition token.
+  const oldSentinel = "<!-- pipeline-override-scope: category:rollback-safety deferred-#90 -->";
+  const scopes = extractScopedOverrides([{ body: oldSentinel }]);
+  assert.equal(scopes.length, 1);
+  assert.equal(scopes[0].disposition, "deferred-#90");
+  assert.equal(scopes[0].reason, "deferred-#90", "old sentinel: reason falls back to disposition token");
 });
 
 test("extractScopedOverrides: file scope sentinel round-trips", () => {
@@ -670,4 +681,20 @@ test("extractScopedOverrides: ignores non-scope sentinels and unrelated comments
     { body: "plain text comment with no sentinels" },
   ];
   assert.equal(extractScopedOverrides(comments).length, 0);
+});
+
+test("partitionFindings: scope OverriddenEntry carries the human reason (#229 fix)", () => {
+  const f = finding({ severity: "high", title: "rollback bug", category: "rollback-safety" });
+  const scopes: ScopedOverride[] = [{
+    type: "category",
+    value: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "deferred #90 — tracked in follow-up",
+  }];
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), scopes);
+  assert.equal(p.overridden.length, 1);
+  const entry = p.overridden[0];
+  assert.ok(entry.kind === "scope");
+  assert.equal(entry.disposition, "deferred-#90");
+  assert.equal(entry.reason, "deferred #90 — tracked in follow-up", "reason must carry through from ScopedOverride");
 });

@@ -19,6 +19,7 @@ import {
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
 import { computeDiffHash, countPriorRounds, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
+import { scopedOverrideComment } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 const cfg = {} as unknown as PipelineConfig;
@@ -714,6 +715,35 @@ test("enforceReviewShaGate: blocking review at matching HEAD with PARTIAL overri
   assert.notEqual(out, null, "a partial override must NOT unblock the remaining blocker");
   assert.equal((out as any)?.status, "blocked");
   assert.equal(rec.blocked.length, 1);
+});
+
+test("enforceReviewShaGate: blocking review at matching HEAD with scoped override → forces re-review, does NOT block (#229)", async (t) => {
+  // Regression (#229): an operator records a scoped override (category:rollback-safety)
+  // after a blocking delta review. The pipeline clears `blocked` and re-enters pre-merge.
+  // reuseBlockedBy must NOT block again — it must force a fresh review so partitionFindings
+  // can apply the scoped disposition to the live findings.
+  const scopeComment = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "deferred #90",
+    stage: "pre-merge",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487", "abcdef01"]),
+    headSha: SHA_HEAD,
+    extraCommentBodies: [scopeComment],
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "scoped override → must NOT return null (would skip verification)");
+  assert.equal((out as any)?.advanced, true, "must transition to re-review, not block");
+  assert.match((out as any)?.to, /review/, "must route back to a review stage");
+  assert.deepEqual(rec.blocked, [], "must NOT call setBlocked with scoped overrides active");
+  assert.equal(rec.transitions.length, 1, "one transition to review stage expected");
 });
 
 test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {

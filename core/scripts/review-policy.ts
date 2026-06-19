@@ -162,6 +162,8 @@ export type OverriddenEntry =
       scopeType: "category" | "file";
       scopeValue: string;
       disposition: string;
+      /** Human-supplied reason, preserved from the operator's --override argument (#229 fix). */
+      reason: string;
     };
 
 export interface PartitionResult {
@@ -278,6 +280,7 @@ export function partitionFindings(
         scopeType: matchedScope.type,
         scopeValue: matchedScope.value,
         disposition: matchedScope.disposition,
+        reason: matchedScope.reason,
       });
       continue;
     }
@@ -352,8 +355,13 @@ export function extractScopedOverrides(comments: { body: string }[]): ScopedOver
     while ((m = SCOPE_OVERRIDE_RE.exec(c.body)) !== null) {
       const type = m[1] as "category" | "file";
       const value = m[2];
-      const disposition = m[3].trim();
-      map.set(`${type}:${value}`, { type, value, disposition, reason: disposition });
+      // Sentinel format: "disposition | human reason" (new, #229 fix) or "disposition" (old).
+      // The " | " delimiter separates the normalized token from the operator-supplied text.
+      const captured = m[3].trim();
+      const pipeIdx = captured.indexOf(" | ");
+      const disposition = pipeIdx >= 0 ? captured.slice(0, pipeIdx).trim() : captured;
+      const reason = pipeIdx >= 0 ? captured.slice(pipeIdx + 3).trim() : captured;
+      map.set(`${type}:${value}`, { type, value, disposition, reason });
     }
   }
   SCOPE_OVERRIDE_RE.lastIndex = 0;
@@ -440,7 +448,7 @@ export function scopedOverrideComment(args: {
     "",
     (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
     "",
-    `<!-- pipeline-override-scope: ${scopeType}:${scopeValue} ${disposition} -->`,
+    `<!-- pipeline-override-scope: ${scopeType}:${scopeValue} ${disposition} | ${reason} -->`,
   ].join("\n");
 }
 

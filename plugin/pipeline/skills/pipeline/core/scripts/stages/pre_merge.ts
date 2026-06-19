@@ -492,6 +492,33 @@ export async function enforceReviewShaGate(
     const overrides = extractOverrides(detail.comments);
     const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
+    // Scoped overrides may cover the remaining key-only blockers, but we can't verify
+    // without the actual finding objects. Force a fresh review so partitionFindings
+    // can be called with live findings and scopes (#229).
+    const activeScopes = extractScopedOverrides(detail.comments);
+    if (activeScopes.length > 0) {
+      const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        `## Pipeline: Re-running review — scoped override active\n\n` +
+          `Active scoped override(s) may cover the ${unresolved.length} cached blocking ` +
+          `finding(s). Re-running review with live findings to apply scoped dispositions.`,
+      );
+      await transitionFn(
+        cfg,
+        issueNumber,
+        "pre-merge",
+        reviewStage,
+        `Scoped overrides active; re-running review ${reviewed.round} to apply scoped dispositions to live findings.`,
+      );
+      return {
+        advanced: true,
+        from: "pre-merge",
+        to: reviewStage,
+        summary: `re-review: scoped overrides may cover cached blockers`,
+      };
+    }
     await setBlockedFn(
       cfg,
       issueNumber,

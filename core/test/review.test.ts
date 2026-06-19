@@ -33,7 +33,7 @@ import {
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
-import { findingKey } from "../scripts/review-policy.ts";
+import { findingKey, scopedOverrideComment } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -1677,6 +1677,61 @@ test("advanceReview: cache hit with all blocking keys overridden → advances in
   assert.equal(outcome.to, "pre-merge", "all blockers overridden → advance to pre-merge (round 2)");
   assert.match(outcome.summary, /cached verdict/);
   assert.deepEqual(rec.blocked, [], "must NOT call setBlocked");
+});
+
+test("advanceReview: cache hit with scoped override active and remaining blockers → reviewer IS called (cache bypass #229)", async (t) => {
+  // Regression: when a scoped override is recorded after a blocking cached verdict,
+  // the cache path cannot verify whether the scope covers the cached blockers without
+  // the actual finding objects. It must bypass the cache and run a fresh review.
+  const blockingKey = "aabbccdd";
+  const blockingComment = [
+    `## Review 2 (Adversarial) — needs-attention (commit ${"a".repeat(7)})`,
+    "",
+    "**Reviewer**: codex",
+    "",
+    "one blocker",
+    "",
+    "*Automated by Claude Code Pipeline Skill*",
+    `<!-- pipeline-blocking-keys: ${blockingKey} -->`,
+    "",
+    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
+  ].join("\n");
+  const scopeComment = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "rollback-safety",
+    disposition: "deferred-#90",
+    reason: "deferred #90",
+    stage: "review-2",
+    timestamp: "2026-06-19T00:00:00Z",
+  });
+
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [
+        { body: blockingComment, author: TEST_ACTOR },
+        { body: scopeComment, author: TEST_ACTOR },
+      ],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  deps.getPrDiff = async () => REVIEW_DIFF;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 2, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 1, "reviewer MUST be called: scoped override active with cached blockers → cache bypassed");
+  assert.ok(outcome.advanced, "fresh review approved → issue must advance");
+  assert.equal(outcome.to, "pre-merge", "approve → advance to pre-merge (round 2)");
+  assert.deepEqual(rec.blocked, [], "must NOT call setBlocked — fresh review approved");
 });
 
 // ---------------------------------------------------------------------------
