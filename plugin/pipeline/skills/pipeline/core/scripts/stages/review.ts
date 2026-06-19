@@ -658,9 +658,17 @@ export async function advanceReview(
       currentSurfaceToKeys.get(sk)!.add(fk);
     }
 
-    // Get the immediately-prior round's surface map for the new-key condition.
-    const lastPriorSurfaceMap = lastPriorRound
-      ? extractBlockingSurfacesFromComment(lastPriorRound.body)
+    // Trusted prior-round comments for surface-streak: require pipeline actor + configured
+    // footer, mirroring the diff-hash cache path's provenance checks (#228 Findings 6+8).
+    // Forged "## Review N" comments from other actors cannot seed the streak (#234 fix).
+    const trustedPriorRoundForSurface = actor !== null
+      ? priorRoundComments.filter((c) => c.body.includes(cfgFooter(cfg)) && c.author === actor)
+      : [];
+
+    // Get the immediately-prior trusted round's surface map for the new-key condition.
+    const lastTrustedPriorRound = trustedPriorRoundForSurface[trustedPriorRoundForSurface.length - 1];
+    const lastPriorSurfaceMap = lastTrustedPriorRound
+      ? extractBlockingSurfacesFromComment(lastTrustedPriorRound.body)
       : new Map<string, string>();
 
     // Determine which surfaces have fired: streak >= threshold AND at least one new key.
@@ -668,8 +676,8 @@ export async function advanceReview(
     for (const [sk, currentKeys] of currentSurfaceToKeys) {
       // Compute the consecutive-round streak for this surface.
       let streak = 1; // current round
-      for (let i = priorRoundComments.length - 1; i >= 0; i--) {
-        const priorMap = extractBlockingSurfacesFromComment(priorRoundComments[i].body);
+      for (let i = trustedPriorRoundForSurface.length - 1; i >= 0; i--) {
+        const priorMap = extractBlockingSurfacesFromComment(trustedPriorRoundForSurface[i].body);
         const inPrior = [...priorMap.values()].some((s) => s === sk);
         if (inPrior) {
           streak++;
