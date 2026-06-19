@@ -27,6 +27,7 @@ import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   computeDiffHash,
+  DELTA_REVIEW_MARKER_PREFIX,
   diffFilePaths,
   extractBlockingKeysFromComment,
   extractDiffHashFromComment,
@@ -960,13 +961,22 @@ export function specDeltaIsStale(id: string, commits: FixCommit[]): boolean {
   return lastImplIdx !== -1 && lastImplIdx > lastSpecIdx;
 }
 
-/** Latest review verdict comment body (round 1 or 2), or null when none exists. */
+/**
+ * Latest review verdict comment body (round 1, round 2, or pre-merge delta),
+ * or null when none exists. Delta review comments are included so that a
+ * `category: spec-divergence` finding in the most recent delta review is
+ * visible to `enforceSpecConsistencyGuard` — without this, an older full-review
+ * comment (without the marker) would be picked up instead (#228 finding 1).
+ */
 function latestReviewBody(
   comments: { author: string; body: string; createdAt: string }[],
 ): string | null {
   const m = findLatestCommentMatching(
     comments,
-    (b) => b.startsWith("## Review 1") || b.startsWith("## Review 2"),
+    (b) =>
+      b.startsWith("## Review 1") ||
+      b.startsWith("## Review 2") ||
+      b.startsWith(DELTA_REVIEW_MARKER_PREFIX),
   );
   return m?.body ?? null;
 }
