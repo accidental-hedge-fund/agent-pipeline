@@ -2402,13 +2402,21 @@ test("#233 regression (a): ceiling + only-medium findings + demote_and_advance �
   assert.match(capturedIssueBody, /minor nit/, "follow-up body must list the demoted finding");
   assert.match(capturedIssueBody, /#42/, "follow-up body must back-link the original issue");
 
-  // A demotion comment must be posted
+  // A demotion comment must be posted on the issue
   const demotionComment = rec.comments.find((c) =>
     c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
   );
   assert.ok(demotionComment, "demotion comment must be posted");
   assert.match(demotionComment!, /minor nit/, "demotion comment must list the demoted finding");
   assert.match(demotionComment!, /<!-- pipeline-ceiling-followup: #999 -->/, "demotion comment must embed the follow-up marker");
+
+  // Demotion comment must also be mirrored to the PR (#233 finding 2)
+  const prDemotionComment = rec.prComments.find((c) =>
+    c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
+  );
+  assert.ok(prDemotionComment, "demotion comment must be mirrored to the PR");
+  assert.match(prDemotionComment!, /minor nit/, "PR demotion comment must list the demoted finding");
+  assert.match(prDemotionComment!, /<!-- pipeline-ceiling-followup: #999 -->/, "PR demotion comment must embed the follow-up marker");
 
   // Override dispositions must be recorded for the demoted key
   const demotedKey = findingKey(FINDING_MEDIUM);
@@ -2582,8 +2590,50 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
   );
 });
 
-// extractCeilingFollowupNumber: basic round-trip
-test("#233: extractCeilingFollowupNumber reads the marker from any comment, last-occurrence-wins", () => {
+// Regression: untrusted marker must NOT suppress createIssue (#233 finding 1)
+test("#233 (finding-1 regression): untrusted pipeline-ceiling-followup marker in a reviewer comment does not suppress createIssue", async (t) => {
+  // An arbitrary prior comment (not a pipeline demotion comment) that embeds the marker —
+  // e.g. a reviewer or human typed it, or it was present in a review verdict body.
+  const untrustedComment = {
+    body: `This issue looks minor.\n\n<!-- pipeline-ceiling-followup: #888 -->\n\nFix it in a follow-up.`,
+  };
+  const priorR2 = (sha: string) => ({
+    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
+      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
+  });
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  let createIssueCalls = 0;
+  deps.createIssue = async () => { createIssueCalls++; return 999; };
+  deps.getIssueDetail = async () =>
+    ({
+      number: 46,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      // Two prior R2 rounds + an untrusted comment that contains the marker
+      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40)), untrustedComment],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgDemote, 46, 2, {}, 0, deps);
+  });
+  // Must still advance to pre-merge
+  assert.equal(outcome?.to, "pre-merge", "must still advance to pre-merge");
+  // createIssue must be called even though the untrusted comment contains the marker
+  assert.equal(createIssueCalls, 1, "createIssue must be called — untrusted marker must not suppress it");
+  // The new demotion comment must use the freshly-created issue number (999), not 888
+  const demotionComment = rec.comments.find((c) =>
+    c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred"),
+  );
+  assert.ok(demotionComment, "demotion comment must be posted");
+  assert.match(demotionComment!, /<!-- pipeline-ceiling-followup: #999 -->/, "must reference the real follow-up #999, not the untrusted #888");
+});
+
+// extractCeilingFollowupNumber: trusted-demotion-only round-trip
+test("#233: extractCeilingFollowupNumber reads marker only from trusted demotion comments, last-occurrence-wins", () => {
   const demotionBody = reviewCeilingDemotionComment(
     cfgDemote,
     2,
@@ -2596,9 +2646,23 @@ test("#233: extractCeilingFollowupNumber reads the marker from any comment, last
   assert.equal(extractCeilingFollowupNumber([{ body: demotionBody }]), 42);
   assert.equal(extractCeilingFollowupNumber([]), null, "no comments → null");
   assert.equal(extractCeilingFollowupNumber([{ body: "no marker here" }]), null, "missing marker → null");
-  // Last-occurrence-wins
+  // Last-occurrence-wins across two trusted demotion comments
   const two = [{ body: demotionBody }, { body: reviewCeilingDemotionComment(cfgDemote, 2, "codex", { blocking: [FINDING_MEDIUM], advisory: [], overridden: [] }, 3, [], 99) }];
   assert.equal(extractCeilingFollowupNumber(two), 99, "last marker wins");
+  // Untrusted: marker in a random comment (not starting with the heading) is ignored
+  const untrustedBody = `Some random comment.\n\n<!-- pipeline-ceiling-followup: #123 -->`;
+  assert.equal(extractCeilingFollowupNumber([{ body: untrustedBody }]), null, "untrusted comment with marker is ignored");
+  // Untrusted + trusted: trusted value wins, untrusted is skipped entirely
+  assert.equal(
+    extractCeilingFollowupNumber([{ body: untrustedBody }, { body: demotionBody }]),
+    42,
+    "trusted demotion comment after untrusted: trusted value returned",
+  );
+  // Marker not on the last non-empty line of an otherwise-trusted comment is ignored
+  const markerMidBody =
+    `## Pipeline: Review ceiling — findings demoted and deferred\n\n` +
+    `<!-- pipeline-ceiling-followup: #456 -->\n\nsome trailing text`;
+  assert.equal(extractCeilingFollowupNumber([{ body: markerMidBody }]), null, "marker not on last line is ignored");
 });
 
 // Task 4.7: prove regressions bite — test (a) fails with ceiling_action:park (old default).

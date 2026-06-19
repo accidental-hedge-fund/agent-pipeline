@@ -681,7 +681,17 @@ export async function advanceReview(
       priorRoundComments,
       followupNumber,
     );
-    await postCommentFn(cfg, issueNumber, reviewComment(demotionBody));
+    const demotionComment = reviewComment(demotionBody);
+    await postCommentFn(cfg, issueNumber, demotionComment);
+    // Mirror to the PR: the demotion advances the item to pre-merge while demoting
+    // findings the human will see at the merge button. Best-effort (issue is authoritative).
+    try {
+      await postPrCommentFn(cfg, prNumber, demotionComment);
+    } catch (err) {
+      console.warn(
+        `[pipeline] #${issueNumber}: could not mirror demotion comment to PR #${prNumber}: ${(err as Error).message}`,
+      );
+    }
 
     // Record an audited override disposition for each demoted finding so the
     // pre-merge review-SHA gate's unresolved = recorded − overrides yields ∅
@@ -1619,25 +1629,37 @@ export function extractReview1Risk(
 // Demote-and-advance helpers (#233)
 // ---------------------------------------------------------------------------
 
-// Machine-readable marker embedded in the demotion comment for idempotency.
-// Anchored to full line; global flag picks the last occurrence.
-const CEILING_FOLLOWUP_RE = /^<!-- pipeline-ceiling-followup: #(\d+) -->$/gm;
+// Controlled heading that every pipeline-authored demotion comment starts with.
+// Used to restrict follow-up marker extraction to trusted comments only.
+const CEILING_DEMOTION_HEADING = "## Pipeline: Review ceiling — findings demoted and deferred";
+
+// Machine-readable follow-up marker anchored to a full line.
+const CEILING_FOLLOWUP_LINE_RE = /^<!-- pipeline-ceiling-followup: #(\d+) -->$/;
 
 /**
  * Scan issue comments for an existing `<!-- pipeline-ceiling-followup: #N -->`
  * marker, returning the recorded follow-up issue number or null when absent.
- * Last-occurrence-wins (mirrors the reviewed-sha guard). Exported for tests.
+ * Only reads markers from pipeline-authored demotion comments (starting with
+ * CEILING_DEMOTION_HEADING) where the marker is the last non-empty line —
+ * the exact placement used by reviewCeilingDemotionComment. This prevents an
+ * arbitrary comment body or reviewer-emitted text from suppressing createIssue.
+ * Last-occurrence-wins. Exported for tests.
  */
 export function extractCeilingFollowupNumber(comments: { body: string }[]): number | null {
   let last: number | null = null;
   for (const c of comments) {
-    CEILING_FOLLOWUP_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = CEILING_FOLLOWUP_RE.exec(c.body)) !== null) {
-      last = Number(m[1]);
-    }
+    // Trust only pipeline-authored demotion comments.
+    if (!c.body.startsWith(CEILING_DEMOTION_HEADING)) continue;
+    // Accept the marker only when it is the last non-empty line of the comment.
+    const lastLine =
+      c.body
+        .split("\n")
+        .map((l) => l.trimEnd())
+        .filter((l) => l.length > 0)
+        .at(-1) ?? "";
+    const m = CEILING_FOLLOWUP_LINE_RE.exec(lastLine);
+    if (m) last = Number(m[1]);
   }
-  CEILING_FOLLOWUP_RE.lastIndex = 0;
   return last;
 }
 
