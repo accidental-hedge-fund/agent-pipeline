@@ -605,27 +605,38 @@ export async function advanceReview(
     : new Set<string>();
   const recurring = partition.blocking.filter((f) => priorKeys.has(findingKey(f)));
   if (recurring.length > 0) {
-    await postCommentFn(
-      cfg,
-      issueNumber,
-      reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
-    );
-    await transitionFn(
-      cfg,
-      issueNumber,
-      stage,
-      "needs-human",
-      `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
-        `finding key after a fix round — a proven non-convergence signal. Recorded as advisory; ` +
-        `parked at needs-human early, without consuming the remaining round budget (will NOT ` +
-        `auto-advance to ready-to-deploy).`,
-    );
-    return {
-      advanced: true,
-      from: stage,
-      to: "needs-human",
-      summary: `recurrence: ${recurring.length} blocking finding(s) unchanged after a fix → needs-human`,
-    };
+    // (#233 delta) At the ceiling with demote_and_advance, the cached failed-attempt
+    // verdict is `lastPriorRound` and its blocking keys look "recurring". Skip the
+    // early-park: the ceiling demotion path auto-demotes below-high findings without
+    // human intervention, so the recurrence signal is irrelevant here.
+    const atDemoteCeiling =
+      roundCap > 0 &&
+      priorRoundComments.length + 1 >= roundCap &&
+      cfg.review_policy.ceiling_action === "demote_and_advance";
+    if (!atDemoteCeiling) {
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
+      );
+      await transitionFn(
+        cfg,
+        issueNumber,
+        stage,
+        "needs-human",
+        `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
+          `finding key after a fix round — a proven non-convergence signal. Recorded as advisory; ` +
+          `parked at needs-human early, without consuming the remaining round budget (will NOT ` +
+          `auto-advance to ready-to-deploy).`,
+      );
+      return {
+        advanced: true,
+        from: stage,
+        to: "needs-human",
+        summary: `recurrence: ${recurring.length} blocking finding(s) unchanged after a fix → needs-human`,
+      };
+    }
+    // At ceiling with demote_and_advance: fall through to the ceiling check below.
   }
 
   // Bounded rounds: cap how many times this review round may re-run before we

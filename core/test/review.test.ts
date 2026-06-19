@@ -2789,7 +2789,8 @@ test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete de
   } as unknown as PipelineConfig;
 
   // The prior blocking verdict: authored by pipeline actor, includes footer + diffHash +
-  // pipeline-blocking-keys. This is what the first (failed) attempt left behind.
+  // pipeline-blocking-keys. This is the ONLY comment — the real partial-failure shape
+  // where the first attempt posted the verdict but failed before completing demotion.
   const cachedBlockingComment = {
     author: TEST_ACTOR,
     body: [
@@ -2805,13 +2806,6 @@ test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete de
       `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
     ].join("\n"),
   };
-  // A bare R2 comment after the cached blocking verdict — no footer/actor, no blocking-keys.
-  // This becomes the `lastPriorRound` for the recurrence check, ensuring priorKeys = {}
-  // so recurrence does not fire and the ceiling check runs instead.
-  const bareAfter = {
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${"b".repeat(7)})\n\n` +
-      `<!-- reviewed-sha: ${"b".repeat(40)} -->`,
-  };
 
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
@@ -2826,10 +2820,10 @@ test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete de
       state: "open",
       url: "u",
       labels: [],
-      // cachedBlockingComment: 1 comment in the cache filter (>= cap=1) → at ceiling.
-      // bareAfter: last in the broad filter → priorKeys = {} → recurrence silent.
-      // No demotion comment: first attempt failed before posting it.
-      comments: [cachedBlockingComment, bareAfter],
+      // Only the cached blocking verdict — the real partial-failure shape.
+      // This is lastPriorRound for the recurrence check AND the cache trigger.
+      // Without the fix, recurrence fires (same key) and parks at needs-human.
+      comments: [cachedBlockingComment],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
 
   let outcome: any;
