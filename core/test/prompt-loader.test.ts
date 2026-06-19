@@ -1282,6 +1282,94 @@ test("review prompts: both embed the non-blocking guidance block byte-for-byte (
   }
 });
 
+// #235: surgical-fix discipline drift tests — each assertion bites if the corresponding
+// instruction is removed from fix.md. Cover all three disciplines: minimal-diff, destructive-
+// operation guard, and pre-commit self-check.
+
+function buildSampleFixPrompt(): string {
+  return buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 235,
+    title: "Surgical fix rounds",
+    reviewFindings: "FINDINGS-SAMPLE",
+    fixRound: 1,
+    pipelineRunId: "235/2026-06-19T12:44:53Z",
+  });
+}
+
+test("fix prompt: minimal-diff discipline is a leading, prominent instruction (#235)", () => {
+  const out = buildSampleFixPrompt();
+  // Must explicitly forbid refactors
+  assert.match(out, /Do NOT refactor|do NOT refactor/i, "fix prompt must forbid refactors");
+  // Must explicitly forbid scope-broadening
+  assert.match(out, /Do NOT broaden|do NOT broaden/i, "fix prompt must forbid scope-broadening");
+  // Must explicitly forbid unrelated changes / opportunistic cleanup
+  assert.match(out, /unrelated changes|opportunistic cleanup/, "fix prompt must forbid unrelated changes and opportunistic cleanup");
+  // The minimal-diff instruction must appear before the Review Findings section
+  assert.ok(
+    out.indexOf("minimal diff") < out.indexOf("## Review Findings"),
+    "minimal-diff discipline must appear before the Review Findings section (must be a leading instruction)",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix prompt: destructive-operation guard names guarded operations and requires scope/justification (#235)", () => {
+  const out = buildSampleFixPrompt();
+  // Must name at least one destructive operation concretely
+  assert.match(out, /worktree remove --force|push --force/, "fix prompt must name a concrete destructive operation");
+  // Must require the operation be scoped to managed worktree root or reviewed head
+  assert.match(
+    out,
+    /managed worktree root|reviewed head/,
+    "fix prompt must require destructive ops be scoped to the managed worktree root or reviewed head",
+  );
+  // Must require explicit safety scope or justification
+  assert.match(
+    out,
+    /explicit.*justification|justification.*explicit|safety scope|explicit.*scope/i,
+    "fix prompt must require an explicit safety scope or justification for destructive operations",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix prompt: pre-commit self-check instructs comparing diff against findings before pushing (#235)", () => {
+  const out = buildSampleFixPrompt();
+  // Must instruct comparing own diff against findings
+  assert.match(
+    out,
+    /[Rr]eview your own diff|compare.*diff.*findings|diff.*against the findings/i,
+    "fix prompt must instruct the harness to compare its diff against the findings",
+  );
+  // Must instruct withholding push on suspected severity escalation
+  assert.match(
+    out,
+    /do NOT push|withhold the push|not push/i,
+    "fix prompt must instruct withholding the push when a severity escalation is suspected",
+  );
+  // Must be conservative-open (surface concern, don't proceed silently)
+  assert.match(
+    out,
+    /[Cc]onservative-open|surface the concern|call it out/i,
+    "fix prompt must be conservative-open: surface concern rather than silently proceeding",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix prompt: rendered prompt contains no unfilled {{placeholder}} on either path (#235)", () => {
+  const withSpec = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 235,
+    title: "t",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "235/r",
+    specContext: "#### cap/spec.md\n\nREQ: thing SHALL work",
+    priorReviewHistory: "## Round 1\n- finding was fixed",
+  });
+  assert.doesNotMatch(withSpec, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders on the OpenSpec path");
+  assert.doesNotMatch(buildSampleFixPrompt(), /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders on the freeform path");
+});
+
 test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {
   // Regression for the round-5 finding: a budget loop that appends later compact
   // sections first could consume the budget and leave a large early cap-crossing

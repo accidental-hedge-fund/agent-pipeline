@@ -73,6 +73,15 @@ into the living specs and runs `openspec validate --all` — a structurally inva
 - When a reviewer finding is out of an issue's stated scope, defer it to a tracked follow-up issue
   rather than expanding the change — but if the reviewer reliably re-flags a real design smell, fix
   the smell (don't fight the reviewer).
+- **Surgical-fix discipline** (`fix.md`, #235): fix rounds SHALL make the **minimal diff** that
+  resolves the specific finding — no refactors, scope-broadening, unrelated changes, or opportunistic
+  cleanup. When a fix touches a destructive/irreversible operation (`git worktree remove --force`,
+  `git push --force`, branch/worktree deletion, the merge surface), the prompt requires an explicit
+  safety scope or written justification confirming the operation is scoped to the **managed worktree
+  root** or the **reviewed head**. Before committing, the harness performs a pre-commit self-check:
+  if the diff appears to introduce a higher-severity problem than the finding it resolves, it surfaces
+  the concern and withholds the push. All three disciplines are drift-guarded by tests in
+  `prompt-loader.test.ts`.
 
 ## Conventions
 
