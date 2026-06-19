@@ -459,7 +459,6 @@ export async function advanceReview(
         body: f.body,
         confidence: f.confidence,
         recommendation: f.recommendation,
-        payload_fingerprint: findingPayloadFingerprint(f),
         effective_blocking: false,
       };
       if (f.file !== undefined) rec.file = f.file;
@@ -470,12 +469,11 @@ export async function advanceReview(
       return rec;
     }),
   );
-  // Restore payload_fingerprint from original findings — sanitizeDeep may corrupt
-  // it when finding text contains an injection-denylist pattern, breaking cross-round
-  // disambiguation. The fingerprint is a computed identifier, not free text, and
-  // must survive sanitization unchanged.
+  // Compute payload_fingerprint from the sanitized record fields so the persisted
+  // fingerprint does not encode raw secret/injection text from reviewer output.
+  // Sanitization runs first; the fingerprint is derived from the redacted fields.
   for (let i = 0; i < findingRecords.length; i++) {
-    findingRecords[i].payload_fingerprint = findingPayloadFingerprint(verdict.findings[i]);
+    findingRecords[i].payload_fingerprint = findingPayloadFingerprint(findingRecords[i] as ReviewFinding);
   }
   const reviewerModel = opts.model ?? cfg.models.review;
 
