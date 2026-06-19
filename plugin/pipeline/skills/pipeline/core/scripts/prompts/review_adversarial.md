@@ -67,6 +67,8 @@ If the change looks safe, say so directly and return no findings.
 
 {{confidence_calibration}}
 
+{{non_blocking_guidance}}
+
 ## Calibration Examples
 
 A model finding — a concrete failure path with high-stakes impact and a specific mitigation:

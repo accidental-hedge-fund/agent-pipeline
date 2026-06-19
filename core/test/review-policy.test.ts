@@ -829,3 +829,55 @@ test("buildTrustedOverrideComments: returns [] when actor is null even with allo
   const trusted = buildTrustedOverrideComments(comments, null, [OTHER]);
   assert.deepEqual(trusted, [], "null actor must produce empty trusted set regardless of allowlist");
 });
+
+// ---------------------------------------------------------------------------
+// Non-blocking marker (#236): blocking: false → advisory regardless of severity
+// ---------------------------------------------------------------------------
+
+test("partition: blocking:false at high severity is advisory, not blocking (#236)", () => {
+  const f = finding({ severity: "high", confidence: 0.95, blocking: false });
+  const p = partitionFindings([f], DEFAULT_POLICY);
+  assert.equal(p.blocking.length, 0, "blocking:false must not block even at high severity");
+  assert.equal(p.advisory.length, 1, "blocking:false must be advisory");
+  assert.match(p.advisory[0].reason, /marked non-blocking by reviewer/);
+});
+
+test("partition: blocking:false at critical severity is advisory, not blocking (#236)", () => {
+  const f = finding({ severity: "critical", confidence: 1.0, blocking: false });
+  const p = partitionFindings([f], DEFAULT_POLICY);
+  assert.equal(p.blocking.length, 0, "blocking:false must not block even at critical severity");
+  assert.equal(p.advisory.length, 1);
+  assert.match(p.advisory[0].reason, /marked non-blocking by reviewer/);
+});
+
+test("partition: unmarked finding (blocking absent) still blocks at high severity (#236)", () => {
+  // Prove the test would catch a regression: without the marker, high/critical blocks.
+  const withoutMarker = finding({ severity: "high", confidence: 0.95 });
+  const p = partitionFindings([withoutMarker], DEFAULT_POLICY);
+  assert.equal(p.blocking.length, 1, "finding without blocking marker must block normally");
+  assert.equal(p.advisory.length, 0);
+});
+
+test("partition: blocking:true at high severity still blocks (explicit true = normal classification) (#236)", () => {
+  const f = finding({ severity: "high", confidence: 0.95, blocking: true });
+  const p = partitionFindings([f], DEFAULT_POLICY);
+  assert.equal(p.blocking.length, 1, "blocking:true must classify normally — high severity must block");
+  assert.equal(p.advisory.length, 0);
+});
+
+test("partition: blocking:false sharing a key with a real blocker does NOT make the key ambiguous (#236)", () => {
+  // A non-blocking sibling at the same location+severity must not inflate the distinct-
+  // blocking-candidate count for that key, so the key override still applies to the
+  // blocker rather than being withheld by the ambiguity guard.
+  const blocker = finding({ severity: "high", file: "x.ts", title: "real bug", line_start: 46, confidence: 0.9 });
+  const nonBlocking = finding({ severity: "high", file: "x.ts", title: "same location, non-blocking", line_start: 48, confidence: 0.9, blocking: false });
+  assert.equal(findingKey(blocker), findingKey(nonBlocking), "precondition: same key");
+
+  const key = findingKey(blocker);
+  const overrides = new Map([[key, "rejected"]]);
+  const p = partitionFindings([blocker, nonBlocking], DEFAULT_POLICY, overrides);
+
+  assert.equal(p.blocking.length, 0, "blocker must be overridden (non-blocking sibling must not cause ambiguity)");
+  assert.equal(p.overridden.length, 1, "only the blocker is overridden");
+  assert.equal(p.advisory.length, 1, "non-blocking sibling is advisory");
+});

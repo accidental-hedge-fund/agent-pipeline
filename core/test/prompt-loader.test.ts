@@ -1234,6 +1234,54 @@ test("readConventions: every compact section that fits the budget is included â€
   assert.ok(result.length <= capChars + sectionCap + 300, `output too large: ${result.length}`);
 });
 
+// #236: severity rubric LOW calibration and non-blocking guidance tests
+
+test("severity rubric: LOW tier names all required classes and carries anti-inflation directive (#236)", () => {
+  const rubric = _testing.SEVERITY_RUBRIC;
+  // The required LOW class names (per the spec delta).
+  assert.match(rubric, /defensive hardening/, "LOW tier must name defensive hardening");
+  assert.match(rubric, /observability gaps/, "LOW tier must name observability gaps");
+  assert.match(rubric, /minor inconsistencies/, "LOW tier must name minor inconsistencies");
+  assert.match(rubric, /edge-case nitpick/, "LOW tier must name narrow edge-case nitpicks");
+  assert.match(rubric, /already fixed this round/, "LOW tier must name next-variant-of-a-class-already-fixed-this-round");
+  // Anti-inflation directive: must explicitly tell the model NOT to inflate LOW to MEDIUM.
+  assert.match(rubric, /[Dd]o NOT inflate/, "rubric must carry an explicit anti-inflation directive");
+  // Concrete LOW example must be present.
+  assert.match(rubric, /[Cc]oncrete LOW example|[Cc]lassify this as LOW/i, "rubric must include a concrete LOW example");
+});
+
+test("severity rubric: both review prompts embed the shared rubric byte-for-byte (#236)", () => {
+  const rubric = _testing.SEVERITY_RUBRIC;
+  const std = buildReviewStandardPrompt({
+    cfg: { domain: "acme", repo: "acme/widget", repo_dir: "/tmp/does-not-exist-236" } as PipelineConfig,
+    issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d",
+  });
+  const adv = buildReviewAdversarialPrompt({
+    cfg: { domain: "acme", repo: "acme/widget", repo_dir: "/tmp/does-not-exist-236" } as PipelineConfig,
+    issueNumber: 7, title: "T", body: "B", diff: "d",
+  });
+  for (const [name, out] of [["standard", std], ["adversarial", adv]] as const) {
+    assert.ok(out.includes(rubric), `${name} prompt must embed the shared SEVERITY_RUBRIC byte-for-byte`);
+  }
+});
+
+test("review prompts: both embed the non-blocking guidance block byte-for-byte (#236)", () => {
+  const guidance = _testing.NON_BLOCKING_GUIDANCE_BLOCK;
+  const std = buildReviewStandardPrompt({
+    cfg: { domain: "acme", repo: "acme/widget", repo_dir: "/tmp/does-not-exist-236" } as PipelineConfig,
+    issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d",
+  });
+  const adv = buildReviewAdversarialPrompt({
+    cfg: { domain: "acme", repo: "acme/widget", repo_dir: "/tmp/does-not-exist-236" } as PipelineConfig,
+    issueNumber: 7, title: "T", body: "B", diff: "d",
+  });
+  for (const [name, out] of [["standard", std], ["adversarial", adv]] as const) {
+    assert.ok(out.includes(guidance), `${name} prompt must embed NON_BLOCKING_GUIDANCE_BLOCK byte-for-byte`);
+    assert.match(out, /blocking.*false|false.*blocking/i, `${name} prompt must document the blocking:false field`);
+    assert.match(out, /[Oo]ut-of-scope|pre-existing|[Ii]nformational/, `${name} prompt must describe when to mark non-blocking`);
+  }
+});
+
 test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {
   // Regression for the round-5 finding: a budget loop that appends later compact
   // sections first could consume the budget and leave a large early cap-crossing

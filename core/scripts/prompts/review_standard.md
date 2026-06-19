@@ -47,6 +47,8 @@ Report only material findings. No style nits, no speculative concerns without ev
 
 {{confidence_calibration}}
 
+{{non_blocking_guidance}}
+
 ## Calibration Examples
 
 A model finding — specific code path, real impact, concrete fix, honest severity and confidence:

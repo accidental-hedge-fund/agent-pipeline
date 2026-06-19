@@ -206,6 +206,12 @@ If no documentation is affected, change nothing — do not add boilerplate docs.
 // actually blocks on (#17). Single-sourced (like {{schema_block}}) so the two
 // prompts cannot drift. An inflated severity turns an advisory note into a
 // blocking fix round and is a primary cause of non-converging review loops.
+//
+// LOW is a populated tier (#236): defensive hardening, observability gaps, minor
+// inconsistencies, narrow edge-case nitpicks, and "the next variant of a class
+// already fixed this round" are explicitly LOW — not MEDIUM. The anti-inflation
+// directive and the concrete LOW example below are what make the model actually
+// use LOW rather than round up to force a fix round.
 const SEVERITY_RUBRIC = `## Severity Rubric
 
 Rate each finding honestly against real-world impact — do NOT inflate. The policy blocks at its \`block_threshold\` and advances on anything below, so severity is the difference between a blocking fix round and an advisory note.
@@ -213,9 +219,26 @@ Rate each finding honestly against real-world impact — do NOT inflate. The pol
 - **critical** — data loss/corruption, security or auth-boundary bypass, customer-facing outage, or an irreversible/unrecoverable state change.
 - **high** — a real correctness defect, a race/ordering bug with concrete impact, or a failure path that strands a production dependency.
 - **medium** — degraded-but-recoverable behavior, a missing edge case, or a hazard that needs a specific trigger to bite.
-- **low** — defensive hardening, observability gaps, or minor inconsistencies unlikely to affect production.
+- **low** — defensive hardening, observability gaps, minor inconsistencies, narrow edge-case nitpicks, and "the next variant of a class already fixed this round." LOW is a tier you are expected to use — not a residual category. A hardening note, a narrow nitpick, or a follow-on variant of something already fixed this round lands at LOW. **Do NOT inflate these to MEDIUM to make them block** — inflating a LOW finding to force a fix round is the exact failure this rubric prevents.
+
+**Concrete LOW example** (classify this as LOW, not MEDIUM):
+
+> A single-operator CLI adds an \`--output json\` flag; the help text for the flag is missing a description of what the JSON shape looks like. No user data is at risk; the gap is purely observability/documentation.
 
 Set each finding's \`category\` to a short machine-readable class (e.g. \`spec-divergence\`, \`correctness\`, \`security\`, \`data-loss\`, \`concurrency\`, \`observability\`) so downstream gates can key on the field instead of parsing prose.`;
+
+// Single-sourced guidance on when to set `blocking: false` on a finding (#236).
+// Injected into BOTH review prompts via {{non_blocking_guidance}} so the standard
+// and adversarial prompts cannot drift. Mirrors the pattern of CONFIDENCE_CALIBRATION_BLOCK.
+const NON_BLOCKING_GUIDANCE_BLOCK = `## Non-Blocking Findings
+
+You may emit a finding with \`"blocking": false\` to record a genuine observation that should NOT route to a fix round. Use this for:
+
+- **Out-of-scope**: a real weakness, but outside the stated change (pre-existing or in adjacent code). Record it for context; do not demand a fix this round.
+- **Pre-existing**: a defect that predates this diff and whose fix would be a separate change. Note it with \`blocking: false\` so the fix-history carries it.
+- **Informational**: a narrow nitpick or hardening suggestion with no concrete production impact — an advisory note worth recording but not worth a fix round.
+
+Put your specific reason in the finding \`body\`. A non-blocking finding is audited in the advance record but does NOT route the item to a fix round, even at \`critical\` severity. Omitting the field (or setting \`"blocking": true\`) classifies normally — the policy's severity threshold and confidence floor apply as before.`;
 
 // Shared confidence calibration injected into BOTH review prompts (#57), single-
 // sourced like SEVERITY_RUBRIC so the two rounds cannot drift. It gives the
@@ -255,6 +278,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
     confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
+    non_blocking_guidance: NON_BLOCKING_GUIDANCE_BLOCK,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -291,6 +315,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
     confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
+    non_blocking_guidance: NON_BLOCKING_GUIDANCE_BLOCK,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
   });
@@ -484,6 +509,7 @@ export function buildDeltaReviewPrompt(a: BuildDeltaReviewArgs): string {
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
     confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
+    non_blocking_guidance: NON_BLOCKING_GUIDANCE_BLOCK,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.deltaDiff, 50_000),
   });
@@ -517,6 +543,7 @@ export function buildSweepPrompt(a: BuildSweepArgs): string {
   });
 }
 
-// Exported for tests. CONFIDENCE_CALIBRATION_BLOCK is exposed so the drift test
-// can assert both review prompts embed the shared constant byte-for-byte.
-export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK };
+// Exported for tests. CONFIDENCE_CALIBRATION_BLOCK and NON_BLOCKING_GUIDANCE_BLOCK
+// are exposed so the drift test can assert both review prompts embed the shared
+// constants byte-for-byte. SEVERITY_RUBRIC is exposed for the rubric-content test.
+export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK, NON_BLOCKING_GUIDANCE_BLOCK, SEVERITY_RUBRIC };

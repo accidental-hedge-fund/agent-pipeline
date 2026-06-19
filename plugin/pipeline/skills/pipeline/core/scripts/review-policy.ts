@@ -256,11 +256,13 @@ export function partitionFindings(
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
 
   // Pre-classify: for each key, collect the set of distinct *payload fingerprints*
-  // among blocking candidates only. Advisory findings are not counted, and
-  // exact-duplicate payloads collapse to one — but two materially different
+  // among blocking candidates only. Advisory findings are not counted — including
+  // findings marked `blocking: false` (#236), which are never blocking candidates.
+  // Exact-duplicate payloads collapse to one — but two materially different
   // findings that share a key stay distinct, so they correctly trigger ambiguity.
   const blockingFingerprintsByKey = new Map<string, Set<string>>();
   for (const f of findings) {
+    if (f.blocking === false) continue; // non-blocking marker: never a blocking candidate (#236)
     const isAboveSeverity = severityRank(f.severity) >= threshold;
     const isAboveConfidence = typeof f.confidence !== "number" || f.confidence >= policy.min_confidence;
     if (isAboveSeverity && isAboveConfidence) {
@@ -271,6 +273,12 @@ export function partitionFindings(
   }
 
   for (const f of findings) {
+    // 0. Non-blocking marker (#236): advisory regardless of severity/confidence.
+    if (f.blocking === false) {
+      result.advisory.push({ finding: f, reason: "marked non-blocking by reviewer" });
+      continue;
+    }
+
     // 1. Scope match (#229): no ambiguity guard, re-evaluated every round.
     const matchedScope = scopes.find((s) => matchFindingScope(f, s));
     if (matchedScope) {
