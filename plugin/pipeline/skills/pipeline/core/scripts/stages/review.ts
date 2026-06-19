@@ -50,11 +50,13 @@ import {
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { sanitizeDeep } from "../artifact-sanitize.ts";
 import type {
   BlockerKind,
   Outcome,
   PipelineConfig,
   ReviewFinding,
+  ReviewFindingRecord,
   ReviewVerdict,
   Stage,
 } from "../types.ts";
@@ -439,12 +441,40 @@ export async function advanceReview(
   for (const f of verdict.findings) {
     findingCounts[f.severity] = (findingCounts[f.severity] ?? 0) + 1;
   }
+  // Build per-finding records for run-directory persistence (#209). sanitizeDeep
+  // screens title/body/recommendation at the field level before they reach disk,
+  // consistent with the write-time injection-denylist + secret-redaction convention
+  // (#161). The same `reviewer` variable is used here — it was reassigned above to
+  // the effective harness (post #39 same-harness fallback reassignment).
+  const findingRecords: ReviewFindingRecord[] = sanitizeDeep(
+    verdict.findings.map((f): ReviewFindingRecord => {
+      const rec: ReviewFindingRecord = {
+        key: findingKey(f),
+        severity: f.severity,
+        title: f.title,
+        body: f.body,
+        confidence: f.confidence,
+        recommendation: f.recommendation,
+      };
+      if (f.file !== undefined) rec.file = f.file;
+      if (f.line_start !== undefined) rec.line_start = f.line_start;
+      if (f.line_end !== undefined) rec.line_end = f.line_end;
+      if (f.category !== undefined) rec.category = f.category;
+      if (f.blocking !== undefined) rec.blocking = f.blocking;
+      return rec;
+    }),
+  );
+  const reviewerModel = opts.model ?? cfg.models.review;
   if (opts.stateDir) {
     await recordReview(opts.stateDir, issueNumber, {
       round,
       sha: commitSha,
       verdict: verdict.verdict,
       findingCounts,
+      findings: findingRecords,
+      harness: reviewer,
+      model: reviewerModel,
+      selfReview,
     }).catch(() => {});
   }
   // JSONL event log (#155): emit review_verdict for Pipeline Desk stage timeline.
@@ -458,6 +488,10 @@ export async function advanceReview(
       sha: commitSha,
       verdict: verdict.verdict,
       finding_counts: findingCounts,
+      findings: findingRecords,
+      reviewer_harness: reviewer,
+      reviewer_model: reviewerModel,
+      self_review: selfReview,
     }, opts.runStoreDeps).catch(() => {});
   }
 

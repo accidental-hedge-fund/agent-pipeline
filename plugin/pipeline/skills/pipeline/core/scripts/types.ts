@@ -534,12 +534,37 @@ export interface StageRecord {
   prompts: PromptRecord[];
 }
 
-/** Summary of one review round's verdict. `findingCounts` maps severity → count. */
+/** A structured per-finding record persisted into the run directory (#209).
+ *  Carries the stable `findingKey` as the cross-round correlation handle plus
+ *  the full `ReviewFinding` field set (text fields sanitized at write time).
+ *  Optional source fields mirror `ReviewFinding` — absent when the reviewer
+ *  did not supply them. */
+export interface ReviewFindingRecord {
+  key: string;
+  severity: "critical" | "high" | "medium" | "low";
+  title: string;
+  body: string;
+  file?: string;
+  line_start?: number;
+  line_end?: number;
+  confidence: number;
+  recommendation: string;
+  category?: string;
+  blocking?: boolean;
+}
+
+/** Summary of one review round's verdict. `findingCounts` maps severity → count.
+ *  `findings`, `harness`, `model`, and `selfReview` are additive optional fields
+ *  (#209) — present on new records, absent on records written before #209. */
 export interface ReviewRecord {
   round: number;
   sha: string;
   verdict: string;
   findingCounts: Record<string, number>;
+  findings?: ReviewFindingRecord[];
+  harness?: string;
+  model?: string;
+  selfReview?: boolean;
 }
 
 /** An operator `--override` disposition applied during the run. */
