@@ -386,3 +386,38 @@ test("filterToBlockingFindings: same-key blocking + blocking:false sibling — a
   assert.ok(!filtered.includes(sameKeyAdvisory.title), "advisory sibling must be excluded despite shared key");
   assert.ok(filtered.includes("1 advisory finding was omitted"), "omission note must be present");
 });
+
+// Regression: advisory sentinel in reviewer body must NOT strip a blocking finding (#236 delta)
+test("filterToBlockingFindings: advisory sentinel in reviewer body does NOT strip a blocking finding", () => {
+  // A blocking finding whose body discusses the sentinel mechanism would previously
+  // be classified as advisory because block.includes() scanned the entire block
+  // including reviewer-controlled body text.
+  const ADVISORY_MARKER = "<!-- pipeline-advisory-finding -->";
+  const blockingWithSentinelInBody: ReviewFinding = {
+    severity: "high",
+    title: "Sentinel spoof vector",
+    file: "core/scripts/stages/fix.ts",
+    line_start: 426,
+    // Body text that contains the sentinel string (e.g. a finding about the mechanism).
+    body: `filterToBlockingFindings uses block.includes("${ADVISORY_MARKER}") which can be spoofed.`,
+    confidence: 0.9,
+    recommendation: `Do not use substring search; check only the header zone before reviewer prose.`,
+  };
+
+  const key = findingKey(blockingWithSentinelInBody);
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "blocking finding about the sentinel", findings: [blockingWithSentinelInBody], next_steps: [] },
+    1, "codex",
+    new Set([key]),
+  );
+
+  // Sanity: the sentinel string appears somewhere in the formatted body (inside the body text).
+  assert.ok(body.includes(ADVISORY_MARKER), "sanity: sentinel string is in the formatted comment");
+
+  const filtered = filterToBlockingFindings(body, new Set([key]));
+
+  // Blocking finding must NOT be stripped (the sentinel was in reviewer prose, not the header zone).
+  assert.ok(filtered.includes(blockingWithSentinelInBody.title), "blocking finding must survive even when body contains the sentinel string");
+  assert.ok(!filtered.includes("advisory finding was omitted"), "no advisory omission note should appear — the finding is blocking");
+});

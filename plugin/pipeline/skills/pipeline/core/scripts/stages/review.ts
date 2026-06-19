@@ -1046,12 +1046,13 @@ export function formatReviewComment(
       const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
       if (loc) lines.push(`Location: \`${loc}\``);
+      // Per-finding advisory marker: emitted BEFORE reviewer-controlled fields (body,
+      // recommendation) so filterToBlockingFindings can detect it in the
+      // formatter-owned header zone rather than substring-searching reviewer prose
+      // (which would let a finding discussing the sentinel strip itself, #236).
+      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
-      // Per-finding advisory marker: emitted when the reviewer explicitly marks a
-      // finding non-blocking (blocking:false). Lets filterToBlockingFindings exclude
-      // this finding even when it shares a findingKey with a genuine blocker (#236).
-      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
     });
   }
   if (verdict._raw) {
@@ -1118,9 +1119,10 @@ export function formatDeltaReviewComment(
       const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
       if (loc) lines.push(`Location: \`${loc}\``);
+      // Emitted before reviewer fields for the same spoof-safety reason as formatReviewComment.
+      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
-      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
     }
   }
   if (verdict.next_steps?.length) {

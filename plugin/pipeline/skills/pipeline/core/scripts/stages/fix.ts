@@ -359,6 +359,28 @@ export function extractAllReviewFindingsHistory(
 // ---------------------------------------------------------------------------
 
 /**
+ * Returns true only when the advisory sentinel appears in the formatter-owned
+ * header zone of a finding block — the title line (`**N. ...`) and the optional
+ * `Location:` line — before any reviewer-controlled prose (body, recommendation).
+ *
+ * The sentinel is emitted by formatReviewComment BEFORE f.body, so for a genuine
+ * advisory finding it sits in this header zone. A blocking finding whose body or
+ * recommendation text happens to contain the sentinel string will NOT match, because
+ * the scan stops at the first non-header line.
+ */
+function advisoryMarkerInHeaderZone(block: string, marker: string): boolean {
+  let seenTitle = false;
+  for (const line of block.split("\n")) {
+    if (!line) continue;
+    if (line === marker) return true;
+    if (!seenTitle && /^\*\*\d+\./.test(line)) { seenTitle = true; continue; }
+    if (seenTitle && line.startsWith("Location:")) continue;
+    break; // first non-header non-empty line → reviewer prose starts
+  }
+  return false;
+}
+
+/**
  * Removes non-blocking (advisory) findings from a review comment body so the
  * fix prompt's "Address EACH finding" instruction applies only to genuine
  * blockers. Advisory findings are identified by their `override-key` NOT
@@ -414,6 +436,8 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
   // Per-finding advisory marker emitted by formatReviewComment for reviewer-marked
   // non-blocking findings (#236 fix 2). Takes precedence over the key-set check so
   // a blocking:false finding that shares a key with a genuine blocker is still excluded.
+  // The marker is emitted BEFORE reviewer-controlled fields (body, recommendation) so
+  // it can be detected safely in the formatter-owned header zone; see fix #236 delta.
   const ADVISORY_FINDING_MARKER = "<!-- pipeline-advisory-finding -->";
 
   const blocking: string[] = [];
@@ -423,7 +447,9 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
     if (!block.trim()) continue;
     // Per-finding marker beats key-set: a reviewer-marked advisory finding is
     // excluded even when its override-key collides with a blocking finding's key.
-    if (block.includes(ADVISORY_FINDING_MARKER)) {
+    // Check only the formatter-controlled header zone (title + Location: lines)
+    // to avoid being spoofed by reviewer prose that contains the sentinel string.
+    if (advisoryMarkerInHeaderZone(block, ADVISORY_FINDING_MARKER)) {
       advisoryCount++;
       continue;
     }
