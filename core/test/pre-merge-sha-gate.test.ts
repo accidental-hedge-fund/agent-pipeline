@@ -18,7 +18,7 @@ import {
   type RunDeltaReviewFn,
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { computeDiffHash } from "../scripts/stages/review.ts";
+import { computeDiffHash, countPriorRounds, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 const cfg = {} as unknown as PipelineConfig;
@@ -88,6 +88,7 @@ function makeDeps(opts: {
   getPrDiff?: () => Promise<string>;
   getCommitDeltaDiff?: () => Promise<string>;
   runDeltaReview?: RunDeltaReviewFn;
+  getForIssue?: () => Promise<{ path: string } | null>;
 }): { deps: ShaGateDeps; rec: Rec } {
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const comments = opts.commentBody === null ? [] : [{ body: opts.commentBody }];
@@ -109,6 +110,8 @@ function makeDeps(opts: {
     setBlocked: async (_cfg, _n, reason) => {
       rec.blocked.push({ reason });
     },
+    getForIssue: async (_cfg, _n) =>
+      opts.getForIssue ? (await opts.getForIssue() as any) : null,
     ...(opts.getPrDiff && {
       getPrDiff: async (_cfg, _n) => opts.getPrDiff!(),
     }),
@@ -462,4 +465,162 @@ test("enforceReviewShaGate: getCommitDeltaDiff throws → falls back to full re-
   });
   assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "review-2" }], "delta diff failure → full re-review");
   assert.deepEqual(rec.blocked, [], "must NOT call setBlocked on a diff failure");
+});
+
+// ---------------------------------------------------------------------------
+// enforceReviewShaGate — fix-round-2 findings (#228)
+// ---------------------------------------------------------------------------
+
+test("countPriorRounds: delta review comment does NOT count as review-2 round (Finding 1)", () => {
+  // A delta review comment uses DELTA_REVIEW_MARKER_PREFIX, not "## Review 2 …".
+  // advanceReview counts prior rounds by the "## Review 2" prefix; delta reviews
+  // must be excluded so they do not consume the max_adversarial_rounds ceiling.
+  const deltaBody = `${DELTA_REVIEW_MARKER_PREFIX} — approve (commit abc1234)\n**Reviewer**: codex\n\nLGTM`;
+  const review2Body = "## Review 2 (Adversarial) — approve (commit def5678)\n**Reviewer**: codex\n\nLGTM";
+  const comments = [
+    { body: deltaBody },
+    { body: review2Body },
+    { body: deltaBody },
+  ];
+  // Only the actual Review 2 comment counts; delta review comments must not count.
+  assert.equal(
+    countPriorRounds(comments, 2),
+    1,
+    "only ## Review 2 comments count, not ## Pre-merge Delta Review comments",
+  );
+  // Verify countPriorRounds(comments, 1) also ignores delta reviews
+  assert.equal(countPriorRounds(comments, 1), 0, "round-1 count must also ignore delta reviews");
+});
+
+test("enforceReviewShaGate: HEAD moved during delta review → falls back to full re-review (Finding 2)", async (t) => {
+  // Regression: a push landing while the delta reviewer is running means the
+  // approval covers an old SHA. The gate must detect this and re-enter the SHA
+  // gate (fall to full re-review) instead of proceeding to CI/ready-to-deploy.
+  const SHA_NEW_HEAD = "3333333333333333333333333333333333333333";
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+
+  let getPrDetailCalls = 0;
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash) }];
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      // First call returns SHA_HEAD (gate's initial head read).
+      // Second call (HEAD re-validation after delta review) returns SHA_NEW_HEAD.
+      return ({ head_sha: getPrDetailCalls === 1 ? SHA_HEAD : SHA_NEW_HEAD }) as any;
+    },
+    getPrCommits: async () =>
+      [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT] as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview: async () => ({
+      verdict: "approve" as const,
+      findings: [],
+      summary: "Delta LGTM",
+    }),
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+
+  // Delta approved but HEAD moved during review → must fall back to full re-review.
+  assert.deepEqual(
+    rec.transitions,
+    [{ from: "pre-merge", to: "review-2" }],
+    "HEAD moved during delta review → must fall back to full re-review, not proceed",
+  );
+  assert.deepEqual(rec.blocked, [], "must NOT call setBlocked — re-review handles it");
+});
+
+test("enforceReviewShaGate: delta review invoked with worktree path from getForIssue (Finding 3)", async (t) => {
+  // The delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
+  // can inspect PR-branch files. Verify getForIssue output is plumbed through.
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const FAKE_WORKTREE_PATH = "/fake/worktrees/issue-16";
+
+  const capturedArgs: { worktreePath: string; specContext: string }[] = [];
+  const runDeltaReview: RunDeltaReviewFn = async (
+    _cfg, _n, _d, _diff, worktreePath, specContext,
+  ) => {
+    capturedArgs.push({ worktreePath, specContext });
+    return { verdict: "approve" as const, findings: [], summary: "Delta LGTM" };
+  };
+
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+    getForIssue: async () => ({ path: FAKE_WORKTREE_PATH }),
+  });
+
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+
+  assert.equal(capturedArgs.length, 1, "runDeltaReview should have been called once");
+  assert.equal(
+    capturedArgs[0].worktreePath,
+    FAKE_WORKTREE_PATH,
+    "delta reviewer must receive the issue worktree path, not cfg.repo_dir",
+  );
+});
+
+test("enforceReviewShaGate: delta self-review disclosure applied in posted comment (Finding 4)", async (t) => {
+  // When invokeReviewer falls back to the same implementing harness, the posted
+  // delta comment must carry the selfReviewBanner disclosure. The DeltaReviewResult
+  // now carries effectiveReviewer/selfReview fields for this purpose.
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const selfReviewResult: DeltaReviewResult = {
+    verdict: "approve",
+    findings: [],
+    summary: "Self-review: LGTM",
+    effectiveReviewer: "claude",
+    selfReview: true,
+  };
+
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview: async () => selfReviewResult,
+  });
+
+  const cfgWithTwoHarnesses = {
+    review_policy: { block_threshold: "low" as const, min_confidence: 0 },
+    harnesses: { reviewer: "codex", implementer: "claude" as const },
+  } as unknown as PipelineConfig;
+
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithTwoHarnesses, 16, 99, deps);
+  });
+
+  assert.equal(rec.comments.length, 1, "one delta comment posted");
+  assert.match(
+    rec.comments[0],
+    /same-harness self-review/i,
+    "self-review disclosure banner must appear in the delta review comment",
+  );
+  assert.match(
+    rec.comments[0],
+    /self-review\)/,
+    "reviewer label must include (self-review) suffix",
+  );
 });

@@ -20,6 +20,7 @@ import {
   advanceReview,
   computeDiffHash,
   countPriorRounds,
+  DELTA_REVIEW_MARKER_PREFIX,
   diffFilePaths,
   extractBlockingKeysFromComment,
   extractDiffHashFromComment,
@@ -1668,4 +1669,46 @@ test("advanceReview: cache hit with all blocking keys overridden → advances in
   assert.equal(outcome.to, "pre-merge", "all blockers overridden → advance to pre-merge (round 2)");
   assert.match(outcome.summary, /cached verdict/);
   assert.deepEqual(rec.blocked, [], "must NOT call setBlocked");
+});
+
+// ---------------------------------------------------------------------------
+// extractReviewedSha — delta review comment recognition (#228)
+// ---------------------------------------------------------------------------
+
+test("extractReviewedSha: recognizes delta review comment as round 2 (Finding 1)", () => {
+  const DELTA_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const deltaCommentBody =
+    `${DELTA_REVIEW_MARKER_PREFIX} — approve (commit ${DELTA_SHA.slice(0, 7)})\n` +
+    `**Reviewer**: codex\n\nLGTM\n\n<!-- reviewed-sha: ${DELTA_SHA} -->`;
+  const comments = [{ body: deltaCommentBody }];
+  const result = extractReviewedSha(comments);
+  assert.ok(result !== null, "should find SHA in delta review comment");
+  assert.equal(result!.sha, DELTA_SHA, "should extract the correct SHA from delta comment");
+  assert.equal(result!.round, 2, "delta review comment should be treated as round 2");
+});
+
+test("extractReviewedSha: delta comment takes precedence over older review-2 comment (Finding 1)", () => {
+  const OLD_SHA = "1111111111111111111111111111111111111111";
+  const NEW_SHA = "2222222222222222222222222222222222222222";
+  const review2Body =
+    `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${OLD_SHA} -->`;
+  const deltaBody =
+    `${DELTA_REVIEW_MARKER_PREFIX} — approve (commit ${NEW_SHA.slice(0, 7)})\n` +
+    `**Reviewer**: codex\n\nLGTM\n\n<!-- reviewed-sha: ${NEW_SHA} -->`;
+  // Delta comment is most recent (appears last in the array as findLatestCommentMatching scans in order).
+  const comments = [{ body: review2Body }, { body: deltaBody }];
+  const result = extractReviewedSha(comments);
+  assert.ok(result !== null, "should find SHA");
+  assert.equal(result!.sha, NEW_SHA, "delta comment's SHA should take precedence as it is most recent");
+  assert.equal(result!.round, 2, "delta review comment treated as round 2");
+});
+
+test("extractReviewedSha: delta comment excluded when round=1 filter (Finding 1)", () => {
+  const DELTA_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const deltaBody =
+    `${DELTA_REVIEW_MARKER_PREFIX} — approve\n\nLGTM\n\n<!-- reviewed-sha: ${DELTA_SHA} -->`;
+  const comments = [{ body: deltaBody }];
+  // round=1 filter must not include delta review comments
+  const result = extractReviewedSha(comments, 1);
+  assert.equal(result, null, "delta review comment must not be found when filtering for round=1");
 });

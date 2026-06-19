@@ -27,10 +27,11 @@ import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   computeDiffHash,
+  diffFilePaths,
   extractBlockingKeysFromComment,
   extractDiffHashFromComment,
   findLatestReviewCommentBody,
-  formatReviewComment,
+  formatDeltaReviewComment,
   extractReviewedSha,
   parseStructuredVerdict,
 } from "./review.ts";
@@ -40,8 +41,9 @@ import {
   partitionFindings,
   reviewCommentFlagsSpecDivergence,
 } from "../review-policy.ts";
-import { invokeReviewer } from "../self-review.ts";
+import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { buildDeltaReviewPrompt } from "../prompts/index.ts";
+import { openspecContextFromDiff } from "../openspec.ts";
 import * as openspec from "../openspec.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
@@ -352,6 +354,11 @@ export interface DeltaReviewResult {
   verdict: "approve" | "needs-attention";
   findings: ReviewFinding[];
   summary: string;
+  /** The harness that actually performed the review (may differ from cfg.harnesses.reviewer
+   *  on the #39 same-harness fallback). Undefined when the caller is a test stub. */
+  effectiveReviewer?: string;
+  /** True when the implementing harness reviewed its own work (same-harness fallback). */
+  selfReview?: boolean;
 }
 
 /**
@@ -364,6 +371,8 @@ export type RunDeltaReviewFn = (
   issueNumber: number,
   issueDetail: { title: string; body: string },
   deltaDiff: string,
+  worktreePath: string,
+  specContext: string,
 ) => Promise<DeltaReviewResult>;
 
 /**
@@ -391,6 +400,8 @@ export interface ShaGateDeps {
   postComment?: typeof postComment;
   transition?: typeof transition;
   setBlocked?: typeof setBlocked;
+  /** Looks up the issue worktree path and slug for the delta reviewer's CWD and OpenSpec context (#228). */
+  getForIssue?: typeof getForIssue;
 }
 
 /**
@@ -416,6 +427,7 @@ export async function enforceReviewShaGate(
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
   const reviewed = extractReviewedSha(detail.comments);
@@ -481,7 +493,20 @@ export async function enforceReviewShaGate(
       const deltaDiff = reviewed.sha
         ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head)
         : currentDiff; // reviewed SHA missing → review the full diff as the delta
-      const deltaResult = await runDeltaReviewFn(cfg, issueNumber, detail, deltaDiff);
+
+      // Resolve worktree and spec context for the delta reviewer (Finding 3): the
+      // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
+      // can inspect PR-branch files, and must receive OpenSpec context for any
+      // change dirs touched by the unreviewed commits.
+      const deltaWt = await getForIssueFn(cfg, issueNumber);
+      const deltaWorktreePath = deltaWt?.path ?? cfg.repo_dir;
+      const deltaSpecContext = deltaWt
+        ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
+        : "";
+
+      const deltaResult = await runDeltaReviewFn(
+        cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
+      );
       // Guard: needs-attention with zero findings indicates unparseable reviewer output
       // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
       // conservative catch path (full re-review) rather than treating zero findings as
@@ -504,17 +529,39 @@ export async function enforceReviewShaGate(
         commitSha: head,
       };
       const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
-      const deltaComment = formatReviewComment(
+
+      // Apply same-harness self-review disclosure (Finding 4): when invokeReviewer
+      // falls back to the implementer, the delta comment must carry the same
+      // selfReviewBanner and (self-review) label used by advanceReview.
+      const deltaEffectiveReviewer = deltaResult.effectiveReviewer ?? cfg.harnesses.reviewer;
+      const deltaIsSelfReview = deltaResult.selfReview ?? false;
+      const deltaReviewerLabel = deltaIsSelfReview
+        ? `${deltaEffectiveReviewer} (self-review)`
+        : deltaEffectiveReviewer;
+      const deltaCommentBody = formatDeltaReviewComment(
         cfg,
         deltaCommentVerdict,
-        reviewed.round,
-        `pre-merge delta review by ${cfg.harnesses.reviewer}`,
+        `pre-merge delta review by ${deltaReviewerLabel}`,
         blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
         newHash,
       );
+      const deltaComment = deltaIsSelfReview
+        ? `${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}\n\n${deltaCommentBody}`
+        : deltaCommentBody;
       await postCommentFn(cfg, issueNumber, deltaComment);
 
       if (partition.blocking.length === 0) {
+        // Re-validate HEAD: a push during the delta reviewer invocation means the
+        // approval covers a commit that is no longer HEAD. Rather than proceeding
+        // on a stale approval, fall back to the conservative full re-review path
+        // (Finding 2). We throw so the catch block handles the fallthrough.
+        const postDeltaHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+        if (postDeltaHead !== head) {
+          throw new Error(
+            `PR HEAD moved from ${head.slice(0, 7)} to ${postDeltaHead.slice(0, 7)} ` +
+            `during delta review; delta approval is stale — re-entering SHA gate`,
+          );
+        }
         // Delta review approves (or findings all below policy): pre-merge proceeds.
         console.log(`[pipeline] #${issueNumber}: pre-merge delta review approved; proceeding`);
         return null;
@@ -604,6 +651,8 @@ async function defaultRunDeltaReview(
   issueNumber: number,
   issueDetail: { title: string; body: string },
   deltaDiff: string,
+  worktreePath: string,
+  specContext: string,
 ): Promise<DeltaReviewResult> {
   const prompt = buildDeltaReviewPrompt({
     cfg,
@@ -611,11 +660,12 @@ async function defaultRunDeltaReview(
     title: issueDetail.title,
     body: issueDetail.body,
     deltaDiff,
+    specContext,
   });
   const invocation = await invokeReviewer(
     cfg.harnesses.reviewer,
     cfg.harnesses.implementer,
-    cfg.repo_dir,
+    worktreePath,
     prompt,
     { timeoutSec: cfg.review_timeout, model: cfg.models.review },
   );
@@ -625,7 +675,13 @@ async function defaultRunDeltaReview(
     );
   }
   const parsed = parseStructuredVerdict(invocation.result.stdout, "");
-  return { verdict: parsed.verdict, findings: parsed.findings, summary: parsed.summary };
+  return {
+    verdict: parsed.verdict,
+    findings: parsed.findings,
+    summary: parsed.summary,
+    effectiveReviewer: invocation.effectiveReviewer,
+    selfReview: invocation.selfReview,
+  };
 }
 
 /** The notice posted before a SHA-mismatch re-review. Pure; exported for tests. */

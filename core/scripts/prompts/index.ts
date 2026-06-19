@@ -452,6 +452,8 @@ export interface BuildDeltaReviewArgs {
   body: string;
   /** The unreviewed delta diff (commits since the last reviewed SHA). */
   deltaDiff: string;
+  /** OpenSpec spec deltas for changed paths; empty/undefined when not applicable. */
+  specContext?: string;
 }
 
 /**
@@ -479,7 +481,7 @@ export function buildDeltaReviewPrompt(a: BuildDeltaReviewArgs): string {
     body: a.body || "(no description)",
     review1_section: deltaScopeNote,
     prior_review2_findings: "",
-    spec_context: "",
+    spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
     confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,

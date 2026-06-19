@@ -69,6 +69,12 @@ const PIPELINE_BLOCKING_KEYS_RE = /^<!-- pipeline-blocking-keys: ([0-9a-f,]*) --
 // injected sentinel appearing earlier in the comment body.
 const VERDICT_DIFF_HASH_RE = /^<!-- verdict-diff-hash: ([0-9a-f]{16}) -->$/gm;
 
+// Distinct heading prefix for pre-merge delta review comments (#228 fix-2). Must NOT
+// start with "## Review 1" or "## Review 2" so delta reviews are excluded from
+// ceiling/recurrence accounting in advanceReview while still carrying the reviewed-sha
+// and verdict-diff-hash sentinels the SHA gate reads back.
+export const DELTA_REVIEW_MARKER_PREFIX = "## Pre-merge Delta Review";
+
 export interface AdvanceReviewOpts {
   dryRun?: boolean;
   model?: string;
@@ -1015,6 +1021,58 @@ export function formatReviewComment(
   return lines.join("\n");
 }
 
+/**
+ * Format a pre-merge delta review comment (#228). Uses a distinct heading prefix
+ * (DELTA_REVIEW_MARKER_PREFIX) so the comment is NOT counted as a full review-2
+ * round by advanceReview's ceiling and recurrence accounting. Still carries the
+ * reviewed-sha and verdict-diff-hash sentinels so the SHA gate can pick up the
+ * updated SHA and hash on the next pre-merge iteration.
+ */
+export function formatDeltaReviewComment(
+  cfg: PipelineConfig,
+  verdict: ReviewVerdict & { _raw?: string },
+  reviewer: string,
+  blockingKeys?: Set<string>,
+  diffHash?: string,
+): string {
+  const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
+  const heading = shortSha
+    ? `${DELTA_REVIEW_MARKER_PREFIX} — ${verdict.verdict} (commit ${shortSha})`
+    : `${DELTA_REVIEW_MARKER_PREFIX} — ${verdict.verdict}`;
+  const lines: string[] = [heading, `**Reviewer**: ${reviewer}`, "", verdict.summary];
+  if (verdict.findings.length > 0) {
+    lines.push("", "### Findings");
+    for (let i = 0; i < verdict.findings.length; i++) {
+      const f = verdict.findings[i];
+      const sev = (f.severity ?? "medium").toUpperCase();
+      const loc = f.line_start
+        ? `${f.file ?? ""}:${f.line_start}-${f.line_end ?? f.line_start}`
+        : f.file ?? "";
+      const conf = f.confidence !== undefined ? ` (confidence: ${f.confidence})` : "";
+      const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
+      if (loc) lines.push(`Location: \`${loc}\``);
+      if (f.body) lines.push(f.body);
+      if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
+    }
+  }
+  if (verdict.next_steps?.length) {
+    lines.push("", "### Next Steps");
+    for (const step of verdict.next_steps) lines.push(`- ${step}`);
+  }
+  lines.push(cfgFooter(cfg));
+  if (blockingKeys !== undefined) {
+    lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
+  }
+  if (verdict.commitSha) {
+    lines.push("", `<!-- reviewed-sha: ${verdict.commitSha} -->`);
+  }
+  if (diffHash) {
+    lines.push(`<!-- verdict-diff-hash: ${diffHash} -->`);
+  }
+  return lines.join("\n");
+}
+
 function cfgFooter(cfg: PipelineConfig | undefined): string {
   return (cfg?.marker_footer ?? "*Automated by Claude Code Pipeline Skill*").trim();
 }
@@ -1160,6 +1218,10 @@ export function tagCeilingFindingLines(
   });
 }
 
+function isDeltaReviewComment(body: string): boolean {
+  return body.startsWith(DELTA_REVIEW_MARKER_PREFIX);
+}
+
 /** Which review round a comment body belongs to, or null if it isn't one. */
 function reviewRoundOf(body: string, only?: 1 | 2): 1 | 2 | null {
   const isR1 = body.startsWith(REVIEW_MARKER_PREFIX_R1);
@@ -1187,7 +1249,7 @@ export function extractReviewedSha(
 ): { sha: string | null; round: 1 | 2 } | null {
   const m = findLatestCommentMatching(
     comments.map((c) => ({ ...c, author: "", createdAt: "" })),
-    (b) => reviewRoundOf(b, round) !== null,
+    (b) => reviewRoundOf(b, round) !== null || (round !== 1 && isDeltaReviewComment(b)),
   );
   if (!m) return null;
   // Reset lastIndex before each exec so the global regex is stateless across calls.
@@ -1200,7 +1262,7 @@ export function extractReviewedSha(
   REVIEWED_SHA_RE.lastIndex = 0;
   return {
     sha: lastMatch?.[1] ?? null,
-    round: reviewRoundOf(m.body, round) as 1 | 2,
+    round: reviewRoundOf(m.body, round) ?? 2,
   };
 }
 
@@ -1242,7 +1304,7 @@ export function findLatestReviewCommentBody(
   const prefix = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
   const m = findLatestCommentMatching(
     comments.map((c) => ({ ...c, author: "", createdAt: "" })),
-    (b) => b.startsWith(prefix),
+    (b) => b.startsWith(prefix) || (round === 2 && isDeltaReviewComment(b)),
   );
   return m?.body ?? null;
 }
