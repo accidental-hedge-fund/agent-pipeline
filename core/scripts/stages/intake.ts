@@ -33,7 +33,7 @@ export interface IntakeOpts {
 
 export interface IntakeDeps {
   /** Invoke the spec-generation model harness with the given prompt. Returns the raw output. */
-  runHarness(prompt: string): Promise<{ success: boolean; output: string }>;
+  runHarness(prompt: string, timeoutSec: number): Promise<{ success: boolean; output: string }>;
   /** Create a GitHub issue and return its number. */
   createIssue(title: string, body: string, labels: string[]): Promise<number>;
   /**
@@ -108,12 +108,12 @@ export function realIntakeDeps(
   model: string = DEFAULT_CONFIG.models.intake,
 ): IntakeDeps {
   return {
-    runHarness: async (prompt) => {
+    runHarness: async (prompt, timeoutSec) => {
       // Intake is a self-contained description->spec transform: the prompt injects
       // all needed context, so pin a fast model and run lean (no built-in tools, no
       // MCP) to stop the call from cold-starting MCP servers or burning agentic
       // turns exploring the repo. See harness.ts InvokeOptions.lean.
-      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true });
+      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true, timeoutSec });
       return { success: result.success, output: result.stdout };
     },
     createIssue: async (title, body, labels) => {
@@ -440,7 +440,7 @@ export function validateSpecBody(body: string): void {
 
 export async function runIntake(
   opts: IntakeOpts,
-  cfg: { repo_dir: string; repo: string; base_branch: string },
+  cfg: { repo_dir: string; repo: string; base_branch: string; intake_timeout?: number },
   deps?: IntakeDeps,
 ): Promise<void> {
   const d = deps ?? realIntakeDeps(cfg.repo_dir);
@@ -509,7 +509,7 @@ export async function runIntake(
     roadmapContext: releaseContext,
   });
 
-  const harnessResult = await d.runHarness(prompt);
+  const harnessResult = await d.runHarness(prompt, cfg.intake_timeout ?? DEFAULT_CONFIG.intake_timeout);
   if (!harnessResult.success) {
     throw new Error(
       `[pipeline intake] spec-generation harness failed — check the output above for details.`,

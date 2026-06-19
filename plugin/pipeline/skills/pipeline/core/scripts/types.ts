@@ -172,6 +172,8 @@ export interface PipelineConfig {
   implementation_timeout: number;
   review_timeout: number;
   fix_timeout: number;
+  intake_timeout: number;
+  sweep_timeout: number;
   ci_timeout: number;
   ci_poll_interval: number;
   // Harness roles + models. The implementer is always taken from the active
@@ -352,6 +354,8 @@ export const DEFAULT_CONFIG: Omit<
   implementation_timeout: 2400,
   review_timeout: 1500,
   fix_timeout: 2400,
+  intake_timeout: 600,
+  sweep_timeout: 600,
   ci_timeout: 900,
   ci_poll_interval: 30,
   models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
