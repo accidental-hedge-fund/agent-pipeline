@@ -1033,6 +1033,7 @@ export function formatReviewComment(
     "",
     verdict.summary,
   ];
+  const advisoryOrdinals: number[] = [];
   if (verdict.findings.length > 0) {
     lines.push("", "### Findings");
     verdict.findings.forEach((f, i) => {
@@ -1046,13 +1047,9 @@ export function formatReviewComment(
       const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
       if (loc) lines.push(`Location: \`${loc}\``);
-      // Per-finding advisory marker: emitted BEFORE reviewer-controlled fields (body,
-      // recommendation) so filterToBlockingFindings can detect it in the
-      // formatter-owned header zone rather than substring-searching reviewer prose
-      // (which would let a finding discussing the sentinel strip itself, #236).
-      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
+      if (f.blocking === false) advisoryOrdinals.push(i + 1);
     });
   }
   if (verdict._raw) {
@@ -1072,6 +1069,12 @@ export function formatReviewComment(
   // Omitted when no `blockingKeys` arg is provided (approve and 0-findings paths).
   if (blockingKeys !== undefined) {
     lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
+  }
+  // Advisory-ordinals marker (#236): records 1-indexed positions of advisory
+  // (blocking:false) findings in a formatter-controlled footer so filterToBlockingFindings
+  // can identify them without touching reviewer-controlled body/recommendation text.
+  if (advisoryOrdinals.length > 0) {
+    lines.push(`<!-- pipeline-advisory-ordinals: ${advisoryOrdinals.join(",")} -->`);
   }
   // Sentinel last (#16): a dedicated, anchorable line the gate reads back to
   // verify the verdict still covers HEAD. Omitted when no SHA was resolved.
@@ -1107,6 +1110,7 @@ export function formatDeltaReviewComment(
     ? `${DELTA_REVIEW_MARKER_PREFIX} — ${verdict.verdict} (commit ${shortSha})`
     : `${DELTA_REVIEW_MARKER_PREFIX} — ${verdict.verdict}`;
   const lines: string[] = [heading, `**Reviewer**: ${reviewer}`, "", verdict.summary];
+  const advisoryOrdinals: number[] = [];
   if (verdict.findings.length > 0) {
     lines.push("", "### Findings");
     for (let i = 0; i < verdict.findings.length; i++) {
@@ -1119,10 +1123,9 @@ export function formatDeltaReviewComment(
       const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
       if (loc) lines.push(`Location: \`${loc}\``);
-      // Emitted before reviewer fields for the same spoof-safety reason as formatReviewComment.
-      if (f.blocking === false) lines.push("<!-- pipeline-advisory-finding -->");
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
+      if (f.blocking === false) advisoryOrdinals.push(i + 1);
     }
   }
   if (verdict.next_steps?.length) {
@@ -1132,6 +1135,9 @@ export function formatDeltaReviewComment(
   lines.push(cfgFooter(cfg));
   if (blockingKeys !== undefined) {
     lines.push(`<!-- pipeline-blocking-keys: ${[...blockingKeys].sort().join(",")} -->`);
+  }
+  if (advisoryOrdinals.length > 0) {
+    lines.push(`<!-- pipeline-advisory-ordinals: ${advisoryOrdinals.join(",")} -->`);
   }
   if (verdict.commitSha) {
     lines.push("", `<!-- reviewed-sha: ${verdict.commitSha} -->`);

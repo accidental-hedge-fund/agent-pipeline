@@ -387,37 +387,37 @@ test("filterToBlockingFindings: same-key blocking + blocking:false sibling — a
   assert.ok(filtered.includes("1 advisory finding was omitted"), "omission note must be present");
 });
 
-// Regression: advisory sentinel in reviewer body must NOT strip a blocking finding (#236 delta)
-test("filterToBlockingFindings: advisory sentinel in reviewer body does NOT strip a blocking finding", () => {
-  // A blocking finding whose body discusses the sentinel mechanism would previously
-  // be classified as advisory because block.includes() scanned the entire block
-  // including reviewer-controlled body text.
-  const ADVISORY_MARKER = "<!-- pipeline-advisory-finding -->";
-  const blockingWithSentinelInBody: ReviewFinding = {
+// Regression: reviewer body containing advisory machinery strings must NOT strip a blocking finding (#236 delta)
+test("filterToBlockingFindings: advisory ordinal marker in reviewer body does NOT strip a blocking finding", () => {
+  // A blocking finding whose body text contains the advisory-ordinals marker string
+  // must NOT be classified as advisory. The ordinal match must search only the
+  // formatter-controlled footer, not the entire comment body.
+  const ORDINAL_MARKER = "<!-- pipeline-advisory-ordinals: 1 -->";
+  const blockingWithOrdinalInBody: ReviewFinding = {
     severity: "high",
-    title: "Sentinel spoof vector",
+    title: "Ordinal footer spoof vector",
     file: "core/scripts/stages/fix.ts",
-    line_start: 426,
-    // Body text that contains the sentinel string (e.g. a finding about the mechanism).
-    body: `filterToBlockingFindings uses block.includes("${ADVISORY_MARKER}") which can be spoofed.`,
+    line_start: 440,
+    // Body discusses the advisory mechanism and contains the ordinal string.
+    body: `filterToBlockingFindings must not match ${ORDINAL_MARKER} from reviewer body.`,
     confidence: 0.9,
-    recommendation: `Do not use substring search; check only the header zone before reviewer prose.`,
+    recommendation: "Search only the footer section, not the whole comment.",
   };
 
-  const key = findingKey(blockingWithSentinelInBody);
+  const key = findingKey(blockingWithOrdinalInBody);
   const body = formatReviewComment(
     minCfg,
-    { verdict: "needs-attention", summary: "blocking finding about the sentinel", findings: [blockingWithSentinelInBody], next_steps: [] },
+    { verdict: "needs-attention", summary: "blocking finding that mentions the ordinal marker", findings: [blockingWithOrdinalInBody], next_steps: [] },
     1, "codex",
     new Set([key]),
   );
 
-  // Sanity: the sentinel string appears somewhere in the formatted body (inside the body text).
-  assert.ok(body.includes(ADVISORY_MARKER), "sanity: sentinel string is in the formatted comment");
+  // Sanity: the ordinal marker string appears in the comment body (inside reviewer text).
+  assert.ok(body.includes(ORDINAL_MARKER), "sanity: ordinal string is present in the formatted comment (in the body text)");
 
   const filtered = filterToBlockingFindings(body, new Set([key]));
 
-  // Blocking finding must NOT be stripped (the sentinel was in reviewer prose, not the header zone).
-  assert.ok(filtered.includes(blockingWithSentinelInBody.title), "blocking finding must survive even when body contains the sentinel string");
-  assert.ok(!filtered.includes("advisory finding was omitted"), "no advisory omission note should appear — the finding is blocking");
+  // Blocking finding must survive — the marker in reviewer text must not affect filtering.
+  assert.ok(filtered.includes(blockingWithOrdinalInBody.title), "blocking finding must survive even when body contains the ordinal marker string");
+  assert.ok(!filtered.includes("advisory finding was omitted"), "no advisory omission note should appear");
 });
