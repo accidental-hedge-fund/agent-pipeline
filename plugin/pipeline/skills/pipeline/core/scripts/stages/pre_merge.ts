@@ -30,6 +30,7 @@ import {
   DELTA_REVIEW_MARKER_PREFIX,
   diffFilePaths,
   extractBlockingKeysFromComment,
+  extractBlockingKeysMarker,
   extractDiffHashFromComment,
   findLatestReviewCommentBody,
   formatDeltaReviewComment,
@@ -438,8 +439,40 @@ export async function enforceReviewShaGate(
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 
-  // Exact match → the verdict still covers HEAD; proceed.
-  if (reviewed.sha && reviewed.sha === head) return null;
+  // Exact match → the verdict still covers HEAD. BUT a matching SHA is only a
+  // valid approval if the recorded review left NO unresolved blockers. A blocking
+  // pre-merge delta review (#228) posts its comment carrying `reviewed-sha == HEAD`
+  // and then `setBlocked`s at `pipeline:pre-merge` — so on re-entry the SHA matches
+  // even though the verdict was a no-ship. Returning null here unconditionally let
+  // clearing the blocked label, or overriding only some of several blockers, resume
+  // pre-merge and advance toward ready-to-deploy with unresolved blocking findings
+  // (a review-gate bypass — #228 review-2 finding). Re-check the recorded blocking
+  // keys against current overrides before accepting the SHA. (Marker-only lookup:
+  // an approve / advisory-only comment carries no marker or an empty one and is
+  // correctly read as "no blockers" → proceed, preserving prior behavior.)
+  if (reviewed.sha && reviewed.sha === head) {
+    const latestReviewBody = findLatestReviewCommentBody(detail.comments, reviewed.round);
+    const recordedBlocking = latestReviewBody ? extractBlockingKeysMarker(latestReviewBody) : null;
+    if (!recordedBlocking || recordedBlocking.size === 0) return null;
+    const overrides = extractOverrides(detail.comments);
+    const unresolved = [...recordedBlocking].filter((k) => !overrides.has(k));
+    if (unresolved.length === 0) return null;
+    // Blockers remain at the reviewed HEAD → keep pre-merge blocked; never advance.
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Pre-merge: the last review recorded ${unresolved.length} unresolved blocking finding(s) ` +
+        `at HEAD (${unresolved.join(", ")}). Fix them (push a commit) or \`--override\` each ` +
+        `before pre-merge can proceed.`,
+      "pre-merge",
+      "needs-human",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) at reviewed HEAD`,
+    };
+  }
 
   // HEAD moved past the reviewed commit. Re-review ONLY when a developer/fix
   // commit landed since the verdict — the pipeline's own pre-merge commits

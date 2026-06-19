@@ -89,9 +89,11 @@ function makeDeps(opts: {
   getCommitDeltaDiff?: () => Promise<string>;
   runDeltaReview?: RunDeltaReviewFn;
   getForIssue?: () => Promise<{ path: string } | null>;
+  extraCommentBodies?: string[];
 }): { deps: ShaGateDeps; rec: Rec } {
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const comments = opts.commentBody === null ? [] : [{ body: opts.commentBody }];
+  for (const b of opts.extraCommentBodies ?? []) comments.push({ body: b });
   const deps: ShaGateDeps = {
     getIssueDetail: async () =>
       ({ comments }) as Awaited<ReturnType<NonNullable<ShaGateDeps["getIssueDetail"]>>>,
@@ -623,4 +625,98 @@ test("enforceReviewShaGate: delta self-review disclosure applied in posted comme
     /self-review\)/,
     "reviewer label must include (self-review) suffix",
   );
+});
+
+// ---------------------------------------------------------------------------
+// enforceReviewShaGate — blocking review at matching HEAD must NOT be treated
+// as a valid approval (#228 review-2 finding: gate-bypass on re-entry)
+//
+// A blocking pre-merge delta review posts its verdict carrying `reviewed-sha ==
+// HEAD` and then setBlocks at pipeline:pre-merge. On re-entry the SHA matches, so
+// the old `reviewed.sha === head → return null` advanced toward ready-to-deploy
+// with unresolved blockers. The gate must re-check the recorded blocking keys
+// against current overrides before accepting a matching SHA.
+// ---------------------------------------------------------------------------
+
+function blockingReviewComment(round: 1 | 2, sha: string, keys: string[]): string {
+  return [
+    `## Review ${round} (Adversarial) — needs-attention`,
+    "",
+    "No-ship: blocking findings remain.",
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+    `<!-- pipeline-blocking-keys: ${[...keys].sort().join(",")} -->`,
+  ].join("\n");
+}
+
+function advisoryReviewComment(round: 1 | 2, sha: string): string {
+  // Advisory-only round: an explicit but EMPTY blocking-keys marker.
+  return [
+    `## Review ${round} (Adversarial) — needs-attention`,
+    "",
+    "Advisory findings only.",
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+    `<!-- pipeline-blocking-keys:  -->`,
+  ].join("\n");
+}
+
+function overrideSentinelComment(key: string): string {
+  return `## Pipeline: Finding override\n\n<!-- pipeline-override: ${key} deferred -->`;
+}
+
+test("enforceReviewShaGate: blocking review at matching HEAD → kept blocked, does NOT proceed (#228)", async (t) => {
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487", "abcdef01"]),
+    headSha: SHA_HEAD,
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "must not return null (proceed) when blockers remain at the reviewed HEAD");
+  assert.equal((out as any)?.status, "blocked", "must report a blocked outcome");
+  assert.equal(rec.blocked.length, 1, "must keep pre-merge blocked");
+  assert.deepEqual(rec.transitions, [], "must not advance toward ready-to-deploy");
+});
+
+test("enforceReviewShaGate: blocking review at matching HEAD with ALL keys overridden → proceeds (#228)", async (t) => {
+  const { deps } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487", "abcdef01"]),
+    headSha: SHA_HEAD,
+    extraCommentBodies: [overrideSentinelComment("953ac487"), overrideSentinelComment("abcdef01")],
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = { advanced: false } as any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "every recorded blocker overridden → a matching SHA is a valid approval");
+});
+
+test("enforceReviewShaGate: blocking review at matching HEAD with PARTIAL override → still blocked (#228)", async (t) => {
+  const { deps, rec } = makeDeps({
+    commentBody: blockingReviewComment(2, SHA_HEAD, ["953ac487", "abcdef01"]),
+    headSha: SHA_HEAD,
+    extraCommentBodies: [overrideSentinelComment("953ac487")], // only 1 of 2 dispositioned
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.notEqual(out, null, "a partial override must NOT unblock the remaining blocker");
+  assert.equal((out as any)?.status, "blocked");
+  assert.equal(rec.blocked.length, 1);
+});
+
+test("enforceReviewShaGate: advisory-only review at matching HEAD (empty marker) → proceeds, no false block (#228)", async (t) => {
+  const { deps, rec } = makeDeps({
+    commentBody: advisoryReviewComment(2, SHA_HEAD),
+    headSha: SHA_HEAD,
+  });
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = { advanced: false } as any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "an advisory-only round records an empty marker → no blockers → proceed");
+  assert.deepEqual(rec.blocked, [], "must not block on an advisory-only verdict");
 });

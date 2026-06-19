@@ -1143,6 +1143,26 @@ function extractAllKeysFromComment(body: string): Set<string> {
  * Pure and total: no network, git, or subprocess calls.
  */
 export function extractBlockingKeysFromComment(body: string): Set<string> {
+  const marker = extractBlockingKeysMarker(body);
+  if (marker !== null) return marker;
+  return extractAllKeysFromComment(body);
+}
+
+/**
+ * Marker-only variant of {@link extractBlockingKeysFromComment}: returns the keys
+ * from the authoritative `pipeline-blocking-keys` marker, or `null` when the
+ * comment carries NO marker at all. Unlike {@link extractBlockingKeysFromComment}
+ * it never falls back to scraping all `override-key` tokens — so an approve or
+ * advisory-only comment (which lists advisory findings' keys but emits no marker,
+ * or an empty marker) is reported as "no blockers" rather than mis-read as blocking.
+ *
+ * Used by the pre-merge SHA gate to decide, on an exact reviewed-SHA match, whether
+ * the recorded review still has UNRESOLVED blockers at HEAD (#228 review-2 finding):
+ * a blocking pre-merge delta review leaves `reviewed-sha == HEAD`, so a matching SHA
+ * must not be treated as a valid approval without re-checking its blocking keys.
+ * An empty marker returns an empty Set (advisory-only round, no blockers).
+ */
+export function extractBlockingKeysMarker(body: string): Set<string> | null {
   PIPELINE_BLOCKING_KEYS_RE.lastIndex = 0;
   let lastMatch: RegExpExecArray | null = null;
   let cur: RegExpExecArray | null;
@@ -1150,14 +1170,12 @@ export function extractBlockingKeysFromComment(body: string): Set<string> {
     lastMatch = cur;
   }
   PIPELINE_BLOCKING_KEYS_RE.lastIndex = 0;
-  if (lastMatch !== null) {
-    const keys = new Set<string>();
-    for (const k of lastMatch[1].split(",")) {
-      if (/^[0-9a-f]{8}$/.test(k)) keys.add(k);
-    }
-    return keys;
+  if (lastMatch === null) return null;
+  const keys = new Set<string>();
+  for (const k of lastMatch[1].split(",")) {
+    if (/^[0-9a-f]{8}$/.test(k)) keys.add(k);
   }
-  return extractAllKeysFromComment(body);
+  return keys;
 }
 
 /**
