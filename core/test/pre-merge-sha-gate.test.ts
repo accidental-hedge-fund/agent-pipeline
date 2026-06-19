@@ -883,7 +883,11 @@ test("enforceReviewShaGate: allowlisted prior-runner review → routes to re-rev
   // routes to re-review so the current actor establishes its own verified baseline.
   // Non-allowlisted commenters posting review-headed comments do NOT trigger this path.
   const OTHER_ACTOR = "other-bot";
-  const cfgWithAllowlist = { ...cfg, trusted_override_actors: [OTHER_ACTOR] } as unknown as PipelineConfig;
+  const cfgWithAllowlist = {
+    ...cfg,
+    trusted_override_actors: [OTHER_ACTOR],
+    steps: { standard_review: true, adversarial_review: true, plan_review: false, docs: false },
+  } as unknown as PipelineConfig;
   const blockingByOther = { body: blockingReviewComment(2, SHA_HEAD, ["953ac487"]), author: OTHER_ACTOR };
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const deps: ShaGateDeps = {
@@ -932,6 +936,37 @@ test("enforceReviewShaGate: non-allowlisted forged review-heading → no spuriou
   });
   assert.equal(out, null, "non-allowlisted review-headed comment must not trigger re-review");
   assert.deepEqual(rec.transitions, [], "must not transition on non-allowlisted forged review");
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("enforceReviewShaGate: allowlisted prior-runner review with adversarial_review=false → no livelock (#229 Finding 9)", async (t) => {
+  // Regression: when adversarial_review is disabled, routing to review-2 on a
+  // multi-actor handoff causes a livelock (pre-merge → review-2 [skipped] → pre-merge → ...).
+  // When no review stage is enabled, the gate must NOT transition — fall through to CI.
+  const OTHER_ACTOR = "other-bot";
+  const cfgReviewsDisabled = {
+    ...cfg,
+    trusted_override_actors: [OTHER_ACTOR],
+    steps: { standard_review: false, adversarial_review: false, plan_review: false, docs: false },
+  } as unknown as PipelineConfig;
+  const reviewByOther = { body: reviewComment(1, SHA_HEAD), author: OTHER_ACTOR };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments: [reviewByOther] }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgReviewsDisabled, 16, 99, deps);
+  });
+  assert.equal(out, null, "reviews fully disabled → must not route to review-2 (livelock)");
+  assert.deepEqual(rec.transitions, [], "must not transition when no review stage is enabled");
   assert.deepEqual(rec.blocked, []);
 });
 

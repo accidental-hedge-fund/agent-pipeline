@@ -493,17 +493,29 @@ export async function enforceReviewShaGate(
             c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX)),
       );
       if (hasAllowlistedReview) {
-        await postCommentFn(
-          cfg,
-          issueNumber,
-          `## Pipeline: Re-running review — prior runner identity differs\n\n` +
-            `Review comments exist from an allowlisted prior runner (not \`${actor}\`). ` +
-            `Re-running review under the current identity to establish a verified baseline ` +
-            `before proceeding to pre-merge.`,
-        );
-        const reviewStage: Stage = "review-2";
-        await transitionFn(cfg, issueNumber, "pre-merge", reviewStage);
-        return { advanced: true, to: reviewStage };
+        // Select the highest-enabled review stage to re-run. If all review steps are
+        // disabled, do not route to a review stage that will be immediately skipped back
+        // to pre-merge (livelock — #229 Finding 9). In that case just proceed.
+        const reviewStage: Stage | null = cfg.steps.adversarial_review
+          ? "review-2"
+          : cfg.steps.standard_review
+            ? "review-1"
+            : null;
+        if (reviewStage === null) {
+          // Reviews are fully disabled for this repo — no review baseline is possible.
+          // Fall through and let pre-merge proceed as if no prior review existed.
+        } else {
+          await postCommentFn(
+            cfg,
+            issueNumber,
+            `## Pipeline: Re-running review — prior runner identity differs\n\n` +
+              `Review comments exist from an allowlisted prior runner (not \`${actor}\`). ` +
+              `Re-running review under the current identity to establish a verified baseline ` +
+              `before proceeding to pre-merge.`,
+          );
+          await transitionFn(cfg, issueNumber, "pre-merge", reviewStage);
+          return { advanced: true, to: reviewStage };
+        }
       }
     }
     return null;
