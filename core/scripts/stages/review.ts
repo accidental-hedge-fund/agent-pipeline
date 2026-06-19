@@ -445,11 +445,13 @@ export async function advanceReview(
   // Build per-finding records for run-directory persistence (#209). sanitizeDeep
   // screens title/body/recommendation at the field level before they reach disk,
   // consistent with the write-time injection-denylist + secret-redaction convention
-  // (#161). payload_fingerprint is computed from the original finding (before
-  // sanitization) so it is stable across rounds even when finding text is redacted.
-  // effective_blocking is set after partitionFindings runs (below) — it is
-  // initialised to false here and overwritten for blocking findings on the
-  // needs-attention path; approve/zero-findings paths leave it false throughout.
+  // (#161). payload_fingerprint is computed from the sanitized record fields (after
+  // sanitizeDeep) so it does not encode raw secret/injection text. When sanitization
+  // collapses two distinct same-key findings (e.g. differing only by redacted secret
+  // value), payload_fingerprint_ambiguous is set to true on both records so consumers
+  // know not to claim per-finding resolution. effective_blocking is set after
+  // partitionFindings runs (below) — initialised false here, overwritten for
+  // blocking findings on the needs-attention path.
   const findingRecords: ReviewFindingRecord[] = sanitizeDeep(
     verdict.findings.map((f): ReviewFindingRecord => {
       const rec: ReviewFindingRecord = {
@@ -474,6 +476,19 @@ export async function advanceReview(
   // Sanitization runs first; the fingerprint is derived from the redacted fields.
   for (let i = 0; i < findingRecords.length; i++) {
     findingRecords[i].payload_fingerprint = findingPayloadFingerprint(findingRecords[i] as ReviewFinding);
+  }
+  // Detect redaction collisions: when two same-key findings in this round share
+  // the same key+payload_fingerprint (because sanitization collapsed distinct secret
+  // values to [REDACTED]), mark both records ambiguous so consumers do not attempt
+  // per-finding resolution for those pairs.
+  const fpCount = new Map<string, number>();
+  for (const rec of findingRecords) {
+    const composite = `${rec.key}\0${rec.payload_fingerprint}`;
+    fpCount.set(composite, (fpCount.get(composite) ?? 0) + 1);
+  }
+  for (const rec of findingRecords) {
+    const composite = `${rec.key}\0${rec.payload_fingerprint}`;
+    if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
   }
   const reviewerModel = opts.model ?? cfg.models.review;
 

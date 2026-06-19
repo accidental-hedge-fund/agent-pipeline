@@ -555,10 +555,15 @@ export interface ReviewFindingRecord {
    *  landed in partition.blocking, false when advisory or overridden. Absent
    *  on records written before #209 fix-2. */
   effective_blocking?: boolean;
-  /** findingPayloadFingerprint(finding) at write time — disambiguates distinct
-   *  findings that share the same findingKey within a round (same-key ambiguity
-   *  guard). Absent on records written before #209 fix-2. */
+  /** findingPayloadFingerprint applied to the sanitized record fields at write time —
+   *  disambiguates distinct findings that share the same findingKey within a round.
+   *  Absent on records written before #209. */
   payload_fingerprint?: string;
+  /** True when sanitization collapsed two or more distinct same-key findings in this
+   *  round to the same key+payload_fingerprint pair. Consumers MUST NOT claim
+   *  per-finding resolution for these records; use aggregate counts only. Absent
+   *  (treat as false) on records without redaction collisions. */
+  payload_fingerprint_ambiguous?: boolean;
 }
 
 /** Summary of one review round's verdict. `findingCounts` maps severity → count.

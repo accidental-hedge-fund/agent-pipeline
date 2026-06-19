@@ -14,6 +14,7 @@
 //   4.10 Same-key disambiguation via payload_fingerprint
 //   4.11 effective_blocking reflects policy partitioning
 //   4.12 payload_fingerprint is an opaque digest (no raw secret/injection text)
+//   4.13 payload_fingerprint_ambiguous set when sanitization collapses same-key findings
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -1014,4 +1015,81 @@ test("4.12 payload_fingerprint: oracle-resistant — two findings with different
   const fpB = findingPayloadFingerprint(sanitizedB as ReviewFinding);
   assert.equal(fpA, fpB,
     "persisted fingerprints for different secrets must be identical after sanitization (oracle-resistant)");
+});
+
+// ---------------------------------------------------------------------------
+// 4.13 — payload_fingerprint_ambiguous: collision detection for same-key findings
+// ---------------------------------------------------------------------------
+
+test("4.13 payload_fingerprint_ambiguous: same-key findings whose secrets collapse to the same sanitized fingerprint are both flagged", () => {
+  // Simulates the collision-detection block that runs in advanceReview after
+  // sanitizeDeep + fingerprint computation.
+  const makeRecord = (secret: string): ReviewFindingRecord => ({
+    key: "k-secret",
+    severity: "high",
+    title: "Hardcoded API key",
+    body: `OPENAI_API_KEY="${secret}" is present`,
+    confidence: 0.9,
+    recommendation: "Remove it.",
+    effective_blocking: true,
+  });
+
+  const records: ReviewFindingRecord[] = sanitizeDeep([
+    makeRecord("SecretAlpha"),
+    makeRecord("SecretBeta"),
+  ]);
+  for (const rec of records) {
+    rec.payload_fingerprint = findingPayloadFingerprint(rec as ReviewFinding);
+  }
+  // Collision detection (mirrors advanceReview logic)
+  const fpCount = new Map<string, number>();
+  for (const rec of records) {
+    const composite = `${rec.key}\0${rec.payload_fingerprint}`;
+    fpCount.set(composite, (fpCount.get(composite) ?? 0) + 1);
+  }
+  for (const rec of records) {
+    const composite = `${rec.key}\0${rec.payload_fingerprint}`;
+    if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
+  }
+
+  assert.equal(records[0].payload_fingerprint_ambiguous, true,
+    "first colliding record must be flagged ambiguous");
+  assert.equal(records[1].payload_fingerprint_ambiguous, true,
+    "second colliding record must be flagged ambiguous");
+});
+
+test("4.13 payload_fingerprint_ambiguous: distinct (non-colliding) findings are NOT flagged", () => {
+  // Two findings with different titles that survive sanitization differently
+  // must each get a distinct fingerprint and NOT be flagged ambiguous.
+  const makeRecord = (title: string, body: string): ReviewFindingRecord => ({
+    key: "k-distinct",
+    severity: "high",
+    title,
+    body,
+    confidence: 0.9,
+    recommendation: "Fix it.",
+    effective_blocking: true,
+  });
+
+  const records: ReviewFindingRecord[] = sanitizeDeep([
+    makeRecord("Missing null check", "The variable x is dereferenced without a null check."),
+    makeRecord("Inefficient loop", "This loop runs in O(n^2) — should be O(n log n)."),
+  ]);
+  for (const rec of records) {
+    rec.payload_fingerprint = findingPayloadFingerprint(rec as ReviewFinding);
+  }
+  const fpCount = new Map<string, number>();
+  for (const rec of records) {
+    const composite = `${rec.key}\0${rec.payload_fingerprint}`;
+    fpCount.set(composite, (fpCount.get(composite) ?? 0) + 1);
+  }
+  for (const rec of records) {
+    const composite = `${rec.key}\0${rec.payload_fingerprint}`;
+    if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
+  }
+
+  assert.ok(!records[0].payload_fingerprint_ambiguous,
+    "first distinct finding must NOT be flagged ambiguous");
+  assert.ok(!records[1].payload_fingerprint_ambiguous,
+    "second distinct finding must NOT be flagged ambiguous");
 });
