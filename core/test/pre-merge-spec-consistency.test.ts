@@ -15,6 +15,7 @@ import {
   type SpecConsistencyDeps,
 } from "../scripts/stages/pre_merge.ts";
 import { SPEC_DIVERGENCE_CATEGORY, categoryMarker } from "../scripts/review-policy.ts";
+import { DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const cfg = { base_branch: "main", repo: "acme/x", repo_dir: "/repo" } as unknown as PipelineConfig;
@@ -90,6 +91,36 @@ test("guard: not stale (spec updated after impl) → not blocked even with the m
 test("guard: no developer commits → not blocked", async () => {
   const { deps } = guardDeps([], reviewWithMarker);
   assert.equal(await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps), null);
+});
+
+// Regression test for #228 finding 1: the stale-delta guard must read the LATEST
+// review comment, including pre-merge delta reviews. If the latest comment is a delta
+// review carrying `category: spec-divergence` and the prior full Review 2 does NOT
+// carry the marker, the guard must still block (not fall through to the old comment).
+test("guard: latest delta review has spec-divergence marker but older Review 2 does not → blocked (#228)", async () => {
+  const deltaReviewWithMarker =
+    `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention (commit abc1234)\n\n` +
+    `### Findings\n\n**1. [HIGH] spec divergence** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+  const olderReview2WithoutMarker = findingLine(""); // no spec-divergence category
+
+  const blocked: string[] = [];
+  const deps: SpecConsistencyDeps = {
+    branchDeveloperCommits: async () => [impl("a")],
+    getIssueDetail: (async () => ({
+      comments: [
+        { author: "r", body: olderReview2WithoutMarker, createdAt: "2024-01-01T00:00:00Z" },
+        { author: "r", body: deltaReviewWithMarker, createdAt: "2024-01-02T00:00:00Z" },
+      ],
+    })) as unknown as SpecConsistencyDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string) => {
+      blocked.push(reason);
+    }) as unknown as SpecConsistencyDeps["setBlocked"],
+  };
+  const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "should block because the latest (delta) review has category:spec-divergence");
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0], /stale spec delta/);
 });
 
 // ---- computeBranchDeveloperCommits: auto-format commits visible to stale-spec guard (#182 review-2 finding 3) ----

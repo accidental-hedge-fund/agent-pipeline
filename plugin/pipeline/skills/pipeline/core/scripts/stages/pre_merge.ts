@@ -12,10 +12,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   findLatestCommentMatching,
+  getGhActor,
   getIssueDetail,
   getPrChecks,
   getPrCommits,
   getPrDetail,
+  getPrDiff,
   getPrForIssue,
   parseChecksAggregate,
   postComment,
@@ -24,14 +26,33 @@ import {
 } from "../gh.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
-import { extractReviewedSha } from "./review.ts";
-import { reviewCommentFlagsSpecDivergence } from "../review-policy.ts";
+import {
+  computeDiffHash,
+  DELTA_REVIEW_MARKER_PREFIX,
+  diffFilePaths,
+  extractBlockingKeysFromComment,
+  extractBlockingKeysMarker,
+  extractDiffHashFromComment,
+  findLatestReviewCommentBody,
+  formatDeltaReviewComment,
+  extractReviewedSha,
+  parseStructuredVerdict,
+} from "./review.ts";
+import {
+  extractOverrides,
+  findingKey,
+  partitionFindings,
+  reviewCommentFlagsSpecDivergence,
+} from "../review-policy.ts";
+import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
+import { buildDeltaReviewPrompt } from "../prompts/index.ts";
+import { openspecContextFromDiff } from "../openspec.ts";
 import * as openspec from "../openspec.ts";
+import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
-const AUTO_FORMAT_PREFIX = "chore: auto-format (#";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
@@ -46,10 +67,7 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
  * come from a developer. Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return (
-    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
-    messageHeadline.startsWith(AUTO_FORMAT_PREFIX)
-  );
+  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
 }
 
 export interface AdvancePreMergeOpts {
@@ -332,6 +350,35 @@ export async function advance(
 // ---------------------------------------------------------------------------
 
 /**
+ * Result of a pre-merge delta review invocation (#228). The caller formats the
+ * comment and routes based on whether there are blocking findings after policy.
+ */
+export interface DeltaReviewResult {
+  verdict: "approve" | "needs-attention";
+  findings: ReviewFinding[];
+  summary: string;
+  /** The harness that actually performed the review (may differ from cfg.harnesses.reviewer
+   *  on the #39 same-harness fallback). Undefined when the caller is a test stub. */
+  effectiveReviewer?: string;
+  /** True when the implementing harness reviewed its own work (same-harness fallback). */
+  selfReview?: boolean;
+}
+
+/**
+ * Injectable seam for the pre-merge delta review (#228). The real implementation
+ * calls `invokeReviewer` with the delta-review prompt and returns the parsed
+ * verdict; fakes in tests return a controlled verdict without any I/O.
+ */
+export type RunDeltaReviewFn = (
+  cfg: PipelineConfig,
+  issueNumber: number,
+  issueDetail: { title: string; body: string },
+  deltaDiff: string,
+  worktreePath: string,
+  specContext: string,
+) => Promise<DeltaReviewResult>;
+
+/**
  * External seams for {@link enforceReviewShaGate}, overridable in tests.
  * Mirrors the DI pattern used elsewhere (testgate.ts, review.ts).
  */
@@ -339,8 +386,28 @@ export interface ShaGateDeps {
   getIssueDetail?: typeof getIssueDetail;
   getPrDetail?: typeof getPrDetail;
   getPrCommits?: typeof getPrCommits;
+  /** Fetches the full PR diff (#228 diff-hash check). */
+  getPrDiff?: typeof getPrDiff;
+  /**
+   * Fetches the diff between two commits on the PR for the delta review (#228).
+   * Injectable seam; real implementation uses `git diff baseSha...headSha`.
+   */
+  getCommitDeltaDiff?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+    baseSha: string,
+    headSha: string,
+  ) => Promise<string>;
+  /** Runs the pre-merge delta review (#228) and returns the parsed verdict. */
+  runDeltaReview?: RunDeltaReviewFn;
   postComment?: typeof postComment;
   transition?: typeof transition;
+  setBlocked?: typeof setBlocked;
+  /** Looks up the issue worktree path and slug for the delta reviewer's CWD and OpenSpec context (#228). */
+  getForIssue?: typeof getForIssue;
+  /** Returns the authenticated GitHub username so the SHA gate only trusts
+   *  pipeline-authored review comments (#228 Finding 9). */
+  getGhActor?: () => Promise<string | null>;
 }
 
 /**
@@ -360,19 +427,95 @@ export async function enforceReviewShaGate(
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
   const getPrCommitsFn = deps.getPrCommits ?? getPrCommits;
+  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
+  const getCommitDeltaDiffFn = deps.getCommitDeltaDiff ?? defaultGetCommitDeltaDiff;
+  const runDeltaReviewFn = deps.runDeltaReview ?? defaultRunDeltaReview;
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getGhActorFn = deps.getGhActor ?? getGhActor;
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
-  const reviewed = extractReviewedSha(detail.comments);
+
+  // Only trust review comments authored by the authenticated pipeline actor (#228
+  // Findings 8 & 9). Any commenter can post a forged `## Review 2 — approve` body;
+  // filtering to the gh user makes forged verdicts invisible to all reuse checks.
+  // Fail-closed (#228 Finding 8): if the actor cannot be determined (network error,
+  // expired token), block rather than silently proceeding — a transient auth failure
+  // must not disable stale-verdict or unresolved-blocker enforcement.
+  const actor = await getGhActorFn();
+  if (actor === null) {
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Pre-merge: cannot verify review-comment provenance — authenticated gh actor ` +
+        `unavailable (\`getGhActor\` returned null). This is typically an expired gh ` +
+        `token or a transient network error. Restore gh authentication (\`gh auth ` +
+        `status\`) and re-run the pipeline to resume.`,
+      "pre-merge",
+      "needs-human",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: "pre-merge: actor lookup failed — cannot verify review provenance",
+    };
+  }
+  const trustedComments = detail.comments.filter((c) => c.author === actor);
+
+  const reviewed = extractReviewedSha(trustedComments);
   // No prior review comment (e.g. review steps disabled, or first run) → nothing
   // to validate; let pre-merge proceed as normal.
   if (!reviewed) return null;
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
 
-  // Exact match → the verdict still covers HEAD; proceed.
-  if (reviewed.sha && reviewed.sha === head) return null;
+  // Shared guard for the verdict-REUSE short-circuits below (exact-SHA match,
+  // pipeline-internal-only commits, diff-hash unchanged). A recorded verdict may
+  // only be REUSED as an approval if it left no unresolved blocking findings.
+  // A blocking pre-merge delta review (#228) records `reviewed-sha`/`verdict-diff-hash`
+  // and `setBlocked`s at `pipeline:pre-merge`, so EVERY reuse path must re-check the
+  // recorded `pipeline-blocking-keys` marker against current overrides — otherwise
+  // clearing the blocked label (optionally plus a no-op commit that preserves the
+  // diff hash, or an OpenSpec archive commit) would advance pre-merge with
+  // unresolved blocking findings (a review-gate bypass — #228 review-2 findings).
+  // Marker-only lookup: an approve / advisory-only verdict has no marker or an empty
+  // one → "no blockers" → returns null (caller proceeds), preserving prior behavior.
+  const reuseBlockedBy = async (
+    commentBody: string | null,
+    via: string,
+  ): Promise<Outcome | null> => {
+    const recorded = commentBody ? extractBlockingKeysMarker(commentBody) : null;
+    if (!recorded || recorded.size === 0) return null;
+    const overrides = extractOverrides(detail.comments);
+    const unresolved = [...recorded].filter((k) => !overrides.has(k));
+    if (unresolved.length === 0) return null;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Pre-merge: the last review recorded ${unresolved.length} unresolved blocking finding(s) ` +
+        `at HEAD (${unresolved.join(", ")})${via}. Fix them (push a commit) or \`--override\` each ` +
+        `before pre-merge can proceed.`,
+      "pre-merge",
+      "needs-human",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) at reviewed HEAD${via}`,
+    };
+  };
+
+  // Exact match → the verdict still covers HEAD, but only as an approval when no
+  // recorded blockers remain unresolved (a blocking delta review leaves
+  // reviewed-sha == HEAD; see reuseBlockedBy).
+  if (reviewed.sha && reviewed.sha === head) {
+    return (
+      (await reuseBlockedBy(findLatestReviewCommentBody(trustedComments, reviewed.round), "")) ??
+      null
+    );
+  }
 
   // HEAD moved past the reviewed commit. Re-review ONLY when a developer/fix
   // commit landed since the verdict — the pipeline's own pre-merge commits
@@ -391,17 +534,160 @@ export async function enforceReviewShaGate(
           landedSince.length > 0 &&
           landedSince.every((c) => isPipelineInternalCommit(c.messageHeadline))
         ) {
-          // Only archive commits landed since the review → verdict valid.
-          return null;
+          // Task 5.8: Only archive commits landed since the review → verdict valid.
+          // No diff-hash check needed: the pipeline-internal exemption takes precedence.
+          // Reuse guard: a recorded verdict with unresolved blockers is not a valid
+          // approval even across pipeline-internal commits (#228).
+          return (
+            (await reuseBlockedBy(
+              findLatestReviewCommentBody(trustedComments, reviewed.round),
+              " (verdict reused across pipeline-internal commits)",
+            )) ?? null
+          );
         }
       }
       // reviewed.sha absent from history (rebased/squashed) or a developer
-      // commit landed → fall through to a re-review (the safe default).
+      // commit landed → fall through to the diff-hash check (#228).
     } catch {
-      // If commit classification fails, fall through to re-review (conservative).
+      // If commit classification fails, fall through to diff-hash check (conservative).
+    }
+
+    // Diff-hash check (#228): before routing back to a full review round, compare
+    // the current PR diff hash to the one recorded in the prior review comment.
+    // If the diff is identical, the verdict is still valid even though SHA changed.
+    // On a hash mismatch, run a focused delta review of only the unreviewed commits.
+    try {
+      const currentDiff = await getPrDiffFn(cfg, prNumber);
+      const currentHash = computeDiffHash(currentDiff);
+      const priorCommentBody = findLatestReviewCommentBody(trustedComments, reviewed.round);
+      const cachedHash = priorCommentBody ? extractDiffHashFromComment(priorCommentBody) : null;
+
+      if (cachedHash !== null && cachedHash === currentHash) {
+        // Diff unchanged despite SHA mismatch: verdict still covers the code. Reuse
+        // guard (#228 review-2): a no-op commit moves HEAD while leaving the diff hash
+        // identical, so this reuse path must also re-check recorded blockers — else
+        // clearing the blocked label + a no-op commit would advance with unresolved
+        // blocking findings.
+        const blocked = await reuseBlockedBy(priorCommentBody, " (diff unchanged)");
+        if (blocked) return blocked;
+        // Diff unchanged and no unresolved blockers: verdict is still valid.
+        await postCommentFn(cfg, issueNumber, diffUnchangedNotice(reviewed.sha, head));
+        console.log(
+          `[pipeline] #${issueNumber}: diff hash unchanged (${currentHash}); verdict reused (SHA ${reviewed.sha?.slice(0, 7)} → ${head.slice(0, 7)})`,
+        );
+        return null;
+      }
+
+      // Diff changed: run a focused adversarial delta review of only the unreviewed
+      // commits instead of routing back to a full review-2 round. The delta review
+      // does NOT count against the max_adversarial_rounds ceiling.
+      const deltaDiff = reviewed.sha
+        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head)
+        : currentDiff; // reviewed SHA missing → review the full diff as the delta
+
+      // Resolve worktree and spec context for the delta reviewer (Finding 3): the
+      // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
+      // can inspect PR-branch files, and must receive OpenSpec context for any
+      // change dirs touched by the unreviewed commits.
+      const deltaWt = await getForIssueFn(cfg, issueNumber);
+      const deltaWorktreePath = deltaWt?.path ?? cfg.repo_dir;
+      const deltaSpecContext = deltaWt
+        ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
+        : "";
+
+      const deltaResult = await runDeltaReviewFn(
+        cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
+      );
+      // Guard: needs-attention with zero findings indicates unparseable reviewer output
+      // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
+      // conservative catch path (full re-review) rather than treating zero findings as
+      // an implicit approval.
+      if (deltaResult.verdict === "needs-attention" && deltaResult.findings.length === 0) {
+        throw new Error(
+          `delta review returned needs-attention with zero findings (likely unparseable output); ` +
+          `summary: ${deltaResult.summary || "(none)"}`,
+        );
+      }
+      const overrides = extractOverrides(detail.comments);
+      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides);
+
+      const newHash = computeDiffHash(currentDiff);
+      const deltaCommentVerdict = {
+        verdict: deltaResult.verdict,
+        summary: deltaResult.summary,
+        findings: deltaResult.findings,
+        next_steps: [] as string[],
+        commitSha: head,
+      };
+      const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
+
+      // Apply same-harness self-review disclosure (Finding 4): when invokeReviewer
+      // falls back to the implementer, the delta comment must carry the same
+      // selfReviewBanner and (self-review) label used by advanceReview.
+      const deltaEffectiveReviewer = deltaResult.effectiveReviewer ?? cfg.harnesses.reviewer;
+      const deltaIsSelfReview = deltaResult.selfReview ?? false;
+      const deltaReviewerLabel = deltaIsSelfReview
+        ? `${deltaEffectiveReviewer} (self-review)`
+        : deltaEffectiveReviewer;
+      const deltaCommentBody = formatDeltaReviewComment(
+        cfg,
+        deltaCommentVerdict,
+        `pre-merge delta review by ${deltaReviewerLabel}`,
+        blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
+        newHash,
+      );
+      // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
+      // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).
+      const deltaComment = deltaIsSelfReview
+        ? (() => {
+            const nl = deltaCommentBody.indexOf("\n");
+            return nl >= 0
+              ? `${deltaCommentBody.slice(0, nl)}\n\n${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}${deltaCommentBody.slice(nl)}`
+              : `${deltaCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}`;
+          })()
+        : deltaCommentBody;
+      await postCommentFn(cfg, issueNumber, deltaComment);
+
+      if (partition.blocking.length === 0) {
+        // Re-validate HEAD: a push during the delta reviewer invocation means the
+        // approval covers a commit that is no longer HEAD. Rather than proceeding
+        // on a stale approval, fall back to the conservative full re-review path
+        // (Finding 2). We throw so the catch block handles the fallthrough.
+        const postDeltaHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+        if (postDeltaHead !== head) {
+          throw new Error(
+            `PR HEAD moved from ${head.slice(0, 7)} to ${postDeltaHead.slice(0, 7)} ` +
+            `during delta review; delta approval is stale — re-entering SHA gate`,
+          );
+        }
+        // Delta review approves (or findings all below policy): pre-merge proceeds.
+        console.log(`[pipeline] #${issueNumber}: pre-merge delta review approved; proceeding`);
+        return null;
+      }
+
+      // Delta review found blocking findings: block pre-merge without routing to review-2.
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        "Pre-merge delta review found blocking findings; fix required before merging.",
+        "pre-merge",
+        "needs-human",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "pre-merge delta review: blocking findings",
+      };
+    } catch (err) {
+      // Diff fetch or delta review failed → fall through to full re-review (conservative).
+      console.warn(
+        `[pipeline] #${issueNumber}: diff-hash check or delta review failed (${(err as Error).message}); falling back to full re-review`,
+      );
     }
   }
 
+  // reviewed.sha is null (no sentinel) OR diff-hash/delta-review path errored:
+  // treat as stale and run the full review stage again.
   const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
   await postCommentFn(cfg, issueNumber, staleReviewNotice(reviewed.sha, head));
   await transitionFn(
@@ -417,6 +703,82 @@ export async function enforceReviewShaGate(
     from: "pre-merge",
     to: reviewStage,
     summary: `re-review: HEAD moved to ${head.slice(0, 7)}`,
+  };
+}
+
+/** Notice posted when the pre-merge diff-hash check finds the diff unchanged (#228). */
+export function diffUnchangedNotice(reviewedSha: string | null, headSha: string): string {
+  const from = reviewedSha ? ` from \`${reviewedSha.slice(0, 7)}\`` : "";
+  return [
+    "## Pipeline: Diff unchanged since last review; verdict reused",
+    "",
+    `HEAD has moved${from} to \`${headSha.slice(0, 7)}\`, but the PR diff hash is identical to the one the last review evaluated.`,
+    "The prior review verdict is still valid; pre-merge proceeds without a re-review.",
+  ].join("\n");
+}
+
+/** Default implementation of the `getCommitDeltaDiff` seam (#228). */
+async function defaultGetCommitDeltaDiff(
+  cfg: PipelineConfig,
+  _prNumber: number,
+  baseSha: string,
+  headSha: string,
+): Promise<string> {
+  const label = `${baseSha.slice(0, 7)}...${headSha.slice(0, 7)}`;
+  const result = await gitInWorktree(cfg.repo_dir, ["diff", `${baseSha}...${headSha}`], {
+    ignoreFailure: true,
+  });
+  if (result.code !== 0) {
+    throw new Error(
+      `git diff ${label} failed (exit ${result.code}): ` +
+      `${result.stderr.trim() || "no error output — objects may not be present locally"}`,
+    );
+  }
+  if (!result.stdout.trim()) {
+    throw new Error(
+      `git diff ${label} produced empty output despite a diff-hash mismatch; ` +
+      `refusing to delta-review an empty range`,
+    );
+  }
+  return result.stdout;
+}
+
+/** Default implementation of the `runDeltaReview` seam (#228). */
+async function defaultRunDeltaReview(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  issueDetail: { title: string; body: string },
+  deltaDiff: string,
+  worktreePath: string,
+  specContext: string,
+): Promise<DeltaReviewResult> {
+  const prompt = buildDeltaReviewPrompt({
+    cfg,
+    issueNumber,
+    title: issueDetail.title,
+    body: issueDetail.body,
+    deltaDiff,
+    specContext,
+  });
+  const invocation = await invokeReviewer(
+    cfg.harnesses.reviewer,
+    cfg.harnesses.implementer,
+    worktreePath,
+    prompt,
+    { timeoutSec: cfg.review_timeout, model: cfg.models.review },
+  );
+  if (!invocation.result.success) {
+    throw new Error(
+      `delta review harness failed: exit ${invocation.result.exit_code}`,
+    );
+  }
+  const parsed = parseStructuredVerdict(invocation.result.stdout, "");
+  return {
+    verdict: parsed.verdict,
+    findings: parsed.findings,
+    summary: parsed.summary,
+    effectiveReviewer: invocation.effectiveReviewer,
+    selfReview: invocation.selfReview,
   };
 }
 
@@ -696,13 +1058,22 @@ export function specDeltaIsStale(id: string, commits: FixCommit[]): boolean {
   return lastImplIdx !== -1 && lastImplIdx > lastSpecIdx;
 }
 
-/** Latest review verdict comment body (round 1 or 2), or null when none exists. */
+/**
+ * Latest review verdict comment body (round 1, round 2, or pre-merge delta),
+ * or null when none exists. Delta review comments are included so that a
+ * `category: spec-divergence` finding in the most recent delta review is
+ * visible to `enforceSpecConsistencyGuard` — without this, an older full-review
+ * comment (without the marker) would be picked up instead (#228 finding 1).
+ */
 function latestReviewBody(
   comments: { author: string; body: string; createdAt: string }[],
 ): string | null {
   const m = findLatestCommentMatching(
     comments,
-    (b) => b.startsWith("## Review 1") || b.startsWith("## Review 2"),
+    (b) =>
+      b.startsWith("## Review 1") ||
+      b.startsWith("## Review 2") ||
+      b.startsWith(DELTA_REVIEW_MARKER_PREFIX),
   );
   return m?.body ?? null;
 }

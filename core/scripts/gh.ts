@@ -1128,3 +1128,17 @@ export async function createMilestone(
   const result = JSON.parse(stdout) as { number: number };
   return result.number;
 }
+
+/**
+ * Return the login of the currently-authenticated GitHub user, or null if the
+ * lookup fails (not authenticated, network error). Used by the diff-hash cache
+ * in advanceReview to reject forged review comments from other commenters (#228).
+ */
+export async function getGhActor(): Promise<string | null> {
+  try {
+    const login = await ghRun(["api", "user", "--jq", ".login"], { timeoutMs: 10_000, retries: 1 });
+    return login.trim() || null;
+  } catch {
+    return null;
+  }
+}
