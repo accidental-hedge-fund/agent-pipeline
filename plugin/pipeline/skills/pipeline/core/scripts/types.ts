@@ -436,6 +436,10 @@ export interface ReviewFinding {
   // never converges (the #106 detector failure). Gates SHOULD key on this, never
   // on keyword-matching a finding's body.
   category?: string;
+  // Non-blocking marker (#236). Absent or true = classify normally by
+  // severity/confidence. false = advisory regardless of severity and confidence;
+  // the finding is recorded but does NOT route to a fix round.
+  blocking?: boolean;
 }
 
 export interface ReviewVerdict {

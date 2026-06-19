@@ -8,9 +8,14 @@ import {
   enforceFixCommitGate,
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
+  extractBlockingReviewFindings,
+  filterToBlockingFindings,
 } from "../scripts/stages/fix.ts";
+import { formatReviewComment } from "../scripts/stages/review.ts";
+import { findingKey } from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import type { ValidateResult } from "../scripts/openspec.ts";
+import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 
 function msgsDeps(messages: string[]): VerifyDeps {
   return {
@@ -220,4 +225,199 @@ test("enforceOpenspecSpecDeltaValidation: headBefore === headAfter → ok withou
   const result = await enforceOpenspecSpecDeltaValidation("/wt", "same", "same", deps);
   assert.equal(result.ok, true);
   assert.deepEqual(deps.validateCalls, [], "no diff when SHAs are equal");
+});
+
+// ---------------------------------------------------------------------------
+// Mixed-verdict filtering: advisory (non-blocking) findings (#236)
+// ---------------------------------------------------------------------------
+
+const minCfg = {
+  review_policy: { block_threshold: "high", min_confidence: 0 },
+  marker_footer: "*Automated by Claude Code Pipeline Skill*",
+} as unknown as PipelineConfig;
+
+const blockingFinding: ReviewFinding = {
+  severity: "high",
+  title: "Real blocking issue",
+  file: "core/scripts/stages/review.ts",
+  line_start: 513,
+  body: "This needs fixing.",
+  confidence: 0.9,
+  recommendation: "Fix it.",
+};
+const advisoryFinding: ReviewFinding = {
+  severity: "high",
+  title: "Advisory out-of-scope observation",
+  file: "core/scripts/foo.ts",
+  line_start: 1,
+  body: "Informational only.",
+  confidence: 0.9,
+  recommendation: "Consider later.",
+  blocking: false,
+};
+const blockingKey = findingKey(blockingFinding);
+const advisoryKey = findingKey(advisoryFinding);
+
+test("filterToBlockingFindings: all blocking → body returned unchanged", () => {
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "issues", findings: [blockingFinding], next_steps: [] },
+    1, "codex",
+    new Set([blockingKey]),
+  );
+  const result = filterToBlockingFindings(body, new Set([blockingKey]));
+  assert.equal(result, body, "no advisory findings — body must be identical");
+});
+
+test("filterToBlockingFindings: mixed verdict — advisory finding removed from Findings, note added (#236)", () => {
+  // Regression: before this fix, the advisory finding appeared in the Findings
+  // section and the fix prompt would present it as mandatory work.
+  const body = formatReviewComment(
+    minCfg,
+    {
+      verdict: "needs-attention",
+      summary: "one blocker one advisory",
+      findings: [blockingFinding, advisoryFinding],
+      next_steps: [],
+    },
+    1, "codex",
+    new Set([blockingKey]),  // only blockingFinding is actually blocking
+  );
+
+  // Without the fix: advisoryFinding appears in the Findings section
+  assert.ok(body.includes(advisoryFinding.title), "sanity: advisory title is in the original comment");
+  assert.ok(body.includes(`override-key: ${advisoryKey}`), "sanity: advisory key is in the original comment");
+
+  const filtered = filterToBlockingFindings(body, new Set([blockingKey]));
+
+  // Blocking finding must survive in the Findings section
+  assert.ok(filtered.includes(blockingFinding.title), "blocking finding must be present in filtered body");
+  assert.ok(filtered.includes(`override-key: ${blockingKey}`), "blocking override-key must survive");
+
+  // Advisory finding must NOT appear in the Findings section
+  assert.ok(!filtered.includes(advisoryFinding.title), "advisory title must be absent from the filtered Findings");
+  assert.ok(!filtered.includes(`override-key: ${advisoryKey}`), "advisory override-key must be absent");
+
+  // Advisory omission note must be present
+  assert.ok(filtered.includes("1 advisory finding was omitted"), "omission note must be present");
+  assert.ok(filtered.includes("not required work"), "note must clarify these are not required work");
+});
+
+test("extractBlockingReviewFindings: no pipeline-blocking-keys marker → body returned unchanged (legacy)", () => {
+  // A legacy comment without the marker falls back to the unfiltered body.
+  const bodyNoMarker =
+    "## Review 1 (Standard) — needs-attention\n**Reviewer**: codex\n\nsummary\n\n### Findings\n\n" +
+    `**1. [HIGH] ${advisoryFinding.title}** \`override-key: ${advisoryKey}\`\nsome body\n\n` +
+    "*Automated by Claude Code Pipeline Skill*";
+  const comments = [{ body: bodyNoMarker }];
+  const result = extractBlockingReviewFindings(comments, 1);
+  assert.equal(result, bodyNoMarker, "legacy body (no marker) must be returned unchanged");
+});
+
+test("extractBlockingReviewFindings: mixed verdict — fix prompt receives only blocking findings (#236)", () => {
+  const verdictComment = formatReviewComment(
+    minCfg,
+    {
+      verdict: "needs-attention",
+      summary: "one real blocker, one advisory",
+      findings: [blockingFinding, advisoryFinding],
+      next_steps: [],
+    },
+    1, "codex",
+    new Set([blockingKey]),
+  );
+  const comments = [{ body: verdictComment }];
+
+  // extractBlockingReviewFindings must strip the advisory finding
+  const filtered = extractBlockingReviewFindings(comments, 1);
+
+  assert.ok(filtered.includes(blockingFinding.title), "blocking finding must survive");
+  assert.ok(!filtered.includes(advisoryFinding.title), "advisory finding must be stripped from fix prompt");
+  assert.ok(filtered.includes("advisory finding was omitted"), "omission note must be present");
+});
+
+// Regression: same-key blocking + blocking:false sibling — advisory must still be excluded (#236 fix 2)
+test("filterToBlockingFindings: same-key blocking + blocking:false sibling — advisory excluded despite shared key (#236)", () => {
+  // Both findings share the same findingKey (HIGH + same file + same 5-line bucket).
+  // Lines 46 and 48 both fall in bucket 46 (Math.floor((L-1)/5)*5+1 = 46).
+  const sameKeyBlocker: ReviewFinding = {
+    severity: "high",
+    title: "Blocking issue at same location",
+    file: "core/x.ts",
+    line_start: 46,
+    body: "Must be fixed.",
+    confidence: 0.9,
+  };
+  const sameKeyAdvisory: ReviewFinding = {
+    severity: "high",
+    title: "Advisory sibling at same location",
+    file: "core/x.ts",
+    line_start: 48,
+    body: "Out of scope — informational only.",
+    confidence: 0.9,
+    blocking: false,
+  };
+
+  // Precondition: keys must collide
+  assert.equal(
+    findingKey(sameKeyBlocker),
+    findingKey(sameKeyAdvisory),
+    "precondition: same bucket → same key",
+  );
+
+  const sharedKey = findingKey(sameKeyBlocker);
+  const body = formatReviewComment(
+    minCfg,
+    {
+      verdict: "needs-attention",
+      summary: "one blocker, one advisory sibling sharing the same key",
+      findings: [sameKeyBlocker, sameKeyAdvisory],
+      next_steps: [],
+    },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+
+  // Both keys are the same — the key-set check alone cannot distinguish them.
+  // The per-finding marker (<!-- pipeline-advisory-finding -->) is the tiebreaker.
+  const filtered = filterToBlockingFindings(body, new Set([sharedKey]));
+
+  assert.ok(filtered.includes(sameKeyBlocker.title), "blocking finding must be present");
+  assert.ok(!filtered.includes(sameKeyAdvisory.title), "advisory sibling must be excluded despite shared key");
+  assert.ok(filtered.includes("1 advisory finding was omitted"), "omission note must be present");
+});
+
+// Regression: reviewer body containing advisory machinery strings must NOT strip a blocking finding (#236 delta)
+test("filterToBlockingFindings: advisory ordinal marker in reviewer body does NOT strip a blocking finding", () => {
+  // A blocking finding whose body text contains the advisory-ordinals marker string
+  // must NOT be classified as advisory. The ordinal match must search only the
+  // formatter-controlled footer, not the entire comment body.
+  const ORDINAL_MARKER = "<!-- pipeline-advisory-ordinals: 1 -->";
+  const blockingWithOrdinalInBody: ReviewFinding = {
+    severity: "high",
+    title: "Ordinal footer spoof vector",
+    file: "core/scripts/stages/fix.ts",
+    line_start: 440,
+    // Body discusses the advisory mechanism and contains the ordinal string.
+    body: `filterToBlockingFindings must not match ${ORDINAL_MARKER} from reviewer body.`,
+    confidence: 0.9,
+    recommendation: "Search only the footer section, not the whole comment.",
+  };
+
+  const key = findingKey(blockingWithOrdinalInBody);
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "blocking finding that mentions the ordinal marker", findings: [blockingWithOrdinalInBody], next_steps: [] },
+    1, "codex",
+    new Set([key]),
+  );
+
+  // Sanity: the ordinal marker string appears in the comment body (inside reviewer text).
+  assert.ok(body.includes(ORDINAL_MARKER), "sanity: ordinal string is present in the formatted comment (in the body text)");
+
+  const filtered = filterToBlockingFindings(body, new Set([key]));
+
+  // Blocking finding must survive — the marker in reviewer text must not affect filtering.
+  assert.ok(filtered.includes(blockingWithOrdinalInBody.title), "blocking finding must survive even when body contains the ordinal marker string");
+  assert.ok(!filtered.includes("advisory finding was omitted"), "no advisory omission note should appear");
 });

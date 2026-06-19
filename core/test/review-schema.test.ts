@@ -53,6 +53,7 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
 // Map a TypeScript scalar type annotation to the schema-block hint vocabulary:
 //   number              -> a bare angle-bracket hint  (<int>, <0.0-1.0>)
 //   string / "a" | "b"  -> a quoted hint              ("<text>", "x" | "y")
+//   boolean             -> an unquoted boolean-literal hint (true | false)
 // Validates EVERY union arm rather than shortcutting on the first one. `undefined`
 // arms are dropped (optional — about field presence, not value type, like the `?`
 // fields). All remaining arms must agree on a single scalar value type; a `null`
@@ -61,14 +62,15 @@ function parseInterfaceFields(src: string, interfaceName: string): string[] {
 // closed) against a concrete schema hint — never a silent skip. (null ≠ undefined;
 // the per-side skip, the first-arm shortcut, and the trailing-only strip were all
 // adversarial-review gaps — validating every arm closes them at the root.)
-function classifyTsType(token: string): "number" | "string" | "other" {
+function classifyTsType(token: string): "number" | "string" | "boolean" | "other" {
   const arms = token
     .split("|")
     .map((a) => a.trim())
     .filter((a) => a.length > 0 && a !== "undefined");
   if (arms.length === 0) return "other";
-  const armCat = (arm: string): "number" | "string" | "other" => {
+  const armCat = (arm: string): "number" | "string" | "boolean" | "other" => {
     if (arm === "number") return "number";
+    if (arm === "boolean") return "boolean";
     if (arm === "string" || /^".*"$/.test(arm)) return "string"; // string or string literal
     return "other"; // null, arrays, mixed/unrecognised → fail closed
   };
@@ -137,12 +139,15 @@ function parseSchemaBlockFields(block: string): { verdict: string[]; finding: st
 }
 
 // A schema-block value hint is `number` when it's a bare angle-bracket placeholder
-// (<int>, <0.0-1.0>) and `string` when it's quoted ("<text>", "x" | "y"). Anything
+// (<int>, <0.0-1.0>), `string` when it's quoted ("<text>", "x" | "y"), and
+// `boolean` when it's the unquoted boolean-literal form (true | false). Anything
 // else — an array (`[`, `["<...>"]`) or nested object — is "other" and excluded
 // from the value-type guard.
-function classifySchemaHint(value: string): "number" | "string" | "other" {
+function classifySchemaHint(value: string): "number" | "string" | "boolean" | "other" {
   if (value.startsWith('"')) return "string";
   if (value.startsWith("<")) return "number";
+  // Boolean-literal hint: unquoted "true | false" (or "true" / "false" alone).
+  if (/^(true|false)(\s*\|\s*(true|false))?$/.test(value)) return "boolean";
   return "other";
 }
 
@@ -152,8 +157,8 @@ function classifySchemaHint(value: string): "number" | "string" | "other" {
 // depth 3) and reads the value text after the key, classifying it via
 // classifySchemaHint. Array/object values (findings, next_steps) classify as
 // "other" and are skipped by the guard.
-function parseSchemaBlockValueHints(block: string): Record<string, "number" | "string" | "other"> {
-  const hints: Record<string, "number" | "string" | "other"> = {};
+function parseSchemaBlockValueHints(block: string): Record<string, "number" | "string" | "boolean" | "other"> {
+  const hints: Record<string, "number" | "string" | "boolean" | "other"> = {};
   let depth = 0;
   for (let i = 0; i < block.length; i++) {
     const ch = block[i];
@@ -309,6 +314,7 @@ test("drift guard: schema block preserves the historical field order and nesting
     "confidence",
     "recommendation",
     "category",
+    "blocking",
   ]);
   assert.deepEqual(parsed.verdict, REVIEW_SCHEMA_FIELDS.verdict);
   assert.deepEqual(parsed.finding, REVIEW_SCHEMA_FIELDS.finding);
@@ -485,6 +491,85 @@ test("drift guard: value-type tokens match schema block value hints", () => {
 // unsupported non-scalar form (e.g. `["<...>"]`) was invisible to the guard. The fix
 // inverts the skip condition: skip only when the *TS* side is non-scalar, so a scalar
 // TS field with a schema-side "other" hint is reported as a mismatch.
+// Boolean type-token tests (#236): classifyTsType must recognise `boolean` as a
+// distinct category (not "number" or "string"), and classifySchemaHint must
+// recognise `true | false` as the boolean-literal hint category.
+test("classifyTsType: boolean is a distinct category; boolean | undefined normalises to boolean (#236)", () => {
+  assert.equal(classifyTsType("boolean"), "boolean", "plain boolean must classify as 'boolean'");
+  assert.equal(classifyTsType("boolean | undefined"), "boolean", "optional boolean must normalise to 'boolean'");
+  // Mixed boolean arms stay 'other' (fail closed).
+  assert.equal(classifyTsType("boolean | string"), "other", "mixed boolean+string must be 'other'");
+  assert.equal(classifyTsType("boolean | null"), "other", "boolean | null must be 'other' (null ≠ undefined)");
+});
+
+test("classifySchemaHint: 'true | false' classifies as 'boolean'; quoted form is 'string', not 'boolean' (#236)", () => {
+  assert.equal(classifySchemaHint("true | false"), "boolean", "'true | false' must be 'boolean'");
+  assert.equal(classifySchemaHint("true"), "boolean", "'true' alone must be 'boolean'");
+  assert.equal(classifySchemaHint("false"), "boolean", "'false' alone must be 'boolean'");
+  // A quoted form must be 'string', not 'boolean' — the mismatch the spec requires.
+  assert.equal(classifySchemaHint('"true"'), "string", 'quoted "true" must be string, not boolean');
+  // A numeric bare-angle hint must not be 'boolean'.
+  assert.equal(classifySchemaHint("<int>"), "number", "'<int>' must be 'number', not 'boolean'");
+});
+
+test("drift guard: boolean TS field with 'true | false' schema hint passes (#236)", () => {
+  const syntheticSrc = `
+interface SyntheticFinding {
+  blocking: boolean;
+}
+`;
+  const syntheticBlock = `{
+    "findings": [
+        {
+            "blocking": true | false
+        }
+    ]
+}`;
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticFinding");
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    const blockCat = hints[field];
+    if (tsCat === "other" || blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${blockCat ?? "absent"})`);
+    }
+  }
+  assert.deepEqual(mismatches, [], "boolean field with 'true | false' hint must pass drift guard");
+});
+
+test("drift guard: boolean TS field with quoted schema hint is a mismatch (#236)", () => {
+  const syntheticSrc = `
+interface SyntheticFinding {
+  blocking: boolean;
+}
+`;
+  const syntheticBlock = `{
+    "findings": [
+        {
+            "blocking": "true"
+        }
+    ]
+}`;
+  const tsTypes = parseInterfaceFieldTypes(syntheticSrc, "SyntheticFinding");
+  const hints = parseSchemaBlockValueHints(syntheticBlock);
+
+  const mismatches: string[] = [];
+  for (const [field, token] of Object.entries(tsTypes)) {
+    const tsCat = classifyTsType(token);
+    const blockCat = hints[field];
+    if (tsCat === "other" || blockCat === undefined || blockCat === "other" || tsCat !== blockCat) {
+      mismatches.push(`${field}: \`${token}\` (${tsCat}) vs schema (${blockCat ?? "absent"})`);
+    }
+  }
+  assert.deepEqual(
+    mismatches,
+    ['blocking: `boolean` (boolean) vs schema (string)'],
+    "boolean TS field with a quoted schema hint must be caught as a type-token mismatch",
+  );
+});
+
 test("drift guard: scalar TS field with unsupported schema hint (other) is a mismatch (regression #85 finding 2)", () => {
   // Simulate `summary: string` with its schema hint changed to an array form.
   const syntheticSrc = `
