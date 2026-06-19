@@ -1282,6 +1282,15 @@ test("resolveReleaseConfig: returns intake_model — default when unset, pipelin
   assert.equal(over.intake_model, "haiku", "models.intake in pipeline.yml must override");
 });
 
+test("resolveReleaseConfig: returns intake_timeout — default when unset, pipeline.yml override when set (#248)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+  // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
+  const dflt = cfgMod.resolveReleaseConfig(makeFakeRepo(null));
+  assert.equal(dflt.intake_timeout, DEFAULT_CONFIG.intake_timeout, "default intake_timeout must be DEFAULT_CONFIG.intake_timeout");
+  const over = cfgMod.resolveReleaseConfig(makeFakeRepo("intake_timeout: 123\n"));
+  assert.equal(over.intake_timeout, 123, "intake_timeout in pipeline.yml must override");
+});
+
 // #154 regression: `doctor --is-ok` is a zero-output 0/1 polling gate, but config
 // resolution runs first and can emit non-fatal warnings (e.g. an inert models.*
 // alias under the default codex implementer). resolveConfig({ quiet: true }) must
