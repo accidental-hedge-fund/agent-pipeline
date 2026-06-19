@@ -16,6 +16,7 @@ import {
   getPrChecks,
   getPrCommits,
   getPrDetail,
+  getPrDiff,
   getPrForIssue,
   parseChecksAggregate,
   postComment,
@@ -24,9 +25,25 @@ import {
 } from "../gh.ts";
 import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
-import { extractReviewedSha } from "./review.ts";
-import { reviewCommentFlagsSpecDivergence } from "../review-policy.ts";
+import {
+  computeDiffHash,
+  extractBlockingKeysFromComment,
+  extractDiffHashFromComment,
+  findLatestReviewCommentBody,
+  formatReviewComment,
+  extractReviewedSha,
+  parseStructuredVerdict,
+} from "./review.ts";
+import {
+  extractOverrides,
+  findingKey,
+  partitionFindings,
+  reviewCommentFlagsSpecDivergence,
+} from "../review-policy.ts";
+import { invokeReviewer } from "../self-review.ts";
+import { buildDeltaReviewPrompt } from "../prompts/index.ts";
 import * as openspec from "../openspec.ts";
+import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
@@ -332,6 +349,28 @@ export async function advance(
 // ---------------------------------------------------------------------------
 
 /**
+ * Result of a pre-merge delta review invocation (#228). The caller formats the
+ * comment and routes based on whether there are blocking findings after policy.
+ */
+export interface DeltaReviewResult {
+  verdict: "approve" | "needs-attention";
+  findings: ReviewFinding[];
+  summary: string;
+}
+
+/**
+ * Injectable seam for the pre-merge delta review (#228). The real implementation
+ * calls `invokeReviewer` with the delta-review prompt and returns the parsed
+ * verdict; fakes in tests return a controlled verdict without any I/O.
+ */
+export type RunDeltaReviewFn = (
+  cfg: PipelineConfig,
+  issueNumber: number,
+  issueDetail: { title: string; body: string },
+  deltaDiff: string,
+) => Promise<DeltaReviewResult>;
+
+/**
  * External seams for {@link enforceReviewShaGate}, overridable in tests.
  * Mirrors the DI pattern used elsewhere (testgate.ts, review.ts).
  */
@@ -339,8 +378,23 @@ export interface ShaGateDeps {
   getIssueDetail?: typeof getIssueDetail;
   getPrDetail?: typeof getPrDetail;
   getPrCommits?: typeof getPrCommits;
+  /** Fetches the full PR diff (#228 diff-hash check). */
+  getPrDiff?: typeof getPrDiff;
+  /**
+   * Fetches the diff between two commits on the PR for the delta review (#228).
+   * Injectable seam; real implementation uses `git diff baseSha...headSha`.
+   */
+  getCommitDeltaDiff?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+    baseSha: string,
+    headSha: string,
+  ) => Promise<string>;
+  /** Runs the pre-merge delta review (#228) and returns the parsed verdict. */
+  runDeltaReview?: RunDeltaReviewFn;
   postComment?: typeof postComment;
   transition?: typeof transition;
+  setBlocked?: typeof setBlocked;
 }
 
 /**
@@ -360,8 +414,12 @@ export async function enforceReviewShaGate(
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
   const getPrCommitsFn = deps.getPrCommits ?? getPrCommits;
+  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
+  const getCommitDeltaDiffFn = deps.getCommitDeltaDiff ?? defaultGetCommitDeltaDiff;
+  const runDeltaReviewFn = deps.runDeltaReview ?? defaultRunDeltaReview;
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
   const reviewed = extractReviewedSha(detail.comments);
@@ -391,17 +449,94 @@ export async function enforceReviewShaGate(
           landedSince.length > 0 &&
           landedSince.every((c) => isPipelineInternalCommit(c.messageHeadline))
         ) {
-          // Only archive commits landed since the review → verdict valid.
+          // Task 5.8: Only archive commits landed since the review → verdict valid.
+          // No diff-hash check needed: the pipeline-internal exemption takes precedence.
           return null;
         }
       }
       // reviewed.sha absent from history (rebased/squashed) or a developer
-      // commit landed → fall through to a re-review (the safe default).
+      // commit landed → fall through to the diff-hash check (#228).
     } catch {
-      // If commit classification fails, fall through to re-review (conservative).
+      // If commit classification fails, fall through to diff-hash check (conservative).
+    }
+
+    // Diff-hash check (#228): before routing back to a full review round, compare
+    // the current PR diff hash to the one recorded in the prior review comment.
+    // If the diff is identical, the verdict is still valid even though SHA changed.
+    // On a hash mismatch, run a focused delta review of only the unreviewed commits.
+    try {
+      const currentDiff = await getPrDiffFn(cfg, prNumber);
+      const currentHash = computeDiffHash(currentDiff);
+      const priorCommentBody = findLatestReviewCommentBody(detail.comments, reviewed.round);
+      const cachedHash = priorCommentBody ? extractDiffHashFromComment(priorCommentBody) : null;
+
+      if (cachedHash !== null && cachedHash === currentHash) {
+        // Diff unchanged despite SHA mismatch: verdict is still valid.
+        await postCommentFn(cfg, issueNumber, diffUnchangedNotice(reviewed.sha, head));
+        console.log(
+          `[pipeline] #${issueNumber}: diff hash unchanged (${currentHash}); verdict reused (SHA ${reviewed.sha?.slice(0, 7)} → ${head.slice(0, 7)})`,
+        );
+        return null;
+      }
+
+      // Diff changed: run a focused adversarial delta review of only the unreviewed
+      // commits instead of routing back to a full review-2 round. The delta review
+      // does NOT count against the max_adversarial_rounds ceiling.
+      const deltaDiff = reviewed.sha
+        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head)
+        : currentDiff; // reviewed SHA missing → review the full diff as the delta
+      const deltaResult = await runDeltaReviewFn(cfg, issueNumber, detail, deltaDiff);
+      const overrides = extractOverrides(detail.comments);
+      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides);
+
+      const newHash = computeDiffHash(currentDiff);
+      const deltaCommentVerdict = {
+        verdict: deltaResult.verdict,
+        summary: deltaResult.summary,
+        findings: deltaResult.findings,
+        next_steps: [] as string[],
+        commitSha: head,
+      };
+      const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
+      const deltaComment = formatReviewComment(
+        cfg,
+        deltaCommentVerdict,
+        reviewed.round,
+        `pre-merge delta review by ${cfg.harnesses.reviewer}`,
+        blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
+        newHash,
+      );
+      await postCommentFn(cfg, issueNumber, deltaComment);
+
+      if (partition.blocking.length === 0) {
+        // Delta review approves (or findings all below policy): pre-merge proceeds.
+        console.log(`[pipeline] #${issueNumber}: pre-merge delta review approved; proceeding`);
+        return null;
+      }
+
+      // Delta review found blocking findings: block pre-merge without routing to review-2.
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        "Pre-merge delta review found blocking findings; fix required before merging.",
+        "pre-merge",
+        "needs-human",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "pre-merge delta review: blocking findings",
+      };
+    } catch (err) {
+      // Diff fetch or delta review failed → fall through to full re-review (conservative).
+      console.warn(
+        `[pipeline] #${issueNumber}: diff-hash check or delta review failed (${(err as Error).message}); falling back to full re-review`,
+      );
     }
   }
 
+  // reviewed.sha is null (no sentinel) OR diff-hash/delta-review path errored:
+  // treat as stale and run the full review stage again.
   const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
   await postCommentFn(cfg, issueNumber, staleReviewNotice(reviewed.sha, head));
   await transitionFn(
@@ -418,6 +553,60 @@ export async function enforceReviewShaGate(
     to: reviewStage,
     summary: `re-review: HEAD moved to ${head.slice(0, 7)}`,
   };
+}
+
+/** Notice posted when the pre-merge diff-hash check finds the diff unchanged (#228). */
+export function diffUnchangedNotice(reviewedSha: string | null, headSha: string): string {
+  const from = reviewedSha ? ` from \`${reviewedSha.slice(0, 7)}\`` : "";
+  return [
+    "## Pipeline: Diff unchanged since last review; verdict reused",
+    "",
+    `HEAD has moved${from} to \`${headSha.slice(0, 7)}\`, but the PR diff hash is identical to the one the last review evaluated.`,
+    "The prior review verdict is still valid; pre-merge proceeds without a re-review.",
+  ].join("\n");
+}
+
+/** Default implementation of the `getCommitDeltaDiff` seam (#228). */
+async function defaultGetCommitDeltaDiff(
+  cfg: PipelineConfig,
+  _prNumber: number,
+  baseSha: string,
+  headSha: string,
+): Promise<string> {
+  const result = await gitInWorktree(cfg.repo_dir, ["diff", `${baseSha}...${headSha}`], {
+    ignoreFailure: true,
+  });
+  return result.stdout;
+}
+
+/** Default implementation of the `runDeltaReview` seam (#228). */
+async function defaultRunDeltaReview(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  issueDetail: { title: string; body: string },
+  deltaDiff: string,
+): Promise<DeltaReviewResult> {
+  const prompt = buildDeltaReviewPrompt({
+    cfg,
+    issueNumber,
+    title: issueDetail.title,
+    body: issueDetail.body,
+    deltaDiff,
+  });
+  const invocation = await invokeReviewer(
+    cfg.harnesses.reviewer,
+    cfg.harnesses.implementer,
+    cfg.repo_dir,
+    prompt,
+    { timeoutSec: cfg.review_timeout, model: cfg.models.review },
+  );
+  if (!invocation.result.success) {
+    throw new Error(
+      `delta review harness failed: exit ${invocation.result.exit_code}`,
+    );
+  }
+  const parsed = parseStructuredVerdict(invocation.result.stdout, "");
+  return { verdict: parsed.verdict, findings: parsed.findings, summary: parsed.summary };
 }
 
 /** The notice posted before a SHA-mismatch re-review. Pure; exported for tests. */

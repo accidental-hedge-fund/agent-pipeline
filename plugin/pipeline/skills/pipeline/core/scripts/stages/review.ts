@@ -9,6 +9,7 @@
 // native prose reviews are parsed by parseProseReview; otherwise text verdict
 // detection is conservative and defaults to "needs-attention".
 
+import { createHash } from "node:crypto";
 import {
   findLatestCommentMatching,
   getIssueDetail,
@@ -62,6 +63,11 @@ const REVIEWED_SHA_RE = /^<!-- reviewed-sha: ([0-9a-fA-F]{40}) -->$/gm;
 // the LAST occurrence, guarding against injected marker content earlier in the
 // comment body (reviewer-authored finding bodies can appear before the footer).
 const PIPELINE_BLOCKING_KEYS_RE = /^<!-- pipeline-blocking-keys: ([0-9a-f,]*) -->$/gm;
+// Machine-readable diff-hash sentinel (#228): binds the verdict to a hash of the
+// exact PR diff string the reviewer evaluated. Anchored full-line + global flag
+// so extractDiffHashFromComment picks the LAST occurrence, guarding against an
+// injected sentinel appearing earlier in the comment body.
+const VERDICT_DIFF_HASH_RE = /^<!-- verdict-diff-hash: ([0-9a-f]{16}) -->$/gm;
 
 export interface AdvanceReviewOpts {
   dryRun?: boolean;
@@ -208,6 +214,40 @@ export async function advanceReview(
   // instead of re-hunting the whole diff for fresh lower-grade tangents (the drip).
   const priorReview2Findings = round === 2 ? extractReview2Findings(detail.comments) : undefined;
 
+  // Diff-hash cache check (#228): compute the hash ONCE from the already-fetched
+  // diff so the sentinel embedded in the comment matches the exact string reviewed.
+  const diffHash = computeDiffHash(diff);
+  const roundPfx = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
+
+  // Re-entering review-N on an unchanged diff? Reuse the cached verdict without
+  // invoking the reviewer (avoids non-deterministic re-reviews of frozen code).
+  // Skipped in dry-run so testing harnesses don't see unexpected early returns.
+  if (!opts.dryRun) {
+    const priorRoundCommentsForCache = detail.comments.filter((c) => c.body.startsWith(roundPfx));
+    const latestPriorComment = priorRoundCommentsForCache[priorRoundCommentsForCache.length - 1];
+    if (latestPriorComment) {
+      const cachedHash = extractDiffHashFromComment(latestPriorComment.body);
+      if (cachedHash !== null && cachedHash === diffHash) {
+        console.log(`[pipeline] #${issueNumber}: Diff hash unchanged; reusing cached verdict for round ${round}`);
+        const cachedVerdict = extractVerdictFromComment(latestPriorComment.body);
+        const cachedBlockingKeys = extractBlockingKeysFromComment(latestPriorComment.body);
+        const isBlocking = cachedVerdict === "needs-attention" && cachedBlockingKeys.size > 0;
+        const toStage: Stage = isBlocking
+          ? (round === 1 ? "fix-1" : "fix-2")
+          : (round === 1 ? "review-2" : "pre-merge");
+        const verb = isBlocking ? "blocking findings" : "advance";
+        await transitionFn(
+          cfg,
+          issueNumber,
+          stage,
+          toStage,
+          `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
+        );
+        return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
+      }
+    }
+  }
+
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would invoke ${reviewer} for ${stage}`);
     return { advanced: true, from: stage, to: round === 1 ? "review-2" : "pre-merge", summary: "[dry-run]" };
@@ -296,7 +336,7 @@ export async function advanceReview(
   }
 
   if (verdict.verdict === "approve") {
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash)));
     if (round === 1) {
       await transitionFn(
         cfg,
@@ -378,7 +418,7 @@ export async function advanceReview(
     // empty marker (#133 fix 2): prevents extractBlockingKeysFromComment from
     // falling back to all override-key tokens on a re-review where an advisory
     // finding later crosses the policy threshold.
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash)));
     const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     // Also surface on the PR: review bookkeeping lives on the issue, but a human
@@ -412,14 +452,14 @@ export async function advanceReview(
 
   // Post the verdict comment WITH the pipeline-blocking-keys marker so future
   // recurrence checks can distinguish prior blocking findings from advisory ones.
-  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet)));
+  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash)));
 
   // Prior verdict comments for THIS round, oldest → newest. `detail.comments`
   // was snapshotted before the current verdict was posted, so the last entry is
   // the round that ran immediately before this one. Drives the recurrence check
   // and the RECURRING/NEW punch-list tags (#133), and the bounded-rounds ceiling.
-  const roundPrefix = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
-  const priorRoundComments = detail.comments.filter((c) => c.body.startsWith(roundPrefix));
+  // `roundPfx` was computed above (before the cache check) from the same constants.
+  const priorRoundComments = detail.comments.filter((c) => c.body.startsWith(roundPfx));
   const roundCap = cfg.review_policy.max_adversarial_rounds;
 
   // Recurrence-aware early park (#133): a blocking finding whose stable key
@@ -899,6 +939,7 @@ export function formatReviewComment(
   roundOrReviewer: 1 | 2 | string,
   maybeReviewer?: string,
   blockingKeys?: Set<string>,
+  diffHash?: string,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -958,6 +999,13 @@ export function formatReviewComment(
   // verify the verdict still covers HEAD. Omitted when no SHA was resolved.
   if (verdict.commitSha) {
     lines.push("", `<!-- reviewed-sha: ${verdict.commitSha} -->`);
+  }
+  // Diff-hash sentinel (#228): records the hash of the diff the reviewer saw so
+  // re-entry on an unchanged diff can skip the reviewer (deterministic). Co-located
+  // with the reviewed-sha sentinel. Omitted when no hash is supplied (e.g. tests,
+  // 0-findings blocked path where caching would produce incorrect advance routing).
+  if (diffHash) {
+    lines.push(`<!-- verdict-diff-hash: ${diffHash} -->`);
   }
   return lines.join("\n");
 }
@@ -1149,6 +1197,61 @@ export function extractReviewedSha(
     sha: lastMatch?.[1] ?? null,
     round: reviewRoundOf(m.body, round) as 1 | 2,
   };
+}
+
+/**
+ * SHA-256 of the raw diff string, truncated to 16 hex characters. Used as the
+ * `verdict-diff-hash` sentinel value to detect whether the PR diff has changed
+ * since the last recorded verdict (#228).
+ */
+export function computeDiffHash(diff: string): string {
+  return createHash("sha256").update(diff).digest("hex").slice(0, 16);
+}
+
+/**
+ * Extract the `verdict-diff-hash` sentinel from a review comment body (#228).
+ * Last-occurrence-wins (same guard as `extractBlockingKeysFromComment`): rejects
+ * a spoofed sentinel appearing before the pipeline-emitted footer.
+ * Returns null when absent or structurally malformed.
+ */
+export function extractDiffHashFromComment(body: string): string | null {
+  VERDICT_DIFF_HASH_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = VERDICT_DIFF_HASH_RE.exec(body)) !== null) {
+    lastMatch = cur;
+  }
+  VERDICT_DIFF_HASH_RE.lastIndex = 0;
+  return lastMatch?.[1] ?? null;
+}
+
+/**
+ * Return the body of the most recent review comment for the given round, or
+ * null when none exists. Used by the pre-merge SHA gate to check the cached
+ * diff-hash sentinel without duplicating the prefix constants (#228).
+ */
+export function findLatestReviewCommentBody(
+  comments: { body: string }[],
+  round: 1 | 2,
+): string | null {
+  const prefix = round === 1 ? REVIEW_MARKER_PREFIX_R1 : REVIEW_MARKER_PREFIX_R2;
+  const m = findLatestCommentMatching(
+    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+    (b) => b.startsWith(prefix),
+  );
+  return m?.body ?? null;
+}
+
+/**
+ * Extract the verdict string (`"approve"` or `"needs-attention"`) from the
+ * heading line of a review comment produced by `formatReviewComment`. Returns
+ * null when the heading is absent or does not match the expected format. Used
+ * by the diff-hash cache path to reproduce routing without re-invoking the reviewer.
+ */
+function extractVerdictFromComment(body: string): "approve" | "needs-attention" | null {
+  const m = body.match(/^## Review \d+ \([^)]+\) — (approve|needs-attention)/m);
+  if (!m) return null;
+  return m[1] as "approve" | "needs-attention";
 }
 
 // Internal export for tests, so review.test isn't needed.

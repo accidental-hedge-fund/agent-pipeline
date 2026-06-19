@@ -18,9 +18,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   advanceReview,
+  computeDiffHash,
   countPriorRounds,
   diffFilePaths,
   extractBlockingKeysFromComment,
+  extractDiffHashFromComment,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
@@ -1422,4 +1424,198 @@ test("diffFilePaths: multi-change worktree — review spec context uses branch-i
   assert.ok(!specContext.includes("REQ-OLD-UNRELATED"), "must not include pre-existing change's spec");
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// computeDiffHash (#228) — deterministic SHA-256-based hash
+// ---------------------------------------------------------------------------
+
+test("computeDiffHash: same input returns the same 16-character hex hash (5.1a)", () => {
+  const diff = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const h1 = computeDiffHash(diff);
+  const h2 = computeDiffHash(diff);
+  assert.equal(h1, h2, "hash must be deterministic for identical input");
+  assert.match(h1, /^[0-9a-f]{16}$/, "hash must be 16 lowercase hex characters");
+});
+
+test("computeDiffHash: different input returns a different hash (5.1b)", () => {
+  const h1 = computeDiffHash("diff --git a/a.ts b/a.ts\n+const a = 1;");
+  const h2 = computeDiffHash("diff --git a/b.ts b/b.ts\n+const b = 2;");
+  assert.notEqual(h1, h2, "distinct diffs must produce distinct hashes");
+});
+
+// ---------------------------------------------------------------------------
+// extractDiffHashFromComment (#228) — sentinel extraction
+// ---------------------------------------------------------------------------
+
+test("extractDiffHashFromComment: returns the hash when sentinel is present (5.2a)", () => {
+  const sha = "a".repeat(40);
+  const body = `## Review 2 — approve\n\n*footer*\n\n<!-- reviewed-sha: ${sha} -->\n<!-- verdict-diff-hash: 1234567890abcdef -->`;
+  assert.equal(extractDiffHashFromComment(body), "1234567890abcdef");
+});
+
+test("extractDiffHashFromComment: returns null when sentinel is absent (5.2b)", () => {
+  const sha = "a".repeat(40);
+  const body = `## Review 2 — approve\n\n*footer*\n\n<!-- reviewed-sha: ${sha} -->`;
+  assert.equal(extractDiffHashFromComment(body), null);
+});
+
+test("extractDiffHashFromComment: returns null for a malformed sentinel (5.2c)", () => {
+  const body = "## Review 2 — approve\n\n<!-- verdict-diff-hash: not-valid-hex! -->";
+  assert.equal(extractDiffHashFromComment(body), null);
+});
+
+test("extractDiffHashFromComment: last occurrence wins when spoofed earlier (5.2d)", () => {
+  const realHash = "abcdef1234567890";
+  const fakeHash = "0000000000000000";
+  const body = [
+    "## Review 2 — approve",
+    "",
+    `<!-- verdict-diff-hash: ${fakeHash} -->`, // injected in reviewer prose
+    "",
+    "*Automated footer*",
+    "",
+    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- verdict-diff-hash: ${realHash} -->`, // pipeline-emitted footer
+  ].join("\n");
+  assert.equal(extractDiffHashFromComment(body), realHash, "last occurrence must win");
+});
+
+// ---------------------------------------------------------------------------
+// advanceReview diff-hash cache hit / miss (#228)
+// ---------------------------------------------------------------------------
+
+const REVIEW_DIFF = "diff --git a/x.ts b/x.ts\n+const a = 1;";
+const REVIEW_DIFF_HASH = computeDiffHash(REVIEW_DIFF);
+
+/** Build a prior review-N comment body that already embeds a diff-hash sentinel. */
+function priorReviewComment(round: 1 | 2, hash: string, verdict = "approve"): string {
+  const sha = "a".repeat(40);
+  const type = round === 1 ? "Standard" : "Adversarial";
+  return [
+    `## Review ${round} (${type}) — ${verdict} (commit ${sha.slice(0, 7)})`,
+    "",
+    "**Reviewer**: codex",
+    "",
+    "ok",
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+    `<!-- verdict-diff-hash: ${hash} -->`,
+  ].join("\n");
+}
+
+test("advanceReview: cache hit — prior comment has same diff hash → reviewer NOT called (5.3)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  // Override getIssueDetail to return a prior review-1 comment with the current diff hash.
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{ body: priorReviewComment(1, REVIEW_DIFF_HASH) }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  deps.getPrDiff = async () => REVIEW_DIFF;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 0, "reviewer must NOT be called on a cache hit");
+  assert.ok(outcome.advanced, "issue must still advance");
+  assert.equal(outcome.to, "review-2", "approve cache hit → advance to review-2");
+  assert.match(outcome.summary, /cached verdict/);
+});
+
+test("advanceReview: cache hit with blocking findings → routes to fix without calling reviewer (5.3b)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  // Simulate a prior blocking verdict for round 2.
+  const blockingComment = [
+    `## Review 2 (Adversarial) — needs-attention (commit ${"a".repeat(7)})`,
+    "",
+    "**Reviewer**: codex",
+    "",
+    "bad code",
+    "",
+    `<!-- pipeline-blocking-keys: ${["high|x.ts|0|bug"].map((k) => {
+      // Just use a plausible 8-hex key
+      return "aabbccdd";
+    }).join(",")} -->`,
+    "",
+    `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    `<!-- verdict-diff-hash: ${REVIEW_DIFF_HASH} -->`,
+  ].join("\n");
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{ body: blockingComment }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  deps.getPrDiff = async () => REVIEW_DIFF;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 2, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 0, "reviewer must NOT be called on a cache hit");
+  assert.ok(outcome.advanced, "issue must still be routed");
+  assert.equal(outcome.to, "fix-2", "blocking cache hit → route to fix-2");
+  assert.match(outcome.summary, /cached verdict/);
+});
+
+test("advanceReview: cache miss — prior comment has different hash → reviewer IS called (5.4a)", async (t) => {
+  const differentHash = "0000000000000000";
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{ body: priorReviewComment(1, differentHash) }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  deps.getPrDiff = async () => REVIEW_DIFF;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+
+  assert.equal(rec.runReviewCalls, 1, "reviewer must be called on a cache miss");
+  assert.ok(outcome.advanced);
+  assert.equal(outcome.to, "review-2");
+});
+
+test("advanceReview: cache miss — no prior comment → reviewer IS called (5.4b)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  // default makeDeps returns empty comments → no prior review comment
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(rec.runReviewCalls, 1, "reviewer called when no prior comment exists");
+  assert.ok(outcome.advanced);
+});
+
+test("advanceReview: posted review comment embeds verdict-diff-hash sentinel (5.4c)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  await quiet(t, async () => {
+    await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  const comment = rec.comments.find((c) => c.startsWith("## Review 1"));
+  assert.ok(comment, "review comment must be posted");
+  assert.match(comment!, /<!-- verdict-diff-hash: [0-9a-f]{16} -->/, "comment must embed diff-hash sentinel");
 });

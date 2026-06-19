@@ -10,12 +10,16 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
+  diffUnchangedNotice,
   enforceReviewShaGate,
   isPipelineInternalCommit,
   staleReviewNotice,
+  type DeltaReviewResult,
+  type RunDeltaReviewFn,
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
-import type { PipelineConfig, Stage } from "../scripts/types.ts";
+import { computeDiffHash } from "../scripts/stages/review.ts";
+import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 const cfg = {} as unknown as PipelineConfig;
 const SHA_REVIEWED = "1111111111111111111111111111111111111111";
@@ -72,14 +76,18 @@ test("staleReviewNotice: explains the missing-sentinel case", () => {
 interface Rec {
   comments: string[];
   transitions: { from: Stage; to: Stage }[];
+  blocked: Array<{ reason: string }>;
 }
 
 function makeDeps(opts: {
   commentBody: string | null;
   headSha: string;
   commits?: { oid: string; messageHeadline: string }[];
+  getPrDiff?: () => Promise<string>;
+  getCommitDeltaDiff?: () => Promise<string>;
+  runDeltaReview?: RunDeltaReviewFn;
 }): { deps: ShaGateDeps; rec: Rec } {
-  const rec: Rec = { comments: [], transitions: [] };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const comments = opts.commentBody === null ? [] : [{ body: opts.commentBody }];
   const deps: ShaGateDeps = {
     getIssueDetail: async () =>
@@ -96,6 +104,16 @@ function makeDeps(opts: {
     transition: async (_cfg, _n, from, to) => {
       rec.transitions.push({ from, to });
     },
+    setBlocked: async (_cfg, _n, reason) => {
+      rec.blocked.push({ reason });
+    },
+    ...(opts.getPrDiff && {
+      getPrDiff: async (_cfg, _n) => opts.getPrDiff!(),
+    }),
+    ...(opts.getCommitDeltaDiff && {
+      getCommitDeltaDiff: async (_cfg, _n, _b, _h) => opts.getCommitDeltaDiff!(),
+    }),
+    ...(opts.runDeltaReview && { runDeltaReview: opts.runDeltaReview }),
   };
   return { deps, rec };
 }
@@ -122,6 +140,7 @@ function reviewComment(round: 1 | 2, sha: string | null): string {
 
 async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
   t.mock.method(console, "log", () => {});
+  t.mock.method(console, "warn", () => {});
   await fn();
 }
 
@@ -261,4 +280,128 @@ test("enforceReviewShaGate: no prior review comment → proceeds (nothing to val
   assert.equal(out, null);
   assert.deepEqual(rec.transitions, []);
   assert.deepEqual(rec.comments, []);
+});
+
+// ---------------------------------------------------------------------------
+// enforceReviewShaGate — diff-hash check + delta review (#228)
+// ---------------------------------------------------------------------------
+
+// A cfg with a valid review_policy, required when the delta-review partition path runs.
+const cfgWithPolicy = {
+  review_policy: { block_threshold: "low" as const, min_confidence: 0 },
+  harnesses: { reviewer: "claude" },
+} as unknown as PipelineConfig;
+
+/** Review comment body that includes both the reviewed-sha and diff-hash sentinels. */
+function reviewCommentWithHash(round: 1 | 2, sha: string | null, hash: string): string {
+  return reviewComment(round, sha) + `\n<!-- verdict-diff-hash: ${hash} -->`;
+}
+
+test("enforceReviewShaGate: SHA mismatch but diff hash unchanged → verdict reused, notice posted (5.5)", async (t) => {
+  const DIFF = "diff --git a/foo.ts b/foo.ts\nindex 0000000..1234567 100644\n+++ b/foo.ts\n+const x = 1;";
+  const hash = computeDiffHash(DIFF);
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, hash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => DIFF,
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "diff unchanged → verdict reused, pre-merge proceeds");
+  assert.deepEqual(rec.transitions, [], "no re-review transition");
+  assert.equal(rec.comments.length, 1, "diffUnchangedNotice must be posted");
+  assert.match(rec.comments[0], /Diff unchanged since last review/);
+  assert.match(rec.comments[0], /2222222/); // headSha short form
+});
+
+test("enforceReviewShaGate: SHA mismatch, diff changed, delta review approves → proceeds (5.6)", async (t) => {
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const deltaResult: DeltaReviewResult = {
+    verdict: "approve",
+    findings: [],
+    summary: "Delta LGTM — no new issues",
+  };
+  const runDeltaReview: RunDeltaReviewFn = async () => deltaResult;
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "delta approve → pre-merge proceeds");
+  assert.deepEqual(rec.transitions, [], "must NOT transition to review-2");
+  assert.equal(rec.comments.length, 1, "delta review comment posted");
+  assert.match(rec.comments[0], /reviewed-sha:/, "new reviewed-sha sentinel embedded");
+  assert.match(rec.comments[0], /verdict-diff-hash:/, "new diff-hash sentinel embedded");
+  assert.deepEqual(rec.blocked, [], "no setBlocked call");
+});
+
+test("enforceReviewShaGate: SHA mismatch, diff changed, delta review blocks → pre-merge blocked, not review-2 (5.7)", async (t) => {
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "critical",
+  };
+  const deltaResult: DeltaReviewResult = {
+    verdict: "needs-attention",
+    findings: [blockingFinding],
+    summary: "Delta review found critical issue",
+  };
+  const runDeltaReview: RunDeltaReviewFn = async () => deltaResult;
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    "returns blocked Outcome",
+  );
+  assert.deepEqual(rec.transitions, [], "must NOT route to review-2");
+  assert.equal(rec.blocked.length, 1, "setBlocked called once");
+  assert.match(rec.blocked[0].reason, /Pre-merge delta review found blocking findings/);
+});
+
+test("enforceReviewShaGate: only pipeline-internal commits → exempted before diff-hash check (5.8)", async (t) => {
+  let getPrDiffCalled = false;
+  const { deps, rec } = makeDeps({
+    commentBody: reviewComment(2, SHA_REVIEWED),
+    headSha: SHA_HEAD,
+    commits: [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+      ARCHIVE_COMMIT_AT_HEAD, // only pipeline-internal since reviewed SHA
+    ],
+    getPrDiff: async () => { getPrDiffCalled = true; return "irrelevant"; },
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 16, 99, deps);
+  });
+  assert.equal(out, null, "pipeline-internal exemption → proceeds");
+  assert.equal(getPrDiffCalled, false, "diff-hash check must NOT run for pipeline-internal commits");
+  assert.deepEqual(rec.transitions, [], "no transition");
+  assert.deepEqual(rec.comments, [], "no notice");
 });

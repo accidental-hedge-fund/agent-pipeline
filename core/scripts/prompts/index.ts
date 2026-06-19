@@ -445,6 +445,48 @@ function buildConfidenceCalibrationWithPolicy(
   );
 }
 
+export interface BuildDeltaReviewArgs {
+  cfg: PipelineConfig;
+  issueNumber: number;
+  title: string;
+  body: string;
+  /** The unreviewed delta diff (commits since the last reviewed SHA). */
+  deltaDiff: string;
+}
+
+/**
+ * Build the adversarial (round-2 equivalent) review prompt for a pre-merge
+ * delta review (#228): focused on the unreviewed commits since the last approved
+ * review, not the full PR diff. The `review1_section` slot carries a scope note
+ * so the reviewer does not re-flag already-reviewed code.
+ */
+export function buildDeltaReviewPrompt(a: BuildDeltaReviewArgs): string {
+  const dc = domainContext(a.cfg);
+  const deltaScopeNote = [
+    "## Pre-merge Delta Review — Unreviewed Changes Only",
+    "",
+    "The diff below represents ONLY the commits added since the last approved adversarial review.",
+    "The rest of the PR diff was already reviewed and approved in a prior review round.",
+    "Focus exclusively on these new changes. Do NOT re-raise findings from already-reviewed",
+    "code unless the new commits caused a concrete regression in that code.",
+  ].join("\n");
+  return substitute(loadTemplate("review_adversarial"), {
+    domain_name: dc.name,
+    domain_description: dc.description,
+    conventions: readConventions(a.cfg),
+    issue_number: String(a.issueNumber),
+    title: a.title,
+    body: a.body || "(no description)",
+    review1_section: deltaScopeNote,
+    prior_review2_findings: "",
+    spec_context: "",
+    severity_rubric: SEVERITY_RUBRIC,
+    confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
+    schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
+    diff: truncateDiff(a.deltaDiff, 50_000),
+  });
+}
+
 export interface BuildIntakeArgs {
   description: string;
   repoContext: string;
