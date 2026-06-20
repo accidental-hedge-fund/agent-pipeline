@@ -434,6 +434,38 @@ export async function listRunIds(
 }
 
 // ---------------------------------------------------------------------------
+// latestSummaryForIssue — for `pipeline N --summary` run-directory-first read
+// ---------------------------------------------------------------------------
+
+/** Return the EvidenceBundle from the most-recent `summary.json` for the given
+ *  issue number, or `null` when none is found.
+ *
+ *  Scans all run directories whose run-id begins with `<issueNumber>-` (already
+ *  sorted by mtime descending by `listRunIds`), reads `summary.json` from the
+ *  first readable match, and parses it.  A missing file, unreadable file, or
+ *  corrupt JSON is treated as absent and the next candidate is tried (so a
+ *  single bad entry does not shadow a valid older run). */
+export async function latestSummaryForIssue(
+  repoDir: string,
+  issueNumber: number,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<EvidenceBundle | null> {
+  const allIds = await listRunIds(repoDir, deps);
+  const prefix = `${issueNumber}-`;
+  for (const id of allIds.filter((rid) => rid.startsWith(prefix))) {
+    const summaryPath = path.join(runDirPath(repoDir, id), "summary.json");
+    try {
+      const raw = await deps.readFile(summaryPath);
+      const parsed = JSON.parse(raw) as EvidenceBundle;
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      // Absent or corrupt — try next matching run
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Terminal log tee — patches process.stdout/stderr to mirror output to a file.
 // Separate from the injectable deps pattern: this operates on global process state.
 // ---------------------------------------------------------------------------

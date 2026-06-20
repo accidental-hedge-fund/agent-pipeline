@@ -10,6 +10,7 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  latestSummaryForIssue,
   listRunIds,
   readEvents,
   runDirPath,
@@ -646,4 +647,139 @@ test("emitGhMetrics after finalizeRun: notification calls included in emitted su
 
   const metricsEvent = events[metricsIdx];
   assert.equal(metricsEvent.call_count, 2, "summary must reflect both notification gh calls");
+});
+
+// ---------------------------------------------------------------------------
+// latestSummaryForIssue (#261)
+// ---------------------------------------------------------------------------
+
+function makeSummaryBundle(issue: number, runId: string): EvidenceBundle {
+  return {
+    schema_version: 1,
+    schemaVersion: 1,
+    runId,
+    issue,
+    pr: null,
+    branch: null,
+    harnesses: [],
+    stages: [],
+    reviews: [],
+    overrides: [],
+    recoveries: [],
+    finalState: "ready-to-deploy",
+    finalizedAt: null,
+    notifiedAt: null,
+  };
+}
+
+test("latestSummaryForIssue: returns null when runs dir is absent (#261)", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => { const e = new Error("ENOENT") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; },
+    stat: async () => ({ mtime: new Date() }),
+  };
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null, "expected null when runs dir is absent");
+});
+
+test("latestSummaryForIssue: returns null when no run matches the issue prefix (#261)", async () => {
+  const dirs = [{ name: "999-2026-06-20T10-00-00-000Z", isDirectory: () => true }];
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => dirs,
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null, "expected null when no run-id matches the issue prefix");
+});
+
+test("latestSummaryForIssue: returns bundle from the most-recent matching run (#261)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`;
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer
+  const bundle1 = makeSummaryBundle(ISSUE, id1);
+  const bundle2 = makeSummaryBundle(ISSUE, id2);
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "summary.json")) return JSON.stringify(bundle2);
+      if (p === path.join(dir, id1, "summary.json")) return JSON.stringify(bundle1);
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      // id2 is newer
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null, "expected a bundle");
+  assert.equal(result.runId, id2, "expected the most-recent run's bundle");
+});
+
+test("latestSummaryForIssue: skips corrupt summary.json and falls back to older run (#261)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`; // older, but valid
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer, but corrupt
+  const bundle1 = makeSummaryBundle(ISSUE, id1);
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "summary.json")) return "not-valid-json{{{";
+      if (p === path.join(dir, id1, "summary.json")) return JSON.stringify(bundle1);
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null, "expected a bundle from the older valid run");
+  assert.equal(result.runId, id1, "should fall back to the older valid run");
+});
+
+test("latestSummaryForIssue: returns null when all matching summaries are absent or corrupt (#261)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T10-00-00-000Z`;
+
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [{ name: id1, isDirectory: () => true }],
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null, "expected null when all matching summaries are absent");
 });

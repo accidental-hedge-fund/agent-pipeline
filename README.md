@@ -193,6 +193,7 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 /pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
 /pipeline N --status --json                   machine-readable JSON status envelope (stable contract)
 /pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
+/pipeline summary <run-id>                    print the evidence bundle for an exact run (domain-independent)
 /pipeline N --unblock "<answer>"              post answer + clear the blocked label
 $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
@@ -679,9 +680,18 @@ It is a **write-only audit supplement**, not a second state machine: GitHub labe
 Print a human-readable summary of a run at any time — this reads the local file only, so it works offline:
 
 ```bash
+# --summary reads from the run directory first (durable), falls back to the legacy /tmp path
 /pipeline N --summary
 $pipeline N --summary
+
+# exact-run-id form: no domain config required; run directory is located from the repo root
+$pipeline summary <run-id>
+# list available run-ids: pipeline logs
 ```
+
+`pipeline N --summary` resolves the evidence bundle in priority order: (1) `.agent-pipeline/runs/<N>-*/summary.json` from the most-recent matching run directory; (2) the legacy `/tmp/pipeline-<domain>/<N>/evidence.json` path as a fallback. A corrupt or missing `summary.json` in the run directory is treated as absent and the legacy path is tried automatically.
+
+`pipeline summary <run-id>` reads `summary.json` directly from `.agent-pipeline/runs/<run-id>/` — no issue number, no domain config, no fallback to `/tmp`.
 
 Print or follow the terminal output of a run (works after the process exits, or from another terminal while it runs):
 
