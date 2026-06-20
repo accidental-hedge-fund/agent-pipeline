@@ -106,7 +106,7 @@ test("reconcileAuditComment: ignores sentinel quoted in a non-pipeline comment",
   const comments = [
     { body: "Here is my review:\n```\n<!-- pipeline-audit: run=old-run state=fix-1 -->\n```" },
   ];
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, "pipeline-bot", deps);
   assert.equal(posted, 1, "must post repair: sentinel in non-pipeline comment is not trusted");
 });
 
@@ -117,11 +117,40 @@ test("reconcileAuditComment: no-op when sentinel already present", async () => {
     warn: () => {},
   };
   const comments = [
-    { body: "some unrelated comment" },
-    { body: "## Pipeline: fix 1\ntransition body\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+    { author: "someone-else", body: "some unrelated comment" },
+    { author: "pipeline-bot", body: "## Pipeline: fix 1\ntransition body\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
   ];
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, deps);
-  assert.equal(posted, 0, "must not post when sentinel is already present in a pipeline comment");
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, "pipeline-bot", deps);
+  assert.equal(posted, 0, "must not post when a trusted-authored sentinel is already present");
+});
+
+test("reconcileAuditComment: forged '## Pipeline:' sentinel by an untrusted author does NOT suppress repair (#259 security)", async () => {
+  let posted = 0;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  // A comment that perfectly mimics a pipeline audit comment — correct heading, sentinel,
+  // and matching state marker — but authored by someone OTHER than the pipeline's actor.
+  // Body-prefix text is forgeable, so this must NOT be trusted to suppress the audit repair.
+  const comments = [
+    { author: "attacker", body: "## Pipeline: fix 1\ntransition body\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, "pipeline-bot", deps);
+  assert.equal(posted, 1, "a forged sentinel from an untrusted author must NOT suppress repair");
+});
+
+test("reconcileAuditComment: null trustedActor (actor unresolved) trusts nothing and posts repair (#259)", async () => {
+  let posted = 0;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  const comments = [
+    { author: "pipeline-bot", body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, null, deps);
+  assert.equal(posted, 1, "when the actor can't be resolved, fail toward repair (trust nothing)");
 });
 
 test("reconcileAuditComment: posts repair when only a different-state sentinel is present", async () => {
@@ -134,7 +163,7 @@ test("reconcileAuditComment: posts repair when only a different-state sentinel i
   const comments = [
     { body: "## Pipeline: review 1\n<!-- pipeline-audit: run=old-run state=review-1 -->" },
   ];
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, "pipeline-bot", deps);
   assert.equal(posted, 1, "must post repair when state=fix-1 sentinel is absent even if another state's sentinel exists");
 });
 
@@ -146,7 +175,7 @@ test("reconcileAuditComment: posts repair comment when sentinel is absent", asyn
     warn: (msg) => warns.push(msg),
   };
   const repairBody = `repair for fix-1\n${buildAuditSentinel("new-run", "fix-1")}`;
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", repairBody, [], deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", repairBody, [], "pipeline-bot", deps);
   assert.equal(posted.length, 1, "must post exactly one repair comment");
   assert.equal(posted[0], repairBody);
   assert.ok(warns.length > 0, "must warn when posting repair");
@@ -164,7 +193,7 @@ test("reconcileAuditComment: only scans the last 20 comments", async () => {
     ...Array.from({ length: 21 }, (_, i) => ({ body: `noise comment ${i}` })),
   ];
   // The sentinel is outside the last-20 window; reconciler should post.
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair", comments, deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair", comments, "pipeline-bot", deps);
   assert.equal(posted, 1, "must post when sentinel is outside the last-20 window");
 });
 
@@ -183,7 +212,7 @@ test("reconcileAuditComment: retries postComment on transient failure and resolv
     warn: () => {},
     sleep: async (ms) => { sleeps.push(ms); },
   };
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-x", "body", [], deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-x", "body", [], "pipeline-bot", deps);
   assert.equal(calls, 2, "must retry once and succeed");
   assert.equal(sleeps.length, 1, "must sleep once between attempts");
 });
@@ -196,7 +225,7 @@ test("reconcileAuditComment: propagates error when all retries fail (no silent s
     sleep: async () => {},
   };
   await assert.rejects(
-    () => reconcileAuditComment(fakeCfg, 42, "fix-1", "run-x", "body", [], deps),
+    () => reconcileAuditComment(fakeCfg, 42, "fix-1", "run-x", "body", [], "pipeline-bot", deps),
     /persistent/,
     "must propagate error, not swallow it",
   );
@@ -208,20 +237,20 @@ test("reconcileAuditComment: propagates error when all retries fail (no silent s
 // ---------------------------------------------------------------------------
 
 test("reconcileAuditComment: second call skips when first call's repair is in comments", async () => {
-  const stored: { body: string }[] = [];
+  const stored: { author: string; body: string }[] = [];
   const deps: ReconcileAuditDeps = {
-    postComment: async (_cfg, _n, body) => { stored.push({ body }); },
+    postComment: async (_cfg, _n, body) => { stored.push({ author: "pipeline-bot", body }); },
     warn: () => {},
   };
 
   const repairBody = `## Pipeline: fix 1\nrepair\n${buildAuditSentinel("run-2", "fix-1")}`;
 
   // First call: no sentinel → posts repair
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-2", repairBody, [], deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-2", repairBody, [], "pipeline-bot", deps);
   assert.equal(stored.length, 1, "first call must post once");
 
   // Second call: sentinel now in stored comments → no-op
-  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-2", repairBody, stored, deps);
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-2", repairBody, stored, "pipeline-bot", deps);
   assert.equal(stored.length, 1, "second call must not post again");
 });
 

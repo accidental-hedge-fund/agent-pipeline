@@ -33,6 +33,7 @@ import {
   getPrForIssue,
   getPrLinkedIssue,
   ensurePipelineLabels,
+  getGhActor,
   isBlocked,
   pickStage,
   postComment,
@@ -1831,6 +1832,9 @@ async function runAdvance(
 
       // Reconcile audit comments (#259): if a prior run's label write succeeded but its
       // comment post failed, the sentinel is missing. Detect and repair the gap.
+      // Resolve the pipeline's own GitHub actor once so a sentinel is only trusted from a
+      // pipeline-authored comment — body-prefix text alone is forgeable (security review).
+      const auditTrustedActor = opts.dryRun ? null : await getGhActor();
       // Skip stage-sentinel repair for manually-applied entry-point stages ("ready", "backlog")
       // since those are never created by transition() and have no sentinel to repair.
       if (!opts.dryRun && stage !== "ready" && stage !== "backlog") {
@@ -1845,7 +1849,7 @@ async function runAdvance(
           `*Automated by Claude Code Pipeline Skill*`,
         ].join("\n");
         await reconcileAuditComment(
-          cfg, issueNumber, stage, pipelineRunId, repairBody, detail.comments,
+          cfg, issueNumber, stage, pipelineRunId, repairBody, detail.comments, auditTrustedActor,
         );
       }
       // Blocked-sentinel repair runs regardless of stage — an issue can be blocked while at
@@ -1867,7 +1871,7 @@ async function runAdvance(
           `*Automated by Claude Code Pipeline Skill*`,
         ].join("\n");
         await reconcileAuditComment(
-          cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments,
+          cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments, auditTrustedActor,
         );
       }
 

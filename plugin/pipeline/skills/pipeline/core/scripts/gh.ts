@@ -145,19 +145,27 @@ export async function reconcileAuditComment(
   currentState: string,
   runId: string,
   commentBody: string,
-  comments: { body: string }[],
+  comments: { author: string; body: string }[],
+  trustedActor: string | null,
   deps: ReconcileAuditDeps = { postComment, warn: (m) => console.warn(m) },
 ): Promise<void> {
   const marker = ` state=${currentState} -->`;
   const recent = comments.slice(-20);
-  // Only trust sentinels found in pipeline-authored comments (those starting with
-  // "## Pipeline:"). A human quoting or code-reviewing a sentinel must not suppress repair.
-  const found = recent.some(
-    (c) =>
-      c.body.trimStart().startsWith("## Pipeline:") &&
-      c.body.includes("<!-- pipeline-audit:") &&
-      c.body.includes(marker),
-  );
+  // Only trust a sentinel when the comment BOTH looks like a pipeline audit comment
+  // (starts with "## Pipeline:") AND was authored by the pipeline's own GitHub actor.
+  // Body-prefix alone is forgeable: anyone can post "## Pipeline: …<!-- pipeline-audit:
+  // state=X -->" to suppress a real audit-repair. When the actor can't be resolved
+  // (trustedActor null) we trust nothing and post the repair — failing toward an extra
+  // audit comment, never toward suppressing a genuine label-without-audit partial failure.
+  const found =
+    trustedActor != null &&
+    recent.some(
+      (c) =>
+        c.author === trustedActor &&
+        c.body.trimStart().startsWith("## Pipeline:") &&
+        c.body.includes("<!-- pipeline-audit:") &&
+        c.body.includes(marker),
+    );
   if (found) return;
   deps.warn(
     `[pipeline] #${issueNumber}: audit sentinel for state=${currentState} (run=${runId}) missing from recent comments; posting repair`,
