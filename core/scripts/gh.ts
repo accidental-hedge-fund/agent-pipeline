@@ -485,6 +485,50 @@ export async function postComment(
 }
 
 /**
+ * Create a GitHub issue and return its number. Delegates to `ghRun` so it
+ * inherits the default 30 s timeout and three-attempt rate-limit retry.
+ * On a non-zero exit, `ghRun` throws with the `gh` stderr included.
+ *
+ * An optional `run` seam is accepted so unit tests can inject a fake without
+ * making real network calls (same pattern as `getIssueLabelEvents`).
+ */
+export async function createIssue(
+  cfg: PipelineConfig,
+  title: string,
+  body: string,
+  labels: string[],
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<number> {
+  const args = ["issue", "create", "--title", title, "--body", body, "-R", cfg.repo];
+  for (const label of labels) {
+    args.push("--label", label);
+  }
+  const stdout = await run(args);
+  const url = stdout.trim();
+  const m = url.match(/\/(\d+)\/?$/);
+  if (!m) throw new Error(`createIssue: could not parse issue number from gh output: ${url}`);
+  return Number.parseInt(m[1], 10);
+}
+
+/**
+ * Append a comment to an existing GitHub issue. Delegates to `ghRun` so it
+ * inherits the default 30 s timeout and three-attempt rate-limit retry.
+ * On a non-zero exit, `ghRun` throws with the `gh` stderr included.
+ *
+ * An optional `run` seam is accepted so unit tests can inject a fake without
+ * making real network calls (same pattern as `getIssueLabelEvents`).
+ */
+export async function addIssueComment(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  body: string,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<void> {
+  const args = ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo];
+  await run(args);
+}
+
+/**
  * Post a comment on the PULL REQUEST (not the linked issue). The pipeline does all
  * its review bookkeeping on the issue, but a human merges the PR — so findings the
  * pipeline advanced past as advisory can slip the merge button if they live only

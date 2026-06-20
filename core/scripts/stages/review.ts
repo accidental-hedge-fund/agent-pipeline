@@ -10,8 +10,9 @@
 // detection is conservative and defaults to "needs-attention".
 
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import {
+  addIssueComment,
+  createIssue,
   findLatestCommentMatching,
   getGhActor,
   getIssueDetail,
@@ -2108,57 +2109,27 @@ export function reviewCeilingDemotionComment(
 }
 
 /**
- * Default `createIssue` dep for {@link advanceReview}. Uses `gh issue create`
- * in the repo's directory, matching the pattern from intake.ts's real dep.
+ * Default `createIssue` dep for {@link advanceReview}. Delegates to the shared
+ * `createIssue` helper in `gh.ts`, which uses `ghRun` and therefore inherits
+ * the default 30 s timeout and three-attempt rate-limit retry.
  */
 function defaultCreateIssue(
   cfg: PipelineConfig,
 ): (title: string, body: string, labels: string[]) => Promise<number> {
-  return async (title: string, body: string, labels: string[]): Promise<number> => {
-    const args = ["issue", "create", "--title", title, "--body", body, "-R", cfg.repo];
-    for (const label of labels) {
-      args.push("--label", label);
-    }
-    const result = spawnSync("gh", args, {
-      encoding: "utf8",
-      stdio: "pipe",
-      cwd: cfg.repo_dir,
-    });
-    if (result.status !== 0) {
-      throw new Error(
-        `[pipeline review] gh issue create failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-      );
-    }
-    const url = result.stdout.trim();
-    const m = url.match(/\/(\d+)$/);
-    if (!m) {
-      throw new Error(`[pipeline review] could not parse issue number from gh output: ${url}`);
-    }
-    return Number(m[1]);
-  };
+  return (title: string, body: string, labels: string[]) =>
+    createIssue(cfg, title, body, labels);
 }
 
 /**
- * Default `addIssueComment` dep for {@link advanceReview}. Posts a comment on an
- * existing issue via `gh issue comment`. Used to append re-entry findings to the
- * existing follow-up issue (#233 finding 2).
+ * Default `addIssueComment` dep for {@link advanceReview}. Delegates to the
+ * shared `addIssueComment` helper in `gh.ts`, which uses `ghRun` and therefore
+ * inherits the default 30 s timeout and three-attempt rate-limit retry.
  */
 function defaultAddIssueComment(
   cfg: PipelineConfig,
 ): (issueNumber: number, body: string) => Promise<void> {
-  return async (issueNumber: number, body: string): Promise<void> => {
-    const args = ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo];
-    const result = spawnSync("gh", args, {
-      encoding: "utf8",
-      stdio: "pipe",
-      cwd: cfg.repo_dir,
-    });
-    if (result.status !== 0) {
-      throw new Error(
-        `[pipeline review] gh issue comment failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-      );
-    }
-  };
+  return (issueNumber: number, body: string) =>
+    addIssueComment(cfg, issueNumber, body);
 }
 
 // Internal export for tests, so review.test isn't needed.
