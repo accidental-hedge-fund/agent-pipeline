@@ -103,7 +103,7 @@ export async function invoke(
     custom = true;
   }
 
-  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness);
+  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness, { killProcessGroup: true });
   // When a configured reviewer CLI cannot be spawned at all (ENOENT / not
   // executable), surface a specific, actionable message that names the CLI —
   // never a bare "Unknown harness". The `spawn_error` flag is preserved so the
@@ -126,11 +126,14 @@ export async function runCapped(
   timeoutSec: number,
   stream: boolean,
   label: string,
-  opts: { killProcessGroup?: boolean } = {},
+  opts: { killProcessGroup?: boolean; killGraceSec?: number } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
-  return new Promise<HarnessResult>((resolve) => {
+  return new Promise<HarnessResult>((resolvePromise) => {
     const killProcessGroup = opts.killProcessGroup ?? false;
+    // Grace period (seconds) between SIGTERM and SIGKILL on timeout. Configurable
+    // so tests can use a short value without waiting the full 5 s default.
+    const killGraceSec = opts.killGraceSec ?? 5;
     const child = spawn(cmd, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -140,6 +143,18 @@ export async function runCapped(
     let stdoutBuf = "";
     let stderrBuf = "";
     let timedOut = false;
+    let lastExitCode: number | null = null;
+    let settled = false;
+
+    const settle = (result: HarnessResult) => {
+      if (settled) return;
+      settled = true;
+      if (killProcessGroup) {
+        process.removeListener("SIGINT", sigintHandler);
+        process.removeListener("SIGTERM", sigtermHandler);
+      }
+      resolvePromise(result);
+    };
 
     const killGroup = (signal: NodeJS.Signals) => {
       if (killProcessGroup && child.pid != null) {
@@ -157,11 +172,43 @@ export async function runCapped(
       }
     };
 
+    // Forward parent cancellation signals to the detached process group so harness
+    // descendants are not left running when the pipeline process is cancelled.
+    const onParentSignal = (sig: NodeJS.Signals) => {
+      killGroup(sig);
+      process.removeListener("SIGINT", sigintHandler);
+      process.removeListener("SIGTERM", sigtermHandler);
+      // Re-raise so the parent process terminates with normal signal semantics.
+      process.kill(process.pid, sig);
+    };
+    const sigintHandler = () => onParentSignal("SIGINT");
+    const sigtermHandler = () => onParentSignal("SIGTERM");
+
+    if (killProcessGroup) {
+      process.on("SIGINT", sigintHandler);
+      process.on("SIGTERM", sigtermHandler);
+    }
+
     const timer = setTimeout(() => {
       timedOut = true;
       killGroup("SIGTERM");
-      // Hard kill the process group if still alive after 5s.
-      setTimeout(() => killGroup("SIGKILL"), 5000);
+      // After the grace period, force-kill any remaining group members and only then
+      // resolve — so all descendants are absent from the OS process table before
+      // runCapped returns, even if a grandchild ignored SIGTERM.
+      setTimeout(() => {
+        killGroup("SIGKILL");
+        setTimeout(() => {
+          const duration = (Date.now() - start) / 1000;
+          settle({
+            success: false,
+            stdout: stdoutBuf,
+            stderr: stderrBuf,
+            exit_code: lastExitCode ?? -1,
+            duration,
+            timed_out: true,
+          });
+        }, 200);
+      }, killGraceSec * 1000);
     }, timeoutSec * 1000);
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -184,7 +231,7 @@ export async function runCapped(
     child.on("error", (err) => {
       clearTimeout(timer);
       const duration = (Date.now() - start) / 1000;
-      resolve({
+      settle({
         success: false,
         stdout: stdoutBuf,
         stderr: `[harness ${label}] spawn error: ${err.message}\n${stderrBuf}`,
@@ -196,15 +243,19 @@ export async function runCapped(
     });
 
     child.on("close", (code) => {
+      lastExitCode = code;
+      // When timed out, the direct child exiting is not sufficient — grandchildren
+      // that ignored SIGTERM may still be alive. Defer to the SIGKILL timer above.
+      if (timedOut) return;
       clearTimeout(timer);
       const duration = (Date.now() - start) / 1000;
-      resolve({
-        success: code === 0 && !timedOut,
+      settle({
+        success: code === 0,
         stdout: stdoutBuf,
         stderr: stderrBuf,
         exit_code: code ?? -1,
         duration,
-        timed_out: timedOut,
+        timed_out: false,
       });
     });
   });

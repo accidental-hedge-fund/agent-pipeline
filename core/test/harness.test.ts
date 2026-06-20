@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { invoke, formatStderrExcerpt } from "../scripts/harness.ts";
+import { invoke, runCapped, formatStderrExcerpt } from "../scripts/harness.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
 
@@ -224,4 +224,100 @@ test("formatStderrExcerpt: stderr at exactly max is not truncated", () => {
   const exact = "y".repeat(500);
   const out = formatStderrExcerpt(exact, 500);
   assert.ok(!out.includes("…(truncated)"), "no truncation marker when length equals max");
+});
+
+// ---------------------------------------------------------------------------
+// descendant-cleanup (#260) — grandchild process is killed when harness times out
+//
+// runCapped with killProcessGroup:true must kill the entire process group on
+// timeout, including grandchild processes spawned by the direct child.
+// ---------------------------------------------------------------------------
+
+test("runCapped: grandchild process is killed when harness times out (#260)", async () => {
+  // Write the grandchild PID to a temp file (not stdout) to avoid pipe-buffering
+  // races when the process is killed near the moment it finishes writing.
+  const pidFile = path.join(tmpRoot, `grandchild-pid-${Date.now()}.txt`);
+  const cli = makeScript(
+    "spawn-grandchild",
+    // Fork a grandchild sleeping well past the timeout, record its PID to a file,
+    // then block in wait so the parent (bash) stays alive until the timeout kills it.
+    `sleep 9999 &\necho "$!" > "${pidFile}"\nwait`,
+  );
+  // 2 s timeout. killGraceSec:0.5 keeps total resolution time ~2.7 s instead of 7 s.
+  const result = await runCapped(cli, [], tmpRoot, 2, false, "test", { killProcessGroup: true, killGraceSec: 0.5 });
+
+  assert.equal(result.timed_out, true, "result.timed_out must be true after timeout fires");
+
+  // Read the PID from the file written before the timeout fired.
+  assert.ok(fs.existsSync(pidFile), `PID file must exist at ${pidFile} — script did not write it before timeout`);
+  const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  assert.ok(Number.isFinite(grandchildPid) && grandchildPid > 0, `grandchild PID must be a positive integer, got: ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`);
+
+  // runCapped now resolves only after the SIGKILL grace has completed, so
+  // descendants are guaranteed absent without an additional wait.
+  assert.throws(
+    () => process.kill(grandchildPid, 0),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+    "grandchild must be absent from the OS process table after process-group kill",
+  );
+});
+
+test("invoke(): a timed-out harness kills its grandchild — proves invoke() threads killProcessGroup into runCapped (#260)", async () => {
+  // Bites the ACTUAL bug: invoke() must pass killProcessGroup into runCapped so a
+  // detached process group is created and the whole descendant tree is killed on
+  // timeout. The runCapped-direct test above passes killProcessGroup itself, so it
+  // cannot catch a regression where invoke() stops threading the option. This goes
+  // through invoke() with the custom-harness path (any non claude/codex name), so no
+  // real model CLI is spawned. If invoke() dropped the option the detached group would
+  // not be created, the grandchild would be orphaned, and the ESRCH assertion below
+  // would fail.
+  const pidFile = path.join(tmpRoot, `invoke-grandchild-pid-${Date.now()}.txt`);
+  const cli = makeScript(
+    "invoke-spawn-grandchild",
+    `sleep 9999 &\necho "$!" > "${pidFile}"\nwait`,
+  );
+  const result = await invoke(cli, tmpRoot, "prompt", { stream: false, timeoutSec: 1 });
+
+  assert.equal(result.timed_out, true, "invoke() must report timed_out after the 1 s timeout fires");
+  assert.ok(fs.existsSync(pidFile), "fake CLI must have recorded its grandchild PID before the timeout");
+  const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  assert.ok(
+    Number.isFinite(grandchildPid) && grandchildPid > 0,
+    `grandchild PID must be a positive integer, got ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`,
+  );
+  assert.throws(
+    () => process.kill(grandchildPid, 0),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+    "invoke() timeout must kill the whole process group — the grandchild must be gone",
+  );
+});
+
+test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace period (#260)", async () => {
+  // Regression for the scenario where the direct child exits on SIGTERM while a
+  // grandchild with 'trap '' TERM' survives — runCapped must not resolve until after
+  // SIGKILL completes, even though 'close' fires early.
+  const pidFile = path.join(tmpRoot, `sigterm-immune-grandchild-${Date.now()}.txt`);
+  const cli = makeScript(
+    "spawn-sigterm-immune",
+    // The subshell sets SIG_IGN for TERM; 'sleep 9999' inside it inherits the
+    // disposition and cannot be killed by SIGTERM. The outer bash is not protected
+    // and dies on SIGTERM, firing 'close' on the direct child — but the subshell
+    // and its sleep stay alive until SIGKILL.
+    `(trap '' TERM; sleep 9999) &\necho "$!" > "${pidFile}"\nsleep 9999`,
+  );
+  // killGraceSec:0.5 keeps total resolution time ~1.7 s (1 s timeout + 0.5 s grace + 0.2 s reap).
+  const result = await runCapped(cli, [], tmpRoot, 1, false, "test", { killProcessGroup: true, killGraceSec: 0.5 });
+
+  assert.equal(result.timed_out, true, "result.timed_out must be true");
+
+  assert.ok(fs.existsSync(pidFile), `PID file must exist at ${pidFile}`);
+  const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  assert.ok(Number.isFinite(grandchildPid) && grandchildPid > 0, `grandchild PID must be a positive integer, got: ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`);
+
+  // runCapped resolves only after SIGKILL + reap window — no extra wait needed.
+  assert.throws(
+    () => process.kill(grandchildPid, 0),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+    "SIGTERM-ignoring grandchild must be dead after SIGKILL grace period",
+  );
 });
