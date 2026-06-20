@@ -1349,7 +1349,7 @@ export async function runSummary(
   const stateDir = runStateDir(cfg.domain);
 
   // Priority 1: run-directory summary.json (durable, survives reboots).
-  const runDirBundle = await deps.latestSummaryForIssue(repoDir, issueNumber);
+  const runDirBundle = await deps.latestSummaryForIssue(repoDir, issueNumber).catch(() => null);
 
   // Priority 2: legacy /tmp evidence.json. Catch any error (corrupt JSON, etc.)
   // and treat it as absent — the error message below names both locations.

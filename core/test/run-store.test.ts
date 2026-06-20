@@ -853,3 +853,36 @@ test("isValidSummaryBundle: returns false when reviews is missing (#261)", () =>
   void reviews;
   assert.equal(isValidSummaryBundle(rest), false);
 });
+
+// Regression tests for nested record validation (review-2 finding: stages:[{}] crashes formatSummary)
+test("isValidSummaryBundle: returns false for stage entry missing required fields (#261)", () => {
+  // {} passes the top-level array check but formatSummary crashes on s.commands iteration
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{}] };
+  assert.equal(isValidSummaryBundle(b), false, "stage missing stage+commands should be rejected");
+});
+
+test("isValidSummaryBundle: returns false for stage entry with stage but missing commands (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning" }] };
+  assert.equal(isValidSummaryBundle(b), false, "stage missing commands array should be rejected");
+});
+
+test("isValidSummaryBundle: returns true for stage entry with required fields present (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning", outcome: null, commands: [], enteredAt: null, exitedAt: null, commits: [], prompts: [] }] };
+  assert.equal(isValidSummaryBundle(b), true, "stage with required fields should be accepted");
+});
+
+test("isValidSummaryBundle: returns false for review entry missing required fields (#261)", () => {
+  // {} passes the top-level array check but formatSummary crashes on r.findingCounts / r.sha
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{}] };
+  assert.equal(isValidSummaryBundle(b), false, "review missing sha/verdict/round/findingCounts should be rejected");
+});
+
+test("isValidSummaryBundle: returns false for review entry missing sha (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{ round: 1, verdict: "approved", findingCounts: {} }] };
+  assert.equal(isValidSummaryBundle(b), false, "review missing sha should be rejected");
+});
+
+test("isValidSummaryBundle: returns true for review entry with required fields present (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{ round: 1, sha: "abc1234", verdict: "approved", findingCounts: {} }] };
+  assert.equal(isValidSummaryBundle(b), true, "review with required fields should be accepted");
+});

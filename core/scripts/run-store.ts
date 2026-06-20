@@ -438,18 +438,38 @@ export async function listRunIds(
 // ---------------------------------------------------------------------------
 
 /** Minimal runtime check for the EvidenceBundle shape required by formatSummary.
- *  Returns false if the value is not an object or any required array field is absent.
- *  Used to treat missing-required-fields summaries as absent (spec §261). */
+ *  Returns false if the value is not an object, any required array field is absent,
+ *  or any nested stage/review entry is missing the fields that formatSummary accesses
+ *  directly (stage.stage, stage.commands, review.sha, review.verdict, review.round,
+ *  review.findingCounts).  Used to treat missing-required-fields summaries as absent
+ *  for fallback purposes (spec §261). */
 export function isValidSummaryBundle(parsed: unknown): parsed is EvidenceBundle {
   if (!parsed || typeof parsed !== "object") return false;
   const b = parsed as Record<string, unknown>;
-  return (
-    Array.isArray(b.harnesses) &&
-    Array.isArray(b.stages) &&
-    Array.isArray(b.reviews) &&
-    Array.isArray(b.overrides) &&
-    Array.isArray(b.recoveries)
-  );
+  if (
+    !Array.isArray(b.harnesses) ||
+    !Array.isArray(b.stages) ||
+    !Array.isArray(b.reviews) ||
+    !Array.isArray(b.overrides) ||
+    !Array.isArray(b.recoveries)
+  ) return false;
+  for (const s of b.stages as unknown[]) {
+    if (!s || typeof s !== "object") return false;
+    const sr = s as Record<string, unknown>;
+    if (typeof sr.stage !== "string" || !Array.isArray(sr.commands)) return false;
+  }
+  for (const r of b.reviews as unknown[]) {
+    if (!r || typeof r !== "object") return false;
+    const rr = r as Record<string, unknown>;
+    if (
+      typeof rr.sha !== "string" ||
+      typeof rr.verdict !== "string" ||
+      typeof rr.round !== "number" ||
+      !rr.findingCounts ||
+      typeof rr.findingCounts !== "object"
+    ) return false;
+  }
+  return true;
 }
 
 /** Return the EvidenceBundle from the most-recent `summary.json` for the given

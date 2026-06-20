@@ -297,3 +297,39 @@ test("runSummaryByRunId: exits non-zero with clear error for summary.json with m
   assert.ok(combined.includes("missing required fields"), `error should mention missing fields; got:\n${combined}`);
   assert.ok(combined.includes(RUN_ID), `error should name the run-id; got:\n${combined}`);
 });
+
+test("runSummaryByRunId: exits non-zero for summary.json with malformed nested stage (stages:[{}]) (#261)", async () => {
+  // Regression: stages:[{}] passes the old top-level array check but crashes printSummary on s.commands.
+  const malformed = JSON.stringify({ harnesses: [], stages: [{}], reviews: [], overrides: [], recoveries: [] });
+  const deps: RunSummaryDeps = {
+    latestSummaryForIssue: async () => { throw new Error("should not be called"); },
+    readBundle: async () => { throw new Error("should not be called"); },
+    readFile: async (_p) => malformed,
+  };
+
+  const { errors, exitCode } = await withCapture(() => runSummaryByRunId(REPO_DIR, RUN_ID, deps));
+
+  assert.equal(exitCode, 1, `expected exitCode 1; got ${String(exitCode)}`);
+  assert.ok(errors.some((e) => e.includes("missing required fields")), `expected "missing required fields" error; got:\n${errors.join("\n")}`);
+});
+
+test("runSummary: falls back to legacy when latestSummaryForIssue throws unexpectedly (#261)", async () => {
+  // Regression: without .catch(), an unexpected throw from the run-dir lookup crashes runSummary.
+  const legacyBundle = makeBundle({ runId: "legacy-after-throw" });
+  const deps: RunSummaryDeps = {
+    latestSummaryForIssue: async () => { throw new Error("unexpected scan error"); },
+    readBundle: async () => legacyBundle,
+    readFile: async (_p) => { throw new Error("should not be called"); },
+  };
+
+  const printed: string[] = [];
+  const origLog = console.log.bind(console);
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(" ")); };
+  try {
+    await runSummary(cfg, ISSUE, REPO_DIR, deps);
+  } finally {
+    console.log = origLog;
+  }
+
+  assert.ok(printed.some((l) => l.includes("legacy-after-throw")), `expected legacy bundle in output after throw; got:\n${printed.join("\n")}`);
+});
