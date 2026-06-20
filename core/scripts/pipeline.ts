@@ -60,6 +60,7 @@ import {
   RUN_SCHEMA_VERSION,
   appendEvent,
   defaultRunStoreDeps,
+  emitGhMetrics,
   finalizeRun,
   initRunDir,
   listRunIds,
@@ -2121,10 +2122,16 @@ async function runAdvance(
           // Run-store finalization (#155): write summary.json + run_complete event before
           // notifyBundlePath so that finalizeRun does not overwrite the notifiedAt stamp
           // that markNotified writes to evidence.json (finding #5).
+          // Metrics are NOT passed here — gh_metrics_summary is emitted after notification
+          // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
-            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps, ghCollector.summary()).catch(() => {});
+            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
           }
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
+          // Emit gh_metrics_summary after notification so all run-scoped gh calls are captured (#257).
+          if (runDir) {
+            await emitGhMetrics(runDir, ghCollector.summary(), runStoreDeps).catch(() => {});
+          }
         } catch {
           /* audit-only — ignore */
         }

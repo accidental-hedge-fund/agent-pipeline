@@ -19,6 +19,7 @@ import {
   type RunStoreDeps,
 } from "../scripts/run-store.ts";
 import type { EvidenceBundle } from "../scripts/types.ts";
+import { GhMetricsCollector } from "../scripts/gh.ts";
 import type { GhMetricsSummary } from "../scripts/gh.ts";
 
 const REPO_DIR = "/tmp/test-repo";
@@ -615,4 +616,34 @@ test("finalizeRun: no gh_metrics_summary event when ghMetrics is omitted", async
   const lines = readFile(EVENTS_JSONL).split("\n").filter(Boolean);
   const types = lines.map((l) => JSON.parse(l).type);
   assert.ok(!types.includes("gh_metrics_summary"), "gh_metrics_summary must not appear when ghMetrics is omitted");
+});
+
+// Regression test for finding #1 in review-1 (#257): notification gh calls must be
+// included in gh_metrics_summary. The fix emits metrics after notifyBundlePath so that
+// getPrForIssue / postPrComment calls are captured in the collector before summary().
+test("emitGhMetrics after finalizeRun: notification calls included in emitted summary", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  // Simulate the fixed dispatch ordering: finalizeRun (no metrics) → notification → emitGhMetrics
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  // Simulate notification gh calls recorded by the active collector after finalizeRun
+  const collector = new GhMetricsCollector();
+  collector.record("pr view", 50); // simulates getPrForIssue
+  collector.record("pr comment", 80); // simulates postPrComment
+
+  await emitGhMetrics(RUN_DIR, collector.summary(), deps);
+
+  const lines = readFile(EVENTS_JSONL).split("\n").filter(Boolean);
+  const events = lines.map((l) => JSON.parse(l));
+  const completeIdx = events.findIndex((e: { type: string }) => e.type === "run_complete");
+  const metricsIdx = events.findIndex((e: { type: string }) => e.type === "gh_metrics_summary");
+
+  assert.ok(completeIdx >= 0, "run_complete must appear in events.jsonl");
+  assert.ok(metricsIdx >= 0, "gh_metrics_summary must appear in events.jsonl");
+  assert.ok(metricsIdx > completeIdx, "gh_metrics_summary must appear after run_complete (notification calls captured)");
+
+  const metricsEvent = events[metricsIdx];
+  assert.equal(metricsEvent.call_count, 2, "summary must reflect both notification gh calls");
 });

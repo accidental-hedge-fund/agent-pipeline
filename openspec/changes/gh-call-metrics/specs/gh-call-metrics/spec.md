@@ -42,7 +42,7 @@ The pipeline engine SHALL maintain one `GhMetricsCollector` instance per dispatc
 ---
 
 ### Requirement: gh_metrics_summary event is appended to events.jsonl at run completion
-At the end of every pipeline dispatch cycle, the engine SHALL append a `gh_metrics_summary` event to `events.jsonl` immediately before or as part of the `run_complete` event sequence. The event SHALL carry: `schema_version`, `type: "gh_metrics_summary"`, `at` (ISO 8601 UTC timestamp), `call_count` (integer), `total_ms` (integer), `p50_ms` (integer), `p95_ms` (integer), and `slowest_calls` (array of up to 5 `{ category: string; elapsed_ms: number }` objects). The write SHALL be non-fatal: any I/O error SHALL be caught, logged as a warning, and SHALL NOT affect the pipeline outcome.
+At the end of every pipeline dispatch cycle, the engine SHALL append a `gh_metrics_summary` event to `events.jsonl` after all run-scoped `gh` calls complete, including any notification calls (e.g. `getPrForIssue`, `postPrComment`). The event SHALL be appended after the `run_complete` event so that notification gh calls are reflected in the count. The event SHALL carry: `schema_version`, `type: "gh_metrics_summary"`, `at` (ISO 8601 UTC timestamp), `call_count` (integer), `total_ms` (integer), `p50_ms` (integer), `p95_ms` (integer), and `slowest_calls` (array of up to 5 `{ category: string; elapsed_ms: number }` objects). The write SHALL be non-fatal: any I/O error SHALL be caught, logged as a warning, and SHALL NOT affect the pipeline outcome.
 
 #### Scenario: metrics summary event appears in events.jsonl after a run
 - **WHEN** a pipeline dispatch cycle completes normally
