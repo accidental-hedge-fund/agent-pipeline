@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { EvidenceBundle, ReviewFindingRecord } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
+import type { GhMetricsSummary } from "./gh.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -105,6 +106,14 @@ export interface BlockerSetEvent extends RunEventBase {
 export interface BlockerClearedEvent extends RunEventBase {
   type: "blocker_cleared";
 }
+export interface GhMetricsSummaryEvent extends RunEventBase {
+  type: "gh_metrics_summary";
+  call_count: number;
+  total_ms: number;
+  p50_ms: number;
+  p95_ms: number;
+  slowest_calls: { category: string; elapsed_ms: number }[];
+}
 
 export type RunEvent =
   | RunStartEvent
@@ -117,7 +126,8 @@ export type RunEvent =
   | WorktreeRemovedEvent
   | ReviewVerdictEvent
   | BlockerSetEvent
-  | BlockerClearedEvent;
+  | BlockerClearedEvent
+  | GhMetricsSummaryEvent;
 
 // ---------------------------------------------------------------------------
 // Deps — injectable I/O seam; unit tests inject in-memory fakes
@@ -290,10 +300,39 @@ export async function readEvents(
 }
 
 // ---------------------------------------------------------------------------
+// emitGhMetrics
+// ---------------------------------------------------------------------------
+
+/** Append a gh_metrics_summary event to events.jsonl. Non-fatal on I/O error. */
+export async function emitGhMetrics(
+  runDir: string,
+  summary: GhMetricsSummary,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  const event: GhMetricsSummaryEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "gh_metrics_summary",
+    at: nowIso(),
+    call_count: summary.call_count,
+    total_ms: summary.total_ms,
+    p50_ms: summary.p50_ms,
+    p95_ms: summary.p95_ms,
+    slowest_calls: summary.slowest_calls,
+  };
+  try {
+    await appendEvent(runDir, event, deps);
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: emitGhMetrics failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // finalizeRun
 // ---------------------------------------------------------------------------
 
-/** Finalize the run: append run_complete, write summary.json, write legacy evidence.json.
+/** Finalize the run: append gh_metrics_summary + run_complete, write summary.json, write legacy evidence.json.
  *  summary.json and legacy write are atomic (tmp + rename). Legacy write failure is non-fatal. */
 export async function finalizeRun(
   runDir: string,
@@ -302,10 +341,16 @@ export async function finalizeRun(
   issue: number,
   startedAt: string,
   deps: RunStoreDeps = defaultRunStoreDeps,
+  ghMetrics?: GhMetricsSummary,
 ): Promise<void> {
   const now = nowIso();
   const startMs = Date.parse(startedAt);
   const elapsedMs = Number.isFinite(startMs) ? Date.parse(now) - startMs : 0;
+
+  // Append gh_metrics_summary before run_complete (#257)
+  if (ghMetrics) {
+    await emitGhMetrics(runDir, ghMetrics, deps);
+  }
 
   // Append run_complete before writing summary.json
   const completeEvent: RunCompleteEvent = {

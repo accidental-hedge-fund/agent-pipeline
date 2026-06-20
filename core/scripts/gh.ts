@@ -24,6 +24,67 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+// ---------------------------------------------------------------------------
+// GhMetricsCollector — per-run gh call instrumentation (#257)
+// ---------------------------------------------------------------------------
+
+export interface GhMetricsSummary {
+  call_count: number;
+  total_ms: number;
+  p50_ms: number;
+  p95_ms: number;
+  slowest_calls: { category: string; elapsed_ms: number }[];
+}
+
+/** Interpolated percentile over a sorted sample (linear interpolation). Returns 0 for empty. */
+function computePercentile(sorted: number[], p: number): number {
+  const n = sorted.length;
+  if (n === 0) return 0;
+  if (n === 1) return sorted[0];
+  const position = (p / 100) * (n - 1);
+  const lower = Math.floor(position);
+  const upper = Math.min(lower + 1, n - 1);
+  const fraction = position - lower;
+  return sorted[lower] + fraction * (sorted[upper] - sorted[lower]);
+}
+
+export class GhMetricsCollector {
+  private times: number[] = [];
+  private _slowest: { category: string; elapsed_ms: number }[] = [];
+
+  record(category: string, elapsedMs: number): void {
+    this.times.push(elapsedMs);
+    this._slowest.push({ category, elapsed_ms: elapsedMs });
+    this._slowest.sort((a, b) => b.elapsed_ms - a.elapsed_ms);
+    if (this._slowest.length > 5) this._slowest.length = 5;
+  }
+
+  summary(): GhMetricsSummary {
+    const n = this.times.length;
+    if (n === 0) {
+      return { call_count: 0, total_ms: 0, p50_ms: 0, p95_ms: 0, slowest_calls: [] };
+    }
+    const total_ms = this.times.reduce((a, b) => a + b, 0);
+    const sorted = [...this.times].sort((a, b) => a - b);
+    return {
+      call_count: n,
+      total_ms,
+      p50_ms: Math.floor(computePercentile(sorted, 50)),
+      p95_ms: Math.floor(computePercentile(sorted, 95)),
+      slowest_calls: [...this._slowest],
+    };
+  }
+}
+
+/** Module-level active collector — set by pipeline.ts at run start, cleared at run end.
+ *  Avoids threading a collector parameter through every gh wrapper function signature. */
+let _activeCollector: GhMetricsCollector | undefined;
+
+/** Set the active metrics collector for the current dispatch cycle. Pass undefined to clear. */
+export function setGhCollector(collector: GhMetricsCollector | undefined): void {
+  _activeCollector = collector;
+}
+
 // Stage priority for picking the "furthest along" pipeline label when multiple
 // are applied. Higher priority = further along, so the forward index in
 // STAGES IS the priority directly.
@@ -42,20 +103,27 @@ interface GhRunOptions {
   timeoutMs?: number;
   /** Number of retries on rate-limit errors. Default 3. */
   retries?: number;
+  /** Metrics collector for the current run. Falls back to module-level active collector. */
+  collector?: GhMetricsCollector;
 }
 
 async function ghRun(args: string[], opts: GhRunOptions = {}): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const retries = opts.retries ?? 3;
+  const collector = opts.collector ?? _activeCollector;
+  const category = args.slice(0, 2).join(" ");
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < retries; attempt++) {
+    const t0 = performance.now();
     try {
       const { stdout } = await execFileAsync("gh", args, {
         timeout: timeoutMs,
         maxBuffer: 50 * 1024 * 1024, // 50 MB
       });
+      collector?.record(category, Math.round(performance.now() - t0));
       return stdout;
     } catch (err) {
+      collector?.record(category, Math.round(performance.now() - t0));
       const e = err as { stderr?: string; message: string; code?: number };
       const stderr = (e.stderr ?? "").toString();
       lastErr = new Error(

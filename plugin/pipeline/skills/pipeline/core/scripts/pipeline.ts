@@ -23,6 +23,7 @@ import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
+  GhMetricsCollector,
   addLabel,
   clearBlocked,
   getIssueDetail,
@@ -35,6 +36,7 @@ import {
   pickStage,
   postComment,
   postPrComment,
+  setGhCollector,
   silentTransition,
   transition,
 } from "./gh.ts";
@@ -58,6 +60,7 @@ import {
   RUN_SCHEMA_VERSION,
   appendEvent,
   defaultRunStoreDeps,
+  emitGhMetrics,
   finalizeRun,
   initRunDir,
   listRunIds,
@@ -874,10 +877,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!opts.dryRun) {
-    await ensurePipelineLabels(cfg);
-  }
-
   await runAdvance(cfg, issueNumber, opts);
 }
 
@@ -1493,7 +1492,6 @@ export async function handleRunSubcommand(
     return;
   }
 
-  if (!opts.dryRun) await ensurePipelineLabels(cfg);
   await runAdvance(cfg, number, opts);
 }
 
@@ -1695,6 +1693,13 @@ async function runAdvance(
   await withLock(
     cfg.domain,
     async () => {
+    // Instantiate a metrics collector for this dispatch cycle (#257).
+    const ghCollector = new GhMetricsCollector();
+    setGhCollector(ghCollector);
+    // Ensure pipeline labels exist inside the collector scope so label-list/create
+    // calls are captured in the run's gh_metrics_summary (#257 finding 1).
+    if (!opts.dryRun) await ensurePipelineLabels(cfg);
+    try {
     const startDetail = await getIssueDetail(cfg, issueNumber);
     if (startDetail.state === "closed") {
       console.error(`#${issueNumber} is closed; nothing to advance.`);
@@ -2115,12 +2120,19 @@ async function runAdvance(
           // Run-store finalization (#155): write summary.json + run_complete event before
           // notifyBundlePath so that finalizeRun does not overwrite the notifiedAt stamp
           // that markNotified writes to evidence.json (finding #5).
+          // Metrics are NOT passed here — gh_metrics_summary is emitted after notification
+          // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
             await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
           }
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
         } catch {
           /* audit-only — ignore */
+        }
+        // Emit gh_metrics_summary unconditionally after the notification attempt so
+        // a notification failure does not suppress the summary (#257 finding 2).
+        if (runDir) {
+          await emitGhMetrics(runDir, ghCollector.summary(), runStoreDeps).catch(() => {});
         }
       }
     }
@@ -2136,6 +2148,10 @@ async function runAdvance(
       if (terminalTee) {
         await terminalTee.stop().catch(() => {});
       }
+    }
+    } finally {
+      // Clear the module-level collector when this dispatch cycle ends (#257).
+      setGhCollector(undefined);
     }
     },
     issueNumber,
