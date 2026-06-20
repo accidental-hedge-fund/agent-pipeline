@@ -85,6 +85,94 @@ export function setGhCollector(collector: GhMetricsCollector | undefined): void 
   _activeCollector = collector;
 }
 
+/** Module-level active run ID — set by pipeline.ts at run start, cleared at run end.
+ *  Used by transition() and setBlocked() to embed idempotency sentinels without
+ *  threading a runId parameter through every call site. */
+let _activeRunId: string | undefined;
+
+/** Set the active run ID for the current dispatch cycle. Pass undefined to clear. */
+export function setGhRunId(id: string | undefined): void {
+  _activeRunId = id;
+}
+
+// ---------------------------------------------------------------------------
+// Idempotent audit helpers (#259)
+// ---------------------------------------------------------------------------
+
+/** Build the HTML audit sentinel embedded in transition and blocker comments.
+ *  The sentinel is invisible in rendered Markdown and anchors idempotency checks. */
+export function buildAuditSentinel(runId: string, state: string): string {
+  return `<!-- pipeline-audit: run=${runId} state=${state} -->`;
+}
+
+/** Retry a comment-post thunk up to `attempts` times with exponential backoff
+ *  (1 s base, doubling per attempt). Re-throws the last error after exhaustion.
+ *  `sleep` is injectable so unit tests skip the real delay. */
+export async function retryComment(
+  thunk: () => Promise<void>,
+  attempts = 3,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<void> {
+  let lastErr: Error | null = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await thunk();
+      return;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (i < attempts - 1) {
+        await sleep(2 ** i * 1000);
+      }
+    }
+  }
+  throw lastErr ?? new Error("retryComment: unknown failure");
+}
+
+/** I/O seam for {@link reconcileAuditComment} so unit tests inject fakes — no real network. */
+export interface ReconcileAuditDeps {
+  postComment: (cfg: PipelineConfig, n: number, body: string) => Promise<void>;
+  warn: (msg: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Scan the most-recent `comments` (up to 20) for an HTML audit sentinel whose
+ *  `state` attribute matches `currentState`. If found, returns immediately (no-op).
+ *  If not found, posts `commentBody` as a repair comment (with up to 3 retries) and
+ *  logs a warning via `deps.warn`. Re-throws on exhaustion so the caller can surface the failure. */
+export async function reconcileAuditComment(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  currentState: string,
+  runId: string,
+  commentBody: string,
+  comments: { author: string; body: string }[],
+  trustedActor: string | null,
+  deps: ReconcileAuditDeps = { postComment, warn: (m) => console.warn(m) },
+): Promise<void> {
+  const marker = ` state=${currentState} -->`;
+  const recent = comments.slice(-20);
+  // Only trust a sentinel when the comment BOTH looks like a pipeline audit comment
+  // (starts with "## Pipeline:") AND was authored by the pipeline's own GitHub actor.
+  // Body-prefix alone is forgeable: anyone can post "## Pipeline: …<!-- pipeline-audit:
+  // state=X -->" to suppress a real audit-repair. When the actor can't be resolved
+  // (trustedActor null) we trust nothing and post the repair — failing toward an extra
+  // audit comment, never toward suppressing a genuine label-without-audit partial failure.
+  const found =
+    trustedActor != null &&
+    recent.some(
+      (c) =>
+        c.author === trustedActor &&
+        c.body.trimStart().startsWith("## Pipeline:") &&
+        c.body.includes("<!-- pipeline-audit:") &&
+        c.body.includes(marker),
+    );
+  if (found) return;
+  deps.warn(
+    `[pipeline] #${issueNumber}: audit sentinel for state=${currentState} (run=${runId}) missing from recent comments; posting repair`,
+  );
+  await retryComment(() => deps.postComment(cfg, issueNumber, commentBody), 3, deps.sleep);
+}
+
 // Stage priority for picking the "furthest along" pipeline label when multiple
 // are applied. Higher priority = further along, so the forward index in
 // STAGES IS the priority directly.
@@ -618,18 +706,40 @@ export async function postPrComment(
   ]);
 }
 
+/** I/O seam for {@link transition} so unit tests inject fakes — no real network. */
+export interface TransitionDeps {
+  getIssueDetail?: (cfg: PipelineConfig, n: number) => Promise<{ labels: string[] }>;
+  editLabels?: (cfg: PipelineConfig, n: number, from: string, to: string) => Promise<void>;
+  postComment?: (cfg: PipelineConfig, n: number, body: string) => Promise<void>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
 export async function transition(
   cfg: PipelineConfig,
   issueNumber: number,
   fromStage: Stage,
   toStage: Stage,
   summary: string,
+  deps: TransitionDeps = {},
 ): Promise<void> {
+  const _getIssueDetail = deps.getIssueDetail ?? getIssueDetail;
+  const _editLabels = deps.editLabels ?? (async (c, n, from, to) => {
+    await ghRun([
+      "issue", "edit", String(n),
+      "--remove-label", `${LABEL_PREFIX}${from}`,
+      "--add-label", `${LABEL_PREFIX}${to}`,
+      "-R", c.repo,
+    ]);
+  });
+  const _postComment = deps.postComment ?? postComment;
+  const _sleep = deps.sleep;
+
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const harness = getHarnessLabel(
-    (await getIssueDetail(cfg, issueNumber)).labels,
+    (await _getIssueDetail(cfg, issueNumber)).labels,
   ) ?? "unassigned";
 
+  const effectiveRunId = _activeRunId ?? "unknown";
   const lines = [
     `## Pipeline: ${toStage.replace(/-/g, " ")}`,
     "",
@@ -640,20 +750,10 @@ export async function transition(
   if (summary) {
     lines.push("", "### Summary", summary);
   }
-  const comment = lines.join("\n") + COMMENT_FOOTER;
+  const comment = lines.join("\n") + COMMENT_FOOTER + "\n" + buildAuditSentinel(effectiveRunId, toStage);
 
-  await ghRun([
-    "issue",
-    "edit",
-    String(issueNumber),
-    "--remove-label",
-    `${LABEL_PREFIX}${fromStage}`,
-    "--add-label",
-    `${LABEL_PREFIX}${toStage}`,
-    "-R",
-    cfg.repo,
-  ]);
-  await postComment(cfg, issueNumber, comment);
+  await _editLabels(cfg, issueNumber, fromStage, toStage);
+  await retryComment(() => _postComment(cfg, issueNumber, comment), 3, _sleep);
 }
 
 /** Swap pipeline labels without posting a comment. Used for silent skip paths. */
@@ -713,30 +813,40 @@ export function buildBlockedComment(args: {
   ].join("\n") + COMMENT_FOOTER;
 }
 
+/** I/O seam for {@link setBlocked} so unit tests inject fakes — no real network. */
+export interface SetBlockedDeps {
+  getIssueDetail?: (cfg: PipelineConfig, n: number) => Promise<{ labels: string[] }>;
+  addBlockedLabel?: (cfg: PipelineConfig, n: number) => Promise<void>;
+  postComment?: (cfg: PipelineConfig, n: number, body: string) => Promise<void>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
 export async function setBlocked(
   cfg: PipelineConfig,
   issueNumber: number,
   reason: string,
   stage: Stage | null = null,
   kind: BlockerKind = DEFAULT_BLOCKER_KIND,
+  deps: SetBlockedDeps = {},
 ): Promise<void> {
+  const _getIssueDetail = deps.getIssueDetail ?? getIssueDetail;
+  const _addBlockedLabel = deps.addBlockedLabel ?? (async (c, n) => {
+    await ghRun(["issue", "edit", String(n), "--add-label", BLOCKED_LABEL, "-R", c.repo]);
+  });
+  const _postComment = deps.postComment ?? postComment;
+  const _sleep = deps.sleep;
+
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-  const detail = await getIssueDetail(cfg, issueNumber);
+  const detail = await _getIssueDetail(cfg, issueNumber);
   const stageStr = stage ?? pickStage(detail.labels) ?? "unknown";
   const harness = getHarnessLabel(detail.labels) ?? "unassigned";
 
-  const body = buildBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind });
+  const effectiveRunId = _activeRunId ?? "unknown";
+  const body = buildBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind })
+    + "\n" + buildAuditSentinel(effectiveRunId, "blocked");
 
-  await ghRun([
-    "issue",
-    "edit",
-    String(issueNumber),
-    "--add-label",
-    BLOCKED_LABEL,
-    "-R",
-    cfg.repo,
-  ]);
-  await postComment(cfg, issueNumber, body);
+  await _addBlockedLabel(cfg, issueNumber);
+  await retryComment(() => _postComment(cfg, issueNumber, body), 3, _sleep);
 }
 
 export async function clearBlocked(

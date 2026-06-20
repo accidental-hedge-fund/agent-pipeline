@@ -25,6 +25,7 @@ import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
   GhMetricsCollector,
   addLabel,
+  buildAuditSentinel,
   clearBlocked,
   getIssueDetail,
   getIssueLabelEvents,
@@ -32,11 +33,14 @@ import {
   getPrForIssue,
   getPrLinkedIssue,
   ensurePipelineLabels,
+  getGhActor,
   isBlocked,
   pickStage,
   postComment,
   postPrComment,
+  reconcileAuditComment,
   setGhCollector,
+  setGhRunId,
   silentTransition,
   transition,
 } from "./gh.ts";
@@ -1777,6 +1781,7 @@ async function runAdvance(
     // into every commit operation, so all commits this invocation produces — across
     // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
     const pipelineRunId = makePipelineRunId(issueNumber, runStartedAt);
+    setGhRunId(pipelineRunId);
     console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
     if (stateDir) {
@@ -1824,6 +1829,51 @@ async function runAdvance(
         break;
       }
       finalStage = stage;
+
+      // Reconcile audit comments (#259): if a prior run's label write succeeded but its
+      // comment post failed, the sentinel is missing. Detect and repair the gap.
+      // Resolve the pipeline's own GitHub actor once so a sentinel is only trusted from a
+      // pipeline-authored comment — body-prefix text alone is forgeable (security review).
+      const auditTrustedActor = opts.dryRun ? null : await getGhActor();
+      // Skip stage-sentinel repair for manually-applied entry-point stages ("ready", "backlog")
+      // since those are never created by transition() and have no sentinel to repair.
+      if (!opts.dryRun && stage !== "ready" && stage !== "backlog") {
+        const repairBody = [
+          `## Pipeline: Audit Repair`,
+          ``,
+          `The audit sentinel for stage \`${stage}\` was missing from the recent comment history. Posting retroactively.`,
+          ``,
+          buildAuditSentinel(pipelineRunId, stage),
+          ``,
+          `---`,
+          `*Automated by Claude Code Pipeline Skill*`,
+        ].join("\n");
+        await reconcileAuditComment(
+          cfg, issueNumber, stage, pipelineRunId, repairBody, detail.comments, auditTrustedActor,
+        );
+      }
+      // Blocked-sentinel repair runs regardless of stage — an issue can be blocked while at
+      // pipeline:ready (label write succeeded, comment post failed) and we must not skip it.
+      if (!opts.dryRun && isBlocked(detail.labels)) {
+        const blockedRepairBody = [
+          `## Pipeline: Blocked (audit repair)`,
+          ``,
+          `The audit sentinel for \`blocked\` state was missing from the recent comment history. Posting retroactively.`,
+          ``,
+          `> **Note**: The original block reason could not be recovered — the blocker comment was not recorded.`,
+          ``,
+          `### How to unblock`,
+          `Remove the \`pipeline:blocked\` label and re-apply the active stage label (e.g. \`pipeline:fix-1\`) to resume the pipeline.`,
+          ``,
+          buildAuditSentinel(pipelineRunId, "blocked"),
+          ``,
+          `---`,
+          `*Automated by Claude Code Pipeline Skill*`,
+        ].join("\n");
+        await reconcileAuditComment(
+          cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments, auditTrustedActor,
+        );
+      }
 
       if (stage === "ready-to-deploy") {
         // The terminal stage is handled outside the common dispatch block, so emit
@@ -2150,8 +2200,9 @@ async function runAdvance(
       }
     }
     } finally {
-      // Clear the module-level collector when this dispatch cycle ends (#257).
+      // Clear module-level per-run state when this dispatch cycle ends (#257, #259).
       setGhCollector(undefined);
+      setGhRunId(undefined);
     }
     },
     issueNumber,
