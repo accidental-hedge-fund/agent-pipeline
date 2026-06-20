@@ -51,8 +51,11 @@ jobs:
           # bypassing --notes-from-tag which resolved to the commit message instead
           # of the tag annotation on the GitHub Actions runner.
           git tag -l "${GITHUB_REF_NAME}" --format='%(contents)' > /tmp/notes.md
-          if [ ! -s /tmp/notes.md ]; then
-            echo "::error::${GITHUB_REF_NAME} has an empty annotation message. Annotate the tag with release notes before pushing."
+          # Reject an empty OR whitespace-only annotation. A whitespace-only message is a
+          # non-zero-size file (e.g. a lone newline) that a `-s` size check would accept,
+          # publishing a blank Release body. Require at least one non-whitespace character.
+          if ! grep -q '[^[:space:]]' /tmp/notes.md; then
+            echo "::error::${GITHUB_REF_NAME} has an empty or whitespace-only annotation message. Annotate the tag with release notes before pushing."
             exit 1
           fi
           # A pre-release tag (e.g. v1.2.0-rc.1) is marked prerelease and must NOT
