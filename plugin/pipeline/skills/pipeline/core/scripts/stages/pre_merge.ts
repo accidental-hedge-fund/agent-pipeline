@@ -1007,6 +1007,26 @@ export async function maybeArchiveOpenspec(
   });
   if (guard) return guard;
 
+  // Pre-archive cleanliness guard: if the worktree already has dirty state outside
+  // openspec/ paths, block — the commit-failure rollback (git restore . + git clean
+  // -fd openspec/) cannot safely recover without discarding those pre-existing changes.
+  const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  const dirtyOutsideOpenspec = preArchiveStatus.stdout
+    .split("\n")
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    .some((path) => !path.startsWith("openspec/"));
+  if (dirtyOutsideOpenspec) {
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      "Worktree has pre-existing dirty state outside openspec/ paths; cannot safely roll back a failed archive commit. Clean or commit those changes first.",
+      "pre-merge",
+      "openspec-invalid",
+    );
+    return { advanced: false, status: "blocked", reason: "worktree dirty outside openspec/ before archive" };
+  }
+
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);

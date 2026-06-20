@@ -14,6 +14,13 @@ After `openspec archive` succeeds and `git add -A` stages a non-empty diff, the 
 - **AND** SHALL return `{ advanced: false, status: "blocked", reason: "archive commit failed" }` (or equivalent)
 - **AND** SHALL NOT invoke `git push origin <branch>`
 
+#### Scenario: worktree has dirty state outside openspec/ before archive
+
+- **WHEN** `maybeArchiveOpenspec` is called
+- **AND** `git status --porcelain` (run before `openspec archive`) reports dirty files outside `openspec/` paths
+- **THEN** the stage SHALL set a pre-merge blocker on the issue
+- **AND** SHALL return `{ advanced: false, status: "blocked" }` without invoking `openspec archive`
+
 #### Scenario: commit succeeds — push proceeds normally
 
 - **WHEN** `maybeArchiveOpenspec` is called

@@ -266,7 +266,7 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
     return (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
       if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
-      if (args[0] === "status") return { stdout: "M openspec/specs/x.md", stderr: "", code: 0 };
+      if (args[0] === "status") return { stdout: "M  openspec/specs/x.md", stderr: "", code: 0 };
       if (args[0] === "commit") return { stdout: "", stderr: "pre-commit hook rejected", code: commitCode };
       if (args[0] === "push") return { stdout: "", stderr: "", code: 0 };
       if (args[0] === "restore" || args[0] === "clean") {

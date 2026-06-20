@@ -194,9 +194,9 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
     if (args[0] === "add") {
       return { stdout: "", stderr: "", code: 0 };
     }
-    // git status --porcelain: non-empty diff so commit is attempted
+    // git status --porcelain: non-empty diff so commit is attempted (XY format: 2 status chars + space + path)
     if (args[0] === "status") {
-      return { stdout: "M openspec/specs/openspec-integration/spec.md", stderr: "", code: 0 };
+      return { stdout: "M  openspec/specs/openspec-integration/spec.md", stderr: "", code: 0 };
     }
     // git commit: fail with a hook rejection
     if (args[0] === "commit") {
@@ -231,6 +231,48 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
   assert.match(blocked[0], /archive commit failed/i, "block reason must mention archive commit failure");
   assert.match(blocked[0], new RegExp(COMMIT_STDERR), "block reason must include the commit stderr");
   assert.equal(pushCalled, false, "git push must NOT be called when commit fails");
+});
+
+// ---- maybeArchiveOpenspec: pre-archive cleanliness guard (#255 review-2) ----
+
+test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ → blocked before archive is called", async () => {
+  const archiveCalls: string[] = [];
+  const blocked: string[] = [];
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    // Pre-archive status --porcelain: dirty file outside openspec/ (XY format)
+    if (args[0] === "status") {
+      return { stdout: " M core/scripts/stages/pre_merge.ts", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string) => {
+      blocked.push(reason);
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    `expected blocked outcome; got: ${JSON.stringify(out)}`);
+  assert.deepEqual(archiveCalls, [], "archive must NOT run when worktree is dirty outside openspec/");
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.match(blocked[0], /dirty/i, "block reason must mention dirty state");
 });
 
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
