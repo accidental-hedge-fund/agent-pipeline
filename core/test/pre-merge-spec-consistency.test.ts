@@ -362,6 +362,50 @@ test("maybeArchiveOpenspec: rename record with destination outside openspec/ →
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
 });
 
+// Regression (#255 review-2): if `git status` itself FAILS before archive (non-zero exit,
+// often with empty stdout), the guard must fail CLOSED (block) — treating empty stdout as a
+// clean tree would let the destructive rollback run over unproven state.
+test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty stdout) → blocked (fail closed)", async () => {
+  const archiveCalls: string[] = [];
+  const blocked: string[] = [];
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    // git status fails: non-zero exit, error on stderr, EMPTY stdout — the trap the
+    // old `stdout.trim() !== ""`-only check fell into (it read empty stdout as clean).
+    if (args[0] === "status") {
+      return { stdout: "", stderr: "fatal: unable to read index", code: 128 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string) => {
+      blocked.push(reason);
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    `expected blocked outcome; got: ${JSON.stringify(out)}`);
+  assert.deepEqual(archiveCalls, [], "archive must NOT run when the pre-archive status check itself failed");
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.match(blocked[0], /git status|clean worktree/i, "block reason must mention the failed status check");
+});
+
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
 
 test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, archive never called", async () => {

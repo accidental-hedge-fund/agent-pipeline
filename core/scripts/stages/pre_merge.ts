@@ -1015,16 +1015,28 @@ export async function maybeArchiveOpenspec(
   // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
   // matching only the first path misses. All planning/fix work is committed before pre-merge,
   // so any non-empty status here is anomalous — fail safe rather than risk data loss.
+  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree. If the
+  // status check itself errors (non-zero exit, often with empty stdout), we cannot prove the
+  // tree is clean — treating that as clean would let the destructive rollback run over
+  // unproven state, the very data-loss class this guard exists to close.
   const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (preArchiveStatus.stdout.trim() !== "") {
+  if (preArchiveStatus.code !== 0 || preArchiveStatus.stdout.trim() !== "") {
+    const detail =
+      preArchiveStatus.code !== 0
+        ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
+        : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
     await setBlockedFn(
       cfg,
       issueNumber,
-      "Worktree has pre-existing dirty (uncommitted) state before the OpenSpec archive; cannot safely roll back a failed archive commit without discarding it. Commit or stash those changes first.",
+      `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
       "pre-merge",
       "openspec-invalid",
     );
-    return { advanced: false, status: "blocked", reason: "worktree dirty before archive" };
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive",
+    };
   }
 
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
