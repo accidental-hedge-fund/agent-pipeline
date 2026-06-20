@@ -1113,6 +1113,25 @@ const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
   /(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*\S+/gi,
 ];
 
+// Patterns matching known prompt-injection imperatives in carry-forward brief text.
+// Replacements use `[REDACTED]` to preserve surrounding prose while removing content
+// that could steer the planning agent away from the actual issue.
+const BRIEF_INJECTION_PATTERNS: ReadonlyArray<RegExp> = [
+  // "Ignore [all|previous|prior] instructions"
+  /ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions?/gi,
+  /ignore\s+all\s+instructions?/gi,
+  // "Act as [anything]" — common role-switching injection
+  /act\s+as\b/gi,
+  // "You are now [anything]"
+  /you\s+are\s+now\b/gi,
+  // "Disregard [previous|prior|all] [instructions]"
+  /disregard\s+(?:previous|prior|all)(?:\s+instructions?)?/gi,
+  // system: prefix injection (e.g. "system: do X")
+  /\bsystem\s*:/gi,
+  // <system> XML tag injection
+  /<\/?system>/gi,
+];
+
 /**
  * Redact URLs, email addresses, and common secret patterns from `text` before
  * the content is forwarded to the last30days skill's external research runtime.
@@ -1121,6 +1140,21 @@ const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
 export function sanitizeBodyForResearch(text: string): string {
   let out = text;
   for (const pattern of REDACT_PATTERNS) {
+    out = out.replace(pattern, "[REDACTED]");
+  }
+  return out;
+}
+
+/**
+ * Redact known prompt-injection imperatives from a last30days brief before the
+ * text is posted to GitHub or embedded in a planning prompt. Public discourse
+ * (Reddit, X, HN, YouTube, GitHub) is untrusted: a crafted community post could
+ * contain injection payloads intended to steer the planning agent. Replacements
+ * use `[REDACTED]` so surrounding contextual text is preserved.
+ */
+export function sanitizeBriefForPrompt(text: string): string {
+  let out = text;
+  for (const pattern of BRIEF_INJECTION_PATTERNS) {
     out = out.replace(pattern, "[REDACTED]");
   }
   return out;
@@ -1200,13 +1234,14 @@ export async function gatherCarryForward(
     console.log(buildSetupHint(issueNumber, "no-signal"));
     return "";
   }
+  const sanitizedBrief = sanitizeBriefForPrompt(res.brief);
   await postComment(
     cfg,
     issueNumber,
-    `## Pre-Planning Context — last30days\n\n_Topic: "${title}"_${res.stats ? `\n\n${res.stats}` : ""}\n\n${res.brief}${footer(cfg)}`,
+    `## Pre-Planning Context — last30days\n\n_Topic: "${title}"_${res.stats ? `\n\n${res.stats}` : ""}\n\n${sanitizedBrief}${footer(cfg)}`,
   );
   console.log(`[pipeline] #${issueNumber}: last30days brief posted + carried into planning`);
-  return res.brief;
+  return sanitizedBrief;
 }
 
 function footer(cfg: PipelineConfig): string {
