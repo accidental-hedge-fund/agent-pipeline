@@ -47,7 +47,8 @@ import {
 import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
-import { branchName, getForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
+import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
+import { RunStateCache } from "./run-state-cache.ts";
 import {
   bundlePath,
   createBundle,
@@ -168,6 +169,8 @@ export function canAutoLoopContinue(
 /** IO seam for {@link runAdvance}: inject a fake clock for wall-clock budgeting in tests. */
 export interface AdvanceDeps {
   now?: () => number;
+  /** Injectable run-state cache for unit tests; real runs create their own instance. */
+  runStateCache?: RunStateCache;
 }
 
 // Package version, single-sourced from package.json so a version bump is reflected
@@ -1154,7 +1157,7 @@ const defaultRunStatusDeps: RunStatusDeps = {
   getIssueDetail,
   getPrForIssue,
   loadLatestPreflightResult,
-  getForIssue,
+  getForIssue: getOnDiskForIssue,
   getLabelEvents: getIssueLabelEvents,
 };
 
@@ -1880,14 +1883,19 @@ async function runAdvance(
     setGhRunId(pipelineRunId);
     console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
+    // Populate run-state cache once at setup: caches issue state/labels, PR number,
+    // and worktree path (disk-only, zero gh calls for the path). Subsequent
+    // bookkeeping callers share these values rather than each issuing independent
+    // gh reads. Best-effort: a refresh failure leaves the cache unpopulated and
+    // callers fall back to null.
+    const runCache = deps.runStateCache ?? new RunStateCache(issueNumber);
+    await runCache.refreshAfterSetup(cfg).catch(() => {});
+
     if (stateDir) {
-      let bundlePr: number | null = null;
-      try {
-        bundlePr = await getPrForIssue(cfg, issueNumber);
-      } catch {
-        /* no PR yet, or lookup failed — record null */
-      }
-      const startWt = await getForIssue(cfg, issueNumber).catch(() => null);
+      const bundlePr = runCache.populated ? runCache.prNumber : null;
+      const startWt = runCache.populated && runCache.worktreePath
+        ? { path: runCache.worktreePath, slug: runCache.worktreeSlug! }
+        : null;
       const bundleBranch = startWt ? branchName(issueNumber, startWt.slug) : null;
       const harnesses = Array.from(new Set([cfg.harnesses.implementer, cfg.harnesses.reviewer]));
       await createBundle(stateDir, {
@@ -2068,7 +2076,7 @@ async function runAdvance(
       // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
       let headBeforeDispatch = "";
       if (stateDir) {
-        const wtBefore = await getForIssue(cfg, issueNumber).catch(() => null);
+        const wtBefore = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
         if (wtBefore) {
           headBeforeDispatch = (
             await gitInWorktree(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
@@ -2114,7 +2122,7 @@ async function runAdvance(
       const stageExitedAt = evidenceTimestamp();
       let stageCommits: string[] = [];
       if (stateDir) {
-        const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
+        const wtAfter = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
         if (wtAfter) {
           lastKnownBranch = branchName(issueNumber, wtAfter.slug);
           // If no worktree existed before dispatch (e.g., planning creates it), fall
@@ -2250,7 +2258,7 @@ async function runAdvance(
           // worktree before this block runs, so latestBranch is null on a successful
           // ready-to-deploy run. Overwriting with null would erase the captured branch.
           const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
-          const latestWt = await getForIssue(cfg, issueNumber).catch(() => null);
+          const latestWt = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
           // deployReady.finalize() removes the worktree before this block runs, so
           // latestWt may be null on a successful run. Fall back to the last branch we
           // observed during the dispatch loop so the bundle is never finalized with

@@ -403,6 +403,28 @@ export async function getForIssue(
   return null;
 }
 
+export interface GetOnDiskForIssueDeps {
+  listOnDisk?: (cfg: PipelineConfig, deps?: ListOnDiskDeps) => Promise<WorktreeRecord[]>;
+}
+
+/** Fast path: resolve a worktree path for a known issue by reading on-disk
+ *  records only — zero GitHub API calls. Use this instead of {@link getForIssue}
+ *  for bookkeeping callers that only need the path, not active-state filtering.
+ *  Returns null if no on-disk record exists for the issue. */
+export async function getOnDiskForIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: GetOnDiskForIssueDeps = {},
+): Promise<{ path: string; slug: string } | null> {
+  const listFn = deps.listOnDisk ?? listOnDisk;
+  for (const rec of await listFn(cfg)) {
+    if (rec.issueNumber === issueNumber && rec.slug) {
+      return { path: rec.path, slug: rec.slug };
+    }
+  }
+  return null;
+}
+
 export async function branchExists(
   cfg: PipelineConfig,
   branch: string,
