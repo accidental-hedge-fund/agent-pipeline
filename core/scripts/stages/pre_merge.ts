@@ -1026,11 +1026,22 @@ export async function maybeArchiveOpenspec(
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
   const status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
-  await gitFn(
+  const commit = await gitFn(
     wt.path,
     ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
     { ignoreFailure: true },
   );
+  if (commit.code !== 0) {
+    const detail = commit.stderr.trim() || commit.stdout.trim() || "(no output)";
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `OpenSpec archive commit failed:\n${detail}`,
+      "pre-merge",
+      "push-failed",
+    );
+    return { advanced: false, status: "blocked", reason: "archive commit failed" };
+  }
   const pushBranch = branchName(issueNumber, wt.slug);
   const push = await gitFn(wt.path, ["push", "origin", pushBranch], {
     ignoreFailure: true,

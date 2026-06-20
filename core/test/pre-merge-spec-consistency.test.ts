@@ -178,6 +178,61 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
   assert.match(blocked[0], /stale spec delta/);
 });
 
+// ---- maybeArchiveOpenspec: archive commit failure blocks and prevents push (#255) ----
+
+test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, no push attempted", async () => {
+  const blocked: string[] = [];
+  let pushCalled = false;
+  const COMMIT_STDERR = "pre-commit hook rejected: lint failed";
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    // candidates diff (three-dot form)
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    // git add -A
+    if (args[0] === "add") {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    // git status --porcelain: non-empty diff so commit is attempted
+    if (args[0] === "status") {
+      return { stdout: "M openspec/specs/openspec-integration/spec.md", stderr: "", code: 0 };
+    }
+    // git commit: fail with a hook rejection
+    if (args[0] === "commit") {
+      return { stdout: "", stderr: COMMIT_STDERR, code: 1 };
+    }
+    // git push: must NOT be called
+    if (args[0] === "push") {
+      pushCalled = true;
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [], // no stale-delta condition
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string) => {
+      blocked.push(reason);
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    `expected blocked outcome; got: ${JSON.stringify(out)}`);
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.match(blocked[0], /archive commit failed/i, "block reason must mention archive commit failure");
+  assert.match(blocked[0], new RegExp(COMMIT_STDERR), "block reason must include the commit stderr");
+  assert.equal(pushCalled, false, "git push must NOT be called when commit fails");
+});
+
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
 
 test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, archive never called", async () => {
