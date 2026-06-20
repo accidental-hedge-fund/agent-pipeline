@@ -15,19 +15,5 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Core test suite
-        working-directory: core
-        run: |
-          npm ci --no-audit --no-fund
-          npm test
-
-      - name: Generated plugin is up to date
-        run: node scripts/build.mjs --check
-
-      - name: Install smoke test (temp HOME)
-        run: |
-          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude-home"
-          mkdir -p "$CLAUDE_CONFIG_DIR"
-          node scripts/install.mjs install --host claude
-          node "$CLAUDE_CONFIG_DIR/skills/pipeline/scripts/pipeline.mjs" --help
-          node scripts/install.mjs uninstall --host claude
+      - name: Full CI gate
+        run: npm run ci
