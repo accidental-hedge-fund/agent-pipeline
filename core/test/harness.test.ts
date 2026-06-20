@@ -262,6 +262,36 @@ test("runCapped: grandchild process is killed when harness times out (#260)", as
   );
 });
 
+test("invoke(): a timed-out harness kills its grandchild — proves invoke() threads killProcessGroup into runCapped (#260)", async () => {
+  // Bites the ACTUAL bug: invoke() must pass killProcessGroup into runCapped so a
+  // detached process group is created and the whole descendant tree is killed on
+  // timeout. The runCapped-direct test above passes killProcessGroup itself, so it
+  // cannot catch a regression where invoke() stops threading the option. This goes
+  // through invoke() with the custom-harness path (any non claude/codex name), so no
+  // real model CLI is spawned. If invoke() dropped the option the detached group would
+  // not be created, the grandchild would be orphaned, and the ESRCH assertion below
+  // would fail.
+  const pidFile = path.join(tmpRoot, `invoke-grandchild-pid-${Date.now()}.txt`);
+  const cli = makeScript(
+    "invoke-spawn-grandchild",
+    `sleep 9999 &\necho "$!" > "${pidFile}"\nwait`,
+  );
+  const result = await invoke(cli, tmpRoot, "prompt", { stream: false, timeoutSec: 1 });
+
+  assert.equal(result.timed_out, true, "invoke() must report timed_out after the 1 s timeout fires");
+  assert.ok(fs.existsSync(pidFile), "fake CLI must have recorded its grandchild PID before the timeout");
+  const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  assert.ok(
+    Number.isFinite(grandchildPid) && grandchildPid > 0,
+    `grandchild PID must be a positive integer, got ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`,
+  );
+  assert.throws(
+    () => process.kill(grandchildPid, 0),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+    "invoke() timeout must kill the whole process group — the grandchild must be gone",
+  );
+});
+
 test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace period (#260)", async () => {
   // Regression for the scenario where the direct child exits on SIGTERM while a
   // grandchild with 'trap '' TERM' survives — runCapped must not resolve until after
