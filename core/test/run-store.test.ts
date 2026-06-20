@@ -886,3 +886,37 @@ test("isValidSummaryBundle: returns true for review entry with required fields p
   const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{ round: 1, sha: "abc1234", verdict: "approved", findingCounts: {} }] };
   assert.equal(isValidSummaryBundle(b), true, "review with required fields should be accepted");
 });
+
+// Regression (#261 pre-merge review): the validator must also reject malformed nested
+// command / override / recovery entries — formatSummary dereferences c.cmd/exitCode/
+// durationMs, o.key/reason, rec.trigger/round/at, so a null or partial element would crash
+// the formatter and must be treated as absent (invalid bundle) for fallback.
+test("isValidSummaryBundle: returns false for a null command entry — commands:[null] (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning", commands: [null] }] };
+  assert.equal(isValidSummaryBundle(b), false, "a non-object command must be rejected");
+});
+
+test("isValidSummaryBundle: returns false for a command missing exitCode/durationMs (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning", commands: [{ cmd: "npm test" }] }] };
+  assert.equal(isValidSummaryBundle(b), false, "a command missing exitCode/durationMs must be rejected");
+});
+
+test("isValidSummaryBundle: returns false for a null override entry — overrides:[null] (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), overrides: [null] };
+  assert.equal(isValidSummaryBundle(b), false, "a non-object override must be rejected");
+});
+
+test("isValidSummaryBundle: returns false for a null recovery entry — recoveries:[null] (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), recoveries: [null] };
+  assert.equal(isValidSummaryBundle(b), false, "a non-object recovery must be rejected");
+});
+
+test("isValidSummaryBundle: returns true for well-formed nested command/override/recovery entries (#261 review)", () => {
+  const b = {
+    ...makeSummaryBundle(ISSUE, "run-1"),
+    stages: [{ stage: "planning", outcome: null, commands: [{ cmd: "npm test", exitCode: 0, durationMs: 12, outputExcerpt: "" }], enteredAt: null, exitedAt: null, commits: [], prompts: [] }],
+    overrides: [{ key: "high|f.ts|t", reason: "audited" }],
+    recoveries: [{ trigger: "harness-timeout", round: 1, at: "2026-06-20T00:00:00Z" }],
+  };
+  assert.equal(isValidSummaryBundle(b), true, "well-formed nested entries must be accepted");
+});

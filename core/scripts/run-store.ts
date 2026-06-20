@@ -457,6 +457,14 @@ export function isValidSummaryBundle(parsed: unknown): parsed is EvidenceBundle 
     if (!s || typeof s !== "object") return false;
     const sr = s as Record<string, unknown>;
     if (typeof sr.stage !== "string" || !Array.isArray(sr.commands)) return false;
+    // formatSummary dereferences each command's cmd/exitCode/durationMs; a malformed
+    // element (e.g. null, or missing fields) would crash the formatter, so a bundle with
+    // any such command must be treated as absent for fallback (not a valid bundle).
+    for (const c of sr.commands as unknown[]) {
+      if (!c || typeof c !== "object") return false;
+      const cr = c as Record<string, unknown>;
+      if (typeof cr.cmd !== "string" || typeof cr.exitCode !== "number" || typeof cr.durationMs !== "number") return false;
+    }
   }
   for (const r of b.reviews as unknown[]) {
     if (!r || typeof r !== "object") return false;
@@ -468,6 +476,18 @@ export function isValidSummaryBundle(parsed: unknown): parsed is EvidenceBundle 
       !rr.findingCounts ||
       typeof rr.findingCounts !== "object"
     ) return false;
+  }
+  // formatSummary also dereferences each override (o.key / o.reason) and recovery
+  // (rec.trigger / rec.round / rec.at); validate those element shapes too.
+  for (const o of b.overrides as unknown[]) {
+    if (!o || typeof o !== "object") return false;
+    const or = o as Record<string, unknown>;
+    if (typeof or.key !== "string" || typeof or.reason !== "string") return false;
+  }
+  for (const rec of b.recoveries as unknown[]) {
+    if (!rec || typeof rec !== "object") return false;
+    const rr = rec as Record<string, unknown>;
+    if (typeof rr.trigger !== "string" || typeof rr.round !== "number" || typeof rr.at !== "string") return false;
   }
   return true;
 }
