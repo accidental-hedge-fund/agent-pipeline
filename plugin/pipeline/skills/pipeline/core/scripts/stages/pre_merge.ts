@@ -24,7 +24,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { branchName, getForIssue, gitInWorktree } from "../worktree.ts";
+import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   computeDiffHash,
@@ -119,7 +119,7 @@ export async function advance(
   const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
   const getPrChecksFn = deps.getPrChecks ?? getPrChecks;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
-  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const transitionFn = deps.transition ?? transition;
   const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
@@ -436,7 +436,7 @@ export async function enforceReviewShaGate(
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
-  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const getGhActorFn = deps.getGhActor ?? getGhActor;
 
   const detail = await getIssueDetailFn(cfg, issueNumber);
@@ -977,7 +977,7 @@ export async function maybeArchiveOpenspec(
   deps: AdvancePreMergeDeps = {},
   stateDir?: string,
 ): Promise<Outcome | null> {
-  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const gitFn = deps.gitInWorktree ?? gitInWorktree;
@@ -1294,7 +1294,7 @@ async function recoverFromMergeConflict(
   stateDir?: string,
   deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome> {
-  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
   const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
@@ -1344,7 +1344,7 @@ async function tryRebaseAndPush(
   cfg: PipelineConfig,
   issueNumber: number,
 ): Promise<boolean> {
-  const wt = await getForIssue(cfg, issueNumber);
+  const wt = await getOnDiskForIssue(cfg, issueNumber);
   if (!wt) return false;
   const branch = branchName(issueNumber, wt.slug);
 

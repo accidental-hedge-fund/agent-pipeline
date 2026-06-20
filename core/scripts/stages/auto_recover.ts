@@ -11,7 +11,7 @@ import {
   postComment,
   removeLabel,
 } from "../gh.ts";
-import { getForIssue, hasCommitsAhead, removeWorktree } from "../worktree.ts";
+import { getOnDiskForIssue, hasCommitsAhead, removeWorktree } from "../worktree.ts";
 import { recordRecovery } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 
@@ -24,7 +24,7 @@ export async function tryAutoRecover(
   // recorded. Undefined → recording disabled (no fs side effects in tests).
   stateDir?: string,
 ): Promise<Outcome> {
-  const wt = await getForIssue(cfg, issueNumber);
+  const wt = await getOnDiskForIssue(cfg, issueNumber);
   if (!wt) {
     return { advanced: false, status: "no-op", reason: "no worktree to recover" };
   }

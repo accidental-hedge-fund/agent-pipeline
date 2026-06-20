@@ -19,7 +19,7 @@ import {
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
-import { getForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
+import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";

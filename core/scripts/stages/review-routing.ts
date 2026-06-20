@@ -20,7 +20,7 @@ import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
 } from "../prompts/index.ts";
-import { getForIssue } from "../worktree.ts";
+import { getForIssue, getOnDiskForIssue } from "../worktree.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import {
   buildTrustedOverrideComments,
@@ -132,7 +132,7 @@ export async function advanceReview(
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
-  const getForIssueFn = deps.getForIssue ?? getForIssue;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const postCommentFn = deps.postComment ?? postComment;
   const postPrCommentFn = deps.postPrComment ?? postPrComment;
   const transitionFn = deps.transition ?? transition;
