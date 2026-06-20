@@ -243,10 +243,8 @@ test("runCapped: grandchild process is killed when harness times out (#260)", as
     // then block in wait so the parent (bash) stays alive until the timeout kills it.
     `sleep 9999 &\necho "$!" > "${pidFile}"\nwait`,
   );
-  // 2 s timeout — gives bash enough time to start up and write the PID file even
-  // under heavy CI load (1972 tests running concurrently), while still being short
-  // enough that the test finishes well before the default mocha/node-test deadline.
-  const result = await runCapped(cli, [], tmpRoot, 2, false, "test", { killProcessGroup: true });
+  // 2 s timeout. killGraceSec:0.5 keeps total resolution time ~2.7 s instead of 7 s.
+  const result = await runCapped(cli, [], tmpRoot, 2, false, "test", { killProcessGroup: true, killGraceSec: 0.5 });
 
   assert.equal(result.timed_out, true, "result.timed_out must be true after timeout fires");
 
@@ -255,13 +253,41 @@ test("runCapped: grandchild process is killed when harness times out (#260)", as
   const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
   assert.ok(Number.isFinite(grandchildPid) && grandchildPid > 0, `grandchild PID must be a positive integer, got: ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`);
 
-  // Give SIGTERM a moment to propagate through the process group. In practice
-  // SIGTERM lands immediately, but a short pause prevents a spurious race.
-  await new Promise((r) => setTimeout(r, 200));
-
+  // runCapped now resolves only after the SIGKILL grace has completed, so
+  // descendants are guaranteed absent without an additional wait.
   assert.throws(
     () => process.kill(grandchildPid, 0),
     (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
     "grandchild must be absent from the OS process table after process-group kill",
+  );
+});
+
+test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace period (#260)", async () => {
+  // Regression for the scenario where the direct child exits on SIGTERM while a
+  // grandchild with 'trap '' TERM' survives — runCapped must not resolve until after
+  // SIGKILL completes, even though 'close' fires early.
+  const pidFile = path.join(tmpRoot, `sigterm-immune-grandchild-${Date.now()}.txt`);
+  const cli = makeScript(
+    "spawn-sigterm-immune",
+    // The subshell sets SIG_IGN for TERM; 'sleep 9999' inside it inherits the
+    // disposition and cannot be killed by SIGTERM. The outer bash is not protected
+    // and dies on SIGTERM, firing 'close' on the direct child — but the subshell
+    // and its sleep stay alive until SIGKILL.
+    `(trap '' TERM; sleep 9999) &\necho "$!" > "${pidFile}"\nsleep 9999`,
+  );
+  // killGraceSec:0.5 keeps total resolution time ~1.7 s (1 s timeout + 0.5 s grace + 0.2 s reap).
+  const result = await runCapped(cli, [], tmpRoot, 1, false, "test", { killProcessGroup: true, killGraceSec: 0.5 });
+
+  assert.equal(result.timed_out, true, "result.timed_out must be true");
+
+  assert.ok(fs.existsSync(pidFile), `PID file must exist at ${pidFile}`);
+  const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  assert.ok(Number.isFinite(grandchildPid) && grandchildPid > 0, `grandchild PID must be a positive integer, got: ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`);
+
+  // runCapped resolves only after SIGKILL + reap window — no extra wait needed.
+  assert.throws(
+    () => process.kill(grandchildPid, 0),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+    "SIGTERM-ignoring grandchild must be dead after SIGKILL grace period",
   );
 });
