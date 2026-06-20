@@ -103,7 +103,7 @@ export async function invoke(
     custom = true;
   }
 
-  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness);
+  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness, { killProcessGroup: true });
   // When a configured reviewer CLI cannot be spawned at all (ENOENT / not
   // executable), surface a specific, actionable message that names the CLI —
   // never a bare "Unknown harness". The `spawn_error` flag is preserved so the

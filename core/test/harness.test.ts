@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { invoke, formatStderrExcerpt } from "../scripts/harness.ts";
+import { invoke, runCapped, formatStderrExcerpt } from "../scripts/harness.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
 
@@ -224,4 +224,44 @@ test("formatStderrExcerpt: stderr at exactly max is not truncated", () => {
   const exact = "y".repeat(500);
   const out = formatStderrExcerpt(exact, 500);
   assert.ok(!out.includes("…(truncated)"), "no truncation marker when length equals max");
+});
+
+// ---------------------------------------------------------------------------
+// descendant-cleanup (#260) — grandchild process is killed when harness times out
+//
+// runCapped with killProcessGroup:true must kill the entire process group on
+// timeout, including grandchild processes spawned by the direct child.
+// ---------------------------------------------------------------------------
+
+test("runCapped: grandchild process is killed when harness times out (#260)", async () => {
+  // Write the grandchild PID to a temp file (not stdout) to avoid pipe-buffering
+  // races when the process is killed near the moment it finishes writing.
+  const pidFile = path.join(tmpRoot, `grandchild-pid-${Date.now()}.txt`);
+  const cli = makeScript(
+    "spawn-grandchild",
+    // Fork a grandchild sleeping well past the timeout, record its PID to a file,
+    // then block in wait so the parent (bash) stays alive until the timeout kills it.
+    `sleep 9999 &\necho "$!" > "${pidFile}"\nwait`,
+  );
+  // 2 s timeout — gives bash enough time to start up and write the PID file even
+  // under heavy CI load (1972 tests running concurrently), while still being short
+  // enough that the test finishes well before the default mocha/node-test deadline.
+  const result = await runCapped(cli, [], tmpRoot, 2, false, "test", { killProcessGroup: true });
+
+  assert.equal(result.timed_out, true, "result.timed_out must be true after timeout fires");
+
+  // Read the PID from the file written before the timeout fired.
+  assert.ok(fs.existsSync(pidFile), `PID file must exist at ${pidFile} — script did not write it before timeout`);
+  const grandchildPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  assert.ok(Number.isFinite(grandchildPid) && grandchildPid > 0, `grandchild PID must be a positive integer, got: ${JSON.stringify(fs.readFileSync(pidFile, "utf8"))}`);
+
+  // Give SIGTERM a moment to propagate through the process group. In practice
+  // SIGTERM lands immediately, but a short pause prevents a spurious race.
+  await new Promise((r) => setTimeout(r, 200));
+
+  assert.throws(
+    () => process.kill(grandchildPid, 0),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
+    "grandchild must be absent from the OS process table after process-group kill",
+  );
 });
