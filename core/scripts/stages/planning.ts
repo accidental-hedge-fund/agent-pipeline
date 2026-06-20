@@ -54,6 +54,7 @@ import {
 } from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -1113,35 +1114,16 @@ const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
   /(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*\S+/gi,
 ];
 
-// Patterns matching known prompt-injection imperatives in carry-forward brief text.
-// Replacements use `[REDACTED]` to preserve surrounding prose while removing content
-// that could steer the planning agent away from the actual issue.
-// Kept equivalent to artifact-sanitize.ts INJECTION_PATTERNS (plus <system> XML tag).
-const BRIEF_INJECTION_PATTERNS: ReadonlyArray<RegExp> = [
-  // "Ignore [all|previous|prior|above] instructions"
-  /ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions?/gi,
-  /ignore\s+all\s+instructions?/gi,
-  // "Act as [anything]" — common role-switching injection
+// Extra patterns for brief sanitization that extend artifact-sanitize.ts INJECTION_PATTERNS.
+// sanitizeBriefForPrompt iterates INJECTION_PATTERNS first (canonical, drift-guarded), then these.
+const BRIEF_SUPPLEMENTAL_PATTERNS: ReadonlyArray<RegExp> = [
+  // "Ignore all previous/prior instructions" — the multi-word sequence (all + previous/prior)
+  // is not matched by INJECTION_PATTERNS which only handles one qualifier after "ignore".
+  /ignore\s+all\s+(?:previous|prior)\s+instructions?/gi,
+  // "Act as [anything]" — broader than INJECTION_PATTERNS' "act as if" to catch "act as a …" variants
   /act\s+as\b/gi,
-  // "You are now [anything]"
-  /you\s+are\s+now\b/gi,
-  // "You must now [anything]"
-  /you\s+must\s+now\b/gi,
-  // "Disregard [the] [above|all|previous|prior|following]"
-  /disregard\s+(?:previous|prior|all)(?:\s+instructions?)?/gi,
-  // "Forget everything / all / previous / the above"
-  /forget\s+(?:everything|all|previous|prior|the\s+above)/gi,
-  // "Override [all] [previous|prior|above] instructions"
-  /override\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?/gi,
-  // system: prefix injection (e.g. "system: do X")
-  /\bsystem\s*:/gi,
-  // <system> XML tag injection
+  // <system> XML tag injection (not in INJECTION_PATTERNS)
   /<\/?system>/gi,
-  // ChatML control tokens that inject chat-role framing
-  /<\|im_start\|>/g,
-  /<\|im_end\|>/g,
-  // Line-start role markers that inject chat-role syntax
-  /^assistant\s*:/gim,
 ];
 
 /**
@@ -1166,7 +1148,10 @@ export function sanitizeBodyForResearch(text: string): string {
  */
 export function sanitizeBriefForPrompt(text: string): string {
   let out = text;
-  for (const pattern of BRIEF_INJECTION_PATTERNS) {
+  for (const pattern of INJECTION_PATTERNS) {
+    out = out.replace(pattern, "[REDACTED]");
+  }
+  for (const pattern of BRIEF_SUPPLEMENTAL_PATTERNS) {
     out = out.replace(pattern, "[REDACTED]");
   }
   return out;
