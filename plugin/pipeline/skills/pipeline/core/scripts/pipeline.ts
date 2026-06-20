@@ -1852,9 +1852,14 @@ async function runAdvance(
       // pipeline:ready (label write succeeded, comment post failed) and we must not skip it.
       if (!opts.dryRun && isBlocked(detail.labels)) {
         const blockedRepairBody = [
-          `## Pipeline: Audit Repair`,
+          `## Pipeline: Blocked (audit repair)`,
           ``,
           `The audit sentinel for \`blocked\` state was missing from the recent comment history. Posting retroactively.`,
+          ``,
+          `> **Note**: The original block reason could not be recovered — the blocker comment was not recorded.`,
+          ``,
+          `### How to unblock`,
+          `Remove the \`pipeline:blocked\` label and re-apply the active stage label (e.g. \`pipeline:fix-1\`) to resume the pipeline.`,
           ``,
           buildAuditSentinel(pipelineRunId, "blocked"),
           ``,

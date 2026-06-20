@@ -96,6 +96,20 @@ test("retryComment: exhausts all attempts and re-throws the last error", async (
 // reconcileAuditComment — no-op when marker present
 // ---------------------------------------------------------------------------
 
+test("reconcileAuditComment: ignores sentinel quoted in a non-pipeline comment", async () => {
+  let posted = 0;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  // A human comment quoting the sentinel in a code block — must NOT suppress repair
+  const comments = [
+    { body: "Here is my review:\n```\n<!-- pipeline-audit: run=old-run state=fix-1 -->\n```" },
+  ];
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, deps);
+  assert.equal(posted, 1, "must post repair: sentinel in non-pipeline comment is not trusted");
+});
+
 test("reconcileAuditComment: no-op when sentinel already present", async () => {
   let posted = 0;
   const deps: ReconcileAuditDeps = {
@@ -104,10 +118,10 @@ test("reconcileAuditComment: no-op when sentinel already present", async () => {
   };
   const comments = [
     { body: "some unrelated comment" },
-    { body: "transition body\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+    { body: "## Pipeline: fix 1\ntransition body\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
   ];
   await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, deps);
-  assert.equal(posted, 0, "must not post when sentinel is already present");
+  assert.equal(posted, 0, "must not post when sentinel is already present in a pipeline comment");
 });
 
 test("reconcileAuditComment: posts repair when only a different-state sentinel is present", async () => {
@@ -118,7 +132,7 @@ test("reconcileAuditComment: posts repair when only a different-state sentinel i
   };
   // Comments have state=review-1 but we're checking for state=fix-1 — still absent
   const comments = [
-    { body: "<!-- pipeline-audit: run=old-run state=review-1 -->" },
+    { body: "## Pipeline: review 1\n<!-- pipeline-audit: run=old-run state=review-1 -->" },
   ];
   await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, deps);
   assert.equal(posted, 1, "must post repair when state=fix-1 sentinel is absent even if another state's sentinel exists");
@@ -146,7 +160,7 @@ test("reconcileAuditComment: only scans the last 20 comments", async () => {
   };
   // Place a matching sentinel at position 0 (oldest), with 21 newer comments after it.
   const comments = [
-    { body: "<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+    { body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
     ...Array.from({ length: 21 }, (_, i) => ({ body: `noise comment ${i}` })),
   ];
   // The sentinel is outside the last-20 window; reconciler should post.
@@ -200,7 +214,7 @@ test("reconcileAuditComment: second call skips when first call's repair is in co
     warn: () => {},
   };
 
-  const repairBody = `repair\n${buildAuditSentinel("run-2", "fix-1")}`;
+  const repairBody = `## Pipeline: fix 1\nrepair\n${buildAuditSentinel("run-2", "fix-1")}`;
 
   // First call: no sentinel → posts repair
   await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-2", repairBody, [], deps);

@@ -150,7 +150,14 @@ export async function reconcileAuditComment(
 ): Promise<void> {
   const marker = ` state=${currentState} -->`;
   const recent = comments.slice(-20);
-  const found = recent.some((c) => c.body.includes("<!-- pipeline-audit:") && c.body.includes(marker));
+  // Only trust sentinels found in pipeline-authored comments (those starting with
+  // "## Pipeline:"). A human quoting or code-reviewing a sentinel must not suppress repair.
+  const found = recent.some(
+    (c) =>
+      c.body.trimStart().startsWith("## Pipeline:") &&
+      c.body.includes("<!-- pipeline-audit:") &&
+      c.body.includes(marker),
+  );
   if (found) return;
   deps.warn(
     `[pipeline] #${issueNumber}: audit sentinel for state=${currentState} (run=${runId}) missing from recent comments; posting repair`,
