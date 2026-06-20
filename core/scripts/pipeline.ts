@@ -67,6 +67,7 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  isValidSummaryBundle,
   latestSummaryForIssue,
   listRunIds,
   runDirPath,
@@ -1387,9 +1388,9 @@ export async function runSummaryByRunId(
     process.exitCode = 1;
     return;
   }
-  let bundle: EvidenceBundle;
+  let parsed: unknown;
   try {
-    bundle = JSON.parse(raw) as EvidenceBundle;
+    parsed = JSON.parse(raw);
   } catch {
     console.error(
       `pipeline summary: summary.json for run '${runId}' is corrupt (invalid JSON)\n` +
@@ -1398,7 +1399,15 @@ export async function runSummaryByRunId(
     process.exitCode = 1;
     return;
   }
-  printSummary(bundle);
+  if (!isValidSummaryBundle(parsed)) {
+    console.error(
+      `pipeline summary: summary.json for run '${runId}' is missing required fields\n` +
+        `  Path: ${summaryPath}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  printSummary(parsed);
 }
 
 // ---------------------------------------------------------------------------

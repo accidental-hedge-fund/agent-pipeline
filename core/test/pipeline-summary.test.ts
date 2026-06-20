@@ -280,3 +280,20 @@ test("runSummaryByRunId: does not consult domain config — path derived from re
   assert.ok(receivedPath.startsWith(REPO_DIR), `path should start with REPO_DIR (${REPO_DIR}); got ${receivedPath}`);
   assert.ok(!receivedPath.includes("/tmp"), `path should not go through /tmp; got ${receivedPath}`);
 });
+
+test("runSummaryByRunId: exits non-zero with clear error for summary.json with missing required fields (#261)", async () => {
+  // {} is valid JSON but missing harnesses/stages/reviews/overrides/recoveries.
+  // Regression: before the fix, printSummary would throw instead of giving a clear error.
+  const deps: RunSummaryDeps = {
+    latestSummaryForIssue: async () => { throw new Error("should not be called"); },
+    readBundle: async () => { throw new Error("should not be called"); },
+    readFile: async (_p) => "{}",
+  };
+
+  const { errors, exitCode } = await withCapture(() => runSummaryByRunId(REPO_DIR, RUN_ID, deps));
+
+  assert.equal(exitCode, 1, `expected exitCode 1; got ${String(exitCode)}`);
+  const combined = errors.join("\n");
+  assert.ok(combined.includes("missing required fields"), `error should mention missing fields; got:\n${combined}`);
+  assert.ok(combined.includes(RUN_ID), `error should name the run-id; got:\n${combined}`);
+});

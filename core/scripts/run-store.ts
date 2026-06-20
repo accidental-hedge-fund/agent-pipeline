@@ -437,14 +437,29 @@ export async function listRunIds(
 // latestSummaryForIssue — for `pipeline N --summary` run-directory-first read
 // ---------------------------------------------------------------------------
 
+/** Minimal runtime check for the EvidenceBundle shape required by formatSummary.
+ *  Returns false if the value is not an object or any required array field is absent.
+ *  Used to treat missing-required-fields summaries as absent (spec §261). */
+export function isValidSummaryBundle(parsed: unknown): parsed is EvidenceBundle {
+  if (!parsed || typeof parsed !== "object") return false;
+  const b = parsed as Record<string, unknown>;
+  return (
+    Array.isArray(b.harnesses) &&
+    Array.isArray(b.stages) &&
+    Array.isArray(b.reviews) &&
+    Array.isArray(b.overrides) &&
+    Array.isArray(b.recoveries)
+  );
+}
+
 /** Return the EvidenceBundle from the most-recent `summary.json` for the given
  *  issue number, or `null` when none is found.
  *
  *  Scans all run directories whose run-id begins with `<issueNumber>-` (already
  *  sorted by mtime descending by `listRunIds`), reads `summary.json` from the
- *  first readable match, and parses it.  A missing file, unreadable file, or
- *  corrupt JSON is treated as absent and the next candidate is tried (so a
- *  single bad entry does not shadow a valid older run). */
+ *  first readable match, and parses it.  A missing file, unreadable file,
+ *  corrupt JSON, or a file missing required fields is treated as absent and the
+ *  next candidate is tried (so a single bad entry does not shadow a valid older run). */
 export async function latestSummaryForIssue(
   repoDir: string,
   issueNumber: number,
@@ -456,8 +471,8 @@ export async function latestSummaryForIssue(
     const summaryPath = path.join(runDirPath(repoDir, id), "summary.json");
     try {
       const raw = await deps.readFile(summaryPath);
-      const parsed = JSON.parse(raw) as EvidenceBundle;
-      if (parsed && typeof parsed === "object") return parsed;
+      const parsed = JSON.parse(raw);
+      if (isValidSummaryBundle(parsed)) return parsed;
     } catch {
       // Absent or corrupt — try next matching run
     }

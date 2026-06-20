@@ -10,6 +10,7 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  isValidSummaryBundle,
   latestSummaryForIssue,
   listRunIds,
   readEvents,
@@ -782,4 +783,73 @@ test("latestSummaryForIssue: returns null when all matching summaries are absent
 
   const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
   assert.equal(result, null, "expected null when all matching summaries are absent");
+});
+
+test("latestSummaryForIssue: treats summary.json with missing required fields as absent (#261)", async () => {
+  // {} is valid JSON but missing harnesses/stages/reviews/overrides/recoveries arrays.
+  // It must be treated as absent so the legacy fallback can be reached.
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`; // older, valid
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer, but missing fields
+  const bundle1 = makeSummaryBundle(ISSUE, id1);
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "summary.json")) return "{}";
+      if (p === path.join(dir, id1, "summary.json")) return JSON.stringify(bundle1);
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null, "expected a bundle from the older valid run");
+  assert.equal(result.runId, id1, "should skip the missing-fields entry and return the valid older run");
+});
+
+// ---------------------------------------------------------------------------
+// isValidSummaryBundle (#261)
+// ---------------------------------------------------------------------------
+
+test("isValidSummaryBundle: returns true for a complete bundle (#261)", () => {
+  const b = makeSummaryBundle(ISSUE, "run-1");
+  assert.equal(isValidSummaryBundle(b), true);
+});
+
+test("isValidSummaryBundle: returns false for null (#261)", () => {
+  assert.equal(isValidSummaryBundle(null), false);
+});
+
+test("isValidSummaryBundle: returns false for empty object (#261)", () => {
+  assert.equal(isValidSummaryBundle({}), false);
+});
+
+test("isValidSummaryBundle: returns false when harnesses is missing (#261)", () => {
+  const { harnesses, ...rest } = makeSummaryBundle(ISSUE, "run-1");
+  void harnesses;
+  assert.equal(isValidSummaryBundle(rest), false);
+});
+
+test("isValidSummaryBundle: returns false when stages is missing (#261)", () => {
+  const { stages, ...rest } = makeSummaryBundle(ISSUE, "run-1");
+  void stages;
+  assert.equal(isValidSummaryBundle(rest), false);
+});
+
+test("isValidSummaryBundle: returns false when reviews is missing (#261)", () => {
+  const { reviews, ...rest } = makeSummaryBundle(ISSUE, "run-1");
+  void reviews;
+  assert.equal(isValidSummaryBundle(rest), false);
 });
