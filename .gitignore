@@ -6,3 +6,13 @@ node_modules/
 
 # Pipeline worktrees (created under .claude/worktrees/ by the worktree policy)
 .claude/worktrees/
+
+# Pipeline worktree_root (default: .worktrees per CLAUDE.md) — pipeline-created
+# worktrees are never committed; without this, every /pipeline run on this repo
+# dirties `main` and trips the doctor `worktree-clean` preflight.
+.worktrees/
+
+# Pipeline run artifacts (per-run evidence bundles written under .agent-pipeline/runs/).
+# Committed eval-gate test fixtures under this path stay tracked (git does not untrack
+# them); only untracked run output is ignored so it no longer dirties the tree.
+.agent-pipeline/runs/
