@@ -1007,24 +1007,24 @@ export async function maybeArchiveOpenspec(
   });
   if (guard) return guard;
 
-  // Pre-archive cleanliness guard: if the worktree already has dirty state outside
-  // openspec/ paths, block — the commit-failure rollback (git restore . + git clean
-  // -fd openspec/) cannot safely recover without discarding those pre-existing changes.
+  // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
+  // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
+  // the worktree is fully clean before archive. Block on ANY pre-existing dirty state —
+  // a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
+  // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
+  // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
+  // matching only the first path misses. All planning/fix work is committed before pre-merge,
+  // so any non-empty status here is anomalous — fail safe rather than risk data loss.
   const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  const dirtyOutsideOpenspec = preArchiveStatus.stdout
-    .split("\n")
-    .map((line) => line.slice(3).trim())
-    .filter(Boolean)
-    .some((path) => !path.startsWith("openspec/"));
-  if (dirtyOutsideOpenspec) {
+  if (preArchiveStatus.stdout.trim() !== "") {
     await setBlockedFn(
       cfg,
       issueNumber,
-      "Worktree has pre-existing dirty state outside openspec/ paths; cannot safely roll back a failed archive commit. Clean or commit those changes first.",
+      "Worktree has pre-existing dirty (uncommitted) state before the OpenSpec archive; cannot safely roll back a failed archive commit without discarding it. Commit or stash those changes first.",
       "pre-merge",
       "openspec-invalid",
     );
-    return { advanced: false, status: "blocked", reason: "worktree dirty outside openspec/ before archive" };
+    return { advanced: false, status: "blocked", reason: "worktree dirty before archive" };
   }
 
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);

@@ -119,6 +119,7 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
   // candidates, masking re-introduced change directories. New code checks candidates
   // first and only skips when there are no active candidates to archive.
   const archiveCalls: string[] = [];
+  let archived = false;
   const CHANGE_ID = "pre-merge-gate-convergence";
   const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
 
@@ -127,12 +128,14 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
     openspecIsActive: () => true,
     gitInWorktree: (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
-      if (args[0] === "status") return { stdout: " M openspec/specs/x/spec.md", stderr: "", code: 0 };
+      // Clean before archive (passes the pre-archive cleanliness guard), dirty after.
+      if (args[0] === "status") return { stdout: archived ? " M openspec/specs/x/spec.md" : "", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
+      archived = true;
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
     setBlocked: async () => {},
@@ -261,12 +264,15 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
   // dirRestored tracks whether the fix performed the restoration that would let
   // changeDirExists return true on the retry run.
   let dirRestored = false;
+  // archived models worktree state: clean before `openspec archive` runs (passes the
+  // pre-archive cleanliness guard), dirty after (the archive's openspec/ changes to commit).
+  let archived = false;
 
   const makeGitFn = (commitCode: number): AdvancePreMergeDeps["gitInWorktree"] => {
     return (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
       if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
-      if (args[0] === "status") return { stdout: "M  openspec/specs/x.md", stderr: "", code: 0 };
+      if (args[0] === "status") return { stdout: archived ? "M  openspec/specs/x.md" : "", stderr: "", code: 0 };
       if (args[0] === "commit") return { stdout: "", stderr: "pre-commit hook rejected", code: commitCode };
       if (args[0] === "push") return { stdout: "", stderr: "", code: 0 };
       if (args[0] === "restore" || args[0] === "clean") {
@@ -286,7 +292,7 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       openspecIsActive: () => true,
       gitInWorktree: makeGitFn(1),
       changeDirExists: () => true,
-      openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+      openspecArchive: (async () => { archived = true; return { success: true, unavailable: false, output: "" }; }) as AdvancePreMergeDeps["openspecArchive"],
       setBlocked: async () => {},
       getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
       branchDeveloperCommits: async () => [],
@@ -301,7 +307,9 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
   );
   assert.ok(dirRestored, "restoration must be triggered so changeDirExists returns true on retry");
 
-  // Run 2: retry after block is cleared — dir is present because run 1 restored it
+  // Run 2: retry after block is cleared — dir is present because run 1 restored it.
+  // The commit-failure rollback restored the tree, so it is clean again before run 2's archive.
+  archived = false;
   const archiveCallsRun2: string[] = [];
   let run2;
   await quiet(t, async () => {
@@ -312,6 +320,7 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       changeDirExists: () => dirRestored, // true because run 1 restored the dir
       openspecArchive: (async (_w: string, id: string) => {
         archiveCallsRun2.push(id);
+        archived = true;
         return { success: true, unavailable: false, output: "" };
       }) as AdvancePreMergeDeps["openspecArchive"],
       setBlocked: async () => {},
