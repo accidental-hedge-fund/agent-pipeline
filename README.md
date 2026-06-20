@@ -374,6 +374,15 @@ base_branch: main
 worktree_root: .worktrees
 review_timeout: 1200
 ci_timeout: 900
+intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
+sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
+models:                            # per-phase model alias — only the claude harness honors these
+  planning: sonnet                 # planning / implementing / fix → implementer harness
+  implementing: sonnet
+  review: opus                     # review → reviewer harness
+  fix: sonnet
+  intake: sonnet                   # intake spec-generation (always the claude harness; set "haiku" for max speed)
+  sweep: sonnet                    # sweep spec-generation (always the claude harness)
 conventions_md_path: CLAUDE.md     # excerpt embedded in prompts
 domain_name: my-service
 domain_description: a payments service
