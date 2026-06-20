@@ -132,11 +132,13 @@ export async function retryComment(
 export interface ReconcileAuditDeps {
   postComment: (cfg: PipelineConfig, n: number, body: string) => Promise<void>;
   warn: (msg: string) => void;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Scan the most-recent `comments` (up to 20) for an HTML audit sentinel whose
  *  `state` attribute matches `currentState`. If found, returns immediately (no-op).
- *  If not found, posts `commentBody` as a repair comment and logs a warning via `deps.warn`. */
+ *  If not found, posts `commentBody` as a repair comment (with up to 3 retries) and
+ *  logs a warning via `deps.warn`. Re-throws on exhaustion so the caller can surface the failure. */
 export async function reconcileAuditComment(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -153,7 +155,7 @@ export async function reconcileAuditComment(
   deps.warn(
     `[pipeline] #${issueNumber}: audit sentinel for state=${currentState} (run=${runId}) missing from recent comments; posting repair`,
   );
-  await deps.postComment(cfg, issueNumber, commentBody);
+  await retryComment(() => deps.postComment(cfg, issueNumber, commentBody), 3, deps.sleep);
 }
 
 // Stage priority for picking the "furthest along" pipeline label when multiple

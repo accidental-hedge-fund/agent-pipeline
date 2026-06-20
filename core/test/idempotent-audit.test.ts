@@ -155,6 +155,41 @@ test("reconcileAuditComment: only scans the last 20 comments", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// reconcileAuditComment — retry on transient failure, propagate on exhaustion
+// ---------------------------------------------------------------------------
+
+test("reconcileAuditComment: retries postComment on transient failure and resolves", async () => {
+  let calls = 0;
+  const sleeps: number[] = [];
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => {
+      calls++;
+      if (calls === 1) throw new Error("transient");
+    },
+    warn: () => {},
+    sleep: async (ms) => { sleeps.push(ms); },
+  };
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "run-x", "body", [], deps);
+  assert.equal(calls, 2, "must retry once and succeed");
+  assert.equal(sleeps.length, 1, "must sleep once between attempts");
+});
+
+test("reconcileAuditComment: propagates error when all retries fail (no silent swallow)", async () => {
+  let calls = 0;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { calls++; throw new Error("persistent"); },
+    warn: () => {},
+    sleep: async () => {},
+  };
+  await assert.rejects(
+    () => reconcileAuditComment(fakeCfg, 42, "fix-1", "run-x", "body", [], deps),
+    /persistent/,
+    "must propagate error, not swallow it",
+  );
+  assert.equal(calls, 3, "must exhaust all 3 attempts");
+});
+
+// ---------------------------------------------------------------------------
 // reconcileAuditComment — idempotent across two calls
 // ---------------------------------------------------------------------------
 

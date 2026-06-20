@@ -1831,7 +1831,8 @@ async function runAdvance(
 
       // Reconcile audit comments (#259): if a prior run's label write succeeded but its
       // comment post failed, the sentinel is missing. Detect and repair the gap.
-      // Skip manually-applied entry-point stages ("ready", "backlog") — they have no sentinel.
+      // Skip stage-sentinel repair for manually-applied entry-point stages ("ready", "backlog")
+      // since those are never created by transition() and have no sentinel to repair.
       if (!opts.dryRun && stage !== "ready" && stage !== "backlog") {
         const repairBody = [
           `## Pipeline: Audit Repair`,
@@ -1845,22 +1846,24 @@ async function runAdvance(
         ].join("\n");
         await reconcileAuditComment(
           cfg, issueNumber, stage, pipelineRunId, repairBody, detail.comments,
-        ).catch(() => {});
-        if (isBlocked(detail.labels)) {
-          const blockedRepairBody = [
-            `## Pipeline: Audit Repair`,
-            ``,
-            `The audit sentinel for \`blocked\` state was missing from the recent comment history. Posting retroactively.`,
-            ``,
-            buildAuditSentinel(pipelineRunId, "blocked"),
-            ``,
-            `---`,
-            `*Automated by Claude Code Pipeline Skill*`,
-          ].join("\n");
-          await reconcileAuditComment(
-            cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments,
-          ).catch(() => {});
-        }
+        );
+      }
+      // Blocked-sentinel repair runs regardless of stage — an issue can be blocked while at
+      // pipeline:ready (label write succeeded, comment post failed) and we must not skip it.
+      if (!opts.dryRun && isBlocked(detail.labels)) {
+        const blockedRepairBody = [
+          `## Pipeline: Audit Repair`,
+          ``,
+          `The audit sentinel for \`blocked\` state was missing from the recent comment history. Posting retroactively.`,
+          ``,
+          buildAuditSentinel(pipelineRunId, "blocked"),
+          ``,
+          `---`,
+          `*Automated by Claude Code Pipeline Skill*`,
+        ].join("\n");
+        await reconcileAuditComment(
+          cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments,
+        );
       }
 
       if (stage === "ready-to-deploy") {
