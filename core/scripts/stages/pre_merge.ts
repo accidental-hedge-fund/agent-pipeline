@@ -1033,6 +1033,13 @@ export async function maybeArchiveOpenspec(
   );
   if (commit.code !== 0) {
     const detail = commit.stderr.trim() || commit.stdout.trim() || "(no output)";
+    // Restore the worktree to its pre-archive state so the next run can retry.
+    // openspec archive removed openspec/changes/<id>/ and modified openspec/specs/;
+    // without this, changeDirExists returns false on retry and candidates is empty,
+    // letting pre-merge continue without the required archive commit.
+    await gitFn(wt.path, ["restore", "--staged", "."], { ignoreFailure: true });
+    await gitFn(wt.path, ["restore", "."], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd", "openspec/"], { ignoreFailure: true });
     await setBlockedFn(
       cfg,
       issueNumber,

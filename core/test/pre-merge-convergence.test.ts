@@ -3,6 +3,9 @@
 //      runs at most once per branch, even across many polling iterations.
 //   2. CI failure with rebase guard exhausted blocks to needs-human immediately
 //      rather than looping until the iteration cap.
+// Pre-merge archive commit failure recovery (#255):
+//   3. When git commit fails after openspec archive, restore the worktree so the
+//      next run's changeDirExists check still finds the active change directory.
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -240,4 +243,84 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
   assert.equal(blockedCalls.length, 1, "setBlocked must be called exactly once");
   assert.equal(blockedCalls[0].label, "needs-human", "label must be needs-human");
   assert.match(blockedCalls[0].reason, /clippy/, "failing check name must appear in reason");
+});
+
+// ---------------------------------------------------------------------------
+// 5. maybeArchiveOpenspec: restores worktree after commit failure (#255)
+// ---------------------------------------------------------------------------
+
+test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun can retry archive", async (t) => {
+  // Regression for #255: when openspec archive deletes openspec/changes/<id>/ and
+  // the subsequent git commit fails, the next run must still find the candidate via
+  // changeDirExists. Without restoration, candidates is empty and pre-merge proceeds
+  // without the required archive commit.
+  const CHANGE_ID = "block-pre-merge-255";
+  const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
+
+  const restorationCalls: string[][] = [];
+  // dirRestored tracks whether the fix performed the restoration that would let
+  // changeDirExists return true on the retry run.
+  let dirRestored = false;
+
+  const makeGitFn = (commitCode: number): AdvancePreMergeDeps["gitInWorktree"] => {
+    return (async (_p: string, args: string[]) => {
+      if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+      if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "status") return { stdout: "M openspec/specs/x.md", stderr: "", code: 0 };
+      if (args[0] === "commit") return { stdout: "", stderr: "pre-commit hook rejected", code: commitCode };
+      if (args[0] === "push") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "restore" || args[0] === "clean") {
+        restorationCalls.push([...args]);
+        dirRestored = true;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"];
+  };
+
+  // Run 1: archive succeeds but commit fails → must block and restore
+  let run1;
+  await quiet(t, async () => {
+    run1 = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", {
+      getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+      openspecIsActive: () => true,
+      gitInWorktree: makeGitFn(1),
+      changeDirExists: () => true,
+      openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+      setBlocked: async () => {},
+      getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+      branchDeveloperCommits: async () => [],
+    });
+  });
+
+  assert.equal((run1 as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.reason, "archive commit failed",
+    "run 1 must block on commit failure");
+  assert.ok(
+    restorationCalls.some((a) => a[0] === "restore" && a.includes("--staged")),
+    "git restore --staged must be called to undo staged archive changes",
+  );
+  assert.ok(dirRestored, "restoration must be triggered so changeDirExists returns true on retry");
+
+  // Run 2: retry after block is cleared — dir is present because run 1 restored it
+  const archiveCallsRun2: string[] = [];
+  let run2;
+  await quiet(t, async () => {
+    run2 = await maybeArchiveOpenspec(cfg, ISSUE, "run-2", {
+      getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+      openspecIsActive: () => true,
+      gitInWorktree: makeGitFn(0),
+      changeDirExists: () => dirRestored, // true because run 1 restored the dir
+      openspecArchive: (async (_w: string, id: string) => {
+        archiveCallsRun2.push(id);
+        return { success: true, unavailable: false, output: "" };
+      }) as AdvancePreMergeDeps["openspecArchive"],
+      setBlocked: async () => {},
+      getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+      branchDeveloperCommits: async () => [],
+    });
+  });
+
+  assert.deepEqual(archiveCallsRun2, [CHANGE_ID], "archive must be called on the retry run");
+  assert.equal((run2 as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.status, "waiting",
+    "retry run must complete archive and return waiting");
 });
