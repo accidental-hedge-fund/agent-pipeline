@@ -3,6 +3,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  addIssueComment,
+  createIssue,
   extractHumanPlanComments,
   getHarnessLabel,
   getIssueLabelEvents,
@@ -691,5 +693,107 @@ test("getOpenIssues pagination: non-slurped multi-page JSON is invalid and JSON.
   assert.throws(
     () => JSON.parse(nonSlurpedStdout),
     "multi-page non-slurped stdout must throw on JSON.parse to document why --slurp is required",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// createIssue / addIssueComment — shared gh.ts helpers (#256)
+// ---------------------------------------------------------------------------
+
+const GH_WRITE_CFG = {
+  repo: "accidental-hedge-fund/agent-pipeline",
+  repo_dir: "/tmp",
+} as PipelineConfig;
+
+test("createIssue: correct gh args and issue-number extraction", async () => {
+  let capturedArgs: string[] = [];
+  const fakeRun: GhApiRunner = async (args) => {
+    capturedArgs = args;
+    return "https://github.com/accidental-hedge-fund/agent-pipeline/issues/42\n";
+  };
+  const num = await createIssue(GH_WRITE_CFG, "My title", "My body", ["bug", "P2"], fakeRun);
+  assert.equal(num, 42);
+  assert.ok(capturedArgs.includes("issue"), "must use 'issue' subcommand");
+  assert.ok(capturedArgs.includes("create"), "must use 'create' subcommand");
+  assert.equal(capturedArgs[capturedArgs.indexOf("--title") + 1], "My title");
+  assert.equal(capturedArgs[capturedArgs.indexOf("--body") + 1], "My body");
+  assert.equal(capturedArgs[capturedArgs.indexOf("-R") + 1], GH_WRITE_CFG.repo);
+  // Each label must appear after a --label flag.
+  const labelIdxs = capturedArgs
+    .map((a, i) => (a === "--label" ? i : -1))
+    .filter((i) => i >= 0);
+  assert.equal(labelIdxs.length, 2, "must pass one --label per label");
+  assert.deepEqual(
+    labelIdxs.map((i) => capturedArgs[i + 1]),
+    ["bug", "P2"],
+  );
+});
+
+test("createIssue: works with no labels", async () => {
+  const fakeRun: GhApiRunner = async () =>
+    "https://github.com/accidental-hedge-fund/agent-pipeline/issues/7\n";
+  const num = await createIssue(GH_WRITE_CFG, "Title", "Body", [], fakeRun);
+  assert.equal(num, 7);
+});
+
+test("createIssue: non-zero exit propagates as an error", async () => {
+  const fakeRun: GhApiRunner = async () => {
+    throw new Error("gh issue create failed: rate limit exceeded");
+  };
+  await assert.rejects(
+    () => createIssue(GH_WRITE_CFG, "T", "B", [], fakeRun),
+    /rate limit exceeded/,
+  );
+});
+
+test("createIssue: unparseable url throws descriptive error", async () => {
+  const fakeRun: GhApiRunner = async () => "not-a-url\n";
+  await assert.rejects(
+    () => createIssue(GH_WRITE_CFG, "T", "B", [], fakeRun),
+    /could not parse issue number/,
+  );
+});
+
+test("createIssue: timeout surfaces as an error rather than hanging", async () => {
+  const fakeRun: GhApiRunner = async () => {
+    throw Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" });
+  };
+  await assert.rejects(
+    () => createIssue(GH_WRITE_CFG, "T", "B", [], fakeRun),
+    /ETIMEDOUT/,
+  );
+});
+
+test("addIssueComment: correct gh args", async () => {
+  let capturedArgs: string[] = [];
+  const fakeRun: GhApiRunner = async (args) => {
+    capturedArgs = args;
+    return "";
+  };
+  await addIssueComment(GH_WRITE_CFG, 99, "Hello world", fakeRun);
+  assert.ok(capturedArgs.includes("issue"), "must use 'issue' subcommand");
+  assert.ok(capturedArgs.includes("comment"), "must use 'comment' subcommand");
+  assert.equal(capturedArgs[capturedArgs.indexOf("comment") + 1], "99");
+  assert.equal(capturedArgs[capturedArgs.indexOf("--body") + 1], "Hello world");
+  assert.equal(capturedArgs[capturedArgs.indexOf("-R") + 1], GH_WRITE_CFG.repo);
+});
+
+test("addIssueComment: non-zero exit propagates as an error", async () => {
+  const fakeRun: GhApiRunner = async () => {
+    throw new Error("gh issue comment failed: Not Found");
+  };
+  await assert.rejects(
+    () => addIssueComment(GH_WRITE_CFG, 1, "body", fakeRun),
+    /Not Found/,
+  );
+});
+
+test("addIssueComment: timeout surfaces as an error rather than hanging", async () => {
+  const fakeRun: GhApiRunner = async () => {
+    throw Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" });
+  };
+  await assert.rejects(
+    () => addIssueComment(GH_WRITE_CFG, 1, "body", fakeRun),
+    /ETIMEDOUT/,
   );
 });
