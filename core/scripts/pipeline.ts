@@ -877,10 +877,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!opts.dryRun) {
-    await ensurePipelineLabels(cfg);
-  }
-
   await runAdvance(cfg, issueNumber, opts);
 }
 
@@ -1496,7 +1492,6 @@ export async function handleRunSubcommand(
     return;
   }
 
-  if (!opts.dryRun) await ensurePipelineLabels(cfg);
   await runAdvance(cfg, number, opts);
 }
 
@@ -1701,6 +1696,9 @@ async function runAdvance(
     // Instantiate a metrics collector for this dispatch cycle (#257).
     const ghCollector = new GhMetricsCollector();
     setGhCollector(ghCollector);
+    // Ensure pipeline labels exist inside the collector scope so label-list/create
+    // calls are captured in the run's gh_metrics_summary (#257 finding 1).
+    if (!opts.dryRun) await ensurePipelineLabels(cfg);
     try {
     const startDetail = await getIssueDetail(cfg, issueNumber);
     if (startDetail.state === "closed") {
@@ -2128,12 +2126,13 @@ async function runAdvance(
             await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
           }
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
-          // Emit gh_metrics_summary after notification so all run-scoped gh calls are captured (#257).
-          if (runDir) {
-            await emitGhMetrics(runDir, ghCollector.summary(), runStoreDeps).catch(() => {});
-          }
         } catch {
           /* audit-only — ignore */
+        }
+        // Emit gh_metrics_summary unconditionally after the notification attempt so
+        // a notification failure does not suppress the summary (#257 finding 2).
+        if (runDir) {
+          await emitGhMetrics(runDir, ghCollector.summary(), runStoreDeps).catch(() => {});
         }
       }
     }
