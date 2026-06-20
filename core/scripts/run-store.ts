@@ -434,6 +434,93 @@ export async function listRunIds(
 }
 
 // ---------------------------------------------------------------------------
+// latestSummaryForIssue — for `pipeline N --summary` run-directory-first read
+// ---------------------------------------------------------------------------
+
+/** Minimal runtime check for the EvidenceBundle shape required by formatSummary.
+ *  Returns false if the value is not an object, any required array field is absent,
+ *  or any nested stage/review entry is missing the fields that formatSummary accesses
+ *  directly (stage.stage, stage.commands, review.sha, review.verdict, review.round,
+ *  review.findingCounts).  Used to treat missing-required-fields summaries as absent
+ *  for fallback purposes (spec §261). */
+export function isValidSummaryBundle(parsed: unknown): parsed is EvidenceBundle {
+  if (!parsed || typeof parsed !== "object") return false;
+  const b = parsed as Record<string, unknown>;
+  if (
+    !Array.isArray(b.harnesses) ||
+    !Array.isArray(b.stages) ||
+    !Array.isArray(b.reviews) ||
+    !Array.isArray(b.overrides) ||
+    !Array.isArray(b.recoveries)
+  ) return false;
+  for (const s of b.stages as unknown[]) {
+    if (!s || typeof s !== "object") return false;
+    const sr = s as Record<string, unknown>;
+    if (typeof sr.stage !== "string" || !Array.isArray(sr.commands)) return false;
+    // formatSummary dereferences each command's cmd/exitCode/durationMs; a malformed
+    // element (e.g. null, or missing fields) would crash the formatter, so a bundle with
+    // any such command must be treated as absent for fallback (not a valid bundle).
+    for (const c of sr.commands as unknown[]) {
+      if (!c || typeof c !== "object") return false;
+      const cr = c as Record<string, unknown>;
+      if (typeof cr.cmd !== "string" || typeof cr.exitCode !== "number" || typeof cr.durationMs !== "number") return false;
+    }
+  }
+  for (const r of b.reviews as unknown[]) {
+    if (!r || typeof r !== "object") return false;
+    const rr = r as Record<string, unknown>;
+    if (
+      typeof rr.sha !== "string" ||
+      typeof rr.verdict !== "string" ||
+      typeof rr.round !== "number" ||
+      !rr.findingCounts ||
+      typeof rr.findingCounts !== "object"
+    ) return false;
+  }
+  // formatSummary also dereferences each override (o.key / o.reason) and recovery
+  // (rec.trigger / rec.round / rec.at); validate those element shapes too.
+  for (const o of b.overrides as unknown[]) {
+    if (!o || typeof o !== "object") return false;
+    const or = o as Record<string, unknown>;
+    if (typeof or.key !== "string" || typeof or.reason !== "string") return false;
+  }
+  for (const rec of b.recoveries as unknown[]) {
+    if (!rec || typeof rec !== "object") return false;
+    const rr = rec as Record<string, unknown>;
+    if (typeof rr.trigger !== "string" || typeof rr.round !== "number" || typeof rr.at !== "string") return false;
+  }
+  return true;
+}
+
+/** Return the EvidenceBundle from the most-recent `summary.json` for the given
+ *  issue number, or `null` when none is found.
+ *
+ *  Scans all run directories whose run-id begins with `<issueNumber>-` (already
+ *  sorted by mtime descending by `listRunIds`), reads `summary.json` from the
+ *  first readable match, and parses it.  A missing file, unreadable file,
+ *  corrupt JSON, or a file missing required fields is treated as absent and the
+ *  next candidate is tried (so a single bad entry does not shadow a valid older run). */
+export async function latestSummaryForIssue(
+  repoDir: string,
+  issueNumber: number,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<EvidenceBundle | null> {
+  const allIds = await listRunIds(repoDir, deps);
+  const prefix = `${issueNumber}-`;
+  for (const id of allIds.filter((rid) => rid.startsWith(prefix))) {
+    const summaryPath = path.join(runDirPath(repoDir, id), "summary.json");
+    try {
+      const raw = await deps.readFile(summaryPath);
+      const parsed = JSON.parse(raw);
+      if (isValidSummaryBundle(parsed)) return parsed;
+    } catch {
+      // Absent or corrupt — try next matching run
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Terminal log tee — patches process.stdout/stderr to mirror output to a file.
 // Separate from the injectable deps pattern: this operates on global process state.
 // ---------------------------------------------------------------------------

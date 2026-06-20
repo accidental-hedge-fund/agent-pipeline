@@ -61,6 +61,8 @@ $pipeline --init                         ensure labels + scaffold .github/pipeli
 $pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
 $pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
 $pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+$pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
+$pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 

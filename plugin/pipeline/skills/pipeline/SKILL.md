@@ -70,6 +70,8 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
 /pipeline roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+/pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
+/pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 

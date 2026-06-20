@@ -67,6 +67,8 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  isValidSummaryBundle,
+  latestSummaryForIssue,
   listRunIds,
   runDirPath,
   runIdFor,
@@ -100,6 +102,7 @@ import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
   reviewStageSkipTarget,
+  type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
   type Stage,
@@ -243,7 +246,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -322,6 +325,27 @@ async function main(): Promise<void> {
         ? logsArg
         : undefined;
     await runLogs(repoDir, logsRunId, !!opts.follow);
+    return;
+  }
+
+  // `pipeline summary <run-id>` — exact-selection form: print summary.json from a
+  // specific run directory without requiring domain config or an issue number (#261).
+  // Dispatched early (before config/gh resolution) like `logs`, since it is
+  // domain-independent and must work offline.
+  if (numArg === "summary") {
+    const summaryStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(summaryStart) ?? summaryStart;
+    const summaryRunId = cmd.args[1];
+    if (!summaryRunId) {
+      console.error(
+        "pipeline summary: a run-id argument is required.\n" +
+          "  Usage: pipeline summary <run-id>\n" +
+          "  Example: pipeline summary 147-2026-06-20T10-00-00-000Z\n" +
+          "  Tip:    pipeline logs   (lists available run-ids)",
+      );
+      process.exit(2);
+    }
+    await runSummaryByRunId(repoDir, summaryRunId);
     return;
   }
 
@@ -703,7 +727,7 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "triage", "merge"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "triage", "merge", "summary"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
@@ -800,7 +824,7 @@ async function main(): Promise<void> {
   // kill-switch check, label-ensure, or lock — and treats <number> as the issue
   // number the bundle is keyed by.
   if (opts.summary) {
-    await runSummary(cfg, number);
+    await runSummary(cfg, number, cfg.repo_dir);
     return;
   }
 
@@ -1293,25 +1317,97 @@ function ceilingFindingLines(body: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Summary mode (#147): print the evidence bundle for an issue and exit. Read-only;
-// never enters the dispatch loop or mutates GitHub.
+// Summary mode (#147 / #261): print the evidence bundle for an issue and exit.
+// Read-only; never enters the dispatch loop or mutates GitHub.
 // ---------------------------------------------------------------------------
 
-export async function runSummary(cfg: PipelineConfig, issueNumber: number): Promise<void> {
+/** Injectable I/O seam for {@link runSummary} and {@link runSummaryByRunId}. */
+export interface RunSummaryDeps {
+  /** Read the most-recent run-directory summary.json for the issue (run-store path). */
+  latestSummaryForIssue: (repoDir: string, issueNumber: number) => Promise<EvidenceBundle | null>;
+  /** Read the legacy evidence bundle from the /tmp state dir (legacy path). */
+  readBundle: (stateDir: string, issueNumber: number) => Promise<EvidenceBundle | null>;
+  /** Raw file read for exact-run-id lookup (runSummaryByRunId). */
+  readFile: (p: string) => Promise<string>;
+}
+
+const defaultRunSummaryDeps: RunSummaryDeps = {
+  latestSummaryForIssue,
+  readBundle,
+  readFile: defaultRunStoreDeps.readFile,
+};
+
+/** `pipeline N --summary` (#261): prefer the run-directory summary.json for the
+ *  most-recent run matching the issue; fall back to the legacy /tmp evidence
+ *  bundle only when no run-directory summary is readable. */
+export async function runSummary(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  repoDir: string,
+  deps: RunSummaryDeps = defaultRunSummaryDeps,
+): Promise<void> {
   const stateDir = runStateDir(cfg.domain);
-  // readBundle returns null when absent; a corrupt/unreadable file throws — treat
-  // both as "no usable bundle" and exit non-zero so the failure is visible.
-  const bundle = await readBundle(stateDir, issueNumber).catch(() => null);
+
+  // Priority 1: run-directory summary.json (durable, survives reboots).
+  const runDirBundle = await deps.latestSummaryForIssue(repoDir, issueNumber).catch(() => null);
+
+  // Priority 2: legacy /tmp evidence.json. Catch any error (corrupt JSON, etc.)
+  // and treat it as absent — the error message below names both locations.
+  const bundle = runDirBundle ?? (await deps.readBundle(stateDir, issueNumber).catch(() => null));
+
   if (!bundle) {
     console.error(
-      `pipeline: no evidence bundle found for #${issueNumber} ` +
-        `(expected ${bundlePath(stateDir, issueNumber)}). ` +
+      `pipeline: no evidence bundle found for #${issueNumber}.\n` +
+        `  Run-directory: ${runsDir(repoDir)}/${issueNumber}-*/summary.json\n` +
+        `  Legacy path:   ${bundlePath(stateDir, issueNumber)}\n` +
         `A bundle is written once the pipeline runs on this issue.`,
     );
     process.exitCode = 1;
     return;
   }
   printSummary(bundle);
+}
+
+/** `pipeline summary <run-id>` (#261): print summary.json from an exact run
+ *  directory without requiring domain config or an issue number. Domain-independent:
+ *  the run directory is located from the repo root alone. */
+export async function runSummaryByRunId(
+  repoDir: string,
+  runId: string,
+  deps: RunSummaryDeps = defaultRunSummaryDeps,
+): Promise<void> {
+  const summaryPath = path.join(runDirPath(repoDir, runId), "summary.json");
+  let raw: string;
+  try {
+    raw = await deps.readFile(summaryPath);
+  } catch {
+    console.error(
+      `pipeline summary: no summary.json found for run '${runId}'\n` +
+        `  Expected: ${summaryPath}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error(
+      `pipeline summary: summary.json for run '${runId}' is corrupt (invalid JSON)\n` +
+        `  Path: ${summaryPath}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (!isValidSummaryBundle(parsed)) {
+    console.error(
+      `pipeline summary: summary.json for run '${runId}' is missing required fields\n` +
+        `  Path: ${summaryPath}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  printSummary(parsed);
 }
 
 // ---------------------------------------------------------------------------

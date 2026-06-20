@@ -10,6 +10,8 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  isValidSummaryBundle,
+  latestSummaryForIssue,
   listRunIds,
   readEvents,
   runDirPath,
@@ -646,4 +648,275 @@ test("emitGhMetrics after finalizeRun: notification calls included in emitted su
 
   const metricsEvent = events[metricsIdx];
   assert.equal(metricsEvent.call_count, 2, "summary must reflect both notification gh calls");
+});
+
+// ---------------------------------------------------------------------------
+// latestSummaryForIssue (#261)
+// ---------------------------------------------------------------------------
+
+function makeSummaryBundle(issue: number, runId: string): EvidenceBundle {
+  return {
+    schema_version: 1,
+    schemaVersion: 1,
+    runId,
+    issue,
+    pr: null,
+    branch: null,
+    harnesses: [],
+    stages: [],
+    reviews: [],
+    overrides: [],
+    recoveries: [],
+    finalState: "ready-to-deploy",
+    finalizedAt: null,
+    notifiedAt: null,
+  };
+}
+
+test("latestSummaryForIssue: returns null when runs dir is absent (#261)", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => { const e = new Error("ENOENT") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; },
+    stat: async () => ({ mtime: new Date() }),
+  };
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null, "expected null when runs dir is absent");
+});
+
+test("latestSummaryForIssue: returns null when no run matches the issue prefix (#261)", async () => {
+  const dirs = [{ name: "999-2026-06-20T10-00-00-000Z", isDirectory: () => true }];
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => dirs,
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null, "expected null when no run-id matches the issue prefix");
+});
+
+test("latestSummaryForIssue: returns bundle from the most-recent matching run (#261)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`;
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer
+  const bundle1 = makeSummaryBundle(ISSUE, id1);
+  const bundle2 = makeSummaryBundle(ISSUE, id2);
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "summary.json")) return JSON.stringify(bundle2);
+      if (p === path.join(dir, id1, "summary.json")) return JSON.stringify(bundle1);
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      // id2 is newer
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null, "expected a bundle");
+  assert.equal(result.runId, id2, "expected the most-recent run's bundle");
+});
+
+test("latestSummaryForIssue: skips corrupt summary.json and falls back to older run (#261)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`; // older, but valid
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer, but corrupt
+  const bundle1 = makeSummaryBundle(ISSUE, id1);
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "summary.json")) return "not-valid-json{{{";
+      if (p === path.join(dir, id1, "summary.json")) return JSON.stringify(bundle1);
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null, "expected a bundle from the older valid run");
+  assert.equal(result.runId, id1, "should fall back to the older valid run");
+});
+
+test("latestSummaryForIssue: returns null when all matching summaries are absent or corrupt (#261)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T10-00-00-000Z`;
+
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [{ name: id1, isDirectory: () => true }],
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null, "expected null when all matching summaries are absent");
+});
+
+test("latestSummaryForIssue: treats summary.json with missing required fields as absent (#261)", async () => {
+  // {} is valid JSON but missing harnesses/stages/reviews/overrides/recoveries arrays.
+  // It must be treated as absent so the legacy fallback can be reached.
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`; // older, valid
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer, but missing fields
+  const bundle1 = makeSummaryBundle(ISSUE, id1);
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "summary.json")) return "{}";
+      if (p === path.join(dir, id1, "summary.json")) return JSON.stringify(bundle1);
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null, "expected a bundle from the older valid run");
+  assert.equal(result.runId, id1, "should skip the missing-fields entry and return the valid older run");
+});
+
+// ---------------------------------------------------------------------------
+// isValidSummaryBundle (#261)
+// ---------------------------------------------------------------------------
+
+test("isValidSummaryBundle: returns true for a complete bundle (#261)", () => {
+  const b = makeSummaryBundle(ISSUE, "run-1");
+  assert.equal(isValidSummaryBundle(b), true);
+});
+
+test("isValidSummaryBundle: returns false for null (#261)", () => {
+  assert.equal(isValidSummaryBundle(null), false);
+});
+
+test("isValidSummaryBundle: returns false for empty object (#261)", () => {
+  assert.equal(isValidSummaryBundle({}), false);
+});
+
+test("isValidSummaryBundle: returns false when harnesses is missing (#261)", () => {
+  const { harnesses, ...rest } = makeSummaryBundle(ISSUE, "run-1");
+  void harnesses;
+  assert.equal(isValidSummaryBundle(rest), false);
+});
+
+test("isValidSummaryBundle: returns false when stages is missing (#261)", () => {
+  const { stages, ...rest } = makeSummaryBundle(ISSUE, "run-1");
+  void stages;
+  assert.equal(isValidSummaryBundle(rest), false);
+});
+
+test("isValidSummaryBundle: returns false when reviews is missing (#261)", () => {
+  const { reviews, ...rest } = makeSummaryBundle(ISSUE, "run-1");
+  void reviews;
+  assert.equal(isValidSummaryBundle(rest), false);
+});
+
+// Regression tests for nested record validation (review-2 finding: stages:[{}] crashes formatSummary)
+test("isValidSummaryBundle: returns false for stage entry missing required fields (#261)", () => {
+  // {} passes the top-level array check but formatSummary crashes on s.commands iteration
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{}] };
+  assert.equal(isValidSummaryBundle(b), false, "stage missing stage+commands should be rejected");
+});
+
+test("isValidSummaryBundle: returns false for stage entry with stage but missing commands (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning" }] };
+  assert.equal(isValidSummaryBundle(b), false, "stage missing commands array should be rejected");
+});
+
+test("isValidSummaryBundle: returns true for stage entry with required fields present (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning", outcome: null, commands: [], enteredAt: null, exitedAt: null, commits: [], prompts: [] }] };
+  assert.equal(isValidSummaryBundle(b), true, "stage with required fields should be accepted");
+});
+
+test("isValidSummaryBundle: returns false for review entry missing required fields (#261)", () => {
+  // {} passes the top-level array check but formatSummary crashes on r.findingCounts / r.sha
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{}] };
+  assert.equal(isValidSummaryBundle(b), false, "review missing sha/verdict/round/findingCounts should be rejected");
+});
+
+test("isValidSummaryBundle: returns false for review entry missing sha (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{ round: 1, verdict: "approved", findingCounts: {} }] };
+  assert.equal(isValidSummaryBundle(b), false, "review missing sha should be rejected");
+});
+
+test("isValidSummaryBundle: returns true for review entry with required fields present (#261)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), reviews: [{ round: 1, sha: "abc1234", verdict: "approved", findingCounts: {} }] };
+  assert.equal(isValidSummaryBundle(b), true, "review with required fields should be accepted");
+});
+
+// Regression (#261 pre-merge review): the validator must also reject malformed nested
+// command / override / recovery entries — formatSummary dereferences c.cmd/exitCode/
+// durationMs, o.key/reason, rec.trigger/round/at, so a null or partial element would crash
+// the formatter and must be treated as absent (invalid bundle) for fallback.
+test("isValidSummaryBundle: returns false for a null command entry — commands:[null] (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning", commands: [null] }] };
+  assert.equal(isValidSummaryBundle(b), false, "a non-object command must be rejected");
+});
+
+test("isValidSummaryBundle: returns false for a command missing exitCode/durationMs (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), stages: [{ stage: "planning", commands: [{ cmd: "npm test" }] }] };
+  assert.equal(isValidSummaryBundle(b), false, "a command missing exitCode/durationMs must be rejected");
+});
+
+test("isValidSummaryBundle: returns false for a null override entry — overrides:[null] (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), overrides: [null] };
+  assert.equal(isValidSummaryBundle(b), false, "a non-object override must be rejected");
+});
+
+test("isValidSummaryBundle: returns false for a null recovery entry — recoveries:[null] (#261 review)", () => {
+  const b = { ...makeSummaryBundle(ISSUE, "run-1"), recoveries: [null] };
+  assert.equal(isValidSummaryBundle(b), false, "a non-object recovery must be rejected");
+});
+
+test("isValidSummaryBundle: returns true for well-formed nested command/override/recovery entries (#261 review)", () => {
+  const b = {
+    ...makeSummaryBundle(ISSUE, "run-1"),
+    stages: [{ stage: "planning", outcome: null, commands: [{ cmd: "npm test", exitCode: 0, durationMs: 12, outputExcerpt: "" }], enteredAt: null, exitedAt: null, commits: [], prompts: [] }],
+    overrides: [{ key: "high|f.ts|t", reason: "audited" }],
+    recoveries: [{ trigger: "harness-timeout", round: 1, at: "2026-06-20T00:00:00Z" }],
+  };
+  assert.equal(isValidSummaryBundle(b), true, "well-formed nested entries must be accepted");
 });
