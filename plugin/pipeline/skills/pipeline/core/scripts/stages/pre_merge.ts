@@ -1007,6 +1007,38 @@ export async function maybeArchiveOpenspec(
   });
   if (guard) return guard;
 
+  // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
+  // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
+  // the worktree is fully clean before archive. Block on ANY pre-existing dirty state —
+  // a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
+  // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
+  // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
+  // matching only the first path misses. All planning/fix work is committed before pre-merge,
+  // so any non-empty status here is anomalous — fail safe rather than risk data loss.
+  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree. If the
+  // status check itself errors (non-zero exit, often with empty stdout), we cannot prove the
+  // tree is clean — treating that as clean would let the destructive rollback run over
+  // unproven state, the very data-loss class this guard exists to close.
+  const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (preArchiveStatus.code !== 0 || preArchiveStatus.stdout.trim() !== "") {
+    const detail =
+      preArchiveStatus.code !== 0
+        ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
+        : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
+      "pre-merge",
+      "openspec-invalid",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive",
+    };
+  }
+
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
@@ -1026,11 +1058,29 @@ export async function maybeArchiveOpenspec(
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
   const status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
-  await gitFn(
+  const commit = await gitFn(
     wt.path,
     ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
     { ignoreFailure: true },
   );
+  if (commit.code !== 0) {
+    const detail = commit.stderr.trim() || commit.stdout.trim() || "(no output)";
+    // Restore the worktree to its pre-archive state so the next run can retry.
+    // openspec archive removed openspec/changes/<id>/ and modified openspec/specs/;
+    // without this, changeDirExists returns false on retry and candidates is empty,
+    // letting pre-merge continue without the required archive commit.
+    await gitFn(wt.path, ["restore", "--staged", "."], { ignoreFailure: true });
+    await gitFn(wt.path, ["restore", "."], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd", "openspec/"], { ignoreFailure: true });
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `OpenSpec archive commit failed:\n${detail}`,
+      "pre-merge",
+      "push-failed",
+    );
+    return { advanced: false, status: "blocked", reason: "archive commit failed" };
+  }
   const pushBranch = branchName(issueNumber, wt.slug);
   const push = await gitFn(wt.path, ["push", "origin", pushBranch], {
     ignoreFailure: true,
