@@ -23,6 +23,7 @@ import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
+  GhMetricsCollector,
   addLabel,
   clearBlocked,
   getIssueDetail,
@@ -35,6 +36,7 @@ import {
   pickStage,
   postComment,
   postPrComment,
+  setGhCollector,
   silentTransition,
   transition,
 } from "./gh.ts";
@@ -1695,6 +1697,10 @@ async function runAdvance(
   await withLock(
     cfg.domain,
     async () => {
+    // Instantiate a metrics collector for this dispatch cycle (#257).
+    const ghCollector = new GhMetricsCollector();
+    setGhCollector(ghCollector);
+    try {
     const startDetail = await getIssueDetail(cfg, issueNumber);
     if (startDetail.state === "closed") {
       console.error(`#${issueNumber} is closed; nothing to advance.`);
@@ -2116,7 +2122,7 @@ async function runAdvance(
           // notifyBundlePath so that finalizeRun does not overwrite the notifiedAt stamp
           // that markNotified writes to evidence.json (finding #5).
           if (runDir) {
-            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
+            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps, ghCollector.summary()).catch(() => {});
           }
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
         } catch {
@@ -2136,6 +2142,10 @@ async function runAdvance(
       if (terminalTee) {
         await terminalTee.stop().catch(() => {});
       }
+    }
+    } finally {
+      // Clear the module-level collector when this dispatch cycle ends (#257).
+      setGhCollector(undefined);
     }
     },
     issueNumber,

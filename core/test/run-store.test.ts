@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
+  emitGhMetrics,
   finalizeRun,
   initRunDir,
   listRunIds,
@@ -18,6 +19,7 @@ import {
   type RunStoreDeps,
 } from "../scripts/run-store.ts";
 import type { EvidenceBundle } from "../scripts/types.ts";
+import type { GhMetricsSummary } from "../scripts/gh.ts";
 
 const REPO_DIR = "/tmp/test-repo";
 const STATE_DIR = "/tmp/test-state";
@@ -502,4 +504,115 @@ test("listRunIds: returns run-ids sorted by mtime descending", async () => {
   };
   const ids = await listRunIds(REPO_DIR, deps);
   assert.deepEqual(ids, ["run-a", "run-b"], "run-a (newer mtime) should come first");
+});
+
+// ---------------------------------------------------------------------------
+// emitGhMetrics (#257)
+// ---------------------------------------------------------------------------
+
+function makeGhMetrics(overrides: Partial<GhMetricsSummary> = {}): GhMetricsSummary {
+  return {
+    call_count: 3,
+    total_ms: 150,
+    p50_ms: 50,
+    p95_ms: 100,
+    slowest_calls: [
+      { category: "pr create", elapsed_ms: 100 },
+      { category: "issue view", elapsed_ms: 30 },
+      { category: "label add", elapsed_ms: 20 },
+    ],
+    ...overrides,
+  };
+}
+
+test("emitGhMetrics: appends a correctly structured gh_metrics_summary event line", async () => {
+  const { deps, readFile } = memRunStore();
+  const summary = makeGhMetrics();
+
+  await emitGhMetrics(RUN_DIR, summary, deps);
+
+  const line = readFile(EVENTS_JSONL).trim();
+  const event = JSON.parse(line);
+  assert.equal(event.type, "gh_metrics_summary");
+  assert.equal(event.schema_version, 1);
+  assert.equal(event.call_count, 3);
+  assert.equal(event.total_ms, 150);
+  assert.equal(event.p50_ms, 50);
+  assert.equal(event.p95_ms, 100);
+  assert.equal(event.slowest_calls.length, 3);
+  assert.ok(typeof event.at === "string" && event.at.length > 0, "must have an at timestamp");
+});
+
+test("emitGhMetrics: I/O error from appendFile is caught and does not propagate", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async () => { throw new Error("disk full"); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date() }),
+  };
+  // Must not throw
+  await emitGhMetrics(RUN_DIR, makeGhMetrics(), deps);
+});
+
+test("emitGhMetrics: event contains schema_version: 1 and no raw arg values", async () => {
+  const { deps, readFile } = memRunStore();
+  // slowest_calls have only category + elapsed_ms — no body/token fields
+  const summary = makeGhMetrics({
+    slowest_calls: [
+      { category: "issue comment", elapsed_ms: 200 },
+    ],
+  });
+
+  await emitGhMetrics(RUN_DIR, summary, deps);
+
+  const event = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.equal(event.schema_version, 1);
+  const entry = event.slowest_calls[0];
+  assert.deepEqual(Object.keys(entry).sort(), ["category", "elapsed_ms"]);
+  assert.equal(entry.category, "issue comment");
+});
+
+test("emitGhMetrics: zero-call summary emits event with call_count: 0 and empty slowest_calls", async () => {
+  const { deps, readFile } = memRunStore();
+
+  await emitGhMetrics(RUN_DIR, makeGhMetrics({ call_count: 0, total_ms: 0, p50_ms: 0, p95_ms: 0, slowest_calls: [] }), deps);
+
+  const event = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.equal(event.call_count, 0);
+  assert.equal(event.total_ms, 0);
+  assert.deepEqual(event.slowest_calls, []);
+});
+
+// ---------------------------------------------------------------------------
+// finalizeRun with ghMetrics (#257)
+// ---------------------------------------------------------------------------
+
+test("finalizeRun: gh_metrics_summary event appears before run_complete when ghMetrics provided", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps, makeGhMetrics());
+
+  const lines = readFile(EVENTS_JSONL).split("\n").filter(Boolean);
+  assert.ok(lines.length >= 2, "must have at least gh_metrics_summary + run_complete");
+  const types = lines.map((l) => JSON.parse(l).type);
+  const metricsIdx = types.indexOf("gh_metrics_summary");
+  const completeIdx = types.indexOf("run_complete");
+  assert.ok(metricsIdx >= 0, "gh_metrics_summary must appear in events.jsonl");
+  assert.ok(completeIdx >= 0, "run_complete must appear in events.jsonl");
+  assert.ok(metricsIdx < completeIdx, "gh_metrics_summary must precede run_complete");
+});
+
+test("finalizeRun: no gh_metrics_summary event when ghMetrics is omitted", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const lines = readFile(EVENTS_JSONL).split("\n").filter(Boolean);
+  const types = lines.map((l) => JSON.parse(l).type);
+  assert.ok(!types.includes("gh_metrics_summary"), "gh_metrics_summary must not appear when ghMetrics is omitted");
 });
