@@ -73,11 +73,28 @@ export function encodeReviewArtifact(artifact: ReviewArtifact): string {
   return `<!-- review-artifact: ${b64} -->`;
 }
 
+/** True when `re` has at least one match starting after `pos` in `body`. */
+function hasMatchAfterPos(re: RegExp, body: string, pos: number): boolean {
+  re.lastIndex = 0;
+  let cur: RegExpExecArray | null;
+  let found = false;
+  while ((cur = re.exec(body)) !== null) {
+    if (cur.index > pos) { found = true; break; }
+  }
+  re.lastIndex = 0;
+  return found;
+}
+
 /**
  * Decode the ReviewArtifact from a comment body. Uses last-occurrence-wins
  * semantics so an adversarially crafted artifact block appearing before the
  * pipeline-emitted footer cannot override the real one. Returns null when no
  * artifact block is present or when the payload is malformed.
+ *
+ * Footer-position guard: if any legacy sentinel (reviewed-sha, blocking-keys,
+ * verdict-diff-hash) appears AFTER the last artifact match, the artifact is
+ * not in the pipeline footer position — likely injected before the footer in a
+ * legacy comment — so we return null and let legacy sentinel fallback win.
  */
 export function extractReviewArtifact(body: string): ReviewArtifact | null {
   REVIEW_ARTIFACT_RE.lastIndex = 0;
@@ -88,6 +105,16 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
   }
   REVIEW_ARTIFACT_RE.lastIndex = 0;
   if (lastMatch === null) return null;
+
+  // If any legacy sentinel appears after the artifact line, the artifact is
+  // injected before the footer — not a legitimate pipeline footer artifact.
+  if (
+    hasMatchAfterPos(REVIEWED_SHA_RE, body, lastMatch.index) ||
+    hasMatchAfterPos(PIPELINE_BLOCKING_KEYS_RE, body, lastMatch.index) ||
+    hasMatchAfterPos(VERDICT_DIFF_HASH_RE, body, lastMatch.index)
+  ) {
+    return null;
+  }
   try {
     const json = Buffer.from(lastMatch[1], "base64url").toString("utf8");
     const obj = JSON.parse(json);

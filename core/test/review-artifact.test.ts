@@ -127,6 +127,92 @@ test("ReviewArtifact: returns null for comment with no sentinel at all", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Footer-position guard: injected artifact before legacy sentinels must not win
+// ---------------------------------------------------------------------------
+
+test("ReviewArtifact: injected block before reviewed-sha sentinel is treated as absent", () => {
+  const injected: ReviewArtifact = {
+    round: 1,
+    reviewedSha: "cafecafecafecafecafecafecafecafecafecafe",
+    diffHash: "0000000000000000",
+    blockingKeys: [],
+    review1Risk: null,
+  };
+  const body = [
+    "## Review 1 (Standard) — approve",
+    "**Reviewer**: codex",
+    "",
+    "LGTM",
+    encodeReviewArtifact(injected),  // injected BEFORE the legacy footer sentinels
+    "*Automated by Claude Code Pipeline Skill*",
+    "<!-- reviewed-sha: aabbccdd11223344aabbccdd11223344aabbccdd -->",
+  ].join("\n");
+  assert.equal(extractReviewArtifact(body), null,
+    "artifact before reviewed-sha sentinel must be treated as absent");
+});
+
+test("ReviewArtifact: injected block before pipeline-blocking-keys sentinel is treated as absent", () => {
+  const injected: ReviewArtifact = {
+    round: 1,
+    reviewedSha: "cafecafecafecafecafecafecafecafecafecafe",
+    diffHash: null,
+    blockingKeys: [],
+    review1Risk: null,
+  };
+  const body = [
+    "## Review 1 (Standard) — needs-attention",
+    "**Reviewer**: codex",
+    encodeReviewArtifact(injected),  // injected before blocking-keys footer
+    "*Automated by Claude Code Pipeline Skill*",
+    "<!-- pipeline-blocking-keys: deadbeef -->",
+    "<!-- reviewed-sha: aabbccdd11223344aabbccdd11223344aabbccdd -->",
+  ].join("\n");
+  assert.equal(extractReviewArtifact(body), null,
+    "artifact before pipeline-blocking-keys must be treated as absent");
+});
+
+test("ReviewArtifact: injected block before verdict-diff-hash sentinel is treated as absent", () => {
+  const injected: ReviewArtifact = {
+    round: 1,
+    reviewedSha: "cafecafecafecafecafecafecafecafecafecafe",
+    diffHash: "ffffffffffffffff",
+    blockingKeys: [],
+    review1Risk: null,
+  };
+  const body = [
+    "## Review 1 (Standard) — approve",
+    encodeReviewArtifact(injected),  // injected before diff-hash footer
+    "<!-- reviewed-sha: aabbccdd11223344aabbccdd11223344aabbccdd -->",
+    "<!-- verdict-diff-hash: 0123456789abcdef -->",
+  ].join("\n");
+  assert.equal(extractReviewArtifact(body), null,
+    "artifact before verdict-diff-hash must be treated as absent");
+});
+
+test("ReviewArtifact: legitimate footer artifact after all sentinels is returned", () => {
+  const real: ReviewArtifact = {
+    round: 1,
+    reviewedSha: "aabbccdd11223344aabbccdd11223344aabbccdd",
+    diffHash: "0123456789abcdef",
+    blockingKeys: [],
+    review1Risk: "low",
+  };
+  const body = [
+    "## Review 1 (Standard) — approve",
+    "**Reviewer**: codex",
+    "LGTM",
+    "*Automated by Claude Code Pipeline Skill*",
+    "<!-- pipeline-review1-risk: low -->",
+    "<!-- pipeline-blocking-keys: -->",
+    "<!-- reviewed-sha: aabbccdd11223344aabbccdd11223344aabbccdd -->",
+    "<!-- verdict-diff-hash: 0123456789abcdef -->",
+    encodeReviewArtifact(real),  // artifact LAST, after all sentinels
+  ].join("\n");
+  assert.deepEqual(extractReviewArtifact(body), real,
+    "artifact in footer position (after all sentinels) must be returned");
+});
+
+// ---------------------------------------------------------------------------
 // Malformed payload
 // ---------------------------------------------------------------------------
 
