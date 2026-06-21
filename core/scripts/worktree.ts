@@ -369,13 +369,27 @@ export async function listOnDisk(cfg: PipelineConfig, deps: ListOnDiskDeps = {})
  *  worktrees occupy disk but no longer represent active work.
  *  On `gh` lookup failure we treat the worktree as active (fail safe — never
  *  let a transient API blip silently uncap concurrency). */
-export async function listActive(cfg: PipelineConfig): Promise<WorktreeRecord[]> {
-  const onDisk = await listOnDisk(cfg);
+/** Injectable seam for {@link listActive} / {@link getForIssue}: the per-worktree
+ *  GitHub state lookup (one `getIssueStateAndLabels` call per on-disk worktree) and
+ *  the on-disk listing can be faked and counted in tests/benchmarks. Both default to
+ *  the real implementations, so production behavior is unchanged. */
+export interface ListActiveDeps {
+  listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  getIssueStateAndLabels?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<{ state: "open" | "closed"; labels: string[] } | null>;
+}
+
+export async function listActive(cfg: PipelineConfig, deps: ListActiveDeps = {}): Promise<WorktreeRecord[]> {
+  const listOnDiskFn = deps.listOnDisk ?? listOnDisk;
+  const getStateFn = deps.getIssueStateAndLabels ?? getIssueStateAndLabels;
+  const onDisk = await listOnDiskFn(cfg);
   const states = await Promise.all(
     onDisk.map((rec) =>
       rec.issueNumber === undefined
         ? Promise.resolve(null)
-        : getIssueStateAndLabels(cfg, rec.issueNumber),
+        : getStateFn(cfg, rec.issueNumber),
     ),
   );
   return onDisk.filter((_, i) => {
@@ -394,8 +408,9 @@ export async function countActive(cfg: PipelineConfig): Promise<number> {
 export async function getForIssue(
   cfg: PipelineConfig,
   issueNumber: number,
+  deps: ListActiveDeps = {},
 ): Promise<{ path: string; slug: string } | null> {
-  for (const rec of await listActive(cfg)) {
+  for (const rec of await listActive(cfg, deps)) {
     if (rec.issueNumber === issueNumber && rec.slug) {
       return { path: rec.path, slug: rec.slug };
     }
