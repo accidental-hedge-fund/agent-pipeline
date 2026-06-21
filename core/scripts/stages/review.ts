@@ -3,10 +3,10 @@
 // them so existing import sites (`pre_merge.ts`, tests) need no import-path
 // changes.
 //
-//   review-parsing.ts    - sentinels, codec, ReviewArtifact, parse helpers
-//   review-rendering.ts  - comment formatting (formatReviewComment, etc.)
-//   review-acquisition.ts - plan/summary extraction from issue comment threads
-//   review-routing.ts    - advanceReview main loop + AdvanceReviewDeps seam
+//   review-parsing.ts    — sentinels, codec, ReviewArtifact, parse helpers
+//   review-rendering.ts  — comment formatting (formatReviewComment, etc.)
+//   review-acquisition.ts — plan/summary extraction from issue comment threads
+//   review-routing.ts    — advanceReview main loop + AdvanceReviewDeps seam
 
 export * from "./review-parsing.ts";
 export * from "./review-rendering.ts";

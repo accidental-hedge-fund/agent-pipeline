@@ -1,59 +1,50 @@
 ## Context
 
-`worktree.ts` exposes two public query functions:
+`worktree.ts` exposes two different worktree query needs:
 
-- `listActive(cfg)` — enumerates on-disk worktrees, then calls `getIssueStateAndLabels` for each to filter out closed/terminal ones. Cost: one `gh` call per on-disk worktree.
-- `getForIssue(cfg, N)` — calls `listActive()` and returns the first record matching issue N. It inherits the full per-worktree cost even though active-state filtering is irrelevant for a known-issue lookup.
+- `listActive(cfg)` enumerates on-disk worktrees, then calls `getIssueStateAndLabels` for each worktree to filter out closed or terminal issues. This is required for capacity decisions, but it costs one GitHub call per on-disk worktree.
+- `getForIssue(cfg, N)` calls `listActive()` and inherits that cost even when the caller only needs the local path for a known issue.
 
-`pipeline.ts` calls `getForIssue()` in at least four places (run setup, pre-stage bookmark, post-fix verify, finalization). With 20 on-disk worktrees this produces 80+ unnecessary `gh` calls per pipeline run that touch no capacity decision.
-
-The existing `GhMetricsCollector` (PR #257) captures per-run call count and latency, making it straightforward to quantify the improvement.
+Pipeline setup, bookkeeping, status JSON, and stage handlers often need only the local path for the issue already being processed. They do not need active-state filtering and should not pay the per-worktree GitHub fan-out.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Eliminate `gh` calls in `getForIssue()` callers that do not need active-state filtering.
-- Add a per-run snapshot cache (`RunStateCache`) so issue/PR state fetched during setup is reused across stages rather than re-fetched independently.
-- Preserve the active-state filter for `createWorktree()` capacity enforcement and `sweepMergedWorktrees()`.
-- Keep the existing `deps`/`Deps` injection pattern so new code is unit-testable without real subprocesses.
+- Add a disk-only lookup for known issue worktree paths.
+- Move non-capacity known-issue path lookups to the disk-only lookup.
+- Preserve active-state filtering for capacity enforcement.
+- Keep the existing `deps`/`Deps` injection pattern so tests avoid real subprocesses and network calls.
 
 **Non-Goals:**
-- Cross-run persistence (no disk or DB cache between pipeline invocations).
-- Changing the shape of the `--status --json` output (that is `machine-readable-status`'s scope).
-- Altering the concurrency gate semantics.
+- Adding a per-run issue/PR snapshot cache.
+- Cross-run persistence or disk/database caching.
+- Changing `--status --json` output shape.
+- Changing concurrency gate semantics.
 
 ## Decisions
 
-### Decision 1: `getOnDiskForIssue()` replaces `getForIssue()` for non-capacity callers
+### Decision 1: `getOnDiskForIssue()` is a separate explicit fast path
 
-`getOnDiskForIssue(cfg, N)` calls `listOnDisk(cfg)` (already exists, no `gh` calls) and returns the first matching record. `getForIssue()` keeps its existing behavior and callers (capacity + sweep paths); non-capacity callers in `pipeline.ts` are migrated to `getOnDiskForIssue()`.
+`getOnDiskForIssue(cfg, N)` calls `listOnDisk(cfg)` and returns the first record matching the requested issue. It does not call GitHub and returns `null` when no on-disk record exists.
 
-**Alternative considered**: add an `activeOnly?: boolean` flag to `getForIssue()`. Rejected — a boolean flag with an active-state footgun is worse than two clearly named functions.
+**Alternative considered**: add an `activeOnly?: boolean` flag to `getForIssue()`. Rejected because a boolean flag would make the active-state cost easy to trigger accidentally. Two named functions keep the behavior clear.
 
-### Decision 2: `RunStateCache` scoped to one pipeline dispatch cycle
+### Decision 2: Keep active-state filtering only where it is needed
 
-A `RunStateCache` object is created at the top of the pipeline dispatch loop and threaded through stage functions via the existing `deps` pattern (added to the relevant `Deps` interface). It holds: issue state + labels, PR state, and worktree path — populated at named refresh points. Getters throw if accessed before the first `refresh()` so callers cannot silently read stale data.
+`createWorktree()` must continue to use active-state filtering through `listActive()` / `countActive()` so the concurrency gate excludes closed and terminal worktrees while failing safe on GitHub lookup errors.
 
-Named refresh points (called explicitly, not automatically):
-- `refreshAfterSetup()` — after worktree creation and initial label apply.
-- `refreshAfterFix()` — after a fix commit lands (PR SHA and labels may have changed).
+Known-issue callers that only need a path use `getOnDiskForIssue()` directly or keep their existing injectable `getForIssue` test seam while defaulting that seam to `getOnDiskForIssue()`.
 
-**Alternative considered**: Automatic cache invalidation on label change. Rejected — the pipeline's own commits already required a careful exclusion in the SHA gate (`isPipelineInternalCommit`); adding another implicit invalidation surface risks the same convergence bugs.
+### Decision 3: Benchmark remains manual evidence, not a new cache design
 
-### Decision 3: No cache for `listActive()` / `countActive()`
-
-`createWorktree()` must see real-time active state; a stale count could allow exceeding `max_concurrent_worktrees`. These callers are left unchanged and always hit GitHub.
-
-### Decision 4: Benchmark is part of the acceptance gate
-
-The issue specifies wall time and `gh` call count at 0/5/20 worktrees. The benchmark is a manual step in the validation checklist (not a CI gate) since synthetic worktree count requires test fixtures not worth automating for a one-time baseline.
+The issue asks to compare `pipeline N --status --json` with multiple on-disk worktree counts. This change makes the status path use the disk-only lookup by default, so its known-issue worktree lookup no longer scales with unrelated worktree count. A separate cache design can be proposed later if issue/PR snapshot sharing is still worth the coupling.
 
 ## Risks / Trade-offs
 
-- **Stale worktree path after rename** → `getOnDiskForIssue()` reads the current on-disk slug; a branch rename would still return a stale path if the directory was not recreated. Mitigation: the same risk exists today in `getForIssue()` (it also scans on-disk slugs). No regression.
-- **Cache accessed before refresh** → Mitigated by throwing on uninitialized access (Decision 2). Makes the bug loud, not silent.
-- **RunStateCache adds coupling** → Threaded via `deps` like existing injected fakes; new stage tests inject a pre-populated fake cache the same way they inject `gh` fakes today.
+- **Stale worktree path after rename**: `getOnDiskForIssue()` reads the current on-disk records, matching the existing path-source behavior of `getForIssue()`.
+- **Bypassing active filtering where it matters**: capacity enforcement remains on `listActive()` / `countActive()`; tests and source checks cover the known-issue stage defaults.
+- **Leaving snapshot caching for later**: this avoids broad dispatch/stage interface changes in a performance PR whose main benefit is eliminating accidental active-worktree fan-out.
 
 ## Open Questions
 
-None — the scope is narrow and the existing `deps` pattern fully covers testability.
+None.

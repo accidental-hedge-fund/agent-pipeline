@@ -48,7 +48,6 @@ import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
-import { RunStateCache } from "./run-state-cache.ts";
 import {
   bundlePath,
   createBundle,
@@ -169,8 +168,6 @@ export function canAutoLoopContinue(
 /** IO seam for {@link runAdvance}: inject a fake clock for wall-clock budgeting in tests. */
 export interface AdvanceDeps {
   now?: () => number;
-  /** Injectable run-state cache for unit tests; real runs create their own instance. */
-  runStateCache?: RunStateCache;
 }
 
 // Package version, single-sourced from package.json so a version bump is reflected
@@ -1883,19 +1880,14 @@ async function runAdvance(
     setGhRunId(pipelineRunId);
     console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
-    // Populate run-state cache once at setup: caches issue state/labels, PR number,
-    // and worktree path (disk-only, zero gh calls for the path). Subsequent
-    // bookkeeping callers share these values rather than each issuing independent
-    // gh reads. Best-effort: a refresh failure leaves the cache unpopulated and
-    // callers fall back to null.
-    const runCache = deps.runStateCache ?? new RunStateCache(issueNumber);
-    await runCache.refreshAfterSetup(cfg).catch(() => {});
-
     if (stateDir) {
-      const bundlePr = runCache.populated ? runCache.prNumber : null;
-      const startWt = runCache.populated && runCache.worktreePath
-        ? { path: runCache.worktreePath, slug: runCache.worktreeSlug! }
-        : null;
+      let bundlePr: number | null = null;
+      try {
+        bundlePr = await getPrForIssue(cfg, issueNumber);
+      } catch {
+        /* no PR yet, or lookup failed — record null */
+      }
+      const startWt = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
       const bundleBranch = startWt ? branchName(issueNumber, startWt.slug) : null;
       const harnesses = Array.from(new Set([cfg.harnesses.implementer, cfg.harnesses.reviewer]));
       await createBundle(stateDir, {

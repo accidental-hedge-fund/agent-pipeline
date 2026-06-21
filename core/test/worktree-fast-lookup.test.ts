@@ -102,7 +102,7 @@ const PATH_ONLY_STAGES = [
   "deploy_ready.ts",
   "eval.ts",
   "planning.ts",
-  "review.ts",
+  "review-routing.ts",
   "shipcheck.ts",
   "pre_merge.ts",
 ];
