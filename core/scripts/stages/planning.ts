@@ -54,6 +54,7 @@ import {
 } from "../verify-harness-commits.ts";
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -1113,6 +1114,19 @@ const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
   /(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*\S+/gi,
 ];
 
+// Extra patterns for brief sanitization that extend artifact-sanitize.ts INJECTION_PATTERNS.
+// sanitizeBriefForPrompt iterates INJECTION_PATTERNS first (canonical, drift-guarded), then these.
+const BRIEF_SUPPLEMENTAL_PATTERNS: ReadonlyArray<RegExp> = [
+  // "Ignore all previous/prior/above instructions" — the multi-word sequence (all + the
+  // qualifier) is not matched by INJECTION_PATTERNS, which only handles ONE qualifier after
+  // "ignore" (so "ignore all above instructions" slips through the canonical pattern).
+  /ignore\s+all\s+(?:previous|prior|above)\s+instructions?/gi,
+  // "Act as [anything]" — broader than INJECTION_PATTERNS' "act as if" to catch "act as a …" variants
+  /act\s+as\b/gi,
+  // <system> XML tag injection (not in INJECTION_PATTERNS)
+  /<\/?system>/gi,
+];
+
 /**
  * Redact URLs, email addresses, and common secret patterns from `text` before
  * the content is forwarded to the last30days skill's external research runtime.
@@ -1121,6 +1135,24 @@ const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
 export function sanitizeBodyForResearch(text: string): string {
   let out = text;
   for (const pattern of REDACT_PATTERNS) {
+    out = out.replace(pattern, "[REDACTED]");
+  }
+  return out;
+}
+
+/**
+ * Redact known prompt-injection imperatives from a last30days brief before the
+ * text is posted to GitHub or embedded in a planning prompt. Public discourse
+ * (Reddit, X, HN, YouTube, GitHub) is untrusted: a crafted community post could
+ * contain injection payloads intended to steer the planning agent. Replacements
+ * use `[REDACTED]` so surrounding contextual text is preserved.
+ */
+export function sanitizeBriefForPrompt(text: string): string {
+  let out = text;
+  for (const pattern of INJECTION_PATTERNS) {
+    out = out.replace(pattern, "[REDACTED]");
+  }
+  for (const pattern of BRIEF_SUPPLEMENTAL_PATTERNS) {
     out = out.replace(pattern, "[REDACTED]");
   }
   return out;
@@ -1200,13 +1232,14 @@ export async function gatherCarryForward(
     console.log(buildSetupHint(issueNumber, "no-signal"));
     return "";
   }
+  const sanitizedBrief = sanitizeBriefForPrompt(res.brief);
   await postComment(
     cfg,
     issueNumber,
-    `## Pre-Planning Context — last30days\n\n_Topic: "${title}"_${res.stats ? `\n\n${res.stats}` : ""}\n\n${res.brief}${footer(cfg)}`,
+    `## Pre-Planning Context — last30days\n\n_Topic: "${title}"_${res.stats ? `\n\n${res.stats}` : ""}\n\n${sanitizedBrief}${footer(cfg)}`,
   );
   console.log(`[pipeline] #${issueNumber}: last30days brief posted + carried into planning`);
-  return res.brief;
+  return sanitizedBrief;
 }
 
 function footer(cfg: PipelineConfig): string {
