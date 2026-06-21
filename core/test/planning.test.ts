@@ -863,6 +863,58 @@ test("makeFreeformPlanningHooks: invokeRevision is absent (falls back to invokeP
 });
 
 // ---------------------------------------------------------------------------
+// Finding 1 regression (fix-2) — OpenSpec plan review must run in wt.path (#265 fix-2)
+//
+// Before this fix, runPlanningPhases called doInvokeReviewer with cfg.repo_dir
+// for both freeform and OpenSpec. The OpenSpec reviewer cannot inspect the
+// just-authored openspec/changes/<id>/ files unless it is spawned from wt.path.
+// ---------------------------------------------------------------------------
+
+test("makeOpenspecPlanningHooks: planReviewCwd returns wt.path (not cfg.repo_dir)", () => {
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test", "body", []);
+  assert.ok(typeof hooks.planReviewCwd === "function", "OpenSpec hooks must implement planReviewCwd");
+  const cwd = hooks.planReviewCwd!({ path: "/fake/wt" });
+  assert.equal(cwd, "/fake/wt", "OpenSpec plan review must use wt.path as cwd");
+  assert.notEqual(cwd, eqCfg.repo_dir, "OpenSpec plan review must NOT use cfg.repo_dir");
+});
+
+test("makeFreeformPlanningHooks: planReviewCwd is absent (falls back to cfg.repo_dir)", () => {
+  const hooks = makeFreeformPlanningHooks(eqCfg, "Test", "body");
+  assert.equal(hooks.planReviewCwd, undefined, "freeform must not override plan-review cwd");
+});
+
+test("runPlanningPhases: OpenSpec hooks causes invokeReviewer to receive wt.path as cwd", async () => {
+  const capturedCwds: string[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, cwd: string, _prompt: string, _opts: unknown) => {
+      capturedCwds.push(cwd);
+      return { result: harnessOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  // openspecHooks() includes planReviewCwd returning wt.path
+  const hooks = openspecHooks({ planReviewCwd: (wt) => wt.path });
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, hooks, deps as any);
+  assert.ok(capturedCwds.length >= 1, "invokeReviewer must have been called");
+  assert.equal(capturedCwds[0], "/fake/wt", "OpenSpec plan review cwd must be wt.path");
+  assert.notEqual(capturedCwds[0], eqCfg.repo_dir, "OpenSpec plan review must NOT use cfg.repo_dir");
+});
+
+test("runPlanningPhases: freeform hooks causes invokeReviewer to receive cfg.repo_dir as cwd", async () => {
+  const capturedCwds: string[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, cwd: string, _prompt: string, _opts: unknown) => {
+      capturedCwds.push(cwd);
+      return { result: harnessOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedCwds.length >= 1, "invokeReviewer must have been called");
+  assert.equal(capturedCwds[0], eqCfg.repo_dir, "freeform plan review cwd must be cfg.repo_dir");
+});
+
+// ---------------------------------------------------------------------------
 // Finding 2 regression — plan-gen failure tag equivalence with real hook
 // builders (#265 fix-1)
 //

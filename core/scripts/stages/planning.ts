@@ -207,6 +207,13 @@ export interface PlanningPhaseHooks {
   buildImplPlan(wt: { path: string }, revisedPlanText: string): string | Promise<string>;
 
   /**
+   * Returns the working directory for the plan reviewer. When absent, defaults
+   * to `cfg.repo_dir`. OpenSpec implementations return `wt.path` so the
+   * reviewer can inspect the just-authored change files in the issue worktree.
+   */
+  planReviewCwd?(wt: { path: string }): string;
+
+  /**
    * Override how the plan-revision harness is invoked. When absent, falls back
    * to `invokePlanStep` (which uses `cfg.repo_dir` for non-sandboxed runs). The
    * OpenSpec implementation sets this so the revision harness runs in `wt.path`
@@ -343,8 +350,11 @@ export async function runPlanningPhases(
     const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext });
     // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
     // implementing harness reviews the plan, clearly labeled below.
+    // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
+    // the just-authored change files; freeform uses cfg.repo_dir.
+    const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      await doInvokeReviewer(reviewer, primary, cfg.repo_dir, reviewPrompt, {
+      await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
         timeoutSec: cfg.review_timeout,
         model: opts.model ?? cfg.models.review,
       });
@@ -853,6 +863,10 @@ export function makeOpenspecPlanningHooks(
         `${proposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`
       );
     },
+
+    // Plan review must also run from wt.path so the reviewer can read the
+    // just-authored openspec/changes/<id>/ files (proposal, design, tasks).
+    planReviewCwd(wt) { return wt.path; },
 
     // Run plan revision in the issue worktree so the harness can update the
     // OpenSpec change files (proposal.md, spec deltas, tasks.md) in wt.path.
