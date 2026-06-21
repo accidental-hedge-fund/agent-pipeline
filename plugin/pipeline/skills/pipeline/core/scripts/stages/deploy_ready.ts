@@ -3,7 +3,7 @@
 
 import { addLabelToPr, getIssueDetail, getPrForIssue, postComment, postPrComment } from "../gh.ts";
 import { LABEL_PREFIX } from "../types.ts";
-import { getForIssue, removeWorktree } from "../worktree.ts";
+import { getOnDiskForIssue, removeWorktree } from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, defaultRunStoreDeps, type RunStoreDeps } from "../run-store.ts";
 
@@ -85,7 +85,7 @@ export async function finalize(
   }
 
   // Remove worktree.
-  const wt = await getForIssue(cfg, issueNumber);
+  const wt = await getOnDiskForIssue(cfg, issueNumber);
   if (wt) {
     await removeWorktree(cfg, issueNumber, wt.slug);
     console.log(`[pipeline] #${issueNumber}: worktree removed`);

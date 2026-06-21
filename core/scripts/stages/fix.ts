@@ -14,7 +14,7 @@ import {
   transition,
 } from "../gh.ts";
 import { invoke } from "../harness.ts";
-import { branchName, getForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
+import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
@@ -64,7 +64,7 @@ export async function advanceFix(
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${harness}`);
 
-  const wt = await getForIssue(cfg, issueNumber);
+  const wt = await getOnDiskForIssue(cfg, issueNumber);
   if (!wt) {
     await setBlocked(cfg, issueNumber, "No worktree found. Cannot apply fixes.", stage, "worktree-missing");
     return { advanced: false, status: "blocked", reason: "no worktree" };

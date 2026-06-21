@@ -9,7 +9,7 @@
 // The command is run through `sh -c` so normal shell syntax works.
 
 import {
-  getForIssue as defaultGetForIssue,
+  getOnDiskForIssue as defaultGetForIssue,
 } from "../worktree.ts";
 import {
   postComment as defaultPostComment,

@@ -27,6 +27,7 @@ import {
   branchName,
   createWorktree,
   getForIssue,
+  getOnDiskForIssue,
   gitInWorktree,
   hasCommitsAhead,
   removeWorktree,
@@ -1069,7 +1070,7 @@ export async function dispatchResume(
   opts: AdvanceOpts,
   deps: DispatchResumeDeps = {},
 ): Promise<Outcome> {
-  const getWt = deps.getForIssue ?? getForIssue;
+  const getWt = deps.getForIssue ?? getOnDiskForIssue;
   const commitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
   const fetchIssue = deps.getIssueDetail ?? getIssueDetail;
   const doResume = deps.resumeFromImplementing ?? resumeFromImplementing;

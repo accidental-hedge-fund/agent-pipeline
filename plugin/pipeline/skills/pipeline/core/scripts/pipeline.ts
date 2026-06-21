@@ -47,7 +47,7 @@ import {
 import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
-import { branchName, getForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
+import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
 import {
   bundlePath,
   createBundle,
@@ -1154,7 +1154,7 @@ const defaultRunStatusDeps: RunStatusDeps = {
   getIssueDetail,
   getPrForIssue,
   loadLatestPreflightResult,
-  getForIssue,
+  getForIssue: getOnDiskForIssue,
   getLabelEvents: getIssueLabelEvents,
 };
 
@@ -1887,7 +1887,7 @@ async function runAdvance(
       } catch {
         /* no PR yet, or lookup failed — record null */
       }
-      const startWt = await getForIssue(cfg, issueNumber).catch(() => null);
+      const startWt = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
       const bundleBranch = startWt ? branchName(issueNumber, startWt.slug) : null;
       const harnesses = Array.from(new Set([cfg.harnesses.implementer, cfg.harnesses.reviewer]));
       await createBundle(stateDir, {
@@ -2068,7 +2068,7 @@ async function runAdvance(
       // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
       let headBeforeDispatch = "";
       if (stateDir) {
-        const wtBefore = await getForIssue(cfg, issueNumber).catch(() => null);
+        const wtBefore = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
         if (wtBefore) {
           headBeforeDispatch = (
             await gitInWorktree(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
@@ -2114,7 +2114,7 @@ async function runAdvance(
       const stageExitedAt = evidenceTimestamp();
       let stageCommits: string[] = [];
       if (stateDir) {
-        const wtAfter = await getForIssue(cfg, issueNumber).catch(() => null);
+        const wtAfter = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
         if (wtAfter) {
           lastKnownBranch = branchName(issueNumber, wtAfter.slug);
           // If no worktree existed before dispatch (e.g., planning creates it), fall
@@ -2250,7 +2250,7 @@ async function runAdvance(
           // worktree before this block runs, so latestBranch is null on a successful
           // ready-to-deploy run. Overwriting with null would erase the captured branch.
           const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
-          const latestWt = await getForIssue(cfg, issueNumber).catch(() => null);
+          const latestWt = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
           // deployReady.finalize() removes the worktree before this block runs, so
           // latestWt may be null on a successful run. Fall back to the last branch we
           // observed during the dispatch loop so the bundle is never finalized with

@@ -11,7 +11,7 @@ Each issue SHALL get a worktree at `<repo>/<cfg.worktree_root>/pipeline-<issueN>
 - **THEN** its path SHALL be `<repo>/<worktree_root>/pipeline-42-<slug>` and its branch SHALL be `pipeline/42-<slug>`
 
 ### Requirement: Concurrency gated on active worktrees only
-`createWorktree` SHALL refuse (throw) when the count of *active* worktrees is at `cfg.max_concurrent_worktrees`. A worktree counts as active only when its issue is open on GitHub AND does not carry `pipeline:ready-to-deploy`; closed issues and terminal (ready-to-deploy) ones are excluded. On a `gh` lookup failure a worktree is treated as active (fail-safe).
+`createWorktree` SHALL refuse (throw) when the count of *active* worktrees is at `cfg.max_concurrent_worktrees`. A worktree counts as active only when its issue is open on GitHub AND does not carry `pipeline:ready-to-deploy`; closed issues and terminal (ready-to-deploy) ones are excluded. On a `gh` lookup failure a worktree is treated as active (fail-safe). All other callers that need only the path of a known-issue worktree SHALL use `getOnDiskForIssue` rather than routing through `listActive`.
 
 #### Scenario: terminal worktrees don't count
 - **WHEN** several on-disk worktrees belong to issues labeled `pipeline:ready-to-deploy`
@@ -20,6 +20,10 @@ Each issue SHALL get a worktree at `<repo>/<cfg.worktree_root>/pipeline-<issueN>
 #### Scenario: at capacity
 - **WHEN** the active worktree count equals `cfg.max_concurrent_worktrees` and a new worktree is requested
 - **THEN** `createWorktree` SHALL throw a capacity error rather than create another
+
+#### Scenario: non-capacity callers do not trigger active-state lookups
+- **WHEN** the pipeline resolves the worktree path for a known issue outside of `createWorktree` or `sweepMergedWorktrees`
+- **THEN** no `gh` call SHALL be issued to determine whether that or any other worktree is active
 
 ### Requirement: Worktree created off the latest base; stale path reclaimed
 `createWorktree` SHALL fetch and branch off the latest `origin/<base_branch>`. If a directory already exists at the target path it SHALL be removed first. After the git worktree is created, the pipeline SHALL: (1) write the `node_modules` staging exclusion to `.git/info/exclude` inside the worktree, (2) remove any pre-existing `node_modules` symlink at the worktree root and log the removal, and (3) execute the dependency install step (as specified in `worktree-dependency-install`) before control returns to the caller, so that every worktree is fully bootstrapped and runnable from the moment it is created.
