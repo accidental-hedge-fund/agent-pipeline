@@ -23,6 +23,7 @@ const PartialConfigSchema = z.object({
   sweep_timeout: z.number().int().positive().optional().describe("Seconds for the sweep harness call before timing out."),
   ci_timeout: z.number().int().positive().optional().describe("Seconds to wait for CI at pre-merge."),
   ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
+  ci_no_run_grace_s: z.number().int().min(0).optional().describe("Seconds to wait before checking for zero check-runs when CI is pending. Default 60; set to 0 to check immediately."),
   // Each alias is independently optional so a partial `models:` block (e.g.
   // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
   // and the inert-alias warning keys off which sub-keys were explicitly set.
@@ -311,6 +312,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     sweep_timeout: fileConfig.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout,
     ci_timeout: fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout,
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
+    ci_no_run_grace_s: fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s,
     // Harness roles are profile-relative; the implementer can never be set by
     // repo config (the strict schema rejects a `harnesses:` key outright). The
     // reviewer defaults to the profile's value but is overridden here by the
@@ -923,6 +925,7 @@ intake_timeout: ${d.intake_timeout} # seconds for the intake harness call before
 sweep_timeout: ${d.sweep_timeout} # seconds for the sweep harness call before timing out
 ci_timeout: ${d.ci_timeout} # seconds to wait for CI at pre-merge
 ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
+ci_no_run_grace_s: ${d.ci_no_run_grace_s} # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately
 
 # models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Uncomment to override.
 #   planning: ${d.models.planning} # implementer harness

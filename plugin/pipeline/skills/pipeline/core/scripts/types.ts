@@ -177,6 +177,7 @@ export interface PipelineConfig {
   sweep_timeout: number;
   ci_timeout: number;
   ci_poll_interval: number;
+  ci_no_run_grace_s: number;
   // Harness roles + models. The implementer is always taken from the active
   // profile (repo config cannot set it). The reviewer defaults to the profile's
   // value but MAY be overridden per-repo by the `review_harness` config key
@@ -360,6 +361,7 @@ export const DEFAULT_CONFIG: Omit<
   sweep_timeout: 600,
   ci_timeout: 900,
   ci_poll_interval: 30,
+  ci_no_run_grace_s: 60,
   models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
