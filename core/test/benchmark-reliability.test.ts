@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { computePercentiles, makeGhCounter, type BenchmarkResult } from "./bench-helpers.ts";
 import { advanceReview, type AdvanceReviewDeps } from "../scripts/stages/review-routing.ts";
 import { advance, type AdvancePreMergeDeps } from "../scripts/stages/pre_merge.ts";
-import { runSummaryByRunId, type RunSummaryDeps } from "../scripts/pipeline.ts";
+import { runStatus, runSummaryByRunId, type RunStatusDeps, type RunSummaryDeps } from "../scripts/pipeline.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { ReviewerInvocation } from "../scripts/self-review.ts";
 
@@ -152,12 +152,12 @@ describe("benchmark-reliability-suite", () => {
    * The target issue is placed at the END of the list (worst-case scan) so that
    * scaling measurements reflect the real upper bound.
    */
-  function runStatusBenchmark(worktreeCount: number, scenario: string): BenchmarkResult {
+  async function runStatusBenchmark(worktreeCount: number, scenario: string): Promise<BenchmarkResult> {
     const SAMPLES = 30;
     const counter = makeGhCounter();
     const samples: number[] = [];
 
-    // Fake worktree records: issue 1..worktreeCount; target = last one.
+    // Fake worktree records: issue 1..worktreeCount; target = last one (worst-case scan).
     const targetIssue = worktreeCount;
     const fakeWorktrees = Array.from({ length: worktreeCount }, (_, i) => ({
       issueNumber: i + 1,
@@ -165,25 +165,50 @@ describe("benchmark-reliability-suite", () => {
       slug: `slug-${i}`,
     }));
 
-    const stageStart = performance.now();
-    for (let i = 0; i < SAMPLES; i++) {
-      const t0 = performance.now();
+    // Drive the PRODUCTION runStatus(json) path through injected deps, so a regression
+    // in the real status code (e.g. dropping getForIssue, or adding extra gh calls)
+    // actually changes this benchmark. The gh-style deps are counted; getForIssue does
+    // the in-process worktree scan whose O(N) cost is what scales latency with
+    // worktreeCount, while gh_call_count stays flat (status makes a fixed number of gh
+    // calls regardless of how many worktrees exist).
+    const deps = {
+      getIssueDetail: counter.track(async () => ({
+        number: targetIssue,
+        type: "issue" as const,
+        title: "Test issue",
+        body: "",
+        state: "open" as const,
+        url: `https://github.com/acme/test-repo/issues/${targetIssue}`,
+        labels: ["pipeline:review-1"],
+        comments: [],
+      })),
+      getPrForIssue: counter.track(async () => 99),
+      getForIssue: async () => {
+        // Worst-case linear scan of the synthetic worktree list (target placed last).
+        let found: { path: string; slug: string } | null = null;
+        for (const wt of fakeWorktrees) {
+          if (wt.issueNumber === targetIssue) { found = { path: wt.path, slug: wt.slug }; break; }
+        }
+        return found;
+      },
+      getLabelEvents: counter.track(async () => [{ label: "pipeline:review-1", createdAt: "2026-06-20T00:00:00Z" }]),
+    } as unknown as RunStatusDeps;
 
-      // Simulate one gh call (issue state lookup — e.g., getIssueStateAndLabels).
-      // This provides a non-zero gh_call_count so 2.3's super-linearity assertion
-      // is not trivially vacuous (0 < 0 * 100 would be false).
-      counter.track(async () => "pipeline:review-1")(); // counted but not awaited in sync benchmark
-
-      // Simulate the worktree scan (mirrors getForIssue / listActive).
-      let found = null;
-      for (const wt of fakeWorktrees) {
-        if (wt.issueNumber === targetIssue) { found = wt; break; }
+    // runStatus(json) prints the assembled payload to stdout; silence it during timing.
+    const origLog = console.log;
+    console.log = () => {};
+    let stageDuration = 0;
+    try {
+      const stageStart = performance.now();
+      for (let i = 0; i < SAMPLES; i++) {
+        const t0 = performance.now();
+        await runStatus(cfg, targetIssue, deps, { json: true });
+        samples.push(performance.now() - t0);
       }
-      void found; // suppress unused-variable lint
-
-      samples.push(performance.now() - t0);
+      stageDuration = performance.now() - stageStart;
+    } finally {
+      console.log = origLog;
     }
-    const stageDuration = performance.now() - stageStart;
 
     const { p50, p95 } = computePercentiles(samples);
     return {
@@ -195,8 +220,8 @@ describe("benchmark-reliability-suite", () => {
     };
   }
 
-  test("status latency — 1 worktree", () => {
-    const result = runStatusBenchmark(1, "status-latency-1");
+  test("status latency — 1 worktree", async () => {
+    const result = await runStatusBenchmark(1, "status-latency-1");
 
     assert.equal(result.scenario, "status-latency-1");
     assert.ok(typeof result.p50_ms === "number" && result.p50_ms >= 0, `p50_ms must be >= 0, got ${result.p50_ms}`);
@@ -207,8 +232,8 @@ describe("benchmark-reliability-suite", () => {
     console.log(`[bench] ${result.scenario}: p50=${result.p50_ms.toFixed(3)}ms p95=${result.p95_ms.toFixed(3)}ms gh_calls=${result.gh_call_count} total=${result.stage_duration_ms.toFixed(1)}ms`);
   });
 
-  test("status latency — 10 worktrees", () => {
-    const result = runStatusBenchmark(10, "status-latency-10");
+  test("status latency — 10 worktrees", async () => {
+    const result = await runStatusBenchmark(10, "status-latency-10");
 
     assert.equal(result.scenario, "status-latency-10");
     assert.ok(typeof result.p50_ms === "number" && result.p50_ms >= 0, `p50_ms must be >= 0, got ${result.p50_ms}`);
@@ -219,8 +244,8 @@ describe("benchmark-reliability-suite", () => {
     console.log(`[bench] ${result.scenario}: p50=${result.p50_ms.toFixed(3)}ms p95=${result.p95_ms.toFixed(3)}ms gh_calls=${result.gh_call_count} total=${result.stage_duration_ms.toFixed(1)}ms`);
   });
 
-  test("status latency — 50 worktrees", () => {
-    const result = runStatusBenchmark(50, "status-latency-50");
+  test("status latency — 50 worktrees", async () => {
+    const result = await runStatusBenchmark(50, "status-latency-50");
 
     assert.equal(result.scenario, "status-latency-50");
     assert.ok(typeof result.p50_ms === "number" && result.p50_ms >= 0, `p50_ms must be >= 0, got ${result.p50_ms}`);
@@ -231,12 +256,12 @@ describe("benchmark-reliability-suite", () => {
     console.log(`[bench] ${result.scenario}: p50=${result.p50_ms.toFixed(3)}ms p95=${result.p95_ms.toFixed(3)}ms gh_calls=${result.gh_call_count} total=${result.stage_duration_ms.toFixed(1)}ms`);
   });
 
-  test("status latency — gh_call_count does not grow super-linearly with worktree count", () => {
-    // Run all three sizes and compare gh_call_count. Since the gh call (issue
-    // state lookup) is a fixed per-sample overhead and the worktree scan itself
-    // makes no gh calls, the count per sample is constant regardless of N.
-    const result1 = runStatusBenchmark(1, "status-latency-1");
-    const result50 = runStatusBenchmark(50, "status-latency-50");
+  test("status latency — gh_call_count does not grow super-linearly with worktree count", async () => {
+    // Run all three sizes and compare gh_call_count. Since the gh calls (issue detail,
+    // PR lookup, label events) are a fixed per-sample overhead and the worktree scan
+    // (getForIssue) makes no gh calls, the count per sample is constant regardless of N.
+    const result1 = await runStatusBenchmark(1, "status-latency-1");
+    const result50 = await runStatusBenchmark(50, "status-latency-50");
 
     // Sanity cap: super-linearity check is meaningful only when there is a non-zero
     // baseline. When gh_call_count(1) > 0, assert that scaling to 50 worktrees
