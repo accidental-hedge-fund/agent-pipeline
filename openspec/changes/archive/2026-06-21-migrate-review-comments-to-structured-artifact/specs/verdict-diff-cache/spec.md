@@ -1,8 +1,5 @@
-# verdict-diff-cache Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change cache-review-verdict-by-diff-hash. Update Purpose after archive.
-## Requirements
 ### Requirement: Review comments SHALL embed a diff-hash sentinel keyed to the reviewed diff
 
 When the pipeline posts a review comment for any review round, the comment SHALL include the diff hash both as the individual HTML-comment sentinel `<!-- verdict-diff-hash: <hash> -->` on its own line (for backward compatibility) and inside the `ReviewArtifact` block (`diffHash` field) described in `review-artifact-record`. The hash SHALL remain the first 16 hexadecimal characters of the SHA-256 digest of the raw PR diff string. When the diff is unavailable (e.g., in tests that do not supply one), `diffHash` SHALL be `null` in the artifact and the individual sentinel SHALL be omitted, matching prior behavior.
@@ -78,4 +75,3 @@ Before invoking the reviewer in a review stage, the pipeline SHALL compute the c
 
 - **WHEN** a comment body contains no `<!-- verdict-diff-hash: … -->` line
 - **THEN** `extractDiffHashFromComment` SHALL return `null`
-

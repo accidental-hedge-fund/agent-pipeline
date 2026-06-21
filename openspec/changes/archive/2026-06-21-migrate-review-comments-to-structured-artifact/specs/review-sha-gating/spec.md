@@ -1,8 +1,5 @@
-# review-sha-gating Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change key-review-verdicts-to-commit-sha. Update Purpose after archive.
-## Requirements
 ### Requirement: Review comment embeds the evaluated commit SHA
 
 When the pipeline posts a review comment for any review round, the comment SHALL include the HEAD commit SHA both as the individual HTML-comment sentinel `<!-- reviewed-sha: <full-sha> -->` on its own line (for backward compatibility) and inside the `ReviewArtifact` block (`reviewedSha` field) described in `review-artifact-record`. New comments SHALL carry both forms; old comments carry only the individual sentinel.
@@ -71,48 +68,3 @@ When the SHAs differ with non-pipeline-internal commits present, the gate SHALL 
 - **THEN** `extractReviewArtifact` SHALL return `null`
 - **AND** the gate SHALL extract the SHA from the `<!-- reviewed-sha: … -->` sentinel
 - **AND** all gate decisions SHALL proceed identically to the pre-migration path
-
-### Requirement: Re-review due to SHA mismatch is visible on the PR
-
-When a review is re-run because HEAD advanced past the reviewed SHA, the pipeline SHALL post a brief notice comment before re-running, identifying the stale SHA and the new HEAD SHA.
-
-#### Scenario: Stale-verdict notice is posted before re-review
-
-- **WHEN** a SHA mismatch is detected before acting on a prior verdict
-- **THEN** the pipeline SHALL post a comment of the form: `Re-running review: HEAD has moved from <old-short-sha> to <new-short-sha> since the last review.`
-- **AND** this notice SHALL be posted before the new review comment
-
----
-
-### Requirement: SHA check does not alter no-movement behavior
-
-When HEAD has not changed since the last review, the pipeline behavior SHALL be identical to behavior before this change — no additional latency, no extra API calls beyond reading the existing review comment.
-
-#### Scenario: HEAD unchanged — pipeline is transparent
-
-- **WHEN** the gate transition detects SHA match
-- **THEN** no additional GitHub API calls beyond reading the existing comment SHALL be made
-- **AND** the verdict routing logic SHALL execute as if no SHA check occurred
-
-### Requirement: Pipeline-internal commit exemption covers only OpenSpec archive commits
-
-When the SHA gate detects that HEAD has moved past the reviewed commit, it SHALL classify commits since the review as either "pipeline-internal" or "developer/fix". A commit is pipeline-internal if and only if its message headline starts with the OpenSpec archive prefix (`chore: archive OpenSpec change(s) for #`). If every commit since the review is pipeline-internal, the prior verdict SHALL remain valid without any further checks. A docs-update commit (`docs: update documentation for #`) SHALL NOT be treated as pipeline-internal, because the pre-merge docs step no longer exists and no such commits are produced by the pipeline. When non-pipeline-internal commits are present, the gate SHALL continue to the diff-hash cache check (not immediately trigger a review stage re-run).
-
-#### Scenario: Only OpenSpec archive commits since review — verdict valid
-
-- **WHEN** HEAD has moved past the reviewed SHA
-- **AND** every commit since the review has the message prefix `chore: archive OpenSpec change(s) for #`
-- **THEN** the SHA gate SHALL treat the prior verdict as valid and SHALL NOT trigger a re-review or diff-hash check
-
-#### Scenario: A docs-prefix commit present — treated as developer commit
-
-- **WHEN** a commit with message prefix `docs: update documentation for #` is present since the review
-- **THEN** the SHA gate SHALL treat that commit as a developer commit
-- **AND** SHALL proceed to the diff-hash cache check (not immediately trigger re-review)
-
-#### Scenario: Mix of archive and developer commits — diff-hash check required
-
-- **WHEN** commits since the review include at least one commit that is not an OpenSpec archive commit
-- **THEN** the SHA gate SHALL NOT immediately trigger a full review re-run
-- **AND** SHALL proceed to the diff-hash cache check; if the diff hash is unchanged, the verdict is reused; if the diff hash changed, a delta review runs
-
