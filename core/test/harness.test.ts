@@ -292,6 +292,57 @@ test("invoke(): a timed-out harness kills its grandchild — proves invoke() thr
   );
 });
 
+// ---------------------------------------------------------------------------
+// reasoningEffort (#278) — codex plan-review reasoning-effort cap
+//
+// invoke("codex", ..., { reasoningEffort: "medium" }) must include
+// -c model_reasoning_effort=medium in the codex args; omitting reasoningEffort
+// must leave the args unchanged; and the claude harness must never include the flag.
+// ---------------------------------------------------------------------------
+
+test("invoke(): codex with reasoningEffort:'medium' includes -c model_reasoning_effort=medium in args (#278)", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "medium" });
+    const lines = result.stdout.split("\n");
+    const cIdx = lines.indexOf("-c");
+    assert.ok(cIdx !== -1, "-c flag must be present in codex args");
+    assert.equal(lines[cIdx + 1], "model_reasoning_effort=medium", "-c value must be model_reasoning_effort=medium");
+    // Prompt must still be the last positional.
+    const args = result.stdout.replace(/\n$/, "").split("\n");
+    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must remain the trailing positional");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): codex WITHOUT reasoningEffort has no -c model_reasoning_effort flag (#278)", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false });
+    assert.doesNotMatch(result.stdout, /model_reasoning_effort/, "no reasoning-effort flag when reasoningEffort is absent");
+    assert.doesNotMatch(result.stdout, /-c\n/, "no -c flag when reasoningEffort is absent");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): claude with reasoningEffort:'medium' does NOT include -c model_reasoning_effort flag (#278)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "medium" });
+    assert.doesNotMatch(result.stdout, /model_reasoning_effort/, "claude must not include model_reasoning_effort flag");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace period (#260)", async () => {
   // Regression for the scenario where the direct child exits on SIGTERM while a
   // grandchild with 'trap '' TERM' survives — runCapped must not resolve until after
