@@ -14,7 +14,7 @@ The planning stage SHALL implement a `runPlanningPhases` internal function that 
 - **AND** the observable behavior (transitions, blockers, comments, PR body) SHALL be identical to the pre-change OpenSpec path
 
 ### Requirement: Hook interface isolates the authoring and validation steps
-The `PlanningPhaseHooks` interface SHALL declare exactly the following hook points: authoring the planning artifact, post-author structural validation, post-revision re-validation, and building the PR body and transition message. No other lifecycle step SHALL vary between hook implementations.
+The `PlanningPhaseHooks` interface SHALL declare exactly the following hook points: authoring the planning artifact, plan-revision invocation (optional), post-author structural validation, post-revision re-validation, and building the PR body and transition message. No other lifecycle step SHALL vary between hook implementations. The plan-revision hook (`invokeRevision`) is optional — when absent, the shared runner falls back to `invokePlanStep` (which uses `cfg.repo_dir` for non-sandboxed runs); when present, it allows the revision harness to run in the issue worktree.
 
 #### Scenario: authoring hook produces the planning artifact
 - **WHEN** `runPlanningPhases` reaches the authoring step
@@ -24,6 +24,12 @@ The `PlanningPhaseHooks` interface SHALL declare exactly the following hook poin
 - **WHEN** `runPlanningPhases` calls `hooks.validateArtifact` (post-author or post-revision)
 - **AND** the hook returns a failure
 - **THEN** `runPlanningPhases` SHALL call `setBlocked` with the hook-supplied reason and return `{ advanced: false, status: "blocked" }`
+
+#### Scenario: OpenSpec revision hook runs in the issue worktree
+- **WHEN** `runPlanningPhases` reaches the plan-revision step
+- **AND** `hooks.invokeRevision` is present
+- **THEN** it SHALL call `hooks.invokeRevision` with the issue worktree and delegate invocation entirely to the hook
+- **AND** the OpenSpec implementation SHALL run the revision harness in `wt.path` so it can update the OpenSpec change files in place
 
 ### Requirement: Paired blocker equivalence across paths
 For every failure mode in the planning lifecycle — bootstrap failure, plan-generation failure, plan-review failure, plan-revision failure, human-feedback-ack failure, implementation harness failure, no-commits, and PR-creation failure — the freeform and OpenSpec hooks SHALL produce the same blocker `tag` value and the same reason prefix when routed through `runPlanningPhases`.

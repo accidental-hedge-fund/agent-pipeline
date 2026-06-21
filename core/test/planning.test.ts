@@ -12,6 +12,8 @@ import {
   formatHumanFeedback,
   gatherCarryForward,
   HUMAN_FEEDBACK_ACK_HEADER,
+  makeFreeformPlanningHooks,
+  makeOpenspecPlanningHooks,
   revisedPlanHeader,
   runPlanningPhases,
   sanitizeBodyForResearch,
@@ -828,4 +830,100 @@ test("runPlanningPhases — blocker equivalence: PR-creation failure", async () 
   assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
   assert.ok(f?.reason.startsWith("PR creation failed:"), `freeform reason: ${f?.reason}`);
   assert.ok(o?.reason.startsWith("PR creation failed:"), `openspec reason: ${o?.reason}`);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression — OpenSpec plan revision must run in wt.path (#265 fix-1)
+//
+// Before this fix, makeOpenspecPlanningHooks had no invokeRevision hook and
+// runPlanningPhases fell through to invokePlanStep, which uses cfg.repo_dir for
+// non-sandboxed runs. The OpenSpec revision harness must run in wt.path so it
+// can write updated proposal/spec files into the issue worktree.
+// ---------------------------------------------------------------------------
+
+test("makeOpenspecPlanningHooks: invokeRevision is present and calls invoke with wt.path (not cfg.repo_dir)", async () => {
+  const capturedDirs: string[] = [];
+  const fakeDeps = {
+    invoke: async (_h: string, dir: string, _p: string, _opts: unknown): Promise<HarnessResult> => {
+      capturedDirs.push(dir);
+      return harnessOk;
+    },
+  };
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test", "body", []);
+  assert.ok(typeof hooks.invokeRevision === "function", "OpenSpec hooks must implement invokeRevision");
+  await hooks.invokeRevision!("claude", { path: "/fake/wt" }, "revision prompt", eqCfg, {}, fakeDeps as Parameters<typeof hooks.invokeRevision>[5]);
+  assert.equal(capturedDirs.length, 1);
+  assert.equal(capturedDirs[0], "/fake/wt", "OpenSpec revision must use wt.path as cwd");
+  assert.notEqual(capturedDirs[0], eqCfg.repo_dir, "OpenSpec revision must NOT use cfg.repo_dir");
+});
+
+test("makeFreeformPlanningHooks: invokeRevision is absent (falls back to invokePlanStep)", () => {
+  const hooks = makeFreeformPlanningHooks(eqCfg, "Test", "body");
+  assert.equal(hooks.invokeRevision, undefined, "freeform must not override revision invocation");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 regression — plan-gen failure tag equivalence with real hook
+// builders (#265 fix-1)
+//
+// The existing blocker-equivalence tests use synthetic overrides of authorArtifact
+// and cannot catch tag divergence in the concrete hook builders. These tests
+// exercise makeFreeformPlanningHooks and makeOpenspecPlanningHooks directly with
+// a fake deps.invoke so no real harness is spawned.
+// ---------------------------------------------------------------------------
+
+test("makeFreeformPlanningHooks: authorArtifact returns harness-failure tag when invoke exits non-zero", async () => {
+  const failDeps = {
+    invoke: async (): Promise<HarnessResult> => harnessFailure,
+  };
+  const hooks = makeFreeformPlanningHooks(eqCfg, "Test issue", "test body");
+  const result = await hooks.authorArtifact(
+    eqCfg, 42, { path: "/fake/wt", branch: "pipeline/42" }, {}, "", "run-42", failDeps as Parameters<typeof hooks.authorArtifact>[6],
+  );
+  assert.equal(result.ok, false, "must fail");
+  assert.ok(!result.ok && result.tag === "harness-failure", `tag: ${!result.ok ? result.tag : "ok"}`);
+  assert.ok(!result.ok && result.reason.startsWith("Plan generation"), `reason: ${!result.ok ? result.reason : ""}`);
+});
+
+test("makeOpenspecPlanningHooks: authorArtifact returns harness-failure tag when invoke exits non-zero", async () => {
+  const failDeps = {
+    invoke: async (): Promise<HarnessResult> => harnessFailure,
+    gitInWorktree: async () => ({ stdout: "abc123", stderr: "", code: 0 }),
+    openspecIsInitialized: (_p: string) => true,
+  };
+  const hooks = makeOpenspecPlanningHooks(eqCfg, "Test issue", "test body", []);
+  const result = await hooks.authorArtifact(
+    eqCfg, 42, { path: "/fake/wt", branch: "pipeline/42" }, {}, "", "run-42", failDeps as Parameters<typeof hooks.authorArtifact>[6],
+  );
+  assert.equal(result.ok, false, "must fail");
+  assert.ok(!result.ok && result.tag === "harness-failure", `tag: ${!result.ok ? result.tag : "ok"}`);
+  assert.ok(!result.ok && result.reason.startsWith("Plan generation"), `reason: ${!result.ok ? result.reason : ""}`);
+});
+
+test("plan-gen failure — concrete hook builders produce same tag and reason prefix (finding 2 paired regression)", async () => {
+  const baseFakeDeps = {
+    invoke: async (): Promise<HarnessResult> => harnessFailure,
+    gitInWorktree: async () => ({ stdout: "abc123", stderr: "", code: 0 }),
+    openspecIsInitialized: (_p: string) => true,
+  };
+  const wt = { path: "/fake/wt", branch: "pipeline/42" };
+
+  const fHooks = makeFreeformPlanningHooks(eqCfg, "Test", "body");
+  const oHooks = makeOpenspecPlanningHooks(eqCfg, "Test", "body", []);
+
+  const fResult = await fHooks.authorArtifact(eqCfg, 42, wt, {}, "", "run-42", baseFakeDeps as Parameters<typeof fHooks.authorArtifact>[6]);
+  const oResult = await oHooks.authorArtifact(eqCfg, 42, wt, {}, "", "run-42", baseFakeDeps as Parameters<typeof oHooks.authorArtifact>[6]);
+
+  assert.equal(fResult.ok, false, "freeform must fail");
+  assert.equal(oResult.ok, false, "openspec must fail");
+
+  const fTag = !fResult.ok ? fResult.tag : "";
+  const oTag = !oResult.ok ? oResult.tag : "";
+  assert.equal(fTag, "harness-failure", `freeform tag: ${fTag}`);
+  assert.equal(oTag, "harness-failure", `openspec tag: ${oTag}`);
+
+  const fReason = !fResult.ok ? fResult.reason : "";
+  const oReason = !oResult.ok ? oResult.reason : "";
+  assert.ok(fReason.startsWith("Plan generation"), `freeform reason must start with "Plan generation": ${fReason}`);
+  assert.ok(oReason.startsWith("Plan generation"), `openspec reason must start with "Plan generation": ${oReason}`);
 });

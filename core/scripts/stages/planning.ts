@@ -205,6 +205,21 @@ export interface PlanningPhaseHooks {
 
   /** Build the implementation plan string passed to the implementing prompt. */
   buildImplPlan(wt: { path: string }, revisedPlanText: string): string | Promise<string>;
+
+  /**
+   * Override how the plan-revision harness is invoked. When absent, falls back
+   * to `invokePlanStep` (which uses `cfg.repo_dir` for non-sandboxed runs). The
+   * OpenSpec implementation sets this so the revision harness runs in `wt.path`
+   * and can update the OpenSpec change files in the issue worktree.
+   */
+  invokeRevision?(
+    primary: Harness,
+    wt: { path: string },
+    prompt: string,
+    cfg: PipelineConfig,
+    opts: AdvanceOpts,
+    deps: RunPlanningPhasesDeps,
+  ): Promise<HarnessResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +238,8 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     invokeReviewer?: typeof invokeReviewer;
     hasCommitsAhead?: typeof hasCommitsAhead;
     gitInWorktree?: typeof gitInWorktree;
+    /** Overrides `openspec.isInitialized` for unit tests that cannot set up a real worktree. */
+    openspecIsInitialized?: (path: string) => boolean;
   };
 
 // ---------------------------------------------------------------------------
@@ -355,7 +372,9 @@ export async function runPlanningPhases(
     );
 
     const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
-    const revisionResult = await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts, { invoke: deps.invoke });
+    const revisionResult = hooks.invokeRevision
+      ? await hooks.invokeRevision(primary, wt, revisionPrompt, cfg, opts, deps)
+      : await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts, { invoke: deps.invoke });
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
@@ -568,13 +587,13 @@ export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, bo
         planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke });
       } catch (err) {
         const e = err as Error;
-        return { ok: false, reason: `Plan generation failed: ${e.message}`, tag: "plan-gen-failed" };
+        return { ok: false, reason: `Plan generation failed: ${e.message}`, tag: "harness-failure" };
       }
       if (!planResult.success || !planResult.stdout.trim()) {
         const reason = planResult.timed_out
           ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
           : `Plan generation failed (exit ${planResult.exit_code})`;
-        return { ok: false, reason, tag: "plan-gen-failed" };
+        return { ok: false, reason, tag: "harness-failure" };
       }
       return {
         ok: true,
@@ -648,9 +667,10 @@ export function makeOpenspecPlanningHooks(
     async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps) {
       const primary: Harness = innerCfg.harnesses.implementer;
       const doGit = deps.gitInWorktree ?? gitInWorktree;
+      const isInit = deps.openspecIsInitialized ?? openspec.isInitialized;
 
       // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
-      if (!openspec.isInitialized(wt.path)) {
+      if (!isInit(wt.path)) {
         if (!innerCfg.openspec.bootstrap) {
           return {
             ok: false,
@@ -687,7 +707,8 @@ export function makeOpenspecPlanningHooks(
         await doGit(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
       ).stdout.trim();
 
-      const planResult = await invoke(
+      const inv = deps.invoke ?? invoke;
+      const planResult = await inv(
         primary,
         wt.path,
         buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, pipelineRunId }),
@@ -699,11 +720,11 @@ export function makeOpenspecPlanningHooks(
       );
       if (!planResult.success) {
         const reason = planResult.timed_out
-          ? `timed out after ${planResult.duration.toFixed(0)}s`
-          : `exit ${planResult.exit_code}`;
+          ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
+          : `Plan generation failed (exit ${planResult.exit_code})`;
         return {
           ok: false,
-          reason: `OpenSpec proposal authoring (${primary}) failed: ${reason}`,
+          reason,
           tag: "harness-failure",
         };
       }
@@ -831,6 +852,19 @@ export function makeOpenspecPlanningHooks(
         `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
         `${proposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`
       );
+    },
+
+    // Run plan revision in the issue worktree so the harness can update the
+    // OpenSpec change files (proposal.md, spec deltas, tasks.md) in wt.path.
+    // Freeform does not implement this hook and falls back to invokePlanStep,
+    // which uses cfg.repo_dir for non-sandboxed runs.
+    async invokeRevision(primary, wt, prompt, innerCfg, opts, deps) {
+      const inv = deps.invoke ?? invoke;
+      return inv(primary, wt.path, prompt, {
+        timeoutSec: innerCfg.implementation_timeout,
+        model: opts.model ?? innerCfg.models.planning,
+        sandbox: innerCfg.harness_sandbox,
+      });
     },
   };
 }
