@@ -1097,6 +1097,53 @@ node scripts/install.mjs uninstall --host all
 /plugin uninstall pipeline@ahf-tools
 ```
 
+## Benchmark & Reliability Suite
+
+`core/test/benchmark-reliability.test.ts` is a lightweight suite that runs inside the normal `npm test` pass. It covers six hotspot scenarios using injectable fake deps — no real network, git, or subprocess calls — and produces structured timing and call-count output.
+
+### How to run
+
+```bash
+cd core && npm test   # includes the benchmark/reliability suite alongside all other tests
+```
+
+### Output
+
+Each benchmark scenario logs a summary line to stdout:
+
+```
+[bench] status-latency-50: p50=0.002ms p95=0.005ms gh_calls=30 total=0.1ms
+[bench] stage-loop-gh-call-count: gh_calls=8 (budget=15) duration=1.6ms
+[bench] pre-merge-polling-call-count: CI polls=4 (K=3) iterations=4 duration=3.0ms
+```
+
+Each reliability scenario logs what it asserted:
+
+```
+[reliability] harness-timeout: outcome={"advanced":false,"status":"blocked",...}
+[reliability] partial-transition-failure: error surfaced="gh label add: label not found"
+[reliability] missing-summary-json: exit code handled, diagnostic emitted
+```
+
+### BenchmarkResult fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scenario` | string | Identifier for the scenario |
+| `p50_ms` | number ≥ 0 | p50 wall time across samples (milliseconds) |
+| `p95_ms` | number ≥ 0 | p95 wall time across samples (milliseconds) |
+| `gh_call_count` | integer ≥ 0 | Total fake-gh invocations during the scenario |
+| `stage_duration_ms` | number ≥ 0 | Total wall time for the scenario (all samples) |
+
+### Six hotspot scenarios covered
+
+1. **Status latency — 1, 10, 50 worktrees** — measures the worktree scan path (mirrors `getForIssue` / `listActive`) with 30 samples each; asserts `gh_call_count` does not grow super-linearly.
+2. **Stage-loop gh call count** — runs one full `advanceReview` iteration with fake deps; asserts the call count stays within a documented observational budget (currently ~8).
+3. **Pre-merge CI polling** — simulates K=3 pending polls then success; asserts `getPrChecks` is called exactly K+1 times.
+4. **Harness timeout** — injects a `timed_out: true` harness result; asserts the stage transitions to `blocked` and does not advance or throw uncaught.
+5. **Partial transition failure** — injects a `transition` dep that throws on label add; asserts the error surfaces and the stage does not silently advance.
+6. **Artifact corruption** — tests `runSummaryByRunId` with a missing file and a malformed (non-JSON) `summary.json`; asserts `process.exitCode = 1` and a diagnostic message, not an uncaught throw.
+
 ## Development
 
 ```bash
