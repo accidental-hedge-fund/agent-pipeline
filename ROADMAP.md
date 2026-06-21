@@ -227,7 +227,9 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.6.1** *(folded into v1.7.0)* | patch | Version-staleness detection | #186 | **#186 shipped within v1.7.0** (merged via #224 before the `v1.7.0` tag) — no separate `v1.6.1` tag was cut. Added the `doctor` stale-install / version-coherence check + a `launcher-smoke` assertion that `--version` equals the installed `core/package.json`. |
 | **v1.7.0** ✅ shipped | minor | Control plane & release_model | #214, #216, #217 | Shipped 2026-06-19 (tag `v1.7.0`). See **Shipped** above for the per-PR detail. |
 | **v1.8.0** ✅ shipped | minor | Faster intake/sweep + fail-fast timeouts | #220, #248 | Shipped 2026-06-19 (tag `v1.8.0`) — eighth minor. Intake/sweep spec-generation pinned to a fast model (`models.intake`/`models.sweep`, default `sonnet`) + a lean tool-free harness (`--tools ""`/`--strict-mcp-config`; no MCP, no repo exploration) → ~15× faster intake (#220/#247); plus configurable `intake_timeout`/`sweep_timeout` (#248/#250). Additive keys; defaults preserve behavior. See **Shipped** above. |
-| **v1.9.0** | minor | Carried autonomy (forge-resistance) | #23 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open). #149 (bounded auto-loop) already shipped in v1.7.0. |
+| **v1.9.0** | minor | Observability & reliability hardening | #256, #257, #258, #259, #260, #261, #262, #264, #265, #266 (+ #253, #254, #255) | Ninth minor — GitHub-call instrumentation (#257), idempotent auditable transitions (#259), structured ReviewArtifact records (#264), run-directory summaries (#261), status caching + fast worktree lookup (#258), a benchmark/reliability regression suite (#266), unified planning flows (#265), untrusted carry-forward sanitization (#262), shared gh-write wrapper (#256), plus CI/release-pipeline fixes (#253/#254/#255). All additive/internal — no breaking changes. |
+| **v1.10.0** | minor | CLI dispatch v2 (command registry + conventions) | #263, #273 | Command registry + lifecycle/CLI-parsing split (#263, PR #284 WIP) co-scoped with moving `/pipeline` off `--` conventions (#273). |
+| **deferred** | minor | Graduated autonomy (forge-resistance) | #23 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open). #149 (bounded auto-loop) already shipped in v1.7.0. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -258,7 +260,9 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #40 | minor | adds key | reviewer pluggability | v1.2.0 | #39 |
 | #70 | minor | adds key | per-step models | v1.2.0 | #91 ✓ |
 | #144 | patch | none | convergence robustness | v1.2.0 | — |
-| #23 | minor | adds key | graduated autonomy | v1.9.0 | — |
+| #23 | minor | adds key | graduated autonomy | deferred | PR #194 |
+| #263 | minor | none | CLI dispatch v2 (command registry) | v1.10.0 | #273 |
+| #273 | minor | none | CLI dispatch v2 (conventions) | v1.10.0 | #263 |
 | #21 | minor | adds key | execution isolation | v1.3.0 | #93 ✓ |
 | #149 | minor | adds key | bounded auto-loop | ✅ v1.7.0 | #21 / #133 ✓ |
 | #220 | minor | adds keys | faster intake/sweep (model pin + lean harness) | ✅ v1.8.0 | — |
