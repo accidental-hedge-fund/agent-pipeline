@@ -356,8 +356,9 @@ export async function runPlanningPhases(
     const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
       await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
-        timeoutSec: cfg.review_timeout,
+        timeoutSec: cfg.plan_review_timeout,
         model: opts.model ?? cfg.models.review,
+        reasoningEffort: "medium",
       });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
@@ -371,6 +372,11 @@ export async function runPlanningPhases(
       return { advanced: false, status: "blocked", reason };
     }
     const planReview = reviewResult.stdout.trim();
+    if (!planReview.includes("## Plan Review Verdict")) {
+      const reason = `plan-review output missing required "## Plan Review Verdict" section — the reviewer returned prose instead of a structured verdict`;
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
+      return { advanced: false, status: "blocked", reason };
+    }
     const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
     await doPostComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
 

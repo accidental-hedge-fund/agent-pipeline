@@ -171,6 +171,7 @@ export interface PipelineConfig {
   // Timeouts (seconds)
   implementation_timeout: number;
   review_timeout: number;
+  plan_review_timeout: number;
   fix_timeout: number;
   intake_timeout: number;
   sweep_timeout: number;
@@ -353,6 +354,7 @@ export const DEFAULT_CONFIG: Omit<
   auto_recovery_max_retries: 2,
   implementation_timeout: 2400,
   review_timeout: 1500,
+  plan_review_timeout: 300,
   fix_timeout: 2400,
   intake_timeout: 600,
   sweep_timeout: 600,

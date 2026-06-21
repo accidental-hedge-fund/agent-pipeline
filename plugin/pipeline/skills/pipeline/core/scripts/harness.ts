@@ -64,6 +64,13 @@ export interface InvokeOptions {
    * would break OAuth auth. Ignored for codex and custom reviewer CLIs.
    */
   lean?: boolean;
+  /**
+   * When set and harness is "codex", passes `-c model_reasoning_effort=<value>`
+   * to the codex CLI so the call overrides the operator's global reasoning-effort
+   * config. Used by plan-review to cap effort at "medium" regardless of the global.
+   * Silently ignored for claude and custom reviewer CLIs.
+   */
+  reasoningEffort?: string;
 }
 
 export async function invoke(
@@ -93,7 +100,9 @@ export async function invoke(
     args.push(prompt);
   } else if (harness === "codex") {
     cmd = "codex";
-    args = ["exec", "--full-auto", "-C", worktreeDir, prompt];
+    args = ["exec", "--full-auto", "-C", worktreeDir];
+    if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort=${opts.reasoningEffort}`);
+    args.push(prompt);
   } else {
     // A user-configured reviewer CLI (`review_harness`, #40). Invoke it with the
     // prompt as a single positional argument; its stdout is the verdict output

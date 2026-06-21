@@ -1390,3 +1390,88 @@ test("resolveConfig: sweep_timeout: 'fast' is rejected (non-integer)", async () 
     process.env.PATH = oldPath;
   }
 });
+
+// ---------------------------------------------------------------------------
+// plan_review_timeout (#278)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: plan_review_timeout absent → defaults to 300", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/prt0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.plan_review_timeout, 300);
+    assert.equal(cfg.plan_review_timeout, DEFAULT_CONFIG.plan_review_timeout);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: file plan_review_timeout:600 overrides default; other timeouts unchanged", async () => {
+  const repo = makeFakeRepo(`plan_review_timeout: 600\n`);
+  const binDir = makeFakeGh("acme/prt1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.plan_review_timeout, 600);
+    assert.equal(cfg.review_timeout, DEFAULT_CONFIG.review_timeout);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: plan_review_timeout: 0 is rejected (non-positive)", async () => {
+  const repo = makeFakeRepo(`plan_review_timeout: 0\n`);
+  const binDir = makeFakeGh("acme/prt2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("plan_review_timeout"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: plan_review_timeout: 'fast' is rejected (non-integer)", async () => {
+  const repo = makeFakeRepo(`plan_review_timeout: fast\n`);
+  const binDir = makeFakeGh("acme/prt3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("plan_review_timeout"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: plan_review_timeout: -1 is rejected (negative integer)", async () => {
+  const repo = makeFakeRepo(`plan_review_timeout: -1\n`);
+  const binDir = makeFakeGh("acme/prt4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("plan_review_timeout"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

@@ -575,6 +575,8 @@ const revisionOkResult: HarnessResult = {
 
 const harnessOk: HarnessResult = { success: true, stdout: "## Plan\n\nDo the thing.", stderr: "", exit_code: 0, duration: 1, timed_out: false };
 const harnessFailure: HarnessResult = { success: false, stdout: "", stderr: "", exit_code: 1, duration: 1, timed_out: false };
+// Plan-review result that satisfies the verdict-header check (#278).
+const planReviewOk: HarnessResult = { success: true, stdout: "## Plan Review Verdict\n\nApproved. No blocking findings.", stderr: "", exit_code: 0, duration: 1, timed_out: false };
 
 // Minimal PipelineConfig for equivalence tests.
 const eqCfg = {
@@ -585,6 +587,7 @@ const eqCfg = {
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   implementation_timeout: 300,
   review_timeout: 300,
+  plan_review_timeout: 300,
   models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
   harness_sandbox: false,
   marker_footer: "---pipeline---",
@@ -607,7 +610,7 @@ function eqBaseDeps() {
     postComment: async () => {},
     addLabel: async () => {},
     getIssueDetail: async () => ({ title: "Test", body: "test body", comments: [], number: 42, labels: [], state: "open" }),
-    invokeReviewer: async () => ({ result: harnessOk, effectiveReviewer: "codex", selfReview: false }),
+    invokeReviewer: async () => ({ result: planReviewOk, effectiveReviewer: "codex", selfReview: false }),
     // Empty stdout → implHeadBefore="" → enforceImplCommitRef is skipped (no real git).
     // code 0 → push in resumeFromImplementing succeeds.
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
@@ -889,7 +892,7 @@ test("runPlanningPhases: OpenSpec hooks causes invokeReviewer to receive wt.path
     ...eqBaseDeps(),
     invokeReviewer: async (_reviewer: string, _primary: string, cwd: string, _prompt: string, _opts: unknown) => {
       capturedCwds.push(cwd);
-      return { result: harnessOk, effectiveReviewer: "codex", selfReview: false };
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
     },
   };
   // openspecHooks() includes planReviewCwd returning wt.path
@@ -912,7 +915,7 @@ test("runPlanningPhases: the CONCRETE makeOpenspecPlanningHooks.planReviewCwd ro
     ...eqBaseDeps(),
     invokeReviewer: async (_reviewer: string, _primary: string, cwd: string, _prompt: string, _opts: unknown) => {
       capturedCwds.push(cwd);
-      return { result: harnessOk, effectiveReviewer: "codex", selfReview: false };
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
     },
   };
   const hooks = openspecHooks({ planReviewCwd: realHooks.planReviewCwd });
@@ -928,7 +931,7 @@ test("runPlanningPhases: freeform hooks causes invokeReviewer to receive cfg.rep
     ...eqBaseDeps(),
     invokeReviewer: async (_reviewer: string, _primary: string, cwd: string, _prompt: string, _opts: unknown) => {
       capturedCwds.push(cwd);
-      return { result: harnessOk, effectiveReviewer: "codex", selfReview: false };
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
     },
   };
   await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
@@ -1000,4 +1003,102 @@ test("plan-gen failure — concrete hook builders produce same tag and reason pr
   const oReason = !oResult.ok ? oResult.reason : "";
   assert.ok(fReason.startsWith("Plan generation"), `freeform reason must start with "Plan generation": ${fReason}`);
   assert.ok(oReason.startsWith("Plan generation"), `openspec reason must start with "Plan generation": ${oReason}`);
+});
+
+// ---------------------------------------------------------------------------
+// Plan-review verdict validation (#278) — missing "## Plan Review Verdict"
+//
+// runPlanningPhases must block immediately when plan-review output does not
+// contain "## Plan Review Verdict", rather than forwarding prose to the
+// plan-revision step.
+// ---------------------------------------------------------------------------
+
+test("runPlanningPhases — verdict validation: output WITH header advances past verdict check (#278)", async () => {
+  // planReviewOk has "## Plan Review Verdict" — the verdict check must pass.
+  const f = await runAndCapture(freeformHooks());
+  const o = await runAndCapture(openspecHooks());
+  // Neither should block at the verdict-check stage (plan-review/needs-human for missing header).
+  // f and o may still be defined (blocked at a later stage), but NOT due to missing verdict.
+  const verdictMissing = (b: typeof f) =>
+    b?.tag === "needs-human" && b.reason.includes("plan-review output missing required");
+  assert.ok(!verdictMissing(f), `freeform must not block for missing verdict header: ${f?.reason}`);
+  assert.ok(!verdictMissing(o), `openspec must not block for missing verdict header: ${o?.reason}`);
+});
+
+test("runPlanningPhases — verdict validation: output WITHOUT header blocks with needs-human (#278)", async () => {
+  // Return plan-review prose without the required "## Plan Review Verdict" section.
+  const noVerdictResult: HarnessResult = {
+    success: true,
+    stdout: "Here is my extensive analysis of the plan. The implementation looks reasonable. Ready to implement on approval.",
+    stderr: "",
+    exit_code: 0,
+    duration: 1,
+    timed_out: false,
+  };
+  const failReview = {
+    invokeReviewer: async () => ({ result: noVerdictResult, effectiveReviewer: "codex", selfReview: false }),
+  };
+  const f = await runAndCapture(freeformHooks(), failReview);
+  const o = await runAndCapture(openspecHooks(), failReview);
+  assert.equal(f?.tag, "needs-human", `freeform tag must be needs-human, got: ${f?.tag}`);
+  assert.equal(o?.tag, f?.tag, "openspec tag must match freeform");
+  assert.equal(f?.stage, "plan-review", `freeform stage must be plan-review, got: ${f?.stage}`);
+  assert.equal(o?.stage, f?.stage, "openspec stage must match freeform");
+  assert.ok(f?.reason.includes("plan-review output missing required"), `freeform reason: ${f?.reason}`);
+  assert.ok(f?.reason.includes("## Plan Review Verdict"), `freeform reason must name the missing section: ${f?.reason}`);
+  assert.ok(o?.reason.includes("plan-review output missing required"), `openspec reason: ${o?.reason}`);
+});
+
+test("runPlanningPhases — verdict validation: empty plan-review output blocks (existing harness-failure path) (#278)", async () => {
+  // Empty stdout is caught by the prior !reviewResult.stdout.trim() check (harness-failure),
+  // not the verdict check — both paths result in a block at plan-review stage.
+  const emptyResult: HarnessResult = {
+    success: true, stdout: "", stderr: "", exit_code: 0, duration: 1, timed_out: false,
+  };
+  const emptyReview = {
+    invokeReviewer: async () => ({ result: emptyResult, effectiveReviewer: "codex", selfReview: false }),
+  };
+  const f = await runAndCapture(freeformHooks(), emptyReview);
+  const o = await runAndCapture(openspecHooks(), emptyReview);
+  assert.equal(f?.stage, "plan-review", `freeform must block at plan-review, got: ${f?.stage}`);
+  assert.equal(o?.stage, f?.stage, "openspec stage must match freeform");
+  assert.ok(f?.tag === "harness-failure" || f?.tag === "needs-human", `freeform tag must be a blocking tag, got: ${f?.tag}`);
+});
+
+// ---------------------------------------------------------------------------
+// Plan-review options forwarding (#278): plan_review_timeout and reasoningEffort
+//
+// runPlanningPhases must pass cfg.plan_review_timeout (not cfg.review_timeout)
+// and reasoningEffort: "medium" to invokeReviewer for the plan-review step.
+// ---------------------------------------------------------------------------
+
+test("runPlanningPhases — plan_review_timeout forwarded to invokeReviewer (#278)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  const cfg = { ...eqCfg, plan_review_timeout: 42 } as unknown as PipelineConfig;
+  await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.timeoutSec, 42, "plan_review_timeout must be forwarded as timeoutSec");
+});
+
+test("runPlanningPhases — reasoningEffort: medium forwarded to invokeReviewer (#278)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.reasoningEffort, "medium", "reasoningEffort must be forwarded as 'medium'");
 });

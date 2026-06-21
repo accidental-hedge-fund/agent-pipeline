@@ -17,6 +17,7 @@ const PartialConfigSchema = z.object({
   auto_recovery_max_retries: z.number().int().min(0).optional().describe("Number of auto-recovery attempts when implementation blocks."),
   implementation_timeout: z.number().int().positive().optional().describe("Seconds for the implementation harness before timing out."),
   review_timeout: z.number().int().positive().optional().describe("Seconds per review stage."),
+  plan_review_timeout: z.number().int().positive().optional().describe("Seconds for the plan-review harness before timing out."),
   fix_timeout: z.number().int().positive().optional().describe("Seconds per fix stage."),
   intake_timeout: z.number().int().positive().optional().describe("Seconds for the intake harness call before timing out."),
   sweep_timeout: z.number().int().positive().optional().describe("Seconds for the sweep harness call before timing out."),
@@ -304,6 +305,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     implementation_timeout:
       fileConfig.implementation_timeout ?? DEFAULT_CONFIG.implementation_timeout,
     review_timeout: fileConfig.review_timeout ?? DEFAULT_CONFIG.review_timeout,
+    plan_review_timeout: fileConfig.plan_review_timeout ?? DEFAULT_CONFIG.plan_review_timeout,
     fix_timeout: fileConfig.fix_timeout ?? DEFAULT_CONFIG.fix_timeout,
     intake_timeout: fileConfig.intake_timeout ?? DEFAULT_CONFIG.intake_timeout,
     sweep_timeout: fileConfig.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout,
@@ -915,6 +917,7 @@ max_concurrent_worktrees: ${d.max_concurrent_worktrees} # cap on simultaneous in
 auto_recovery_max_retries: ${d.auto_recovery_max_retries} # auto-recovery attempts when implementation blocks
 implementation_timeout: ${d.implementation_timeout} # seconds for the implementation harness
 review_timeout: ${d.review_timeout} # seconds per review stage
+plan_review_timeout: ${d.plan_review_timeout} # seconds for the plan-review harness (shorter cap; fails fast on runaway review)
 fix_timeout: ${d.fix_timeout} # seconds per fix stage
 intake_timeout: ${d.intake_timeout} # seconds for the intake harness call before timing out
 sweep_timeout: ${d.sweep_timeout} # seconds for the sweep harness call before timing out
