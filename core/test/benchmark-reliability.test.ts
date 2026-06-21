@@ -543,6 +543,76 @@ describe("benchmark-reliability-suite", () => {
     console.log(`[reliability] partial-transition-failure: outcome=${JSON.stringify(outcome)} blocked_reason="${blockedReason}"`);
   });
 
+  test("partial transition failure on non-approve path: needs-attention below-policy verdict blocks on label-add error", async () => {
+    // RED: fails without the safeTransitionFn helper on the no-blocking-advancement
+    // path (partition.blocking.length === 0). Before the fix, that path called
+    // transitionFn directly with no try/catch, so a label-add error propagated as
+    // an uncaught exception rather than returning { advanced: false, status: "blocked" }.
+    //
+    // Setup: needs-attention verdict with one low-severity finding. With
+    // block_threshold="medium" in the test config, the finding lands in advisory
+    // (partition.blocking.length === 0), so the no-blocking advancement path is
+    // taken. The transition is then guarded by safeTransitionFn.
+
+    const BELOW_POLICY_VERDICT = JSON.stringify({
+      verdict: "needs-attention",
+      summary: "One minor style issue",
+      findings: [{
+        severity: "low",
+        title: "Unused variable",
+        body: "Variable `x` is declared but never used.",
+        confidence: 0.9,
+        recommendation: "Remove the unused variable.",
+        file: "src/foo.ts",
+      }],
+      next_steps: ["Remove unused variable"],
+      commit_sha: FAKE_SHA,
+    });
+
+    let transitionAttempted = false;
+    let blockedReason: string | undefined;
+
+    const deps: AdvanceReviewDeps = {
+      ...makeBaseReviewDeps(),
+      runReview: async () => ({
+        result: {
+          success: true,
+          stdout: BELOW_POLICY_VERDICT,
+          stderr: "",
+          exit_code: 0,
+          duration: 0.001,
+          timed_out: false,
+        },
+        effectiveReviewer: "codex",
+        selfReview: false,
+      }),
+      transition: async () => {
+        transitionAttempted = true;
+        throw new Error("gh label add: label 'pipeline:review-2' not found in repository");
+      },
+      setBlocked: async (_cfg, _issue, reason) => {
+        blockedReason = reason;
+      },
+    };
+
+    const outcome = await advanceReview(cfg, 42, 1, {}, 0, deps);
+
+    assert.ok(transitionAttempted, "transition must have been attempted before failing");
+    assert.equal(outcome.advanced, false, "stage must NOT advance when transition throws on non-approve path");
+    assert.equal(
+      (outcome as { status?: string }).status,
+      "blocked",
+      `stage must return status=blocked on label-add failure (non-approve path); got ${JSON.stringify(outcome)}`,
+    );
+    assert.ok(blockedReason !== undefined, "setBlocked must be called with a reason");
+    assert.ok(
+      blockedReason!.includes("label"),
+      `blocked reason must reference label; got: "${blockedReason}"`,
+    );
+
+    console.log(`[reliability] partial-transition-non-approve: outcome=${JSON.stringify(outcome)} blocked_reason="${blockedReason}"`);
+  });
+
   // -------------------------------------------------------------------------
   // Section 7: Artifact corruption / missing file reliability tests
   // -------------------------------------------------------------------------

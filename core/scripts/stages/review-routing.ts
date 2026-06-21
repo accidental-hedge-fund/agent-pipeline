@@ -142,6 +142,18 @@ export async function advanceReview(
   const actor = await getGhActorFn();
 
   const stage: Stage = round === 1 ? "review-1" : "review-2";
+
+  async function safeTransitionFn(fromStage: Stage, toStage: Stage, message: string): Promise<Outcome | null> {
+    try {
+      await transitionFn(cfg, issueNumber, fromStage, toStage, message);
+      return null;
+    } catch (err) {
+      const errMsg = (err as Error).message;
+      await setBlockedFn(cfg, issueNumber, `Label transition failed: ${errMsg}`, stage, "harness-failure");
+      return { advanced: false, status: "blocked", reason: errMsg };
+    }
+  }
+
   const configuredReviewer = cfg.harnesses.reviewer;
   let reviewer = configuredReviewer;
 
@@ -271,13 +283,8 @@ export async function advanceReview(
               ? (round === 1 ? "fix-1" : "fix-2")
               : (round === 1 ? "review-2" : "pre-merge");
             const verb = isBlocking ? "blocking findings" : "advance";
-            await transitionFn(
-              cfg,
-              issueNumber,
-              stage,
-              toStage,
-              `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`,
-            );
+            const cachedBlocked = await safeTransitionFn(stage, toStage, `Diff hash unchanged; reusing cached verdict for round ${round} (${verb}).`);
+            if (cachedBlocked) return cachedBlocked;
             return { advanced: true, from: stage, to: toStage, summary: `cached verdict: ${verb}` };
           }
         }
@@ -402,24 +409,14 @@ export async function advanceReview(
     }
     await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment)));
     if (round === 1) {
-      try {
-        await transitionFn(cfg, issueNumber, "review-1", "review-2",
-          `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
-      } catch (err) {
-        const msg = (err as Error).message;
-        await setBlockedFn(cfg, issueNumber, `Label transition failed: ${msg}`, stage, "harness-failure");
-        return { advanced: false, status: "blocked", reason: msg };
-      }
+      const r1Blocked = await safeTransitionFn("review-1", "review-2",
+        `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
+      if (r1Blocked) return r1Blocked;
       return { advanced: true, from: "review-1", to: "review-2", summary: `approved (${verdict.findings.length} findings)` };
     } else {
-      try {
-        await transitionFn(cfg, issueNumber, "review-2", "pre-merge",
-          `Adversarial review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
-      } catch (err) {
-        const msg = (err as Error).message;
-        await setBlockedFn(cfg, issueNumber, `Label transition failed: ${msg}`, stage, "harness-failure");
-        return { advanced: false, status: "blocked", reason: msg };
-      }
+      const r2Blocked = await safeTransitionFn("review-2", "pre-merge",
+        `Adversarial review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
+      if (r2Blocked) return r2Blocked;
       return { advanced: true, from: "review-2", to: "pre-merge", summary: `adversarial approved (${verdict.findings.length} findings)` };
     }
   }
@@ -501,11 +498,11 @@ export async function advanceReview(
       }
     }
     const toStage: Stage = round === 1 ? "review-2" : "pre-merge";
-    await transitionFn(
-      cfg, issueNumber, stage, toStage,
+    const advBlocked = await safeTransitionFn(stage, toStage,
       `Review ${round} by ${reviewerLabel}: ${verdict.findings.length} finding(s), none above policy ` +
         `(${partition.advisory.length} advisory, ${partition.overridden.length} overridden) — advancing.`,
     );
+    if (advBlocked) return advBlocked;
     return {
       advanced: true,
       from: stage,
@@ -536,13 +533,13 @@ export async function advanceReview(
         issueNumber,
         reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
       );
-      await transitionFn(
-        cfg, issueNumber, stage, "needs-human",
+      const recurrenceBlocked = await safeTransitionFn(stage, "needs-human",
         `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
           `finding key after a fix round — a proven non-convergence signal. Recorded as advisory; ` +
           `parked at needs-human early, without consuming the remaining round budget (will NOT ` +
           `auto-advance to ready-to-deploy).`,
       );
+      if (recurrenceBlocked) return recurrenceBlocked;
       return {
         advanced: true,
         from: stage,
@@ -625,13 +622,13 @@ export async function advanceReview(
           issueNumber,
           reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
         );
-        await transitionFn(
-          cfg, issueNumber, stage, "needs-human",
+        const srBlocked = await safeTransitionFn(stage, "needs-human",
           `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
             `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
             `same (file + category) cluster. Parked at needs-human early without consuming ` +
             `the remaining round budget.`,
         );
+        if (srBlocked) return srBlocked;
         return {
           advanced: true,
           from: stage,
@@ -689,11 +686,11 @@ export async function advanceReview(
       }
 
       const surfaceNextStage: Stage = round === 1 ? "review-2" : "pre-merge";
-      await transitionFn(
-        cfg, issueNumber, stage, surfaceNextStage,
+      const srdBlocked = await safeTransitionFn(stage, surfaceNextStage,
         `Surface-recurrence guard fired: ${belowHighInFired.length} below-high finding(s) ` +
           `auto-demoted to advisory and deferred to #${surfaceFollowupNumber}. Advancing to ${surfaceNextStage}.`,
       );
+      if (srdBlocked) return srdBlocked;
       return {
         advanced: true,
         from: stage,
@@ -723,12 +720,12 @@ export async function advanceReview(
         issueNumber,
         reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments)),
       );
-      await transitionFn(
-        cfg, issueNumber, stage, "needs-human",
+      const ceilingBlocked = await safeTransitionFn(stage, "needs-human",
         `Review ${round} hit the ${roundCap}-round ceiling with ` +
           `${partition.blocking.length} finding(s) still blocking. Recorded as advisory; parked at ` +
           `needs-human for a human to override or fix (will NOT auto-advance to ready-to-deploy).`,
       );
+      if (ceilingBlocked) return ceilingBlocked;
       return {
         advanced: true,
         from: stage,
@@ -784,11 +781,11 @@ export async function advanceReview(
     }
 
     const toStage: Stage = "pre-merge";
-    await transitionFn(
-      cfg, issueNumber, stage, toStage,
+    const ceilingDemoteBlocked = await safeTransitionFn(stage, toStage,
       `Review ${round} hit the ${roundCap}-round ceiling; ${belowHigh.length} below-high finding(s) ` +
         `auto-demoted to advisory and deferred to #${followupNumber}. Advancing to pre-merge.`,
     );
+    if (ceilingDemoteBlocked) return ceilingDemoteBlocked;
     return {
       advanced: true,
       from: stage,
@@ -802,11 +799,11 @@ export async function advanceReview(
     partition.advisory.length || partition.overridden.length
       ? ` (${partition.advisory.length} advisory + ${partition.overridden.length} overridden not blocking)`
       : "";
-  await transitionFn(
-    cfg, issueNumber, stage, fixStage,
+  const fixBlocked = await safeTransitionFn(stage, fixStage,
     `Review ${round} by ${reviewerLabel} requested changes (${partition.blocking.length} blocking ` +
       `of ${verdict.findings.length} findings${advisoryNote}).`,
   );
+  if (fixBlocked) return fixBlocked;
   return {
     advanced: true,
     from: stage,
