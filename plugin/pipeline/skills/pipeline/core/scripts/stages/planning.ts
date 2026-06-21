@@ -1117,9 +1117,10 @@ const REDACT_PATTERNS: ReadonlyArray<RegExp> = [
 // Extra patterns for brief sanitization that extend artifact-sanitize.ts INJECTION_PATTERNS.
 // sanitizeBriefForPrompt iterates INJECTION_PATTERNS first (canonical, drift-guarded), then these.
 const BRIEF_SUPPLEMENTAL_PATTERNS: ReadonlyArray<RegExp> = [
-  // "Ignore all previous/prior instructions" — the multi-word sequence (all + previous/prior)
-  // is not matched by INJECTION_PATTERNS which only handles one qualifier after "ignore".
-  /ignore\s+all\s+(?:previous|prior)\s+instructions?/gi,
+  // "Ignore all previous/prior/above instructions" — the multi-word sequence (all + the
+  // qualifier) is not matched by INJECTION_PATTERNS, which only handles ONE qualifier after
+  // "ignore" (so "ignore all above instructions" slips through the canonical pattern).
+  /ignore\s+all\s+(?:previous|prior|above)\s+instructions?/gi,
   // "Act as [anything]" — broader than INJECTION_PATTERNS' "act as if" to catch "act as a …" variants
   /act\s+as\b/gi,
   // <system> XML tag injection (not in INJECTION_PATTERNS)
