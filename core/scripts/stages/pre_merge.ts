@@ -11,8 +11,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  closePr,
   findLatestCommentMatching,
   getGhActor,
+  getHeadCheckRunCount,
   getIssueDetail,
   getPrChecks,
   getPrCommits,
@@ -21,6 +23,7 @@ import {
   getPrForIssue,
   parseChecksAggregate,
   postComment,
+  reopenPr,
   setBlocked,
   transition,
 } from "../gh.ts";
@@ -73,6 +76,26 @@ export function isPipelineInternalCommit(messageHeadline: string): boolean {
   return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
 }
 
+/**
+ * Mutable context shared across `advancePolling` iterations. `advancePolling`
+ * allocates one per polling session and passes it to every `advance()` call so
+ * the CI-gate grace window and the no-run recovery guard persist across polls
+ * (fixing the reset-on-every-poll bug — #281 review 2).
+ */
+export interface PreMergePollingContext {
+  /** Wall-clock ms when the CI gate first observed pending checks. Set by
+   *  `advance()` on first entry; never reset once set within a session. */
+  ciGateEnteredAt?: number;
+  /** Head SHA for which a close+reopen recovery was already attempted. Prevents
+   *  repeated PR state churn when two consecutive polls both see zero check-runs. */
+  noRunRecoveryAttemptedForSha?: string;
+  /** PR head SHA before the OpenSpec archive commit was pushed. Used by the
+   *  no-run recovery path to verify the pre-archive SHA had green CI and to
+   *  compute the archive-only diff. Captured once at the start of the first
+   *  poll that reaches the archive step. */
+  preArchiveSha?: string;
+}
+
 export interface AdvancePreMergeOpts {
   dryRun?: boolean;
   model?: string;
@@ -82,6 +105,10 @@ export interface AdvancePreMergeOpts {
    *  (CI checks, OpenSpec archive push, rebase) are recorded under "pre-merge".
    *  Undefined → recording disabled. */
   stateDir?: string;
+  /** Mutable context shared across polling iterations. When absent (single
+   *  `advance()` call without a polling loop), the CI-gate grace window and the
+   *  no-run recovery guard are skipped (pre-existing behaviour). */
+  pollingCtx?: PreMergePollingContext;
 }
 
 /**
@@ -108,6 +135,18 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
+  // Seams for the no-run recovery path (#281).
+  getHeadCheckRunCount?: typeof getHeadCheckRunCount;
+  closePr?: typeof closePr;
+  reopenPr?: typeof reopenPr;
+  /** Returns the diff file paths between two SHAs (used for the archive-only check).
+   *  Injected seam; defaults to `git diff --name-only baseSha...headSha`. */
+  getDiffFilePaths?: (cfg: PipelineConfig, baseSha: string, headSha: string) => Promise<string[]>;
+  /** Wall-clock timestamp in ms. Injectable for tests; defaults to Date.now(). */
+  nowMs?: () => number;
+  /** Sleep for the given ms. Injectable for tests to avoid real waits in
+   *  `advancePolling` unit tests; defaults to setTimeout-based sleep. */
+  sleepMs?: (ms: number) => Promise<void>;
 }
 
 export async function advance(
@@ -125,6 +164,11 @@ export async function advance(
   const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
   const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
   const markRebaseAttemptedFn = deps.markRebaseAttempted ?? markRebaseAttempted;
+  const getHeadCheckRunCountFn = deps.getHeadCheckRunCount ?? getHeadCheckRunCount;
+  const closePrFn = deps.closePr ?? closePr;
+  const reopenPrFn = deps.reopenPr ?? reopenPr;
+  const getDiffFilePathsFn = deps.getDiffFilePaths ?? defaultGetDiffFilePaths;
+  const nowMsFn = deps.nowMs ?? (() => Date.now());
 
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
 
@@ -152,6 +196,20 @@ export async function advance(
   // commits (openspec archive) do not invalidate the verdict.
   const shaGate = await enforceReviewShaGate(cfg, issueNumber, prNumber, deps);
   if (shaGate) return shaGate;
+
+  // ---- Capture pre-archive SHA for the no-run recovery path (#281) ----
+  // Done once per polling session (when pollingCtx exists and preArchiveSha is not
+  // yet set). Captures the current PR head — the developer's last commit — before
+  // maybeArchiveOpenspec potentially pushes an archive commit that moves HEAD.
+  // Subsequent polls find preArchiveSha already set and skip this fetch.
+  if (opts.pollingCtx && !opts.pollingCtx.preArchiveSha) {
+    try {
+      const preArchiveDetail = await getPrDetailFn(cfg, prNumber);
+      opts.pollingCtx.preArchiveSha = preArchiveDetail.head_sha;
+    } catch {
+      // Fetch failed; no-run recovery will use the non-archive fallback path.
+    }
+  }
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
   const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, deps, opts.stateDir);
@@ -202,6 +260,29 @@ export async function advance(
   }
 
   if (agg.pending) {
+    // No-run recovery (#281): when GitHub Actions never fires a run for the head
+    // SHA (e.g. after an archive-only commit), `getPrChecks` returns a stale
+    // pending state indefinitely. After the grace window, query the check-runs API
+    // directly. Zero runs → enter recovery rather than polling out ci_timeout.
+    // Only active when a polling context is present (advancePolling session).
+    const ctx = opts.pollingCtx;
+    if (ctx) {
+      const headSha = prDetail.head_sha;
+      if (ctx.ciGateEnteredAt === undefined) ctx.ciGateEnteredAt = nowMsFn();
+      const elapsed = nowMsFn() - ctx.ciGateEnteredAt;
+      if (elapsed >= (cfg.ci_no_run_grace_s ?? 60) * 1000) {
+        let runCount: number;
+        try {
+          runCount = await getHeadCheckRunCountFn(cfg, headSha);
+        } catch {
+          runCount = -1; // API failure → treat as "runs exist" (conservative-open)
+        }
+        if (runCount === 0) {
+          return handleZeroRunRecovery(cfg, issueNumber, prNumber, headSha, ctx,
+            setBlockedFn, closePrFn, reopenPrFn, getHeadCheckRunCountFn, getDiffFilePathsFn);
+        }
+      }
+    }
     return { advanced: false, status: "waiting", reason: "CI still running" };
   }
 
@@ -1277,6 +1358,119 @@ function staleSpecDeltaBlockReason(id: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// No-run recovery (#281)
+// ---------------------------------------------------------------------------
+
+/**
+ * Called when `getPrChecks` shows pending CI but the check-runs API reports
+ * zero runs for the head SHA — GitHub Actions never fired, typically after an
+ * archive-only commit that did not re-trigger the `pull_request` event.
+ *
+ * Decision tree:
+ *  1. Already attempted recovery for this SHA → block (needs-human).
+ *  2. Diff from preArchiveSha to headSha is openspec-only AND preArchiveSha had
+ *     ≥1 check-run (prior green) → close+reopen PR to re-fire CI → waiting.
+ *  3. close+reopen throws → block (needs-human).
+ *  4. Non-archive diff or preArchiveSha unavailable → block (needs-human) with
+ *     actionable manual close+reopen suggestion.
+ */
+async function handleZeroRunRecovery(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  prNumber: number,
+  headSha: string,
+  ctx: PreMergePollingContext,
+  setBlockedFn: typeof setBlocked,
+  closePrFn: typeof closePr,
+  reopenPrFn: typeof reopenPr,
+  getHeadCheckRunCountFn: typeof getHeadCheckRunCount,
+  getDiffFilePathsFn: (cfg: PipelineConfig, baseSha: string, headSha: string) => Promise<string[]>,
+): Promise<Outcome> {
+  // One-shot-per-SHA guard: prevents repeated PR state churn on consecutive polls.
+  if (ctx.noRunRecoveryAttemptedForSha === headSha) {
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `No CI run detected for head SHA ${headSha.slice(0, 7)}; close+reopen recovery was already attempted for this SHA. ` +
+        `Investigate why GitHub Actions is not triggering and manually re-fire CI, then remove the \`blocked\` label and re-run the pipeline.`,
+      "pre-merge",
+      "needs-human",
+    );
+    return { advanced: false, status: "blocked", reason: `no CI run after recovery for ${headSha.slice(0, 7)}` };
+  }
+
+  const preArchiveSha = ctx.preArchiveSha;
+  let isArchiveOnly = false;
+  let priorGreen = false;
+
+  if (preArchiveSha && preArchiveSha !== headSha) {
+    try {
+      const diffPaths = await getDiffFilePathsFn(cfg, preArchiveSha, headSha);
+      isArchiveOnly = diffPaths.length > 0 && diffPaths.every((p) => p.startsWith("openspec/"));
+      if (isArchiveOnly) {
+        const priorCount = await getHeadCheckRunCountFn(cfg, preArchiveSha);
+        priorGreen = priorCount > 0;
+      }
+    } catch {
+      // Treat as non-archive-only on error (conservative-open: no auto-recover).
+    }
+  }
+
+  if (isArchiveOnly && priorGreen) {
+    try {
+      await closePrFn(cfg, prNumber);
+      await reopenPrFn(cfg, prNumber);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `No CI run detected for head SHA ${headSha.slice(0, 7)}; close+reopen recovery failed: ${msg}`,
+        "pre-merge",
+        "needs-human",
+      );
+      return { advanced: false, status: "blocked", reason: `no CI run; close+reopen failed: ${msg}` };
+    }
+    ctx.noRunRecoveryAttemptedForSha = headSha;
+    console.log(
+      `[pipeline] #${issueNumber}: no CI run for SHA ${headSha.slice(0, 7)}; closed and reopened PR #${prNumber} to re-fire CI`,
+    );
+    return {
+      advanced: false,
+      status: "waiting",
+      reason: "no CI run detected; closed and reopened PR to re-fire CI",
+    };
+  }
+
+  // Non-archive diff or pre-archive SHA unavailable or prior SHA had no runs.
+  await setBlockedFn(
+    cfg,
+    issueNumber,
+    `No CI run detected for head SHA ${headSha.slice(0, 7)}; try closing and reopening the PR to re-fire GitHub Actions.`,
+    "pre-merge",
+    "needs-human",
+  );
+  return { advanced: false, status: "blocked", reason: `no CI run detected for head SHA ${headSha.slice(0, 7)}` };
+}
+
+/** Default implementation of the `getDiffFilePaths` seam. */
+async function defaultGetDiffFilePaths(
+  cfg: PipelineConfig,
+  baseSha: string,
+  headSha: string,
+): Promise<string[]> {
+  const result = await gitInWorktree(
+    cfg.repo_dir,
+    ["diff", "--name-only", `${baseSha}...${headSha}`],
+    { ignoreFailure: true },
+  );
+  if (result.code !== 0) {
+    throw new Error(`git diff --name-only ${baseSha.slice(0, 7)}...${headSha.slice(0, 7)} failed: ${result.stderr.trim()}`);
+  }
+  return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
 // Rebase tracking
 // ---------------------------------------------------------------------------
 
@@ -1374,20 +1568,31 @@ async function tryRebaseAndPush(
  * exhausts the CI timeout. Used by the top-level orchestrator. Returns the
  * last outcome. `opts.stateDir` is forwarded to each `advance` call so
  * evidence recording works across all polling iterations.
+ *
+ * `deps` is optional and forwarded to every `advance` call; injectable seams
+ * (nowMs, sleepMs, getHeadCheckRunCount, …) enable unit-testing the polling
+ * loop without real network calls or wall-clock waits.
  */
 export async function advancePolling(
   cfg: PipelineConfig,
   issueNumber: number,
   opts: AdvancePreMergeOpts = {},
+  deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome> {
-  const deadline = Date.now() + cfg.ci_timeout * 1000;
+  const nowMsFn = deps.nowMs ?? (() => Date.now());
+  const sleepMsFn = deps.sleepMs ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = nowMsFn() + cfg.ci_timeout * 1000;
   let last: Outcome | null = null;
-  while (Date.now() < deadline) {
-    last = await advance(cfg, issueNumber, opts);
+  // Allocate a shared polling context so grace-window timing and no-run recovery
+  // state persist across advance() iterations (#281). Reuses an existing context
+  // when one was passed in opts (e.g. from a resumed polling session).
+  const pollingCtx: PreMergePollingContext = opts.pollingCtx ?? {};
+  while (nowMsFn() < deadline) {
+    last = await advance(cfg, issueNumber, { ...opts, pollingCtx }, deps);
     if (last.advanced) return last;
     if (!last.advanced && last.status !== "waiting") return last;
     // waiting → sleep and try again
-    await new Promise((r) => setTimeout(r, cfg.ci_poll_interval * 1000));
+    await sleepMsFn(cfg.ci_poll_interval * 1000);
   }
   return last ?? { advanced: false, status: "waiting", reason: "timed out polling pre-merge" };
 }

@@ -23,9 +23,12 @@
 - [ ] 4.1 Add optional dep fields to the deps interface:
   `getHeadCheckRunCount`, `closePr`, `reopenPr`.
 - [ ] 4.2 Wire production defaults in `advancePreMerge`.
-- [ ] 4.3 Add `noRunRecoveryAttemptedForSha?: string` to the CI-gate state (threaded
-  via deps or a mutable ref in the polling context) so a recovery attempt for a given
-  head SHA is tracked across successive `advance` calls within the same polling session.
+- [ ] 4.3 Add a `PreMergePollingContext` interface with three fields:
+  `ciGateEnteredAt?: number` (wall-clock ms when CI gate first observed pending checks),
+  `noRunRecoveryAttemptedForSha?: string` (head SHA for which close+reopen was already tried),
+  and `preArchiveSha?: string` (PR head before the OpenSpec archive commit). All three
+  fields are allocated once in `advancePolling` and threaded via `opts.pollingCtx` so
+  they persist across successive `advance()` calls within the same polling session.
 
 ## 5. Capture pre-archive SHA in `advancePreMerge`
 
@@ -36,9 +39,13 @@
 
 ## 6. Implement no-run detection and recovery in the CI-gate path
 
-- [ ] 6.1 After `getPrChecksFn` returns `agg.pending`, check elapsed time since
-  polling started for this iteration. If elapsed ≥ `cfg.ci_no_run_grace_s * 1000`,
-  call `getHeadCheckRunCountFn(cfg, prDetail.headRefOid)`.
+- [ ] 6.1 After `getPrChecksFn` returns `agg.pending`, check elapsed time since the
+  first CI-pending observation in the current polling session (persisted in
+  `pollingCtx.ciGateEnteredAt` across all `advance()` calls; set on first entry,
+  never reset within the session). If elapsed ≥ `cfg.ci_no_run_grace_s * 1000`,
+  call `getHeadCheckRunCountFn(cfg, prDetail.head_sha)`.
+  NOTE: the check must use `=== undefined` (not falsy) to guard the first-write,
+  because `0` (epoch) is a valid timestamp and falsy in JavaScript.
 - [ ] 6.2 If count > 0, return `waiting` as before (runs exist, just pending).
 - [ ] 6.3 If count === 0:
   - If `noRunRecoveryAttemptedForSha` equals the current head SHA, skip
