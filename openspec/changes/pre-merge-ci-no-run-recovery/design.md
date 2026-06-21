@@ -54,10 +54,17 @@ and pass it to the CI-gate path. This avoids a separate git/gh lookup.
 `AdvancePreMergeDeps` pattern so unit tests can exercise the path without real GitHub
 calls. The production defaults delegate to `ghRun`-based helpers.
 
-**Decision: Close+reopen is attempted at most once per pipeline loop iteration.**
-The state is ephemeral (no marker file needed): the gate attempts close+reopen once,
-then returns `{ status: "waiting" }` so the next pipeline tick re-enters the CI-poll
-path normally. If the close+reopen itself fails (PR already closed, rate limit), the
+**Decision: Close+reopen is attempted at most once per head SHA.**
+The gate tracks the SHA for which a no-run recovery was attempted (stored as
+`noRunRecoveryAttemptedForSha` in the deps/state object injected into the CI-gate
+path). Before calling `closePr`/`reopenPr`, the gate checks whether the current
+head SHA matches `noRunRecoveryAttemptedForSha`; if it does, the gate skips
+close+reopen and surfaces an actionable error instead (treating it the same as the
+non-archive-only case). After a successful close+reopen, `noRunRecoveryAttemptedForSha`
+is set to the current head SHA so subsequent polls for the same SHA do not repeat the
+operation. This prevents the `advancePolling` loop from triggering repeated PR state
+churn when GitHub still reports 0 check-runs on the poll immediately following
+close+reopen. If the close+reopen itself fails (PR already closed, rate limit), the
 gate surfaces the error and blocks with `needs-human`.
 
 ## Risks / Trade-offs

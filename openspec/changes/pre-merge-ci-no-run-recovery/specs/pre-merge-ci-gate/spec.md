@@ -55,6 +55,14 @@ SHALL return `waiting` to resume polling on the next pipeline tick.
 - **THEN** the gate SHALL call `setBlocked` with label `needs-human` and a reason that includes the failure detail
 - **AND** SHALL return `{ advanced: false, status: "blocked", reason: "..." }`
 
+#### Scenario: second zero-count poll for the same head SHA after recovery — no additional close+reopen
+
+- **WHEN** zero check-runs are detected for a head SHA
+- **AND** a close+reopen recovery was already attempted for that same head SHA in a prior poll
+- **THEN** the gate SHALL NOT call `closePr` or `reopenPr` again
+- **AND** SHALL call `setBlocked` with label `needs-human` and a reason indicating that recovery was already attempted
+- **AND** SHALL return `{ advanced: false, status: "blocked", reason: "..." }`
+
 ---
 
 ### Requirement: The gate SHALL surface an actionable error when zero check-runs exist for a non-archive-only diff

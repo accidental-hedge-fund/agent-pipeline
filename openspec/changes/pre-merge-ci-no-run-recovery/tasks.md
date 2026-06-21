@@ -23,6 +23,9 @@
 - [ ] 4.1 Add optional dep fields to the deps interface:
   `getHeadCheckRunCount`, `closePr`, `reopenPr`.
 - [ ] 4.2 Wire production defaults in `advancePreMerge`.
+- [ ] 4.3 Add `noRunRecoveryAttemptedForSha?: string` to the CI-gate state (threaded
+  via deps or a mutable ref in the polling context) so a recovery attempt for a given
+  head SHA is tracked across successive `advance` calls within the same polling session.
 
 ## 5. Capture pre-archive SHA in `advancePreMerge`
 
@@ -38,10 +41,14 @@
   call `getHeadCheckRunCountFn(cfg, prDetail.headRefOid)`.
 - [ ] 6.2 If count > 0, return `waiting` as before (runs exist, just pending).
 - [ ] 6.3 If count === 0:
-  - Fetch the archive diff file paths (via `gh pr diff --name-only` on
+  - If `noRunRecoveryAttemptedForSha` equals the current head SHA, skip
+    close+reopen and call `setBlockedFn` with `needs-human` and message
+    "no CI run detected for head SHA <sha> after recovery was already attempted".
+  - Otherwise, fetch the archive diff file paths (via `gh pr diff --name-only` on
     `preArchiveSha..HEAD` or equivalent).
   - If diff is openspec-only AND `getHeadCheckRunCount(preArchiveSha)` > 0:
-    call `closePrFn` then `reopenPrFn`, return `waiting`.
+    set `noRunRecoveryAttemptedForSha` to the current head SHA, call `closePrFn`
+    then `reopenPrFn`, return `waiting`.
   - Otherwise: surface actionable error, call `setBlockedFn` with `needs-human`
     and message "no CI run detected for head SHA; try closing and reopening the PR".
 
@@ -57,6 +64,12 @@
   fake `getHeadCheckRunCount` returns 2 → stays `waiting`; no close+reopen.
 - [ ] 7.4 `pre_merge.test.ts` — normal case unaffected:
   `agg.pending = false, agg.passed = true` → advances; no zero-run check invoked.
+- [ ] 7.5 `pre_merge.test.ts` — second zero-count poll for the same head SHA (regression):
+  simulate two successive `advance` calls with `getHeadCheckRunCount` returning 0
+  both times and the archive-only + prior-SHA-green conditions satisfied; assert that
+  `closePr` and `reopenPr` are each called exactly once (not twice), and the second
+  call returns `{ status: "blocked" }` with `setBlocked` invoked. This proves the
+  one-shot-per-SHA guard prevents repeated PR state churn.
 
 ## 8. Mirror + CI
 
