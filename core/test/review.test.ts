@@ -239,14 +239,17 @@ test("parseStructuredVerdict: stamps commitSha onto the text-fallback verdict (#
   assert.equal(v.commitSha, SHA_A);
 });
 
-test("formatReviewComment: embeds the short SHA in the header and full SHA sentinel last (#16)", () => {
+test("formatReviewComment: embeds the short SHA in the header; artifact block is last (#16, #264)", () => {
   const md = formatReviewComment(
     { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: SHA_A },
     1,
     "codex",
   );
   assert.match(md, new RegExp(`\\(commit ${SHA_A.slice(0, 7)}\\)`));
-  assert.match(md, new RegExp(`<!-- reviewed-sha: ${SHA_A} -->\\s*$`), "sentinel must be the last line");
+  // reviewed-sha sentinel is still present (backward compat) but is no longer last.
+  assert.ok(md.includes(`<!-- reviewed-sha: ${SHA_A} -->`), "reviewed-sha sentinel must be present");
+  // ReviewArtifact block (#264) is now the final line.
+  assert.match(md, /<!-- review-artifact: [A-Za-z0-9_-]+ -->\s*$/, "artifact block must be the last line");
 });
 
 test("formatReviewComment: omits the sentinel when no SHA was resolved (#16)", () => {

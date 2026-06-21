@@ -33,6 +33,7 @@ import {
   extractBlockingKeysFromComment,
   extractBlockingKeysMarker,
   extractDiffHashFromComment,
+  extractReviewArtifact,
   findLatestReviewCommentBody,
   formatDeltaReviewComment,
   extractReviewedSha,
@@ -518,10 +519,13 @@ export async function enforceReviewShaGate(
             )
             .at(-1);
           if (priorReviewComment) {
-            // Use the legacy-aware extractor: falls back to override-key token scraping
-            // for comments that predate the pipeline-blocking-keys marker (#229 Finding 11).
-            // An explicit empty marker (advisory-only) is preserved as "no blockers".
-            const recorded = extractBlockingKeysFromComment(priorReviewComment.body);
+            // Primary: prefer artifact for blocking-keys read (#264); fall back to legacy
+            // extractor (scrapes override-key tokens) for comments without an artifact.
+            // An explicit empty marker / empty artifact.blockingKeys is "no blockers".
+            const _priorArtifact = extractReviewArtifact(priorReviewComment.body);
+            const recorded = _priorArtifact !== null
+              ? new Set(_priorArtifact.blockingKeys)
+              : extractBlockingKeysFromComment(priorReviewComment.body);
             if (recorded.size > 0) {
               const overrides = extractOverrides(trustedOverrideComments);
               const unresolved = [...recorded].filter((k) => !overrides.has(k));
@@ -578,7 +582,12 @@ export async function enforceReviewShaGate(
     commentBody: string | null,
     via: string,
   ): Promise<Outcome | null> => {
-    const recorded = commentBody ? extractBlockingKeysMarker(commentBody) : null;
+    // Primary: prefer artifact for blocking-keys read (#264); marker-only fallback
+    // for pre-artifact comments. Null artifact + null marker = approve/advisory → no blockers.
+    const _bodyArtifact = commentBody ? extractReviewArtifact(commentBody) : null;
+    const recorded = _bodyArtifact !== null
+      ? new Set(_bodyArtifact.blockingKeys)
+      : (commentBody ? extractBlockingKeysMarker(commentBody) : null);
     if (!recorded || recorded.size === 0) return null;
     // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
     const overrides = extractOverrides(trustedOverrideComments);
@@ -680,7 +689,9 @@ export async function enforceReviewShaGate(
       const currentDiff = await getPrDiffFn(cfg, prNumber);
       const currentHash = computeDiffHash(currentDiff);
       const priorCommentBody = findLatestReviewCommentBody(trustedComments, reviewed.round);
-      const cachedHash = priorCommentBody ? extractDiffHashFromComment(priorCommentBody) : null;
+      // Primary: prefer artifact for diff-hash read (#264); sentinel fallback for pre-artifact.
+      const _priorArtifact2 = priorCommentBody ? extractReviewArtifact(priorCommentBody) : null;
+      const cachedHash = _priorArtifact2?.diffHash ?? (priorCommentBody ? extractDiffHashFromComment(priorCommentBody) : null);
 
       if (cachedHash !== null && cachedHash === currentHash) {
         // Diff unchanged despite SHA mismatch: verdict still covers the code. Reuse
