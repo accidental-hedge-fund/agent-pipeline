@@ -900,6 +900,28 @@ test("runPlanningPhases: OpenSpec hooks causes invokeReviewer to receive wt.path
   assert.notEqual(capturedCwds[0], eqCfg.repo_dir, "OpenSpec plan review must NOT use cfg.repo_dir");
 });
 
+test("runPlanningPhases: the CONCRETE makeOpenspecPlanningHooks.planReviewCwd routes invokeReviewer to wt.path (#265 review)", async () => {
+  // The review asked specifically for an integration test that uses the CONCRETE OpenSpec
+  // hooks (not a hand-written planReviewCwd) and asserts the invokeReviewer cwd. Build the
+  // real production hooks, inject their planReviewCwd through runPlanningPhases (heavy hooks
+  // stay faked via the helper), and assert invokeReviewer receives wt.path — proving the
+  // production hook is what reaches the reviewer, end to end.
+  const realHooks = makeOpenspecPlanningHooks(eqCfg, "Test", "body", []);
+  const capturedCwds: string[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, cwd: string, _prompt: string, _opts: unknown) => {
+      capturedCwds.push(cwd);
+      return { result: harnessOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  const hooks = openspecHooks({ planReviewCwd: realHooks.planReviewCwd });
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, hooks, deps as any);
+  assert.ok(capturedCwds.length >= 1, "invokeReviewer must have been called");
+  assert.equal(capturedCwds[0], "/fake/wt", "the concrete OpenSpec planReviewCwd must route invokeReviewer to wt.path");
+  assert.notEqual(capturedCwds[0], eqCfg.repo_dir, "must NOT fall back to cfg.repo_dir");
+});
+
 test("runPlanningPhases: freeform hooks causes invokeReviewer to receive cfg.repo_dir as cwd", async () => {
   const capturedCwds: string[] = [];
   const deps = {
