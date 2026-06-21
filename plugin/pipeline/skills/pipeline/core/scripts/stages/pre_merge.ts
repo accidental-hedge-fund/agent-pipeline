@@ -15,6 +15,7 @@ import {
   findLatestCommentMatching,
   getGhActor,
   getHeadCheckRunCount,
+  getSuccessfulCheckRunCount,
   getIssueDetail,
   getPrChecks,
   getPrCommits,
@@ -137,6 +138,10 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
   // Seams for the no-run recovery path (#281).
   getHeadCheckRunCount?: typeof getHeadCheckRunCount;
+  /** Counts only successful (conclusion=success) check-runs for a SHA.
+   *  Used for the prior-SHA green check in auto-recovery: a pre-archive SHA
+   *  with only failed/pending runs must NOT qualify as green. */
+  getSuccessfulCheckRunCount?: typeof getSuccessfulCheckRunCount;
   closePr?: typeof closePr;
   reopenPr?: typeof reopenPr;
   /** Returns the diff file paths between two SHAs (used for the archive-only check).
@@ -165,6 +170,7 @@ export async function advance(
   const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
   const markRebaseAttemptedFn = deps.markRebaseAttempted ?? markRebaseAttempted;
   const getHeadCheckRunCountFn = deps.getHeadCheckRunCount ?? getHeadCheckRunCount;
+  const getSuccessfulCheckRunCountFn = deps.getSuccessfulCheckRunCount ?? getSuccessfulCheckRunCount;
   const closePrFn = deps.closePr ?? closePr;
   const reopenPrFn = deps.reopenPr ?? reopenPr;
   const getDiffFilePathsFn = deps.getDiffFilePaths ?? defaultGetDiffFilePaths;
@@ -279,7 +285,7 @@ export async function advance(
         }
         if (runCount === 0) {
           return handleZeroRunRecovery(cfg, issueNumber, prNumber, headSha, ctx,
-            setBlockedFn, closePrFn, reopenPrFn, getHeadCheckRunCountFn, getDiffFilePathsFn);
+            setBlockedFn, closePrFn, reopenPrFn, getSuccessfulCheckRunCountFn, getDiffFilePathsFn);
         }
       }
     }
@@ -1369,7 +1375,7 @@ function staleSpecDeltaBlockReason(id: string): string {
  * Decision tree:
  *  1. Already attempted recovery for this SHA → block (needs-human).
  *  2. Diff from preArchiveSha to headSha is openspec-only AND preArchiveSha had
- *     ≥1 check-run (prior green) → close+reopen PR to re-fire CI → waiting.
+ *     ≥1 successful check-run (prior green) → close+reopen PR to re-fire CI → waiting.
  *  3. close+reopen throws → block (needs-human).
  *  4. Non-archive diff or preArchiveSha unavailable → block (needs-human) with
  *     actionable manual close+reopen suggestion.
@@ -1383,7 +1389,7 @@ async function handleZeroRunRecovery(
   setBlockedFn: typeof setBlocked,
   closePrFn: typeof closePr,
   reopenPrFn: typeof reopenPr,
-  getHeadCheckRunCountFn: typeof getHeadCheckRunCount,
+  getSuccessfulCheckRunCountFn: typeof getSuccessfulCheckRunCount,
   getDiffFilePathsFn: (cfg: PipelineConfig, baseSha: string, headSha: string) => Promise<string[]>,
 ): Promise<Outcome> {
   // One-shot-per-SHA guard: prevents repeated PR state churn on consecutive polls.
@@ -1408,8 +1414,8 @@ async function handleZeroRunRecovery(
       const diffPaths = await getDiffFilePathsFn(cfg, preArchiveSha, headSha);
       isArchiveOnly = diffPaths.length > 0 && diffPaths.every((p) => p.startsWith("openspec/"));
       if (isArchiveOnly) {
-        const priorCount = await getHeadCheckRunCountFn(cfg, preArchiveSha);
-        priorGreen = priorCount > 0;
+        const successCount = await getSuccessfulCheckRunCountFn(cfg, preArchiveSha);
+        priorGreen = successCount > 0;
       }
     } catch {
       // Treat as non-archive-only on error (conservative-open: no auto-recover).

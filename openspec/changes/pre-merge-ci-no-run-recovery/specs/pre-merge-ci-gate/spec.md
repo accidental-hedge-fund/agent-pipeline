@@ -42,11 +42,20 @@ SHALL return `waiting` to resume polling on the next pipeline tick.
 #### Scenario: archive-only diff + prior SHA green → close+reopen then wait
 
 - **WHEN** zero check-runs are detected for the head SHA
-- **AND** `getHeadCheckRunCount(preArchiveSha)` returns a positive integer
+- **AND** the pre-archive SHA has at least one check-run with `conclusion=success`
 - **AND** the diff `preArchiveSha..headSha` contains only paths under `openspec/`
 - **THEN** the gate SHALL call `closePr(cfg, prNumber)` then `reopenPr(cfg, prNumber)`
 - **AND** SHALL return `{ advanced: false, status: "waiting", reason: "no CI run detected; closed and reopened PR to re-fire CI" }`
 - **AND** SHALL NOT call `setBlocked`
+
+#### Scenario: archive-only diff but prior SHA has only failed check-runs — block with actionable message
+
+- **WHEN** zero check-runs are detected for the head SHA
+- **AND** the diff contains only paths under `openspec/`
+- **AND** the pre-archive SHA has zero check-runs with `conclusion=success` (e.g. all failed or cancelled)
+- **THEN** the gate SHALL NOT call `closePr` or `reopenPr`
+- **AND** SHALL call `setBlocked` with label `needs-human` and a reason of the form "no CI run detected for head SHA <sha>; try closing and reopening the PR to re-fire GitHub Actions"
+- **AND** SHALL return `{ advanced: false, status: "blocked", reason: "..." }`
 
 #### Scenario: archive-only condition met but close+reopen fails — block with needs-human
 

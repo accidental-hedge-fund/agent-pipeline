@@ -106,10 +106,8 @@ test("pre-merge no-run: grace window elapsed, zero runs, archive-only diff + pri
   const deps: AdvancePreMergeDeps = {
     ...baseDeps(),
     getPrChecks: async () => [{ name: "ci", bucket: "pending", state: "pending" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
-    getHeadCheckRunCount: async (_cfg, sha) => {
-      // current HEAD has 0 runs; pre-archive SHA has 3 runs (prior green)
-      return sha === SHA_HEAD ? 0 : 3;
-    },
+    getHeadCheckRunCount: async () => 0, // HEAD has 0 total runs → zero-run path
+    getSuccessfulCheckRunCount: async () => 3, // pre-archive SHA has 3 successful runs (prior green)
     getDiffFilePaths: async () => ["openspec/changes/foo/spec.md", "openspec/specs/bar.md"],
     closePr: async (_cfg, n) => { closedPr = n; },
     reopenPr: async (_cfg, n) => { reopenedPr = n; },
@@ -231,6 +229,35 @@ test("pre-merge no-run: normal CI (agg.pending = false) → unaffected, advances
   assert.equal(countCalls, 0, "getHeadCheckRunCount must NOT be called when CI is not pending");
 });
 
+test("pre-merge no-run: archive-only diff but prior SHA has only failed runs → block, no close+reopen (#281)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  let closeCalls = 0;
+  let blockedReason: string | undefined;
+
+  const ctx: PreMergePollingContext = {
+    ciGateEnteredAt: 0,
+    preArchiveSha: SHA_PRE_ARCHIVE,
+  };
+
+  const deps: AdvancePreMergeDeps = {
+    ...baseDeps(),
+    getPrChecks: async () => [{ name: "ci", bucket: "pending", state: "pending" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
+    getHeadCheckRunCount: async () => 0, // HEAD has 0 total runs
+    getSuccessfulCheckRunCount: async () => 0, // pre-archive SHA has NO successful runs (only failed)
+    getDiffFilePaths: async () => ["openspec/changes/foo/spec.md"], // archive-only
+    closePr: async () => { closeCalls++; },
+    setBlocked: async (_cfg, _n, reason) => { blockedReason = reason; },
+    nowMs: () => 61_000,
+  };
+
+  const out = await advance(makeCfg(60), 281, { pollingCtx: ctx }, deps);
+
+  assert.equal(out.status, "blocked");
+  assert.equal(closeCalls, 0, "closePr must NOT be called when prior SHA has no successful runs");
+  assert.ok(blockedReason?.includes("try closing and reopening"), "block reason must include manual recovery suggestion");
+});
+
 test("pre-merge no-run: close+reopen throws → block with failure detail (#281)", async (t) => {
   t.mock.method(console, "log", () => {});
 
@@ -244,7 +271,8 @@ test("pre-merge no-run: close+reopen throws → block with failure detail (#281)
   const deps: AdvancePreMergeDeps = {
     ...baseDeps(),
     getPrChecks: async () => [{ name: "ci", bucket: "pending", state: "pending" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
-    getHeadCheckRunCount: async (_cfg, sha) => sha === SHA_HEAD ? 0 : 5,
+    getHeadCheckRunCount: async () => 0,
+    getSuccessfulCheckRunCount: async () => 5, // pre-archive SHA has successful runs
     getDiffFilePaths: async () => ["openspec/specs/bar.md"],
     closePr: async () => { throw new Error("gh: PR not found"); },
     setBlocked: async (_cfg, _n, reason) => { blockedReason = reason; },
@@ -288,10 +316,8 @@ test("advancePolling: grace window spans multiple polls — getHeadCheckRunCount
       pollCount++;
       return [{ name: "ci", bucket: "pending", state: "pending" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>;
     },
-    getHeadCheckRunCount: async (_cfg, sha) => {
-      countCalls++;
-      return sha === SHA_HEAD ? 0 : 3; // HEAD has 0 runs; pre-archive SHA has 3 (prior green)
-    },
+    getHeadCheckRunCount: async () => { countCalls++; return 0; }, // HEAD always 0
+    getSuccessfulCheckRunCount: async () => 3, // pre-archive SHA has 3 successful runs (prior green)
     getDiffFilePaths: async () => ["openspec/specs/bar.md"],
     closePr: async (_cfg, n) => { closedPr = n; },
     reopenPr: async () => {},

@@ -883,6 +883,25 @@ export async function getHeadCheckRunCount(
   return isNaN(n) ? 0 : n;
 }
 
+/**
+ * Return the count of check-runs with conclusion=success for a specific commit SHA.
+ * Used by the no-run recovery path to verify the pre-archive SHA was actually green
+ * (not just that any check-run exists — failed or pending runs must not qualify).
+ */
+export async function getSuccessfulCheckRunCount(
+  cfg: PipelineConfig,
+  sha: string,
+): Promise<number> {
+  const stdout = await ghRun([
+    "api",
+    `repos/${cfg.repo}/commits/${sha}/check-runs`,
+    "--jq",
+    "[.check_runs[] | select(.conclusion == \"success\")] | length",
+  ]);
+  const n = parseInt(stdout.trim(), 10);
+  return isNaN(n) ? 0 : n;
+}
+
 export async function closePr(cfg: PipelineConfig, prNumber: number): Promise<void> {
   await ghRun(["pr", "close", String(prNumber), "-R", cfg.repo]);
 }
