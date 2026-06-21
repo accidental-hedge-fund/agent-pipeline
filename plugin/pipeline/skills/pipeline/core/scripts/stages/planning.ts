@@ -125,6 +125,387 @@ export interface AdvanceOpts {
   runStoreDeps?: RunStoreDeps;
 }
 
+// ---------------------------------------------------------------------------
+// PlanningPhaseHooks — strategy interface parameterizing runPlanningPhases
+// ---------------------------------------------------------------------------
+
+/**
+ * Strategy interface that parameterizes the shared planning-phase runner for
+ * both freeform and OpenSpec flows. Each hook corresponds to a step where the
+ * two flows diverge.
+ */
+export interface PlanningPhaseHooks {
+  /**
+   * Author the planning artifact (freeform plan or OpenSpec change). Called after
+   * the worktree is created and carry-forward context is gathered.
+   */
+  authorArtifact(
+    cfg: PipelineConfig,
+    issueNumber: number,
+    wt: { path: string; branch: string },
+    opts: AdvanceOpts,
+    carryForward: string,
+    pipelineRunId: string,
+    deps: RunPlanningPhasesDeps,
+  ): Promise<
+    | {
+        ok: true;
+        /** Text posted in the `## Implementation Plan` comment (may include a decorative header). */
+        planText: string;
+        /**
+         * Raw plan text passed to review and revision prompts. When absent, `planText` is
+         * used; for OpenSpec the comment body has a decorative prefix that is stripped here.
+         */
+        promptPlanText?: string;
+        specContext: string;
+        readyToPlanningMsg: string;
+      }
+    | { ok: false; reason: string; tag: string }
+  >;
+
+  /**
+   * Validate the artifact after authoring (e.g. OpenSpec structural check).
+   * Freeform always returns `{ ok: true }`.
+   */
+  validateArtifact(wt: { path: string }): Promise<
+    | { ok: true }
+    | { ok: false; reason: string; tag: string; blockStage: Stage }
+  >;
+
+  /**
+   * Re-validate and re-read the artifact after plan revision. Returns the
+   * (potentially updated) planText and specContext.
+   */
+  revalidateArtifact(wt: { path: string }, revisionStdout: string): Promise<
+    | { ok: true; updatedPlanText: string; updatedSpecContext: string }
+    | { ok: false; reason: string; tag: string }
+  >;
+
+  /** Build the PR body from the plan excerpt and harness names. */
+  buildPrBody(
+    cfg: PipelineConfig,
+    issueNumber: number,
+    title: string,
+    planExcerpt: string,
+    primary: string,
+    reviewer: string,
+  ): string;
+
+  /** Build the transition message for the implementing → review-1 transition. */
+  buildTransitionMessage(prNumber: number, primary: string, reviewer: string): string;
+
+  /** Transition message for planning → plan-review. */
+  planToReviewMsg(primary: string, reviewer: string): string;
+
+  /** Transition message for plan-review/planning → implementing. */
+  preImplTransitionMsg(primary: string, reviewer: string, planReviewEnabled: boolean): string;
+
+  /** Header lines for the `## Revised Implementation Plan` comment. */
+  revisedPlanHeaderLines(primary: string, reviewer: string, humanComments: { author: string }[]): string[];
+
+  /** Build the implementation plan string passed to the implementing prompt. */
+  buildImplPlan(wt: { path: string }, revisedPlanText: string): string | Promise<string>;
+
+  /**
+   * Returns the working directory for the plan reviewer. When absent, defaults
+   * to `cfg.repo_dir`. OpenSpec implementations return `wt.path` so the
+   * reviewer can inspect the just-authored change files in the issue worktree.
+   */
+  planReviewCwd?(wt: { path: string }): string;
+
+  /**
+   * Override how the plan-revision harness is invoked. When absent, falls back
+   * to `invokePlanStep` (which uses `cfg.repo_dir` for non-sandboxed runs). The
+   * OpenSpec implementation sets this so the revision harness runs in `wt.path`
+   * and can update the OpenSpec change files in the issue worktree.
+   */
+  invokeRevision?(
+    primary: Harness,
+    wt: { path: string },
+    prompt: string,
+    cfg: PipelineConfig,
+    opts: AdvanceOpts,
+    deps: RunPlanningPhasesDeps,
+  ): Promise<HarnessResult>;
+}
+
+// ---------------------------------------------------------------------------
+// RunPlanningPhasesDeps — injectable seams for runPlanningPhases
+// ---------------------------------------------------------------------------
+
+type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
+  PlanStepDeps &
+  ImplementerInvokeDeps &
+  ResumeFromImplementingDeps & {
+    getIssueDetail?: typeof getIssueDetail;
+    setBlocked?: typeof setBlocked;
+    transition?: typeof transition;
+    postComment?: typeof postComment;
+    addLabel?: typeof addLabel;
+    invokeReviewer?: typeof invokeReviewer;
+    hasCommitsAhead?: typeof hasCommitsAhead;
+    gitInWorktree?: typeof gitInWorktree;
+    /** Overrides `openspec.isInitialized` for unit tests that cannot set up a real worktree. */
+    openspecIsInitialized?: (path: string) => boolean;
+  };
+
+// ---------------------------------------------------------------------------
+// Shared planning-phase runner — exported for tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared implementation of the planning → plan-review → implementing → review-1
+ * sequence, parameterized by `PlanningPhaseHooks` so both the freeform and
+ * OpenSpec flows can delegate here without duplicating the state machine.
+ */
+export async function runPlanningPhases(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  title: string,
+  body: string,
+  pipelineRunId: string,
+  opts: AdvanceOpts,
+  hooks: PlanningPhaseHooks,
+  deps: RunPlanningPhasesDeps = {},
+): Promise<Outcome> {
+  const doSetBlocked = deps.setBlocked ?? setBlocked;
+  const doTransition = deps.transition ?? transition;
+  const doPostComment = deps.postComment ?? postComment;
+  const doAddLabel = deps.addLabel ?? addLabel;
+  const doInvokeReviewer = deps.invokeReviewer ?? invokeReviewer;
+  const doHasCommitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
+  const doGitInWorktree = deps.gitInWorktree ?? gitInWorktree;
+
+  const primary: Harness = cfg.harnesses.implementer;
+  const reviewer: string = cfg.harnesses.reviewer;
+
+  // ---- Step 0: optional carry-forward context (last30days) ----
+  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
+
+  // ---- Worktree bootstrap: create + dependency install ----
+  const slug = slugify(title) || `issue-${issueNumber}`;
+  const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug, deps);
+  if (!bootstrap.ok) {
+    await doSetBlocked(
+      cfg,
+      issueNumber,
+      bootstrap.tag === "worktree-creation-failed"
+        ? `Worktree creation failed: ${bootstrap.reason}`
+        : `Worktree setup failed: ${bootstrap.reason}`,
+      "ready",
+      bootstrap.tag,
+    );
+    return { advanced: false, status: "blocked", reason: bootstrap.reason };
+  }
+  const wt = bootstrap.wt;
+  if (opts.runDir) {
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
+  }
+
+  // ---- Author the planning artifact ----
+  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps);
+  if (!authorResult.ok) {
+    await doSetBlocked(cfg, issueNumber, authorResult.reason, "ready", authorResult.tag);
+    return { advanced: false, status: "blocked", reason: authorResult.reason };
+  }
+  let planText = authorResult.planText;
+  // `promptPlanText` is the version passed to review/revision prompts — for OpenSpec
+  // the comment includes a decorative header that should not appear in prompts.
+  let promptPlanText = authorResult.promptPlanText ?? planText;
+  let specContext = authorResult.specContext;
+
+  // ---- Validate the artifact structurally ----
+  const validateResult = await hooks.validateArtifact(wt);
+  if (!validateResult.ok) {
+    await doSetBlocked(cfg, issueNumber, validateResult.reason, validateResult.blockStage, validateResult.tag);
+    return { advanced: false, status: "blocked", reason: validateResult.reason };
+  }
+
+  // ---- Transition ready → planning, post plan comment ----
+  await doTransition(cfg, issueNumber, "ready", "planning", authorResult.readyToPlanningMsg);
+  const planComment = `## Implementation Plan\n\n${planText}${footer(cfg)}`;
+  await doPostComment(cfg, issueNumber, planComment);
+
+  // Tag the primary harness early for visibility in transition/blocker comments.
+  try {
+    await doAddLabel(cfg, issueNumber, `harness:${primary}`);
+  } catch {
+    /* idempotent */
+  }
+
+  // ---- Plan review + revision (skippable via steps.plan_review) ----
+  let revisedPlan = planText;
+  let preImplStage: Stage = "planning";
+  if (cfg.steps.plan_review) {
+    await doTransition(
+      cfg,
+      issueNumber,
+      "planning",
+      "plan-review",
+      hooks.planToReviewMsg(primary, reviewer),
+    );
+    preImplStage = "plan-review";
+
+    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext });
+    // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
+    // implementing harness reviews the plan, clearly labeled below.
+    // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
+    // the just-authored change files; freeform uses cfg.repo_dir.
+    const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
+    const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
+      await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
+        timeoutSec: cfg.review_timeout,
+        model: opts.model ?? cfg.models.review,
+      });
+    if (!reviewResult.success || !reviewResult.stdout.trim()) {
+      const reason = reviewResult.timed_out
+        ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
+        : `Plan review failed (exit ${reviewResult.exit_code})`;
+      const stderrExcerpt = formatStderrExcerpt(reviewResult.stderr);
+      const blockMsg = planSelfReview
+        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
+        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
+      await doSetBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
+      return { advanced: false, status: "blocked", reason };
+    }
+    const planReview = reviewResult.stdout.trim();
+    const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
+    await doPostComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
+
+    // #26: re-fetch comments so any human feedback left on the posted plan
+    // during the reviewer run flows into the revision alongside the reviewer's.
+    const doGetIssueDetail = deps.getIssueDetail ?? getIssueDetail;
+    const humanComments = extractHumanPlanComments(
+      (await doGetIssueDetail(cfg, issueNumber)).comments,
+      planComment,
+    );
+
+    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
+    const revisionResult = hooks.invokeRevision
+      ? await hooks.invokeRevision(primary, wt, revisionPrompt, cfg, opts, deps)
+      : await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts, { invoke: deps.invoke });
+    if (!revisionResult.success || !revisionResult.stdout.trim()) {
+      const reason = revisionResult.timed_out
+        ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
+        : `Plan revision failed (exit ${revisionResult.exit_code})`;
+      await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
+      return { advanced: false, status: "blocked", reason };
+    }
+    // Verify the plan-revision output includes the required acknowledgement section (#68).
+    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
+    if (!ackCheck.ok) {
+      await doSetBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
+      return { advanced: false, status: "blocked", reason: ackCheck.reason };
+    }
+    if (ackCheck.warning) {
+      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackCheck.warning}`);
+    }
+
+    // Re-validate and re-read artifact after revision (OpenSpec re-reads proposal; freeform is a no-op).
+    const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());
+    if (!rv.ok) {
+      await doSetBlocked(cfg, issueNumber, rv.reason, "plan-review", rv.tag);
+      return { advanced: false, status: "blocked", reason: rv.reason };
+    }
+    revisedPlan = rv.updatedPlanText;
+    specContext = rv.updatedSpecContext || specContext;
+
+    if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
+      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
+      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
+      await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
+      return { advanced: false, status: "blocked", reason };
+    }
+    await doPostComment(
+      cfg,
+      issueNumber,
+      `## Revised Implementation Plan\n\n${hooks.revisedPlanHeaderLines(primary, reviewer, humanComments).join("\n")}\n\n${revisedPlan}${footer(cfg)}`,
+    );
+  } else {
+    console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing from the original artifact`);
+  }
+
+  // ---- → implementing ----
+  await doTransition(
+    cfg,
+    issueNumber,
+    preImplStage,
+    "implementing",
+    hooks.preImplTransitionMsg(primary, reviewer, cfg.steps.plan_review),
+  );
+
+  // ---- Build implementation plan and invoke implementer harness ----
+  const implPlan = await hooks.buildImplPlan(wt, revisedPlan);
+  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext });
+  const implHeadBefore = (
+    await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  const result = await invokeImplementer(primary, wt.path, implPrompt, cfg, opts, { invoke: deps.invoke });
+
+  if (!result.success) {
+    const reason = result.timed_out
+      ? `timed out after ${result.duration.toFixed(0)}s`
+      : `exit ${result.exit_code}`;
+    await doSetBlocked(
+      cfg,
+      issueNumber,
+      `Implementation harness (${primary}) failed: ${reason}`,
+      "implementing",
+      "harness-failure",
+    );
+    return { advanced: false, status: "blocked", reason };
+  }
+
+  console.log(
+    `[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`,
+  );
+
+  // #131: the implementer may have done the work without committing — salvage
+  // real uncommitted changes into a commit before the no-commit checks below.
+  await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
+
+  // ---- Verify commits ----
+  const ahead = await doHasCommitsAhead(wt.path, cfg.base_branch);
+  if (!ahead) {
+    await doSetBlocked(
+      cfg,
+      issueNumber,
+      `Implementation harness (${primary}) completed but produced no commits.`,
+      "implementing",
+      "no-commits",
+    );
+    return { advanced: false, status: "blocked", reason: "no commits produced" };
+  }
+
+  // ---- Verify implementation commit references the issue (#68) ----
+  if (implHeadBefore) {
+    const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
+    if (!implCheck.ok) {
+      await doSetBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
+      return { advanced: false, status: "blocked", reason: implCheck.reason };
+    }
+  }
+
+  // ---- Build PR body and hand off to post-implementation steps ----
+  const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
+  const prBody = hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer);
+
+  return resumeFromImplementing(cfg, issueNumber, wt, {
+    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
+    prBody,
+    transitionMessage: (prNumber) => hooks.buildTransitionMessage(prNumber, primary, reviewer),
+    pipelineRunId,
+    stateDir: opts.stateDir,
+    runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
+  }, deps);
+}
+
+// ---------------------------------------------------------------------------
+// advance — freeform entry point
+// ---------------------------------------------------------------------------
+
 export async function advance(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -151,232 +532,8 @@ export async function advance(
     return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] planning + plan-review" };
   }
 
-  // ---- Worktree bootstrap: create + dependency install BEFORE planning ----
-  // Failures block at "ready" before any planning, review, or test stage runs,
-  // so retries are not charged a full planning round to hit the same install
-  // failure again (spec: worktree-dependency-install, finding 2 from review-2).
-  // bootstrapWorktree also removes the worktree on install failure so the issue
-  // does not count against max_concurrent_worktrees on retry (finding 1).
-  const slug = slugify(title) || `issue-${issueNumber}`;
-  const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug);
-  if (!bootstrap.ok) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      bootstrap.tag === "worktree-creation-failed"
-        ? `Worktree creation failed: ${bootstrap.reason}`
-        : `Worktree setup failed: ${bootstrap.reason}`,
-      "ready",
-      bootstrap.tag,
-    );
-    return { advanced: false, status: "blocked", reason: bootstrap.reason };
-  }
-  const wt = bootstrap.wt;
-  if (opts.runDir) {
-    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
-  }
-
-  // ---- Step 0: optional carry-forward context (last30days) ----
-  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
-
-  // ---- Step 1: generate plan ----
-  const planPrompt = buildPlanningPrompt({ cfg, issueNumber, title, body, carryForward });
-  let planResult: HarnessResult;
-  try {
-    planResult = await invokePlanStep(primary, wt.path, planPrompt, cfg, opts);
-  } catch (err) {
-    const e = err as Error;
-    await setBlocked(cfg, issueNumber, `Plan generation failed: ${e.message}`, "ready", "plan-gen-failed");
-    return { advanced: false, status: "blocked", reason: `plan failed: ${e.message}` };
-  }
-  if (!planResult.success || !planResult.stdout.trim()) {
-    const reason = planResult.timed_out
-      ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
-      : `Plan generation failed (exit ${planResult.exit_code})`;
-    await setBlocked(cfg, issueNumber, reason, "ready", "plan-gen-failed");
-    return { advanced: false, status: "blocked", reason };
-  }
-  const plan = planResult.stdout.trim();
-
-  // ---- Step 2: post plan, transition ready → planning ----
-  await transition(cfg, issueNumber, "ready", "planning", "Implementation plan generated.");
-  const planComment = `## Implementation Plan\n\n${plan}${footer(cfg)}`;
-  await postComment(cfg, issueNumber, planComment);
-
-  // Tag the primary harness early for visibility in transition/blocker comments.
-  try {
-    await addLabel(cfg, issueNumber, `harness:${primary}`);
-  } catch {
-    /* idempotent */
-  }
-
-  // ---- Steps 3+4: secondary plan review + revision (skippable via steps.plan_review) ----
-  const specContext = openspec.openspecContext(cfg, cfg.repo_dir);
-  let revisedPlan = plan;
-  let preImplStage: Stage = "planning";
-  if (cfg.steps.plan_review) {
-    await transition(
-      cfg,
-      issueNumber,
-      "planning",
-      "plan-review",
-      `Plan generated by ${primary}. ${reviewer} reviewing before implementation.`,
-    );
-    preImplStage = "plan-review";
-
-    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan, reviewer, implementer: primary, specContext });
-    // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
-    // implementing harness reviews the plan, clearly labeled below.
-    const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      await invokeReviewer(reviewer, primary, cfg.repo_dir, reviewPrompt, {
-        timeoutSec: cfg.review_timeout,
-        model: opts.model ?? cfg.models.review,
-      });
-    if (!reviewResult.success || !reviewResult.stdout.trim()) {
-      const reason = reviewResult.timed_out
-        ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
-        : `Plan review failed (exit ${reviewResult.exit_code})`;
-      const stderrExcerpt = formatStderrExcerpt(reviewResult.stderr);
-      const blockMsg = planSelfReview
-        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
-        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
-      await setBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
-      return { advanced: false, status: "blocked", reason };
-    }
-    const planReview = reviewResult.stdout.trim();
-    const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
-    await postComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
-
-    // #26: re-fetch comments so any human feedback left on the posted plan
-    // during the reviewer run flows into the revision alongside the reviewer's.
-    const humanComments = extractHumanPlanComments(
-      (await getIssueDetail(cfg, issueNumber)).comments,
-      planComment,
-    );
-
-    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
-    const revisionResult = await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts);
-    if (!revisionResult.success || !revisionResult.stdout.trim()) {
-      const reason = revisionResult.timed_out
-        ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
-        : `Plan revision failed (exit ${revisionResult.exit_code})`;
-      await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
-      return { advanced: false, status: "blocked", reason };
-    }
-    // Verify the plan-revision output includes the required acknowledgement section (#68).
-    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
-    if (!ackCheck.ok) {
-      await setBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
-      return { advanced: false, status: "blocked", reason: ackCheck.reason };
-    }
-    if (ackCheck.warning) {
-      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackCheck.warning}`);
-    }
-    revisedPlan = revisionResult.stdout.trim();
-    if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
-      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
-      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
-      await setBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
-      return { advanced: false, status: "blocked", reason };
-    }
-    await postComment(
-      cfg,
-      issueNumber,
-      `## Revised Implementation Plan\n\n${revisedPlanHeader(primary, reviewer, humanComments).join("\n")}\n\n${revisedPlan}${footer(cfg)}`,
-    );
-  } else {
-    console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the original plan`);
-  }
-
-  // ---- Step 6: → implementing ----
-  await transition(
-    cfg,
-    issueNumber,
-    preImplStage,
-    "implementing",
-    cfg.steps.plan_review
-      ? `Plan reviewed by ${reviewer}, revised by ${primary}. Implementation starting with ${primary}.`
-      : `Plan-review step disabled. Implementation starting with ${primary} from the original plan.`,
-  );
-
-  // ---- Step 7: primary implementer harness ----
-  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: revisedPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext });
-  const implHeadBefore = (
-    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-  const result = await invokeImplementer(primary, wt.path, implPrompt, cfg, opts);
-
-  if (!result.success) {
-    const reason = result.timed_out
-      ? `timed out after ${result.duration.toFixed(0)}s`
-      : `exit ${result.exit_code}`;
-    await setBlocked(
-      cfg,
-      issueNumber,
-      `Implementation harness (${primary}) failed: ${reason}`,
-      "implementing",
-      "harness-failure",
-    );
-    return { advanced: false, status: "blocked", reason };
-  }
-
-  console.log(
-    `[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`,
-  );
-
-  // #131: the implementer may have done the work without committing — salvage
-  // real uncommitted changes into a commit before the no-commit checks below.
-  // A clean worktree (nothing salvaged) keeps the existing block path.
-  await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
-
-  // ---- Step 8: verify commits ----
-  const ahead = await hasCommitsAhead(wt.path, cfg.base_branch);
-  if (!ahead) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      `Implementation harness (${primary}) completed but produced no commits.`,
-      "implementing",
-      "no-commits",
-    );
-    return { advanced: false, status: "blocked", reason: "no commits produced" };
-  }
-
-  // ---- Verify implementation commit references the issue (#68) ----
-  if (implHeadBefore) {
-    const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
-    if (!implCheck.ok) {
-      await setBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
-      return { advanced: false, status: "blocked", reason: implCheck.reason };
-    }
-  }
-
-  // ---- Steps 8.5–10: test gate + push + PR + implementing → review-1 ----
-  const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
-  const prBody = [
-    `Closes #${issueNumber}`,
-    "",
-    `## Summary`,
-    `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
-    "",
-    `**Implemented by**: ${primary}`,
-    `**Plan reviewed by**: ${reviewer}`,
-    "",
-    `## Revised Implementation Plan`,
-    planExcerpt,
-  ].join("\n") + footer(cfg);
-
-  return resumeFromImplementing(cfg, issueNumber, wt, {
-    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
-    prBody,
-    transitionMessage: (prNumber) =>
-      `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`,
-    pipelineRunId,
-    stateDir: opts.stateDir,
-    runDir: opts.runDir,
-    runStoreDeps: opts.runStoreDeps,
-  });
+  const hooks = makeFreeformPlanningHooks(cfg, title, body);
+  return runPlanningPhases(cfg, issueNumber, title, body, pipelineRunId, opts, hooks);
 }
 
 // ---------------------------------------------------------------------------
@@ -412,321 +569,318 @@ async function advanceOpenspec(
     return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] openspec planning" };
   }
 
-  // ---- Step 0: optional carry-forward context (last30days) ----
-  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
+  // Capture the list of existing change dirs BEFORE the worktree is created.
+  // The worktree is a fresh checkout of the same branch, so listing from cfg.repo_dir
+  // gives the correct baseline (no in-flight changes exist in the primary checkout).
+  const beforeList = openspec.listChangeDirs(cfg.repo_dir);
 
-  // ---- Worktree first: OpenSpec artifacts are files in the change folder. ----
-  // bootstrapWorktree removes the worktree on install failure so the issue does
-  // not count against max_concurrent_worktrees on retry (finding 1 from review-2).
-  const slug = slugify(title) || `issue-${issueNumber}`;
-  const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug);
-  if (!bootstrap.ok) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      bootstrap.tag === "worktree-creation-failed"
-        ? `Worktree creation failed: ${bootstrap.reason}`
-        : `Worktree setup failed: ${bootstrap.reason}`,
-      "ready",
-      bootstrap.tag,
-    );
-    return { advanced: false, status: "blocked", reason: bootstrap.reason };
-  }
-  const wt = bootstrap.wt;
-  if (opts.runDir) {
-    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
-  }
+  const hooks = makeOpenspecPlanningHooks(cfg, title, body, beforeList);
+  return runPlanningPhases(cfg, issueNumber, title, body, pipelineRunId, opts, hooks);
+}
 
-  // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
-  if (!openspec.isInitialized(wt.path)) {
-    if (!cfg.openspec.bootstrap) {
-      await setBlocked(
-        cfg,
-        issueNumber,
-        "OpenSpec is required (openspec.enabled: on) but this repo has no `openspec/` " +
-          "workspace. Set `openspec.bootstrap: true` in .github/pipeline.yml, or run `openspec init`.",
-        "ready",
-        "needs-human",
-      );
-      return { advanced: false, status: "blocked", reason: "openspec not initialized" };
-    }
-    console.log(`[pipeline] #${issueNumber}: bootstrapping OpenSpec (openspec init)`);
-    const initRes = await openspec.init(wt.path);
-    if (initRes.unavailable) {
-      await setBlocked(
-        cfg,
-        issueNumber,
-        "OpenSpec bootstrap requested but the `openspec` CLI is not on PATH " +
-          "(install: `npm i -g @fission-ai/openspec`).",
-        "ready",
-        "needs-human",
-      );
-      return { advanced: false, status: "blocked", reason: "openspec CLI unavailable" };
-    }
-    if (!initRes.success) {
-      await setBlocked(cfg, issueNumber, `openspec init failed:\n${initRes.output}`, "ready", "needs-human");
-      return { advanced: false, status: "blocked", reason: "openspec init failed" };
-    }
-    await gitInWorktree(wt.path, ["add", "-A"], { ignoreFailure: true });
-    await gitInWorktree(
-      wt.path,
-      ["commit", "-m", withTrailers(`chore: openspec init for #${issueNumber}`, issueNumber, pipelineRunId)],
-      { ignoreFailure: true },
-    );
-  }
+// ---------------------------------------------------------------------------
+// Hook builders — exported for tests; advance/advanceOpenspec call these
+// ---------------------------------------------------------------------------
 
-  // ---- Author the OpenSpec change (intent only, no code). ----
-  const before = openspec.listChangeDirs(wt.path);
-  // Capture HEAD before authoring so we can verify committed artifacts afterward (#68).
-  const osAuthorHeadBefore = (
-    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-  const planResult = await invoke(primary, wt.path, buildPlanningOpenspecPrompt({ cfg, issueNumber, title, body, carryForward, pipelineRunId }), {
-    timeoutSec: cfg.implementation_timeout,
-    model: opts.model ?? cfg.models.planning,
-    sandbox: cfg.harness_sandbox,
-  });
-  if (!planResult.success) {
-    const reason = planResult.timed_out
-      ? `timed out after ${planResult.duration.toFixed(0)}s`
-      : `exit ${planResult.exit_code}`;
-    await setBlocked(cfg, issueNumber, `OpenSpec proposal authoring (${primary}) failed: ${reason}`, "ready", "harness-failure");
-    return { advanced: false, status: "blocked", reason };
-  }
+/**
+ * Build the PlanningPhaseHooks for the freeform path. Captures cfg, title, and
+ * body so authorArtifact can rebuild the planning prompt without the hook needing
+ * separate parameters for them.
+ */
+export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, body: string): PlanningPhaseHooks {
+  return {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps) {
+      const primary: Harness = innerCfg.harnesses.implementer;
+      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward });
+      let planResult: HarnessResult;
+      try {
+        planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke });
+      } catch (err) {
+        const e = err as Error;
+        return { ok: false, reason: `Plan generation failed: ${e.message}`, tag: "harness-failure" };
+      }
+      if (!planResult.success || !planResult.stdout.trim()) {
+        const reason = planResult.timed_out
+          ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
+          : `Plan generation failed (exit ${planResult.exit_code})`;
+        return { ok: false, reason, tag: "harness-failure" };
+      }
+      return {
+        ok: true,
+        planText: planResult.stdout.trim(),
+        specContext: openspec.openspecContext(cfg, cfg.repo_dir),
+        readyToPlanningMsg: "Implementation plan generated.",
+      };
+    },
 
-  // #131: salvage authoring work the harness left uncommitted before the
-  // commit-range verification below (the change folder may exist only on disk).
-  await salvageIfNoNewCommit(
-    wt.path,
-    issueNumber,
-    pipelineRunId,
-    "OpenSpec authoring",
-    osAuthorHeadBefore,
-  );
+    async validateArtifact(_wt) {
+      return { ok: true };
+    },
 
-  // ---- Discover the change the implementer created. ----
-  const after = openspec.listChangeDirs(wt.path);
-  const fresh = after.filter((c) => !before.includes(c));
-  // Block on multiple new changes — silently selecting the first would hide a
-  // non-compliant authoring run (#68, finding 3).
-  const changeResult = enforceOpenspecChangeSingular(fresh, after);
-  if (!changeResult.ok) {
-    const blockMsg =
-      changeResult.reason === "no openspec change created"
-        ? "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
-          "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`)."
-        : changeResult.reason;
-    await setBlocked(cfg, issueNumber, blockMsg, "ready", "needs-human");
-    return { advanced: false, status: "blocked", reason: changeResult.reason };
-  }
-  const changeId = changeResult.changeId;
+    async revalidateArtifact(_wt, revisionStdout) {
+      return { ok: true, updatedPlanText: revisionStdout, updatedSpecContext: "" };
+    },
 
-  // ---- Verify the authoring harness committed only openspec/ artifacts (#68). ----
-  if (osAuthorHeadBefore) {
-    const authorCheck = await verifyHarnessCommits(wt.path, osAuthorHeadBefore, {
-      issueNumber,
-      pathConstraint: {
-        allowPattern: /^openspec\//,
-        description:
-          "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
-      },
-    });
-    if (!authorCheck.ok) {
-      await setBlocked(cfg, issueNumber, authorCheck.reason, "ready", "needs-human");
-      return { advanced: false, status: "blocked", reason: authorCheck.reason };
-    }
-  }
+    buildPrBody(_innerCfg, issueNumber, _title, planExcerpt, primary, reviewer) {
+      return [
+        `Closes #${issueNumber}`,
+        "",
+        `## Summary`,
+        `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
+        "",
+        `**Implemented by**: ${primary}`,
+        `**Plan reviewed by**: ${reviewer}`,
+        "",
+        `## Revised Implementation Plan`,
+        planExcerpt,
+      ].join("\n") + footer(cfg);
+    },
 
-  console.log(`[pipeline] #${issueNumber}: OpenSpec change \`${changeId}\` drafted`);
+    buildTransitionMessage(prNumber, primary, reviewer) {
+      return `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary}. Plan reviewed by ${reviewer}.`;
+    },
 
-  // ---- Validate the change structurally. ----
-  const v1 = await openspec.validateItem(wt.path, changeId);
-  if (!v1.unavailable && !v1.valid) {
-    await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` is invalid:\n${formatIssues(v1)}`, "planning", "openspec-invalid");
-    return { advanced: false, status: "blocked", reason: "openspec change invalid" };
-  }
+    planToReviewMsg(primary, reviewer) {
+      return `Plan generated by ${primary}. ${reviewer} reviewing before implementation.`;
+    },
 
-  const proposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || "(proposal.md not found)";
+    preImplTransitionMsg(primary, reviewer, withReview) {
+      return withReview
+        ? `Plan reviewed by ${reviewer}, revised by ${primary}. Implementation starting with ${primary}.`
+        : `Plan-review step disabled. Implementation starting with ${primary} from the original plan.`;
+    },
 
-  // ---- ready → planning, post the proposal as the plan. ----
-  await transition(cfg, issueNumber, "ready", "planning", `OpenSpec change \`${changeId}\` drafted by ${primary}.`);
-  const planComment = `## Implementation Plan\n\n_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}${footer(cfg)}`;
-  await postComment(cfg, issueNumber, planComment);
-  try {
-    await addLabel(cfg, issueNumber, `harness:${primary}`);
-  } catch {
-    /* idempotent */
-  }
+    revisedPlanHeaderLines(primary, reviewer, humanComments) {
+      return revisedPlanHeader(primary, reviewer, humanComments);
+    },
 
-  // ---- plan review + revision (skippable via steps.plan_review) ----
-  let specContext = openspec.readSpecDeltas(wt.path, changeId);
-  let revisedProposal = proposal;
-  let preImplStage: Stage = "planning";
-  if (cfg.steps.plan_review) {
-    await transition(
-      cfg,
-      issueNumber,
-      "planning",
-      "plan-review",
-      `OpenSpec proposal by ${primary}. ${reviewer} reviewing intent before implementation.`,
-    );
-    preImplStage = "plan-review";
-    // #39: same-harness fallback — see the freeform path above.
-    const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      await invokeReviewer(
-        reviewer,
+    buildImplPlan(_wt, revisedPlanText) {
+      return revisedPlanText;
+    },
+  };
+}
+
+/**
+ * Build the PlanningPhaseHooks for the OpenSpec path. Captures cfg, title, body,
+ * and beforeList. Uses a mutable `changeId` variable that `authorArtifact` sets
+ * and all subsequent hooks read.
+ */
+export function makeOpenspecPlanningHooks(
+  cfg: PipelineConfig,
+  title: string,
+  body: string,
+  beforeList: string[],
+): PlanningPhaseHooks {
+  let changeId = "";
+
+  return {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps) {
+      const primary: Harness = innerCfg.harnesses.implementer;
+      const doGit = deps.gitInWorktree ?? gitInWorktree;
+      const isInit = deps.openspecIsInitialized ?? openspec.isInitialized;
+
+      // ---- Bootstrap the OpenSpec workspace if the repo lacks one (opt-in). ----
+      if (!isInit(wt.path)) {
+        if (!innerCfg.openspec.bootstrap) {
+          return {
+            ok: false,
+            reason:
+              "OpenSpec is required (openspec.enabled: on) but this repo has no `openspec/` " +
+              "workspace. Set `openspec.bootstrap: true` in .github/pipeline.yml, or run `openspec init`.",
+            tag: "needs-human",
+          };
+        }
+        console.log(`[pipeline] #${issueNumber}: bootstrapping OpenSpec (openspec init)`);
+        const initRes = await openspec.init(wt.path);
+        if (initRes.unavailable) {
+          return {
+            ok: false,
+            reason:
+              "OpenSpec bootstrap requested but the `openspec` CLI is not on PATH " +
+              "(install: `npm i -g @fission-ai/openspec`).",
+            tag: "needs-human",
+          };
+        }
+        if (!initRes.success) {
+          return { ok: false, reason: `openspec init failed:\n${initRes.output}`, tag: "needs-human" };
+        }
+        await doGit(wt.path, ["add", "-A"], { ignoreFailure: true });
+        await doGit(
+          wt.path,
+          ["commit", "-m", withTrailers(`chore: openspec init for #${issueNumber}`, issueNumber, pipelineRunId)],
+          { ignoreFailure: true },
+        );
+      }
+
+      // ---- Author the OpenSpec change (intent only, no code). ----
+      const osAuthorHeadBefore = (
+        await doGit(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+      ).stdout.trim();
+
+      const inv = deps.invoke ?? invoke;
+      const planResult = await inv(
         primary,
         wt.path,
-        buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: proposal, reviewer, implementer: primary, specContext }),
-        { timeoutSec: cfg.review_timeout, model: opts.model ?? cfg.models.review },
+        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, pipelineRunId }),
+        {
+          timeoutSec: innerCfg.implementation_timeout,
+          model: opts.model ?? innerCfg.models.planning,
+          sandbox: innerCfg.harness_sandbox,
+        },
       );
-    if (!reviewResult.success || !reviewResult.stdout.trim()) {
-      const reason = reviewResult.timed_out
-        ? `timed out after ${reviewResult.duration.toFixed(0)}s`
-        : `exit ${reviewResult.exit_code}`;
-      const stderrExcerpt = formatStderrExcerpt(reviewResult.stderr);
-      const blockMsg = planSelfReview
-        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
-        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
-      await setBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
-      return { advanced: false, status: "blocked", reason };
-    }
-    const planReview = reviewResult.stdout.trim();
-    const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
-    await postComment(
-      cfg,
-      issueNumber,
-      `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`,
-    );
+      if (!planResult.success) {
+        const reason = planResult.timed_out
+          ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
+          : `Plan generation failed (exit ${planResult.exit_code})`;
+        return {
+          ok: false,
+          reason,
+          tag: "harness-failure",
+        };
+      }
 
-    // #26: pull in human comments left on the posted plan during the reviewer run.
-    const humanComments = extractHumanPlanComments(
-      (await getIssueDetail(cfg, issueNumber)).comments,
-      planComment,
-    );
-    const revisionResult = await invoke(
-      primary,
-      wt.path,
-      buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: proposal, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext }),
-      { timeoutSec: cfg.implementation_timeout, model: opts.model ?? cfg.models.planning, sandbox: cfg.harness_sandbox },
-    );
-    if (!revisionResult.success || !revisionResult.stdout.trim()) {
-      const reason = revisionResult.timed_out
-        ? `timed out after ${revisionResult.duration.toFixed(0)}s`
-        : `exit ${revisionResult.exit_code}`;
-      await setBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
-      return { advanced: false, status: "blocked", reason };
-    }
-    // Verify the plan-revision output includes the required acknowledgement section (#68).
-    const osAckCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
-    if (!osAckCheck.ok) {
-      await setBlocked(cfg, issueNumber, osAckCheck.reason, "plan-review", "needs-human");
-      return { advanced: false, status: "blocked", reason: osAckCheck.reason };
-    }
-    if (osAckCheck.warning) {
-      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${osAckCheck.warning}`);
-    }
-    const v2 = await openspec.validateItem(wt.path, changeId);
-    if (!v2.unavailable && !v2.valid) {
-      await setBlocked(cfg, issueNumber, `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`, "plan-review", "openspec-invalid");
-      return { advanced: false, status: "blocked", reason: "openspec change invalid after revision" };
-    }
-    revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || proposal;
-    if (!validateHumanFeedbackAck(revisedProposal, humanComments)) {
-      const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
-      const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
-      await setBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
-      return { advanced: false, status: "blocked", reason };
-    }
-    // Recompute spec deltas: revision may have updated the spec files.
-    specContext = openspec.readSpecDeltas(wt.path, changeId);
-    await postComment(
-      cfg,
-      issueNumber,
-      `## Revised Implementation Plan\n\n${[...revisedPlanHeader(primary, reviewer, humanComments), `_OpenSpec change \`${changeId}\`_`].join("\n")}\n\n${revisedProposal}${footer(cfg)}`,
-    );
-  } else {
-    console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing the drafted change`);
-  }
+      // #131: salvage authoring work the harness left uncommitted before the
+      // commit-range verification below (the change folder may exist only on disk).
+      await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore);
 
-  // ---- → implementing (work the change's task checklist). ----
-  await transition(
-    cfg,
-    issueNumber,
-    preImplStage,
-    "implementing",
-    cfg.steps.plan_review
-      ? `OpenSpec proposal reviewed by ${reviewer}, revised by ${primary}. Implementation starting with ${primary}.`
-      : `Plan-review step disabled. Implementation starting with ${primary} from the drafted change.`,
-  );
-  const tasks = openspec.readChangeFile(wt.path, changeId, "tasks.md")?.trim() ?? "";
-  const implPlan =
-    `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
-    `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
-    `${revisedProposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`;
-  const osImplHeadBefore = (
-    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-  const result = await invokeImplementer(
-    primary,
-    wt.path,
-    buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext }),
-    cfg,
-    opts,
-  );
-  if (!result.success) {
-    const reason = result.timed_out ? `timed out after ${result.duration.toFixed(0)}s` : `exit ${result.exit_code}`;
-    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) failed: ${reason}`, "implementing", "harness-failure");
-    return { advanced: false, status: "blocked", reason };
-  }
-  console.log(`[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`);
+      // ---- Discover the change the implementer created. ----
+      const after = openspec.listChangeDirs(wt.path);
+      const fresh = after.filter((c) => !beforeList.includes(c));
+      const changeResult = enforceOpenspecChangeSingular(fresh, after);
+      if (!changeResult.ok) {
+        const blockMsg =
+          changeResult.reason === "no openspec change created"
+            ? "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
+              "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`)."
+            : changeResult.reason;
+        return { ok: false, reason: blockMsg, tag: "needs-human" };
+      }
+      changeId = changeResult.changeId;
 
-  // #131: salvage uncommitted implementer work before the no-commit checks.
-  await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", osImplHeadBefore);
+      // ---- Verify the authoring harness committed only openspec/ artifacts (#68). ----
+      if (osAuthorHeadBefore) {
+        const authorCheck = await verifyHarnessCommits(wt.path, osAuthorHeadBefore, {
+          issueNumber,
+          pathConstraint: {
+            allowPattern: /^openspec\//,
+            description:
+              "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+          },
+        });
+        if (!authorCheck.ok) {
+          return { ok: false, reason: authorCheck.reason, tag: "needs-human" };
+        }
+      }
 
-  // ---- Verify commits, push, open PR, implementing → review-1. ----
-  if (!(await hasCommitsAhead(wt.path, cfg.base_branch))) {
-    await setBlocked(cfg, issueNumber, `Implementation harness (${primary}) completed but produced no commits.`, "implementing", "no-commits");
-    return { advanced: false, status: "blocked", reason: "no commits produced" };
-  }
+      console.log(`[pipeline] #${issueNumber}: OpenSpec change \`${changeId}\` drafted`);
 
-  // ---- Verify implementation commit references the issue (#68) ----
-  if (osImplHeadBefore) {
-    const osImplCheck = await enforceImplCommitRef(issueNumber, wt.path, osImplHeadBefore);
-    if (!osImplCheck.ok) {
-      await setBlocked(cfg, issueNumber, osImplCheck.reason, "implementing", "needs-human");
-      return { advanced: false, status: "blocked", reason: osImplCheck.reason };
-    }
-  }
+      const proposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || "(proposal.md not found)";
 
-  // ---- test gate + push + PR + implementing → review-1 ----
-  const planExcerpt =
-    revisedProposal.length > 2000 ? revisedProposal.slice(0, 2000) + "\n\n[…proposal truncated]" : revisedProposal;
-  const prBody = [
-    `Closes #${issueNumber}`,
-    "",
-    `## Summary`,
-    `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
-    "",
-    `**Implemented by**: ${primary}`,
-    `**Plan reviewed by**: ${reviewer}`,
-    `**OpenSpec change**: \`${changeId}\``,
-    "",
-    `## Proposal`,
-    planExcerpt,
-  ].join("\n") + footer(cfg);
+      return {
+        ok: true,
+        // planText includes the decorative header for the posted comment.
+        planText: `_OpenSpec change \`${changeId}\` — proposal.md_\n\n${proposal}`,
+        // promptPlanText is the raw proposal passed to review/revision prompts.
+        promptPlanText: proposal,
+        specContext: openspec.readSpecDeltas(wt.path, changeId),
+        readyToPlanningMsg: `OpenSpec change \`${changeId}\` drafted by ${primary}.`,
+      };
+    },
 
-  return resumeFromImplementing(cfg, issueNumber, wt, {
-    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
-    prBody,
-    transitionMessage: (prNumber) =>
-      `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`,
-    pipelineRunId,
-    stateDir: opts.stateDir,
-    runDir: opts.runDir,
-    runStoreDeps: opts.runStoreDeps,
-  });
+    async validateArtifact(wt) {
+      const v1 = await openspec.validateItem(wt.path, changeId);
+      if (!v1.unavailable && !v1.valid) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` is invalid:\n${formatIssues(v1)}`,
+          tag: "openspec-invalid",
+          blockStage: "planning" as Stage,
+        };
+      }
+      return { ok: true };
+    },
+
+    async revalidateArtifact(wt, _revisionStdout) {
+      const v2 = await openspec.validateItem(wt.path, changeId);
+      if (!v2.unavailable && !v2.valid) {
+        return {
+          ok: false,
+          reason: `OpenSpec change \`${changeId}\` invalid after revision:\n${formatIssues(v2)}`,
+          tag: "openspec-invalid",
+        };
+      }
+      const revisedProposal = openspec.readChangeFile(wt.path, changeId, "proposal.md")?.trim() || _revisionStdout;
+      return {
+        ok: true,
+        updatedPlanText: revisedProposal,
+        updatedSpecContext: openspec.readSpecDeltas(wt.path, changeId),
+      };
+    },
+
+    buildPrBody(_innerCfg, issueNumber, _title, planExcerpt, primary, reviewer) {
+      return [
+        `Closes #${issueNumber}`,
+        "",
+        `## Summary`,
+        `Automated implementation of [${title}](https://github.com/${cfg.repo}/issues/${issueNumber}).`,
+        "",
+        `**Implemented by**: ${primary}`,
+        `**Plan reviewed by**: ${reviewer}`,
+        `**OpenSpec change**: \`${changeId}\``,
+        "",
+        `## Proposal`,
+        planExcerpt,
+      ].join("\n") + footer(cfg);
+    },
+
+    buildTransitionMessage(prNumber, primary, reviewer) {
+      return `${cfg.implementation_ready_message} PR #${prNumber} created by ${primary} (OpenSpec change \`${changeId}\`). Plan reviewed by ${reviewer}.`;
+    },
+
+    planToReviewMsg(primary, reviewer) {
+      return `OpenSpec proposal by ${primary}. ${reviewer} reviewing intent before implementation.`;
+    },
+
+    preImplTransitionMsg(primary, reviewer, withReview) {
+      return withReview
+        ? `OpenSpec proposal reviewed by ${reviewer}, revised by ${primary}. Implementation starting with ${primary}.`
+        : `Plan-review step disabled. Implementation starting with ${primary} from the drafted change.`;
+    },
+
+    revisedPlanHeaderLines(primary, reviewer, humanComments) {
+      return [...revisedPlanHeader(primary, reviewer, humanComments), `_OpenSpec change \`${changeId}\`_`];
+    },
+
+    buildImplPlan(wt, revisedPlanText) {
+      // Strip the "_OpenSpec change `id` — proposal.md_\n\n" prefix that was added by authorArtifact.
+      // The actual proposal text is what follows the header line; for the impl plan we need
+      // just the raw proposal without the markdown prefix.
+      const proposal = revisedPlanText.replace(/^_OpenSpec change `[^`]+` — proposal\.md_\n\n/, "");
+      const tasks = openspec.readChangeFile(wt.path, changeId, "tasks.md")?.trim() ?? "";
+      return (
+        `Implement OpenSpec change \`${changeId}\`. Work through the checklist in ` +
+        `\`openspec/changes/${changeId}/tasks.md\`, keep that change folder committed, and satisfy its spec deltas.\n\n` +
+        `${proposal}${tasks ? `\n\n## Tasks\n\n${tasks}` : ""}`
+      );
+    },
+
+    // Plan review must also run from wt.path so the reviewer can read the
+    // just-authored openspec/changes/<id>/ files (proposal, design, tasks).
+    planReviewCwd(wt) { return wt.path; },
+
+    // Run plan revision in the issue worktree so the harness can update the
+    // OpenSpec change files (proposal.md, spec deltas, tasks.md) in wt.path.
+    // Freeform does not implement this hook and falls back to invokePlanStep,
+    // which uses cfg.repo_dir for non-sandboxed runs.
+    async invokeRevision(primary, wt, prompt, innerCfg, opts, deps) {
+      const inv = deps.invoke ?? invoke;
+      return inv(primary, wt.path, prompt, {
+        timeoutSec: innerCfg.implementation_timeout,
+        model: opts.model ?? innerCfg.models.planning,
+        sandbox: innerCfg.harness_sandbox,
+      });
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
