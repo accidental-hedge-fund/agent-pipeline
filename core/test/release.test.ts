@@ -1141,7 +1141,7 @@ test("CLI: 'pipeline release --cleanup' exits non-zero with conflict message", (
   );
   assert.notEqual(result.status, 0, "should exit non-zero");
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(combined.includes("cannot be combined"), `got: ${combined}`);
+  assert.ok(combined.includes("does not support"), `got: ${combined}`);
 });
 
 test("CLI: 'pipeline release --status' exits non-zero with conflict message", () => {
@@ -1152,7 +1152,7 @@ test("CLI: 'pipeline release --status' exits non-zero with conflict message", ()
   );
   assert.notEqual(result.status, 0, "should exit non-zero");
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(combined.includes("cannot be combined"), `got: ${combined}`);
+  assert.ok(combined.includes("does not support"), `got: ${combined}`);
 });
 
 // ---------------------------------------------------------------------------

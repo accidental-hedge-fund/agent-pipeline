@@ -15,6 +15,7 @@ import { mergePr, type MergeDeps, type RequiredCheck } from "../scripts/stages/m
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STAGES_DIR = path.join(__dirname, "..", "scripts", "stages");
 const PIPELINE_TS = path.join(__dirname, "..", "scripts", "pipeline.ts");
+const PIPELINE_RUN_TS = path.join(__dirname, "..", "scripts", "pipeline-run.ts");
 const PIPELINE_SCRIPT = path.join(__dirname, "..", "scripts", "pipeline.ts");
 
 // ---------------------------------------------------------------------------
@@ -608,15 +609,15 @@ test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
   }
 });
 
-test("merge: loop-isolation — dispatch() in pipeline.ts does not call mergePr", () => {
-  const content = fs.readFileSync(PIPELINE_TS, "utf8");
+test("merge: loop-isolation — dispatch() in pipeline-run.ts does not call mergePr", () => {
+  const content = fs.readFileSync(PIPELINE_RUN_TS, "utf8");
 
   // Extract the dispatch() function body by finding its declaration and the
   // closing brace at the same indentation level. We look for the function text
   // between "async function dispatch(" and the balanced closing "}" so that the
   // test is robust to formatting changes.
   const dispatchStart = content.indexOf("async function dispatch(");
-  assert.ok(dispatchStart !== -1, "dispatch() function must exist in pipeline.ts");
+  assert.ok(dispatchStart !== -1, "dispatch() function must exist in pipeline-run.ts");
 
   // Find the end of the dispatch function by counting braces from the opening '{'.
   const openBrace = content.indexOf("{", dispatchStart);

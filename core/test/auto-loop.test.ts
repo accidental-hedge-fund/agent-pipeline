@@ -27,7 +27,7 @@ import {
   isAutoLoopRecoverable,
   isAutoLoopEligible,
   canAutoLoopContinue,
-} from "../scripts/pipeline.ts";
+} from "../scripts/pipeline-run.ts";
 import { validateConfig } from "../scripts/config.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
