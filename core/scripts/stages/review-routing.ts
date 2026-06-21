@@ -402,12 +402,24 @@ export async function advanceReview(
     }
     await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment)));
     if (round === 1) {
-      await transitionFn(cfg, issueNumber, "review-1", "review-2",
-        `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
+      try {
+        await transitionFn(cfg, issueNumber, "review-1", "review-2",
+          `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
+      } catch (err) {
+        const msg = (err as Error).message;
+        await setBlockedFn(cfg, issueNumber, `Label transition failed: ${msg}`, stage, "harness-failure");
+        return { advanced: false, status: "blocked", reason: msg };
+      }
       return { advanced: true, from: "review-1", to: "review-2", summary: `approved (${verdict.findings.length} findings)` };
     } else {
-      await transitionFn(cfg, issueNumber, "review-2", "pre-merge",
-        `Adversarial review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
+      try {
+        await transitionFn(cfg, issueNumber, "review-2", "pre-merge",
+          `Adversarial review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
+      } catch (err) {
+        const msg = (err as Error).message;
+        await setBlockedFn(cfg, issueNumber, `Label transition failed: ${msg}`, stage, "harness-failure");
+        return { advanced: false, status: "blocked", reason: msg };
+      }
       return { advanced: true, from: "review-2", to: "pre-merge", summary: `adversarial approved (${verdict.findings.length} findings)` };
     }
   }

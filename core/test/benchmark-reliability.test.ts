@@ -499,13 +499,14 @@ describe("benchmark-reliability-suite", () => {
   // Section 6: Partial GitHub transition failure reliability test
   // -------------------------------------------------------------------------
 
-  test("partial transition failure: label-add error surfaces as a thrown error, stage does not silently advance", async () => {
-    // RED: fails without partial-failure handling because stage would advance
-    // despite label add error. The current advanceReview code does not wrap
-    // transition() in a try/catch, so a label-add failure propagates as a throw
-    // rather than advancing with a wrong label.
+  test("partial transition failure: label-add error surfaces blocked outcome, stage does not silently advance", async () => {
+    // RED: fails without partial-failure handling because stage would propagate
+    // the transition error as an uncaught throw rather than returning a blocked
+    // outcome. The fix wraps the transition call in a try/catch and calls
+    // setBlocked so the caller receives { advanced: false, status: "blocked" }.
 
     let transitionAttempted = false;
+    let blockedReason: string | undefined;
 
     const deps: AdvanceReviewDeps = {
       ...makeBaseReviewDeps(),
@@ -514,28 +515,32 @@ describe("benchmark-reliability-suite", () => {
         // Simulate: gh comment create succeeds, gh label add fails.
         throw new Error("gh label add: label 'pipeline:review-2' not found in repository");
       },
+      setBlocked: async (_cfg, _issue, reason) => {
+        blockedReason = reason;
+      },
     };
 
-    let caughtError: Error | undefined;
-    try {
-      await advanceReview(cfg, 42, 1, {}, 0, deps);
-      // Should not reach here when transition throws.
-      assert.fail("expected advanceReview to surface the transition error");
-    } catch (err) {
-      caughtError = err as Error;
-    }
+    const outcome = await advanceReview(cfg, 42, 1, {}, 0, deps);
 
     // Transition must have been attempted (the stage reached the label-apply step).
     assert.ok(transitionAttempted, "transition must have been attempted before failing");
 
-    // The error must surface (not be swallowed) and must reference the label.
-    assert.ok(caughtError !== undefined, "error must propagate from advanceReview");
-    assert.ok(
-      caughtError!.message.includes("label"),
-      `error must reference label; got: "${caughtError!.message}"`,
+    // Stage must return blocked — not throw, not advance.
+    assert.equal(outcome.advanced, false, "stage must NOT advance when transition throws");
+    assert.equal(
+      (outcome as { status?: string }).status,
+      "blocked",
+      `stage must return status=blocked on label-add failure; got ${JSON.stringify(outcome)}`,
     );
 
-    console.log(`[reliability] partial-transition-failure: error surfaced="${caughtError!.message}"`);
+    // setBlocked must be called with a reason referencing the label failure.
+    assert.ok(blockedReason !== undefined, "setBlocked must be called with a reason");
+    assert.ok(
+      blockedReason!.includes("label"),
+      `blocked reason must reference label; got: "${blockedReason}"`,
+    );
+
+    console.log(`[reliability] partial-transition-failure: outcome=${JSON.stringify(outcome)} blocked_reason="${blockedReason}"`);
   });
 
   // -------------------------------------------------------------------------
