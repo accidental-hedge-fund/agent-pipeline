@@ -5,10 +5,12 @@ name: ci
 # of duplicating step logic in YAML, so "green locally with `npm run ci`" means "green
 # in CI". Run `npm run ci:fast` for the quick per-commit local gate (see README).
 #
-# Deliberately NO `paths:` filter: the pre-merge stage polls for a passing check-run on
-# EVERY commit, including the OpenSpec-archive commit (which can touch only openspec/ and
-# docs). Skipping CI on docs/openspec-only changes would strand the pre-merge gate waiting
-# for a run that never fires (cf. bug #281). Do not add path filters to this workflow.
+# Deliberately NO `paths:` filter: the pre-merge gate requires a real check-run on the head
+# SHA of EVERY commit, including the OpenSpec-archive commit (which can touch only openspec/).
+# Filtering CI off for those paths would leave the archive commit with zero check-runs; the
+# gate's no-run recovery (see openspec/specs/pre-merge-ci-gate) then auto close+reopens the PR
+# to re-fire CI — but a path filter would suppress that re-fired run too, so the gate ends up
+# blocking `needs-human`. Net: path-filtering openspec/docs changes still breaks the gate.
 #
 # Deliberately NO npm cache: `npm ci` in core/ installs 4 small deps in ~0.5s (measured),
 # so an actions cache step would add complexity for no meaningful wall-clock or billing win.
