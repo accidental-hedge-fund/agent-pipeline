@@ -76,6 +76,29 @@ The handler SHALL invoke exactly one model harness call that takes the provided 
 
 ---
 
+### Requirement: The `refine-spec` sub-command SHALL validate that the harness response body contains required sections and at least one checkable criterion before emitting output
+
+After parsing and shape-validating the harness JSON response, the handler SHALL verify that the `body` field contains the four required section headings (`## Summary`, `## User story`, `## Acceptance criteria`, `## Out of scope`) and at least one `- [ ]` item anywhere in the body text. If either condition is not met, the handler SHALL exit non-zero and write nothing to stdout.
+
+#### Scenario: Body missing a required section exits non-zero
+
+- **WHEN** the harness returns JSON whose `body` does not contain one or more of the required section headings
+- **THEN** the handler SHALL exit non-zero with an error identifying the missing sections
+- **AND** no JSON object is written to stdout
+
+#### Scenario: Body with no checkable criterion exits non-zero
+
+- **WHEN** the harness returns JSON whose `body` contains all required section headings but no `- [ ]` item
+- **THEN** the handler SHALL exit non-zero with an error noting the missing criterion
+- **AND** no JSON object is written to stdout
+
+#### Scenario: Well-structured body passes validation
+
+- **WHEN** the harness returns JSON whose `body` contains all four required section headings and at least one `- [ ]` item
+- **THEN** body validation passes and the handler proceeds to emit the JSON result
+
+---
+
 ### Requirement: The `refine-spec` sub-command SHALL emit a single unfenced JSON object to stdout
 
 When invoked (with or without `--json`), the command SHALL write exactly one JSON object to stdout. The output SHALL NOT be wrapped in a markdown code fence, preceded by prose, or followed by trailing non-JSON bytes. The object SHALL contain at minimum: `title` (string), `body` (string), and `milestone` (string or null). `body` SHALL be the full markdown text of the refined spec. Additional fields beyond this minimum are permitted and do not constitute a breaking change. The exit code SHALL be 0 on success.

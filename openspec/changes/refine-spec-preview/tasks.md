@@ -21,6 +21,7 @@
 - [x] 4.2 Render the `refine-spec.md` prompt template with `{{title}}` and `{{body}}` substituted.
 - [x] 4.3 Invoke `deps.runHarness` with the rendered prompt; parse the response as JSON.
 - [x] 4.4 Validate the parsed response has at minimum `title` (string), `body` (string), and `milestone` (string or null); exit non-zero with a clear error if the shape is wrong.
+- [x] 4.4b Validate body structure: check all four required section headings (`## Summary`, `## User story`, `## Acceptance criteria`, `## Out of scope`) are present and at least one `- [ ]` item exists anywhere in the body; exit non-zero with a clear error if either check fails, with nothing written to stdout.
 - [x] 4.5 Write the validated JSON object as a single unfenced JSON string to stdout; exit 0.
 - [x] 4.6 On any harness or parse error: exit non-zero with an error message; do not write partial JSON to stdout.
 
