@@ -800,7 +800,7 @@ export interface RemoveWorktreeResult {
 export interface RemoveWorktreeDeps {
   listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
   hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
-  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, resolvedPath?: string) => Promise<void>;
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, resolvedPath?: string, force?: boolean) => Promise<void>;
   pathExists?: (p: string) => boolean;
 }
 
@@ -810,11 +810,15 @@ async function realRemoveWorktreeOp(
   issueNumber: number,
   slug: string,
   resolvedPath?: string,
+  force?: boolean,
 ): Promise<void> {
   const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
   if (fs.existsSync(wtPath)) {
-    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", "--force", wtPath], { ignoreFailure: true });
+    const rmArgs = force
+      ? ["worktree", "remove", "--force", wtPath]
+      : ["worktree", "remove", wtPath];
+    const r = await git(cfg, cfg.repo_dir, rmArgs, { ignoreFailure: true });
     if (r.code !== 0) {
       throw new Error(`git worktree remove failed: ${r.stderr.trim()}`);
     }
@@ -845,7 +849,12 @@ export async function removeWorktreeForIssue(
   const existsFn = deps.pathExists ?? fs.existsSync;
 
   const records = await listFn(cfg);
-  const rec = records.find((r) => r.issueNumber === issueNumber && r.slug);
+  const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
+  const rec = records.find((r) => {
+    if (r.issueNumber !== issueNumber || !r.slug) return false;
+    if (r.underManagedRoot !== undefined) return r.underManagedRoot;
+    return r.path === root || r.path.startsWith(root + path.sep);
+  });
 
   if (!rec || !rec.slug) {
     return {
@@ -876,7 +885,7 @@ export async function removeWorktreeForIssue(
   }
 
   try {
-    await removeFn(cfg, issueNumber, rec.slug, worktreeP);
+    await removeFn(cfg, issueNumber, rec.slug, worktreeP, opts.force);
   } catch (err) {
     return {
       removed: false,

@@ -214,6 +214,64 @@ test("removeWorktreeForIssue: worktree path not on disk → skip dirty check, pr
 });
 
 // ---------------------------------------------------------------------------
+// Managed-root guard — underManagedRoot: false records must be skipped
+// ---------------------------------------------------------------------------
+
+test("removeWorktreeForIssue: underManagedRoot=false record is skipped → not-found result, removeWorktree not called", async () => {
+  const cfg = makeCfg();
+  const rec: WorktreeRecord = {
+    path: "/outside/.worktrees/pipeline-42-foo",
+    branch: "pipeline/42-foo",
+    issueNumber: 42,
+    slug: "foo",
+    underManagedRoot: false,
+  };
+  let removeCalled = false;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+  };
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+  assert.equal(result.removed, false, "must not remove unmanaged worktree");
+  assert.equal(removeCalled, false, "removeWorktree must not be called for unmanaged record");
+  assert.match(result.error ?? "", /no worktree found/);
+});
+
+// ---------------------------------------------------------------------------
+// Force threading — opts.force must be forwarded to the removeWorktree dep
+// ---------------------------------------------------------------------------
+
+test("removeWorktreeForIssue: opts.force=false → removeWorktree dep receives force=false", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let capturedForce: boolean | undefined = undefined;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async (_cfg, _num, _slug, _path, force) => { capturedForce = force; },
+    pathExists: () => true,
+  };
+  await removeWorktreeForIssue(cfg, 42, { force: false }, deps);
+  assert.equal(capturedForce, false, "removeWorktree must receive force=false when opts.force is false");
+});
+
+test("removeWorktreeForIssue: opts.force=true → removeWorktree dep receives force=true", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let capturedForce: boolean | undefined = undefined;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => true,
+    removeWorktree: async (_cfg, _num, _slug, _path, force) => { capturedForce = force; },
+    pathExists: () => true,
+  };
+  await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
+  assert.equal(capturedForce, true, "removeWorktree must receive force=true when opts.force is true");
+});
+
+// ---------------------------------------------------------------------------
 // 5.6 CLI smoke: --force and --remove-worktree are recognized Commander options
 // ---------------------------------------------------------------------------
 
