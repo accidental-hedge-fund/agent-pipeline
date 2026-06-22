@@ -79,6 +79,7 @@ import {
 } from "./run-store.ts";
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
+import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
@@ -221,6 +222,10 @@ export interface CliOpts {
   edit?: boolean;
   /** Intake: short free-text description to spec into a GitHub issue. */
   description?: string;
+  /** refine-spec: existing issue title to refine. */
+  title?: string;
+  /** refine-spec: existing issue body to refine. */
+  body?: string;
   /** Intake/release: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
   release?: string;
   /** Roadmap/sweep: gate GitHub write-backs (comments, PRs); default is dry-run. */
@@ -246,7 +251,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary")
+    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | refine-spec | triage | roadmap | sweep | merge | summary")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -276,6 +281,8 @@ export function buildCmd(): Command {
     .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)")
     .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
     .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
+    .option("--title <text>", "refine-spec: existing issue title to refine")
+    .option("--body <markdown>", "refine-spec: existing issue body to refine")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
     .option("--apply", "roadmap/sweep: execute GitHub write-backs (issue updates, roadmap PR); default is dry-run")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
@@ -289,6 +296,28 @@ export function buildCmd(): Command {
 }
 
 async function main(): Promise<void> {
+  // Pre-intercept `pipeline refine-spec --help` before Commander processes the
+  // global --help flag. Commander exits 0 on --help before dispatch runs, so
+  // without this, both old and new installs exit 0 with generic top-level help —
+  // indistinguishable by content. New installs print refine-spec-specific usage
+  // mentioning --title and --body; old installs print generic help without them.
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs[0] === "refine-spec" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
+    process.stdout.write(
+      'Usage: pipeline refine-spec --title "<title>" --body "<markdown>" [--json]\n\n' +
+      "Non-mutating spec refinement: given an existing issue title and body,\n" +
+      "runs a single model harness call and emits a JSON object to stdout.\n\n" +
+      "Options:\n" +
+      "  --title <text>      existing issue title to refine (required)\n" +
+      "  --body <markdown>   existing issue body to refine (required)\n" +
+      "  --json              accepted; output is always JSON (no-op)\n" +
+      "  --repo-path <path>  override the target repo working tree\n\n" +
+      'Output: { "title": string, "body": string, "milestone": string|null }\n' +
+      "Exit code: 0 on success, non-zero on harness failure or missing --title/--body.\n",
+    );
+    process.exit(0);
+  }
+
   const cmd = buildCmd();
   cmd.parse(process.argv);
 
@@ -309,6 +338,8 @@ async function main(): Promise<void> {
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
   const isMergeCommand = numArg === "merge";
+  // `pipeline refine-spec --title "<t>" --body "<b>"` — non-mutating spec refinement preview.
+  const isRefineSpecCommand = numArg === "refine-spec";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -390,9 +421,9 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  // `pipeline path --json` and `pipeline config validate --json` legitimately emit
-  // JSON, so exempt those subcommands from the status/doctor-only --json requirement.
-  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path" && numArg !== "config") {
+  // `pipeline path --json`, `pipeline config validate --json`, and `pipeline refine-spec --json`
+  // legitimately emit JSON, so exempt those subcommands from the status/doctor-only --json requirement.
+  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -512,7 +543,7 @@ async function main(): Promise<void> {
     cmd.args[0] === "triage" ||
     cmd.args[0] === "merge"
       ? 2
-      : 1;
+      : 1; // refine-spec takes only flags (no extra positionals)
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
@@ -567,6 +598,18 @@ async function main(): Promise<void> {
       console.error(`pipeline intake: ${(err as Error).message}`);
       process.exit(1);
     }
+    return;
+  }
+
+  // Early refine-spec dispatch — no issue number, no config resolution required.
+  // Non-mutating: no GitHub writes, no git writes, no filesystem writes.
+  if (isRefineSpecCommand) {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    await runRefineSpec(
+      { title: opts.title ?? "", body: opts.body ?? "" },
+      realRefineSpecDeps(repoDir),
+    );
     return;
   }
 
@@ -727,7 +770,7 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "roadmap", "sweep", "triage", "merge", "summary"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +

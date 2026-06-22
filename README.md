@@ -207,6 +207,8 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
 /pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
+/pipeline refine-spec --title "<t>" --body "<b>"  refine an existing issue's spec preview; non-mutating JSON output (no number)
+/pipeline refine-spec --help                  probe for contract availability; exits 0 on supported installs
 /pipeline triage <N> --stage ready            set pipeline:ready on issue N; remove any other pipeline:* stage label
 /pipeline triage <N> --stage backlog          set pipeline:backlog on issue N; idempotent, no model call
 /pipeline sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
@@ -256,6 +258,43 @@ The number is auto-detected as an issue or PR. PRs resolve to their linked closi
 | `--dry-run` | Print the proposed issue body and ROADMAP diff; exit without writing to GitHub or the filesystem. |
 
 The pipeline never merges — the ROADMAP PR requires a human to review and merge the release-slot placement.
+
+## refine-spec sub-command
+
+`pipeline refine-spec` is a **non-mutating** spec-refinement preview command. It accepts an existing issue's title and body, invokes a single model harness call to refine the spec, and returns the result as a JSON object on stdout. It performs **no GitHub writes**, **no git writes**, and **no filesystem writes** — safe to call from any UI that needs a preview before the operator confirms a change.
+
+```bash
+# Refine an existing issue's spec and print JSON:
+/pipeline refine-spec --title "Add retry logic" --body "## Summary\nA retry mechanism."
+
+# --json is accepted (behavior is identical — output is always JSON):
+/pipeline refine-spec --title "Add retry logic" --body "## Summary\n..." --json
+
+# Probe for contract availability before calling with real content:
+pipeline refine-spec --help   # exits 0 on installs that support this contract
+```
+
+**Output shape:**
+
+```json
+{
+  "title": "Add retry logic to the fix loop",
+  "body": "## Summary\n...\n## User story\n...\n## Acceptance criteria\n- [ ] ...\n## Out of scope\n- ...",
+  "milestone": null
+}
+```
+
+The `body` field follows the WHAT-not-HOW section contract: **Summary**, **User story**, **Acceptance criteria** (testable `- [ ]` items), **Out of scope**, and **Open questions** only when the input is genuinely ambiguous.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--title "<text>"` | Existing issue title (required). |
+| `--body "<markdown>"` | Existing issue body in GitHub-flavored markdown (required). |
+| `--json` | Accepted for compatibility; output is always JSON regardless. |
+
+**Discovery:** a caller (e.g. Pipeline Desk) can probe whether this contract is available by running `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context. Checking for a zero exit code alone is not sufficient: older installs may print generic top-level help and exit 0 without refine-spec-specific flag descriptions. Only when the output mentions `--title` and `--body` alongside `refine-spec` can the caller determine the contract is present.
 
 ## Sweep sub-command
 
