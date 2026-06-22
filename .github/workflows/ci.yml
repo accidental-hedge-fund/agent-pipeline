@@ -1,9 +1,32 @@
 name: ci
 
+# Required gate for every PR and every push to main. This MUST stay in sync with the
+# local `npm run ci` command — CI runs the identical script (see package.json) instead
+# of duplicating step logic in YAML, so "green locally with `npm run ci`" means "green
+# in CI". Run `npm run ci:fast` for the quick per-commit local gate (see README).
+#
+# Deliberately NO `paths:` filter: the pre-merge gate requires a real check-run on the head
+# SHA of EVERY commit, including the OpenSpec-archive commit (which can touch only openspec/).
+# Filtering CI off for those paths would leave the archive commit with zero check-runs; the
+# gate's no-run recovery (see openspec/specs/pre-merge-ci-gate) then auto close+reopens the PR
+# to re-fire CI — but a path filter would suppress that re-fired run too, so the gate ends up
+# blocking `needs-human`. Net: path-filtering openspec/docs changes still breaks the gate.
+#
+# Deliberately NO npm cache: `npm ci` in core/ installs 4 small deps in ~0.5s (measured),
+# so an actions cache step would add complexity for no meaningful wall-clock or billing win.
+
 on:
   push:
     branches: [main]
   pull_request:
+
+# Cancel superseded runs: a newer push to the same PR branch (or to main) cancels the
+# in-flight run for the older commit, since only the head commit's result matters to the
+# pre-merge gate. This trims wasted Actions minutes during rapid iteration without
+# reducing coverage (the head commit still runs the full gate).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
