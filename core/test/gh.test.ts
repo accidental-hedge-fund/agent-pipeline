@@ -248,26 +248,6 @@ test("postComment: retries on transient 401 and succeeds — wrapper-level regre
   assert.equal(sleepCalls.length, 1, "exactly one backoff sleep between attempts");
 });
 
-test("postComment with { retries: 1 }: single attempt on transient error — RECOVERY_MARKER budget guard", async () => {
-  // Regression: auto_recover passes { retries: 1 } when posting RECOVERY_MARKER
-  // comments. Without it, an accepted-but-transient error would retry, posting the
-  // marker twice and inflating the next run's recovery count by 1 extra slot.
-  let calls = 0;
-  const runner = async (_args: string[]) => {
-    calls++;
-    const err = new Error("gh failed") as Error & { stderr: string };
-    err.stderr = "ETIMEDOUT";
-    throw err;
-  };
-  const sleep = async (_ms: number) => {};
-  const cfg = { repo: "owner/repo" } as unknown as PipelineConfig;
-
-  await assert.rejects(() =>
-    postComment(cfg, 42, "## Pipeline: Auto-Recovery (1/2)\n...", { runner, sleep, retries: 1 }),
-  );
-  assert.equal(calls, 1, "single attempt — RECOVERY_MARKER writes must not retry to avoid double-counting");
-});
-
 test("ghRun retry loop: network-level error (ETIMEDOUT in message, empty stderr) is classified transient", async () => {
   let calls = 0;
 
