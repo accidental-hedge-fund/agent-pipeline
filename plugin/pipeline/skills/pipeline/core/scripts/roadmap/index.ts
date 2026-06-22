@@ -544,18 +544,33 @@ export async function runRoadmap(
         `[roadmap] phase 7: correction round ${correctionRound} — ${depViolations.length} dep-order violation(s)`,
       );
 
+      // Only allow critique to re-assert ordering for edges already source-verified
+      // in phase 3. Critique text is not a source-verification path.
+      const verifiedEdgeKeys = new Set([
+        ...depGraph.must_precede.map((e) => `${e.from}:${e.to}`),
+        ...depGraph.should_precede.map((e) => `${e.from}:${e.to}`),
+      ]);
+
       const newEdges: DepEdge[] = [];
       for (const f of depViolations) {
         const nums = [...(f.title + " " + f.body).matchAll(/#(\d+)/g)].map(
           (m) => Number.parseInt(m[1], 10),
         );
         if (nums.length >= 2) {
-          newEdges.push({
-            from: nums[0],
-            to: nums[1],
-            file_line: f.file ? `${f.file}:${f.line_start ?? 0}` : "",
-            rationale: `critique correction: ${f.body.slice(0, 100)}`,
-          });
+          if (verifiedEdgeKeys.has(`${nums[0]}:${nums[1]}`)) {
+            newEdges.push({
+              from: nums[0],
+              to: nums[1],
+              file_line: f.file ? `${f.file}:${f.line_start ?? 0}` : "",
+              rationale: `critique correction: ${f.body.slice(0, 100)}`,
+            });
+          } else {
+            openQuestions.push({
+              description: `Critique proposed unverified dep edge #${nums[0]}→#${nums[1]}: ${f.title}`,
+              related_issues: [nums[0], nums[1]],
+              rationale: `edge not source-verified; critique correction: ${f.body.slice(0, 200)}`,
+            });
+          }
         }
       }
 
@@ -566,6 +581,10 @@ export async function runRoadmap(
         // the corrected edges before rebuilding the roadmap order.
         scored = scoreItems(items, depGraph, config.score_weights);
         roadmap = applyDepAdjustment(scored, items, depGraph);
+      } else {
+        // All proposed corrections were unverified; break to avoid re-critiquing
+        // an unchanged roadmap (unverified edges already recorded in openQuestions).
+        break;
       }
 
       if (correctionRound >= MAX_CORRECTION_ROUNDS) {

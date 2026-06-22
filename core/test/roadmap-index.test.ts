@@ -323,6 +323,59 @@ describe("runRoadmap - critique integration", () => {
     // scored array in plan should reflect re-computed dep_leverage
     assert.ok(plan.scored.length > 0, "plan should have scored items");
   });
+
+  it("regression: critique corrections do NOT promote unverified dep edges to must_precede", async () => {
+    // Bug: phase-7 correction path was calling addMustPrecedeEdges with edges parsed
+    // solely from reviewer finding text, bypassing source verification.
+    // Fix: only edges already in the source-verified depGraph may be re-asserted.
+    // Unverified edges must go to open_questions instead.
+    const written: Record<string, string> = {};
+
+    // The depGraph has NO edges (neither issue mentions the other; harness returns []).
+    // Critique flags a dep-order violation proposing #1→#2.
+    // Expected: edge goes to open_questions, NOT must_precede.
+    const critiqueFindingUnverified = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "#1 must precede #2 — dep-order violation detected",
+        body: "Issue #2 appears before prerequisite #1. The edge #1→#2 must be enforced.",
+        confidence: 0.95,
+        recommendation: "Add must_precede edge #1→#2",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation",
+      next_steps: [],
+    };
+
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runCritiqueHarness: async () => ({
+        success: true,
+        output: "```json\n" + JSON.stringify(critiqueFindingUnverified) + "\n```",
+      }),
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-unverified-edge" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+
+    // The unverified edge must NOT appear in must_precede
+    const wasPromoted = plan.dependency_graph.must_precede.some((e) => e.from === 1 && e.to === 2);
+    assert.ok(!wasPromoted, "unverified critique edge should NOT be promoted to must_precede");
+
+    // The unverified edge must appear in open_questions
+    const inOpenQuestions = plan.open_questions.some(
+      (q) => q.related_issues.includes(1) && q.related_issues.includes(2),
+    );
+    assert.ok(inOpenQuestions, "unverified critique edge should be recorded in open_questions");
+  });
 });
 
 describe("runRoadmap - run_stats", () => {
