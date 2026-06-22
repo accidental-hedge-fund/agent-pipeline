@@ -2,6 +2,7 @@
 // All external I/O is injectable via InventoryDeps for unit testing.
 
 import type { Issue, InventoryItem, RoadmapConfig } from "./types.ts";
+import { runPool } from "./pool.ts";
 
 export interface InventoryDeps {
   getOpenIssues(repo: string, opts?: { labels?: string[] }): Promise<Issue[]>;
@@ -92,38 +93,76 @@ export function parseTouchedFiles(output: string): string[] {
   }
 }
 
+export interface InventoryStats {
+  harness_calls: number;
+  harness_skipped: number;
+}
+
 /**
  * Build the inventory: fetch all open issues, filter by config, identify touched files.
+ * Uses regex-first elision: harness is only called when extractCandidateFiles returns nothing.
+ * Harness calls run with bounded concurrency (config.inventory_concurrency ?? 4).
+ * Returns items and stats for run_stats assembly.
  */
 export async function buildInventory(
   repo: string,
   config: RoadmapConfig,
   deps: InventoryDeps,
-): Promise<InventoryItem[]> {
+): Promise<{ items: InventoryItem[]; stats: InventoryStats }> {
   deps.log("[roadmap] phase 2: inventory — fetching open issues...");
 
   const allIssues = await deps.getOpenIssues(repo);
   if (allIssues.length === 0) {
     deps.log("[roadmap] inventory: no open issues found");
-    return [];
+    return { items: [], stats: { harness_calls: 0, harness_skipped: 0 } };
   }
 
   const filtered = filterIssues(allIssues, config);
   deps.log(`[roadmap] inventory: ${filtered.length}/${allIssues.length} issues after filtering`);
 
-  const items: InventoryItem[] = [];
-  for (const issue of filtered) {
-    deps.log(`[roadmap] inventory: analyzing issue #${issue.number}: ${issue.title}`);
-    // Use harness to identify touched files
-    const prompt = buildTouchedFilesPrompt(issue);
-    const result = await deps.runHarness(prompt);
-    const touched_files = result.success
-      ? parseTouchedFiles(result.output)
-      : extractCandidateFiles(issue);
+  // Partition issues: those with regex-extracted files skip the harness.
+  const regexResults = new Map<number, string[]>();
+  const harnessQueue: Issue[] = [];
 
-    items.push({ issue, touched_files });
+  for (const issue of filtered) {
+    const candidates = extractCandidateFiles(issue);
+    if (candidates.length > 0) {
+      regexResults.set(issue.number, candidates);
+    } else {
+      harnessQueue.push(issue);
+    }
   }
 
-  deps.log(`[roadmap] inventory: built ${items.length} inventory items`);
-  return items;
+  const skipped = regexResults.size;
+  deps.log(`[roadmap] inventory: ${skipped} issues resolved via regex, ${harnessQueue.length} need harness`);
+
+  // Run harness calls with bounded concurrency.
+  const harnessResults = new Map<number, string[]>();
+  if (harnessQueue.length > 0) {
+    const concurrency = config.inventory_concurrency ?? 4;
+    const tasks = harnessQueue.map((issue) => async () => {
+      deps.log(`[roadmap] inventory: harness call for issue #${issue.number}: ${issue.title}`);
+      const prompt = buildTouchedFilesPrompt(issue);
+      const result = await deps.runHarness(prompt);
+      const files = result.success
+        ? parseTouchedFiles(result.output)
+        : extractCandidateFiles(issue);
+      return { number: issue.number, files };
+    });
+    const outcomes = await runPool(tasks, concurrency);
+    for (const { number, files } of outcomes) {
+      harnessResults.set(number, files);
+    }
+  }
+
+  const items: InventoryItem[] = filtered.map((issue) => ({
+    issue,
+    touched_files: regexResults.get(issue.number) ?? harnessResults.get(issue.number) ?? [],
+  }));
+
+  deps.log(`[roadmap] inventory: built ${items.length} inventory items (${harnessQueue.length} harness calls, ${skipped} skipped)`);
+  return {
+    items,
+    stats: { harness_calls: harnessQueue.length, harness_skipped: skipped },
+  };
 }

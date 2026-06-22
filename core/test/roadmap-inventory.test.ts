@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { computeBacklogSha, filterIssues, extractCandidateFiles, parseTouchedFiles, buildInventory } from "../scripts/roadmap/inventory.ts";
 import type { Issue, RoadmapConfig } from "../scripts/roadmap/types.ts";
-import type { InventoryDeps } from "../scripts/roadmap/inventory.ts";
+import type { InventoryDeps, InventoryStats } from "../scripts/roadmap/inventory.ts";
 
 function makeIssue(n: number, overrides: Partial<Issue> = {}): Issue {
   return {
@@ -139,8 +139,10 @@ describe("buildInventory", () => {
       runHarness: async () => ({ success: true, output: "[]" }),
       log: () => {},
     };
-    const result = await buildInventory("example/repo", {}, deps);
-    assert.deepEqual(result, []);
+    const { items, stats } = await buildInventory("example/repo", {}, deps);
+    assert.deepEqual(items, []);
+    assert.equal(stats.harness_calls, 0);
+    assert.equal(stats.harness_skipped, 0);
   });
 
   it("filters issues before calling harness per issue", async () => {
@@ -158,10 +160,13 @@ describe("buildInventory", () => {
       },
       log: () => {},
     };
-    const result = await buildInventory("example/repo", { exclude_labels: ["wontfix"] }, deps);
-    assert.equal(result.length, 1);
-    assert.equal(result[0].issue.number, 1);
+    const { items, stats } = await buildInventory("example/repo", { exclude_labels: ["wontfix"] }, deps);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].issue.number, 1);
+    // Issue 1 body is generic "Body of issue 1" with no file paths → harness is called
     assert.equal(harnessCallCount.value, 1, "harness should only run for filtered issues");
+    assert.equal(stats.harness_calls, 1);
+    assert.equal(stats.harness_skipped, 0);
   });
 
   it("falls back to extractCandidateFiles when harness fails", async () => {
@@ -172,8 +177,88 @@ describe("buildInventory", () => {
       runHarness: async () => ({ success: false, output: "error" }),
       log: () => {},
     };
-    const result = await buildInventory("example/repo", {}, deps);
-    assert.equal(result.length, 1);
-    assert.ok(result[0].touched_files.some((f) => f.includes("gh.ts")));
+    // This issue has a file ref → regex elision fires → harness NOT called
+    const { items, stats } = await buildInventory("example/repo", {}, deps);
+    assert.equal(items.length, 1);
+    assert.ok(items[0].touched_files.some((f) => f.includes("gh.ts")));
+    // harness is skipped because regex extracted the file path
+    assert.equal(stats.harness_skipped, 1);
+    assert.equal(stats.harness_calls, 0);
+  });
+
+  it("skips harness for issues with file paths in body (regex elision)", async () => {
+    const issue = makeIssue(10, { body: "Edit `core/scripts/config.ts` to add new field." });
+    let harnessCallCount = 0;
+    const deps: InventoryDeps = {
+      getOpenIssues: async () => [issue],
+      readFile: async () => null,
+      runHarness: async () => { harnessCallCount++; return { success: true, output: '["other.ts"]' }; },
+      log: () => {},
+    };
+    const { items, stats } = await buildInventory("example/repo", {}, deps);
+    assert.equal(harnessCallCount, 0, "harness must not be called when regex extracts files");
+    assert.equal(stats.harness_skipped, 1);
+    assert.equal(stats.harness_calls, 0);
+    assert.ok(items[0].touched_files.some((f) => f.includes("config.ts")));
+  });
+
+  it("calls harness for ambiguous issue with no file paths", async () => {
+    const issue = makeIssue(11, { body: "Add dark mode support to the UI." });
+    let harnessCallCount = 0;
+    const deps: InventoryDeps = {
+      getOpenIssues: async () => [issue],
+      readFile: async () => null,
+      runHarness: async () => { harnessCallCount++; return { success: true, output: '["ui/theme.ts"]' }; },
+      log: () => {},
+    };
+    const { items, stats } = await buildInventory("example/repo", {}, deps);
+    assert.equal(harnessCallCount, 1, "harness must be called when regex finds no files");
+    assert.equal(stats.harness_calls, 1);
+    assert.equal(stats.harness_skipped, 0);
+    assert.ok(items[0].touched_files.includes("ui/theme.ts"));
+  });
+
+  it("multiple ambiguous issues run concurrently up to cap", async () => {
+    // 5 issues with no file paths, concurrency cap of 2
+    const issues = Array.from({ length: 5 }, (_, i) =>
+      makeIssue(i + 1, { body: "Generic description with no file references." })
+    );
+    let inflight = 0;
+    let maxInflight = 0;
+    const deps: InventoryDeps = {
+      getOpenIssues: async () => issues,
+      readFile: async () => null,
+      runHarness: async () => {
+        inflight++;
+        maxInflight = Math.max(maxInflight, inflight);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        inflight--;
+        return { success: true, output: "[]" };
+      },
+      log: () => {},
+    };
+    const { stats } = await buildInventory("example/repo", { inventory_concurrency: 2 }, deps);
+    assert.equal(stats.harness_calls, 5);
+    assert.equal(stats.harness_skipped, 0);
+    assert.ok(maxInflight <= 2, `max inflight ${maxInflight} exceeded concurrency cap 2`);
+  });
+
+  it("skipped count equals number of regex-satisfying issues", async () => {
+    const issues = [
+      makeIssue(1, { body: "Edit `src/a.ts` here." }),        // regex match
+      makeIssue(2, { body: "Update `src/b.ts` as well." }),   // regex match
+      makeIssue(3, { body: "Generic UI change." }),            // no match
+    ];
+    let harnessCallCount = 0;
+    const deps: InventoryDeps = {
+      getOpenIssues: async () => issues,
+      readFile: async () => null,
+      runHarness: async () => { harnessCallCount++; return { success: true, output: "[]" }; },
+      log: () => {},
+    };
+    const { stats } = await buildInventory("example/repo", {}, deps);
+    assert.equal(stats.harness_skipped, 2, "2 issues have file paths in body");
+    assert.equal(stats.harness_calls, 1, "only the ambiguous issue needs harness");
+    assert.equal(harnessCallCount, 1);
   });
 });

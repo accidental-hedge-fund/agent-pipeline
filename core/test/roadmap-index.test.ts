@@ -323,6 +323,212 @@ describe("runRoadmap - critique integration", () => {
     // scored array in plan should reflect re-computed dep_leverage
     assert.ok(plan.scored.length > 0, "plan should have scored items");
   });
+
+  it("regression: critique corrections do NOT promote unverified dep edges to must_precede", async () => {
+    // Bug: phase-7 correction path was calling addMustPrecedeEdges with edges parsed
+    // solely from reviewer finding text, bypassing source verification.
+    // Fix: only edges already in the source-verified depGraph may be re-asserted.
+    // Unverified edges must go to open_questions instead.
+    const written: Record<string, string> = {};
+
+    // The depGraph has NO edges (neither issue mentions the other; harness returns []).
+    // Critique flags a dep-order violation proposing #1→#2.
+    // Expected: edge goes to open_questions, NOT must_precede.
+    const critiqueFindingUnverified = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "#1 must precede #2 — dep-order violation detected",
+        body: "Issue #2 appears before prerequisite #1. The edge #1→#2 must be enforced.",
+        confidence: 0.95,
+        recommendation: "Add must_precede edge #1→#2",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation",
+      next_steps: [],
+    };
+
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runCritiqueHarness: async () => ({
+        success: true,
+        output: "```json\n" + JSON.stringify(critiqueFindingUnverified) + "\n```",
+      }),
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-unverified-edge" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+
+    // The unverified edge must NOT appear in must_precede
+    const wasPromoted = plan.dependency_graph.must_precede.some((e) => e.from === 1 && e.to === 2);
+    assert.ok(!wasPromoted, "unverified critique edge should NOT be promoted to must_precede");
+
+    // The unverified edge must appear in open_questions
+    const inOpenQuestions = plan.open_questions.some(
+      (q) => q.related_issues.includes(1) && q.related_issues.includes(2),
+    );
+    assert.ok(inOpenQuestions, "unverified critique edge should be recorded in open_questions");
+  });
+
+  it("regression: a blocking dep-order finding with < 2 issue refs is recorded, not dropped (#292)", async () => {
+    // review-2 finding: the newEdges.length === 0 early break could drop a blocking
+    // dep-order-violation whose text contains fewer than two #NN references — it
+    // recorded nothing and broke before the cap block, vanishing from plan.json.
+    const written: Record<string, string> = {};
+    const critiqueFinding = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "Dependency ordering looks wrong",
+        body: "The roadmap orders dependent work before its prerequisite, but the exact issue pair is unclear.",
+        confidence: 0.9,
+        recommendation: "Re-check the ordering",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation (unparseable)",
+      next_steps: [],
+    };
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runCritiqueHarness: async () => ({ success: true, output: "```json\n" + JSON.stringify(critiqueFinding) + "\n```" }),
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-unparseable-deporder" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.open_questions !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+    assert.ok(
+      plan.open_questions.some((q) => q.description.includes("Unparseable dep-order critique finding")),
+      "a dep-order finding with < 2 issue refs must be preserved as an open_question, not dropped",
+    );
+  });
+
+  it("regression: an advisory should_precede edge is NOT promoted to must_precede by critique (#292)", async () => {
+    // review-2 finding: the correction guard treated should_precede as a verified edge
+    // key, so critique text could promote an advisory edge to a hard must_precede
+    // constraint without source verification. Advisory edges must be recorded as
+    // open_questions instead — never silently hardened.
+    const written: Record<string, string> = {};
+    // "#2 depends on #1" makes [1,2] a candidate pair; the dep-verify harness confirms a
+    // WEAK edge (is_strong:false) → should_precede #1→#2 (advisory, not a hard prereq).
+    const issues: Issue[] = [
+      makeIssue(1),
+      { ...makeIssue(2), body: "## Summary\nIssue 2 depends on #1.\n## Acceptance Criteria\n- [ ] Done" },
+    ];
+    const critiqueFinding = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "#1 must precede #2 — dep-order violation",
+        body: "The edge #1→#2 should be enforced as a hard prerequisite.",
+        confidence: 0.95,
+        recommendation: "Add must_precede edge #1→#2",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation",
+      next_steps: [],
+    };
+    let critiqueRound = 0;
+    const deps = makeDeps({
+      getOpenIssues: async () => issues,
+      // dep-verify harness confirms a weak (advisory) edge for the candidate pair
+      runHarness: async () => ({ success: true, output: JSON.stringify({ edge_confirmed: true, file_line: "", rationale: "advisory ordering", is_strong: false }) }),
+      runCritiqueHarness: async () => {
+        critiqueRound++;
+        const result = critiqueRound === 1 ? critiqueFinding : { verdict: "approved", findings: [], summary: "OK", next_steps: [] };
+        return { success: true, output: "```json\n" + JSON.stringify(result) + "\n```" };
+      },
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-advisory-no-promote" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+
+    assert.ok(
+      plan.dependency_graph.should_precede.some((e) => e.from === 1 && e.to === 2),
+      "the advisory edge #1→#2 should remain in should_precede",
+    );
+    assert.ok(
+      !plan.dependency_graph.must_precede.some((e) => e.from === 1 && e.to === 2),
+      "an advisory should_precede edge must NOT be promoted to must_precede by critique text",
+    );
+    assert.ok(
+      plan.open_questions.some((q) => q.description.includes("promoting advisory edge") && q.related_issues.includes(1) && q.related_issues.includes(2)),
+      "the proposed advisory→hard promotion must be recorded as an open_question",
+    );
+  });
+});
+
+describe("runRoadmap - run_stats", () => {
+  it("plan.json contains run_stats with all required fields after a run", async () => {
+    const written: Record<string, string> = {};
+    let tick = 0;
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runHarness: async () => ({ success: true, output: "[]" }),
+      runCritiqueHarness: async () => ({ success: true, output: '{"verdict":"approved","findings":[],"summary":"OK","next_steps":[]}' }),
+      writeFile: async (p: string, c: string) => { written[p] = c; },
+      now: () => { tick += 10; return tick; },
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-run-stats" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.run_stats !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should contain run_stats");
+
+    const plan = JSON.parse(planContent!) as PlanJson;
+    const rs = plan.run_stats!;
+    assert.ok(rs !== undefined, "run_stats must be present");
+
+    // All required fields present and non-negative
+    assert.ok(typeof rs.open_issue_count === "number" && rs.open_issue_count >= 0);
+    assert.ok(typeof rs.filtered_issue_count === "number" && rs.filtered_issue_count >= 0);
+    assert.ok(typeof rs.inventory_harness_calls === "number" && rs.inventory_harness_calls >= 0);
+    assert.ok(typeof rs.inventory_harness_skipped === "number" && rs.inventory_harness_skipped >= 0);
+    assert.ok(typeof rs.depgraph_candidates_textual === "number" && rs.depgraph_candidates_textual >= 0);
+    assert.ok(typeof rs.depgraph_candidates_shared_file === "number" && rs.depgraph_candidates_shared_file >= 0);
+    assert.ok(typeof rs.depgraph_candidates_cross_file === "number" && rs.depgraph_candidates_cross_file >= 0);
+    assert.ok(typeof rs.depgraph_verify_calls === "number" && rs.depgraph_verify_calls >= 0);
+    assert.ok(typeof rs.depgraph_verify_skipped === "number" && rs.depgraph_verify_skipped >= 0);
+    assert.ok(typeof rs.critique_rounds === "number" && rs.critique_rounds >= 0);
+    assert.ok(typeof rs.phase_elapsed_ms === "object" && rs.phase_elapsed_ms !== null);
+
+    // Invariant: open_issue_count >= filtered_issue_count
+    assert.ok(rs.open_issue_count >= rs.filtered_issue_count,
+      `open_issue_count (${rs.open_issue_count}) must be >= filtered_issue_count (${rs.filtered_issue_count})`);
+
+    // Invariant: harness_calls + harness_skipped === filtered_issue_count
+    assert.equal(
+      rs.inventory_harness_calls + rs.inventory_harness_skipped,
+      rs.filtered_issue_count,
+      "inventory_harness_calls + inventory_harness_skipped must equal filtered_issue_count",
+    );
+
+    // phase_elapsed_ms covers all 7 named phases
+    for (const phase of ["comprehend", "inventory", "depgraph", "score", "roadmap", "hygiene", "critique"]) {
+      assert.ok(phase in rs.phase_elapsed_ms, `phase_elapsed_ms must include phase: ${phase}`);
+      assert.ok(rs.phase_elapsed_ms[phase]! >= 0, `phase_elapsed_ms[${phase}] must be non-negative`);
+    }
+  });
 });
 
 describe("runRoadmap - --next validation", () => {

@@ -691,3 +691,50 @@ test("validateConfig: unknown key with a mapping value reports the KEY line (#15
   assert.ok(diag, "expected a diagnostic for the unknown key eval_gate.mdoe");
   assert.equal(diag!.line, 2, `must report the misspelled key line (2); got ${diag!.line}`);
 });
+
+// ---------------------------------------------------------------------------
+// 5.17 roadmap concurrency config (#292)
+// ---------------------------------------------------------------------------
+
+test("validateConfig: roadmap.inventory_concurrency accepts a positive integer", () => {
+  const result = validateConfig("/repo", makeDeps("roadmap:\n  inventory_concurrency: 4\n"));
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.filter((d) => d.path === "roadmap.inventory_concurrency").length, 0);
+});
+
+test("validateConfig: roadmap.depgraph_concurrency accepts a positive integer", () => {
+  const result = validateConfig("/repo", makeDeps("roadmap:\n  depgraph_concurrency: 4\n"));
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.filter((d) => d.path === "roadmap.depgraph_concurrency").length, 0);
+});
+
+test("validateConfig: roadmap.depgraph_verify_cap accepts a positive integer", () => {
+  const result = validateConfig("/repo", makeDeps("roadmap:\n  depgraph_verify_cap: 20\n"));
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.filter((d) => d.path === "roadmap.depgraph_verify_cap").length, 0);
+});
+
+test("validateConfig: roadmap.inventory_concurrency rejects non-integer value", () => {
+  const result = validateConfig("/repo", makeDeps("roadmap:\n  inventory_concurrency: 2.5\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "roadmap.inventory_concurrency");
+  assert.ok(d, `expected diagnostic for roadmap.inventory_concurrency, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: roadmap.depgraph_concurrency rejects zero (not positive)", () => {
+  const result = validateConfig("/repo", makeDeps("roadmap:\n  depgraph_concurrency: 0\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "roadmap.depgraph_concurrency");
+  assert.ok(d, `expected diagnostic for roadmap.depgraph_concurrency, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: roadmap concurrency keys absent → valid (defaults applied at usage site)", () => {
+  const result = validateConfig("/repo", makeDeps("roadmap:\n  release_model: semver\n"));
+  assert.equal(result.valid, true);
+  const concurrencyDiags = result.diagnostics.filter((d) =>
+    d.path === "roadmap.inventory_concurrency" || d.path === "roadmap.depgraph_concurrency" || d.path === "roadmap.depgraph_verify_cap"
+  );
+  assert.equal(concurrencyDiags.length, 0, "absent concurrency keys should not produce diagnostics");
+});

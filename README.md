@@ -300,6 +300,23 @@ sweep:
     - Out of scope
 ```
 
+## Roadmap sub-command
+
+`pipeline roadmap` generates a dependency-aware scored roadmap from the open backlog and writes `plan.json` + `roadmap.md` to `.agent-pipeline/roadmap/<repo>/`. Without `--apply` it only previews.
+
+**Performance note:** on a small backlog, total wall-clock is roughly proportional to `(inventory harness calls × per-call time) + (dep-verify calls × per-call time)`. `plan.json` includes a `run_stats` object after every run so you can identify the slow phase from logs or the output file alone.
+
+**Config overrides** (`.github/pipeline.yml`):
+```yaml
+roadmap:
+  include_labels: []             # include only issues with at least one of these labels
+  exclude_labels: []             # exclude issues with any of these labels
+  inventory_concurrency: 4       # max concurrent harness calls during inventory (default: 4)
+  depgraph_concurrency: 4        # max concurrent harness calls during dep verification (default: 4)
+  depgraph_verify_cap: 20        # max dep candidates to source-verify; excess go to open_questions (default: 20)
+  release_model: semver          # semver (default) | continuous
+```
+
 ## Triage sub-command
 
 `pipeline triage <N> --stage <stage>` sets a pre-pipeline stage label on an issue without manual `gh issue edit`. It is the authoritative command for promoting an issue from `pipeline:backlog` to `pipeline:ready` (or the reverse). No model harness call — fully deterministic.

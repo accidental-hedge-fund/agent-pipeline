@@ -1,7 +1,8 @@
 // Phase 3: Dependency graph construction with source verification and topo sort.
 // All external I/O is injectable via DepgraphDeps for unit testing.
 
-import type { InventoryItem, DepGraph, DepEdge, CycleReport, OpenQuestion, IssueNumber } from "./types.ts";
+import type { InventoryItem, DepGraph, DepEdge, CycleReport, OpenQuestion, IssueNumber, RoadmapConfig } from "./types.ts";
+import { runPool } from "./pool.ts";
 
 export interface DepVerifyResult {
   edge_confirmed: boolean;
@@ -278,17 +279,79 @@ export function topoSort(
   return { tiers, cycleReports: [] };
 }
 
+export interface DepgraphStats {
+  candidates_textual: number;
+  candidates_shared_file: number;
+  candidates_cross_file: number;
+  verify_calls: number;
+  verify_skipped: number;
+}
+
+/** Source type priority for deduplication: lower number = higher priority. */
+const SOURCE_PRIORITY: Record<string, number> = { textual: 0, "shared-file": 1, "cross-file": 2 };
+
+interface TaggedCandidate {
+  pair: [IssueNumber, IssueNumber];
+  source: "textual" | "shared-file" | "cross-file";
+  sharedFileCount: number;
+}
+
+/**
+ * Build a ranked, deduplicated list of dependency candidates from all sources.
+ * Deduplication keeps the highest-priority source tag for each unique pair.
+ * Ranking: textual → shared-file → cross-file; within group descending by sharedFileCount.
+ */
+export function rankCandidates(
+  textual: Array<[IssueNumber, IssueNumber]>,
+  sharedFile: Array<[IssueNumber, IssueNumber]>,
+  crossFile: Array<[IssueNumber, IssueNumber]>,
+  items: InventoryItem[],
+): TaggedCandidate[] {
+  const itemByNumber = new Map(items.map((i) => [i.issue.number, i]));
+
+  function sharedFileCount(a: IssueNumber, b: IssueNumber): number {
+    const filesA = itemByNumber.get(a)?.touched_files ?? [];
+    const filesB = itemByNumber.get(b)?.touched_files ?? [];
+    return filesA.filter((f) => filesB.includes(f)).length;
+  }
+
+  const seen = new Map<string, TaggedCandidate>();
+
+  function add(pair: [IssueNumber, IssueNumber], source: "textual" | "shared-file" | "cross-file"): void {
+    const key = `${pair[0]}:${pair[1]}`;
+    const existing = seen.get(key);
+    if (!existing || SOURCE_PRIORITY[source]! < SOURCE_PRIORITY[existing.source]!) {
+      seen.set(key, { pair, source, sharedFileCount: sharedFileCount(pair[0], pair[1]) });
+    }
+  }
+
+  for (const p of textual) add(p, "textual");
+  for (const p of sharedFile) add(p, "shared-file");
+  for (const p of crossFile) add(p, "cross-file");
+
+  const all = [...seen.values()];
+  all.sort((a, b) => {
+    const pa = SOURCE_PRIORITY[a.source]!;
+    const pb = SOURCE_PRIORITY[b.source]!;
+    if (pa !== pb) return pa - pb;
+    return b.sharedFileCount - a.sharedFileCount;
+  });
+  return all;
+}
+
 /**
  * Build the full dependency graph from inventory items.
- * - Finds textual dependency candidates
- * - Source-verifies each candidate via harness
- * - Promotes confirmed edges to must_precede or should_precede
- * - Unverified candidates go to open_questions
+ * - Collects textual, shared-file, and cross-file candidates
+ * - Deduplicates and ranks candidates (textual first)
+ * - Caps verification at config.depgraph_verify_cap (default 20); excess → open_questions
+ * - Runs verification with bounded concurrency (config.depgraph_concurrency ?? 4)
+ * - Returns graph and stats for run_stats assembly
  */
 export async function buildDepgraph(
   items: InventoryItem[],
   deps: DepgraphDeps,
-): Promise<DepGraph> {
+  config: Pick<RoadmapConfig, "depgraph_concurrency" | "depgraph_verify_cap"> = {},
+): Promise<{ graph: DepGraph; stats: DepgraphStats }> {
   deps.log("[roadmap] phase 3: depgraph — building dependency graph...");
 
   const graph: DepGraph = {
@@ -302,12 +365,16 @@ export async function buildDepgraph(
     open_questions: [],
   };
 
-  if (items.length === 0) return graph;
+  if (items.length === 0) {
+    return {
+      graph,
+      stats: { candidates_textual: 0, candidates_shared_file: 0, candidates_cross_file: 0, verify_calls: 0, verify_skipped: 0 },
+    };
+  }
 
   const itemByNumber = new Map(items.map((i) => [i.issue.number, i]));
 
-  // Find candidate dependency pairs from issue text, shared files, and cross-file imports.
-  // Candidate pair [prerequisite, depender]: prerequisite must come before depender.
+  // Collect candidates from all three sources.
   const textualCandidates = findTextualDepCandidates(items);
   deps.log(`[roadmap] depgraph: found ${textualCandidates.length} textual dep candidates`);
   const fileCandidates = findFileBasedDepCandidates(items, textualCandidates);
@@ -319,15 +386,35 @@ export async function buildDepgraph(
   );
   deps.log(`[roadmap] depgraph: found ${crossFileCandidates.length} cross-file dep candidates`);
 
-  const allCandidates = [...textualCandidates, ...fileCandidates, ...crossFileCandidates];
+  // Deduplicate and rank before verification.
+  const ranked = rankCandidates(textualCandidates, fileCandidates, crossFileCandidates, items);
+  deps.log(`[roadmap] depgraph: ${ranked.length} unique candidates after deduplication`);
 
-  // Source-verify each candidate. Edge convention: {from: prerequisite, to: depender}
-  // so "from must precede to" = prerequisite comes before depender in the roadmap.
-  for (const [prereqNum, dependerNum] of allCandidates) {
+  // Apply verification cap.
+  const verifyCap = config.depgraph_verify_cap ?? 20;
+  const toVerify = ranked.slice(0, verifyCap);
+  const capped = ranked.slice(verifyCap);
+
+  for (const { pair: [prereqNum, dependerNum] } of capped) {
+    graph.open_questions.push({
+      description: `Dependency candidate #${prereqNum} → #${dependerNum} not verified (ranked beyond cap)`,
+      related_issues: [prereqNum, dependerNum],
+      rationale: "candidate ranked beyond verify cap",
+    });
+  }
+
+  if (capped.length > 0) {
+    deps.log(`[roadmap] depgraph: ${capped.length} candidates skipped due to verify cap (${verifyCap})`);
+  }
+
+  // Source-verify the capped list with bounded concurrency.
+  const concurrency = config.depgraph_concurrency ?? 4;
+
+  const verifyTasks = toVerify.map(({ pair: [prereqNum, dependerNum] }) => async () => {
     const itemPrereq = itemByNumber.get(prereqNum);
     const itemDepender = itemByNumber.get(dependerNum);
 
-    if (!itemPrereq || !itemDepender) continue;
+    if (!itemPrereq || !itemDepender) return;
 
     deps.log(`[roadmap] depgraph: verifying prerequisite #${prereqNum} → depender #${dependerNum}...`);
     const prompt = await buildDepVerifyPrompt(itemPrereq, itemDepender, deps);
@@ -339,7 +426,7 @@ export async function buildDepgraph(
         related_issues: [prereqNum, dependerNum],
         rationale: "harness failure during dep verification",
       });
-      continue;
+      return;
     }
 
     const verified = parseDepVerifyResult(result.output);
@@ -349,7 +436,7 @@ export async function buildDepgraph(
         related_issues: [prereqNum, dependerNum],
         rationale: "parse failure",
       });
-      continue;
+      return;
     }
 
     if (!verified.edge_confirmed) {
@@ -358,7 +445,7 @@ export async function buildDepgraph(
         related_issues: [prereqNum, dependerNum],
         rationale: verified.rationale || "edge not source-verified",
       });
-      continue;
+      return;
     }
 
     const edge: DepEdge = {
@@ -375,9 +462,11 @@ export async function buildDepgraph(
       graph.should_precede.push(edge);
       deps.log(`[roadmap] depgraph: promoted should_precede #${prereqNum} → #${dependerNum} (${verified.file_line})`);
     }
-  }
+  });
 
-  // Detect cycles in must_precede edges
+  await runPool(verifyTasks, concurrency);
+
+  // Detect cycles in must_precede edges.
   const { cycleReports } = topoSort(
     items.map((i) => i.issue.number),
     graph.must_precede,
@@ -389,7 +478,17 @@ export async function buildDepgraph(
   }
 
   deps.log(`[roadmap] depgraph: ${graph.must_precede.length} must_precede, ${graph.should_precede.length} should_precede edges`);
-  return graph;
+
+  return {
+    graph,
+    stats: {
+      candidates_textual: textualCandidates.length,
+      candidates_shared_file: fileCandidates.length,
+      candidates_cross_file: crossFileCandidates.length,
+      verify_calls: toVerify.length,
+      verify_skipped: capped.length,
+    },
+  };
 }
 
 /**
