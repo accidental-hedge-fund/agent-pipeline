@@ -41,6 +41,8 @@ export async function tryAutoRecover(
   await removeWorktree(cfg, issueNumber, wt.slug);
 
   if (recoveryCount >= cfg.auto_recovery_max_retries) {
+    // retries:1 — this comment contains RECOVERY_MARKER; a retry on a transient
+    // error would double-count it on the next run and inflate the budget check.
     await postComment(
       cfg,
       issueNumber,
@@ -55,6 +57,7 @@ export async function tryAutoRecover(
         "---",
         "*Automated by Claude Code Pipeline Skill*",
       ].join("\n"),
+      { retries: 1 },
     );
     return {
       advanced: false,
@@ -76,6 +79,8 @@ export async function tryAutoRecover(
   }
   await addLabel(cfg, issueNumber, "pipeline:ready");
 
+  // retries:1 — this comment contains RECOVERY_MARKER; a retry on a transient
+  // error would post it twice, inflating the recovery count on the next run.
   await postComment(
     cfg,
     issueNumber,
@@ -87,6 +92,7 @@ export async function tryAutoRecover(
       "---",
       "*Automated by Claude Code Pipeline Skill*",
     ].join("\n"),
+    { retries: 1 },
   );
 
   // Evidence bundle (#147): record the recovery event. Best-effort + gated on
