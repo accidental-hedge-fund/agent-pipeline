@@ -123,8 +123,9 @@ test("isTransientGhError: HTTP 403 without rate-limit body is deterministic", ()
 // This is added in gh.ts for this test module. If it's not present, the tests
 // below will fail at import time (proving the bite).
 
-import { ghRunForTest } from "../scripts/gh.ts";
+import { ghRunForTest, postComment } from "../scripts/gh.ts";
 import type { GhRunOptions } from "../scripts/gh.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 test("ghRun retry loop: transient 401 fails once then succeeds → returns successfully, 2 invocations", async () => {
   let calls = 0;
@@ -221,30 +222,30 @@ test("ghRun retry loop: isTransient override returning false prevents retry even
   assert.equal(sleepCalled, false, "sleep must not be called when isTransient returns false");
 });
 
-test("ghRun retry loop: retries:1 does not retry on transient error — non-idempotent mutation safety", async () => {
-  // Non-idempotent callers (postComment, createPr, createIssue, etc.) pass retries:1
-  // so that a transient failure after a successful GitHub write doesn't create duplicates.
-  // This test verifies the invariant: retries:1 → single attempt, never retried.
+test("postComment: retries on transient 401 and succeeds — wrapper-level regression for #270", async () => {
+  // Regression: postComment previously passed { retries: 1 } to ghRun, meaning
+  // a single transient 401 would abort the run and strand the issue. Verify the
+  // fix: postComment must retry and succeed when the first attempt sees a transient error.
   let calls = 0;
-  let sleepCalled = false;
+  const sleepCalls: number[] = [];
 
   const runner = async (_args: string[]) => {
     calls++;
-    const err = new Error("gh failed") as Error & { stderr: string };
-    err.stderr = "HTTP 401: Bad credentials";
-    throw err;
+    if (calls === 1) {
+      const err = new Error("gh failed") as Error & { stderr: string };
+      err.stderr = "HTTP 401: Bad credentials (https://api.github.com/graphql)";
+      throw err;
+    }
+    return { stdout: "" };
   };
 
-  const sleep = async (_ms: number) => {
-    sleepCalled = true;
-  };
+  const sleep = async (ms: number) => { sleepCalls.push(ms); };
+  const cfg = { repo: "owner/repo" } as unknown as PipelineConfig;
 
-  await assert.rejects(
-    () => ghRunForTest(["issue", "comment", "1", "--body", "x"], { runner, sleep, retries: 1 }),
-    /401/,
-  );
-  assert.equal(calls, 1, "retries:1 → exactly one attempt, no retry");
-  assert.equal(sleepCalled, false, "sleep must not be called when no retry budget remains");
+  await postComment(cfg, 42, "test body", { runner, sleep });
+
+  assert.equal(calls, 2, "postComment must retry on transient 401 — not abort");
+  assert.equal(sleepCalls.length, 1, "exactly one backoff sleep between attempts");
 });
 
 test("ghRun retry loop: network-level error (ETIMEDOUT in message, empty stderr) is classified transient", async () => {

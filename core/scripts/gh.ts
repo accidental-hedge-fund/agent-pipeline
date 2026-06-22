@@ -679,10 +679,11 @@ export async function postComment(
   cfg: PipelineConfig,
   issueNumber: number,
   body: string,
+  runOpts: GhRunOptions = {},
 ): Promise<void> {
   await ghRun(
     ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo],
-    { retries: 1 },
+    runOpts,
   );
 }
 
@@ -740,10 +741,11 @@ export async function postPrComment(
   cfg: PipelineConfig,
   prNumber: number,
   body: string,
+  runOpts: GhRunOptions = {},
 ): Promise<void> {
   await ghRun(
     ["pr", "comment", String(prNumber), "--body", body, "-R", cfg.repo],
-    { retries: 1 },
+    runOpts,
   );
 }
 
