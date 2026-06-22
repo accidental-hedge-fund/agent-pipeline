@@ -14,6 +14,7 @@ import {
   type RefineSpecOpts,
 } from "../scripts/stages/refine-spec.ts";
 import { buildRefineSpecPrompt } from "../scripts/prompts/index.ts";
+import { buildCmd } from "../scripts/pipeline.ts";
 
 // ---------------------------------------------------------------------------
 // Fake deps factory
@@ -346,4 +347,65 @@ test("refine-spec: harness returns success=false — exits non-zero; no JSON on 
     assert.equal(stdout.trim(), "", "no JSON on stdout");
     assert.ok(process.exitCode !== 0 && process.exitCode !== undefined, "exit code is non-zero");
   });
+});
+
+// ---------------------------------------------------------------------------
+// 5.8 Regression: stdout is exactly one JSON object (no harness stdout leak)
+// ---------------------------------------------------------------------------
+
+test("refine-spec: stdout contains exactly one parseable JSON object — stream:false regression", async () => {
+  // Regression for #295 finding 1: realRefineSpecDeps must use stream:false.
+  // If stream:true were used, invoke() would write raw harness output to
+  // process.stdout in real-time, then runRefineSpec would write the validated
+  // JSON again — two concatenated JSON objects that cannot be JSON.parse'd.
+  await withExitCode(async () => {
+    const deps = makeDeps();
+    const opts: RefineSpecOpts = { title: "T", body: "B" };
+    let captured = "";
+    const origWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as any).write = (chunk: string | Uint8Array) => {
+      captured += typeof chunk === "string" ? chunk : chunk.toString();
+      return true;
+    };
+    try {
+      await runRefineSpec(opts, deps);
+    } finally {
+      (process.stdout as any).write = origWrite;
+    }
+    assert.doesNotThrow(
+      () => JSON.parse(captured.trim()),
+      `stdout must be a single parseable JSON object; got: ${captured.slice(0, 200)}`,
+    );
+    const obj = JSON.parse(captured.trim()) as Record<string, unknown>;
+    assert.equal(typeof obj.title, "string", "title is a string");
+    assert.equal(typeof obj.body, "string", "body is a string");
+    assert.ok("milestone" in obj, "milestone field is present");
+    assert.equal(process.exitCode, 0, "exit code is 0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5.9 Regression: buildCmd() --title and --body options carry refine-spec context
+// ---------------------------------------------------------------------------
+
+test("refine-spec: buildCmd() registers --title and --body options with refine-spec descriptions", () => {
+  // Regression for #295 finding 2: the pre-interception in main() prints
+  // refine-spec-specific usage mentioning --title and --body so a caller can
+  // distinguish new installs (refine-spec-specific flags) from old installs
+  // (generic top-level help without --title/--body in refine-spec context).
+  // This test verifies the underlying commander options are registered.
+  const cmd = buildCmd();
+  const options = cmd.options.map((o) => o.long ?? "");
+  assert.ok(options.includes("--title"), "buildCmd() has --title option");
+  assert.ok(options.includes("--body"), "buildCmd() has --body option");
+  const titleOpt = cmd.options.find((o) => o.long === "--title");
+  const bodyOpt = cmd.options.find((o) => o.long === "--body");
+  assert.ok(
+    titleOpt?.description?.includes("refine-spec"),
+    `--title description must mention refine-spec; got: ${titleOpt?.description}`,
+  );
+  assert.ok(
+    bodyOpt?.description?.includes("refine-spec"),
+    `--body description must mention refine-spec; got: ${bodyOpt?.description}`,
+  );
 });

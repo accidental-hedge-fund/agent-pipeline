@@ -32,7 +32,7 @@ The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword 
 
 ### Requirement: The `refine-spec` sub-command SHALL be discoverable via `--help` before invocation
 
-The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` with exit code 0 and SHALL print usage text describing its flags (`--title`, `--body`, `--json`). Additionally, `pipeline --help` SHALL list `refine-spec` alongside other no-issue-number sub-commands. A caller (e.g. Pipeline Desk) MAY probe for the contract's presence by invoking `pipeline refine-spec --help` and checking for a zero exit code before calling the command with real content.
+The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` with exit code 0 and SHALL print usage text describing its flags (`--title`, `--body`, `--json`). Additionally, `pipeline --help` SHALL list `refine-spec` alongside other no-issue-number sub-commands. A caller (e.g. Pipeline Desk) MAY probe for the contract's presence by invoking `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context; an install that does not support this contract prints generic top-level help without refine-spec-specific flag descriptions.
 
 #### Scenario: `--help` exits zero and prints usage
 
@@ -45,11 +45,11 @@ The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` wit
 - **WHEN** `pipeline --help` is invoked
 - **THEN** `refine-spec` SHALL appear in the sub-command list alongside `intake`, `release`, and peers
 
-#### Scenario: Unknown command on older installs exits non-zero
+#### Scenario: Older installs print generic help without refine-spec-specific flags
 
 - **WHEN** `pipeline refine-spec --help` is invoked on an install that does NOT support this contract
-- **THEN** the command exits with a non-zero code
-- **AND** a caller observing the non-zero exit knows the contract is unavailable
+- **THEN** the output does NOT contain refine-spec-specific usage text describing `--title` and `--body` alongside the `refine-spec` command
+- **AND** a caller checking that the output mentions both `--title` and `--body` in a refine-spec context can determine the contract is unavailable
 
 ---
 

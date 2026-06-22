@@ -296,6 +296,28 @@ export function buildCmd(): Command {
 }
 
 async function main(): Promise<void> {
+  // Pre-intercept `pipeline refine-spec --help` before Commander processes the
+  // global --help flag. Commander exits 0 on --help before dispatch runs, so
+  // without this, both old and new installs exit 0 with generic top-level help —
+  // indistinguishable by content. New installs print refine-spec-specific usage
+  // mentioning --title and --body; old installs print generic help without them.
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs[0] === "refine-spec" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
+    process.stdout.write(
+      'Usage: pipeline refine-spec --title "<title>" --body "<markdown>" [--json]\n\n' +
+      "Non-mutating spec refinement: given an existing issue title and body,\n" +
+      "runs a single model harness call and emits a JSON object to stdout.\n\n" +
+      "Options:\n" +
+      "  --title <text>      existing issue title to refine (required)\n" +
+      "  --body <markdown>   existing issue body to refine (required)\n" +
+      "  --json              accepted; output is always JSON (no-op)\n" +
+      "  --repo-path <path>  override the target repo working tree\n\n" +
+      'Output: { "title": string, "body": string, "milestone": string|null }\n' +
+      "Exit code: 0 on success, non-zero on harness failure or missing --title/--body.\n",
+    );
+    process.exit(0);
+  }
+
   const cmd = buildCmd();
   cmd.parse(process.argv);
 

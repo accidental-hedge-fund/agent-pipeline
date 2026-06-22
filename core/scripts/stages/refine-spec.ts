@@ -43,7 +43,7 @@ export function realRefineSpecDeps(
   return {
     runHarness: async (prompt) => {
       const result = await invoke("claude", repoDir, prompt, {
-        stream: true,
+        stream: false,
         model,
         lean: true,
         timeoutSec: DEFAULT_CONFIG.intake_timeout,
