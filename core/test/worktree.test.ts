@@ -12,8 +12,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk, reattachIfDetached } from "../scripts/worktree.ts";
-import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk, reattachIfDetached, removeWorktreeForIssue } from "../scripts/worktree.ts";
+import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps, RemoveWorktreeDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -1661,4 +1661,52 @@ test("sweep: linked-launch — sibling worktree with underManagedRoot:true is a 
     1,
     "sibling worktree with underManagedRoot:true must be a sweep candidate even when cfg.repo_dir is a linked path",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Regression: detached worktree with local-only branch commits (#296)
+//
+// When a pipeline worktree is detached at a pushed commit (HEAD is clean),
+// the branch ref may still be ahead of origin. The old on-disk guard only ran
+// `origin/<branch>..HEAD`, which returned empty — so the guard passed and
+// `git branch -D` silently deleted the unpushed commits. Fix: also check
+// `origin/<branch>..<branch>` for on-disk worktrees.
+// ---------------------------------------------------------------------------
+
+test("removeWorktreeForIssue: detached worktree at pushed HEAD but branch ref ahead → blocked (local-only commits)", async () => {
+  const cfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    worktree_root: ".worktrees",
+    base_branch: "main",
+    domain: "test",
+    max_concurrent_worktrees: 4,
+  } as unknown as PipelineConfig;
+
+  const rec: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-42-detached-slug",
+    // No branch field — worktree is in detached HEAD state
+    issueNumber: 42,
+    slug: "detached-slug",
+  };
+
+  let removeCalled = false;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    pathExists: () => true,
+    // Simulate: HEAD is clean (at a pushed commit), but branch ref is ahead of origin
+    hasLocalOnlyCommits: async (_cfg, worktreePath, _branch) => {
+      // Verifies the on-disk path passes worktreePath (non-null) to the guard
+      assert.ok(worktreePath !== null, "on-disk worktree must pass worktreePath to hasLocalOnlyCommits");
+      return true; // branch ref has unpushed commits
+    },
+    removeWorktree: async () => { removeCalled = true; },
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called when branch has local-only commits");
+  assert.equal(result.removed, false);
+  assert.match(result.error ?? "", /local-only commits/, "error must mention local-only commits");
 });

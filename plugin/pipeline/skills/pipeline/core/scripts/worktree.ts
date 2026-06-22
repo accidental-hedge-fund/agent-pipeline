@@ -815,9 +815,10 @@ export interface RemoveWorktreeDeps {
 /** Returns true when the worktree has commits not present on origin/<branch>.
  *
  *  Two modes:
- *  - worktreePath non-null (path on disk): compares origin/<branch>..HEAD from
- *    the worktree, catching both branch commits and detached HEAD commits not
- *    reachable from origin.
+ *  - worktreePath non-null (path on disk): checks both origin/<branch>..HEAD
+ *    (catches detached HEAD commits) AND origin/<branch>..<branch> from the
+ *    repo root (catches branch-ref commits when the worktree is detached at a
+ *    pushed commit but the branch ref is ahead of origin).
  *  - worktreePath null (stale registration, directory gone): compares
  *    origin/<branch>..<branch> from cfg.repo_dir, checking the branch ref
  *    without needing the worktree directory to exist.
@@ -829,10 +830,15 @@ async function checkLocalOnlyCommits(
   branch: string,
 ): Promise<boolean | null> {
   if (worktreePath !== null) {
-    // On-disk: check worktree HEAD — catches detached commits not on the branch
-    const r = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
-    if (r.code !== 0) return null;
-    return r.stdout.trim().length > 0;
+    // On-disk: check HEAD first (catches detached commits not reachable from origin)
+    const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
+    if (headR.code !== 0) return null;
+    if (headR.stdout.trim().length > 0) return true;
+    // Also check the branch ref from the repo root: a detached worktree at a pushed
+    // commit passes the HEAD check but the branch ref may still be ahead of origin.
+    const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
+    if (branchR.code !== 0) return null;
+    return branchR.stdout.trim().length > 0;
   }
   // Stale registration: directory gone, check branch ref from repo root
   const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
