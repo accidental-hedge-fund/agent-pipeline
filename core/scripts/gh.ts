@@ -680,15 +680,10 @@ export async function postComment(
   issueNumber: number,
   body: string,
 ): Promise<void> {
-  await ghRun([
-    "issue",
-    "comment",
-    String(issueNumber),
-    "--body",
-    body,
-    "-R",
-    cfg.repo,
-  ]);
+  await ghRun(
+    ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo],
+    { retries: 1 },
+  );
 }
 
 /**
@@ -704,7 +699,7 @@ export async function createIssue(
   title: string,
   body: string,
   labels: string[],
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { retries: 1 }),
 ): Promise<number> {
   const args = ["issue", "create", "--title", title, "--body", body, "-R", cfg.repo];
   for (const label of labels) {
@@ -729,7 +724,7 @@ export async function addIssueComment(
   cfg: PipelineConfig,
   issueNumber: number,
   body: string,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { retries: 1 }),
 ): Promise<void> {
   const args = ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo];
   await run(args);
@@ -746,15 +741,10 @@ export async function postPrComment(
   prNumber: number,
   body: string,
 ): Promise<void> {
-  await ghRun([
-    "pr",
-    "comment",
-    String(prNumber),
-    "--body",
-    body,
-    "-R",
-    cfg.repo,
-  ]);
+  await ghRun(
+    ["pr", "comment", String(prNumber), "--body", body, "-R", cfg.repo],
+    { retries: 1 },
+  );
 }
 
 /** I/O seam for {@link transition} so unit tests inject fakes — no real network. */
@@ -1027,7 +1017,7 @@ export async function createPr(
     cfg.repo,
   ];
   if (opts.draft) args.push("--draft");
-  const stdout = await ghRun(args, { timeoutMs: 60_000 });
+  const stdout = await ghRun(args, { timeoutMs: 60_000, retries: 1 });
   const url = stdout.trim();
   const match = url.match(/\/pull\/(\d+)\/?$/);
   if (!match) throw new Error(`Could not parse PR number from gh output: ${url}`);
@@ -1443,7 +1433,7 @@ export async function createMilestone(
   ];
   if (dueOn) args.push("--field", `due_on=${dueOn}`);
 
-  const stdout = await ghRun(args, { timeoutMs: 30_000 });
+  const stdout = await ghRun(args, { timeoutMs: 30_000, retries: 1 });
   const result = JSON.parse(stdout) as { number: number };
   return result.number;
 }

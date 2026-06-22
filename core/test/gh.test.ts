@@ -221,6 +221,32 @@ test("ghRun retry loop: isTransient override returning false prevents retry even
   assert.equal(sleepCalled, false, "sleep must not be called when isTransient returns false");
 });
 
+test("ghRun retry loop: retries:1 does not retry on transient error — non-idempotent mutation safety", async () => {
+  // Non-idempotent callers (postComment, createPr, createIssue, etc.) pass retries:1
+  // so that a transient failure after a successful GitHub write doesn't create duplicates.
+  // This test verifies the invariant: retries:1 → single attempt, never retried.
+  let calls = 0;
+  let sleepCalled = false;
+
+  const runner = async (_args: string[]) => {
+    calls++;
+    const err = new Error("gh failed") as Error & { stderr: string };
+    err.stderr = "HTTP 401: Bad credentials";
+    throw err;
+  };
+
+  const sleep = async (_ms: number) => {
+    sleepCalled = true;
+  };
+
+  await assert.rejects(
+    () => ghRunForTest(["issue", "comment", "1", "--body", "x"], { runner, sleep, retries: 1 }),
+    /401/,
+  );
+  assert.equal(calls, 1, "retries:1 → exactly one attempt, no retry");
+  assert.equal(sleepCalled, false, "sleep must not be called when no retry budget remains");
+});
+
 test("ghRun retry loop: network-level error (ETIMEDOUT in message, empty stderr) is classified transient", async () => {
   let calls = 0;
 
