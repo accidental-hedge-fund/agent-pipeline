@@ -79,6 +79,32 @@ export function validateRefineSpecResult(parsed: unknown): string | null {
   return null;
 }
 
+const REQUIRED_BODY_SECTIONS = [
+  "## Summary",
+  "## User story",
+  "## Acceptance criteria",
+  "## Out of scope",
+];
+
+/**
+ * Validate that the refined spec body contains the required sections and at
+ * least one checkable acceptance criterion. Returns an error message on
+ * failure, or null on success.
+ */
+export function validateRefineSpecBody(body: string): string | null {
+  const missing = REQUIRED_BODY_SECTIONS.filter((s) => !body.includes(s));
+  if (missing.length > 0) {
+    return (
+      `refined spec is missing required sections: ${missing.join(", ")}.\n` +
+      `  Required: Summary, User story, Acceptance criteria, Out of scope.`
+    );
+  }
+  if (!body.includes("- [ ]")) {
+    return 'refined spec has no checkable acceptance criteria (expected "- [ ]" items)';
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
@@ -151,6 +177,17 @@ export async function runRefineSpec(
     process.stderr.write(
       `pipeline refine-spec: harness response has wrong shape: ${shapeError}.\n` +
         `  First 500 chars: ${harnessOutput.slice(0, 500)}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // 5b. Validate body section contract.
+  const bodyError = validateRefineSpecBody((parsed as RefineSpecResult).body);
+  if (bodyError) {
+    process.stderr.write(
+      `pipeline refine-spec: ${bodyError}.\n` +
+        `  First 500 chars of body: ${(parsed as RefineSpecResult).body.slice(0, 500)}\n`,
     );
     process.exitCode = 1;
     return;

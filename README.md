@@ -294,7 +294,7 @@ The `body` field follows the WHAT-not-HOW section contract: **Summary**, **User 
 | `--body "<markdown>"` | Existing issue body in GitHub-flavored markdown (required). |
 | `--json` | Accepted for compatibility; output is always JSON regardless. |
 
-**Discovery:** a caller (e.g. Pipeline Desk) can probe whether this contract is available by running `pipeline refine-spec --help` and checking for a zero exit code. An older install without this sub-command exits non-zero.
+**Discovery:** a caller (e.g. Pipeline Desk) can probe whether this contract is available by running `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context. Checking for a zero exit code alone is not sufficient: older installs may print generic top-level help and exit 0 without refine-spec-specific flag descriptions. Only when the output mentions `--title` and `--body` alongside `refine-spec` can the caller determine the contract is present.
 
 ## Sweep sub-command
 

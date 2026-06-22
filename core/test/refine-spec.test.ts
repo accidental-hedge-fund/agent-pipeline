@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import {
   runRefineSpec,
   validateRefineSpecResult,
+  validateRefineSpecBody,
   type RefineSpecDeps,
   type RefineSpecOpts,
 } from "../scripts/stages/refine-spec.ts";
@@ -321,6 +322,71 @@ test("validateRefineSpecResult: missing body returns error mentioning body", () 
 test("validateRefineSpecResult: milestone as number returns error", () => {
   const result = validateRefineSpecResult({ title: "T", body: "B", milestone: 42 });
   assert.ok(result !== null && result.includes("milestone"), `expected mention of 'milestone' in: ${result}`);
+});
+
+// ---------------------------------------------------------------------------
+// validateRefineSpecBody unit tests
+// ---------------------------------------------------------------------------
+
+test("validateRefineSpecBody: valid body with all sections and checkboxes returns null", () => {
+  const body =
+    "## Summary\nA summary.\n\n## User story\nAs a dev.\n\n## Acceptance criteria\n- [ ] Criterion.\n\n## Out of scope\nNone.";
+  assert.equal(validateRefineSpecBody(body), null);
+});
+
+test("validateRefineSpecBody: body missing all required sections returns error", () => {
+  const result = validateRefineSpecBody("not a sectioned spec");
+  assert.ok(result !== null && result.length > 0, "expected error for missing sections");
+  assert.ok(result.includes("Summary"), "error mentions Summary");
+});
+
+test("validateRefineSpecBody: body with sections but no checkboxes returns error", () => {
+  const body =
+    "## Summary\nA.\n\n## User story\nB.\n\n## Acceptance criteria\n- Must do X.\n\n## Out of scope\nC.";
+  const result = validateRefineSpecBody(body);
+  assert.ok(result !== null, "expected error for missing checkboxes");
+  assert.ok(result.includes("- [ ]"), `error mentions '- [ ]'; got: ${result}`);
+});
+
+// ---------------------------------------------------------------------------
+// 5.6b Regression: valid JSON with malformed body exits non-zero, empty stdout
+// ---------------------------------------------------------------------------
+
+test("refine-spec: valid JSON body with no required sections — exits non-zero; no JSON on stdout", async () => {
+  await withExitCode(async () => {
+    const malformedBody = JSON.stringify({
+      title: "T",
+      body: "not a sectioned spec",
+      milestone: null,
+    });
+    const deps = makeDeps({ harnessResult: malformedBody });
+    const opts: RefineSpecOpts = { title: "T", body: "B" };
+    let stdoutCapture = "";
+    let stderrCapture = "";
+    const origOut = process.stdout.write.bind(process.stdout);
+    const origErr = process.stderr.write.bind(process.stderr);
+    (process.stdout as any).write = (chunk: string | Uint8Array) => {
+      stdoutCapture += typeof chunk === "string" ? chunk : chunk.toString();
+      return true;
+    };
+    (process.stderr as any).write = (chunk: string | Uint8Array) => {
+      stderrCapture += typeof chunk === "string" ? chunk : chunk.toString();
+      return true;
+    };
+    try {
+      await runRefineSpec(opts, deps);
+    } finally {
+      (process.stdout as any).write = origOut;
+      (process.stderr as any).write = origErr;
+    }
+
+    assert.equal(stdoutCapture.trim(), "", "no JSON written to stdout for malformed body");
+    assert.ok(
+      stderrCapture.includes("section") || stderrCapture.includes("Summary"),
+      `stderr must mention missing sections; got: ${stderrCapture}`,
+    );
+    assert.ok(process.exitCode !== 0 && process.exitCode !== undefined, "exit code is non-zero");
+  });
 });
 
 // ---------------------------------------------------------------------------
