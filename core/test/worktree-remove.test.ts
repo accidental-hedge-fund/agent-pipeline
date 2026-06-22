@@ -4,9 +4,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { removeWorktreeForIssue } from "../scripts/worktree.ts";
 import type { RemoveWorktreeDeps, WorktreeRecord } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PIPELINE_SCRIPT = path.join(__dirname, "..", "scripts", "pipeline.ts");
 
 function makeCfg(): PipelineConfig {
   return {
@@ -42,6 +48,7 @@ test("removeWorktreeForIssue: clean worktree → removed=true, dirty=false, erro
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
@@ -68,6 +75,7 @@ test("removeWorktreeForIssue: dirty worktree without --force → removed=false, 
     hasDirtyWorkdir: async () => true,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
@@ -92,6 +100,7 @@ test("removeWorktreeForIssue: dirty worktree with --force → removed=true, dirt
     hasDirtyWorkdir: async () => true,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
+    // hasLocalOnlyCommits not injected — --force bypasses the check
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
@@ -114,6 +123,7 @@ test("removeWorktreeForIssue: no worktree for issue → removed=false, worktree=
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => {},
     pathExists: () => false,
+    hasLocalOnlyCommits: async () => false,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
@@ -133,6 +143,7 @@ test("removeWorktreeForIssue: empty on-disk list → not-found result", async ()
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => {},
     pathExists: () => false,
+    hasLocalOnlyCommits: async () => false,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
@@ -156,6 +167,7 @@ test("removeWorktreeForIssue: removeWorktree dep throws → removed=false, error
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { throw new Error("git worktree remove failed: locked"); },
     pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
@@ -179,6 +191,7 @@ test("removeWorktreeForIssue: uses listOnDisk (not listActive), so PR state is i
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
@@ -197,18 +210,24 @@ test("removeWorktreeForIssue: worktree path not on disk → skip dirty check, pr
   const rec = makeRec(42, "some-feature");
   let dirtyChecked = false;
   let removeCalled = false;
+  let capturedPathOnDisk: boolean | undefined;
 
   const deps: RemoveWorktreeDeps = {
     listOnDisk: async () => [rec],
     hasDirtyWorkdir: async () => { dirtyChecked = true; return false; },
-    removeWorktree: async () => { removeCalled = true; },
+    removeWorktree: async (_cfg, _num, _slug, pathOnDisk) => {
+      capturedPathOnDisk = pathOnDisk;
+      removeCalled = true;
+    },
     pathExists: () => false,
+    // hasLocalOnlyCommits not injected — skip check when path not on disk
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
 
   assert.equal(dirtyChecked, false, "dirty check must be skipped when path is not on disk");
   assert.ok(removeCalled, "removeWorktree must still be called to deregister branch");
+  assert.equal(capturedPathOnDisk, false, "removeWorktree must receive pathOnDisk=false for stale registration");
   assert.equal(result.removed, true);
   assert.equal(result.dirty, false);
 });
@@ -232,6 +251,7 @@ test("removeWorktreeForIssue: underManagedRoot=false record is skipped → not-f
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
   };
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
   assert.equal(result.removed, false, "must not remove unmanaged worktree");
@@ -250,8 +270,9 @@ test("removeWorktreeForIssue: opts.force=false → removeWorktree dep receives f
   const deps: RemoveWorktreeDeps = {
     listOnDisk: async () => [rec],
     hasDirtyWorkdir: async () => false,
-    removeWorktree: async (_cfg, _num, _slug, _path, force) => { capturedForce = force; },
+    removeWorktree: async (_cfg, _num, _slug, _pathOnDisk, _path, force) => { capturedForce = force; },
     pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
   };
   await removeWorktreeForIssue(cfg, 42, { force: false }, deps);
   assert.equal(capturedForce, false, "removeWorktree must receive force=false when opts.force is false");
@@ -264,8 +285,9 @@ test("removeWorktreeForIssue: opts.force=true → removeWorktree dep receives fo
   const deps: RemoveWorktreeDeps = {
     listOnDisk: async () => [rec],
     hasDirtyWorkdir: async () => true,
-    removeWorktree: async (_cfg, _num, _slug, _path, force) => { capturedForce = force; },
+    removeWorktree: async (_cfg, _num, _slug, _pathOnDisk, _path, force) => { capturedForce = force; },
     pathExists: () => true,
+    // hasLocalOnlyCommits not injected — --force bypasses the check
   };
   await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
   assert.equal(capturedForce, true, "removeWorktree must receive force=true when opts.force is true");
@@ -317,6 +339,7 @@ test("removeWorktreeForIssue: result always contains required fields (removed, d
         hasDirtyWorkdir: async () => false,
         removeWorktree: async () => {},
         pathExists: () => true,
+        hasLocalOnlyCommits: async () => false,
       } as RemoveWorktreeDeps,
       false,
     ],
@@ -327,6 +350,7 @@ test("removeWorktreeForIssue: result always contains required fields (removed, d
         hasDirtyWorkdir: async () => true,
         removeWorktree: async () => {},
         pathExists: () => true,
+        hasLocalOnlyCommits: async () => false,
       } as RemoveWorktreeDeps,
       false,
     ],
@@ -337,6 +361,7 @@ test("removeWorktreeForIssue: result always contains required fields (removed, d
         hasDirtyWorkdir: async () => false,
         removeWorktree: async () => {},
         pathExists: () => false,
+        hasLocalOnlyCommits: async () => false,
       } as RemoveWorktreeDeps,
       false,
     ],
@@ -350,4 +375,132 @@ test("removeWorktreeForIssue: result always contains required fields (removed, d
     assert.equal(typeof result.removed, "boolean", `${label}: 'removed' must be boolean`);
     assert.equal(typeof result.dirty, "boolean", `${label}: 'dirty' must be boolean`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression: local-only commits must block non-forced clean removal
+// ---------------------------------------------------------------------------
+
+test("removeWorktreeForIssue: clean but has local-only commits without --force → removed=false, error names local-only", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => true,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, false, "must not remove when local-only commits exist without --force");
+  assert.equal(result.dirty, false);
+  assert.match(result.error ?? "", /local-only commits/, "error must mention local-only commits");
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called when local-only commits block");
+});
+
+test("removeWorktreeForIssue: hasLocalOnlyCommits returns null (remote not found) without --force → removed=false, error mentions cannot verify", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => null,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, false, "must not remove when remote branch cannot be verified without --force");
+  assert.match(result.error ?? "", /cannot verify/, "error must mention cannot verify");
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called when remote check fails");
+});
+
+test("removeWorktreeForIssue: local-only commits with --force → removed=true (force bypasses check)", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    // hasLocalOnlyCommits not injected — --force bypasses the check entirely
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
+
+  assert.equal(result.removed, true, "--force must bypass the local-only commits check");
+  assert.ok(removeCalled, "removeWorktree must be called when --force is set");
+});
+
+test("removeWorktreeForIssue: hasLocalOnlyCommits not called when path not on disk", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let localOnlyCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => {},
+    pathExists: () => false,
+    hasLocalOnlyCommits: async () => { localOnlyCalled = true; return false; },
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(localOnlyCalled, false, "local-only check must be skipped when path is not on disk");
+  assert.equal(result.removed, true);
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 regression: removeWorktree dep receives pathOnDisk=true when on disk
+// ---------------------------------------------------------------------------
+
+test("removeWorktreeForIssue: path on disk → removeWorktree dep receives pathOnDisk=true", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let capturedPathOnDisk: boolean | undefined;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async (_cfg, _num, _slug, pathOnDisk) => { capturedPathOnDisk = pathOnDisk; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
+  };
+
+  await removeWorktreeForIssue(cfg, 42, {}, deps);
+  assert.equal(capturedPathOnDisk, true, "removeWorktree must receive pathOnDisk=true when directory exists");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 regression: --remove-worktree must reject --dry-run and --detach
+// ---------------------------------------------------------------------------
+
+test("CLI: 'pipeline 42 --remove-worktree --dry-run' exits 2 with conflict error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "42", "--remove-worktree", "--dry-run"],
+    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+  );
+  assert.equal(result.status, 2, "must exit 2 when --remove-worktree is combined with --dry-run");
+  assert.match(result.stderr, /--dry-run/, "error must name the conflicting flag");
+});
+
+test("CLI: 'pipeline 42 --remove-worktree --detach' exits 2 with conflict error", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "42", "--remove-worktree", "--detach"],
+    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+  );
+  assert.equal(result.status, 2, "must exit 2 when --remove-worktree is combined with --detach");
+  assert.match(result.stderr, /--detach/, "error must name the conflicting flag");
 });

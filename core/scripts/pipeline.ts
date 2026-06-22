@@ -447,6 +447,8 @@ async function main(): Promise<void> {
       ["--status", opts.status],
       ["--unblock", opts.unblock !== undefined],
       ["--override", opts.override !== undefined],
+      ["--dry-run", opts.dryRun],
+      ["--detach", opts.detach],
     ];
     for (const [flag, active] of rwConflicts) {
       if (active) {

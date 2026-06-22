@@ -800,8 +800,27 @@ export interface RemoveWorktreeResult {
 export interface RemoveWorktreeDeps {
   listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
   hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
-  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, resolvedPath?: string, force?: boolean) => Promise<void>;
+  /** pathOnDisk: true when the directory exists; false when git still has the
+   *  entry registered but the directory is already gone (stale registration). */
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, pathOnDisk: boolean, resolvedPath?: string, force?: boolean) => Promise<void>;
   pathExists?: (p: string) => boolean;
+  /** Returns true when local HEAD has commits not present on origin/<branch>,
+   *  false when in sync, null when the remote branch cannot be resolved
+   *  (fail-closed: treat null as "cannot verify" and block without --force). */
+  hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string, branch: string) => Promise<boolean | null>;
+}
+
+/** Returns true when local has commits ahead of origin/<branch>, false when in
+ *  sync, null when the remote ref cannot be resolved (remote deleted or never
+ *  pushed — treat as unverifiable and fail closed). */
+async function checkLocalOnlyCommits(
+  cfg: PipelineConfig,
+  worktreePath: string,
+  branch: string,
+): Promise<boolean | null> {
+  const r = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
+  if (r.code !== 0) return null;
+  return r.stdout.trim().length > 0;
 }
 
 /** Remove-worktree dep default: throws on failure so the caller can capture the message. */
@@ -809,18 +828,26 @@ async function realRemoveWorktreeOp(
   cfg: PipelineConfig,
   issueNumber: number,
   slug: string,
+  pathOnDisk: boolean,
   resolvedPath?: string,
   force?: boolean,
 ): Promise<void> {
   const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
-  if (fs.existsSync(wtPath)) {
+  if (pathOnDisk) {
     const rmArgs = force
       ? ["worktree", "remove", "--force", wtPath]
       : ["worktree", "remove", wtPath];
     const r = await git(cfg, cfg.repo_dir, rmArgs, { ignoreFailure: true });
     if (r.code !== 0) {
       throw new Error(`git worktree remove failed: ${r.stderr.trim()}`);
+    }
+  } else {
+    // Directory gone but still git-registered — deregister the stale entry only.
+    // --force is required; it is scoped to wtPath and does not prune other worktrees.
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", "--force", wtPath], { ignoreFailure: true });
+    if (r.code !== 0) {
+      throw new Error(`git worktree remove (stale) failed: ${r.stderr.trim()}`);
     }
   }
   const br = await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
@@ -847,6 +874,7 @@ export async function removeWorktreeForIssue(
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
   const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
   const existsFn = deps.pathExists ?? fs.existsSync;
+  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
 
   const records = await listFn(cfg);
   const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
@@ -869,8 +897,10 @@ export async function removeWorktreeForIssue(
   const branch = rec.branch ?? branchName(issueNumber, rec.slug);
   const worktreeP = rec.path;
 
+  const pathOnDisk = existsFn(worktreeP);
+
   let dirty = false;
-  if (existsFn(worktreeP)) {
+  if (pathOnDisk) {
     dirty = await dirtyFn(worktreeP);
   }
 
@@ -884,8 +914,26 @@ export async function removeWorktreeForIssue(
     };
   }
 
+  // Guard against silently losing local-only commits (commits pushed failed or
+  // never attempted). Only blocks non-forced clean removals; --force bypasses.
+  if (!opts.force && pathOnDisk) {
+    const localOnly = await localOnlyFn(cfg, worktreeP, branch);
+    if (localOnly !== false) {
+      return {
+        removed: false,
+        dirty: false,
+        branch,
+        worktree: worktreeP,
+        error:
+          localOnly === null
+            ? "cannot verify all commits are pushed (remote branch not found); use --force to proceed"
+            : "branch has local-only commits not pushed to remote; use --force to discard",
+      };
+    }
+  }
+
   try {
-    await removeFn(cfg, issueNumber, rec.slug, worktreeP, opts.force);
+    await removeFn(cfg, issueNumber, rec.slug, pathOnDisk, worktreeP, opts.force);
   } catch (err) {
     return {
       removed: false,
