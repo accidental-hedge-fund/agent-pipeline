@@ -61,6 +61,8 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
 /pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
 /pipeline intake --description "<text>" --dry-run  preview only; no writes
+/pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output (no number)
+/pipeline refine-spec --help             probe for contract availability; exits 0 on supported installs
 /pipeline triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
 /pipeline triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
 /pipeline sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
@@ -117,6 +119,23 @@ The spec-generation step is the only model call; issue creation and roadmap edit
 are deterministic. The roadmap update is opened as a PR for human review — the
 pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
 proposes the first open lane from `ROADMAP.md`.
+
+`refine-spec` is a **non-mutating** spec-refinement preview command. It accepts
+an existing issue's title and body and returns a refined spec as JSON — no GitHub
+writes, no git writes, no filesystem writes:
+
+```bash
+/pipeline refine-spec --title "Add retry logic" --body "## Summary\nA retry mechanism."
+# → {"title":"...","body":"## Summary\n...","milestone":null}
+
+pipeline refine-spec --help   # probe: exits 0 only on installs that support this contract
+```
+
+The output object always contains `title` (string), `body` (string), and `milestone`
+(string or null). The `body` field follows the WHAT-not-HOW section contract: Summary,
+User story, Acceptance criteria, Out of scope, and Open questions only when genuinely
+ambiguous. `--json` is accepted for callers that pass it; behavior is identical (output
+is always JSON). Re-running on the same input leaves all repo and GitHub state unchanged.
 
 `triage` sets a pre-pipeline stage label on an issue — no model call, fully
 deterministic:

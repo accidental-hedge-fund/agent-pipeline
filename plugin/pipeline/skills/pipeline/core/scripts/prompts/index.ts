@@ -550,6 +550,18 @@ export function buildSweepPrompt(a: BuildSweepArgs): string {
   });
 }
 
+export interface BuildRefineSpecArgs {
+  title: string;
+  body: string;
+}
+
+export function buildRefineSpecPrompt(a: BuildRefineSpecArgs): string {
+  return substitute(loadTemplate("refine-spec"), {
+    title: a.title,
+    body: a.body,
+  });
+}
+
 // Exported for tests. CONFIDENCE_CALIBRATION_BLOCK and NON_BLOCKING_GUIDANCE_BLOCK
 // are exposed so the drift test can assert both review prompts embed the shared
 // constants byte-for-byte. SEVERITY_RUBRIC is exposed for the rubric-content test.
