@@ -441,6 +441,28 @@ test("removeWorktreeForIssue: hasLocalOnlyCommits returns null (remote not found
   assert.equal(removeCalled, false, "removeWorktree must NOT be called when remote check fails");
 });
 
+// Regression: post-merge deleted-branch case — hasLocalOnlyCommits returns null
+// (remote branch gone) but --force allows removal (user takes responsibility for
+// unverifiable state, e.g. squash-merge where commit SHAs differ from base branch).
+test("removeWorktreeForIssue: hasLocalOnlyCommits returns null + --force → removed=true (force bypasses unverifiable, not definitively-unpushed)", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => null, // unverifiable (e.g. squash-merge, deleted remote)
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
+
+  assert.equal(result.removed, true, "--force must allow removal when check is unverifiable (null)");
+  assert.ok(removeCalled, "removeWorktree must be called when --force overrides null result");
+});
+
 // Regression for pre-merge delta finding: --force must NOT bypass the local-only
 // commits check. --force only bypasses the uncommitted-changes guard.
 test("removeWorktreeForIssue: local-only commits with --force → removed=false (--force does not bypass local-only check)", async () => {
@@ -606,6 +628,31 @@ test("removeWorktreeForIssue: path on disk → removeWorktree dep receives pathO
 
   await removeWorktreeForIssue(cfg, 42, {}, deps);
   assert.equal(capturedPathOnDisk, true, "removeWorktree must receive pathOnDisk=true when directory exists");
+});
+
+// Regression: post-merge deleted-branch case — checkLocalOnlyCommits returns false
+// (all commits reachable from base branch) so removal proceeds without --force.
+// Simulated via dep injection: hasLocalOnlyCommits returns false even though remote
+// branch is absent (base-branch reachability proved the work was merged).
+test("removeWorktreeForIssue: post-merge clean worktree (deleted remote branch, commits in base) → removed=true without --force", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "merged-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    // Simulates checkLocalOnlyCommits returning false when remote branch is gone but
+    // commits are all reachable from origin/<base_branch> (the merged case).
+    hasLocalOnlyCommits: async () => false,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, true, "merged worktree must be removable without --force even if remote branch was deleted");
+  assert.ok(removeCalled);
 });
 
 // ---------------------------------------------------------------------------
