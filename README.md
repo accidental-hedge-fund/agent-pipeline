@@ -574,13 +574,29 @@ test_gate:
 {
   "scripts": {
     "ci:core": "(cd core && npm ci --no-audit --no-fund && npm test)",
-    "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke",
-    "ci:install-smoke": "node scripts/ci-install-smoke.mjs"
+    "ci:fast": "npm run ci:core && npm run build:check",
+    "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke && npm run ci:launcher-smoke",
+    "ci:install-smoke": "node scripts/ci-install-smoke.mjs",
+    "ci:launcher-smoke": "node scripts/launcher-smoke.mjs"
   }
 }
 ```
 
 `test_gate.command` is run through `bash -c` with `set -o pipefail`, so compound operators like `&&`, `||`, `;`, and `|` work directly in the config value — and `pipefail` ensures a failing earlier stage in a pipeline (e.g. `npm test | tee log`) fails the gate rather than being hidden by the last stage's exit code. (Configured commands therefore require `bash`; it is assumed present, as on every supported CI runner and dev host.) Auto-detected commands (entries 2–6) continue to spawn the binary directly without a shell.
+
+### Local verification: fast vs full gate
+
+Two tiers, so you can verify the right amount before pushing and let CI run less duplicated work:
+
+| Command | What it runs | When |
+|---------|--------------|------|
+| `npm run ci:fast` | core unit tests + `plugin/` mirror check | **default, per commit** — the quick local gate (~16s) |
+| `npm run ci` | clean install + core tests + mirror check + install-smoke + launcher-smoke | **before opening a PR / cutting a release** — the exact gate GitHub Actions runs |
+| `cd core && node --test --experimental-strip-types test/<file>.test.ts` | a single test file | **targeted** — iterating on one area |
+
+`ci:fast` catches the vast majority of failures (logic regressions and a stale `plugin/` mirror) without the packaging install/launcher smoke-tests, which rarely break from a normal `core/` change and are reserved for the full gate. `ci` is the CI-equivalent: the GitHub Actions workflow runs this identical script, so a green `npm run ci` locally means a green CI run. Run `ci:fast` while iterating; run `ci` once before you push a PR.
+
+> CI runs the full gate on **every** commit (including the pipeline's OpenSpec-archive commits — the pre-merge gate depends on it) and cancels superseded runs automatically, so the cheapest way to save Actions minutes is to catch failures with `ci:fast` locally before pushing.
 
 ## Format/lint gate (optional, default off)
 
