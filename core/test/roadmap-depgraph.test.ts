@@ -11,6 +11,7 @@ import {
   buildDepVerifyPrompt,
   buildDepgraph,
   addMustPrecedeEdges,
+  rankCandidates,
 } from "../scripts/roadmap/depgraph.ts";
 import type { InventoryItem, DepEdge } from "../scripts/roadmap/types.ts";
 import type { DepgraphDeps } from "../scripts/roadmap/depgraph.ts";
@@ -198,10 +199,12 @@ describe("buildDepgraph", () => {
       readFile: async () => null,
       log: () => {},
     };
-    const graph = await buildDepgraph([], deps);
+    const { graph, stats } = await buildDepgraph([], deps);
     assert.deepEqual(graph.must_precede, []);
     assert.deepEqual(graph.should_precede, []);
     assert.deepEqual(graph.cycle_reports, []);
+    assert.equal(stats.verify_calls, 0);
+    assert.equal(stats.verify_skipped, 0);
   });
 
   it("promotes textually-confirmed strong edge to must_precede with correct direction", async () => {
@@ -223,7 +226,7 @@ describe("buildDepgraph", () => {
       log: () => {},
     };
 
-    const graph = await buildDepgraph(items, deps);
+    const { graph } = await buildDepgraph(items, deps);
     // Edge convention: {from: prerequisite, to: depender} — #5 must precede #10
     assert.ok(graph.must_precede.some((e) => e.from === 5 && e.to === 10),
       "prerequisite (#5) should be 'from', depender (#10) should be 'to'");
@@ -249,7 +252,7 @@ describe("buildDepgraph", () => {
       log: () => {},
     };
 
-    const graph = await buildDepgraph(items, deps);
+    const { graph } = await buildDepgraph(items, deps);
     assert.ok(graph.should_precede.some((e) => e.from === 5 && e.to === 10));
     assert.deepEqual(graph.must_precede, []);
   });
@@ -280,7 +283,7 @@ describe("buildDepgraph", () => {
       log: () => {},
     };
 
-    const graph = await buildDepgraph(items, deps);
+    const { graph } = await buildDepgraph(items, deps);
     // The file-based candidate should have been source-verified and promoted
     assert.ok(graph.must_precede.length > 0, "file-based candidate should be promoted to must_precede");
   });
@@ -304,9 +307,57 @@ describe("buildDepgraph", () => {
       log: () => {},
     };
 
-    const graph = await buildDepgraph(items, deps);
+    const { graph } = await buildDepgraph(items, deps);
     assert.deepEqual(graph.must_precede, []);
     assert.ok(graph.open_questions.length > 0, "unverified edge should be in open_questions");
+  });
+
+  it("verify cap sends excess candidates to open_questions", async () => {
+    // Build 3 issues that share files → produces shared-file candidates exceeding the cap
+    const items: InventoryItem[] = [
+      { issue: { number: 1, title: "A", body: "Depends on #2.", labels: [], url: "", state: "open" }, touched_files: ["shared.ts"] },
+      { issue: { number: 2, title: "B", body: "", labels: [], url: "", state: "open" }, touched_files: ["shared.ts"] },
+      { issue: { number: 3, title: "C", body: "", labels: [], url: "", state: "open" }, touched_files: ["shared.ts"] },
+    ];
+
+    const unverifiedResult = JSON.stringify({ edge_confirmed: false, file_line: "", rationale: "none", is_strong: false });
+    let harnessCallCount = 0;
+    const deps: DepgraphDeps = {
+      runHarness: async () => { harnessCallCount++; return { success: true, output: unverifiedResult }; },
+      readFile: async () => null,
+      log: () => {},
+    };
+
+    // Set cap to 1 so only 1 candidate gets verified; the rest go to open_questions
+    const { graph, stats } = await buildDepgraph(items, deps, { depgraph_verify_cap: 1 });
+    assert.equal(stats.verify_calls, 1, "only 1 call should be made due to cap");
+    assert.ok(stats.verify_skipped > 0, "some candidates should be skipped due to cap");
+    assert.ok(graph.open_questions.some((oq) => oq.rationale === "candidate ranked beyond verify cap"),
+      "capped candidates must appear in open_questions with correct rationale");
+  });
+
+  it("concurrent verification is bounded by depgraph_concurrency", async () => {
+    const items: InventoryItem[] = Array.from({ length: 5 }, (_, i) => ({
+      issue: { number: i + 1, title: `Issue ${i + 1}`, body: `Depends on #${i + 2 <= 5 ? i + 2 : 1}.`, labels: [], url: "", state: "open" as const },
+      touched_files: [`file${i}.ts`],
+    }));
+
+    let inflight = 0;
+    let maxInflight = 0;
+    const deps: DepgraphDeps = {
+      runHarness: async () => {
+        inflight++;
+        maxInflight = Math.max(maxInflight, inflight);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        inflight--;
+        return { success: true, output: JSON.stringify({ edge_confirmed: false, file_line: "", rationale: "none", is_strong: false }) };
+      },
+      readFile: async () => null,
+      log: () => {},
+    };
+
+    await buildDepgraph(items, deps, { depgraph_concurrency: 2, depgraph_verify_cap: 20 });
+    assert.ok(maxInflight <= 2, `max inflight ${maxInflight} exceeded concurrency cap 2`);
   });
 
   it("regression: topoSort with must_precede ranks prerequisite before dependent", () => {
@@ -469,5 +520,58 @@ describe("addMustPrecedeEdges", () => {
     const updated = addMustPrecedeEdges(graph, newEdges, [1, 2, 3]);
     assert.equal(updated.must_precede.length, 2);
     assert.ok(updated.must_precede.some((e) => e.from === 2 && e.to === 3));
+  });
+});
+
+describe("rankCandidates", () => {
+  function makeItem2(n: number, files: string[] = []): InventoryItem {
+    return {
+      issue: { number: n, title: `Issue ${n}`, body: "", labels: [], url: "", state: "open" },
+      touched_files: files,
+    };
+  }
+
+  it("deduplication: same pair from two sources keeps highest-priority source (textual wins over shared-file)", () => {
+    const items = [makeItem2(1, ["a.ts"]), makeItem2(2, ["a.ts"])];
+    const textual: Array<[number, number]> = [[1, 2]];
+    const sharedFile: Array<[number, number]> = [[1, 2]];
+    const crossFile: Array<[number, number]> = [];
+
+    const ranked = rankCandidates(textual, sharedFile, crossFile, items);
+    const pair12 = ranked.filter((c) => c.pair[0] === 1 && c.pair[1] === 2);
+    assert.equal(pair12.length, 1, "duplicate pair should be deduplicated to one entry");
+    assert.equal(pair12[0]!.source, "textual", "textual source should win over shared-file");
+  });
+
+  it("ranking order: textual before shared-file before cross-file", () => {
+    const items = [makeItem2(1), makeItem2(2), makeItem2(3)];
+    const textual: Array<[number, number]> = [[2, 3]];
+    const sharedFile: Array<[number, number]> = [[1, 3]];
+    const crossFile: Array<[number, number]> = [[1, 2]];
+
+    const ranked = rankCandidates(textual, sharedFile, crossFile, items);
+    assert.equal(ranked.length, 3);
+    assert.equal(ranked[0]!.source, "textual", "textual must be first");
+    assert.equal(ranked[1]!.source, "shared-file", "shared-file must be second");
+    assert.equal(ranked[2]!.source, "cross-file", "cross-file must be last");
+  });
+
+  it("within same source group, candidates with more shared files rank higher", () => {
+    const items = [
+      makeItem2(1, ["a.ts", "b.ts", "c.ts"]),
+      makeItem2(2, ["a.ts", "b.ts", "c.ts"]),
+      makeItem2(3, ["a.ts"]),
+      makeItem2(4, ["a.ts"]),
+    ];
+    const sharedFile: Array<[number, number]> = [[1, 2], [3, 4]];
+    const ranked = rankCandidates([], sharedFile, [], items);
+    // [1,2] shares 3 files; [3,4] shares 1 file → [1,2] should rank higher
+    assert.equal(ranked[0]!.pair[0], 1, "pair with more shared files should rank first");
+    assert.equal(ranked[0]!.pair[1], 2);
+  });
+
+  it("handles empty inputs", () => {
+    const ranked = rankCandidates([], [], [], []);
+    assert.deepEqual(ranked, []);
   });
 });

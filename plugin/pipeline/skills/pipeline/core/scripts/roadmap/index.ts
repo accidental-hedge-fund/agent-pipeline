@@ -8,6 +8,7 @@ import { partitionFindings } from "../review-policy.ts";
 import type { ReviewFinding } from "../types.ts";
 import type {
   PlanJson,
+  RunStats,
   DepEdge,
   HygieneItem,
   MilestoneSpec,
@@ -43,6 +44,8 @@ export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps 
   runCritiqueHarness(prompt: string): Promise<{ success: boolean; output: string }>;
   /** Return the latest git tag (e.g. "v1.6.0") or "" if no tags exist. */
   getLatestTag(repoDir: string): Promise<string>;
+  /** Injectable clock for phase timing; defaults to Date.now. */
+  now?: () => number;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,156 +404,207 @@ export async function runRoadmap(
     return;
   }
 
-  // Phase 1: Comprehend
-  deps.log("[roadmap] phase 1: comprehend...");
-  try {
-    const allIssuesForCount = await deps.getOpenIssues(repo);
-    const prompt = buildComprehendPrompt(repo, allIssuesForCount.length);
-    await deps.runHarness(prompt);
-    deps.log("[roadmap] phase 1: comprehension complete");
-  } catch (err) {
-    deps.log(`[roadmap] phase 1: comprehension warning: ${(err as Error).message}`);
+  const clock = deps.now ?? Date.now;
+  const phaseElapsedMs: Record<string, number> = {};
+
+  async function timed<T>(phaseName: string, fn: () => Promise<T>): Promise<T> {
+    const start = clock();
+    try {
+      return await fn();
+    } finally {
+      phaseElapsedMs[phaseName] = clock() - start;
+    }
   }
 
+  // Phase 1: Comprehend
+  let openIssueCount = 0;
+  await timed("comprehend", async () => {
+    deps.log("[roadmap] phase 1: comprehend...");
+    try {
+      const allIssuesForCount = await deps.getOpenIssues(repo);
+      openIssueCount = allIssuesForCount.length;
+      const prompt = buildComprehendPrompt(repo, allIssuesForCount.length);
+      await deps.runHarness(prompt);
+      deps.log("[roadmap] phase 1: comprehension complete");
+    } catch (err) {
+      deps.log(`[roadmap] phase 1: comprehension warning: ${(err as Error).message}`);
+    }
+  });
+
   // Phase 2: Inventory
-  const items = await buildInventory(repo, config, deps);
+  const { items, stats: inventoryStats } = await timed("inventory", () =>
+    buildInventory(repo, config, deps),
+  );
   const backlogSha = computeBacklogSha(items.map((i) => i.issue));
 
   // Phase 3: Dependency graph
-  let depGraph = await buildDepgraph(items, deps);
+  const { graph: depGraphResult, stats: depgraphStats } = await timed("depgraph", () =>
+    buildDepgraph(items, deps, config),
+  );
+  let depGraph = depGraphResult;
 
   // Phase 4: Score
-  deps.log("[roadmap] phase 4: scoring...");
-  let scored = scoreItems(items, depGraph, config.score_weights);
+  const scored_result = await timed("score", async () => {
+    deps.log("[roadmap] phase 4: scoring...");
+    return scoreItems(items, depGraph, config.score_weights);
+  });
+  let scored = scored_result;
 
   // Phase 5: Roadmap tiers (canonical tier order within each dep-tier preserved)
-  deps.log("[roadmap] phase 5: producing tiered roadmap...");
-  let roadmap = applyDepAdjustment(scored, items, depGraph);
+  let roadmap = await timed("roadmap", async () => {
+    deps.log("[roadmap] phase 5: producing tiered roadmap...");
+    return applyDepAdjustment(scored, items, depGraph);
+  });
 
   // Phase 6: Hygiene (proposals with file:line go to hygiene[]; issue-only to openQuestions)
-  deps.log("[roadmap] phase 6: hygiene analysis...");
-  const { hygiene, openQuestions: hygieneOpenQuestions } = generateHygiene(items);
+  const { hygiene, openQuestions: hygieneOpenQuestions } = await timed("hygiene", async () => {
+    deps.log("[roadmap] phase 6: hygiene analysis...");
+    return generateHygiene(items);
+  });
 
   // Phase 7: Adversarial critique (up to 2 correction rounds, using reviewer harness)
-  deps.log("[roadmap] phase 7: adversarial critique...");
-
   const openQuestions: OpenQuestion[] = [...depGraph.open_questions, ...hygieneOpenQuestions];
   const critiqueEntries: CritiqueEntry[] = [];
   const MAX_CORRECTION_ROUNDS = 2;
   let correctionRound = 0;
 
-  while (correctionRound < MAX_CORRECTION_ROUNDS) {
-    const critiqueResult = await deps.runCritiqueHarness(
-      buildCritiquePrompt(roadmap, depGraph, hygiene, openQuestions, items),
-    );
+  await timed("critique", async () => {
+    deps.log("[roadmap] phase 7: adversarial critique...");
 
-    if (!critiqueResult.success) {
-      deps.log("[roadmap] phase 7: critique harness failed — recording as open question");
-      openQuestions.push({
-        description: "Adversarial critique harness failed — roadmap may have undetected dep-order violations",
-        related_issues: [],
-        rationale: "critique harness returned success:false; re-run 'pipeline roadmap' to retry",
-      });
-      break;
-    }
-
-    const verdict = parseCritiqueVerdict(critiqueResult.output);
-    if (verdict === null) {
-      // Malformed output — treat as a critique failure, not a clean approval
-      deps.log("[roadmap] phase 7: critique returned malformed output — recording open question");
-      openQuestions.push({
-        description: "Adversarial critique returned malformed output — roadmap may have undetected dep-order violations",
-        related_issues: [],
-        rationale: "critique output was not parseable as a review verdict JSON; re-run 'pipeline roadmap' to retry",
-      });
-      break;
-    }
-    if (verdict.findings.length === 0) {
-      deps.log("[roadmap] phase 7: no critique findings — plan looks good");
-      break;
-    }
-
-    const { blocking, advisory } = partitionFindings(verdict.findings, CRITIQUE_POLICY);
-
-    for (const { finding } of advisory) {
-      critiqueEntries.push({
-        severity: finding.severity,
-        title: finding.title,
-        body: finding.body,
-        file: finding.file,
-        line_start: finding.line_start,
-        line_end: finding.line_end,
-        confidence: finding.confidence,
-        recommendation: finding.recommendation,
-        category: finding.category,
-        is_advisory: true,
-      });
-    }
-
-    const depViolations = blocking.filter((f) => f.category === "dep-order-violation");
-
-    if (depViolations.length === 0) {
-      for (const f of blocking) {
-        critiqueEntries.push({
-          severity: f.severity,
-          title: f.title,
-          body: f.body,
-          file: f.file,
-          line_start: f.line_start,
-          line_end: f.line_end,
-          confidence: f.confidence,
-          recommendation: f.recommendation,
-          category: f.category,
-          is_advisory: false,
-        });
-      }
-      break;
-    }
-
-    correctionRound++;
-    deps.log(
-      `[roadmap] phase 7: correction round ${correctionRound} — ${depViolations.length} dep-order violation(s)`,
-    );
-
-    const newEdges: DepEdge[] = [];
-    for (const f of depViolations) {
-      const nums = [...(f.title + " " + f.body).matchAll(/#(\d+)/g)].map(
-        (m) => Number.parseInt(m[1], 10),
+    while (correctionRound < MAX_CORRECTION_ROUNDS) {
+      const critiqueResult = await deps.runCritiqueHarness(
+        buildCritiquePrompt(roadmap, depGraph, hygiene, openQuestions, items),
       );
-      if (nums.length >= 2) {
-        newEdges.push({
-          from: nums[0],
-          to: nums[1],
-          file_line: f.file ? `${f.file}:${f.line_start ?? 0}` : "",
-          rationale: `critique correction: ${f.body.slice(0, 100)}`,
-        });
-      }
-    }
 
-    if (newEdges.length > 0) {
-      const allIssueNums = items.map((i) => i.issue.number);
-      depGraph = addMustPrecedeEdges(depGraph, newEdges, allIssueNums);
-      // Re-score with the updated dep graph so dep_leverage and dep_rationale reflect
-      // the corrected edges before rebuilding the roadmap order.
-      scored = scoreItems(items, depGraph, config.score_weights);
-      roadmap = applyDepAdjustment(scored, items, depGraph);
-    }
-
-    if (correctionRound >= MAX_CORRECTION_ROUNDS) {
-      for (const f of depViolations) {
+      if (!critiqueResult.success) {
+        deps.log("[roadmap] phase 7: critique harness failed — recording as open question");
         openQuestions.push({
-          description: `Unresolved dep-order violation after ${MAX_CORRECTION_ROUNDS} correction rounds: ${f.title}`,
-          related_issues: [...(f.title + " " + f.body).matchAll(/#(\d+)/g)].map(
-            (m) => Number.parseInt(m[1], 10),
-          ),
-          rationale: f.body.slice(0, 200),
+          description: "Adversarial critique harness failed — roadmap may have undetected dep-order violations",
+          related_issues: [],
+          rationale: "critique harness returned success:false; re-run 'pipeline roadmap' to retry",
+        });
+        break;
+      }
+
+      const verdict = parseCritiqueVerdict(critiqueResult.output);
+      if (verdict === null) {
+        // Malformed output — treat as a critique failure, not a clean approval
+        deps.log("[roadmap] phase 7: critique returned malformed output — recording open question");
+        openQuestions.push({
+          description: "Adversarial critique returned malformed output — roadmap may have undetected dep-order violations",
+          related_issues: [],
+          rationale: "critique output was not parseable as a review verdict JSON; re-run 'pipeline roadmap' to retry",
+        });
+        break;
+      }
+      if (verdict.findings.length === 0) {
+        deps.log("[roadmap] phase 7: no critique findings — plan looks good");
+        break;
+      }
+
+      const { blocking, advisory } = partitionFindings(verdict.findings, CRITIQUE_POLICY);
+
+      for (const { finding } of advisory) {
+        critiqueEntries.push({
+          severity: finding.severity,
+          title: finding.title,
+          body: finding.body,
+          file: finding.file,
+          line_start: finding.line_start,
+          line_end: finding.line_end,
+          confidence: finding.confidence,
+          recommendation: finding.recommendation,
+          category: finding.category,
+          is_advisory: true,
         });
       }
+
+      const depViolations = blocking.filter((f) => f.category === "dep-order-violation");
+
+      if (depViolations.length === 0) {
+        for (const f of blocking) {
+          critiqueEntries.push({
+            severity: f.severity,
+            title: f.title,
+            body: f.body,
+            file: f.file,
+            line_start: f.line_start,
+            line_end: f.line_end,
+            confidence: f.confidence,
+            recommendation: f.recommendation,
+            category: f.category,
+            is_advisory: false,
+          });
+        }
+        break;
+      }
+
+      correctionRound++;
       deps.log(
-        `[roadmap] phase 7: correction cap reached — ${depViolations.length} violation(s) promoted to open_questions`,
+        `[roadmap] phase 7: correction round ${correctionRound} — ${depViolations.length} dep-order violation(s)`,
       );
+
+      const newEdges: DepEdge[] = [];
+      for (const f of depViolations) {
+        const nums = [...(f.title + " " + f.body).matchAll(/#(\d+)/g)].map(
+          (m) => Number.parseInt(m[1], 10),
+        );
+        if (nums.length >= 2) {
+          newEdges.push({
+            from: nums[0],
+            to: nums[1],
+            file_line: f.file ? `${f.file}:${f.line_start ?? 0}` : "",
+            rationale: `critique correction: ${f.body.slice(0, 100)}`,
+          });
+        }
+      }
+
+      if (newEdges.length > 0) {
+        const allIssueNums = items.map((i) => i.issue.number);
+        depGraph = addMustPrecedeEdges(depGraph, newEdges, allIssueNums);
+        // Re-score with the updated dep graph so dep_leverage and dep_rationale reflect
+        // the corrected edges before rebuilding the roadmap order.
+        scored = scoreItems(items, depGraph, config.score_weights);
+        roadmap = applyDepAdjustment(scored, items, depGraph);
+      }
+
+      if (correctionRound >= MAX_CORRECTION_ROUNDS) {
+        for (const f of depViolations) {
+          openQuestions.push({
+            description: `Unresolved dep-order violation after ${MAX_CORRECTION_ROUNDS} correction rounds: ${f.title}`,
+            related_issues: [...(f.title + " " + f.body).matchAll(/#(\d+)/g)].map(
+              (m) => Number.parseInt(m[1], 10),
+            ),
+            rationale: f.body.slice(0, 200),
+          });
+        }
+        deps.log(
+          `[roadmap] phase 7: correction cap reached — ${depViolations.length} violation(s) promoted to open_questions`,
+        );
+      }
     }
-  }
+  });
+
+  // Assemble run_stats from per-phase counts and timings.
+  const runStats: RunStats = {
+    open_issue_count: openIssueCount,
+    filtered_issue_count: items.length,
+    inventory_harness_calls: inventoryStats.harness_calls,
+    inventory_harness_skipped: inventoryStats.harness_skipped,
+    depgraph_candidates_textual: depgraphStats.candidates_textual,
+    depgraph_candidates_shared_file: depgraphStats.candidates_shared_file,
+    depgraph_candidates_cross_file: depgraphStats.candidates_cross_file,
+    depgraph_verify_calls: depgraphStats.verify_calls,
+    depgraph_verify_skipped: depgraphStats.verify_skipped,
+    critique_rounds: correctionRound,
+    phase_elapsed_ms: phaseElapsedMs,
+  };
+
+  deps.log(
+    `[roadmap] run_stats: inventory harness=${runStats.inventory_harness_calls} skipped=${runStats.inventory_harness_skipped}` +
+    ` depgraph verify=${runStats.depgraph_verify_calls} skipped=${runStats.depgraph_verify_skipped}` +
+    ` critique_rounds=${runStats.critique_rounds}`,
+  );
 
   // Build milestones based on release_model (semver default)
   deps.log("[roadmap] phase 8: building milestone groupings...");
@@ -586,6 +640,7 @@ export async function runRoadmap(
     critique: critiqueEntries,
     open_questions: openQuestions,
     ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
+    run_stats: runStats,
   };
 
   // Ensure output dir exists, then write outputs. Writes are atomic (temp + rename in the real

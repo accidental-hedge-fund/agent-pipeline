@@ -163,6 +163,9 @@ const PartialConfigSchema = z.object({
       hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
       pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
       release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery."),
+      inventory_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during inventory phase (default: 4)."),
+      depgraph_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during dependency verification (default: 4)."),
+      depgraph_verify_cap: z.number().int().positive().optional().describe("Maximum candidates to source-verify; excess go to open_questions (default: 20)."),
     })
     .strict()
     .optional()

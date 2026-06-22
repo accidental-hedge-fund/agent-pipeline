@@ -140,6 +140,20 @@ export interface CritiqueEntry {
   is_advisory: boolean;
 }
 
+export interface RunStats {
+  open_issue_count: number;
+  filtered_issue_count: number;
+  inventory_harness_calls: number;
+  inventory_harness_skipped: number;
+  depgraph_candidates_textual: number;
+  depgraph_candidates_shared_file: number;
+  depgraph_candidates_cross_file: number;
+  depgraph_verify_calls: number;
+  depgraph_verify_skipped: number;
+  critique_rounds: number;
+  phase_elapsed_ms: Record<string, number>;
+}
+
 export interface PlanJson {
   generated_at: string;
   backlog_sha: string;
@@ -154,6 +168,7 @@ export interface PlanJson {
   open_questions: OpenQuestion[];
   /** Present only when release_model === 'continuous'. CalVer format: YYYY.0M.MICRO */
   continuous_version_marker?: string;
+  run_stats?: RunStats;
 }
 
 export interface RoadmapConfig {
@@ -163,6 +178,9 @@ export interface RoadmapConfig {
   hygiene_auto_apply?: boolean;
   pr_docs?: boolean;
   release_model?: 'semver' | 'continuous';
+  inventory_concurrency?: number;
+  depgraph_concurrency?: number;
+  depgraph_verify_cap?: number;
 }
 
 export type ReleaseModel = 'semver' | 'continuous';

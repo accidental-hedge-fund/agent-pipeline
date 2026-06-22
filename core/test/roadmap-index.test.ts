@@ -325,6 +325,62 @@ describe("runRoadmap - critique integration", () => {
   });
 });
 
+describe("runRoadmap - run_stats", () => {
+  it("plan.json contains run_stats with all required fields after a run", async () => {
+    const written: Record<string, string> = {};
+    let tick = 0;
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runHarness: async () => ({ success: true, output: "[]" }),
+      runCritiqueHarness: async () => ({ success: true, output: '{"verdict":"approved","findings":[],"summary":"OK","next_steps":[]}' }),
+      writeFile: async (p: string, c: string) => { written[p] = c; },
+      now: () => { tick += 10; return tick; },
+    });
+
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-run-stats" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.run_stats !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should contain run_stats");
+
+    const plan = JSON.parse(planContent!) as PlanJson;
+    const rs = plan.run_stats!;
+    assert.ok(rs !== undefined, "run_stats must be present");
+
+    // All required fields present and non-negative
+    assert.ok(typeof rs.open_issue_count === "number" && rs.open_issue_count >= 0);
+    assert.ok(typeof rs.filtered_issue_count === "number" && rs.filtered_issue_count >= 0);
+    assert.ok(typeof rs.inventory_harness_calls === "number" && rs.inventory_harness_calls >= 0);
+    assert.ok(typeof rs.inventory_harness_skipped === "number" && rs.inventory_harness_skipped >= 0);
+    assert.ok(typeof rs.depgraph_candidates_textual === "number" && rs.depgraph_candidates_textual >= 0);
+    assert.ok(typeof rs.depgraph_candidates_shared_file === "number" && rs.depgraph_candidates_shared_file >= 0);
+    assert.ok(typeof rs.depgraph_candidates_cross_file === "number" && rs.depgraph_candidates_cross_file >= 0);
+    assert.ok(typeof rs.depgraph_verify_calls === "number" && rs.depgraph_verify_calls >= 0);
+    assert.ok(typeof rs.depgraph_verify_skipped === "number" && rs.depgraph_verify_skipped >= 0);
+    assert.ok(typeof rs.critique_rounds === "number" && rs.critique_rounds >= 0);
+    assert.ok(typeof rs.phase_elapsed_ms === "object" && rs.phase_elapsed_ms !== null);
+
+    // Invariant: open_issue_count >= filtered_issue_count
+    assert.ok(rs.open_issue_count >= rs.filtered_issue_count,
+      `open_issue_count (${rs.open_issue_count}) must be >= filtered_issue_count (${rs.filtered_issue_count})`);
+
+    // Invariant: harness_calls + harness_skipped === filtered_issue_count
+    assert.equal(
+      rs.inventory_harness_calls + rs.inventory_harness_skipped,
+      rs.filtered_issue_count,
+      "inventory_harness_calls + inventory_harness_skipped must equal filtered_issue_count",
+    );
+
+    // phase_elapsed_ms covers all 7 named phases
+    for (const phase of ["comprehend", "inventory", "depgraph", "score", "roadmap", "hygiene", "critique"]) {
+      assert.ok(phase in rs.phase_elapsed_ms, `phase_elapsed_ms must include phase: ${phase}`);
+      assert.ok(rs.phase_elapsed_ms[phase]! >= 0, `phase_elapsed_ms[${phase}] must be non-negative`);
+    }
+  });
+});
+
 describe("runRoadmap - --next validation", () => {
   it("regression: --next NaN falls through to full engine run — must now throw", async () => {
     // Finding #8: Commander parses '--next foo' as NaN; the engine must reject it before running.
