@@ -199,6 +199,9 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
 /pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
+/pipeline N --remove-worktree               remove issue N's on-disk worktree + local branch (bypasses kill switch)
+/pipeline N --remove-worktree --force       same, discarding uncommitted changes with a warning
+/pipeline N --remove-worktree --json        machine-readable JSON result (stable contract)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
 /pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
 /pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)

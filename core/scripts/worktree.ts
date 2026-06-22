@@ -786,6 +786,117 @@ export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<
 }
 
 // ---------------------------------------------------------------------------
+// Per-issue worktree removal (#296)
+// ---------------------------------------------------------------------------
+
+export interface RemoveWorktreeResult {
+  removed: boolean;
+  dirty: boolean;
+  branch: string | null;
+  worktree: string | null;
+  error: string | null;
+}
+
+export interface RemoveWorktreeDeps {
+  listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, resolvedPath?: string) => Promise<void>;
+  pathExists?: (p: string) => boolean;
+}
+
+/** Remove-worktree dep default: throws on failure so the caller can capture the message. */
+async function realRemoveWorktreeOp(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  slug: string,
+  resolvedPath?: string,
+): Promise<void> {
+  const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
+  const branch = branchName(issueNumber, slug);
+  if (fs.existsSync(wtPath)) {
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", "--force", wtPath], { ignoreFailure: true });
+    if (r.code !== 0) {
+      throw new Error(`git worktree remove failed: ${r.stderr.trim()}`);
+    }
+  }
+  const br = await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+  if (br.code !== 0) {
+    throw new Error(`git branch -D failed: ${br.stderr.trim()}`);
+  }
+}
+
+/** Remove the on-disk worktree for issue N regardless of PR merge state.
+ *
+ *  - Dirty + no force → `{ removed: false, dirty: true, error: "uncommitted changes" }`
+ *  - Dirty + force → removes anyway, returns `{ removed: true, dirty: true }`
+ *  - Not found → `{ removed: false, error: "no worktree found …" }`
+ *  - git failure → `{ removed: false, error: git-error-message }`
+ *
+ *  All deps are injectable for unit tests (no real git, network, or filesystem). */
+export async function removeWorktreeForIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  opts: { force?: boolean },
+  deps: RemoveWorktreeDeps = {},
+): Promise<RemoveWorktreeResult> {
+  const listFn = deps.listOnDisk ?? listOnDisk;
+  const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
+  const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
+  const existsFn = deps.pathExists ?? fs.existsSync;
+
+  const records = await listFn(cfg);
+  const rec = records.find((r) => r.issueNumber === issueNumber && r.slug);
+
+  if (!rec || !rec.slug) {
+    return {
+      removed: false,
+      dirty: false,
+      branch: null,
+      worktree: null,
+      error: `no worktree found for issue #${issueNumber}`,
+    };
+  }
+
+  const branch = rec.branch ?? branchName(issueNumber, rec.slug);
+  const worktreeP = rec.path;
+
+  let dirty = false;
+  if (existsFn(worktreeP)) {
+    dirty = await dirtyFn(worktreeP);
+  }
+
+  if (dirty && !opts.force) {
+    return {
+      removed: false,
+      dirty: true,
+      branch,
+      worktree: worktreeP,
+      error: "uncommitted changes; use --force to discard",
+    };
+  }
+
+  try {
+    await removeFn(cfg, issueNumber, rec.slug, worktreeP);
+  } catch (err) {
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error: (err as Error).message,
+    };
+  }
+
+  return {
+    removed: true,
+    dirty,
+    branch,
+    worktree: worktreeP,
+    error: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Worktree sweep (cleanup of merged-PR worktrees)
 // ---------------------------------------------------------------------------
 

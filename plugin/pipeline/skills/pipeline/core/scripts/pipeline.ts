@@ -47,7 +47,7 @@ import {
 import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
-import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, sweepMergedWorktrees } from "./worktree.ts";
+import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
 import {
   bundlePath,
   createBundle,
@@ -236,6 +236,10 @@ export interface CliOpts {
   repo?: string;
   /** Triage: target pre-pipeline stage label (ready or backlog). */
   stage?: string;
+  /** Remove issue N's on-disk worktree and local branch, then exit. */
+  removeWorktree?: boolean;
+  /** Modifier for --remove-worktree: remove despite uncommitted changes. */
+  force?: boolean;
 }
 
 /**
@@ -251,7 +255,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup), or a subcommand: init | doctor | logs | path | config | run | release | intake | refine-spec | triage | roadmap | sweep | merge | summary")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -287,7 +291,9 @@ export function buildCmd(): Command {
     .option("--apply", "roadmap/sweep: execute GitHub write-backs (issue updates, roadmap PR); default is dry-run")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
-    .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)");
+    .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
+    .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
+    .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -421,11 +427,35 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  // `pipeline path --json`, `pipeline config validate --json`, and `pipeline refine-spec --json`
-  // legitimately emit JSON, so exempt those subcommands from the status/doctor-only --json requirement.
-  if (opts.json && !isDoctorCommand && !opts.status && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec") {
+  // `pipeline path --json` and `pipeline config validate --json` legitimately emit
+  // JSON, so exempt those subcommands from the status/doctor-only --json requirement.
+  // `--remove-worktree --json` also legitimately emits JSON.
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
+  }
+  // --force is scoped to --remove-worktree; using it alone is a usage error.
+  if (opts.force && !opts.removeWorktree) {
+    console.error("pipeline: --force requires --remove-worktree. Usage: pipeline <N> --remove-worktree --force");
+    process.exit(2);
+  }
+  // --remove-worktree cannot be combined with conflicting modes.
+  if (opts.removeWorktree) {
+    const rwConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--cleanup", opts.cleanup],
+      ["--init (or 'pipeline init')", isInit],
+      ["--status", opts.status],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+    ];
+    for (const [flag, active] of rwConflicts) {
+      if (active) {
+        console.error(
+          `pipeline: --remove-worktree cannot be combined with ${flag}. These are separate modes.`,
+        );
+        process.exit(2);
+      }
+    }
   }
   // Reject 'pipeline doctor' combined with side-effecting modes. cleanup and init
   // are separate standalone operations; running either when doctor was intended
@@ -896,6 +926,26 @@ async function main(): Promise<void> {
     return;
   }
 
+  // --remove-worktree bypasses the kill switch — operators need worktree cleanup
+  // most when a kill switch is active due to a stuck run.
+  if (opts.removeWorktree) {
+    let issueNumber: number;
+    try {
+      issueNumber = await resolveIssueNumber(cfg, number, { quiet: !!opts.json });
+    } catch (err) {
+      const e = err as Error;
+      if (opts.json) {
+        console.log(JSON.stringify({ removed: false, dirty: false, branch: null, worktree: null, error: e.message }));
+      } else {
+        console.error(`pipeline: ${e.message}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    await runRemoveWorktree(cfg, issueNumber, opts);
+    return;
+  }
+
   if (isKillSwitchActive(cfg.domain)) {
     console.error(
       `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
@@ -974,6 +1024,47 @@ async function runCleanup(cfg: PipelineConfig): Promise<void> {
       console.log(`  - ${rec.branch}: ${reason}`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Remove-worktree mode (#296)
+// ---------------------------------------------------------------------------
+
+export async function runRemoveWorktree(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  opts: Pick<CliOpts, "force" | "json">,
+): Promise<void> {
+  const result = await removeWorktreeForIssue(cfg, issueNumber, { force: opts.force });
+
+  if (opts.json) {
+    console.log(JSON.stringify(result));
+    if (!result.removed) process.exitCode = 1;
+    return;
+  }
+
+  if (result.removed) {
+    if (result.dirty) {
+      console.warn(
+        `[pipeline] #${issueNumber}: warning — worktree had uncommitted changes that were discarded`,
+      );
+    }
+    console.log(`[pipeline] #${issueNumber}: worktree removed`);
+    if (result.branch) console.log(`  branch: ${result.branch}`);
+    if (result.worktree) console.log(`  path:   ${result.worktree}`);
+    return;
+  }
+
+  // Failure paths
+  if (result.error?.includes("no worktree found")) {
+    console.error(`pipeline: #${issueNumber}: ${result.error}`);
+  } else if (result.dirty && !opts.force) {
+    console.error(`pipeline: #${issueNumber}: ${result.error}`);
+    console.error(`  Retry with --force to discard uncommitted changes.`);
+  } else {
+    console.error(`pipeline: #${issueNumber}: removal failed: ${result.error}`);
+  }
+  process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------------------
