@@ -427,10 +427,9 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  // `pipeline path --json` and `pipeline config validate --json` legitimately emit
-  // JSON, so exempt those subcommands from the status/doctor-only --json requirement.
-  // `--remove-worktree --json` also legitimately emits JSON.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config") {
+  // `pipeline path --json`, `pipeline config validate --json`, `pipeline refine-spec --json`,
+  // and `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }

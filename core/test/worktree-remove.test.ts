@@ -100,7 +100,7 @@ test("removeWorktreeForIssue: dirty worktree with --force → removed=true, dirt
     hasDirtyWorkdir: async () => true,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
-    // hasLocalOnlyCommits not injected — --force bypasses the check
+    hasLocalOnlyCommits: async () => false, // no unpushed commits; --force only bypasses dirty check
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
@@ -289,7 +289,7 @@ test("removeWorktreeForIssue: opts.force=true → removeWorktree dep receives fo
     hasDirtyWorkdir: async () => true,
     removeWorktree: async (_cfg, _num, _slug, _pathOnDisk, _path, force) => { capturedForce = force; },
     pathExists: () => true,
-    // hasLocalOnlyCommits not injected — --force bypasses the check
+    hasLocalOnlyCommits: async () => false, // no unpushed commits; --force only bypasses dirty check
   };
   await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
   assert.equal(capturedForce, true, "removeWorktree must receive force=true when opts.force is true");
@@ -441,7 +441,9 @@ test("removeWorktreeForIssue: hasLocalOnlyCommits returns null (remote not found
   assert.equal(removeCalled, false, "removeWorktree must NOT be called when remote check fails");
 });
 
-test("removeWorktreeForIssue: local-only commits with --force → removed=true (force bypasses check)", async () => {
+// Regression for pre-merge delta finding: --force must NOT bypass the local-only
+// commits check. --force only bypasses the uncommitted-changes guard.
+test("removeWorktreeForIssue: local-only commits with --force → removed=false (--force does not bypass local-only check)", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
   let removeCalled = false;
@@ -451,13 +453,37 @@ test("removeWorktreeForIssue: local-only commits with --force → removed=true (
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
-    // hasLocalOnlyCommits not injected — --force bypasses the check entirely
+    hasLocalOnlyCommits: async () => true,
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
 
-  assert.equal(result.removed, true, "--force must bypass the local-only commits check");
-  assert.ok(removeCalled, "removeWorktree must be called when --force is set");
+  assert.equal(result.removed, false, "--force must NOT bypass local-only commits; user must push first");
+  assert.match(result.error ?? "", /local-only commits/, "error must mention local-only commits");
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called when local-only commits block");
+});
+
+// Regression for pre-merge delta finding: dirty + local-only + --force must block
+// on local-only (not silently discard both uncommitted changes and unpushed commits).
+test("removeWorktreeForIssue: dirty + local-only commits + --force → blocked on local-only, not silently discarded", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => true,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => true,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
+
+  assert.equal(result.removed, false, "dirty + local-only + force must be blocked by local-only check");
+  assert.equal(result.dirty, true, "dirty flag must reflect actual workdir state");
+  assert.match(result.error ?? "", /local-only commits/);
+  assert.equal(removeCalled, false);
 });
 
 // Regression for pre-merge finding: on-disk detached HEAD with commits not on branch
@@ -604,4 +630,20 @@ test("CLI: 'pipeline 42 --remove-worktree --detach' exits 2 with conflict error"
   );
   assert.equal(result.status, 2, "must exit 2 when --remove-worktree is combined with --detach");
   assert.match(result.stderr, /--detach/, "error must name the conflicting flag");
+});
+
+// Regression: adding !opts.removeWorktree to the --json guard must not remove the
+// refine-spec exemption — `pipeline refine-spec --json` must reach dispatch, not exit 2.
+test("CLI: 'pipeline refine-spec --json' is not rejected by the --json status-only guard", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "refine-spec", "--json"],
+    { encoding: "utf8", env: { ...process.env, PATH: process.env.PATH ?? "" } },
+  );
+  // The command may fail for other reasons (missing --title/--body, no GitHub auth),
+  // but it must NOT exit 2 with the "requires --status" json-guard message.
+  assert.ok(
+    result.status !== 2 || !result.stderr.includes("--json requires --status"),
+    `refine-spec --json must not be blocked by the --json guard; got: ${result.stderr}`,
+  );
 });

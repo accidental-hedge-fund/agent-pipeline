@@ -814,7 +814,13 @@ export interface RemoveWorktreeDeps {
 
 /** Returns true when the worktree has commits not present on origin/<branch>.
  *
- *  Two modes:
+ *  First verifies the live remote ref via `git ls-remote` and confirms the
+ *  local tracking ref is current — a stale refs/remotes/origin/<branch> (e.g.
+ *  after remote branch deletion) could make the ranges appear empty, masking
+ *  local-only commits. Returns null (fail-closed) if the remote branch is
+ *  absent or the local tracking ref is stale.
+ *
+ *  Two commit-range modes (run after verification):
  *  - worktreePath non-null (path on disk): checks both origin/<branch>..HEAD
  *    (catches detached HEAD commits) AND origin/<branch>..<branch> from the
  *    repo root (catches branch-ref commits when the worktree is detached at a
@@ -829,6 +835,15 @@ async function checkLocalOnlyCommits(
   worktreePath: string | null,
   branch: string,
 ): Promise<boolean | null> {
+  // Verify the live remote ref so stale local tracking refs don't mask local-only commits.
+  const lsR = await git(cfg, cfg.repo_dir, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true });
+  if (lsR.code !== 0) return null;
+  const remoteSha = lsR.stdout.trim().split(/\s+/)[0] ?? "";
+  if (!remoteSha) return null; // branch absent on remote — cannot verify
+  // Confirm local tracking ref matches live remote before trusting range checks.
+  const localRefR = await git(cfg, cfg.repo_dir, ["rev-parse", `refs/remotes/origin/${branch}`], { ignoreFailure: true });
+  if (localRefR.code !== 0 || localRefR.stdout.trim() !== remoteSha) return null;
+
   if (worktreePath !== null) {
     // On-disk: check HEAD first (catches detached commits not reachable from origin)
     const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
@@ -927,6 +942,25 @@ export async function removeWorktreeForIssue(
     dirty = await dirtyFn(worktreeP);
   }
 
+  // Guard against silently losing local-only commits. Runs always — before the
+  // dirty early-return and regardless of --force. --force only bypasses the
+  // uncommitted-changes guard below; committed-but-unpushed work must be pushed
+  // before cleanup to prevent accidental data loss.
+  // Pass null when path is absent so the impl uses the branch-ref fallback.
+  const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
+  if (localOnly !== false) {
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error:
+        localOnly === null
+          ? "cannot verify all commits are pushed (remote branch not found)"
+          : "branch has local-only commits not pushed to remote; push first",
+    };
+  }
+
   if (dirty && !opts.force) {
     return {
       removed: false,
@@ -935,26 +969,6 @@ export async function removeWorktreeForIssue(
       worktree: worktreeP,
       error: "uncommitted changes; use --force to discard",
     };
-  }
-
-  // Guard against silently losing local-only commits (commits pushed failed or
-  // never attempted). Runs regardless of pathOnDisk — stale registrations
-  // (directory gone) can still have unpushed branch refs. --force bypasses.
-  // Pass null when path is absent so the impl uses the branch-ref fallback.
-  if (!opts.force) {
-    const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
-    if (localOnly !== false) {
-      return {
-        removed: false,
-        dirty: false,
-        branch,
-        worktree: worktreeP,
-        error:
-          localOnly === null
-            ? "cannot verify all commits are pushed (remote branch not found); use --force to proceed"
-            : "branch has local-only commits not pushed to remote; use --force to discard",
-      };
-    }
   }
 
   try {
