@@ -546,10 +546,17 @@ export async function runRoadmap(
 
       // Only allow critique to re-assert ordering for edges already source-verified
       // in phase 3. Critique text is not a source-verification path.
-      const verifiedEdgeKeys = new Set([
-        ...depGraph.must_precede.map((e) => `${e.from}:${e.to}`),
-        ...depGraph.should_precede.map((e) => `${e.from}:${e.to}`),
-      ]);
+      // Only edges already classified as HARD (must_precede) in phase 3 may be
+      // re-asserted directly from critique text. should_precede is advisory
+      // (is_strong:false) and must NOT be promoted to a hard ordering constraint on
+      // critique text alone — record it as an open question instead so it does not
+      // silently serialize work or inflate dep_leverage (#292 review-2 finding).
+      const mustEdgeKeys = new Set(
+        depGraph.must_precede.map((e) => `${e.from}:${e.to}`),
+      );
+      const shouldEdgeKeys = new Set(
+        depGraph.should_precede.map((e) => `${e.from}:${e.to}`),
+      );
 
       const newEdges: DepEdge[] = [];
       for (const f of depViolations) {
@@ -557,12 +564,19 @@ export async function runRoadmap(
           (m) => Number.parseInt(m[1], 10),
         );
         if (nums.length >= 2) {
-          if (verifiedEdgeKeys.has(`${nums[0]}:${nums[1]}`)) {
+          const edgeKey = `${nums[0]}:${nums[1]}`;
+          if (mustEdgeKeys.has(edgeKey)) {
             newEdges.push({
               from: nums[0],
               to: nums[1],
               file_line: f.file ? `${f.file}:${f.line_start ?? 0}` : "",
               rationale: `critique correction: ${f.body.slice(0, 100)}`,
+            });
+          } else if (shouldEdgeKeys.has(edgeKey)) {
+            openQuestions.push({
+              description: `Critique proposed promoting advisory edge #${nums[0]}→#${nums[1]} to a hard dependency: ${f.title}`,
+              related_issues: [nums[0], nums[1]],
+              rationale: `edge exists only as advisory should_precede (is_strong:false); not promoted to must_precede without source re-verification; critique: ${f.body.slice(0, 200)}`,
             });
           } else {
             openQuestions.push({
@@ -571,6 +585,16 @@ export async function runRoadmap(
               rationale: `edge not source-verified; critique correction: ${f.body.slice(0, 200)}`,
             });
           }
+        } else {
+          // Fewer than two issue references parsed — there is no actionable edge.
+          // Record the finding visibly instead of silently dropping it before the
+          // newEdges.length === 0 break (#292 review-2: a blocking dep-order critique
+          // must never vanish from plan.json).
+          openQuestions.push({
+            description: `Unparseable dep-order critique finding (could not extract two issue references): ${f.title}`,
+            related_issues: nums,
+            rationale: `dep-order violation preserved as an open question; no verified edge applied; critique: ${f.body.slice(0, 200)}`,
+          });
         }
       }
 

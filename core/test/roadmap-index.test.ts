@@ -376,6 +376,103 @@ describe("runRoadmap - critique integration", () => {
     );
     assert.ok(inOpenQuestions, "unverified critique edge should be recorded in open_questions");
   });
+
+  it("regression: a blocking dep-order finding with < 2 issue refs is recorded, not dropped (#292)", async () => {
+    // review-2 finding: the newEdges.length === 0 early break could drop a blocking
+    // dep-order-violation whose text contains fewer than two #NN references — it
+    // recorded nothing and broke before the cap block, vanishing from plan.json.
+    const written: Record<string, string> = {};
+    const critiqueFinding = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "Dependency ordering looks wrong",
+        body: "The roadmap orders dependent work before its prerequisite, but the exact issue pair is unclear.",
+        confidence: 0.9,
+        recommendation: "Re-check the ordering",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation (unparseable)",
+      next_steps: [],
+    };
+    const deps = makeDeps({
+      getOpenIssues: async () => [makeIssue(1), makeIssue(2)],
+      runCritiqueHarness: async () => ({ success: true, output: "```json\n" + JSON.stringify(critiqueFinding) + "\n```" }),
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-unparseable-deporder" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.open_questions !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+    assert.ok(
+      plan.open_questions.some((q) => q.description.includes("Unparseable dep-order critique finding")),
+      "a dep-order finding with < 2 issue refs must be preserved as an open_question, not dropped",
+    );
+  });
+
+  it("regression: an advisory should_precede edge is NOT promoted to must_precede by critique (#292)", async () => {
+    // review-2 finding: the correction guard treated should_precede as a verified edge
+    // key, so critique text could promote an advisory edge to a hard must_precede
+    // constraint without source verification. Advisory edges must be recorded as
+    // open_questions instead — never silently hardened.
+    const written: Record<string, string> = {};
+    // "#2 depends on #1" makes [1,2] a candidate pair; the dep-verify harness confirms a
+    // WEAK edge (is_strong:false) → should_precede #1→#2 (advisory, not a hard prereq).
+    const issues: Issue[] = [
+      makeIssue(1),
+      { ...makeIssue(2), body: "## Summary\nIssue 2 depends on #1.\n## Acceptance Criteria\n- [ ] Done" },
+    ];
+    const critiqueFinding = {
+      verdict: "needs-attention",
+      findings: [{
+        severity: "high",
+        title: "#1 must precede #2 — dep-order violation",
+        body: "The edge #1→#2 should be enforced as a hard prerequisite.",
+        confidence: 0.95,
+        recommendation: "Add must_precede edge #1→#2",
+        category: "dep-order-violation",
+      }],
+      summary: "Dep order violation",
+      next_steps: [],
+    };
+    let critiqueRound = 0;
+    const deps = makeDeps({
+      getOpenIssues: async () => issues,
+      // dep-verify harness confirms a weak (advisory) edge for the candidate pair
+      runHarness: async () => ({ success: true, output: JSON.stringify({ edge_confirmed: true, file_line: "", rationale: "advisory ordering", is_strong: false }) }),
+      runCritiqueHarness: async () => {
+        critiqueRound++;
+        const result = critiqueRound === 1 ? critiqueFinding : { verdict: "approved", findings: [], summary: "OK", next_steps: [] };
+        return { success: true, output: "```json\n" + JSON.stringify(result) + "\n```" };
+      },
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-roadmap-advisory-no-promote" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planContent = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planContent, "plan.json should be written");
+    const plan = JSON.parse(planContent!) as PlanJson;
+
+    assert.ok(
+      plan.dependency_graph.should_precede.some((e) => e.from === 1 && e.to === 2),
+      "the advisory edge #1→#2 should remain in should_precede",
+    );
+    assert.ok(
+      !plan.dependency_graph.must_precede.some((e) => e.from === 1 && e.to === 2),
+      "an advisory should_precede edge must NOT be promoted to must_precede by critique text",
+    );
+    assert.ok(
+      plan.open_questions.some((q) => q.description.includes("promoting advisory edge") && q.related_issues.includes(1) && q.related_issues.includes(2)),
+      "the proposed advisory→hard promotion must be recorded as an open_question",
+    );
+  });
 });
 
 describe("runRoadmap - run_stats", () => {
