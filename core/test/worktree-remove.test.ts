@@ -421,7 +421,8 @@ test("removeWorktreeForIssue: clean but has local-only commits without --force �
   assert.equal(removeCalled, false, "removeWorktree must NOT be called when local-only commits block");
 });
 
-test("removeWorktreeForIssue: hasLocalOnlyCommits returns null (remote not found) without --force → removed=false, error mentions cannot verify", async () => {
+// null = hard failure (network/auth/stale-ref/git error) — blocked regardless of --force
+test("removeWorktreeForIssue: hasLocalOnlyCommits returns null (git/network/auth error) → removed=false, error mentions verification failed", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
   let removeCalled = false;
@@ -436,15 +437,13 @@ test("removeWorktreeForIssue: hasLocalOnlyCommits returns null (remote not found
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
 
-  assert.equal(result.removed, false, "must not remove when remote branch cannot be verified without --force");
-  assert.match(result.error ?? "", /cannot verify/, "error must mention cannot verify");
-  assert.equal(removeCalled, false, "removeWorktree must NOT be called when remote check fails");
+  assert.equal(result.removed, false, "must not remove when commit verification failed (hard failure)");
+  assert.match(result.error ?? "", /commit verification failed/, "error must mention verification failure");
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called on hard git/network failure");
 });
 
-// Regression: post-merge deleted-branch case — hasLocalOnlyCommits returns null
-// (remote branch gone) but --force allows removal (user takes responsibility for
-// unverifiable state, e.g. squash-merge where commit SHAs differ from base branch).
-test("removeWorktreeForIssue: hasLocalOnlyCommits returns null + --force → removed=true (force bypasses unverifiable, not definitively-unpushed)", async () => {
+// Regression: null is a HARD block — --force must NOT bypass git/network/auth errors
+test("removeWorktreeForIssue: hasLocalOnlyCommits returns null + --force → removed=false (hard failure, not bypassable)", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
   let removeCalled = false;
@@ -454,13 +453,56 @@ test("removeWorktreeForIssue: hasLocalOnlyCommits returns null + --force → rem
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
-    hasLocalOnlyCommits: async () => null, // unverifiable (e.g. squash-merge, deleted remote)
+    hasLocalOnlyCommits: async () => null, // hard failure: network/auth/git error
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
 
-  assert.equal(result.removed, true, "--force must allow removal when check is unverifiable (null)");
-  assert.ok(removeCalled, "removeWorktree must be called when --force overrides null result");
+  assert.equal(result.removed, false, "--force must NOT bypass hard git/network failure (null)");
+  assert.match(result.error ?? "", /commit verification failed/);
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called when hard failure blocks");
+});
+
+// "unverifiable" = squash-merge ambiguity (remote branch deleted, commits not in base)
+// Blocked without --force; allowed with --force (user takes explicit responsibility).
+test("removeWorktreeForIssue: hasLocalOnlyCommits returns 'unverifiable' without --force → removed=false, error mentions squash-merge", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => "unverifiable",
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, false, "must not remove on squash-merge ambiguity without --force");
+  assert.match(result.error ?? "", /cannot verify/, "error must mention cannot verify");
+  assert.equal(removeCalled, false);
+});
+
+// Regression: post-merge deleted-branch squash-merge case — "unverifiable" + --force → removed=true
+test("removeWorktreeForIssue: hasLocalOnlyCommits returns 'unverifiable' + --force → removed=true (squash-merge, user takes responsibility)", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => "unverifiable", // squash-merge: remote deleted, commits not in base
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, { force: true }, deps);
+
+  assert.equal(result.removed, true, "--force must allow removal for squash-merge ambiguity (unverifiable)");
+  assert.ok(removeCalled, "removeWorktree must be called when --force overrides squash-merge ambiguity");
 });
 
 // Regression for pre-merge delta finding: --force must NOT bypass the local-only
@@ -589,7 +631,7 @@ test("removeWorktreeForIssue: stale registration (path not on disk) with local-o
   assert.equal(removeCalled, false, "removeWorktree must NOT be called");
 });
 
-test("removeWorktreeForIssue: stale registration (path not on disk) with unverifiable remote → removed=false, fails closed", async () => {
+test("removeWorktreeForIssue: stale registration (path not on disk) with git/network error → removed=false, fails closed", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
   let removeCalled = false;
@@ -599,13 +641,13 @@ test("removeWorktreeForIssue: stale registration (path not on disk) with unverif
     hasDirtyWorkdir: async () => false,
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => false,
-    hasLocalOnlyCommits: async () => null,
+    hasLocalOnlyCommits: async () => null, // hard failure: network/auth/git error
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
 
-  assert.equal(result.removed, false, "stale registration with missing remote must fail closed");
-  assert.match(result.error ?? "", /cannot verify/, "error must mention cannot verify");
+  assert.equal(result.removed, false, "stale registration with git/network failure must fail closed");
+  assert.match(result.error ?? "", /commit verification failed/, "error must mention verification failure");
   assert.equal(removeCalled, false, "removeWorktree must NOT be called");
 });
 

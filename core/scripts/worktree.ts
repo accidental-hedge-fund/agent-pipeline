@@ -804,82 +804,78 @@ export interface RemoveWorktreeDeps {
    *  entry registered but the directory is already gone (stale registration). */
   removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, pathOnDisk: boolean, resolvedPath?: string, force?: boolean) => Promise<void>;
   pathExists?: (p: string) => boolean;
-  /** Returns true when the worktree HEAD (or branch ref for stale registrations)
-   *  has commits not present on origin/<branch>, false when in sync, null when
-   *  the remote branch cannot be resolved (fail-closed: treat null as "cannot
-   *  verify" and block without --force).
+  /** Returns:
+   *  - true              → definitively has local-only commits (hard block, never bypassed)
+   *  - false             → no local-only commits (safe to delete)
+   *  - "unverifiable"    → remote branch deleted + commits not reachable from base branch
+   *                        (squash-merge ambiguity; blocked without --force, allowed with)
+   *  - null              → git/network/auth/stale-ref error (hard block, not bypassed by --force)
    *  worktreePath is null for stale registrations (path no longer on disk). */
-  hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string | null, branch: string) => Promise<boolean | null>;
+  hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string | null, branch: string) => Promise<boolean | "unverifiable" | null>;
 }
 
-/** Returns true when the worktree has commits not present on origin/<branch>,
- *  false when all commits are verifiably on the remote, or null when the check
- *  cannot make a determination (fail-closed).
+/** Returns:
+ *  - true           → definitively has local-only commits (hard block)
+ *  - false          → no local-only commits or all commits already merged (safe)
+ *  - "unverifiable" → remote branch deleted AND commits not reachable from base
+ *                     (squash-merge ambiguity; soft block, bypassable with --force)
+ *  - null           → git/network/auth/stale-ref error (hard failure, not bypassable)
  *
- *  Remote-branch present path:
- *  - Verifies the live remote ref via `git ls-remote` and confirms the local
- *    tracking ref matches — a stale refs/remotes/origin/<branch> could make
- *    commit ranges appear empty, masking local-only commits.
- *  - On-disk worktrees check both origin/<branch>..HEAD and origin/<branch>..<branch>
- *    (covers detached HEAD at a pushed commit whose branch ref is still ahead).
- *  - Stale registrations check origin/<branch>..<branch> from the repo root.
+ *  Remote-branch present: verifies live ref via `git ls-remote` and confirms the
+ *  local tracking ref matches (guards against stale refs/remotes/ masking local commits).
+ *  Checks both origin/<branch>..HEAD (detached HEAD) and origin/<branch>..<branch>
+ *  (branch ref ahead after detach).
  *
- *  Remote-branch absent path (common after GitHub deletes the PR head branch):
- *  - Falls back to checking reachability from origin/<base_branch>. If all local
- *    commits are already in the base branch the work is merged — returns false.
- *  - If any commit is NOT reachable from the base branch (e.g. squash-merge where
- *    commit SHAs differ) returns null so the caller can decide (--force or verify).
- *
- *  Returns null on network/auth errors (fail-closed). */
+ *  Remote-branch absent (e.g. GitHub deleted PR head after merge): falls back to
+ *  reachability from origin/<base_branch>. All reachable → false (merged via regular
+ *  merge). Some unreachable → "unverifiable" (squash-merge where SHAs differ). */
 async function checkLocalOnlyCommits(
   cfg: PipelineConfig,
   worktreePath: string | null,
   branch: string,
-): Promise<boolean | null> {
-  // Check the live remote ref first.
+): Promise<boolean | "unverifiable" | null> {
+  // Verify the live remote ref (guards against stale local tracking refs).
   const lsR = await git(cfg, cfg.repo_dir, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true });
-  if (lsR.code !== 0) return null; // network/auth failure
+  if (lsR.code !== 0) return null; // network/auth failure — hard block
+
   const remoteSha = lsR.stdout.trim().split(/\s+/)[0] ?? "";
 
   if (remoteSha) {
-    // Remote branch exists — confirm local tracking ref matches before trusting ranges.
+    // Remote branch exists — confirm local tracking ref is current before trusting ranges.
     const localRefR = await git(cfg, cfg.repo_dir, ["rev-parse", `refs/remotes/origin/${branch}`], { ignoreFailure: true });
-    if (localRefR.code !== 0 || localRefR.stdout.trim() !== remoteSha) return null;
+    if (localRefR.code !== 0 || localRefR.stdout.trim() !== remoteSha) return null; // stale — hard block
 
     if (worktreePath !== null) {
-      // On-disk: check HEAD first (catches detached commits not reachable from origin)
       const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
       if (headR.code !== 0) return null;
       if (headR.stdout.trim().length > 0) return true;
-      // Also check the branch ref: a detached worktree at a pushed commit passes the
-      // HEAD check but the branch ref may still be ahead of origin.
       const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
       if (branchR.code !== 0) return null;
       return branchR.stdout.trim().length > 0;
     }
-    // Stale registration: directory gone, check branch ref from repo root
     const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
     if (r.code !== 0) return null;
     return r.stdout.trim().length > 0;
   }
 
-  // Remote branch is absent (e.g. GitHub deleted the PR head branch after merge).
-  // Safe path: if all local commits are reachable from origin/<base_branch> they
-  // are already merged — no data-loss risk → return false.
-  // If any commit is not reachable (e.g. squash-merge, unmerged work) → null so
-  // the caller can decide via --force.
+  // Remote branch absent (e.g. GitHub deleted PR head after merge).
+  // Check reachability from origin/<base_branch>:
+  //   all reachable  → false (regular merge, safe to delete)
+  //   some unreachable → "unverifiable" (squash-merge; soft block, --force allowed)
+  //   git error       → null (hard block)
   const baseBranch = cfg.base_branch ?? "main";
   if (worktreePath !== null) {
     const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${baseBranch}..HEAD`], { ignoreFailure: true });
-    if (headR.code !== 0 || headR.stdout.trim().length > 0) return null;
+    if (headR.code !== 0) return null;
     const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
-    if (branchR.code !== 0 || branchR.stdout.trim().length > 0) return null;
-    return false; // both HEAD and branch ref fully reachable from base — merged
+    if (branchR.code !== 0) return null;
+    if (headR.stdout.trim().length === 0 && branchR.stdout.trim().length === 0) return false;
+    return "unverifiable"; // squash-merge ambiguity — remote deleted, commits not in base
   }
   // Stale registration + remote absent
   const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
-  if (r.code !== 0 || r.stdout.trim().length > 0) return null;
-  return false; // branch ref fully reachable from base — merged
+  if (r.code !== 0) return null;
+  return r.stdout.trim().length === 0 ? false : "unverifiable";
 }
 
 /** Remove-worktree dep default: throws on failure so the caller can capture the message. */
@@ -980,13 +976,25 @@ export async function removeWorktreeForIssue(
       error: "branch has local-only commits not pushed to remote; push first",
     };
   }
-  if (localOnly === null && !opts.force) {
+  if (localOnly === "unverifiable" && !opts.force) {
+    // Remote branch deleted + commits not in base branch (squash-merge ambiguity).
+    // Blocked without --force; with --force the user takes explicit responsibility.
     return {
       removed: false,
       dirty,
       branch,
       worktree: worktreeP,
-      error: "cannot verify all commits are pushed (remote branch not found); use --force to proceed",
+      error: "cannot verify all commits are merged (remote branch deleted, commits not reachable from base); use --force to proceed if work was squash-merged",
+    };
+  }
+  if (localOnly === null) {
+    // Hard failure: network/auth/stale-ref/git error — blocked even with --force.
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error: "commit verification failed (git/network/auth error); check connectivity and retry",
     };
   }
 
