@@ -383,6 +383,23 @@ test("removeWorktreeForIssue: result always contains required fields (removed, d
 // Finding 1 regression: local-only commits must block non-forced clean removal
 // ---------------------------------------------------------------------------
 
+test("removeWorktreeForIssue: on-disk worktree calls hasLocalOnlyCommits with non-null path", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let capturedPath: string | null | undefined;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => {},
+    pathExists: () => true,
+    hasLocalOnlyCommits: async (_cfg, worktreePath) => { capturedPath = worktreePath; return false; },
+  };
+
+  await removeWorktreeForIssue(cfg, 42, {}, deps);
+  assert.equal(capturedPath, "/repo/.worktrees/pipeline-42-some-feature", "on-disk path must be passed for HEAD check");
+});
+
 test("removeWorktreeForIssue: clean but has local-only commits without --force → removed=false, error names local-only", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
@@ -441,6 +458,48 @@ test("removeWorktreeForIssue: local-only commits with --force → removed=true (
 
   assert.equal(result.removed, true, "--force must bypass the local-only commits check");
   assert.ok(removeCalled, "removeWorktree must be called when --force is set");
+});
+
+// Regression for pre-merge finding: on-disk detached HEAD with commits not on branch
+// must be caught. hasLocalOnlyCommits receives the worktree path so it can check HEAD.
+test("removeWorktreeForIssue: on-disk clean worktree in detached HEAD with unreachable commits → removed=false (reviewer catches via HEAD check)", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+  // Simulate detached HEAD at a local commit not on origin/<branch>:
+  // hasDirtyWorkdir=false (clean), but HEAD has a commit not on origin/<branch>
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    // hasLocalOnlyCommits is called with the worktree path and returns true
+    // because origin/<branch>..HEAD is non-empty (detached commit)
+    hasLocalOnlyCommits: async (_cfg, worktreePath) => worktreePath !== null ? true : false,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, false, "must not remove when detached HEAD has local-only commits");
+  assert.match(result.error ?? "", /local-only commits/);
+  assert.equal(removeCalled, false);
+});
+
+test("removeWorktreeForIssue: stale registration (path not on disk) calls hasLocalOnlyCommits with null path", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let capturedPath: string | null | undefined;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => {},
+    pathExists: () => false,
+    hasLocalOnlyCommits: async (_cfg, worktreePath) => { capturedPath = worktreePath; return false; },
+  };
+
+  await removeWorktreeForIssue(cfg, 42, {}, deps);
+  assert.equal(capturedPath, null, "stale registration must pass null so impl uses branch-ref check");
 });
 
 test("removeWorktreeForIssue: stale registration (path not on disk) with all-pushed branch → removed=true", async () => {

@@ -804,24 +804,37 @@ export interface RemoveWorktreeDeps {
    *  entry registered but the directory is already gone (stale registration). */
   removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, pathOnDisk: boolean, resolvedPath?: string, force?: boolean) => Promise<void>;
   pathExists?: (p: string) => boolean;
-  /** Returns true when local HEAD has commits not present on origin/<branch>,
-   *  false when in sync, null when the remote branch cannot be resolved
-   *  (fail-closed: treat null as "cannot verify" and block without --force). */
-  hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string, branch: string) => Promise<boolean | null>;
+  /** Returns true when the worktree HEAD (or branch ref for stale registrations)
+   *  has commits not present on origin/<branch>, false when in sync, null when
+   *  the remote branch cannot be resolved (fail-closed: treat null as "cannot
+   *  verify" and block without --force).
+   *  worktreePath is null for stale registrations (path no longer on disk). */
+  hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string | null, branch: string) => Promise<boolean | null>;
 }
 
-/** Returns true when the branch ref has commits not present on origin/<branch>,
- *  false when in sync, null when the remote ref cannot be resolved (remote
- *  deleted or never pushed — treat as unverifiable and fail closed).
+/** Returns true when the worktree has commits not present on origin/<branch>.
  *
- *  Compares the branch ref (not worktree HEAD) so the check is correct in
- *  detached-HEAD state and runs from cfg.repo_dir so it works even when the
- *  worktree directory no longer exists on disk. */
+ *  Two modes:
+ *  - worktreePath non-null (path on disk): compares origin/<branch>..HEAD from
+ *    the worktree, catching both branch commits and detached HEAD commits not
+ *    reachable from origin.
+ *  - worktreePath null (stale registration, directory gone): compares
+ *    origin/<branch>..<branch> from cfg.repo_dir, checking the branch ref
+ *    without needing the worktree directory to exist.
+ *
+ *  Returns null when the remote ref cannot be resolved (fail closed). */
 async function checkLocalOnlyCommits(
   cfg: PipelineConfig,
-  _worktreePath: string,
+  worktreePath: string | null,
   branch: string,
 ): Promise<boolean | null> {
+  if (worktreePath !== null) {
+    // On-disk: check worktree HEAD — catches detached commits not on the branch
+    const r = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
+    if (r.code !== 0) return null;
+    return r.stdout.trim().length > 0;
+  }
+  // Stale registration: directory gone, check branch ref from repo root
   const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
   if (r.code !== 0) return null;
   return r.stdout.trim().length > 0;
@@ -921,8 +934,9 @@ export async function removeWorktreeForIssue(
   // Guard against silently losing local-only commits (commits pushed failed or
   // never attempted). Runs regardless of pathOnDisk — stale registrations
   // (directory gone) can still have unpushed branch refs. --force bypasses.
+  // Pass null when path is absent so the impl uses the branch-ref fallback.
   if (!opts.force) {
-    const localOnly = await localOnlyFn(cfg, worktreeP, branch);
+    const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
     if (localOnly !== false) {
       return {
         removed: false,
