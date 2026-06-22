@@ -810,15 +810,19 @@ export interface RemoveWorktreeDeps {
   hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string, branch: string) => Promise<boolean | null>;
 }
 
-/** Returns true when local has commits ahead of origin/<branch>, false when in
- *  sync, null when the remote ref cannot be resolved (remote deleted or never
- *  pushed — treat as unverifiable and fail closed). */
+/** Returns true when the branch ref has commits not present on origin/<branch>,
+ *  false when in sync, null when the remote ref cannot be resolved (remote
+ *  deleted or never pushed — treat as unverifiable and fail closed).
+ *
+ *  Compares the branch ref (not worktree HEAD) so the check is correct in
+ *  detached-HEAD state and runs from cfg.repo_dir so it works even when the
+ *  worktree directory no longer exists on disk. */
 async function checkLocalOnlyCommits(
   cfg: PipelineConfig,
-  worktreePath: string,
+  _worktreePath: string,
   branch: string,
 ): Promise<boolean | null> {
-  const r = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
+  const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
   if (r.code !== 0) return null;
   return r.stdout.trim().length > 0;
 }
@@ -915,8 +919,9 @@ export async function removeWorktreeForIssue(
   }
 
   // Guard against silently losing local-only commits (commits pushed failed or
-  // never attempted). Only blocks non-forced clean removals; --force bypasses.
-  if (!opts.force && pathOnDisk) {
+  // never attempted). Runs regardless of pathOnDisk — stale registrations
+  // (directory gone) can still have unpushed branch refs. --force bypasses.
+  if (!opts.force) {
     const localOnly = await localOnlyFn(cfg, worktreeP, branch);
     if (localOnly !== false) {
       return {

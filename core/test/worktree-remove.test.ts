@@ -205,11 +205,12 @@ test("removeWorktreeForIssue: uses listOnDisk (not listActive), so PR state is i
 // Path not on disk — skip dirty check, still remove (deregister branch)
 // ---------------------------------------------------------------------------
 
-test("removeWorktreeForIssue: worktree path not on disk → skip dirty check, proceed to remove", async () => {
+test("removeWorktreeForIssue: worktree path not on disk → skip dirty check, still run local-only check, proceed to remove", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
   let dirtyChecked = false;
   let removeCalled = false;
+  let localOnlyCalled = false;
   let capturedPathOnDisk: boolean | undefined;
 
   const deps: RemoveWorktreeDeps = {
@@ -220,12 +221,13 @@ test("removeWorktreeForIssue: worktree path not on disk → skip dirty check, pr
       removeCalled = true;
     },
     pathExists: () => false,
-    // hasLocalOnlyCommits not injected — skip check when path not on disk
+    hasLocalOnlyCommits: async () => { localOnlyCalled = true; return false; },
   };
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
 
   assert.equal(dirtyChecked, false, "dirty check must be skipped when path is not on disk");
+  assert.ok(localOnlyCalled, "local-only check must still run even when path is not on disk");
   assert.ok(removeCalled, "removeWorktree must still be called to deregister branch");
   assert.equal(capturedPathOnDisk, false, "removeWorktree must receive pathOnDisk=false for stale registration");
   assert.equal(result.removed, true);
@@ -441,7 +443,7 @@ test("removeWorktreeForIssue: local-only commits with --force → removed=true (
   assert.ok(removeCalled, "removeWorktree must be called when --force is set");
 });
 
-test("removeWorktreeForIssue: hasLocalOnlyCommits not called when path not on disk", async () => {
+test("removeWorktreeForIssue: stale registration (path not on disk) with all-pushed branch → removed=true", async () => {
   const cfg = makeCfg();
   const rec = makeRec(42, "some-feature");
   let localOnlyCalled = false;
@@ -456,8 +458,48 @@ test("removeWorktreeForIssue: hasLocalOnlyCommits not called when path not on di
 
   const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
 
-  assert.equal(localOnlyCalled, false, "local-only check must be skipped when path is not on disk");
+  assert.ok(localOnlyCalled, "local-only check must run even when path is not on disk");
   assert.equal(result.removed, true);
+});
+
+test("removeWorktreeForIssue: stale registration (path not on disk) with local-only branch commits → removed=false, blocks without --force", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => false,
+    hasLocalOnlyCommits: async () => true,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, false, "stale registration with local-only commits must block without --force");
+  assert.match(result.error ?? "", /local-only commits/, "error must mention local-only commits");
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called");
+});
+
+test("removeWorktreeForIssue: stale registration (path not on disk) with unverifiable remote → removed=false, fails closed", async () => {
+  const cfg = makeCfg();
+  const rec = makeRec(42, "some-feature");
+  let removeCalled = false;
+
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => false,
+    hasLocalOnlyCommits: async () => null,
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 42, {}, deps);
+
+  assert.equal(result.removed, false, "stale registration with missing remote must fail closed");
+  assert.match(result.error ?? "", /cannot verify/, "error must mention cannot verify");
+  assert.equal(removeCalled, false, "removeWorktree must NOT be called");
 });
 
 // ---------------------------------------------------------------------------
