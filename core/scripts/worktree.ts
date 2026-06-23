@@ -786,6 +786,250 @@ export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<
 }
 
 // ---------------------------------------------------------------------------
+// Per-issue worktree removal (#296)
+// ---------------------------------------------------------------------------
+
+export interface RemoveWorktreeResult {
+  removed: boolean;
+  dirty: boolean;
+  branch: string | null;
+  worktree: string | null;
+  error: string | null;
+}
+
+export interface RemoveWorktreeDeps {
+  listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
+  /** pathOnDisk: true when the directory exists; false when git still has the
+   *  entry registered but the directory is already gone (stale registration). */
+  removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, pathOnDisk: boolean, resolvedPath?: string, force?: boolean) => Promise<void>;
+  pathExists?: (p: string) => boolean;
+  /** Returns:
+   *  - true              → definitively has local-only commits (hard block, never bypassed)
+   *  - false             → no local-only commits (safe to delete)
+   *  - "unverifiable"    → remote branch deleted + commits not reachable from base branch
+   *                        (squash-merge ambiguity; blocked without --force, allowed with)
+   *  - null              → git/network/auth/stale-ref error (hard block, not bypassed by --force)
+   *  worktreePath is null for stale registrations (path no longer on disk). */
+  hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string | null, branch: string) => Promise<boolean | "unverifiable" | null>;
+}
+
+/** Returns:
+ *  - true           → definitively has local-only commits (hard block)
+ *  - false          → no local-only commits or all commits already merged (safe)
+ *  - "unverifiable" → remote branch deleted AND commits not reachable from base
+ *                     (squash-merge ambiguity; soft block, bypassable with --force)
+ *  - null           → git/network/auth/stale-ref error (hard failure, not bypassable)
+ *
+ *  Remote-branch present: verifies live ref via `git ls-remote` and confirms the
+ *  local tracking ref matches (guards against stale refs/remotes/ masking local commits).
+ *  Checks both origin/<branch>..HEAD (detached HEAD) and origin/<branch>..<branch>
+ *  (branch ref ahead after detach).
+ *
+ *  Remote-branch absent (e.g. GitHub deleted PR head after merge): falls back to
+ *  reachability from origin/<base_branch>. All reachable → false (merged via regular
+ *  merge). Some unreachable → "unverifiable" (squash-merge where SHAs differ). */
+async function checkLocalOnlyCommits(
+  cfg: PipelineConfig,
+  worktreePath: string | null,
+  branch: string,
+): Promise<boolean | "unverifiable" | null> {
+  // Verify the live remote ref (guards against stale local tracking refs).
+  const lsR = await git(cfg, cfg.repo_dir, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true });
+  if (lsR.code !== 0) return null; // network/auth failure — hard block
+
+  const remoteSha = lsR.stdout.trim().split(/\s+/)[0] ?? "";
+
+  if (remoteSha) {
+    // Remote branch exists — confirm local tracking ref is current before trusting ranges.
+    const localRefR = await git(cfg, cfg.repo_dir, ["rev-parse", `refs/remotes/origin/${branch}`], { ignoreFailure: true });
+    if (localRefR.code !== 0 || localRefR.stdout.trim() !== remoteSha) return null; // stale — hard block
+
+    if (worktreePath !== null) {
+      const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
+      if (headR.code !== 0) return null;
+      if (headR.stdout.trim().length > 0) return true;
+      const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
+      if (branchR.code !== 0) return null;
+      return branchR.stdout.trim().length > 0;
+    }
+    const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
+    if (r.code !== 0) return null;
+    return r.stdout.trim().length > 0;
+  }
+
+  // Remote branch absent (e.g. GitHub deleted PR head after merge).
+  // Check reachability from origin/<base_branch>:
+  //   all reachable  → false (regular merge, safe to delete)
+  //   some unreachable → "unverifiable" (squash-merge; soft block, --force allowed)
+  //   git error       → null (hard block)
+  const baseBranch = cfg.base_branch ?? "main";
+  if (worktreePath !== null) {
+    const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${baseBranch}..HEAD`], { ignoreFailure: true });
+    if (headR.code !== 0) return null;
+    const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
+    if (branchR.code !== 0) return null;
+    if (headR.stdout.trim().length === 0 && branchR.stdout.trim().length === 0) return false;
+    return "unverifiable"; // squash-merge ambiguity — remote deleted, commits not in base
+  }
+  // Stale registration + remote absent
+  const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
+  if (r.code !== 0) return null;
+  return r.stdout.trim().length === 0 ? false : "unverifiable";
+}
+
+/** Remove-worktree dep default: throws on failure so the caller can capture the message. */
+async function realRemoveWorktreeOp(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  slug: string,
+  pathOnDisk: boolean,
+  resolvedPath?: string,
+  force?: boolean,
+): Promise<void> {
+  const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
+  const branch = branchName(issueNumber, slug);
+  if (pathOnDisk) {
+    const rmArgs = force
+      ? ["worktree", "remove", "--force", wtPath]
+      : ["worktree", "remove", wtPath];
+    const r = await git(cfg, cfg.repo_dir, rmArgs, { ignoreFailure: true });
+    if (r.code !== 0) {
+      throw new Error(`git worktree remove failed: ${r.stderr.trim()}`);
+    }
+  } else {
+    // Directory gone but still git-registered — deregister the stale entry only.
+    // --force is required; it is scoped to wtPath and does not prune other worktrees.
+    const r = await git(cfg, cfg.repo_dir, ["worktree", "remove", "--force", wtPath], { ignoreFailure: true });
+    if (r.code !== 0) {
+      throw new Error(`git worktree remove (stale) failed: ${r.stderr.trim()}`);
+    }
+  }
+  const br = await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+  if (br.code !== 0) {
+    throw new Error(`git branch -D failed: ${br.stderr.trim()}`);
+  }
+}
+
+/** Remove the on-disk worktree for issue N regardless of PR merge state.
+ *
+ *  - Dirty + no force → `{ removed: false, dirty: true, error: "uncommitted changes" }`
+ *  - Dirty + force → removes anyway, returns `{ removed: true, dirty: true }`
+ *  - Not found → `{ removed: false, error: "no worktree found …" }`
+ *  - git failure → `{ removed: false, error: git-error-message }`
+ *
+ *  All deps are injectable for unit tests (no real git, network, or filesystem). */
+export async function removeWorktreeForIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  opts: { force?: boolean },
+  deps: RemoveWorktreeDeps = {},
+): Promise<RemoveWorktreeResult> {
+  const listFn = deps.listOnDisk ?? listOnDisk;
+  const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
+  const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
+  const existsFn = deps.pathExists ?? fs.existsSync;
+  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+
+  const records = await listFn(cfg);
+  const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
+  const rec = records.find((r) => {
+    if (r.issueNumber !== issueNumber || !r.slug) return false;
+    if (r.underManagedRoot !== undefined) return r.underManagedRoot;
+    return r.path === root || r.path.startsWith(root + path.sep);
+  });
+
+  if (!rec || !rec.slug) {
+    return {
+      removed: false,
+      dirty: false,
+      branch: null,
+      worktree: null,
+      error: `no worktree found for issue #${issueNumber}`,
+    };
+  }
+
+  const branch = rec.branch ?? branchName(issueNumber, rec.slug);
+  const worktreeP = rec.path;
+
+  const pathOnDisk = existsFn(worktreeP);
+
+  let dirty = false;
+  if (pathOnDisk) {
+    dirty = await dirtyFn(worktreeP);
+  }
+
+  // Guard against silently losing local-only commits. Runs always — before the
+  // dirty early-return so dirty state does not hide unpushed commits.
+  // Two tiers:
+  //   true  → definitively has unpushed commits; blocked even with --force.
+  //   null  → cannot verify (e.g. stale remote, squash-merge); blocked without
+  //            --force, allowed with --force (user takes explicit responsibility).
+  // Pass null when path is absent so the impl uses the branch-ref fallback.
+  const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
+  if (localOnly === true) {
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error: "branch has local-only commits not pushed to remote; push first",
+    };
+  }
+  if (localOnly === "unverifiable" && !opts.force) {
+    // Remote branch deleted + commits not in base branch (squash-merge ambiguity).
+    // Blocked without --force; with --force the user takes explicit responsibility.
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error: "cannot verify all commits are merged (remote branch deleted, commits not reachable from base); use --force to proceed if work was squash-merged",
+    };
+  }
+  if (localOnly === null) {
+    // Hard failure: network/auth/stale-ref/git error — blocked even with --force.
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error: "commit verification failed (git/network/auth error); check connectivity and retry",
+    };
+  }
+
+  if (dirty && !opts.force) {
+    return {
+      removed: false,
+      dirty: true,
+      branch,
+      worktree: worktreeP,
+      error: "uncommitted changes; use --force to discard",
+    };
+  }
+
+  try {
+    await removeFn(cfg, issueNumber, rec.slug, pathOnDisk, worktreeP, opts.force);
+  } catch (err) {
+    return {
+      removed: false,
+      dirty,
+      branch,
+      worktree: worktreeP,
+      error: (err as Error).message,
+    };
+  }
+
+  return {
+    removed: true,
+    dirty,
+    branch,
+    worktree: worktreeP,
+    error: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Worktree sweep (cleanup of merged-PR worktrees)
 // ---------------------------------------------------------------------------
 
