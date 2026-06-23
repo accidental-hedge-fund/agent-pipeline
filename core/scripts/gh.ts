@@ -186,40 +186,85 @@ const STAGE_PRIORITY: Record<string, number> = (() => {
 
 const COMMENT_FOOTER = "\n\n---\n*Automated by Claude Code Pipeline Skill*";
 
-interface GhRunOptions {
+/**
+ * Classify a gh CLI error string as transient (worth retrying) or deterministic.
+ * Operates case-insensitively. Exported for unit tests.
+ *
+ * Transient: HTTP 401 bad credentials, HTTP 403 rate-limit, any HTTP 5xx, or
+ * network-level errors (ETIMEDOUT, ECONNRESET, ENOTFOUND, socket hang up).
+ * Deterministic: HTTP 404, HTTP 422, "not found", "validation failed",
+ * "unprocessable", "resource not accessible", or any unrecognized pattern.
+ */
+export function isTransientGhError(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  // HTTP 401 with "bad credentials" — momentary API blip
+  if (s.includes("401") && s.includes("bad credentials")) return true;
+  // HTTP 403 with rate-limit indicator
+  if (s.includes("403") && (s.includes("rate limit") || s.includes("secondary rate limit"))) return true;
+  // Any HTTP 5xx status code
+  if (/http 5\d\d/.test(s)) return true;
+  // Network-level errors
+  if (s.includes("etimedout") || s.includes("econnreset") || s.includes("enotfound") || s.includes("socket hang up")) return true;
+  return false;
+}
+
+/**
+ * Error shape thrown by execFileAsync when the subprocess exits non-zero.
+ * Exported for use in GhRunOptions.runner fakes in unit tests.
+ */
+export interface GhSubprocessError {
+  stderr?: string | Buffer;
+  message: string;
+  code?: number;
+}
+
+/** Injectable subprocess runner seam for GhRunOptions — matches the signature
+ *  used by execFileAsync internally so unit tests can fake subprocess results
+ *  without spawning real processes. */
+export type GhSubprocessRunner = (args: string[]) => Promise<{ stdout: string }>;
+
+export interface GhRunOptions {
   /** Per-call timeout in ms. Default 30s. */
   timeoutMs?: number;
-  /** Number of retries on rate-limit errors. Default 3. */
+  /** Number of retries on transient errors. Default 3. */
   retries?: number;
   /** Metrics collector for the current run. Falls back to module-level active collector. */
   collector?: GhMetricsCollector;
+  /** Injectable delay function — used by tests to skip real waits during backoff. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable transient-error classifier — replaces `isTransientGhError` when provided. */
+  isTransient?: (stderr: string) => boolean;
+  /** Injectable subprocess runner — replaces execFileAsync in unit tests. */
+  runner?: GhSubprocessRunner;
 }
 
 async function ghRun(args: string[], opts: GhRunOptions = {}): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const retries = opts.retries ?? 3;
   const collector = opts.collector ?? _activeCollector;
+  const _sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const _isTransient = opts.isTransient ?? isTransientGhError;
+  const _runner: GhSubprocessRunner = opts.runner ?? ((runArgs) =>
+    execFileAsync("gh", runArgs, { timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024 })
+  );
   const category = args.slice(0, 2).join(" ");
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < retries; attempt++) {
     const t0 = performance.now();
     try {
-      const { stdout } = await execFileAsync("gh", args, {
-        timeout: timeoutMs,
-        maxBuffer: 50 * 1024 * 1024, // 50 MB
-      });
+      const { stdout } = await _runner(args);
       collector?.record(category, Math.round(performance.now() - t0));
       return stdout;
     } catch (err) {
       collector?.record(category, Math.round(performance.now() - t0));
-      const e = err as { stderr?: string; message: string; code?: number };
-      const stderr = (e.stderr ?? "").toString();
+      const e = err as GhSubprocessError;
+      const combinedStderr = (e.stderr ?? "").toString() || e.message;
       lastErr = new Error(
-        `gh ${args.slice(0, 3).join(" ")} failed: ${stderr.trim() || e.message}`,
+        `gh ${args.slice(0, 3).join(" ")} failed: ${combinedStderr.trim() || e.message}`,
       );
-      if (stderr.toLowerCase().includes("rate limit") && attempt < retries - 1) {
+      if (_isTransient(combinedStderr) && attempt < retries - 1) {
         const backoff = 2 ** attempt * 1000;
-        await new Promise((r) => setTimeout(r, backoff));
+        await _sleep(backoff);
         continue;
       }
       throw lastErr;
@@ -227,6 +272,12 @@ async function ghRun(args: string[], opts: GhRunOptions = {}): Promise<string> {
   }
   // Unreachable, but keep the type checker happy.
   throw lastErr ?? new Error("gh: unknown failure");
+}
+
+/** Thin re-export of ghRun that exposes GhRunOptions seams for unit tests.
+ *  Not intended for production callers — use the typed wrapper functions instead. */
+export async function ghRunForTest(args: string[], opts: GhRunOptions): Promise<string> {
+  return ghRun(args, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -628,16 +679,12 @@ export async function postComment(
   cfg: PipelineConfig,
   issueNumber: number,
   body: string,
+  runOpts: GhRunOptions = {},
 ): Promise<void> {
-  await ghRun([
-    "issue",
-    "comment",
-    String(issueNumber),
-    "--body",
-    body,
-    "-R",
-    cfg.repo,
-  ]);
+  await ghRun(
+    ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo],
+    runOpts,
+  );
 }
 
 /**
@@ -653,7 +700,7 @@ export async function createIssue(
   title: string,
   body: string,
   labels: string[],
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { retries: 1 }),
 ): Promise<number> {
   const args = ["issue", "create", "--title", title, "--body", body, "-R", cfg.repo];
   for (const label of labels) {
@@ -678,7 +725,7 @@ export async function addIssueComment(
   cfg: PipelineConfig,
   issueNumber: number,
   body: string,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { retries: 1 }),
 ): Promise<void> {
   const args = ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo];
   await run(args);
@@ -694,16 +741,12 @@ export async function postPrComment(
   cfg: PipelineConfig,
   prNumber: number,
   body: string,
+  runOpts: GhRunOptions = {},
 ): Promise<void> {
-  await ghRun([
-    "pr",
-    "comment",
-    String(prNumber),
-    "--body",
-    body,
-    "-R",
-    cfg.repo,
-  ]);
+  await ghRun(
+    ["pr", "comment", String(prNumber), "--body", body, "-R", cfg.repo],
+    runOpts,
+  );
 }
 
 /** I/O seam for {@link transition} so unit tests inject fakes — no real network. */
@@ -976,7 +1019,7 @@ export async function createPr(
     cfg.repo,
   ];
   if (opts.draft) args.push("--draft");
-  const stdout = await ghRun(args, { timeoutMs: 60_000 });
+  const stdout = await ghRun(args, { timeoutMs: 60_000, retries: 1 });
   const url = stdout.trim();
   const match = url.match(/\/pull\/(\d+)\/?$/);
   if (!match) throw new Error(`Could not parse PR number from gh output: ${url}`);
@@ -1392,7 +1435,7 @@ export async function createMilestone(
   ];
   if (dueOn) args.push("--field", `due_on=${dueOn}`);
 
-  const stdout = await ghRun(args, { timeoutMs: 30_000 });
+  const stdout = await ghRun(args, { timeoutMs: 30_000, retries: 1 });
   const result = JSON.parse(stdout) as { number: number };
   return result.number;
 }

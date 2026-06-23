@@ -16,6 +16,23 @@ import { recordRecovery } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 
 const RECOVERY_MARKER = "## Pipeline: Auto-Recovery";
+const RECOVERY_LIMIT_MARKER = `${RECOVERY_MARKER} Limit`;
+
+/**
+ * Count distinct recovery attempts from issue comments. Deduplicates by the
+ * round token `(N/M)` so that a retry which posts the same marker twice
+ * (accepted-but-transient network error) still counts as one attempt.
+ * Exported for unit tests.
+ */
+export function countRecoveryAttempts(comments: { body: string }[]): number {
+  const rounds = new Set(
+    comments
+      .filter((c) => c.body.includes(RECOVERY_MARKER) && !c.body.startsWith(RECOVERY_LIMIT_MARKER))
+      .map((c) => c.body.match(/\(\d+\/\d+\)/)?.[0] ?? "")
+      .filter(Boolean),
+  );
+  return rounds.size;
+}
 
 export async function tryAutoRecover(
   cfg: PipelineConfig,
@@ -35,7 +52,8 @@ export async function tryAutoRecover(
   }
 
   const detail = await getIssueDetail(cfg, issueNumber);
-  const recoveryCount = detail.comments.filter((c) => c.body.includes(RECOVERY_MARKER)).length;
+  // Dedupe by round token so a retried marker post doesn't inflate the count.
+  const recoveryCount = countRecoveryAttempts(detail.comments);
 
   // Always remove the failed worktree before retry.
   await removeWorktree(cfg, issueNumber, wt.slug);
@@ -45,7 +63,7 @@ export async function tryAutoRecover(
       cfg,
       issueNumber,
       [
-        `## Pipeline: Auto-Recovery Limit`,
+        RECOVERY_LIMIT_MARKER,
         "",
         `Implementation produced no commits after ${recoveryCount} retries. ` +
           `This issue may already be resolved on \`${cfg.base_branch}\`, or it may need manual intervention.`,
