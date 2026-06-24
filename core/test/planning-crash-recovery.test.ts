@@ -278,6 +278,58 @@ test("planning crash recovery: live marker from another domain prevents rollback
   assert.equal(planningCalled, 0, "must not call planningAdvance when live planning is active");
 });
 
+// ---------------------------------------------------------------------------
+// Cross-domain guard for `ready` stage (#271 pre-merge finding)
+//
+// A domain-B run can reach dispatch with stage=`ready` while domain-A is still
+// in the pre-label planning window (label not yet flipped to `planning`).
+// The live-planning marker must prevent domain-B from calling planningAdvance
+// and starting a second planning arc.
+// ---------------------------------------------------------------------------
+
+test("planning crash recovery: ready stage waits when live marker is active", async () => {
+  const cfg = makeCfg();
+  const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const crossDomainDeps: PlanningRecoveryDeps = {
+    ...deps,
+    isLivePlanningActive: (_repo: string, _issueNumber: number) => true,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "ready", OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
+
+  assert.equal(
+    (out as { status?: string }).status,
+    "waiting",
+    "ready dispatch must return waiting when live marker is active",
+  );
+  assert.equal(transitionCalls.length, 0, "must not call transition when live planning is active");
+  assert.equal(planningCalled, 0, "must not call planningAdvance when live planning is active");
+});
+
+test("planning crash recovery: ready stage proceeds when live marker is absent", async () => {
+  const cfg = makeCfg();
+  const { deps } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const noMarkerDeps: PlanningRecoveryDeps = {
+    ...deps,
+    isLivePlanningActive: (_repo: string, _issueNumber: number) => false,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "ready", OPTS, RUN_ID, undefined, undefined, undefined, noMarkerDeps);
+
+  assert.equal(out.advanced, true, "ready dispatch must advance when no live marker is present");
+  assert.equal(planningCalled, 1, "planningAdvance must be called when no live marker");
+});
+
 test("planning crash recovery: absent live marker still triggers recovery (crash-stranded path)", async () => {
   const cfg = makeCfg();
   const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);

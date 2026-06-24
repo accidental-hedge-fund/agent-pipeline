@@ -2525,8 +2525,22 @@ async function dispatch(
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
-    case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    case "ready": {
+      // Guard: if another domain's live-planning marker is active, this run
+      // arrived at `ready` while domain-A is still in the pre-label planning
+      // window (label not yet flipped to `planning`). Return waiting so we
+      // don't overwrite the marker and start a second planning arc.
+      const readyDeps = recoveryDeps ?? realPlanningRecoveryDeps();
+      const checkLiveReady = readyDeps.isLivePlanningActive ?? isLivePlanningActive;
+      if (checkLiveReady(cfg.repo, issueNumber)) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `planning is active under a different domain — waiting for it to complete`,
+        };
+      }
+      return readyDeps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    }
     case "review-1":
       return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "review-2":
