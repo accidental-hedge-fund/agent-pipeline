@@ -163,9 +163,16 @@ export function livePlanningMarkerPath(repo: string, issueNumber: number): strin
   return `/tmp/pipeline-planning-${safeRepo}-${issueNumber}.live`;
 }
 
-/** Write the current PID into the repo-stable live-planning marker. */
+/**
+ * Write the current PID into the repo-stable live-planning marker using an
+ * atomic temp-file + rename so the marker is never visible as empty.
+ * Safe to call whether the marker already exists (overwrite) or not (create).
+ */
 export function setLivePlanningMarker(repo: string, issueNumber: number): void {
-  fs.writeFileSync(livePlanningMarkerPath(repo, issueNumber), String(process.pid));
+  const markerPath = livePlanningMarkerPath(repo, issueNumber);
+  const tmpPath = markerPath + ".set." + process.pid;
+  fs.writeFileSync(tmpPath, String(process.pid));
+  fs.renameSync(tmpPath, markerPath);
 }
 
 /**
@@ -180,6 +187,9 @@ export function setLivePlanningMarker(repo: string, issueNumber: number): void {
  */
 function tryExclCreate(path: string, content: string): boolean {
   const tmpPath = path + ".claim." + process.pid;
+  // Remove any stale hard link from a prior crashed attempt so it cannot
+  // mutate an already-published marker when the OS reuses this PID.
+  try { fs.unlinkSync(tmpPath); } catch { /* ENOENT is fine */ }
   fs.writeFileSync(tmpPath, content);
   try {
     fs.linkSync(tmpPath, path);

@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import {
   tryAcquireLivePlanningMarker,
+  setLivePlanningMarker,
   clearLivePlanningMarker,
   livePlanningMarkerPath,
 } from "../scripts/lock.ts";
@@ -126,6 +127,26 @@ test("tryAcquireLivePlanningMarker: second acquire attempt on live marker return
   // Marker still held by first caller (PID unchanged)
   const content = fs.readFileSync(markerPath(), "utf8").trim();
   assert.equal(content, String(process.pid), "marker PID must not be overwritten by losing caller");
+});
+
+// ---------------------------------------------------------------------------
+// setLivePlanningMarker is atomic (no empty-file window)
+// ---------------------------------------------------------------------------
+
+test("setLivePlanningMarker: marker always has valid PID content after call", () => {
+  setLivePlanningMarker(REPO, ISSUE);
+  const content = fs.readFileSync(markerPath(), "utf8").trim();
+  const pid = Number.parseInt(content, 10);
+  assert.ok(Number.isFinite(pid) && pid > 0, `marker must have valid PID after set, got: '${content}'`);
+  assert.equal(pid, process.pid);
+});
+
+test("setLivePlanningMarker: overwrites existing marker atomically", () => {
+  // Simulate a prior PID in the marker
+  fs.writeFileSync(markerPath(), "12345");
+  setLivePlanningMarker(REPO, ISSUE);
+  const content = fs.readFileSync(markerPath(), "utf8").trim();
+  assert.equal(content, String(process.pid), "setLivePlanningMarker must overwrite with current PID");
 });
 
 // ---------------------------------------------------------------------------
