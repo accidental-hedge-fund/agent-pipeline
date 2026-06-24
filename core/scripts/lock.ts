@@ -168,6 +168,43 @@ export function setLivePlanningMarker(repo: string, issueNumber: number): void {
   fs.writeFileSync(livePlanningMarkerPath(repo, issueNumber), String(process.pid));
 }
 
+/**
+ * Atomically claim the live-planning marker for the current process using
+ * O_CREAT|O_EXCL. Returns true if this process now owns the marker, false if
+ * a live process already holds it. Reclaims stale (dead-PID) markers and
+ * retries once so a single crashed predecessor doesn't block the next run.
+ */
+export function tryAcquireLivePlanningMarker(repo: string, issueNumber: number): boolean {
+  const markerPath = livePlanningMarkerPath(repo, issueNumber);
+  const tryCreate = (): boolean | null => {
+    try {
+      const fd = fs.openSync(markerPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return true;
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === "EEXIST") return null; // file already exists
+      throw err;
+    }
+  };
+  const result = tryCreate();
+  if (result !== null) return result;
+  // File exists — check if the owning PID is still alive
+  if (isLivePlanningActive(repo, issueNumber)) return false;
+  // Stale marker — remove and retry once
+  try {
+    fs.unlinkSync(markerPath);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") throw err;
+    // Another process unlinked first; fall through to retry
+  }
+  const retryResult = tryCreate();
+  if (retryResult === null) return false; // another process won the race on retry
+  return retryResult;
+}
+
 /** Remove the repo-stable live-planning marker (no-op if absent). */
 export function clearLivePlanningMarker(repo: string, issueNumber: number): void {
   try {

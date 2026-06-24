@@ -44,7 +44,7 @@ import {
   silentTransition,
   transition,
 } from "./gh.ts";
-import { isKillSwitchActive, isLivePlanningActive, runStateDir, withLock } from "./lock.ts";
+import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
@@ -2505,10 +2505,12 @@ export interface PlanningRecoveryDeps {
   planningAdvance: typeof planningStage.advance;
   /** Check if a live planning process is active for this repo+issue (repo-stable). */
   isLivePlanningActive?: (repo: string, issueNumber: number) => boolean;
+  /** Atomically claim the live-planning marker; returns false if a live process already holds it. */
+  tryAcquireLivePlanningMarker?: (repo: string, issueNumber: number) => boolean;
 }
 
 function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
-  return { transition, planningAdvance: planningStage.advance, isLivePlanningActive };
+  return { transition, planningAdvance: planningStage.advance, isLivePlanningActive, tryAcquireLivePlanningMarker };
 }
 
 async function dispatch(
@@ -2526,13 +2528,15 @@ async function dispatch(
   const model = opts.model;
   switch (stage) {
     case "ready": {
-      // Guard: if another domain's live-planning marker is active, this run
-      // arrived at `ready` while domain-A is still in the pre-label planning
-      // window (label not yet flipped to `planning`). Return waiting so we
-      // don't overwrite the marker and start a second planning arc.
+      // Atomically claim the live-planning marker before calling planningAdvance.
+      // A plain check-then-call would be racy: two different-domain runs can
+      // both observe no marker and both enter planningAdvance before either
+      // writes it.  O_CREAT|O_EXCL inside tryAcquireLivePlanningMarker is
+      // atomic at the OS level; only one caller gets true.  planningStage.advance()
+      // will overwrite (same PID) and clear the marker in its own finally block.
       const readyDeps = recoveryDeps ?? realPlanningRecoveryDeps();
-      const checkLiveReady = readyDeps.isLivePlanningActive ?? isLivePlanningActive;
-      if (checkLiveReady(cfg.repo, issueNumber)) {
+      const tryAcquire = readyDeps.tryAcquireLivePlanningMarker ?? tryAcquireLivePlanningMarker;
+      if (!tryAcquire(cfg.repo, issueNumber)) {
         return {
           advanced: false,
           status: "waiting",

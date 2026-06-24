@@ -287,13 +287,14 @@ test("planning crash recovery: live marker from another domain prevents rollback
 // and starting a second planning arc.
 // ---------------------------------------------------------------------------
 
-test("planning crash recovery: ready stage waits when live marker is active", async () => {
+test("planning crash recovery: ready stage waits when tryAcquire fails (live marker held)", async () => {
   const cfg = makeCfg();
   const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
   let planningCalled = 0;
   const crossDomainDeps: PlanningRecoveryDeps = {
     ...deps,
-    isLivePlanningActive: (_repo: string, _issueNumber: number) => true,
+    // Simulate atomic acquire failing because another process holds the marker
+    tryAcquireLivePlanningMarker: (_repo: string, _issueNumber: number) => false,
     planningAdvance: async (c, n, o) => {
       planningCalled++;
       return deps.planningAdvance(c, n, o);
@@ -305,29 +306,29 @@ test("planning crash recovery: ready stage waits when live marker is active", as
   assert.equal(
     (out as { status?: string }).status,
     "waiting",
-    "ready dispatch must return waiting when live marker is active",
+    "ready dispatch must return waiting when tryAcquire returns false",
   );
-  assert.equal(transitionCalls.length, 0, "must not call transition when live planning is active");
-  assert.equal(planningCalled, 0, "must not call planningAdvance when live planning is active");
+  assert.equal(transitionCalls.length, 0, "must not call transition when acquire fails");
+  assert.equal(planningCalled, 0, "must not call planningAdvance when acquire fails");
 });
 
-test("planning crash recovery: ready stage proceeds when live marker is absent", async () => {
+test("planning crash recovery: ready stage proceeds when tryAcquire succeeds", async () => {
   const cfg = makeCfg();
   const { deps } = makeDeps(ADVANCING_OUTCOME);
   let planningCalled = 0;
-  const noMarkerDeps: PlanningRecoveryDeps = {
+  const acquiredDeps: PlanningRecoveryDeps = {
     ...deps,
-    isLivePlanningActive: (_repo: string, _issueNumber: number) => false,
+    tryAcquireLivePlanningMarker: (_repo: string, _issueNumber: number) => true,
     planningAdvance: async (c, n, o) => {
       planningCalled++;
       return deps.planningAdvance(c, n, o);
     },
   };
 
-  const out = await dispatch(cfg, ISSUE, "ready", OPTS, RUN_ID, undefined, undefined, undefined, noMarkerDeps);
+  const out = await dispatch(cfg, ISSUE, "ready", OPTS, RUN_ID, undefined, undefined, undefined, acquiredDeps);
 
-  assert.equal(out.advanced, true, "ready dispatch must advance when no live marker is present");
-  assert.equal(planningCalled, 1, "planningAdvance must be called when no live marker");
+  assert.equal(out.advanced, true, "ready dispatch must advance when tryAcquire succeeds");
+  assert.equal(planningCalled, 1, "planningAdvance must be called when marker is acquired");
 });
 
 test("planning crash recovery: absent live marker still triggers recovery (crash-stranded path)", async () => {
