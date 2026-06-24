@@ -2571,7 +2571,9 @@ async function dispatch(
       console.log(
         `[pipeline] #${issueNumber}: recovered stranded planning attempt — restarting from ready`,
       );
-      await deps.transition(cfg, issueNumber, stage, "ready", "recovered crashed planning attempt — restarting");
+      if (!dryRun) {
+        await deps.transition(cfg, issueNumber, stage, "ready", "recovered crashed planning attempt — restarting");
+      }
       return deps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     }
     case "implementing":

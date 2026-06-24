@@ -177,3 +177,45 @@ test("planning crash recovery: transition called with correct from-stage for pla
   assert.equal(transitionCalls[0]?.from, "plan-review");
   assert.equal(transitionCalls[0]?.to, "ready");
 });
+
+// ---------------------------------------------------------------------------
+// Dry-run: transition must NOT be called (#271 review-1 finding)
+// ---------------------------------------------------------------------------
+
+test("planning crash recovery: dry-run does not call transition for planning", async () => {
+  const cfg = makeCfg();
+  const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const trackingDeps: PlanningRecoveryDeps = {
+    ...deps,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "planning", { dryRun: true }, RUN_ID, undefined, undefined, undefined, trackingDeps);
+
+  assert.equal(transitionCalls.length, 0, "dry-run must not call transition for planning");
+  assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");
+  assert.ok(out !== undefined, "dry-run must return an outcome");
+});
+
+test("planning crash recovery: dry-run does not call transition for plan-review", async () => {
+  const cfg = makeCfg();
+  const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const trackingDeps: PlanningRecoveryDeps = {
+    ...deps,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "plan-review", { dryRun: true }, RUN_ID, undefined, undefined, undefined, trackingDeps);
+
+  assert.equal(transitionCalls.length, 0, "dry-run must not call transition for plan-review");
+  assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");
+  assert.ok(out !== undefined, "dry-run must return an outcome");
+});
