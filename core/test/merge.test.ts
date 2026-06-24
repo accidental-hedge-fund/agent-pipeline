@@ -36,6 +36,9 @@ function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
     async ghPrChecksRequired(_pr): Promise<RequiredCheck[]> {
       return [{ name: "ci", bucket: "pass" }];
     },
+    async ghPrChecksAll(_pr): Promise<RequiredCheck[]> {
+      return [{ name: "ci", bucket: "pass" }];
+    },
     async ghPrMerge(pr, headRefOid) {
       mergeCalls.push({ pr, headRefOid });
     },
@@ -366,6 +369,142 @@ test("merge: optional non-passing check does not block (only required checks mat
   });
   await mergePr(42, deps);
   assert.equal(deps.mergeCalls.length, 1, "ghPrMerge should be called when required checks pass");
+});
+
+// ---------------------------------------------------------------------------
+// 4.15 Fallback path: no required checks configured (#275)
+//
+// When `gh pr checks --required` exits with "no required checks reported", the
+// handler must NOT hard-fail. Instead it falls back to verifying all observable
+// checks via ghPrChecksAll. These tests confirm the three fallback scenarios.
+//
+// Red→green proof: each test was confirmed to fail before the fallback path was
+// added (ghPrChecksRequired threw an uncaught error; the handler always aborted).
+// ---------------------------------------------------------------------------
+
+// Helper: returns a ghPrChecksRequired stub that throws the "no required checks" error
+// (matching the real gh CLI output shape used in production).
+function noRequiredChecksDeps(overrides: Partial<MergeDeps> = {}) {
+  return makeDeps({
+    async ghPrChecksRequired(_pr): Promise<RequiredCheck[]> {
+      // Mirrors the real `gh pr checks --required` exit-non-zero message.
+      const err = Object.assign(
+        new Error("Command failed: gh pr checks"),
+        { stderr: "no required checks reported on the 'main' branch" },
+      );
+      throw err;
+    },
+    ...overrides,
+  });
+}
+
+test("merge: no required checks + all observable checks green → proceeds to squash-merge (fallback pass)", async () => {
+  const deps = noRequiredChecksDeps({
+    async ghPrChecksAll(_pr) {
+      return [
+        { name: "test", bucket: "pass" },
+        { name: "lint", bucket: "skipping" },
+      ];
+    },
+  });
+  await mergePr(42, deps);
+  assert.equal(deps.mergeCalls.length, 1, "ghPrMerge should be called when fallback checks pass");
+});
+
+test("merge: no required checks + a failing observable check → blocks with the check name (fallback fail)", async () => {
+  const deps = noRequiredChecksDeps({
+    async ghPrChecksAll(_pr) {
+      return [
+        { name: "test", bucket: "pass" },
+        { name: "security-scan", bucket: "fail" },
+      ];
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("security-scan"),
+        `expected failing check name in: ${err.message}`,
+      );
+      assert.ok(
+        err.message.includes("fail"),
+        `expected bucket in: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
+});
+
+test("merge: no required checks + a pending observable check → blocks with the check name (fallback pending)", async () => {
+  const deps = noRequiredChecksDeps({
+    async ghPrChecksAll(_pr) {
+      return [
+        { name: "slow-ci", bucket: "pending" },
+      ];
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("slow-ci"),
+        `expected pending check name in: ${err.message}`,
+      );
+      assert.ok(
+        err.message.includes("pending"),
+        `expected bucket in: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
+});
+
+test("merge: no required checks + a cancelled observable check → blocks with the check name (fallback cancel)", async () => {
+  const deps = noRequiredChecksDeps({
+    async ghPrChecksAll(_pr) {
+      return [
+        { name: "cancelled-check", bucket: "cancel" },
+      ];
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("cancelled-check"),
+        `expected cancelled check name in: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
+});
+
+test("merge: unrelated ghPrChecksRequired error → hard failure preserved (not swallowed as no-required-checks)", async () => {
+  const deps = makeDeps({
+    async ghPrChecksRequired(_pr): Promise<RequiredCheck[]> {
+      const err = Object.assign(
+        new Error("Command failed: gh pr checks"),
+        { stderr: "HTTP 401: authentication required" },
+      );
+      throw err;
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("401") || err.message.includes("authentication") ||
+        err.message.includes("Command failed"),
+        `expected auth error to propagate, got: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called on auth error");
 });
 
 // ---------------------------------------------------------------------------

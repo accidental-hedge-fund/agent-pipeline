@@ -43,6 +43,10 @@ export interface MergeDeps {
    *  required checks. This keeps optional pending/skipped/failed checks from
    *  blocking a merge where all required checks have passed. */
   ghPrChecksRequired(pr: number): Promise<RequiredCheck[]>;
+  /** Calls `gh pr checks <pr> --json name,bucket` (without --required) and returns
+   *  all observable check results. Used as a fallback safety gate when the base
+   *  branch has no required checks configured. */
+  ghPrChecksAll(pr: number): Promise<RequiredCheck[]>;
   /** Calls `gh pr merge --squash --delete-branch --match-head-commit <headRefOid>`.
    *  The headRefOid is fetched from ghPrView and binds the merge to the inspected
    *  head SHA, closing the TOCTOU race between gate inspection and merge execution. */
@@ -72,6 +76,15 @@ export function realMergeDeps(repo: string): MergeDeps {
       const { stdout } = await execFileAsync(
         "gh",
         ["pr", "checks", String(pr), "--required", "--json", "name,bucket", "-R", repo],
+        { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+      );
+      return JSON.parse(stdout) as RequiredCheck[];
+    },
+
+    async ghPrChecksAll(pr) {
+      const { stdout } = await execFileAsync(
+        "gh",
+        ["pr", "checks", String(pr), "--json", "name,bucket", "-R", repo],
         { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
       );
       return JSON.parse(stdout) as RequiredCheck[];
@@ -362,10 +375,43 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
   }
 
   deps.log(`[pipeline merge] #${pr}: checking required status checks...`);
-  const requiredChecks = await deps.ghPrChecksRequired(pr);
-  const checksError = checkStatusChecks(requiredChecks);
-  if (checksError) {
-    throw new Error(checksError);
+  let requiredChecks: RequiredCheck[];
+  let noRequiredChecksConfigured = false;
+  try {
+    requiredChecks = await deps.ghPrChecksRequired(pr);
+  } catch (err) {
+    const e = err as { stderr?: string; message?: string };
+    const errText = `${e.stderr ?? ""} ${e.message ?? ""}`;
+    if (errText.includes("no required checks reported")) {
+      noRequiredChecksConfigured = true;
+      requiredChecks = [];
+    } else {
+      throw err;
+    }
+  }
+
+  if (noRequiredChecksConfigured) {
+    deps.log(`[pipeline merge] #${pr}: no required checks configured — verifying all observable checks as fallback...`);
+    const allChecks = await deps.ghPrChecksAll(pr);
+    const blocking: string[] = [];
+    for (const check of allChecks) {
+      const bucket = (check.bucket ?? "").toLowerCase();
+      if (bucket === "fail" || bucket === "pending" || bucket === "cancel") {
+        blocking.push(`${check.name ?? "unknown"} (${bucket})`);
+      }
+    }
+    if (blocking.length > 0) {
+      throw new Error(
+        `No required checks are configured, but observable checks are not all green:\n` +
+        blocking.map((c) => `  - ${c}`).join("\n") +
+        `\nFix or wait for the checks to pass, then retry.`,
+      );
+    }
+  } else {
+    const checksError = checkStatusChecks(requiredChecks!);
+    if (checksError) {
+      throw new Error(checksError);
+    }
   }
 
   deps.log(`[pipeline merge] #${pr}: checking linked issue stage...`);
