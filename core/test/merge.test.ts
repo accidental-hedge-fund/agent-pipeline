@@ -483,6 +483,23 @@ test("merge: no required checks + a cancelled observable check → blocks with t
   assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
 });
 
+test("merge: no required checks + ghPrChecksAll exits with 'no checks reported' (zero observable checks) → proceeds to squash-merge", async () => {
+  // Regression for #275 review-2: gh pr checks (without --required) exits non-zero with
+  // "no checks reported on the '<branch>' branch" when a repo has zero observable checks.
+  // The fallback path must normalize this error to [] and proceed, not hard-fail.
+  const deps = noRequiredChecksDeps({
+    async ghPrChecksAll(_pr): Promise<RequiredCheck[]> {
+      const err = Object.assign(
+        new Error("Command failed: gh pr checks"),
+        { stderr: "no checks reported on the 'main' branch" },
+      );
+      throw err;
+    },
+  });
+  await mergePr(42, deps);
+  assert.equal(deps.mergeCalls.length, 1, "ghPrMerge should be called when there are no observable checks");
+});
+
 test("merge: unrelated ghPrChecksRequired error → hard failure preserved (not swallowed as no-required-checks)", async () => {
   const deps = makeDeps({
     async ghPrChecksRequired(_pr): Promise<RequiredCheck[]> {

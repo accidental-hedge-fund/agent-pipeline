@@ -392,7 +392,18 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
 
   if (noRequiredChecksConfigured) {
     deps.log(`[pipeline merge] #${pr}: no required checks configured — verifying all observable checks as fallback...`);
-    const allChecks = await deps.ghPrChecksAll(pr);
+    let allChecks: RequiredCheck[];
+    try {
+      allChecks = await deps.ghPrChecksAll(pr);
+    } catch (err) {
+      const e = err as { stderr?: string; message?: string };
+      const errText = `${e.stderr ?? ""} ${e.message ?? ""}`;
+      if (errText.includes("no checks reported")) {
+        allChecks = [];
+      } else {
+        throw err;
+      }
+    }
     const blocking: string[] = [];
     for (const check of allChecks) {
       const bucket = (check.bucket ?? "").toLowerCase();

@@ -50,6 +50,12 @@ When `gh pr checks --required` reports that no required checks are configured on
 - **THEN** the handler SHALL exit non-zero with a message naming the pending/cancelled check(s)
 - **AND** SHALL NOT merge
 
+#### Scenario: No required checks configured, `gh pr checks` exits with "no checks reported" — fallback treats as empty and passes
+- **WHEN** `gh pr checks --required` exits with the "no required checks reported" message
+- **AND** `gh pr checks <pr>` (without `--required`) itself exits non-zero with a message containing "no checks reported"
+- **THEN** the handler SHALL treat this as an empty check list (equivalent to zero observable checks)
+- **AND** SHALL proceed to the issue-stage gate and SHALL NOT exit non-zero at this point
+
 #### Scenario: Unit test injects fake `ghPrChecksAll` via `MergeDeps`
 - **WHEN** a unit test constructs `MergeDeps` with a stubbed `ghPrChecksAll` that returns a fixture list of check results
 - **AND** `ghPrChecksRequired` is stubbed to return the "no required checks" error
