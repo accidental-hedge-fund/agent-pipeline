@@ -169,40 +169,100 @@ export function setLivePlanningMarker(repo: string, issueNumber: number): void {
 }
 
 /**
- * Atomically claim the live-planning marker for the current process using
- * O_CREAT|O_EXCL. Returns true if this process now owns the marker, false if
- * a live process already holds it. Reclaims stale (dead-PID) markers and
- * retries once so a single crashed predecessor doesn't block the next run.
+ * Try to create a file with O_CREAT|O_EXCL, writing `content`.
+ * Returns true on success, false if the file already exists.
+ */
+function tryExclCreate(path: string, content: string): boolean {
+  try {
+    const fd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
+    fs.writeSync(fd, content);
+    fs.closeSync(fd);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "EEXIST") return false;
+    throw err;
+  }
+}
+
+/** Return true when the PID read from `path` belongs to a live process. */
+function isFilePidAlive(path: string): boolean {
+  let text: string;
+  try {
+    text = fs.readFileSync(path, "utf8").trim();
+  } catch {
+    return false;
+  }
+  const pid = Number.parseInt(text, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    if (e.code === "EPERM") return true;
+    return false;
+  }
+}
+
+/**
+ * Atomically claim the live-planning marker for the current process.
+ *
+ * Uses O_CREAT|O_EXCL so only one caller wins when the marker is absent.
+ * When a stale (dead-PID) marker exists, reclamation is serialized through a
+ * per-marker cleanup lock (also PID-stamped so stale cleanup locks are
+ * reclaimed without blocking future runs).
+ *
+ * Returns true when this process owns the marker, false when a live process
+ * holds it (or the reclamation race was lost — caller should wait and retry).
  */
 export function tryAcquireLivePlanningMarker(repo: string, issueNumber: number): boolean {
   const markerPath = livePlanningMarkerPath(repo, issueNumber);
-  const tryCreate = (): boolean | null => {
+  const pid = String(process.pid);
+
+  // 1. Happy path: no marker — claim it atomically.
+  if (tryExclCreate(markerPath, pid)) return true;
+
+  // 2. Marker exists; if the owner is alive we must wait.
+  if (isLivePlanningActive(repo, issueNumber)) return false;
+
+  // 3. Stale marker. Serialize reclamation with a per-marker cleanup lock so
+  //    two concurrent callers cannot both unlink+recreate (TOCTOU).
+  const cleanupPath = markerPath + ".cleanup";
+  if (!tryExclCreate(cleanupPath, pid)) {
+    // Cleanup lock is held by someone. If their PID is dead, reclaim the lock.
+    if (isFilePidAlive(cleanupPath)) return false; // live reclaimer — wait
     try {
-      const fd = fs.openSync(markerPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
-      fs.writeSync(fd, String(process.pid));
-      fs.closeSync(fd);
-      return true;
+      fs.unlinkSync(cleanupPath);
     } catch (err) {
       const e = err as NodeJS.ErrnoException;
-      if (e.code === "EEXIST") return null; // file already exists
-      throw err;
+      if (e.code !== "ENOENT") throw err;
     }
-  };
-  const result = tryCreate();
-  if (result !== null) return result;
-  // File exists — check if the owning PID is still alive
-  if (isLivePlanningActive(repo, issueNumber)) return false;
-  // Stale marker — remove and retry once
-  try {
-    fs.unlinkSync(markerPath);
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code !== "ENOENT") throw err;
-    // Another process unlinked first; fall through to retry
+    // Retry acquiring the cleanup lock once; if another process beats us, wait.
+    if (!tryExclCreate(cleanupPath, pid)) return false;
   }
-  const retryResult = tryCreate();
-  if (retryResult === null) return false; // another process won the race on retry
-  return retryResult;
+
+  // 4. We hold the cleanup lock. Reclaim the stale main marker.
+  try {
+    // Re-check: the marker might have been reclaimed between step 2 and now.
+    if (isLivePlanningActive(repo, issueNumber)) return false;
+    try {
+      fs.unlinkSync(markerPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+    }
+    // A fresh process could have claimed the marker between our unlink and this
+    // create; if so we lose gracefully.
+    return tryExclCreate(markerPath, pid);
+  } finally {
+    try {
+      fs.unlinkSync(cleanupPath);
+    } catch {
+      // ignore
+    }
+  }
 }
 
 /** Remove the repo-stable live-planning marker (no-op if absent). */
