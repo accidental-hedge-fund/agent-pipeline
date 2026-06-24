@@ -149,3 +149,177 @@ export function killSwitchPath(domain: string): string {
 export function isKillSwitchActive(domain: string): boolean {
   return fs.existsSync(killSwitchPath(domain));
 }
+
+// ---------------------------------------------------------------------------
+// Repo-stable live-planning marker (#271 cross-domain/worktree guard).
+//
+// Path uses the GitHub repo slug (owner/name → owner-name) rather than the
+// domain so the signal is stable across worktrees of the same repo that
+// happen to resolve different domain basenames.
+// ---------------------------------------------------------------------------
+
+export function livePlanningMarkerPath(repo: string, issueNumber: number): string {
+  const safeRepo = repo.replace(/\//g, "-");
+  return `/tmp/pipeline-planning-${safeRepo}-${issueNumber}.live`;
+}
+
+/**
+ * Write the current PID into the repo-stable live-planning marker using an
+ * atomic temp-file + rename so the marker is never visible as empty.
+ * Safe to call whether the marker already exists (overwrite) or not (create).
+ */
+export function setLivePlanningMarker(repo: string, issueNumber: number): void {
+  const markerPath = livePlanningMarkerPath(repo, issueNumber);
+  const tmpPath = markerPath + ".set." + process.pid;
+  fs.writeFileSync(tmpPath, String(process.pid));
+  fs.renameSync(tmpPath, markerPath);
+}
+
+/**
+ * Atomically publish `content` at `path` using a temp-file + hard-link
+ * strategy so the marker is never visible as empty.
+ *
+ * Writes content to a per-PID temp file first (full content present before
+ * any other process can observe the marker path), then hard-links the temp
+ * file into `path`. `link(2)` is atomic: if `path` already exists the call
+ * fails with EEXIST and we return false without touching the existing file.
+ * The temp file is always removed in the finally block.
+ */
+function tryExclCreate(path: string, content: string): boolean {
+  const tmpPath = path + ".claim." + process.pid;
+  // Remove any stale hard link from a prior crashed attempt so it cannot
+  // mutate an already-published marker when the OS reuses this PID.
+  try { fs.unlinkSync(tmpPath); } catch { /* ENOENT is fine */ }
+  fs.writeFileSync(tmpPath, content);
+  try {
+    fs.linkSync(tmpPath, path);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "EEXIST") return false;
+    throw err;
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Return true when the PID read from `path` belongs to a live process. */
+function isFilePidAlive(path: string): boolean {
+  let text: string;
+  try {
+    text = fs.readFileSync(path, "utf8").trim();
+  } catch {
+    return false;
+  }
+  const pid = Number.parseInt(text, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    if (e.code === "EPERM") return true;
+    return false;
+  }
+}
+
+/**
+ * Atomically claim the live-planning marker for the current process.
+ *
+ * Uses O_CREAT|O_EXCL so only one caller wins when the marker is absent.
+ * When a stale (dead-PID) marker exists, reclamation is serialized through a
+ * per-marker cleanup lock (also PID-stamped so stale cleanup locks are
+ * reclaimed without blocking future runs).
+ *
+ * Returns true when this process owns the marker, false when a live process
+ * holds it (or the reclamation race was lost — caller should wait and retry).
+ */
+export function tryAcquireLivePlanningMarker(repo: string, issueNumber: number): boolean {
+  const markerPath = livePlanningMarkerPath(repo, issueNumber);
+  const pid = String(process.pid);
+
+  // 1. Happy path: no marker — claim it atomically.
+  if (tryExclCreate(markerPath, pid)) return true;
+
+  // 2. Marker exists; if the owner is alive we must wait.
+  if (isLivePlanningActive(repo, issueNumber)) return false;
+
+  // 3. Stale marker. Serialize reclamation with a per-marker cleanup lock so
+  //    two concurrent callers cannot both unlink+recreate (TOCTOU).
+  const cleanupPath = markerPath + ".cleanup";
+  if (!tryExclCreate(cleanupPath, pid)) {
+    // Cleanup lock is held by someone. If their PID is dead, reclaim the lock.
+    if (isFilePidAlive(cleanupPath)) return false; // live reclaimer — wait
+    try {
+      fs.unlinkSync(cleanupPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+    }
+    // Retry acquiring the cleanup lock once; if another process beats us, wait.
+    if (!tryExclCreate(cleanupPath, pid)) return false;
+  }
+
+  // 4. We hold the cleanup lock. Reclaim the stale main marker.
+  try {
+    // Re-check: the marker might have been reclaimed between step 2 and now.
+    if (isLivePlanningActive(repo, issueNumber)) return false;
+    try {
+      fs.unlinkSync(markerPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+    }
+    // A fresh process could have claimed the marker between our unlink and this
+    // create; if so we lose gracefully.
+    return tryExclCreate(markerPath, pid);
+  } finally {
+    try {
+      fs.unlinkSync(cleanupPath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Remove the repo-stable live-planning marker (no-op if absent). */
+export function clearLivePlanningMarker(repo: string, issueNumber: number): void {
+  try {
+    fs.unlinkSync(livePlanningMarkerPath(repo, issueNumber));
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") throw err;
+  }
+}
+
+/**
+ * Return true when another process is actively running the planning stage for
+ * this repo+issue. Uses the same PID-probe logic as {@link PipelineLock}.
+ */
+export function isLivePlanningActive(repo: string, issueNumber: number): boolean {
+  const markerPath = livePlanningMarkerPath(repo, issueNumber);
+  let pidText: string;
+  try {
+    pidText = fs.readFileSync(markerPath, "utf8").trim();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return false;
+    throw err;
+  }
+  const pid = Number.parseInt(pidText, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    if (e.code === "EPERM") return true;
+    throw err;
+  }
+}

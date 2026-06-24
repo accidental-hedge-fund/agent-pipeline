@@ -44,7 +44,7 @@ import {
   silentTransition,
   transition,
 } from "./gh.ts";
-import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
+import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
@@ -2498,6 +2498,21 @@ async function notifyBundlePath(
   await markNotified(stateDir, issueNumber);
 }
 
+/** IO seam for the stranded-planning crash-recovery path in {@link dispatch}.
+ *  Inject fakes in unit tests; production uses {@link realPlanningRecoveryDeps}. */
+export interface PlanningRecoveryDeps {
+  transition: typeof transition;
+  planningAdvance: typeof planningStage.advance;
+  /** Check if a live planning process is active for this repo+issue (repo-stable). */
+  isLivePlanningActive?: (repo: string, issueNumber: number) => boolean;
+  /** Atomically claim the live-planning marker; returns false if a live process already holds it. */
+  tryAcquireLivePlanningMarker?: (repo: string, issueNumber: number) => boolean;
+}
+
+function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
+  return { transition, planningAdvance: planningStage.advance, isLivePlanningActive, tryAcquireLivePlanningMarker };
+}
+
 async function dispatch(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -2507,12 +2522,29 @@ async function dispatch(
   stateDir?: string,
   runDir?: string,
   runStoreDeps?: RunStoreDeps,
+  recoveryDeps?: PlanningRecoveryDeps,
 ): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
-    case "ready":
-      return planningStage.advance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    case "ready": {
+      // Atomically claim the live-planning marker before calling planningAdvance.
+      // A plain check-then-call would be racy: two different-domain runs can
+      // both observe no marker and both enter planningAdvance before either
+      // writes it.  O_CREAT|O_EXCL inside tryAcquireLivePlanningMarker is
+      // atomic at the OS level; only one caller gets true.  planningStage.advance()
+      // will overwrite (same PID) and clear the marker in its own finally block.
+      const readyDeps = recoveryDeps ?? realPlanningRecoveryDeps();
+      const tryAcquire = readyDeps.tryAcquireLivePlanningMarker ?? tryAcquireLivePlanningMarker;
+      if (!tryAcquire(cfg.repo, issueNumber)) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `planning is active under a different domain — waiting for it to complete`,
+        };
+      }
+      return readyDeps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    }
     case "review-1":
       return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "review-2":
@@ -2550,12 +2582,30 @@ async function dispatch(
         reason: "backlog is a triage stage; promote to pipeline:ready manually",
       };
     case "planning":
-    case "plan-review":
-      return {
-        advanced: false,
-        status: "waiting",
-        reason: `${stage} is set mid-flight by the planning/plan-review handler; nothing to do at this point.`,
-      };
+    case "plan-review": {
+      // The per-issue lock (domain-scoped) is already held by this process.  A
+      // concurrent run with the SAME domain would have failed at lock acquisition.
+      // However, a run from a different worktree or --domain value holds a different
+      // lock file and can reach dispatch simultaneously.  To distinguish a live
+      // cross-domain run from a crash-stranded one, check the repo-stable
+      // live-planning marker (#271 review-2 finding 1).
+      const deps = recoveryDeps ?? realPlanningRecoveryDeps();
+      const checkLive = deps.isLivePlanningActive ?? isLivePlanningActive;
+      if (checkLive(cfg.repo, issueNumber)) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `planning is active under a different domain — waiting for it to complete`,
+        };
+      }
+      console.log(
+        `[pipeline] #${issueNumber}: recovered stranded planning attempt — restarting from ready`,
+      );
+      if (!dryRun) {
+        await deps.transition(cfg, issueNumber, stage, "ready", "recovered crashed planning attempt — restarting");
+      }
+      return deps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    }
     case "implementing":
       // Re-entry: if a worktree with commits exists, resume the post-implementation
       // steps (gate → push → PR → review-1) without re-planning or re-implementing.
@@ -2587,7 +2637,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 // Internal exports for tests (state-transition table tests).
 // ---------------------------------------------------------------------------
 
-export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
+export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue, realPlanningRecoveryDeps };
 
 // Suppress unused import warnings for test-only helpers.
 void addLabel;
