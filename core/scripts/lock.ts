@@ -169,19 +169,31 @@ export function setLivePlanningMarker(repo: string, issueNumber: number): void {
 }
 
 /**
- * Try to create a file with O_CREAT|O_EXCL, writing `content`.
- * Returns true on success, false if the file already exists.
+ * Atomically publish `content` at `path` using a temp-file + hard-link
+ * strategy so the marker is never visible as empty.
+ *
+ * Writes content to a per-PID temp file first (full content present before
+ * any other process can observe the marker path), then hard-links the temp
+ * file into `path`. `link(2)` is atomic: if `path` already exists the call
+ * fails with EEXIST and we return false without touching the existing file.
+ * The temp file is always removed in the finally block.
  */
 function tryExclCreate(path: string, content: string): boolean {
+  const tmpPath = path + ".claim." + process.pid;
+  fs.writeFileSync(tmpPath, content);
   try {
-    const fd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
-    fs.writeSync(fd, content);
-    fs.closeSync(fd);
+    fs.linkSync(tmpPath, path);
     return true;
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     if (e.code === "EEXIST") return false;
     throw err;
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore
+    }
   }
 }
 

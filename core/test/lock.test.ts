@@ -97,6 +97,38 @@ test("tryAcquireLivePlanningMarker: live cleanup lock → returns false", () => 
 });
 
 // ---------------------------------------------------------------------------
+// Atomic publication: marker is never visible as empty (#271 pre-merge finding)
+//
+// tryExclCreate uses writeFile-to-temp + hardlink so that any process that
+// observes the marker path (via EEXIST) always reads the full PID content.
+// No concurrent reader can see an empty/unparseable marker and treat it as
+// stale, then unlink the just-acquired file.
+// ---------------------------------------------------------------------------
+
+test("tryAcquireLivePlanningMarker: marker file always has valid PID content when visible", () => {
+  // Acquire the marker, then immediately read back the content. There must be
+  // no window where the file exists but the PID is absent or unparseable.
+  const result = tryAcquireLivePlanningMarker(REPO, ISSUE);
+  assert.equal(result, true, "should acquire when marker is absent");
+  const content = fs.readFileSync(markerPath(), "utf8").trim();
+  const pid = Number.parseInt(content, 10);
+  assert.ok(Number.isFinite(pid) && pid > 0, `marker must contain a valid PID immediately, got: '${content}'`);
+  assert.equal(pid, process.pid, "marker PID should match current process");
+});
+
+test("tryAcquireLivePlanningMarker: second acquire attempt on live marker returns false", () => {
+  // First acquire
+  const first = tryAcquireLivePlanningMarker(REPO, ISSUE);
+  assert.equal(first, true, "first acquire should succeed");
+  // Second acquire while first is live (current PID is alive)
+  const second = tryAcquireLivePlanningMarker(REPO, ISSUE);
+  assert.equal(second, false, "second acquire with live marker must return false");
+  // Marker still held by first caller (PID unchanged)
+  const content = fs.readFileSync(markerPath(), "utf8").trim();
+  assert.equal(content, String(process.pid), "marker PID must not be overwritten by losing caller");
+});
+
+// ---------------------------------------------------------------------------
 // clearLivePlanningMarker is a no-op when marker is absent
 // ---------------------------------------------------------------------------
 
