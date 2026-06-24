@@ -2498,6 +2498,17 @@ async function notifyBundlePath(
   await markNotified(stateDir, issueNumber);
 }
 
+/** IO seam for the stranded-planning crash-recovery path in {@link dispatch}.
+ *  Inject fakes in unit tests; production uses {@link realPlanningRecoveryDeps}. */
+export interface PlanningRecoveryDeps {
+  transition: typeof transition;
+  planningAdvance: typeof planningStage.advance;
+}
+
+function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
+  return { transition, planningAdvance: planningStage.advance };
+}
+
 async function dispatch(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -2507,6 +2518,7 @@ async function dispatch(
   stateDir?: string,
   runDir?: string,
   runStoreDeps?: RunStoreDeps,
+  recoveryDeps?: PlanningRecoveryDeps,
 ): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
@@ -2550,12 +2562,18 @@ async function dispatch(
         reason: "backlog is a triage stage; promote to pipeline:ready manually",
       };
     case "planning":
-    case "plan-review":
-      return {
-        advanced: false,
-        status: "waiting",
-        reason: `${stage} is set mid-flight by the planning/plan-review handler; nothing to do at this point.`,
-      };
+    case "plan-review": {
+      // The per-issue lock is already held by the current process when dispatch is
+      // entered. A genuine concurrent run would have failed at lock acquisition before
+      // reaching here. Therefore, seeing planning or plan-review at this point always
+      // means a prior run crashed mid-flight. Roll back to ready and restart planning.
+      const deps = recoveryDeps ?? realPlanningRecoveryDeps();
+      console.log(
+        `[pipeline] #${issueNumber}: recovered stranded planning attempt — restarting from ready`,
+      );
+      await deps.transition(cfg, issueNumber, stage, "ready", "recovered crashed planning attempt — restarting");
+      return deps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    }
     case "implementing":
       // Re-entry: if a worktree with commits exists, resume the post-implementation
       // steps (gate → push → PR → review-1) without re-planning or re-implementing.
@@ -2587,7 +2605,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 // Internal exports for tests (state-transition table tests).
 // ---------------------------------------------------------------------------
 
-export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
+export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue, realPlanningRecoveryDeps };
 
 // Suppress unused import warnings for test-only helpers.
 void addLabel;
