@@ -22,6 +22,12 @@ jobs:
         with:
           fetch-depth: 0 # full history + tags so the annotation is available
 
+      - name: Fetch the annotated tag object (actions/checkout peels it to a commit)
+        # actions/checkout@v4 materializes refs/tags/${GITHUB_REF_NAME} pointing at the
+        # underlying commit rather than the annotated tag object. Re-fetch with --force so
+        # git cat-file and git tag --format='%(contents)' see the real tag object.
+        run: git fetch origin --force "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
