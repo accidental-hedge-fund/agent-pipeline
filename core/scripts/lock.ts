@@ -149,3 +149,58 @@ export function killSwitchPath(domain: string): string {
 export function isKillSwitchActive(domain: string): boolean {
   return fs.existsSync(killSwitchPath(domain));
 }
+
+// ---------------------------------------------------------------------------
+// Repo-stable live-planning marker (#271 cross-domain/worktree guard).
+//
+// Path uses the GitHub repo slug (owner/name → owner-name) rather than the
+// domain so the signal is stable across worktrees of the same repo that
+// happen to resolve different domain basenames.
+// ---------------------------------------------------------------------------
+
+export function livePlanningMarkerPath(repo: string, issueNumber: number): string {
+  const safeRepo = repo.replace(/\//g, "-");
+  return `/tmp/pipeline-planning-${safeRepo}-${issueNumber}.live`;
+}
+
+/** Write the current PID into the repo-stable live-planning marker. */
+export function setLivePlanningMarker(repo: string, issueNumber: number): void {
+  fs.writeFileSync(livePlanningMarkerPath(repo, issueNumber), String(process.pid));
+}
+
+/** Remove the repo-stable live-planning marker (no-op if absent). */
+export function clearLivePlanningMarker(repo: string, issueNumber: number): void {
+  try {
+    fs.unlinkSync(livePlanningMarkerPath(repo, issueNumber));
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") throw err;
+  }
+}
+
+/**
+ * Return true when another process is actively running the planning stage for
+ * this repo+issue. Uses the same PID-probe logic as {@link PipelineLock}.
+ */
+export function isLivePlanningActive(repo: string, issueNumber: number): boolean {
+  const markerPath = livePlanningMarkerPath(repo, issueNumber);
+  let pidText: string;
+  try {
+    pidText = fs.readFileSync(markerPath, "utf8").trim();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return false;
+    throw err;
+  }
+  const pid = Number.parseInt(pidText, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    if (e.code === "EPERM") return true;
+    throw err;
+  }
+}

@@ -47,6 +47,7 @@ import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
+import { setLivePlanningMarker, clearLivePlanningMarker } from "../lock.ts";
 import {
   verifyHarnessCommits,
   verifyPlanRevisionOutput,
@@ -518,29 +519,37 @@ export async function advance(
   issueNumber: number,
   opts: AdvanceOpts = {},
 ): Promise<Outcome> {
-  if (openspec.shouldPlanWithOpenspec(cfg, cfg.repo_dir)) {
-    return advanceOpenspec(cfg, issueNumber, opts);
+  // Set a repo-stable marker so that a concurrent process using a different
+  // domain (different worktree basename) can distinguish a live planning run
+  // from a crash-stranded one (#271 review-2 finding 1).
+  setLivePlanningMarker(cfg.repo, issueNumber);
+  try {
+    if (openspec.shouldPlanWithOpenspec(cfg, cfg.repo_dir)) {
+      return await advanceOpenspec(cfg, issueNumber, opts);
+    }
+
+    const detail = await getIssueDetail(cfg, issueNumber);
+    const title = detail.title;
+    const body = detail.body;
+
+    const primary: Harness = cfg.harnesses.implementer;
+    // `reviewer` may be a custom reviewer CLI (`review_harness`, #40), so it is a
+    // `string`; the implementer fallback (`primary`) is always a built-in Harness.
+    const reviewer: string = cfg.harnesses.reviewer;
+    const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+
+    console.log(`[pipeline] #${issueNumber}: planning (impl=${primary}, plan-review=${reviewer})`);
+
+    if (opts.dryRun) {
+      console.log(`[pipeline] #${issueNumber}: [dry-run] would plan + ${reviewer} plan-review + ${primary} plan revision + implement + open PR`);
+      return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] planning + plan-review" };
+    }
+
+    const hooks = makeFreeformPlanningHooks(cfg, title, body);
+    return await runPlanningPhases(cfg, issueNumber, title, body, pipelineRunId, opts, hooks);
+  } finally {
+    clearLivePlanningMarker(cfg.repo, issueNumber);
   }
-
-  const detail = await getIssueDetail(cfg, issueNumber);
-  const title = detail.title;
-  const body = detail.body;
-
-  const primary: Harness = cfg.harnesses.implementer;
-  // `reviewer` may be a custom reviewer CLI (`review_harness`, #40), so it is a
-  // `string`; the implementer fallback (`primary`) is always a built-in Harness.
-  const reviewer: string = cfg.harnesses.reviewer;
-  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
-
-  console.log(`[pipeline] #${issueNumber}: planning (impl=${primary}, plan-review=${reviewer})`);
-
-  if (opts.dryRun) {
-    console.log(`[pipeline] #${issueNumber}: [dry-run] would plan + ${reviewer} plan-review + ${primary} plan revision + implement + open PR`);
-    return { advanced: true, from: "ready", to: "review-1", summary: "[dry-run] planning + plan-review" };
-  }
-
-  const hooks = makeFreeformPlanningHooks(cfg, title, body);
-  return runPlanningPhases(cfg, issueNumber, title, body, pipelineRunId, opts, hooks);
 }
 
 // ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@ import {
   silentTransition,
   transition,
 } from "./gh.ts";
-import { isKillSwitchActive, runStateDir, withLock } from "./lock.ts";
+import { isKillSwitchActive, isLivePlanningActive, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
@@ -2503,10 +2503,12 @@ async function notifyBundlePath(
 export interface PlanningRecoveryDeps {
   transition: typeof transition;
   planningAdvance: typeof planningStage.advance;
+  /** Check if a live planning process is active for this repo+issue (repo-stable). */
+  isLivePlanningActive?: (repo: string, issueNumber: number) => boolean;
 }
 
 function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
-  return { transition, planningAdvance: planningStage.advance };
+  return { transition, planningAdvance: planningStage.advance, isLivePlanningActive };
 }
 
 async function dispatch(
@@ -2563,11 +2565,21 @@ async function dispatch(
       };
     case "planning":
     case "plan-review": {
-      // The per-issue lock is already held by the current process when dispatch is
-      // entered. A genuine concurrent run would have failed at lock acquisition before
-      // reaching here. Therefore, seeing planning or plan-review at this point always
-      // means a prior run crashed mid-flight. Roll back to ready and restart planning.
+      // The per-issue lock (domain-scoped) is already held by this process.  A
+      // concurrent run with the SAME domain would have failed at lock acquisition.
+      // However, a run from a different worktree or --domain value holds a different
+      // lock file and can reach dispatch simultaneously.  To distinguish a live
+      // cross-domain run from a crash-stranded one, check the repo-stable
+      // live-planning marker (#271 review-2 finding 1).
       const deps = recoveryDeps ?? realPlanningRecoveryDeps();
+      const checkLive = deps.isLivePlanningActive ?? isLivePlanningActive;
+      if (checkLive(cfg.repo, issueNumber)) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `planning is active under a different domain — waiting for it to complete`,
+        };
+      }
       console.log(
         `[pipeline] #${issueNumber}: recovered stranded planning attempt — restarting from ready`,
       );

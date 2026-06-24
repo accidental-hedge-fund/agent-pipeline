@@ -219,3 +219,82 @@ test("planning crash recovery: dry-run does not call transition for plan-review"
   assert.equal(planningCalled, 1, "dry-run must still call planningAdvance");
   assert.ok(out !== undefined, "dry-run must return an outcome");
 });
+
+// ---------------------------------------------------------------------------
+// Cross-domain/worktree guard (#271 review-2 finding 1)
+//
+// Two processes with different --domain values (different worktree basenames)
+// each acquire their own domain-scoped lock.  If process A is actively planning,
+// its live-planning marker must prevent process B from treating the planning
+// label as crash-stranded and rolling back A's in-flight work.
+// ---------------------------------------------------------------------------
+
+test("planning crash recovery: live marker from another domain prevents rollback", async () => {
+  const cfg = makeCfg();
+  const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const crossDomainDeps: PlanningRecoveryDeps = {
+    ...deps,
+    // Simulate another process actively holding the repo-stable marker.
+    isLivePlanningActive: (_repo: string, _issueNumber: number) => true,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
+
+  assert.equal(
+    (out as { status?: string }).status,
+    "waiting",
+    "when live marker is set by another process, dispatch must return waiting",
+  );
+  assert.equal(transitionCalls.length, 0, "must not roll back when live planning is active");
+  assert.equal(planningCalled, 0, "must not call planningAdvance when live planning is active");
+});
+
+test("planning crash recovery: live marker from another domain prevents rollback for plan-review", async () => {
+  const cfg = makeCfg();
+  const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const crossDomainDeps: PlanningRecoveryDeps = {
+    ...deps,
+    isLivePlanningActive: (_repo: string, _issueNumber: number) => true,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, crossDomainDeps);
+
+  assert.equal(
+    (out as { status?: string }).status,
+    "waiting",
+    "when live marker is set by another process, plan-review dispatch must return waiting",
+  );
+  assert.equal(transitionCalls.length, 0, "must not roll back when live planning is active");
+  assert.equal(planningCalled, 0, "must not call planningAdvance when live planning is active");
+});
+
+test("planning crash recovery: absent live marker still triggers recovery (crash-stranded path)", async () => {
+  const cfg = makeCfg();
+  const { deps, transitionCalls } = makeDeps(ADVANCING_OUTCOME);
+  let planningCalled = 0;
+  const noliveMarkerDeps: PlanningRecoveryDeps = {
+    ...deps,
+    // Explicitly return false: no live process, marker is absent/stale.
+    isLivePlanningActive: (_repo: string, _issueNumber: number) => false,
+    planningAdvance: async (c, n, o) => {
+      planningCalled++;
+      return deps.planningAdvance(c, n, o);
+    },
+  };
+
+  const out = await dispatch(cfg, ISSUE, "planning", OPTS, RUN_ID, undefined, undefined, undefined, noliveMarkerDeps);
+
+  assert.equal(out.advanced, true, "absent live marker must trigger recovery and advance");
+  assert.equal(transitionCalls.length, 1, "must call transition to roll back to ready");
+  assert.equal(planningCalled, 1, "must call planningAdvance to restart");
+});
