@@ -7,6 +7,7 @@
 import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
+import { type BlockerKind } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Taxonomy
@@ -167,4 +168,43 @@ export function summarizeInterventions(
   }
 
   return { total: items.length, byKind, items };
+}
+
+// ---------------------------------------------------------------------------
+// Blocker-kind mapping
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a `BlockerKind` value to the closest `HumanInterventionKind` for emission
+ * at the common `blocker_set` orchestrator point. Guarantees ordering:
+ * `blocker_set` is written first by the orchestrator, then this function is
+ * called to emit the `human_intervention` event immediately after.
+ */
+export function blockerKindToInterventionKind(kind: BlockerKind): HumanInterventionKind {
+  switch (kind) {
+    case "test-gate-exhausted":
+    case "no-commits":
+    case "push-failed":
+      return "test-build-failure";
+    case "eval-gate-failed":
+    case "eval-gate-misconfigured":
+      return "eval-shipcheck-failure";
+    case "merge-conflict":
+      return "merge-conflict-or-branch-drift";
+    case "worktree-missing":
+    case "worktree-creation-failed":
+    case "worktree-setup-failed":
+    case "pr-creation-failed":
+    case "plan-gen-failed":
+      return "auth-tooling-preflight-failure";
+    case "harness-failure":
+      return "reviewer-unavailable";
+    case "openspec-invalid":
+    case "openspec-stale-delta":
+    case "no-pull-request":
+    case "needs-human":
+      return "product-judgment-required";
+    default:
+      return "unknown";
+  }
 }

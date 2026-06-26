@@ -58,7 +58,6 @@ import * as openspec from "../openspec.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
-import { emitHumanIntervention } from "../intervention.ts";
 import type { RunStoreDeps } from "../run-store.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
@@ -378,12 +377,6 @@ export async function advance(
     }
     const mergeConflictMsg = "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.";
     await setBlockedFn(cfg, issueNumber, mergeConflictMsg, "pre-merge", "merge-conflict");
-    await emitHumanIntervention(opts.runDir, {
-      kind: "merge-conflict-or-branch-drift",
-      stage: "pre-merge",
-      issue: issueNumber,
-      detail: mergeConflictMsg,
-    }, opts.runStoreDeps).catch(() => {});
     return { advanced: false, status: "blocked", reason: "branch behind base" };
   }
   if (freshState === "BLOCKED") {

@@ -20,7 +20,6 @@ import {
 import { runCapped } from "../harness.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
-import { emitHumanIntervention } from "../intervention.ts";
 import type { RunStoreDeps } from "../run-store.ts";
 
 /** Next stage after eval-gate: shipcheck-gate when opted in, else ready-to-deploy. */
@@ -274,12 +273,6 @@ export async function advanceEval(
     "eval-gate",
     "eval-gate-failed",
   );
-  await emitHumanIntervention(opts.runDir, {
-    kind: "eval-shipcheck-failure",
-    stage: "eval-gate",
-    issue: issueNumber,
-    detail: evalFailDetail,
-  }, opts.runStoreDeps).catch(() => {});
   return { advanced: false, status: "blocked", reason: `eval gate failed${attempts}`, blockerKind: "eval-gate-failed" };
 }
 

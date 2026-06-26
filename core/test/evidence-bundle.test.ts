@@ -346,6 +346,18 @@ test("recordOverride: appends an override disposition", async () => {
   assert.deepEqual(b.overrides, [{ key: "abc12345", reason: "out of scope for this issue" }]);
 });
 
+// Regression for #302 Finding 3: operator overrides must carry kind: "human-risk-override".
+test("recordOverride: override record with kind:human-risk-override persists the kind field", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  await recordOverride(STATE, ISSUE, { key: "abc12345", reason: "accepted risk", kind: "human-risk-override" }, deps);
+  const b = readState(files);
+  assert.equal(b.overrides.length, 1);
+  assert.equal(b.overrides[0].kind, "human-risk-override");
+  assert.equal(b.overrides[0].key, "abc12345");
+  assert.equal(b.overrides[0].reason, "accepted risk");
+});
+
 test("recordRecovery: appends a recovery event", async () => {
   const { files, deps } = memFs();
   await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);

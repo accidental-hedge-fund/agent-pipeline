@@ -91,7 +91,7 @@ import * as evalStage from "./stages/eval.ts";
 import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
-import { emitHumanIntervention } from "./intervention.ts";
+import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
   formatDoctorJson,
   formatDoctorSummary,
@@ -2099,6 +2099,7 @@ async function runAdvance(
           await recordOverride(stateDir, issueNumber, {
             key: parsedOverride.key,
             reason: parsedOverride.reason,
+            kind: "human-risk-override",
           }).catch(() => {});
           await emitHumanIntervention(runDir, {
             kind: "human-risk-override",
@@ -2431,6 +2432,12 @@ async function runAdvance(
           // Not eligible or no rounds spent: stop as today.
           if (out.status === "blocked" && runDir) {
             await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+            await emitHumanIntervention(runDir, {
+              kind: blockerKindToInterventionKind(out.blockerKind ?? "needs-human"),
+              stage: auditStage,
+              issue: issueNumber,
+              detail: out.reason,
+            }, runStoreDeps).catch(() => {});
           }
         }
         break;

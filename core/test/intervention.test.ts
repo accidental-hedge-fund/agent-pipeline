@@ -10,8 +10,10 @@ import {
   type HumanInterventionEvent,
   emitHumanIntervention,
   summarizeInterventions,
+  blockerKindToInterventionKind,
   type EmitInterventionDeps,
 } from "../scripts/intervention.ts";
+import { BLOCKER_KINDS } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // 4.1 Taxonomy — all 11 members present and unique
@@ -363,4 +365,32 @@ test("runImprove --interventions: exits early without cluster analysis", async (
   assert.equal(written.length, 1);
   const summary = JSON.parse(written[0]);
   assert.ok("total" in summary, "expected InterventionSummary shape");
+});
+
+// ---------------------------------------------------------------------------
+// blockerKindToInterventionKind — every BlockerKind maps to a valid HumanInterventionKind
+// ---------------------------------------------------------------------------
+
+test("blockerKindToInterventionKind: every BlockerKind maps to a known HumanInterventionKind", () => {
+  for (const kind of BLOCKER_KINDS) {
+    const mapped = blockerKindToInterventionKind(kind);
+    assert.ok(
+      HUMAN_INTERVENTION_KINDS.includes(mapped),
+      `BlockerKind "${kind}" maps to unknown kind "${mapped}"`,
+    );
+  }
+});
+
+test("blockerKindToInterventionKind: specific mappings are stable", () => {
+  assert.equal(blockerKindToInterventionKind("test-gate-exhausted"), "test-build-failure");
+  assert.equal(blockerKindToInterventionKind("eval-gate-failed"), "eval-shipcheck-failure");
+  assert.equal(blockerKindToInterventionKind("eval-gate-misconfigured"), "eval-shipcheck-failure");
+  assert.equal(blockerKindToInterventionKind("merge-conflict"), "merge-conflict-or-branch-drift");
+  assert.equal(blockerKindToInterventionKind("worktree-missing"), "auth-tooling-preflight-failure");
+  assert.equal(blockerKindToInterventionKind("worktree-creation-failed"), "auth-tooling-preflight-failure");
+  assert.equal(blockerKindToInterventionKind("worktree-setup-failed"), "auth-tooling-preflight-failure");
+  assert.equal(blockerKindToInterventionKind("harness-failure"), "reviewer-unavailable");
+  assert.equal(blockerKindToInterventionKind("needs-human"), "product-judgment-required");
+  assert.equal(blockerKindToInterventionKind("push-failed"), "test-build-failure");
+  assert.equal(blockerKindToInterventionKind("no-commits"), "test-build-failure");
 });

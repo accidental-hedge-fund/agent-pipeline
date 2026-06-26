@@ -335,12 +335,6 @@ export async function advanceReview(
         `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
       : `Review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
     await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
-    await emitHumanIntervention(opts.runDir, {
-      kind: "reviewer-unavailable",
-      stage,
-      issue: issueNumber,
-      detail: detailMsg,
-    }, opts.runStoreDeps).catch(() => {});
     return { advanced: false, status: "blocked", reason };
   }
 
