@@ -96,6 +96,13 @@ test("normalizeSignal: merges findings differing only by line number", () => {
   assert.equal(a, b);
 });
 
+test("normalizeSignal: merges findings differing only by space-separated line number", () => {
+  const a = normalizeSignal("Null check missing at line 42");
+  const b = normalizeSignal("Null check missing at line 107");
+  assert.equal(a, b);
+  assert.ok(!a.includes("42") && !a.includes("107"), `normalized form still contains line number: ${a}`);
+});
+
 // ---------------------------------------------------------------------------
 // 2.2 discoverRuns
 // ---------------------------------------------------------------------------

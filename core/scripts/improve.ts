@@ -62,7 +62,7 @@ async function* realReadLines(p: string): AsyncIterable<string> {
   }
 }
 
-export function realImproveDeps(): ImproveDeps {
+export function realImproveDeps(repoDir: string): ImproveDeps {
   return {
     readFile: (p) => fsp.readFile(p, "utf8"),
     readLines: (p) => realReadLines(p),
@@ -73,6 +73,7 @@ export function realImproveDeps(): ImproveDeps {
     createIssue: async (title, body) => {
       const r = spawnSync("gh", ["issue", "create", "--title", title, "--body", body], {
         encoding: "utf8",
+        cwd: repoDir,
       });
       if (r.status !== 0) {
         throw new Error(`gh issue create failed: ${r.stderr?.trim() ?? "unknown error"}`);
@@ -80,7 +81,7 @@ export function realImproveDeps(): ImproveDeps {
       return (r.stdout ?? "").trim();
     },
     ghAuthCheck: async () => {
-      const r = spawnSync("gh", ["auth", "status"], { encoding: "utf8" });
+      const r = spawnSync("gh", ["auth", "status"], { encoding: "utf8", cwd: repoDir });
       return r.status === 0;
     },
     log: (msg) => process.stdout.write(msg + "\n"),
@@ -98,6 +99,7 @@ export function normalizeSignal(str: string): string {
     .toLowerCase()
     .replace(/\b[0-9a-f]{7,40}\b/g, "")
     .replace(/#\d+/g, "")
+    .replace(/\bline\s+\d+\b/g, "")
     .replace(/:\d+/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -482,7 +484,15 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
   const entries = clustersToEntries(clusters, top);
 
   if (opts.apply) {
-    await applyIssues(entries, { minOccurrences: minOcc }, deps);
+    const applyDeps: Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "log"> = opts.json
+      ? { createIssue: deps.createIssue, ghAuthCheck: deps.ghAuthCheck, log: (msg) => { process.stderr.write(msg + "\n"); } }
+      : deps;
+    await applyIssues(entries, { minOccurrences: minOcc }, applyDeps);
+    if (opts.json) {
+      for (const e of entries) {
+        if (e.issueUrl === undefined) e.issueUrl = null;
+      }
+    }
   }
 
   if (opts.json) {

@@ -688,7 +688,7 @@ async function main(): Promise<void> {
           json: !!opts.json,
           repoDir,
         },
-        realImproveDeps(),
+        realImproveDeps(repoDir),
       );
     } catch (err) {
       console.error(`pipeline improve: ${(err as Error).message}`);
