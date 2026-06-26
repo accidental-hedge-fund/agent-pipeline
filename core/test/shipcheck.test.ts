@@ -216,6 +216,8 @@ test("shipcheck-gate: gate mode + fail verdict → setBlocked, no forward transi
 
   assert.equal(out.advanced, false);
   assert.equal((out as { status: string }).status, "blocked");
+  // Regression for #302 review-2: fail verdict must emit eval-shipcheck-failure, not needs-human.
+  assert.equal((out as { blockerKind: string }).blockerKind, "eval-gate-failed", "fail verdict blockerKind must be eval-gate-failed");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0);
   assert.equal(log.comments.length, 1);
@@ -243,6 +245,8 @@ test("shipcheck-gate: gate mode + partial verdict + block_on_partial:true → bl
 
   assert.equal(out.advanced, false);
   assert.equal((out as { status: string }).status, "blocked");
+  // Regression for #302 review-2: partial verdict must emit eval-gate-failed, not needs-human.
+  assert.equal((out as { blockerKind: string }).blockerKind, "eval-gate-failed", "partial verdict blockerKind must be eval-gate-failed");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0);
   assert.equal(log.comments.length, 1);

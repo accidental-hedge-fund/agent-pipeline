@@ -377,7 +377,7 @@ export async function advance(
     }
     const mergeConflictMsg = "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.";
     await setBlockedFn(cfg, issueNumber, mergeConflictMsg, "pre-merge", "merge-conflict");
-    return { advanced: false, status: "blocked", reason: "branch behind base" };
+    return { advanced: false, status: "blocked", reason: mergeConflictMsg, blockerKind: "merge-conflict" };
   }
   if (freshState === "BLOCKED") {
     return { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" };
@@ -1266,8 +1266,9 @@ export async function enforceSpecConsistencyGuard(
   const reviewBody = latestReviewBody(detail.comments);
   if (!reviewBody || !reviewCommentFlagsSpecDivergence(reviewBody)) return null;
 
-  await deps.setBlocked(cfg, issueNumber, staleSpecDeltaBlockReason(stale), "pre-merge", "openspec-stale-delta");
-  return { advanced: false, status: "blocked", reason: `stale OpenSpec delta (${stale})` };
+  const staleMsg = staleSpecDeltaBlockReason(stale);
+  await deps.setBlocked(cfg, issueNumber, staleMsg, "pre-merge", "openspec-stale-delta");
+  return { advanced: false, status: "blocked", reason: staleMsg, blockerKind: "openspec-stale-delta" };
 }
 
 /**

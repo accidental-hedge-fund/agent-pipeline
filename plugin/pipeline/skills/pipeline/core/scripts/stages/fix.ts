@@ -54,6 +54,8 @@ export interface AdvanceFixDeps {
   openspecValidateItem?: (wtPath: string, id: string) => Promise<ValidateResult>;
   /** Format/lint gate runner (#182); defaults to runFormatGate. */
   runFormatGate?: typeof runFormatGate;
+  /** Format+test gate runner (defaults to runFormatAndTestGates); injectable for tests. */
+  _runFormatAndTestGates?: typeof runFormatAndTestGates;
 }
 
 export async function advanceFix(
@@ -72,7 +74,7 @@ export async function advanceFix(
   const wt = await getOnDiskForIssue(cfg, issueNumber);
   if (!wt) {
     await setBlocked(cfg, issueNumber, "No worktree found. Cannot apply fixes.", stage, "worktree-missing");
-    return { advanced: false, status: "blocked", reason: "no worktree" };
+    return { advanced: false, status: "blocked", reason: "No worktree found. Cannot apply fixes.", blockerKind: "worktree-missing" };
   }
 
   const detail = await getIssueDetail(cfg, issueNumber);
@@ -170,14 +172,9 @@ export async function advanceFix(
       fixSalvageStageLabel(round, issueNumber),
     );
     if (!salvaged) {
-      await setBlocked(
-        cfg,
-        issueNumber,
-        `${stage} reported success but produced no new commits.`,
-        stage,
-        "no-commits",
-      );
-      return { advanced: false, status: "blocked", reason: "no new commits" };
+      const noCommitsMsg = `${stage} reported success but produced no new commits.`;
+      await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
+      return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
     }
     headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   }
@@ -209,29 +206,24 @@ export async function advanceFix(
   // produces a new commit, so the pushed fix state is simultaneously formatted
   // and tested — no auto-format commit ships untested, no test-fix commit unformatted.
   const fmtGateFn = deps.runFormatGate ?? runFormatGate;
-  const gates = await runFormatAndTestGates(
+  const gatesRunner = deps._runFormatAndTestGates ?? runFormatAndTestGates;
+  const gates = await gatesRunner(
     cfg, issueNumber, wt.path, stage, pipelineRunId, opts.stateDir,
     { runFormatGate: fmtGateFn },
   );
   if (!gates.ok) {
-    await setBlocked(
-      cfg, issueNumber, gates.reason, stage,
-      gates.source === "test" ? "test-gate-exhausted" : "needs-human",
-    );
-    return { advanced: false, status: "blocked", reason: gates.reason };
+    await setBlocked(cfg, issueNumber, gates.reason, stage,
+      gates.source === "test" ? "test-gate-exhausted" : "needs-human");
+    return { advanced: false, status: "blocked", reason: gates.reason,
+      blockerKind: gates.source === "test" ? "test-gate-exhausted" : "needs-human" };
   }
 
   const branch = branchName(issueNumber, wt.slug);
   const push = await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
   if (push.code !== 0) {
-    await setBlocked(
-      cfg,
-      issueNumber,
-      `Git push failed after fix: ${push.stderr.trim()}`,
-      stage,
-      "push-failed",
-    );
-    return { advanced: false, status: "blocked", reason: "push failed" };
+    const pushFailedMsg = `Git push failed after fix: ${push.stderr.trim()}`;
+    await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
+    return { advanced: false, status: "blocked", reason: pushFailedMsg, blockerKind: "push-failed" };
   }
 
   if (round === 1) {

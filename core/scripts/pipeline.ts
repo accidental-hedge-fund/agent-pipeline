@@ -2096,8 +2096,11 @@ async function runAdvance(
       if (opts.override) {
         const parsedOverride = parseOverrideArg(opts.override);
         if (!("error" in parsedOverride)) {
+          const overrideRef = parsedOverride.kind === "key"
+            ? parsedOverride.key
+            : `${parsedOverride.scopeType}:${parsedOverride.scopeValue}`;
           await recordOverride(stateDir, issueNumber, {
-            key: parsedOverride.key,
+            key: overrideRef,
             reason: parsedOverride.reason,
             kind: "human-risk-override",
           }).catch(() => {});
@@ -2105,7 +2108,8 @@ async function runAdvance(
             kind: "human-risk-override",
             stage: null,
             issue: issueNumber,
-            detail: `override applied: ${parsedOverride.key} — ${parsedOverride.reason}`,
+            detail: `override applied: ${overrideRef} — ${parsedOverride.reason}`,
+            ref: overrideRef,
           }, runStoreDeps).catch(() => {});
         }
       }
@@ -2420,6 +2424,14 @@ async function runAdvance(
                 cfg.marker_footer,
               ].join("\n"),
             ).catch(() => {});
+            if (runDir) {
+              await emitHumanIntervention(runDir, {
+                kind: blockerKindToInterventionKind(out.status === "blocked" ? (out.blockerKind ?? "needs-human") : "needs-human"),
+                stage: auditStage,
+                issue: issueNumber,
+                detail: `auto-loop budget exhausted after ${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds} rounds: ${out.reason}`,
+              }, runStoreDeps).catch(() => {});
+            }
             if (stateDir) {
               await recordRecovery(stateDir, issueNumber, {
                 trigger: "bounded-auto-loop:exhausted",

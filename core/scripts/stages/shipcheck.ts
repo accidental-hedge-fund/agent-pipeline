@@ -393,8 +393,8 @@ export async function advance(
   if (verdict.verdict === "partial") {
     if (cfg.shipcheck_gate.block_on_partial) {
       console.log(`[pipeline] #${issueNumber}: shipcheck-gate partial verdict + block_on_partial; blocking`);
-      await setBlockedFn(cfg, issueNumber, `Shipcheck gate: partial verdict.\n\n${verdict.summary}`, "shipcheck-gate", "needs-human" as BlockerKind);
-      return { advanced: false, status: "blocked", reason: "shipcheck partial verdict", blockerKind: "needs-human" as BlockerKind };
+      await setBlockedFn(cfg, issueNumber, `Shipcheck gate: partial verdict.\n\n${verdict.summary}`, "shipcheck-gate", "eval-gate-failed" as BlockerKind);
+      return { advanced: false, status: "blocked", reason: "shipcheck partial verdict", blockerKind: "eval-gate-failed" as BlockerKind };
     }
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate partial verdict (block_on_partial=false); advancing`);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck partial verdict (block_on_partial: false).");
@@ -403,8 +403,8 @@ export async function advance(
 
   // Fail verdict in gate mode.
   console.log(`[pipeline] #${issueNumber}: shipcheck-gate failed (gate mode); blocking`);
-  await setBlockedFn(cfg, issueNumber, `Shipcheck gate failed.\n\n${verdict.summary}`, "shipcheck-gate", "needs-human" as BlockerKind);
-  return { advanced: false, status: "blocked", reason: "shipcheck fail verdict", blockerKind: "needs-human" as BlockerKind };
+  await setBlockedFn(cfg, issueNumber, `Shipcheck gate failed.\n\n${verdict.summary}`, "shipcheck-gate", "eval-gate-failed" as BlockerKind);
+  return { advanced: false, status: "blocked", reason: "shipcheck fail verdict", blockerKind: "eval-gate-failed" as BlockerKind };
 }
 
 // ---------------------------------------------------------------------------

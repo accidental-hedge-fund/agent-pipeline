@@ -215,11 +215,11 @@ test("BEHIND with rebase marker present blocks with a behind-specific reason, no
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(
-    out,
-    { advanced: false, status: "blocked", reason: "branch behind base" },
-    "marker-present BEHIND must block with behind-specific reason, not merge-conflict reason",
-  );
+  const blockedOut = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
+  assert.equal(blockedOut.status, "blocked", "marker-present BEHIND must block");
+  assert.match(blockedOut.reason, /behind/, "blocked reason must mention 'behind'");
+  assert.doesNotMatch(blockedOut.reason, /merge conflict/, "blocked reason must NOT say 'merge conflict'");
+  assert.equal(blockedOut.blockerKind, "merge-conflict", "blockerKind must be merge-conflict");
   assert.equal(rec.blocked.length, 1, "must call setBlocked exactly once");
   assert.match(rec.blocked[0], /behind/, "block reason must mention 'behind'");
   assert.doesNotMatch(rec.blocked[0], /merge conflict/, "block reason must NOT mention 'merge conflict'");
@@ -243,7 +243,11 @@ test("post-CI BEHIND invokes tryRebaseAndPush instead of returning waiting indef
   assert.equal(rec.ciPolls, 1, "must still poll CI — BEHIND does not bypass early-conflict check");
   assert.equal(rec.rebaseCalls, 1, "BEHIND must invoke tryRebaseAndPush");
   assert.deepEqual(rec.marked, [], "failed rebase must not mark as attempted");
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "branch behind base" });
+  const blockedOut2 = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
+  assert.equal(blockedOut2.status, "blocked");
+  assert.match(blockedOut2.reason, /behind/);
+  assert.doesNotMatch(blockedOut2.reason, /merge conflict/);
+  assert.equal(blockedOut2.blockerKind, "merge-conflict");
   assert.equal(rec.blocked.length, 1);
   assert.match(rec.blocked[0], /behind/, "block message must name the root cause");
   assert.doesNotMatch(rec.blocked[0], /merge conflict/, "must not use merge-conflict wording for an out-of-date branch");
