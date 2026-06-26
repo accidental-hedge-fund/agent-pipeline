@@ -240,6 +240,12 @@ export interface CliOpts {
   removeWorktree?: boolean;
   /** Modifier for --remove-worktree: remove despite uncommitted changes. */
   force?: boolean;
+  /** improve: restrict analysis to runs on or after this ISO date. */
+  since?: string;
+  /** improve: emit top-N clusters in the report (default 5). */
+  top?: number;
+  /** improve: only report clusters with at least this many occurrences (default 3). */
+  minOccurrences?: number;
 }
 
 /**
@@ -255,7 +261,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -288,10 +294,13 @@ export function buildCmd(): Command {
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap/sweep: execute GitHub write-backs (issue updates, roadmap PR); default is dry-run")
+    .option("--apply", "roadmap/sweep/improve: execute GitHub write-backs (issue updates, roadmap PR, improve issues); default is dry-run")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
+    .option("--since <date>", "improve: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
+    .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
+    .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
     .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
@@ -320,6 +329,24 @@ async function main(): Promise<void> {
       "  --repo-path <path>  override the target repo working tree\n\n" +
       'Output: { "title": string, "body": string, "milestone": string|null }\n' +
       "Exit code: 0 on success, non-zero on harness failure or missing --title/--body.\n",
+    );
+    process.exit(0);
+  }
+  if (rawArgs[0] === "improve" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
+    process.stdout.write(
+      "Usage: pipeline improve [--apply] [--top <n>] [--since <date>] [--min-occurrences <n>] [--json]\n\n" +
+      "Read-only analyzer: reads .agent-pipeline/runs/**/events.jsonl and summary.json,\n" +
+      "clusters recurring failure patterns (review findings, blockers, flaky gates, token waste),\n" +
+      "and prints a dry-run report. With --apply, creates GitHub issues for the top clusters.\n\n" +
+      "Options:\n" +
+      "  --apply                   create GitHub issues for top-N qualifying clusters\n" +
+      "  --top <n>                 emit top-N clusters in the report (default: 5)\n" +
+      "  --since <date>            restrict to runs on or after this ISO date (e.g. 2026-06-01)\n" +
+      "  --min-occurrences <n>     --apply threshold: skip clusters below this count (default: 3)\n" +
+      "  --json                    emit a JSON array instead of the Markdown-ish report\n" +
+      "  --repo-path <path>        override the target repo working tree\n\n" +
+      "The command never modifies pipeline labels, branches, PRs, worktrees, or repo files.\n" +
+      "Exit code: 0 always (even when no run data is found).\n",
     );
     process.exit(0);
   }
@@ -428,8 +455,9 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   // `pipeline path --json`, `pipeline config validate --json`, `pipeline refine-spec --json`,
-  // and `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec") {
+  // `pipeline improve --json`, and `--remove-worktree --json` legitimately emit JSON —
+  // exempt from the status-only guard.
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -644,6 +672,31 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early improve dispatch — no issue number, no config resolution required.
+  // Read-only by default; --apply creates GitHub issues via gh issue create only.
+  if (numArg === "improve") {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    const { runImprove, realImproveDeps } = await import("./improve.ts");
+    try {
+      await runImprove(
+        {
+          apply: !!opts.apply,
+          top: opts.top,
+          since: opts.since,
+          minOccurrences: opts.minOccurrences,
+          json: !!opts.json,
+          repoDir,
+        },
+        realImproveDeps(repoDir),
+      );
+    } catch (err) {
+      console.error(`pipeline improve: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early roadmap dispatch — no issue number, derives repo/config from local git state.
   if (numArg === "roadmap") {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
@@ -801,7 +854,7 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
