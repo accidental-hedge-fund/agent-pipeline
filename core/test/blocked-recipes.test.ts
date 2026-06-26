@@ -131,6 +131,11 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
+  "shipcheck-failed":
+    "The shipcheck gate returned a failing or partial verdict (see the shipcheck " +
+    "comment above for the specific concerns). Address the flagged concerns in " +
+    "the worktree and commit the fix, remove the `blocked` label, then re-run " +
+    "`$pipeline 7`.",
   "worktree-setup-failed":
     "The worktree dependency install step failed (see the error above). " +
     "Fix the root cause (package manager not installed, bad lockfile, network " +
@@ -255,6 +260,20 @@ test("eval-gate-misconfigured directs to set the command, clear label, re-run", 
 test("eval-gate-failed directs to fix evals, commit, clear label, re-run", () => {
   const body = comment("eval-gate-failed");
   assert.ok(body.includes("eval"));
+  assert.ok(body.includes("commit"));
+  assert.ok(body.includes("`blocked`"));
+  assert.ok(body.includes("re-run `$pipeline 7`"));
+  assert.ok(!body.includes("--unblock"));
+});
+
+// shipcheck-failed is a distinct kind from eval-gate-failed (#302 pre-merge
+// review): it must describe the shipcheck verdict, not direct the operator to
+// "fix the failing evals" (the misleading recipe that reusing eval-gate-failed
+// produced), while still mapping to the eval-shipcheck-failure taxonomy.
+test("shipcheck-failed directs to address shipcheck concerns, commit, clear label, re-run — not 'evals'", () => {
+  const body = comment("shipcheck-failed");
+  assert.ok(body.includes("shipcheck"), "must name the shipcheck gate");
+  assert.ok(!body.includes("eval"), "must not tell the operator to fix evals");
   assert.ok(body.includes("commit"));
   assert.ok(body.includes("`blocked`"));
   assert.ok(body.includes("re-run `$pipeline 7`"));

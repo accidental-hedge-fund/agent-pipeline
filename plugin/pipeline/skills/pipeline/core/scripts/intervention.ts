@@ -188,6 +188,7 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
       return "test-build-failure";
     case "eval-gate-failed":
     case "eval-gate-misconfigured":
+    case "shipcheck-failed":
       return "eval-shipcheck-failure";
     case "merge-conflict":
       return "merge-conflict-or-branch-drift";

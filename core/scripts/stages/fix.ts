@@ -58,6 +58,18 @@ export interface AdvanceFixDeps {
   _runFormatAndTestGates?: typeof runFormatAndTestGates;
 }
 
+/**
+ * Blocked Outcome for a fix-harness invocation failure (#302). Carries
+ * `blockerKind: "harness-failure"` so the run-artifact emitter records the
+ * intervention as `reviewer-unavailable` rather than falling back to the
+ * `needs-human` → `product-judgment-required` default. Shared with the unit
+ * test so the propagation is verified through the real construction, not a
+ * re-implementation in the test body.
+ */
+export function fixHarnessFailureOutcome(reason: string): Outcome {
+  return { advanced: false, status: "blocked", reason, blockerKind: "harness-failure" };
+}
+
 export async function advanceFix(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -157,7 +169,7 @@ export async function advanceFix(
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
     await setBlocked(cfg, issueNumber, `Fix harness (${harness}) failed: ${reason}`, stage, "harness-failure");
-    return { advanced: false, status: "blocked", reason };
+    return fixHarnessFailureOutcome(reason);
   }
 
   let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();

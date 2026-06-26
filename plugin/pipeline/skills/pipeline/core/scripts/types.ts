@@ -58,6 +58,7 @@ export const BLOCKER_KINDS = [
   "push-failed",
   "eval-gate-misconfigured",
   "eval-gate-failed",
+  "shipcheck-failed",
   "worktree-setup-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
@@ -143,6 +144,11 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
   "eval-gate-failed":
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "shipcheck-failed":
+    "The shipcheck gate returned a failing or partial verdict (see the shipcheck " +
+    "comment above for the specific concerns). Address the flagged concerns in " +
+    "the worktree and commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
   "worktree-setup-failed":
     "The worktree dependency install step failed (see the error above). " +

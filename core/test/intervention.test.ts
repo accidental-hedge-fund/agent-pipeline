@@ -385,6 +385,7 @@ test("blockerKindToInterventionKind: specific mappings are stable", () => {
   assert.equal(blockerKindToInterventionKind("test-gate-exhausted"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("eval-gate-failed"), "eval-shipcheck-failure");
   assert.equal(blockerKindToInterventionKind("eval-gate-misconfigured"), "eval-shipcheck-failure");
+  assert.equal(blockerKindToInterventionKind("shipcheck-failed"), "eval-shipcheck-failure");
   assert.equal(blockerKindToInterventionKind("merge-conflict"), "merge-conflict-or-branch-drift");
   assert.equal(blockerKindToInterventionKind("worktree-missing"), "auth-tooling-preflight-failure");
   assert.equal(blockerKindToInterventionKind("worktree-creation-failed"), "auth-tooling-preflight-failure");
@@ -403,7 +404,7 @@ test("blockerKindToInterventionKind: specific mappings are stable", () => {
 // The fix.ts advanceFix function now carries blockerKind in its blocked Outcome;
 // this test verifies the mapping chain: source="test" → blockerKind="test-gate-exhausted"
 // → intervention kind="test-build-failure".
-import { advanceFix, type AdvanceFixDeps } from "../scripts/stages/fix.ts";
+import { advanceFix, fixHarnessFailureOutcome, type AdvanceFixDeps } from "../scripts/stages/fix.ts";
 import type { FormatTestGateResult } from "../scripts/stages/format-gate.ts";
 
 test("advanceFix: test-gate failure returns blockerKind:test-gate-exhausted on blocked Outcome (regression #302-r2-f1)", async () => {
@@ -442,6 +443,27 @@ test("advanceFix: test-gate failure returns blockerKind:test-gate-exhausted on b
   assert.equal(blockerKindToInterventionKind("test-gate-exhausted"), "test-build-failure");
   void fakeGates; void fakeDepsForFix; // used above for type coverage
   void advanceFix; // imported for the dep type
+});
+
+// Pre-merge review finding 2 (#302): the fix-stage harness-failure path returned
+// a blocked Outcome WITHOUT blockerKind, so the run-artifact emitter fell back to
+// needs-human → product-judgment-required — mis-recording a harness crash/timeout
+// instead of reviewer-unavailable. Exercise the shared production helper directly
+// (not a re-implementation in the test body) and assert the full mapping chain.
+test("fixHarnessFailureOutcome: harness failure carries blockerKind:harness-failure → reviewer-unavailable (regression #302-pm-f2)", () => {
+  const out = fixHarnessFailureOutcome("timed out after 1200s");
+  assert.equal(out.advanced, false);
+  assert.equal(out.status === "blocked" ? out.status : "", "blocked");
+  assert.equal(
+    (out as { blockerKind?: string }).blockerKind,
+    "harness-failure",
+    "harness-failure path must propagate the blockerKind onto the Outcome",
+  );
+  assert.equal(
+    blockerKindToInterventionKind("harness-failure"),
+    "reviewer-unavailable",
+    "harness-failure must record as reviewer-unavailable, not the needs-human default",
+  );
 });
 
 // Finding 2: override intervention ref is set for both key and scoped overrides.

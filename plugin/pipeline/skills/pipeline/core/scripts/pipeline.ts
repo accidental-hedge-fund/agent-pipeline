@@ -137,8 +137,11 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
 
 /**
  * Decide whether the auto-loop should continue past this outcome at this stage.
- * `plan-review` is a human-feedback checkpoint and is never eligible even when
- * allowlisted, because its `waiting` return means "a human must review the plan".
+ * `plan-review` and `shipcheck-gate` are human-judgment checkpoints and are never
+ * eligible even when allowlisted: plan-review's `waiting` return means "a human
+ * must review the plan", and a shipcheck verdict failure must not be silently
+ * re-run on reviewer nondeterminism (#302) — a failed shipcheck requires a human
+ * disposition, not an automatic retry that could flip to pass on a later pass.
  */
 export function isAutoLoopEligible(
   out: Outcome,
@@ -147,7 +150,7 @@ export function isAutoLoopEligible(
 ): boolean {
   if (!autoLoop.enabled) return false;
   if (!isAutoLoopRecoverable(out)) return false;
-  if (stage === "plan-review") return false;
+  if (stage === "plan-review" || stage === "shipcheck-gate") return false;
   return (autoLoop.stages as string[]).includes(stage);
 }
 
