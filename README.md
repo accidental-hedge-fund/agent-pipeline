@@ -221,6 +221,9 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
 /pipeline roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
+/pipeline improve                             read run artifacts; print dry-run cluster report (no number; read-only)
+/pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
+/pipeline improve --top 10 --since 2026-06-01 --json  limit scope + emit JSON array of clusters
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
@@ -406,6 +409,25 @@ $pipeline merge 42
 If any gate fails the command exits non-zero with a clear, actionable message identifying the specific blocker — no merge is attempted.
 
 **Invariant:** no `auto_merge` config key exists and the autonomous `advance` loop never invokes this handler. A unit test asserts the loop-isolation guarantee.
+
+## Improve sub-command
+
+`pipeline improve` is a **read-only** batch analyzer that reads `.agent-pipeline/runs/**/events.jsonl` and `summary.json`, clusters recurring failure patterns (review findings, blockers, flaky gates, token waste), and prints a dry-run report. It never modifies pipeline labels, branches, PRs, worktrees, or repo files.
+
+```bash
+/pipeline improve                         # dry-run: print cluster report to stdout
+/pipeline improve --json                  # emit a JSON array of cluster objects
+/pipeline improve --since 2026-06-01      # restrict to runs from this date onward
+/pipeline improve --top 10               # show top-10 clusters instead of the default 5
+/pipeline improve --apply                 # create GitHub issues for clusters with ≥3 occurrences
+/pipeline improve --apply --min-occurrences 5  # raise the issue-creation threshold
+```
+
+**Cluster categories:** `review-finding` (same normalized finding title across runs), `blocker` (same normalized blocker reason), `flaky-gate` (same stage with repeated `outcome: error`), and `token-waste` (stages with anomalously high token count or duration, when data is available).
+
+**Output:** the default human-readable report lists category, normalized signal, occurrence count, affected run IDs, an evidence excerpt, and a proposed issue title. `--json` emits a JSON array with the same fields. When `--apply --json` are combined, each cluster object also includes the `issueUrl` of the created issue.
+
+**`--apply` safety:** only `gh issue create` is ever called — no label mutations, no branch writes, no pipeline state changes. Requires gh authentication; fails fast with a clear error if not authenticated.
 
 ## Onboarding a new repo
 
