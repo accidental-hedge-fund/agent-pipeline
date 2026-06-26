@@ -91,6 +91,7 @@ import * as evalStage from "./stages/eval.ts";
 import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
+import { emitHumanIntervention } from "./intervention.ts";
 import {
   formatDoctorJson,
   formatDoctorSummary,
@@ -246,6 +247,8 @@ export interface CliOpts {
   top?: number;
   /** improve: only report clusters with at least this many occurrences (default 3). */
   minOccurrences?: number;
+  /** improve: print an intervention summary (--interventions). */
+  interventions?: boolean;
 }
 
 /**
@@ -301,6 +304,7 @@ export function buildCmd(): Command {
     .option("--since <date>", "improve: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
+    .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
     .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
     .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
@@ -687,6 +691,7 @@ async function main(): Promise<void> {
           minOccurrences: opts.minOccurrences,
           json: !!opts.json,
           repoDir,
+          interventions: !!opts.interventions,
         },
         realImproveDeps(repoDir),
       );
@@ -2095,6 +2100,12 @@ async function runAdvance(
             key: parsedOverride.key,
             reason: parsedOverride.reason,
           }).catch(() => {});
+          await emitHumanIntervention(runDir, {
+            kind: "human-risk-override",
+            stage: null,
+            issue: issueNumber,
+            detail: `override applied: ${parsedOverride.key} — ${parsedOverride.reason}`,
+          }, runStoreDeps).catch(() => {});
         }
       }
     }
@@ -2603,9 +2614,9 @@ async function dispatch(
     case "review-2":
       return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "fix-1":
-      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir });
+      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "fix-2":
-      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir });
+      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "pre-merge":
       // Use the polling wrapper, not bare advance(). Bare advance returns
       // "waiting" after docs push / on pending CI / after rebase — that
@@ -2613,9 +2624,9 @@ async function dispatch(
       // exit the loop, requiring the user to re-invoke. Our skill is
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
-      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
+      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "eval-gate":
-      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir });
+      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir, runDir, runStoreDeps });
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":

@@ -15,6 +15,7 @@ import * as path from "node:path";
 import type { EvidenceBundle, ReviewFindingRecord } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import type { GhMetricsSummary } from "./gh.ts";
+import type { HumanInterventionEvent } from "./intervention.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -115,6 +116,8 @@ export interface GhMetricsSummaryEvent extends RunEventBase {
   slowest_calls: { category: string; elapsed_ms: number }[];
 }
 
+export type { HumanInterventionEvent };
+
 export type RunEvent =
   | RunStartEvent
   | RunCompleteEvent
@@ -127,7 +130,8 @@ export type RunEvent =
   | ReviewVerdictEvent
   | BlockerSetEvent
   | BlockerClearedEvent
-  | GhMetricsSummaryEvent;
+  | GhMetricsSummaryEvent
+  | HumanInterventionEvent;
 
 // ---------------------------------------------------------------------------
 // Deps — injectable I/O seam; unit tests inject in-memory fakes
@@ -362,12 +366,29 @@ export async function finalizeRun(
   };
   await appendEvent(runDir, completeEvent, deps);
 
+  // Collect human_intervention events from events.jsonl to embed in summary.json.
+  // Non-fatal: if the read fails, interventions is an empty array.
+  let interventions: HumanInterventionEvent[] = [];
+  try {
+    const eventsForSummary = await readEvents(runDir, deps);
+    interventions = eventsForSummary.filter(
+      (e): e is HumanInterventionEvent => e.type === "human_intervention",
+    );
+  } catch {
+    // Non-fatal: missing or unreadable events.jsonl → empty array
+  }
+
   // Serialize bundle — same sanitization as evidence-bundle.ts writeBundle.
   // run_id is the filesystem-safe directory name so consumers can join summary.json
   // to the run directory by a single stable identifier (the bundle's runId field
   // uses the commit-trailer format 155/..., which differs from the dir name 155-...).
   const fileRunId = path.basename(runDir);
-  const summaryWithVersion = { ...bundle, schema_version: RUN_SCHEMA_VERSION, run_id: fileRunId };
+  const summaryWithVersion = {
+    ...bundle,
+    schema_version: RUN_SCHEMA_VERSION,
+    run_id: fileRunId,
+    interventions,
+  };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
 

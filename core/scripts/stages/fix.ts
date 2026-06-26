@@ -30,6 +30,8 @@ import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker } from "./review.ts";
+import { emitHumanIntervention } from "../intervention.ts";
+import type { RunStoreDeps } from "../run-store.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -39,6 +41,10 @@ export interface AdvanceFixOpts {
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
    *  command runs under this round's stage. Undefined → recording disabled. */
   stateDir?: string;
+  /** Run directory for JSONL event log (#302). Undefined → event appends disabled. */
+  runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` for streaming events (#302). */
+  runStoreDeps?: RunStoreDeps;
 }
 
 /** Injectable seams for {@link advanceFix} — overridable in tests. */
@@ -213,6 +219,14 @@ export async function advanceFix(
       cfg, issueNumber, gates.reason, stage,
       gates.source === "test" ? "test-gate-exhausted" : "needs-human",
     );
+    if (gates.source === "test") {
+      await emitHumanIntervention(opts.runDir, {
+        kind: "test-build-failure",
+        stage,
+        issue: issueNumber,
+        detail: gates.reason,
+      }, opts.runStoreDeps).catch(() => {});
+    }
     return { advanced: false, status: "blocked", reason: gates.reason };
   }
 

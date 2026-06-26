@@ -595,6 +595,10 @@ export interface ReviewRecord {
 export interface OverrideRecord {
   key: string;
   reason: string;
+  /** Taxonomy kind for this override; always `"human-risk-override"` for
+   *  operator-supplied `--override` dispositions. Optional for backward
+   *  compatibility: absent on records written before #302. */
+  kind?: import("./intervention.ts").HumanInterventionKind;
 }
 
 /** One auto-recovery event. */
@@ -623,6 +627,10 @@ export interface EvidenceBundle {
   /** ISO timestamp set once the PR/issue path-notification comment is posted;
    *  null until then. Guards against a duplicate comment on a re-finalize. */
   notifiedAt: string | null;
+  /** All `human_intervention` events emitted during the run, in chronological
+   *  order. Populated by `finalizeRun` from `events.jsonl`. Additive and
+   *  optional: consumers that do not recognize this field SHALL ignore it. */
+  interventions?: import("./intervention.ts").HumanInterventionEvent[];
 }
 
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry

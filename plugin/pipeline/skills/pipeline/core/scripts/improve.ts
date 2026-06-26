@@ -8,6 +8,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { spawnSync } from "node:child_process";
 import { runsDir } from "./run-store.ts";
+import { summarizeInterventions } from "./intervention.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -31,6 +32,8 @@ export interface ImproveOpts {
   minOccurrences?: number;
   json?: boolean;
   repoDir: string;
+  /** When true, print an intervention summary as JSON instead of the cluster report. */
+  interventions?: boolean;
 }
 
 export interface ImproveDeps {
@@ -471,6 +474,22 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
   const minOcc = opts.minOccurrences ?? 3;
 
   const runs = await discoverRuns(runsDirPath, opts.since, deps);
+
+  // --interventions: collect all human_intervention events and emit a summary.
+  if (opts.interventions) {
+    const allEvents: Record<string, unknown>[] = [];
+    for (const run of runs) {
+      const eventsPath = path.join(run.dir, "events.jsonl");
+      for await (const event of readEventsLines(eventsPath, deps)) {
+        if ((event as { type?: unknown }).type === "human_intervention") {
+          allEvents.push(event as Record<string, unknown>);
+        }
+      }
+    }
+    const summary = summarizeInterventions(allEvents);
+    process.stdout.write(JSON.stringify(summary, null, 2) + "\n");
+    return;
+  }
 
   if (runs.length === 0) {
     if (opts.json) {

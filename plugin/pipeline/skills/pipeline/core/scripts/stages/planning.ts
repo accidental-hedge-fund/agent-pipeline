@@ -57,6 +57,7 @@ import {
 import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
+import { emitHumanIntervention } from "../intervention.ts";
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -288,15 +289,16 @@ export async function runPlanningPhases(
   const slug = slugify(title) || `issue-${issueNumber}`;
   const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug, deps);
   if (!bootstrap.ok) {
-    await doSetBlocked(
-      cfg,
-      issueNumber,
-      bootstrap.tag === "worktree-creation-failed"
-        ? `Worktree creation failed: ${bootstrap.reason}`
-        : `Worktree setup failed: ${bootstrap.reason}`,
-      "ready",
-      bootstrap.tag,
-    );
+    const bootstrapMsg = bootstrap.tag === "worktree-creation-failed"
+      ? `Worktree creation failed: ${bootstrap.reason}`
+      : `Worktree setup failed: ${bootstrap.reason}`;
+    await doSetBlocked(cfg, issueNumber, bootstrapMsg, "ready", bootstrap.tag);
+    await emitHumanIntervention(opts.runDir, {
+      kind: "auth-tooling-preflight-failure",
+      stage: "ready",
+      issue: issueNumber,
+      detail: bootstrapMsg,
+    }, opts.runStoreDeps).catch(() => {});
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
   const wt = bootstrap.wt;
@@ -309,6 +311,12 @@ export async function runPlanningPhases(
   const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps);
   if (!authorResult.ok) {
     await doSetBlocked(cfg, issueNumber, authorResult.reason, "ready", authorResult.tag);
+    await emitHumanIntervention(opts.runDir, {
+      kind: "ambiguous-issue",
+      stage: "ready",
+      issue: issueNumber,
+      detail: authorResult.reason,
+    }, opts.runStoreDeps).catch(() => {});
     return { advanced: false, status: "blocked", reason: authorResult.reason };
   }
   let planText = authorResult.planText;
@@ -376,6 +384,12 @@ export async function runPlanningPhases(
     if (!planReview.includes("## Plan Review Verdict")) {
       const reason = `plan-review output missing required "## Plan Review Verdict" section — the reviewer returned prose instead of a structured verdict`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
+      await emitHumanIntervention(opts.runDir, {
+        kind: "product-judgment-required",
+        stage: "plan-review",
+        issue: issueNumber,
+        detail: reason,
+      }, opts.runStoreDeps).catch(() => {});
       return { advanced: false, status: "blocked", reason };
     }
     const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
@@ -423,6 +437,12 @@ export async function runPlanningPhases(
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
       const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
+      await emitHumanIntervention(opts.runDir, {
+        kind: "plan-review-feedback",
+        stage: "plan-review",
+        issue: issueNumber,
+        detail: reason,
+      }, opts.runStoreDeps).catch(() => {});
       return { advanced: false, status: "blocked", reason };
     }
     await doPostComment(
