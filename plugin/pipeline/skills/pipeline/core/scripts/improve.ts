@@ -293,8 +293,11 @@ export function clusterFlakyGates(
   }
 }
 
-/** Cluster token waste from a summary JSON. Skipped silently if absent or schema mismatch.
- *  Returns true if the summary had recognizable token/duration fields. */
+/** Cluster token waste from a summary JSON. Reads per-stage command durations from
+ *  the real EvidenceBundle shape (stages[].commands[].durationMs). Stages whose total
+ *  command duration meets or exceeds the high-duration threshold are clustered by stage
+ *  name so the same slow stage across runs produces one cluster. Skipped silently if
+ *  absent or schema mismatch. Returns true if recognizable stage duration data was found. */
 export function clusterTokenWaste(
   summaryJson: unknown,
   runId: string,
@@ -302,30 +305,49 @@ export function clusterTokenWaste(
 ): boolean {
   if (!summaryJson || typeof summaryJson !== "object") return false;
   const obj = summaryJson as Record<string, unknown>;
-  const totalTokens = typeof obj["total_tokens"] === "number" ? obj["total_tokens"] : null;
-  const durationMs = typeof obj["elapsed_ms"] === "number" ? obj["elapsed_ms"] : null;
-  if (totalTokens === null && durationMs === null) return false;
+  const stages = obj["stages"];
+  if (!Array.isArray(stages) || stages.length === 0) return false;
 
-  const highTokens = totalTokens !== null && totalTokens > 200_000;
-  const longDuration = durationMs !== null && durationMs > 30 * 60 * 1000;
+  const HIGH_DURATION_MS = 30 * 60 * 1000;
+  let hadData = false;
 
-  if (highTokens || longDuration) {
-    const parts: string[] = [];
-    if (highTokens) parts.push(`${totalTokens} tokens`);
-    if (longDuration) parts.push(`${Math.round((durationMs ?? 0) / 60_000)}min`);
-    const signal = parts.join(", ");
-    const key = `token-waste:${runId}`;
-    if (!clusters.has(key)) {
-      clusters.set(key, {
-        category: "token-waste",
-        signal,
-        count: 1,
-        runIds: new Set([runId]),
-        excerpt: truncateExcerpt(`Run ${runId}: ${signal}`),
-      });
+  for (const stage of stages) {
+    if (!stage || typeof stage !== "object") continue;
+    const s = stage as Record<string, unknown>;
+    const stageName = typeof s["stage"] === "string" ? s["stage"] : "";
+    if (!stageName) continue;
+    const commands = s["commands"];
+    if (!Array.isArray(commands)) continue;
+
+    hadData = true;
+    let totalDurationMs = 0;
+    for (const cmd of commands) {
+      if (!cmd || typeof cmd !== "object") continue;
+      const c = cmd as Record<string, unknown>;
+      const d = typeof c["durationMs"] === "number" ? c["durationMs"] : 0;
+      totalDurationMs += d;
+    }
+
+    if (totalDurationMs >= HIGH_DURATION_MS) {
+      const durationMin = Math.round(totalDurationMs / 60_000);
+      const signal = `high-duration:${stageName}`;
+      const key = `token-waste:stage:${stageName}`;
+      const existing = clusters.get(key);
+      if (existing) {
+        existing.count++;
+        existing.runIds.add(runId);
+      } else {
+        clusters.set(key, {
+          category: "token-waste",
+          signal,
+          count: 1,
+          runIds: new Set([runId]),
+          excerpt: truncateExcerpt(`Stage "${stageName}" took ${durationMin}min in run ${runId}`),
+        });
+      }
     }
   }
-  return true;
+  return hadData;
 }
 
 // ---------------------------------------------------------------------------

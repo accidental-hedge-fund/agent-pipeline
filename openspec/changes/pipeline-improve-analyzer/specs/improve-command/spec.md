@@ -33,6 +33,12 @@ The analyzer SHALL group run evidence into four named categories: `review-findin
 - **THEN** those events SHALL be grouped into a single `flaky-gate` cluster
 - **AND** the cluster SHALL record the stage name and affected run IDs
 
+#### Scenario: same high-duration stage across runs is clustered as token-waste
+- **WHEN** `summary.json` files across multiple runs contain stages whose total command duration meets or exceeds the high-duration threshold
+- **AND** the stage name is the same across those runs
+- **THEN** those runs SHALL be grouped into a single `token-waste` cluster keyed by stage name
+- **AND** the cluster SHALL list all affected run IDs
+
 #### Scenario: token-waste category skipped when data absent
 - **WHEN** run summaries do not contain token-count or duration fields
 - **THEN** the `token-waste` category SHALL be silently omitted from the report

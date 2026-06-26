@@ -384,29 +384,48 @@ test("clusterTokenWaste: returns false for null/non-object summary", () => {
   assert.equal(clusters.size, 0);
 });
 
-test("clusterTokenWaste: returns true when fields are present (below threshold)", () => {
+test("clusterTokenWaste: returns true when stage duration data present (below threshold)", () => {
   const clusters = new Map();
-  const result = clusterTokenWaste({ total_tokens: 100, elapsed_ms: 1000 }, "run-1", clusters);
+  const summary = { stages: [{ stage: "planning", commands: [{ durationMs: 1000 }] }] };
+  const result = clusterTokenWaste(summary, "run-1", clusters);
   assert.equal(result, true);
   assert.equal(clusters.size, 0); // below threshold — no cluster created
 });
 
-test("clusterTokenWaste: adds cluster for high token usage", () => {
+test("clusterTokenWaste: adds cluster for high-duration stage", () => {
   const clusters = new Map();
-  clusterTokenWaste({ total_tokens: 250_000, elapsed_ms: 1000 }, "run-1", clusters);
+  const HIGH_MS = 31 * 60 * 1000;
+  const summary = { stages: [{ stage: "review", commands: [{ durationMs: HIGH_MS }] }] };
+  clusterTokenWaste(summary, "run-1", clusters);
   assert.equal(clusters.size, 1);
   const entry = [...clusters.values()][0];
   assert.equal(entry.category, "token-waste");
-  assert.ok(entry.signal.includes("250000"));
+  assert.ok(entry.signal.includes("review"));
 });
 
-test("clusterTokenWaste: adds cluster for long duration", () => {
+test("clusterTokenWaste: adds cluster for very long duration stage", () => {
   const clusters = new Map();
-  clusterTokenWaste({ total_tokens: 1000, elapsed_ms: 2 * 60 * 60 * 1000 }, "run-1", clusters);
+  const HIGH_MS = 2 * 60 * 60 * 1000; // 2 hours
+  const summary = { stages: [{ stage: "fix", commands: [{ durationMs: HIGH_MS }] }] };
+  clusterTokenWaste(summary, "run-1", clusters);
   assert.equal(clusters.size, 1);
   const entry = [...clusters.values()][0];
   assert.equal(entry.category, "token-waste");
-  assert.ok(entry.signal.includes("min"));
+  assert.ok(entry.signal.includes("fix"));
+});
+
+test("clusterTokenWaste: same high-duration stage across runs produces one cluster", () => {
+  const clusters = new Map();
+  const HIGH_MS = 35 * 60 * 1000;
+  const summary = { stages: [{ stage: "review", commands: [{ durationMs: HIGH_MS }] }] };
+  clusterTokenWaste(summary, "run-1", clusters);
+  clusterTokenWaste(summary, "run-2", clusters);
+  clusterTokenWaste(summary, "run-3", clusters);
+  assert.equal(clusters.size, 1, `expected 1 cluster, got ${clusters.size}`);
+  const entry = [...clusters.values()][0];
+  assert.equal(entry.count, 3);
+  assert.deepEqual([...entry.runIds].sort(), ["run-1", "run-2", "run-3"]);
+  assert.equal(entry.category, "token-waste");
 });
 
 // ---------------------------------------------------------------------------
