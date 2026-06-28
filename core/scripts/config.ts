@@ -180,6 +180,19 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Sweep backlog maintenance pass settings (#168)."),
+  // Queue batch factory operation mode (#305). Optional operator defaults.
+  // CLI flags take precedence over these config values, which take precedence
+  // over the built-in defaults (maxIssues=10, concurrency=1, maxFailureRate=1.0).
+  queue: z
+    .object({
+      max_issues: z.number().int().positive().optional().describe("Maximum number of issues to dispatch in a batch run (default: 10)."),
+      budget_dollars: z.number().nonnegative().nullable().optional().describe("Stop launching new runs when cumulative cost reaches this limit in USD; null means unlimited."),
+      concurrency: z.number().int().positive().optional().describe("Maximum simultaneously active pipeline runs (default: 1)."),
+      max_failure_rate: z.number().min(0).max(1).optional().describe("Halt new launches when failedCount/completedCount reaches this threshold (0.0–1.0); requires at least 3 completed runs (default: 1.0)."),
+    })
+    .strict()
+    .optional()
+    .describe("Queue batch factory operation mode defaults (#305). CLI flags override these values."),
   // Multi-actor override trust list (#229). GitHub identities whose
   // `## Pipeline: Finding override` and `## Pipeline: Scope override` comments
   // are trusted in addition to the current actor. Default: [] (actor-only).
@@ -404,6 +417,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       ? { ...fileConfig.roadmap, release_model: fileConfig.roadmap.release_model ?? "semver" }
       : fileConfig.roadmap,
     sweep: fileConfig.sweep,
+    queue: fileConfig.queue,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;

@@ -186,6 +186,19 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  queue: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath", "base", "profile",
+      "maxIssues", "budgetDollars", "concurrency", "maxFailureRate",
+      "label", "milestone", "risk",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
   // cleanup and remove-worktree are flag-based modes (not positional keywords),
   // but are registered here for completeness and to enable future registry-driven
   // dispatch of these modes.

@@ -227,6 +227,9 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline scoreboard                          read run artifacts; print factory throughput/cost/reliability metrics
 /pipeline scoreboard --days 14 --json         emit one JSON scoreboard object for the last 14 days
 /pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
+/pipeline queue                               batch factory: dispatch all pipeline:ready issues up to limits (no number)
+/pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
+/pipeline queue --label team:backend --milestone v2.0 --risk medium
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
@@ -449,6 +452,75 @@ When no window flags are supplied, the window is the last 30 days ending at comm
 Cost metrics use recorded `cost_usd` or `usage.cost_usd` values when present. For harness calls without actual cost, pass repeatable `--estimate-cost <harness>=<usd-per-call>` values. Actual cost wins over estimates. If a successful PR has a recorded harness call with neither actual nor estimated cost, `cost_per_ready_pr_usd.value` is `null` and diagnostics name the missing harness estimate instead of silently using zero. Stage accounting records also distinguish `actual`, `estimated`, and `unknown` costs; unknown-cost invocations are counted explicitly and are not treated as free.
 
 Historical artifact problems are reported as diagnostics, not crashes: missing run stores, missing/corrupt `summary.json`, missing/corrupt `run.json`, missing `events.jsonl`, partial final event lines, missing start times, and ready runs without PR numbers all surface with stable reason codes and file paths.
+
+## Queue sub-command (batch factory)
+
+`pipeline queue` is the **batch factory operation mode**: it fetches every `pipeline:ready`-labelled issue from the repo's backlog, ranks them by pipeline stage priority (highest-score stages first; ties broken by issue number ascending for FIFO order within the same stage), applies optional filters, and dispatches up to `--max-issues` of them in concurrency-bounded parallel pipeline runs.
+
+```bash
+# Default run: up to 10 issues, concurrency 1, no budget cap
+/pipeline queue
+
+# Run up to 5 issues, 2 at a time, stop when cumulative cost reaches $2.00
+/pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
+
+# Only issues carrying team:backend AND belonging to the v2.0 milestone, risk ≤ medium
+/pipeline queue --label team:backend --milestone v2.0 --risk medium
+
+# Multiple --label flags require ALL labels present (intersection / AND):
+/pipeline queue --label team:backend --label size:small
+```
+
+**Flags** (all have config-file equivalents under the `queue:` key):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--max-issues <N>` | `10` | Maximum issues to start in this batch |
+| `--concurrency <C>` | `1` | Maximum simultaneous pipeline runs |
+| `--budget-dollars <D>` | unlimited | Halt new launches when cumulative cost (USD) reaches this limit |
+| `--max-failure-rate <R>` | `1.0` | Halt new launches when `failed/completed ≥ R` (checked only after ≥ 3 completions) |
+| `--label <L>` | (none) | Filter to issues carrying this label (repeatable; all must be present) |
+| `--milestone <M>` | (none) | Filter to issues in this milestone (exact title match) |
+| `--risk <level>` | (none) | Filter to issues at or below this risk level (`low` \| `medium` \| `high`); excludes any issue carrying a `risk:*` label above the specified level |
+
+**Gate semantics:**
+- **Budget gate**: checked after each run completes; when cumulative cost ≥ `--budget-dollars`, no further runs are launched. In-flight runs complete normally.
+- **Failure-rate gate**: only fires when ≥ 3 runs have completed and `failed_count / completed_count ≥ --max-failure-rate`. `ready-to-deploy` and `needs-human` both count as succeeded; everything else counts as failed.
+
+**Per-run config defaults** (`.github/pipeline.yml`):
+
+```yaml
+queue:
+  max_issues: 10          # CLI --max-issues overrides this
+  budget_dollars: null    # null = unlimited; CLI --budget-dollars overrides
+  concurrency: 1          # CLI --concurrency overrides
+  max_failure_rate: 1.0   # CLI --max-failure-rate overrides
+```
+
+**Batch summary artifact** (machine-readable):
+
+After every run, `queue` writes `.agent-pipeline/runs/batch-<batch_id>/batch-summary.json`:
+
+```json
+{
+  "schema_version": "1",
+  "batch_id": "2026-06-28T20-18-09-000Z",
+  "started_at": "2026-06-28T20:18:09.000Z",
+  "ended_at": "2026-06-28T21:04:31.000Z",
+  "halt_reason": null,
+  "excluded_count": 3,
+  "issues": [
+    { "number": 42, "title": "...", "final_state": "ready-to-deploy", "cost_usd": 0.31, "duration_ms": 1234 }
+  ],
+  "aggregate": {
+    "total_issues": 5, "succeeded": 4, "failed": 1,
+    "failure_rate": 0.2, "total_cost_usd": 1.55, "total_duration_ms": 6170
+  },
+  "limits": { "max_issues": 5, "budget_dollars": 2.0, "concurrency": 2, "max_failure_rate": 1.0 }
+}
+```
+
+`halt_reason` is `null` when the batch ran to natural completion, `"budget_exhausted"` when the budget gate fired, or `"failure_rate_exceeded"` when the failure-rate gate fired. `excluded_count` is the number of eligible issues that were filtered out (by label/milestone/risk/cap) and not dispatched.
 
 ## Onboarding a new repo
 
