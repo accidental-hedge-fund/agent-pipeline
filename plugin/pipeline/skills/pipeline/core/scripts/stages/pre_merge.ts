@@ -58,6 +58,7 @@ import * as openspec from "../openspec.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
+import type { RunStoreDeps } from "../run-store.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
@@ -106,6 +107,10 @@ export interface AdvancePreMergeOpts {
    *  (CI checks, OpenSpec archive push, rebase) are recorded under "pre-merge".
    *  Undefined → recording disabled. */
   stateDir?: string;
+  /** Run directory for JSONL event log (#302). Undefined → event appends disabled. */
+  runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` for streaming events (#302). */
+  runStoreDeps?: RunStoreDeps;
   /** Mutable context shared across polling iterations. When absent (single
    *  `advance()` call without a polling loop), the CI-gate grace window and the
    *  no-run recovery guard are skipped (pre-existing behaviour). */
@@ -370,14 +375,9 @@ export async function advance(
         return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
       }
     }
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.",
-      "pre-merge",
-      "merge-conflict",
-    );
-    return { advanced: false, status: "blocked", reason: "branch behind base" };
+    const mergeConflictMsg = "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.";
+    await setBlockedFn(cfg, issueNumber, mergeConflictMsg, "pre-merge", "merge-conflict");
+    return { advanced: false, status: "blocked", reason: mergeConflictMsg, blockerKind: "merge-conflict" };
   }
   if (freshState === "BLOCKED") {
     return { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" };
@@ -1266,8 +1266,9 @@ export async function enforceSpecConsistencyGuard(
   const reviewBody = latestReviewBody(detail.comments);
   if (!reviewBody || !reviewCommentFlagsSpecDivergence(reviewBody)) return null;
 
-  await deps.setBlocked(cfg, issueNumber, staleSpecDeltaBlockReason(stale), "pre-merge", "openspec-stale-delta");
-  return { advanced: false, status: "blocked", reason: `stale OpenSpec delta (${stale})` };
+  const staleMsg = staleSpecDeltaBlockReason(stale);
+  await deps.setBlocked(cfg, issueNumber, staleMsg, "pre-merge", "openspec-stale-delta");
+  return { advanced: false, status: "blocked", reason: staleMsg, blockerKind: "openspec-stale-delta" };
 }
 
 /**

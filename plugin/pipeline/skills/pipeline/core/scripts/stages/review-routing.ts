@@ -39,6 +39,7 @@ import {
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { emitHumanIntervention } from "../intervention.ts";
 import { sanitizeDeep } from "../artifact-sanitize.ts";
 import type {
   Outcome,
@@ -533,12 +534,19 @@ export async function advanceReview(
         issueNumber,
         reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
       );
+      const recurrenceDetail = `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
+        `finding key after a fix round — a proven non-convergence signal`;
       const recurrenceBlocked = await safeTransitionFn(stage, "needs-human",
-        `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
-          `finding key after a fix round — a proven non-convergence signal. Recorded as advisory; ` +
+        `${recurrenceDetail}. Recorded as advisory; ` +
           `parked at needs-human early, without consuming the remaining round budget (will NOT ` +
           `auto-advance to ready-to-deploy).`,
       );
+      await emitHumanIntervention(opts.runDir, {
+        kind: "review-non-convergence",
+        stage,
+        issue: issueNumber,
+        detail: recurrenceDetail,
+      }, opts.runStoreDeps).catch(() => {});
       if (recurrenceBlocked) return recurrenceBlocked;
       return {
         advanced: true,
@@ -622,12 +630,18 @@ export async function advanceReview(
           issueNumber,
           reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
         );
+        const srDetail = `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
+          `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
+          `same (file + category) cluster`;
         const srBlocked = await safeTransitionFn(stage, "needs-human",
-          `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
-            `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
-            `same (file + category) cluster. Parked at needs-human early without consuming ` +
-            `the remaining round budget.`,
+          `${srDetail}. Parked at needs-human early without consuming the remaining round budget.`,
         );
+        await emitHumanIntervention(opts.runDir, {
+          kind: "review-non-convergence",
+          stage,
+          issue: issueNumber,
+          detail: srDetail,
+        }, opts.runStoreDeps).catch(() => {});
         if (srBlocked) return srBlocked;
         return {
           advanced: true,
@@ -720,11 +734,18 @@ export async function advanceReview(
         issueNumber,
         reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments)),
       );
+      const ceilingDetail = `Review ${round} hit the ${roundCap}-round ceiling with ` +
+        `${partition.blocking.length} finding(s) still blocking`;
       const ceilingBlocked = await safeTransitionFn(stage, "needs-human",
-        `Review ${round} hit the ${roundCap}-round ceiling with ` +
-          `${partition.blocking.length} finding(s) still blocking. Recorded as advisory; parked at ` +
+        `${ceilingDetail}. Recorded as advisory; parked at ` +
           `needs-human for a human to override or fix (will NOT auto-advance to ready-to-deploy).`,
       );
+      await emitHumanIntervention(opts.runDir, {
+        kind: "review-non-convergence",
+        stage,
+        issue: issueNumber,
+        detail: ceilingDetail,
+      }, opts.runStoreDeps).catch(() => {});
       if (ceilingBlocked) return ceilingBlocked;
       return {
         advanced: true,

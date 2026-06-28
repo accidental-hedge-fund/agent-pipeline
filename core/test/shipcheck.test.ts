@@ -216,6 +216,10 @@ test("shipcheck-gate: gate mode + fail verdict → setBlocked, no forward transi
 
   assert.equal(out.advanced, false);
   assert.equal((out as { status: string }).status, "blocked");
+  // Regression for #302: fail verdict must use the dedicated shipcheck-failed
+  // blockerKind (maps to eval-shipcheck-failure in the taxonomy) — not the
+  // recoverable eval-gate-failed kind, and not the generic needs-human.
+  assert.equal((out as { blockerKind: string }).blockerKind, "shipcheck-failed", "fail verdict blockerKind must be shipcheck-failed");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0);
   assert.equal(log.comments.length, 1);
@@ -243,6 +247,10 @@ test("shipcheck-gate: gate mode + partial verdict + block_on_partial:true → bl
 
   assert.equal(out.advanced, false);
   assert.equal((out as { status: string }).status, "blocked");
+  // Regression for #302: partial verdict (block_on_partial) must use the dedicated
+  // shipcheck-failed blockerKind (maps to eval-shipcheck-failure) — not the
+  // recoverable eval-gate-failed kind, and not the generic needs-human.
+  assert.equal((out as { blockerKind: string }).blockerKind, "shipcheck-failed", "partial verdict blockerKind must be shipcheck-failed");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0);
   assert.equal(log.comments.length, 1);

@@ -20,6 +20,7 @@ import {
 import { runCapped } from "../harness.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
+import type { RunStoreDeps } from "../run-store.ts";
 
 /** Next stage after eval-gate: shipcheck-gate when opted in, else ready-to-deploy. */
 function nextAfterEval(cfg: PipelineConfig): Stage {
@@ -33,6 +34,10 @@ export interface AdvanceEvalOpts {
   /** Evidence-bundle run/state dir (#147); when set, the eval command is recorded
    *  under the "eval-gate" stage. Undefined → recording disabled. */
   stateDir?: string;
+  /** Run directory for JSONL event log (#302). Undefined → event appends disabled. */
+  runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` for streaming events (#302). */
+  runStoreDeps?: RunStoreDeps;
 }
 
 export interface EvalRunResult {
@@ -260,10 +265,11 @@ export async function advanceEval(
   }
 
   console.log(`[pipeline] #${issueNumber}: eval-gate failed${attempts} (gate mode); blocking`);
+  const evalFailDetail = `Eval gate failed${attempts}.`;
   await setBlockedFn(
     cfg,
     issueNumber,
-    `Eval gate failed${attempts}.\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
+    `${evalFailDetail}\n\n\`\`\`\n${truncate(result.output, MAX_COMMENT_OUTPUT)}\n\`\`\``,
     "eval-gate",
     "eval-gate-failed",
   );

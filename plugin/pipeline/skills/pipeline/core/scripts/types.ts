@@ -58,6 +58,7 @@ export const BLOCKER_KINDS = [
   "push-failed",
   "eval-gate-misconfigured",
   "eval-gate-failed",
+  "shipcheck-failed",
   "worktree-setup-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
@@ -143,6 +144,11 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
   "eval-gate-failed":
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "shipcheck-failed":
+    "The shipcheck gate returned a failing or partial verdict (see the shipcheck " +
+    "comment above for the specific concerns). Address the flagged concerns in " +
+    "the worktree and commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
   "worktree-setup-failed":
     "The worktree dependency install step failed (see the error above). " +
@@ -595,6 +601,10 @@ export interface ReviewRecord {
 export interface OverrideRecord {
   key: string;
   reason: string;
+  /** Taxonomy kind for this override; always `"human-risk-override"` for
+   *  operator-supplied `--override` dispositions. Optional for backward
+   *  compatibility: absent on records written before #302. */
+  kind?: import("./intervention.ts").HumanInterventionKind;
 }
 
 /** One auto-recovery event. */
@@ -623,6 +633,10 @@ export interface EvidenceBundle {
   /** ISO timestamp set once the PR/issue path-notification comment is posted;
    *  null until then. Guards against a duplicate comment on a re-finalize. */
   notifiedAt: string | null;
+  /** All `human_intervention` events emitted during the run, in chronological
+   *  order. Populated by `finalizeRun` from `events.jsonl`. Additive and
+   *  optional: consumers that do not recognize this field SHALL ignore it. */
+  interventions?: import("./intervention.ts").HumanInterventionEvent[];
 }
 
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry

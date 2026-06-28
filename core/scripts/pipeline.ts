@@ -91,6 +91,7 @@ import * as evalStage from "./stages/eval.ts";
 import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
+import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
   formatDoctorJson,
   formatDoctorSummary,
@@ -136,8 +137,11 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
 
 /**
  * Decide whether the auto-loop should continue past this outcome at this stage.
- * `plan-review` is a human-feedback checkpoint and is never eligible even when
- * allowlisted, because its `waiting` return means "a human must review the plan".
+ * `plan-review` and `shipcheck-gate` are human-judgment checkpoints and are never
+ * eligible even when allowlisted: plan-review's `waiting` return means "a human
+ * must review the plan", and a shipcheck verdict failure must not be silently
+ * re-run on reviewer nondeterminism (#302) — a failed shipcheck requires a human
+ * disposition, not an automatic retry that could flip to pass on a later pass.
  */
 export function isAutoLoopEligible(
   out: Outcome,
@@ -146,7 +150,7 @@ export function isAutoLoopEligible(
 ): boolean {
   if (!autoLoop.enabled) return false;
   if (!isAutoLoopRecoverable(out)) return false;
-  if (stage === "plan-review") return false;
+  if (stage === "plan-review" || stage === "shipcheck-gate") return false;
   return (autoLoop.stages as string[]).includes(stage);
 }
 
@@ -246,6 +250,8 @@ export interface CliOpts {
   top?: number;
   /** improve: only report clusters with at least this many occurrences (default 3). */
   minOccurrences?: number;
+  /** improve: print an intervention summary (--interventions). */
+  interventions?: boolean;
 }
 
 /**
@@ -301,6 +307,7 @@ export function buildCmd(): Command {
     .option("--since <date>", "improve: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
+    .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
     .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
     .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
@@ -687,6 +694,7 @@ async function main(): Promise<void> {
           minOccurrences: opts.minOccurrences,
           json: !!opts.json,
           repoDir,
+          interventions: !!opts.interventions,
         },
         realImproveDeps(repoDir),
       );
@@ -2091,10 +2099,21 @@ async function runAdvance(
       if (opts.override) {
         const parsedOverride = parseOverrideArg(opts.override);
         if (!("error" in parsedOverride)) {
+          const overrideRef = parsedOverride.kind === "key"
+            ? parsedOverride.key
+            : `${parsedOverride.scopeType}:${parsedOverride.scopeValue}`;
           await recordOverride(stateDir, issueNumber, {
-            key: parsedOverride.key,
+            key: overrideRef,
             reason: parsedOverride.reason,
+            kind: "human-risk-override",
           }).catch(() => {});
+          await emitHumanIntervention(runDir, {
+            kind: "human-risk-override",
+            stage: null,
+            issue: issueNumber,
+            detail: `override applied: ${overrideRef} — ${parsedOverride.reason}`,
+            ref: overrideRef,
+          }, runStoreDeps).catch(() => {});
         }
       }
     }
@@ -2408,6 +2427,14 @@ async function runAdvance(
                 cfg.marker_footer,
               ].join("\n"),
             ).catch(() => {});
+            if (runDir) {
+              await emitHumanIntervention(runDir, {
+                kind: blockerKindToInterventionKind(out.status === "blocked" ? (out.blockerKind ?? "needs-human") : "needs-human"),
+                stage: auditStage,
+                issue: issueNumber,
+                detail: `auto-loop budget exhausted after ${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds} rounds: ${out.reason}`,
+              }, runStoreDeps).catch(() => {});
+            }
             if (stateDir) {
               await recordRecovery(stateDir, issueNumber, {
                 trigger: "bounded-auto-loop:exhausted",
@@ -2420,6 +2447,12 @@ async function runAdvance(
           // Not eligible or no rounds spent: stop as today.
           if (out.status === "blocked" && runDir) {
             await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+            await emitHumanIntervention(runDir, {
+              kind: blockerKindToInterventionKind(out.blockerKind ?? "needs-human"),
+              stage: auditStage,
+              issue: issueNumber,
+              detail: out.reason,
+            }, runStoreDeps).catch(() => {});
           }
         }
         break;
@@ -2603,9 +2636,9 @@ async function dispatch(
     case "review-2":
       return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir, runDir, runStoreDeps });
     case "fix-1":
-      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir });
+      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "fix-2":
-      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir });
+      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "pre-merge":
       // Use the polling wrapper, not bare advance(). Bare advance returns
       // "waiting" after docs push / on pending CI / after rebase — that
@@ -2613,9 +2646,9 @@ async function dispatch(
       // exit the loop, requiring the user to re-invoke. Our skill is
       // manual-only, so pre-merge owns the wait itself, capped at
       // cfg.ci_timeout.
-      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir });
+      return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "eval-gate":
-      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir });
+      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir, runDir, runStoreDeps });
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir });
     case "ready-to-deploy":

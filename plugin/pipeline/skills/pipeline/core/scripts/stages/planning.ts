@@ -288,15 +288,10 @@ export async function runPlanningPhases(
   const slug = slugify(title) || `issue-${issueNumber}`;
   const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug, deps);
   if (!bootstrap.ok) {
-    await doSetBlocked(
-      cfg,
-      issueNumber,
-      bootstrap.tag === "worktree-creation-failed"
-        ? `Worktree creation failed: ${bootstrap.reason}`
-        : `Worktree setup failed: ${bootstrap.reason}`,
-      "ready",
-      bootstrap.tag,
-    );
+    const bootstrapMsg = bootstrap.tag === "worktree-creation-failed"
+      ? `Worktree creation failed: ${bootstrap.reason}`
+      : `Worktree setup failed: ${bootstrap.reason}`;
+    await doSetBlocked(cfg, issueNumber, bootstrapMsg, "ready", bootstrap.tag);
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
   const wt = bootstrap.wt;
