@@ -20,7 +20,7 @@ import {
 import { runCapped } from "../harness.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
-import type { RunStoreDeps } from "../run-store.ts";
+import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 
 /** Next stage after eval-gate: shipcheck-gate when opted in, else ready-to-deploy. */
 function nextAfterEval(cfg: PipelineConfig): Stage {
@@ -89,6 +89,32 @@ export interface EvalDeps {
   ) => Promise<void>;
 }
 
+function eventTimestamp(): string {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+async function recordGateResult(
+  opts: AdvanceEvalOpts,
+  result: "pass" | "fail" | "skipped",
+  mode: PipelineConfig["eval_gate"]["mode"],
+  reason?: string,
+): Promise<void> {
+  if (!opts.runDir) return;
+  await appendEvent(
+    opts.runDir,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "gate_result",
+      at: eventTimestamp(),
+      gate: "eval-gate",
+      result,
+      mode,
+      reason,
+    },
+    opts.runStoreDeps,
+  ).catch(() => {});
+}
+
 export async function advanceEval(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -122,6 +148,7 @@ export async function advanceEval(
     console.log(`[pipeline] #${issueNumber}: eval-gate step disabled; skipping.`);
     const skipTo = nextAfterEval(cfg);
     await silentTransitionFn(cfg, issueNumber, "eval-gate", skipTo);
+    await recordGateResult(opts, "skipped", cfg.eval_gate.mode, "disabled");
     return { advanced: true, from: "eval-gate", to: skipTo, summary: "eval-gate disabled" };
   }
 
@@ -220,6 +247,7 @@ export async function advanceEval(
     console.log(`[pipeline] #${issueNumber}: eval-gate passed in ${result.durationSec.toFixed(1)}s`);
     const passTo = nextAfterEval(cfg);
     await transitionFn(cfg, issueNumber, "eval-gate", passTo, `Eval gate passed. Advancing to ${passTo}.`);
+    await recordGateResult(opts, "pass", cfg.eval_gate.mode);
     return {
       advanced: true,
       from: "eval-gate",
@@ -241,6 +269,7 @@ export async function advanceEval(
       "eval-gate",
       "harness-failure",
     );
+    await recordGateResult(opts, "fail", cfg.eval_gate.mode, "timeout");
     return { advanced: false, status: "blocked", reason: `eval gate timed out${attempts}`, blockerKind: "harness-failure" };
   }
 
@@ -253,6 +282,7 @@ export async function advanceEval(
       "eval-gate",
       "harness-failure",
     );
+    await recordGateResult(opts, "fail", cfg.eval_gate.mode, "spawn_error");
     return { advanced: false, status: "blocked", reason: `eval gate runner error${attempts}`, blockerKind: "harness-failure" };
   }
 
@@ -261,6 +291,7 @@ export async function advanceEval(
     console.log(`[pipeline] #${issueNumber}: eval-gate failed${attempts} (advisory mode); advancing`);
     const advisoryTo = nextAfterEval(cfg);
     await transitionFn(cfg, issueNumber, "eval-gate", advisoryTo, `Eval gate failed${attempts} (advisory mode); advancing to ${advisoryTo}.`);
+    await recordGateResult(opts, "fail", cfg.eval_gate.mode, "advisory_failure");
     return { advanced: true, from: "eval-gate", to: advisoryTo, summary: `eval failed (advisory)` };
   }
 
@@ -273,6 +304,7 @@ export async function advanceEval(
     "eval-gate",
     "eval-gate-failed",
   );
+  await recordGateResult(opts, "fail", cfg.eval_gate.mode, "gate_failure");
   return { advanced: false, status: "blocked", reason: `eval gate failed${attempts}`, blockerKind: "eval-gate-failed" };
 }
 

@@ -100,6 +100,13 @@ export interface ReviewVerdictEvent extends RunEventBase {
   reviewer_model?: string;
   self_review?: boolean;
 }
+export interface GateResultEvent extends RunEventBase {
+  type: "gate_result";
+  gate: string;
+  result: "pass" | "fail" | "partial" | "skipped";
+  mode?: string;
+  reason?: string;
+}
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
   reason: string;
@@ -128,6 +135,7 @@ export type RunEvent =
   | WorktreeCreatedEvent
   | WorktreeRemovedEvent
   | ReviewVerdictEvent
+  | GateResultEvent
   | BlockerSetEvent
   | BlockerClearedEvent
   | GhMetricsSummaryEvent

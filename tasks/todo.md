@@ -1,28 +1,27 @@
-# PR #277 Recovery Plan
+# Issue #301 Review 1 Fix Plan
 
 ## Goal
 
-Salvage issue #258 / PR #277 by keeping the fast on-disk worktree lookup changes and removing the unfinished `RunStateCache` scope that caused the OpenSpec spec-divergence block.
+Address the blocking standard-review finding that scoreboard gate pass rates
+inflate disabled and advisory-failed gates by reading a real gate verdict signal
+instead of treating stage advancement as a pass.
 
 ## Checklist
 
-- [x] Confirm current PR branch and latest `origin/main` state.
-- [x] Rebase or merge PR branch onto latest `origin/main`; resolve conflicts without dropping newer main behavior.
-- [x] Remove or de-scope `RunStateCache` implementation, tests, and OpenSpec promises while preserving `getOnDiskForIssue` behavior.
-- [x] Update `openspec/changes/fast-worktree-lookup-cache-status/specs/**` and `tasks.md` to match the narrower fast-lookup implementation.
-- [x] Keep/adjust tests that prove known-issue path lookup uses on-disk records and does not fan out through active-state GitHub calls.
-- [x] Run `node scripts/build.mjs` after core edits and include generated `plugin/` mirror updates.
-- [x] Run `openspec validate fast-worktree-lookup-cache-status`.
-- [x] Run `node scripts/build.mjs --check`.
-- [x] Run `npm run ci`.
-- [x] Review final diff for unintended cache/stage-interface scope and document results.
+- [x] Inspect current scoreboard gate aggregation, real eval/shipcheck artifact writers, and existing scoreboard tests.
+- [x] Update gate pass-rate derivation minimally so disabled advances count as skipped and advisory failures count as failures when artifacts prove the verdict.
+- [x] Add regression fixtures/tests using artifact shapes the pipeline actually writes for disabled gates and advisory failures.
+- [x] Decide whether the existing OpenSpec delta needs a narrow update for the clarified behavior.
+- [x] Run `node scripts/build.mjs` after core edits and include regenerated `plugin/`.
+- [x] Run `openspec validate factory-scoreboard`.
+- [x] Run targeted scoreboard tests from `core`.
+- [x] Run `npm run ci` from the repo root.
+- [ ] Perform the pre-commit self-check, document review results, and commit with the required trailers.
 
-## Review Notes
+## Review Results
 
-- `RunStateCache` implementation, tests, generated mirror file, and OpenSpec requirements were removed from scope.
-- `getOnDiskForIssue` and known-issue path lookup migrations remain.
-- Verification passed:
-  - `node --test --experimental-strip-types test/worktree-fast-lookup.test.ts`
-  - `openspec validate fast-worktree-lookup-cache-status`
-  - `node scripts/build.mjs --check`
-  - `npm run ci`
+- OpenSpec delta already describes disabled gate skips outside the pass-rate denominator; no spec edit required.
+- Targeted verification passed: `node --test --experimental-strip-types test/scoreboard.test.ts test/eval.test.ts test/shipcheck.test.ts`.
+- Full verification passed: `npm run ci`.
+- Pre-commit self-check found no higher-severity issue introduced by the diff.
+- Commit blocked by sandbox permissions: `git commit` could not create `.git/worktrees/pipeline-301-factory-scoreboard-for-autonomous-develo/index.lock` (`Operation not permitted`).

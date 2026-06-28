@@ -25,6 +25,7 @@ import { readBundle as defaultReadBundle } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
 import { substitute } from "../prompts/index.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
+import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import type {
   BlockerKind,
   EvidenceBundle,
@@ -194,6 +195,36 @@ export interface AdvanceShipcheckOpts {
   dryRun?: boolean;
   /** Evidence-bundle run/state dir; when set, eval results are read from it. */
   stateDir?: string;
+  /** Run directory for JSONL event log. Undefined → event appends disabled. */
+  runDir?: string;
+  /** Run-store deps carrying `stdoutWrite` for streaming events. */
+  runStoreDeps?: RunStoreDeps;
+}
+
+function eventTimestamp(): string {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+async function recordGateResult(
+  opts: AdvanceShipcheckOpts,
+  result: ShipcheckVerdict["verdict"] | "skipped",
+  mode: PipelineConfig["shipcheck_gate"]["mode"],
+  reason?: string,
+): Promise<void> {
+  if (!opts.runDir) return;
+  await appendEvent(
+    opts.runDir,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "gate_result",
+      at: eventTimestamp(),
+      gate: "shipcheck-gate",
+      result,
+      mode,
+      reason,
+    },
+    opts.runStoreDeps,
+  ).catch(() => {});
 }
 
 export async function advance(
@@ -226,6 +257,7 @@ export async function advance(
   if (!cfg.shipcheck_gate.enabled) {
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate step disabled; skipping.`);
     await silentTransitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy");
+    await recordGateResult(opts, "skipped", cfg.shipcheck_gate.mode, "disabled");
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck-gate step disabled; skipping." };
   }
 
@@ -346,11 +378,13 @@ export async function advance(
         "shipcheck-gate",
         "needs-human" as BlockerKind,
       );
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "parse_failure");
       return { advanced: false, status: "blocked", reason: "shipcheck parse failure after max rounds", blockerKind: "needs-human" as BlockerKind };
     }
     // Advisory: warn and advance.
     console.warn(`[pipeline] #${issueNumber}: shipcheck-gate parse failure (advisory mode); advancing`);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck parse failure (advisory mode); advancing.");
+    await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "parse_failure");
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck parse failure (advisory)" };
   }
 
@@ -358,9 +392,11 @@ export async function advance(
     // Harness produced no output at all.
     if (cfg.shipcheck_gate.mode === "gate") {
       await setBlockedFn(cfg, issueNumber, "Shipcheck gate: reviewer harness produced no output.", "shipcheck-gate", "needs-human" as BlockerKind);
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "no_output");
       return { advanced: false, status: "blocked", reason: "shipcheck: no harness output", blockerKind: "needs-human" as BlockerKind };
     }
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck: no harness output (advisory); advancing.");
+    await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "no_output");
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck no output (advisory)" };
   }
 
@@ -380,6 +416,7 @@ export async function advance(
   if (cfg.shipcheck_gate.mode === "advisory") {
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate verdict=${verdict.verdict} (advisory mode); advancing`);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", `Shipcheck verdict: ${verdict.verdict} (advisory mode).`);
+    await recordGateResult(opts, verdict.verdict, cfg.shipcheck_gate.mode);
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck ${verdict.verdict} (advisory)` };
   }
 
@@ -387,6 +424,7 @@ export async function advance(
   if (verdict.verdict === "pass") {
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate passed; advancing`);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck passed.");
+    await recordGateResult(opts, "pass", cfg.shipcheck_gate.mode);
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck passed" };
   }
 
@@ -394,16 +432,19 @@ export async function advance(
     if (cfg.shipcheck_gate.block_on_partial) {
       console.log(`[pipeline] #${issueNumber}: shipcheck-gate partial verdict + block_on_partial; blocking`);
       await setBlockedFn(cfg, issueNumber, `Shipcheck gate: partial verdict.\n\n${verdict.summary}`, "shipcheck-gate", "shipcheck-failed" as BlockerKind);
+      await recordGateResult(opts, "partial", cfg.shipcheck_gate.mode);
       return { advanced: false, status: "blocked", reason: "shipcheck partial verdict", blockerKind: "shipcheck-failed" as BlockerKind };
     }
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate partial verdict (block_on_partial=false); advancing`);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck partial verdict (block_on_partial: false).");
+    await recordGateResult(opts, "partial", cfg.shipcheck_gate.mode);
     return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck partial (not blocking)" };
   }
 
   // Fail verdict in gate mode.
   console.log(`[pipeline] #${issueNumber}: shipcheck-gate failed (gate mode); blocking`);
   await setBlockedFn(cfg, issueNumber, `Shipcheck gate failed.\n\n${verdict.summary}`, "shipcheck-gate", "shipcheck-failed" as BlockerKind);
+  await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode);
   return { advanced: false, status: "blocked", reason: "shipcheck fail verdict", blockerKind: "shipcheck-failed" as BlockerKind };
 }
 

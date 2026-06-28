@@ -16,6 +16,7 @@ import {
 } from "../scripts/stages/shipcheck.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK, SHIPCHECK_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import type { PipelineConfig, ShipcheckVerdict } from "../scripts/types.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -131,6 +132,22 @@ function makeDeps(
   };
 }
 
+function appendOnlyRunStore(appended: string[]): RunStoreDeps {
+  return {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async (_p, data) => { appended.push(data); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+  };
+}
+
+function appendedEvents(appended: string[]): Record<string, unknown>[] {
+  return appended.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -181,8 +198,9 @@ test("shipcheck-gate: advisory mode + fail verdict → comment posted, still adv
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "advisory" });
   const deps = makeDeps(log, fencedJson(FAIL_VERDICT));
+  const appended: string[] = [];
 
-  const out = await advance(cfg, 44, {}, deps);
+  const out = await advance(cfg, 44, { runDir: "/runs/44", runStoreDeps: appendOnlyRunStore(appended) }, deps);
 
   assert.equal(out.advanced, true);
   assert.equal((out as { to: string }).to, "ready-to-deploy");
@@ -191,6 +209,10 @@ test("shipcheck-gate: advisory mode + fail verdict → comment posted, still adv
   assert.ok(log.comments[0].includes("advisory"), "comment must say advisory");
   assert.ok(log.comments[0].includes("FAIL") || log.comments[0].includes("fail"), "comment must show fail verdict");
   assert.equal(log.transitions.length, 1);
+  assert.deepEqual(
+    appendedEvents(appended).map((event) => ({ type: event.type, gate: event.gate, result: event.result, mode: event.mode })),
+    [{ type: "gate_result", gate: "shipcheck-gate", result: "fail", mode: "advisory" }],
+  );
 });
 
 test("shipcheck-gate: gate mode + pass verdict → transitions to ready-to-deploy", async () => {

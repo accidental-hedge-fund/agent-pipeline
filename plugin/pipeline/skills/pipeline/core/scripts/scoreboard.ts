@@ -150,6 +150,10 @@ interface PrGroup {
   runs: IncludedRun[];
 }
 
+type GateName = "test" | "eval" | "shipcheck";
+type GateOutcome = "pass" | "fail" | "skipped";
+type GateResult = { gate: GateName; outcome: GateOutcome };
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 export function parseScoreboardWindow(
@@ -847,31 +851,54 @@ function countRetryFixRounds(run: IncludedRun): number {
   return keys.size;
 }
 
-function collectGateResults(run: IncludedRun): Array<{ gate: "test" | "eval" | "shipcheck"; outcome: "pass" | "fail" | "skipped" }> {
-  const results: Array<{ gate: "test" | "eval" | "shipcheck"; outcome: "pass" | "fail" | "skipped" }> = [];
+function collectGateResults(run: IncludedRun): GateResult[] {
+  const results: GateResult[] = [];
   const seen = new Set<string>();
+  const structuredGates = new Set<GateName>();
+  const coveredLifecycleStages = new Set<string>();
+
+  for (const [index, event] of run.events.entries()) {
+    const type = stringField(event, "type");
+    if (type !== "gate_result" && type !== "gate_complete" && type !== "gate") continue;
+    const gate = gateForName(stringField(event, "gate") ?? stringField(event, "stage"));
+    const outcome = outcomeForGateVerdict(
+      stringField(event, "verdict") ?? stringField(event, "result") ?? stringField(event, "outcome"),
+    );
+    if (!gate || !outcome) continue;
+    structuredGates.add(gate);
+    addGateResult(results, seen, gate, outcome, `event:gate:${index}:${stringField(event, "at") ?? ""}`);
+  }
 
   for (const [index, stage] of arrayRecords(run.summary?.["stages"]).entries()) {
-    const gate = gateForName(stringField(stage, "stage"));
-    const outcome = outcomeForGate(stringField(stage, "outcome"));
-    if (!gate || !outcome) continue;
-    addGateResult(results, seen, gate, outcome, `${gate}:${outcome}:${stringField(stage, "stage")}:${stringField(stage, "exitedAt") ?? stringField(stage, "enteredAt") ?? index}`);
+    const stageName = stringField(stage, "stage");
+    const gate = gateForName(stageName);
+    if (gate && !structuredGates.has(gate)) {
+      const outcome = outcomeForStageRecord(gate, stage);
+      if (outcome) {
+        coveredLifecycleStages.add(`${gate}:${normalizeStageName(stageName)}`);
+        addGateResult(results, seen, gate, outcome, `${gate}:${outcome}:${stageName}:${stringField(stage, "exitedAt") ?? stringField(stage, "enteredAt") ?? index}`);
+      }
+    }
+
+    if (gate !== "test" && stageCanContainTestGateCommands(stageName) && !structuredGates.has("test")) {
+      const outcome = outcomeFromCommands(arrayRecords(stage["commands"]));
+      if (outcome) {
+        addGateResult(results, seen, "test", outcome, `test:${outcome}:${stageName}:${stringField(stage, "exitedAt") ?? stringField(stage, "enteredAt") ?? index}`);
+      }
+    }
   }
 
   for (const [index, event] of run.events.entries()) {
     const type = stringField(event, "type");
     if (type === "stage_complete") {
-      const gate = gateForName(stringField(event, "stage"));
-      const outcome = outcomeForGate(stringField(event, "outcome"));
+      const stageName = stringField(event, "stage");
+      const gate = gateForName(stageName);
+      const lifecycleKey = `${gate}:${normalizeStageName(stageName)}`;
+      const outcome = !gate || structuredGates.has(gate) || coveredLifecycleStages.has(lifecycleKey)
+        ? null
+        : outcomeForStageLifecycle(stringField(event, "outcome"));
       if (gate && outcome) {
         addGateResult(results, seen, gate, outcome, `${gate}:${outcome}:${stringField(event, "stage")}:${stringField(event, "at") ?? index}`);
-      }
-    }
-    if (type === "gate_result" || type === "gate_complete" || type === "gate") {
-      const gate = gateForName(stringField(event, "gate") ?? stringField(event, "stage"));
-      const outcome = outcomeForGate(stringField(event, "outcome") ?? stringField(event, "result"));
-      if (gate && outcome) {
-        addGateResult(results, seen, gate, outcome, `event:gate:${index}:${stringField(event, "at")}`);
       }
     }
   }
@@ -880,10 +907,10 @@ function collectGateResults(run: IncludedRun): Array<{ gate: "test" | "eval" | "
 }
 
 function addGateResult(
-  results: Array<{ gate: "test" | "eval" | "shipcheck"; outcome: "pass" | "fail" | "skipped" }>,
+  results: GateResult[],
   seen: Set<string>,
-  gate: "test" | "eval" | "shipcheck",
-  outcome: "pass" | "fail" | "skipped",
+  gate: GateName,
+  outcome: GateOutcome,
   key: string,
 ): void {
   if (seen.has(key)) return;
@@ -891,20 +918,56 @@ function addGateResult(
   results.push({ gate, outcome });
 }
 
-function gateForName(value: string | null): "test" | "eval" | "shipcheck" | null {
+function gateForName(value: string | null): GateName | null {
   if (!value) return null;
-  const normalized = value.toLowerCase().replace(/_/g, "-");
+  const normalized = normalizeStageName(value);
   if (normalized.includes("shipcheck")) return "shipcheck";
   if (normalized.includes("eval")) return "eval";
   if (normalized.includes("test") || normalized.includes("build")) return "test";
   return null;
 }
 
-function outcomeForGate(value: string | null): "pass" | "fail" | "skipped" | null {
+function normalizeStageName(value: string | null): string {
+  return (value ?? "").toLowerCase().replace(/_/g, "-");
+}
+
+function outcomeForStageRecord(gate: GateName, stage: JsonRecord): GateOutcome | null {
+  if (gate === "test" || gate === "eval") {
+    const commandOutcome = outcomeFromCommands(arrayRecords(stage["commands"]));
+    if (commandOutcome) return commandOutcome;
+  }
+  const explicitOutcome = outcomeForGateVerdict(
+    stringField(stage, "verdict") ?? stringField(stage, "result"),
+  );
+  if (explicitOutcome) return explicitOutcome;
+  return outcomeForStageLifecycle(stringField(stage, "outcome"));
+}
+
+function outcomeFromCommands(commands: JsonRecord[]): GateOutcome | null {
+  if (commands.length === 0) return null;
+  const last = commands[commands.length - 1];
+  const exitCode = numberField(last, "exitCode") ?? numberField(last, "exit_code");
+  if (exitCode === null) return null;
+  return exitCode === 0 ? "pass" : "fail";
+}
+
+function stageCanContainTestGateCommands(value: string | null): boolean {
+  const normalized = normalizeStageName(value);
+  return normalized === "planning" || /^fix-\d+$/.test(normalized);
+}
+
+function outcomeForStageLifecycle(value: string | null): GateOutcome | null {
+  const explicit = outcomeForGateVerdict(value);
+  if (explicit) return explicit;
+  if (value?.toLowerCase() === "advanced") return "skipped";
+  return null;
+}
+
+function outcomeForGateVerdict(value: string | null): GateOutcome | null {
   if (!value) return null;
   const normalized = value.toLowerCase();
-  if (["advanced", "pass", "passed", "success", "ok"].includes(normalized)) return "pass";
-  if (["blocked", "error", "fail", "failed", "failure"].includes(normalized)) return "fail";
+  if (["pass", "passed", "success", "ok"].includes(normalized)) return "pass";
+  if (["blocked", "error", "fail", "failed", "failure", "partial"].includes(normalized)) return "fail";
   if (["skipped", "skip", "disabled", "not_applicable", "na"].includes(normalized)) return "skipped";
   return null;
 }

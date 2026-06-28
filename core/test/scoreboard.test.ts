@@ -176,7 +176,6 @@ test("buildScoreboardReport: computes required throughput, autonomy, reliability
       { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
       { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:00Z", stage: "review-1" },
       { schema_version: 1, type: "stage_complete", at: "2026-06-10T00:01:00Z", stage: "review-1", outcome: "advanced" },
-      { schema_version: 1, type: "stage_complete", at: "2026-06-10T00:01:10Z", stage: "test-gate", outcome: "advanced" },
       { schema_version: 1, type: "stage_complete", at: "2026-06-10T00:01:20Z", stage: "eval-gate", outcome: "advanced" },
       { schema_version: 1, type: "stage_complete", at: "2026-06-10T00:01:30Z", stage: "shipcheck-gate", outcome: "skipped" },
       { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "ready-to-deploy", elapsed_ms: 120000 },
@@ -197,6 +196,15 @@ test("buildScoreboardReport: computes required throughput, autonomy, reliability
             { kind: "fix", harness: "codex", hash: "c", usage: { cost_usd: 0.5 } },
           ],
         },
+        {
+          stage: "planning",
+          commands: [{ cmd: "npm test", exitCode: 0, durationMs: 1000, outputExcerpt: "ok" }],
+        },
+        {
+          stage: "eval-gate",
+          outcome: "advanced",
+          commands: [{ cmd: "pnpm evals", exitCode: 0, durationMs: 1200, outputExcerpt: "PASS" }],
+        },
       ],
       reviews: [
         { round: 1, sha: "a", verdict: "approve", findingCounts: {}, selfReview: false },
@@ -214,6 +222,7 @@ test("buildScoreboardReport: computes required throughput, autonomy, reliability
       { schema_version: 1, type: "run_start", at: "2026-06-11T00:00:00Z", issue: 2, repo: "owner/repo" },
       { schema_version: 1, type: "human_intervention", at: "2026-06-11T00:00:30Z", kind: "test-build-failure", stage: "fix-1", issue: 2, detail: "tests failed" },
       { schema_version: 1, type: "stage_complete", at: "2026-06-11T00:01:00Z", stage: "eval-gate", outcome: "blocked" },
+      { schema_version: 1, type: "gate_result", at: "2026-06-11T00:01:20Z", gate: "shipcheck-gate", result: "pass", mode: "gate" },
       { schema_version: 1, type: "stage_complete", at: "2026-06-11T00:01:30Z", stage: "shipcheck-gate", outcome: "advanced" },
       { schema_version: 1, type: "run_complete", at: "2026-06-11T00:03:00Z", final_state: "ready-to-deploy", elapsed_ms: 180000 },
     ],
@@ -271,6 +280,69 @@ test("buildScoreboardReport: computes required throughput, autonomy, reliability
   assert.equal(report.metrics.cost_per_ready_pr_usd.actual_usd, 3);
   assert.equal(report.metrics.cost_per_ready_pr_usd.estimated_usd, 1.75);
   assert.equal(report.metrics.cost_per_ready_pr_usd.value, 2.375);
+});
+
+test("buildScoreboardReport: gate pass rates use verdict evidence, not stage advancement (#301 review 1)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "301-2026-06-13T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-13T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-13T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-13T00:01:00Z", stage: "eval-gate", outcome: "advanced" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-13T00:02:00Z", stage: "shipcheck-gate", outcome: "advanced" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-13T00:03:00Z", final_state: "ready-to-deploy", elapsed_ms: 180000 },
+    ],
+    summary: {
+      issue: 1,
+      pr: 201,
+      finalState: "ready-to-deploy",
+      stages: [
+        { stage: "eval-gate", outcome: "advanced", commands: [] },
+        { stage: "shipcheck-gate", outcome: "advanced", commands: [] },
+      ],
+      reviews: [],
+      overrides: [],
+      recoveries: [],
+    },
+  });
+  addRun(files, "302-2026-06-14T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-14T00:00:00Z", issue: 2 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-14T00:00:00Z", issue: 2, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-14T00:01:00Z", stage: "eval-gate", outcome: "advanced" },
+      { schema_version: 1, type: "gate_result", at: "2026-06-14T00:02:00Z", gate: "shipcheck-gate", result: "fail", mode: "advisory" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-14T00:02:10Z", stage: "shipcheck-gate", outcome: "advanced" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-14T00:03:00Z", final_state: "ready-to-deploy", elapsed_ms: 180000 },
+    ],
+    summary: {
+      issue: 2,
+      pr: 202,
+      finalState: "ready-to-deploy",
+      stages: [
+        {
+          stage: "eval-gate",
+          outcome: "advanced",
+          commands: [{ cmd: "pnpm evals", exitCode: 1, durationMs: 1000, outputExcerpt: "FAIL" }],
+        },
+        { stage: "shipcheck-gate", outcome: "advanced", commands: [] },
+      ],
+      reviews: [],
+      overrides: [],
+      recoveries: [],
+    },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+
+  assert.deepEqual(report.metrics.gate_pass_rates.eval.pass_rate, { numerator: 0, denominator: 1, ratio: 0 });
+  assert.equal(report.metrics.gate_pass_rates.eval.failed, 1);
+  assert.equal(report.metrics.gate_pass_rates.eval.skipped, 1);
+  assert.deepEqual(report.metrics.gate_pass_rates.shipcheck.pass_rate, { numerator: 0, denominator: 1, ratio: 0 });
+  assert.equal(report.metrics.gate_pass_rates.shipcheck.failed, 1);
+  assert.equal(report.metrics.gate_pass_rates.shipcheck.skipped, 1);
 });
 
 test("buildScoreboardReport: artifact problems are diagnostics, not crashes (#301)", async () => {
