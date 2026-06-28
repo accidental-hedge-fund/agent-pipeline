@@ -26,7 +26,13 @@ import { invoke as defaultInvoke } from "../harness.ts";
 import { substitute } from "../prompts/index.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import {
+  runEligibilityGate,
+  formatEligibilityVerdict,
+  type EligibilityGateDeps,
+} from "./auto_merge_eligibility.ts";
 import type {
+  AutoMergeEligibilityArtifact,
   BlockerKind,
   EvidenceBundle,
   Outcome,
@@ -185,6 +191,10 @@ export interface ShipcheckDeps {
   readSpecDeltasFn?: (wtPath: string, name: string) => string;
   /** Invoke the reviewer harness with a prompt. Returns stdout string or null on failure. */
   invokeReviewer?: (prompt: string, worktreeDir: string, timeoutSec: number) => Promise<{ stdout: string; success: boolean; timed_out?: boolean; stderr?: string }>;
+  /** Run the auto-merge eligibility gate (#306). Injectable for tests. */
+  runEligibilityGateFn?: typeof runEligibilityGate;
+  /** Deps forwarded to the eligibility gate (for deep test injection). */
+  eligibilityGateDeps?: EligibilityGateDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,9 +405,10 @@ export async function advance(
     }
     // Advisory: warn and advance.
     console.warn(`[pipeline] #${issueNumber}: shipcheck-gate parse failure (advisory mode); advancing`);
+    const eligibilitySuffixPf = await maybeRunEligibilityGate(cfg, issueNumber, prNumber, worktreeDir, opts, deps);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck parse failure (advisory mode); advancing.");
     await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "parse_failure");
-    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck parse failure (advisory)" };
+    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck parse failure (advisory)${eligibilitySuffixPf}` };
   }
 
   if (!verdict) {
@@ -407,9 +418,10 @@ export async function advance(
       await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "no_output");
       return { advanced: false, status: "blocked", reason: "shipcheck: no harness output", blockerKind: "needs-human" as BlockerKind };
     }
+    const eligibilitySuffixNo = await maybeRunEligibilityGate(cfg, issueNumber, prNumber, worktreeDir, opts, deps);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck: no harness output (advisory); advancing.");
     await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "no_output");
-    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck no output (advisory)" };
+    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck no output (advisory)${eligibilitySuffixNo}` };
   }
 
   // Post verdict comment. Issue comment is authoritative; PR mirror is best-effort
@@ -427,17 +439,19 @@ export async function advance(
   // Route based on mode and verdict.
   if (cfg.shipcheck_gate.mode === "advisory") {
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate verdict=${verdict.verdict} (advisory mode); advancing`);
+    const eligibilitySuffix = await maybeRunEligibilityGate(cfg, issueNumber, prNumber, worktreeDir, opts, deps);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", `Shipcheck verdict: ${verdict.verdict} (advisory mode).`);
     await recordGateResult(opts, verdict.verdict, cfg.shipcheck_gate.mode);
-    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck ${verdict.verdict} (advisory)` };
+    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck ${verdict.verdict} (advisory)${eligibilitySuffix}` };
   }
 
   // Gate mode.
   if (verdict.verdict === "pass") {
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate passed; advancing`);
+    const eligibilitySuffix = await maybeRunEligibilityGate(cfg, issueNumber, prNumber, worktreeDir, opts, deps);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck passed.");
     await recordGateResult(opts, "pass", cfg.shipcheck_gate.mode);
-    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck passed" };
+    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck passed${eligibilitySuffix}` };
   }
 
   if (verdict.verdict === "partial") {
@@ -448,9 +462,10 @@ export async function advance(
       return { advanced: false, status: "blocked", reason: "shipcheck partial verdict", blockerKind: "shipcheck-failed" as BlockerKind };
     }
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate partial verdict (block_on_partial=false); advancing`);
+    const eligibilitySuffix = await maybeRunEligibilityGate(cfg, issueNumber, prNumber, worktreeDir, opts, deps);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck partial verdict (block_on_partial: false).");
     await recordGateResult(opts, "partial", cfg.shipcheck_gate.mode);
-    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck partial (not blocking)" };
+    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck partial (not blocking)${eligibilitySuffix}` };
   }
 
   // Fail verdict in gate mode.
@@ -458,6 +473,58 @@ export async function advance(
   await setBlockedFn(cfg, issueNumber, `Shipcheck gate failed.\n\n${verdict.summary}`, "shipcheck-gate", "shipcheck-failed" as BlockerKind);
   await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode);
   return { advanced: false, status: "blocked", reason: "shipcheck fail verdict", blockerKind: "shipcheck-failed" as BlockerKind };
+}
+
+// ---------------------------------------------------------------------------
+// Eligibility gate integration (#306)
+// ---------------------------------------------------------------------------
+
+/**
+ * Invoke the auto-merge eligibility gate when enabled (config.auto_merge_eligibility.enabled).
+ * Called on every path that advances to `ready-to-deploy`.
+ * Returns a summary suffix string for the stage summary comment, or "" when disabled.
+ * Errors are caught and logged — gate failures NEVER block ready-to-deploy.
+ */
+async function maybeRunEligibilityGate(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  prNumber: number | null,
+  worktreeDir: string,
+  opts: AdvanceShipcheckOpts,
+  deps: ShipcheckDeps,
+): Promise<string> {
+  if (!cfg.auto_merge_eligibility?.enabled) return "";
+  if (!prNumber) {
+    console.log(`[pipeline] #${issueNumber}: auto-merge-eligibility: no PR linked; skipping`);
+    return "";
+  }
+  try {
+    console.log(`[pipeline] #${issueNumber}: auto-merge-eligibility: running eligibility gate`);
+    const gateFn = deps.runEligibilityGateFn ?? runEligibilityGate;
+    const artifact = await gateFn(
+      cfg,
+      issueNumber,
+      prNumber,
+      {
+        stateDir: opts.stateDir,
+        worktreeDir,
+        runId: opts.runDir ?? "",
+        // By the time we reach shipcheck-gate the review is always approved
+        // (pre-merge enforces this before advancing). Pass a synthetic verdict.
+        reviewVerdict: { verdict: "approve", findingCount: 0, recordedAt: new Date().toISOString().replace(/\.\d+Z$/, "Z") },
+        issueScope: "(see issue body)",
+      },
+      deps.eligibilityGateDeps ?? {},
+    );
+    const line = formatEligibilityVerdict(artifact);
+    console.log(`[pipeline] #${issueNumber}: ${line}`);
+    return `\n${line}`;
+  } catch (err) {
+    console.warn(
+      `[pipeline] #${issueNumber}: auto-merge-eligibility: gate error (non-fatal): ${(err as Error).message}`,
+    );
+    return "";
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -483,3 +483,17 @@ export function formatSummary(bundle: EvidenceBundle): string {
 export function printSummary(bundle: EvidenceBundle): void {
   console.log(formatSummary(bundle));
 }
+
+/** Write the auto-merge eligibility artifact to the bundle (#306).
+ *  The artifact is set on `bundle.auto_merge_eligibility` and the bundle
+ *  is written atomically. Non-fatal: write errors are caught and logged. */
+export async function recordEligibilityArtifact(
+  stateDir: string,
+  issue: number,
+  artifact: import("./types.ts").AutoMergeEligibilityArtifact,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  bundle.auto_merge_eligibility = artifact;
+  await writeBundle(stateDir, issue, bundle, deps);
+}
