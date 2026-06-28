@@ -72,6 +72,16 @@ export const BUILT_IN_DENY_PATTERNS: readonly RegExp[] = [
   /\.prod\./i,
   /(?:^|\/)production\//i,
   /\.production\./i,
+  // Auth / security / billing file basenames (not already caught by directory patterns)
+  /(?:^|\/)auth(?:entication|orization)?(?:\.[a-z]+)+$/i,
+  /(?:^|\/)security(?:\.[a-z]+)+$/i,
+  /(?:^|\/)billing(?:\.[a-z]+)+$/i,
+  // Additional dependency manifests (lock files are already covered above)
+  /(?:^|\/)go\.mod$/,
+  /(?:^|\/)requirements(?:-[a-z]+)?\.txt$/i,
+  /(?:^|\/)pyproject\.toml$/,
+  /(?:^|\/)Cargo\.toml$/,
+  /(?:^|\/)Gemfile$/,
 ];
 
 // ---------------------------------------------------------------------------
@@ -101,10 +111,14 @@ function matchesAnyGlob(filePath: string, patterns: string[]): boolean {
 // ---------------------------------------------------------------------------
 
 export function parseDiffFiles(diff: string): string[] {
+  const seen = new Set<string>();
   const files: string[] = [];
   for (const line of diff.split("\n")) {
-    const m = line.match(/^diff --git a\/(.*) b\//);
-    if (m) files.push(m[1]);
+    const m = line.match(/^diff --git a\/(.*) b\/(.*)/);
+    if (!m) continue;
+    const [, aPath, bPath] = m;
+    if (!seen.has(aPath)) { seen.add(aPath); files.push(aPath); }
+    if (!seen.has(bPath)) { seen.add(bPath); files.push(bPath); }
   }
   return files;
 }
@@ -280,7 +294,7 @@ function patternLabel(pattern: RegExp): string {
   if (/security/i.test(src)) return "security";
   if (/infra|deploy|terraform|kubernetes|k8s/i.test(src)) return "infrastructure";
   if (/secret|\.env/i.test(src)) return "secrets";
-  if (/package(?:\.json|-lock)|yarn\.lock|pnpm|Cargo\.lock|go\.sum|Pipfile|Gemfile|composer/i.test(src)) return "dependency_manifest";
+  if (/package(?:\.json|-lock)|yarn\.lock|pnpm|Cargo(?:\.lock|\.toml)|go(?:\.sum|\.mod)|Pipfile|Gemfile|composer|requirements|pyproject/i.test(src)) return "dependency_manifest";
   if (/cron|schedule/i.test(src)) return "cron_scheduler";
   if (/openapi|swagger|graphql/i.test(src)) return "public_api";
   if (/github\/workflow|CHANGELOG|release/i.test(src)) return "release_config";
@@ -459,7 +473,7 @@ export interface EligibilityGateDeps {
   readEvidenceBundle?: (
     stateDir: string,
     issue: number,
-  ) => Promise<{ runId: string; no_test_rationale?: string } | null>;
+  ) => Promise<{ runId: string; issue?: number; pr?: number | null; no_test_rationale?: string } | null>;
   /** Invoke the reviewer/judge harness. Returns stdout and success flag. */
   invokeJudge?: (
     prompt: string,
@@ -572,8 +586,12 @@ export async function runEligibilityGate(
       return readBundle(sd, iss);
     });
     const bundle = await readBundleFn(opts.stateDir, issueNumber).catch(() => null);
-    hasEvidenceBundle = bundle !== null && !!bundle.runId;
-    noTestRationale = bundle?.no_test_rationale;
+    const bundleIdentityOk = bundle !== null &&
+      !!bundle.runId &&
+      (bundle.issue === undefined || bundle.issue === issueNumber) &&
+      (bundle.pr === undefined || bundle.pr === null || bundle.pr === prNumber);
+    hasEvidenceBundle = bundleIdentityOk;
+    noTestRationale = bundleIdentityOk ? bundle?.no_test_rationale : undefined;
   }
 
   const headSha = prDetail.head_sha;

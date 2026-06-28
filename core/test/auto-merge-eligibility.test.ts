@@ -890,3 +890,124 @@ test("finding5: nested lockfile at any path triggers built-in deny pattern", () 
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Regression tests for review-2 findings
+// ---------------------------------------------------------------------------
+
+// Finding 3 (review-2): parseDiffFiles includes b/ path for renames
+test("parseDiffFiles: rename into .github/workflows → b/ path included", () => {
+  const renameDiff = `diff --git a/scripts/old-ci.sh b/.github/workflows/ci.yml
+similarity index 80%
+rename from scripts/old-ci.sh
+rename to .github/workflows/ci.yml
+index abc..def 100644
+--- a/scripts/old-ci.sh
++++ b/.github/workflows/ci.yml
+@@ -1,3 +1,3 @@
+-old
++new
+`;
+  const files = parseDiffFiles(renameDiff);
+  assert.ok(files.includes(".github/workflows/ci.yml"), `expected b/ path included, got: ${JSON.stringify(files)}`);
+  assert.ok(files.includes("scripts/old-ci.sh"), `expected a/ path included, got: ${JSON.stringify(files)}`);
+});
+
+test("auto-merge-eligibility: rename from safe file into workflows → needs-human (b/ path evaluated)", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const renameDiff = `diff --git a/scripts/old-ci.sh b/.github/workflows/ci.yml
+similarity index 80%
+rename from scripts/old-ci.sh
+rename to .github/workflows/ci.yml
+index abc..def 100644
+--- a/scripts/old-ci.sh
++++ b/.github/workflows/ci.yml
+@@ -1,3 +1,3 @@
+-#!/bin/bash
++name: CI
+`;
+  const { deps, rec } = makeDeps({
+    getPrDiff: async () => renameDiff,
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("release_config") || r.includes("ci.yml") || r.includes("workflows")),
+    `expected workflows deny, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 0, "judge must not be invoked when hard-deny fires");
+});
+
+// Finding 4 (review-2): stale bundle with wrong PR number → missing_evidence denial
+test("finding: stale bundle with wrong PR number → missing_evidence denial", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const { deps, rec } = makeDeps({
+    readEvidenceBundle: async () => ({
+      runId: "some-run-id",
+      issue: 123,
+      pr: 999, // wrong PR number — prNumber in the gate call is 42
+    }),
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("missing_evidence")),
+    `expected missing_evidence denial due to stale bundle, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 0);
+});
+
+test("finding: bundle with matching issue+pr → evidence check passes", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const { deps } = makeDeps({
+    readEvidenceBundle: async () => ({
+      runId: "run-id-1",
+      issue: 123,
+      pr: 42,
+    }),
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  // Should not deny on evidence check when identity matches
+  assert.ok(
+    !artifact.denial_reasons.some((r) => r.includes("missing_evidence")),
+    `should NOT have missing_evidence denial, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+});
+
+// Finding 5 (review-2): new built-in deny patterns
+test("BUILT_IN_DENY_PATTERNS: auth file basename matches", () => {
+  const authPaths = ["src/auth.ts", "lib/authentication.js", "app/authorization.rb"];
+  for (const p of authPaths) {
+    assert.ok(
+      BUILT_IN_DENY_PATTERNS.some((r) => r.test(p)),
+      `expected ${p} to match a built-in deny pattern`,
+    );
+  }
+});
+
+test("BUILT_IN_DENY_PATTERNS: dependency manifest files match", () => {
+  const manifestPaths = [
+    "go.mod",
+    "packages/api/go.mod",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "pyproject.toml",
+    "Cargo.toml",
+    "Gemfile",
+  ];
+  for (const p of manifestPaths) {
+    assert.ok(
+      BUILT_IN_DENY_PATTERNS.some((r) => r.test(p)),
+      `expected ${p} to match a built-in deny pattern`,
+    );
+  }
+});

@@ -266,9 +266,16 @@ export async function advance(
   // Skip path — disabled → silent label swap, no comment.
   if (!cfg.shipcheck_gate.enabled) {
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate step disabled; skipping.`);
+    let eligibilitySuffix = "";
+    if (cfg.auto_merge_eligibility?.enabled) {
+      const prNumForElig = await getPrForIssueFn(cfg, issueNumber);
+      const wtForElig = await getForIssueFn(cfg, issueNumber);
+      const wdForElig = wtForElig?.path ?? cfg.repo_dir;
+      eligibilitySuffix = await maybeRunEligibilityGate(cfg, issueNumber, prNumForElig, wdForElig, opts, deps);
+    }
     await silentTransitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy");
     await recordGateResult(opts, "skipped", cfg.shipcheck_gate.mode, "disabled");
-    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: "shipcheck-gate step disabled; skipping." };
+    return { advanced: true, from: "shipcheck-gate", to: "ready-to-deploy", summary: `shipcheck-gate step disabled; skipping.${eligibilitySuffix}` };
   }
 
   // Load the issue detail for context.
@@ -500,6 +507,22 @@ async function maybeRunEligibilityGate(
   }
   try {
     console.log(`[pipeline] #${issueNumber}: auto-merge-eligibility: running eligibility gate`);
+    // Read actual review verdict from evidence bundle (not synthetic).
+    let actualReviewVerdict: { verdict: string; findingCount: number; recordedAt: string } | null = null;
+    let actualRunId: string = opts.runDir ?? "";
+    if (opts.stateDir) {
+      const readBundleFn = deps.readEvidenceBundle ?? defaultReadBundle;
+      const bundle = await readBundleFn(opts.stateDir, issueNumber).catch(() => null);
+      if (bundle && bundle.reviews.length > 0) {
+        const latest = bundle.reviews.reduce((a, b) => (b.round > a.round ? b : a));
+        actualReviewVerdict = {
+          verdict: latest.verdict,
+          findingCount: Object.values(latest.findingCounts).reduce((s, n) => s + n, 0),
+          recordedAt: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+        };
+      }
+      if (bundle?.runId) actualRunId = bundle.runId;
+    }
     const gateFn = deps.runEligibilityGateFn ?? runEligibilityGate;
     const artifact = await gateFn(
       cfg,
@@ -508,10 +531,8 @@ async function maybeRunEligibilityGate(
       {
         stateDir: opts.stateDir,
         worktreeDir,
-        runId: opts.runDir ?? "",
-        // By the time we reach shipcheck-gate the review is always approved
-        // (pre-merge enforces this before advancing). Pass a synthetic verdict.
-        reviewVerdict: { verdict: "approve", findingCount: 0, recordedAt: new Date().toISOString().replace(/\.\d+Z$/, "Z") },
+        runId: actualRunId,
+        reviewVerdict: actualReviewVerdict,
         issueScope: "(see issue body)",
       },
       deps.eligibilityGateDeps ?? {},

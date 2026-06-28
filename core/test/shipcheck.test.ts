@@ -988,6 +988,204 @@ test("shipcheck-gate: OpenSpec deltas recovered from date-prefixed archive dir a
   );
 });
 
+// ---------------------------------------------------------------------------
+// Regression tests for review-2 findings
+// ---------------------------------------------------------------------------
+
+// Finding 1 (review-2): disabled shipcheck + auto_merge_eligibility.enabled → eligibility gate still runs
+test("shipcheck-gate: disabled + auto_merge_eligibility.enabled → eligibility gate still runs", async () => {
+  const log = makeCallLog();
+  let eligibilityGateCalled = false;
+  const cfg: PipelineConfig = {
+    ...baseCfg({ enabled: false }),
+    auto_merge_eligibility: {
+      enabled: true,
+      max_diff_lines: 300,
+      max_files: 10,
+      deny_paths: [],
+      allow_paths: [],
+      min_confidence: 0.8,
+    },
+  };
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    getPrForIssue: async () => 99,
+    getForIssue: async () => null,
+    runEligibilityGateFn: async () => {
+      eligibilityGateCalled = true;
+      return {
+        eligibility: "needs-human",
+        evaluated_at: "2026-06-28T00:00:00Z",
+        deterministic_checks: [],
+        denial_reasons: ["ci: no passing run"],
+        judge_output: null,
+        ci_status_snapshot: { sha: "abc", conclusion: "failure", checked_at: "2026-06-28T00:00:00Z" },
+        review_verdict_snapshot: { verdict: "unknown", finding_count: 0, recorded_at: "2026-06-28T00:00:00Z" },
+        linked_run_id: "",
+        linked_issue: 42,
+        linked_pr: 99,
+        revert_note: "git revert abc",
+      };
+    },
+  };
+
+  const out = await advance(cfg, 42, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(eligibilityGateCalled, true, "eligibility gate must run even when shipcheck is disabled");
+});
+
+// Finding 1 (review-2): disabled shipcheck without auto_merge_eligibility → gate NOT called
+test("shipcheck-gate: disabled + auto_merge_eligibility absent → eligibility gate NOT called", async () => {
+  const log = makeCallLog();
+  let eligibilityGateCalled = false;
+  const cfg = baseCfg({ enabled: false });
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    runEligibilityGateFn: async () => {
+      eligibilityGateCalled = true;
+      return {
+        eligibility: "needs-human",
+        evaluated_at: "2026-06-28T00:00:00Z",
+        deterministic_checks: [],
+        denial_reasons: [],
+        judge_output: null,
+        ci_status_snapshot: { sha: "abc", conclusion: "unknown", checked_at: "2026-06-28T00:00:00Z" },
+        review_verdict_snapshot: { verdict: "unknown", finding_count: 0, recorded_at: "2026-06-28T00:00:00Z" },
+        linked_run_id: "",
+        linked_issue: 42,
+        linked_pr: null as unknown as number,
+        revert_note: "git revert abc",
+      };
+    },
+  };
+
+  const out = await advance(cfg, 42, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(eligibilityGateCalled, false, "eligibility gate must NOT run when auto_merge_eligibility is not configured");
+});
+
+// Finding 2 (review-2): actual review verdict read from bundle (no reviews → null)
+test("shipcheck-gate: actual review verdict read from bundle, not synthetic approve (empty reviews → null)", async () => {
+  const log = makeCallLog();
+  let capturedReviewVerdict: unknown = "NOT_CALLED";
+  const cfg: PipelineConfig = {
+    ...baseCfg({ enabled: true, mode: "advisory" }),
+    auto_merge_eligibility: {
+      enabled: true,
+      max_diff_lines: 300,
+      max_files: 10,
+      deny_paths: [],
+      allow_paths: [],
+      min_confidence: 0.8,
+    },
+  };
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 99,
+    getForIssue: async () => null,
+    readEvidenceBundle: async () => ({
+      schema_version: 1,
+      schemaVersion: 1,
+      runId: "real-run-id",
+      issue: 42,
+      pr: 99,
+      branch: "test",
+      harnesses: [],
+      stages: [],
+      reviews: [],
+      overrides: [],
+      recoveries: [],
+      finalState: null,
+      finalizedAt: null,
+      notifiedAt: null,
+    }),
+    runEligibilityGateFn: async (_cfg, _issue, _pr, gateOpts) => {
+      capturedReviewVerdict = gateOpts.reviewVerdict;
+      return {
+        eligibility: "needs-human",
+        evaluated_at: "2026-06-28T00:00:00Z",
+        deterministic_checks: [],
+        denial_reasons: ["review: verdict is not approved"],
+        judge_output: null,
+        ci_status_snapshot: { sha: "abc", conclusion: "unknown", checked_at: "2026-06-28T00:00:00Z" },
+        review_verdict_snapshot: { verdict: "unknown", finding_count: 0, recorded_at: "2026-06-28T00:00:00Z" },
+        linked_run_id: "real-run-id",
+        linked_issue: 42,
+        linked_pr: 99,
+        revert_note: "git revert abc",
+      };
+    },
+  };
+
+  const out = await advance(cfg, 42, { stateDir: "/tmp/state" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(capturedReviewVerdict, null, "with no reviews in bundle, reviewVerdict should be null (not synthetic approve)");
+});
+
+// Finding 2 (review-2): actual review verdict from bundle reviews passed to eligibility gate
+test("shipcheck-gate: actual review verdict from bundle reviews passed to eligibility gate", async () => {
+  const log = makeCallLog();
+  let capturedReviewVerdict: unknown = "NOT_CALLED";
+  const cfg: PipelineConfig = {
+    ...baseCfg({ enabled: true, mode: "advisory" }),
+    auto_merge_eligibility: {
+      enabled: true,
+      max_diff_lines: 300,
+      max_files: 10,
+      deny_paths: [],
+      allow_paths: [],
+      min_confidence: 0.8,
+    },
+  };
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 99,
+    getForIssue: async () => null,
+    readEvidenceBundle: async () => ({
+      schema_version: 1,
+      schemaVersion: 1,
+      runId: "real-run-id",
+      issue: 42,
+      pr: 99,
+      branch: "test",
+      harnesses: [],
+      stages: [],
+      reviews: [{ round: 1, sha: "abc", verdict: "approve", findingCounts: { low: 0 } }],
+      overrides: [],
+      recoveries: [],
+      finalState: null,
+      finalizedAt: null,
+      notifiedAt: null,
+    }),
+    runEligibilityGateFn: async (_cfg, _issue, _pr, gateOpts) => {
+      capturedReviewVerdict = gateOpts.reviewVerdict;
+      return {
+        eligibility: "auto-merge-eligible",
+        evaluated_at: "2026-06-28T00:00:00Z",
+        deterministic_checks: [],
+        denial_reasons: [],
+        judge_output: null,
+        ci_status_snapshot: { sha: "abc", conclusion: "success", checked_at: "2026-06-28T00:00:00Z" },
+        review_verdict_snapshot: { verdict: "approve", finding_count: 0, recorded_at: "2026-06-28T00:00:00Z" },
+        linked_run_id: "real-run-id",
+        linked_issue: 42,
+        linked_pr: 99,
+        revert_note: "git revert abc",
+      };
+    },
+  };
+
+  const out = await advance(cfg, 42, { stateDir: "/tmp/state" }, deps);
+
+  assert.equal(out.advanced, true);
+  const rv = capturedReviewVerdict as { verdict: string } | null;
+  assert.ok(rv !== null, "reviewVerdict should not be null when reviews exist");
+  assert.equal((rv as { verdict: string }).verdict, "approve", "reviewVerdict.verdict should match the bundle review verdict");
+});
+
 test("shipcheck-gate: OpenSpec disabled (enabled:off) → archive lookup skipped", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "advisory" });
