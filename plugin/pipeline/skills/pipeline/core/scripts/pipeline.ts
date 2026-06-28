@@ -246,6 +246,12 @@ export interface CliOpts {
   force?: boolean;
   /** improve: restrict analysis to runs on or after this ISO date. */
   since?: string;
+  /** scoreboard: restrict analysis to runs on or before this ISO date. */
+  until?: string;
+  /** scoreboard: use a relative N-day window. */
+  days?: number;
+  /** scoreboard: explicit per-harness cost estimates, as harness=usd-per-call. */
+  estimateCost?: string[];
   /** improve: emit top-N clusters in the report (default 5). */
   top?: number;
   /** improve: only report clusters with at least this many occurrences (default 3). */
@@ -260,6 +266,7 @@ export interface CliOpts {
  */
 export function buildCmd(): Command {
   const cmd = new Command();
+  const collectRepeatable = (value: string, previous: string[] = []): string[] => [...previous, value];
   cmd
     .name("pipeline")
     .description("Advance a GitHub issue/PR through the pipeline state machine.")
@@ -267,7 +274,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -304,7 +311,10 @@ export function buildCmd(): Command {
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
-    .option("--since <date>", "improve: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
+    .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
+    .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
+    .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
+    .option("--estimate-cost <harness=usd>", "scoreboard: estimate missing harness-call costs; repeatable", collectRepeatable, [])
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -354,6 +364,23 @@ async function main(): Promise<void> {
       "  --repo-path <path>        override the target repo working tree\n\n" +
       "The command never modifies pipeline labels, branches, PRs, worktrees, or repo files.\n" +
       "Exit code: 0 always (even when no run data is found).\n",
+    );
+    process.exit(0);
+  }
+  if (rawArgs[0] === "scoreboard" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
+    process.stdout.write(
+      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--json]\n\n" +
+      "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
+      "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
+      "Options:\n" +
+      "  --since <date>              window start (ISO-8601)\n" +
+      "  --until <date>              window end (ISO-8601)\n" +
+      "  --days <n>                  relative N-day window; default is last 30 days\n" +
+      "  --estimate-cost <harness=usd>  estimate missing per-call cost; repeatable\n" +
+      "  --json                      emit one unfenced JSON object\n" +
+      "  --repo-path <path>          override the target repo working tree\n\n" +
+      "The command never modifies pipeline labels, branches, PRs, worktrees, config, or run artifacts.\n" +
+      "Exit code: 0 on success, non-zero only for invalid flags or unreadable report setup.\n",
     );
     process.exit(0);
   }
@@ -462,9 +489,9 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   // `pipeline path --json`, `pipeline config validate --json`, `pipeline refine-spec --json`,
-  // `pipeline improve --json`, and `--remove-worktree --json` legitimately emit JSON —
+  // `pipeline improve --json`, `pipeline scoreboard --json`, and `--remove-worktree --json` legitimately emit JSON —
   // exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve") {
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -705,6 +732,31 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early scoreboard dispatch — no issue number, no config resolution, no GitHub calls.
+  // It reads only existing run artifacts under .agent-pipeline/runs.
+  if (numArg === "scoreboard") {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    const { runScoreboard, realScoreboardDeps } = await import("./scoreboard.ts");
+    try {
+      await runScoreboard(
+        {
+          repoDir,
+          since: opts.since,
+          until: opts.until,
+          days: opts.days,
+          json: !!opts.json,
+          estimateCost: opts.estimateCost,
+        },
+        realScoreboardDeps(),
+      );
+    } catch (err) {
+      console.error(`pipeline scoreboard: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early roadmap dispatch — no issue number, derives repo/config from local git state.
   if (numArg === "roadmap") {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
@@ -862,7 +914,7 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +

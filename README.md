@@ -224,6 +224,9 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline improve                             read run artifacts; print dry-run cluster report (no number; read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
 /pipeline improve --top 10 --since 2026-06-01 --json  limit scope + emit JSON array of clusters
+/pipeline scoreboard                          read run artifacts; print factory throughput/cost/reliability metrics
+/pipeline scoreboard --days 14 --json         emit one JSON scoreboard object for the last 14 days
+/pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
@@ -428,6 +431,24 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 **Output:** the default human-readable report lists category, normalized signal, occurrence count, affected run IDs, an evidence excerpt, and a proposed issue title. `--json` emits a JSON array with the same fields. When `--apply --json` are combined, each cluster object also includes the `issueUrl` of the created issue.
 
 **`--apply` safety:** only `gh issue create` is ever called — no label mutations, no branch writes, no pipeline state changes. Requires gh authentication; fails fast with a clear error if not authenticated.
+
+## Scoreboard sub-command
+
+`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+
+```bash
+/pipeline scoreboard
+/pipeline scoreboard --since 2026-06-01T00:00:00Z --until 2026-06-15T00:00:00Z
+/pipeline scoreboard --days 7
+/pipeline scoreboard --json
+/pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
+```
+
+When no window flags are supplied, the window is the last 30 days ending at command start. `--since`, `--until`, and `--days` select the reporting window. `--json` emits exactly one unfenced JSON object with `schema_version`, `window`, `totals`, `metrics`, and `diagnostics`; the human report prints the same metric headings plus diagnostics when present.
+
+Cost metrics use recorded `cost_usd` or `usage.cost_usd` values when present. For harness calls without actual cost, pass repeatable `--estimate-cost <harness>=<usd-per-call>` values. Actual cost wins over estimates. If a successful PR has a recorded harness call with neither actual nor estimated cost, `cost_per_ready_pr_usd.value` is `null` and diagnostics name the missing harness estimate instead of silently using zero.
+
+Historical artifact problems are reported as diagnostics, not crashes: missing run stores, missing/corrupt `summary.json`, missing/corrupt `run.json`, missing `events.jsonl`, partial final event lines, missing start times, and ready runs without PR numbers all surface with stable reason codes and file paths.
 
 ## Onboarding a new repo
 
