@@ -89,11 +89,16 @@ results.
 - **THEN** the stage transition decisions SHALL be identical for both runs
 - **AND** no label transition SHALL depend on the accounting cost values
 
-#### Scenario: Accounting records are not required to continue a run
+#### Scenario: Accounting event emission failure is non-fatal
 
-- **WHEN** an accounting record write fails or accounting data is missing for a
-  stage
+- **WHEN** an accounting event emission to `events.jsonl` fails
 - **THEN** the stage SHALL continue according to the existing run-artifact
   non-fatal write convention
 - **AND** the pipeline SHALL NOT enter a blocked or error state solely because
-  accounting data is absent
+  accounting event emission fails
+
+#### Scenario: Absent accounting instrumentation does not block a stage
+
+- **WHEN** accounting instrumentation is not wired for a stage invocation
+- **THEN** the stage SHALL complete normally without producing an accounting record
+- **AND** no accounting record SHALL be required for the stage to produce its outcome
