@@ -764,15 +764,18 @@ test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
   }
 });
 
-test("merge: loop-isolation — dispatch() in pipeline.ts does not call mergePr", () => {
-  const content = fs.readFileSync(PIPELINE_TS, "utf8");
+test("merge: loop-isolation — dispatch() in pipeline-run.ts does not call mergePr", () => {
+  // dispatch() moved from pipeline.ts to pipeline-run.ts in #263.
+  // The invariant is preserved: check pipeline-run.ts instead.
+  const pipelineRunTs = path.join(__dirname, "..", "scripts", "pipeline-run.ts");
+  const content = fs.readFileSync(pipelineRunTs, "utf8");
 
   // Extract the dispatch() function body by finding its declaration and the
   // closing brace at the same indentation level. We look for the function text
-  // between "async function dispatch(" and the balanced closing "}" so that the
+  // between "export async function dispatch(" and the balanced closing "}" so that the
   // test is robust to formatting changes.
-  const dispatchStart = content.indexOf("async function dispatch(");
-  assert.ok(dispatchStart !== -1, "dispatch() function must exist in pipeline.ts");
+  const dispatchStart = content.indexOf("export async function dispatch(");
+  assert.ok(dispatchStart !== -1, "dispatch() function must exist in pipeline-run.ts");
 
   // Find the end of the dispatch function by counting braces from the opening '{'.
   const openBrace = content.indexOf("{", dispatchStart);
