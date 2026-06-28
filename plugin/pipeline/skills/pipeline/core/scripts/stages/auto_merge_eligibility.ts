@@ -588,8 +588,8 @@ export async function runEligibilityGate(
     const bundle = await readBundleFn(opts.stateDir, issueNumber).catch(() => null);
     const bundleIdentityOk = bundle !== null &&
       !!bundle.runId &&
-      (bundle.issue === undefined || bundle.issue === issueNumber) &&
-      (bundle.pr === undefined || bundle.pr === null || bundle.pr === prNumber);
+      bundle.issue === issueNumber &&
+      bundle.pr === prNumber;
     hasEvidenceBundle = bundleIdentityOk;
     noTestRationale = bundleIdentityOk ? bundle?.no_test_rationale : undefined;
   }

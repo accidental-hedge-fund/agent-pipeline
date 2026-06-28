@@ -268,10 +268,14 @@ export async function advance(
     console.log(`[pipeline] #${issueNumber}: shipcheck-gate step disabled; skipping.`);
     let eligibilitySuffix = "";
     if (cfg.auto_merge_eligibility?.enabled) {
-      const prNumForElig = await getPrForIssueFn(cfg, issueNumber);
-      const wtForElig = await getForIssueFn(cfg, issueNumber);
-      const wdForElig = wtForElig?.path ?? cfg.repo_dir;
-      eligibilitySuffix = await maybeRunEligibilityGate(cfg, issueNumber, prNumForElig, wdForElig, opts, deps);
+      try {
+        const prNumForElig = await getPrForIssueFn(cfg, issueNumber);
+        const wtForElig = await getForIssueFn(cfg, issueNumber);
+        const wdForElig = wtForElig?.path ?? cfg.repo_dir;
+        eligibilitySuffix = await maybeRunEligibilityGate(cfg, issueNumber, prNumForElig, wdForElig, opts, deps);
+      } catch (err) {
+        console.warn(`[pipeline] #${issueNumber}: eligibility gate lookup failed (non-fatal in disabled-shipcheck path): ${err}`);
+      }
     }
     await silentTransitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy");
     await recordGateResult(opts, "skipped", cfg.shipcheck_gate.mode, "disabled");

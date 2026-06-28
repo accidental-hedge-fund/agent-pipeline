@@ -178,7 +178,7 @@ function makeDeps(overrides: Partial<EligibilityGateDeps> = {}): { deps: Eligibi
     getPrChecks: async () => PASSING_CI,
     getPrDiff: async () => SIMPLE_DIFF,
     getPrUnresolvedThreadCount: async () => 0,
-    readEvidenceBundle: async () => ({ runId: "test-run-1" }),
+    readEvidenceBundle: async () => ({ runId: "test-run-1", issue: 123, pr: 42 }),
     invokeJudge: async () => {
       rec.judgeInvocations++;
       return { stdout: JSON.stringify(VALID_JUDGE_OUTPUT), success: true };
@@ -959,6 +959,28 @@ test("finding: stale bundle with wrong PR number → missing_evidence denial", a
   assert.ok(
     artifact.denial_reasons.some((r) => r.includes("missing_evidence")),
     `expected missing_evidence denial due to stale bundle, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 0);
+});
+
+// Finding 2 (review-3): bundle with pr:null → missing_evidence hard denial (spec: incomplete evidence = deny)
+test("finding2-review3: bundle with pr:null → missing_evidence denial", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const { deps, rec } = makeDeps({
+    readEvidenceBundle: async () => ({
+      runId: "some-run-id",
+      issue: 123,
+      pr: null, // null PR — must be rejected as incomplete identity
+    }),
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("missing_evidence")),
+    `expected missing_evidence denial for null pr, got: ${JSON.stringify(artifact.denial_reasons)}`,
   );
   assert.equal(rec.judgeInvocations, 0);
 });
