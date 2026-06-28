@@ -14,6 +14,10 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
+import {
+  findUnacknowledgedComments,
+  PRE_PLANNING_CONTEXT_HEADER,
+} from "../issue-context-snapshot.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import { formatStderrExcerpt } from "../harness.ts";
 import {
@@ -86,6 +90,8 @@ export interface AdvanceReviewOpts {
   runDir?: string;
   /** Run-store deps carrying `stdoutWrite` for streaming events (#155). */
   runStoreDeps?: RunStoreDeps;
+  /** Pre-rendered context snapshot block for prompt injection (#318). Set internally by advanceReview. */
+  contextSnapshot?: string;
 }
 
 /**
@@ -229,6 +235,31 @@ export async function advanceReview(
   const plan = extractPlan(detail.comments);
   const review1Summary = round === 2 ? extractReview1Summary(detail.comments) : undefined;
   const priorReview2Findings = round === 2 ? extractReview2Findings(detail.comments) : undefined;
+
+  // Extract pre-planning context snapshot (#318).
+  const prePlanningCtxComment = detail.comments.find(
+    (c) => c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER),
+  );
+  if (prePlanningCtxComment && !opts.contextSnapshot) {
+    const stripped = prePlanningCtxComment.body
+      .slice(PRE_PLANNING_CONTEXT_HEADER.length)
+      .trimStart()
+      // Strip the pipeline footer (--- marker) from the end.
+      .replace(/\n\n---\n.*$/s, '')
+      .trimEnd();
+    opts = { ...opts, contextSnapshot: stripped };
+  }
+
+  // Advisory warning for new human comments posted after the plan (#318).
+  const unacknowledged = findUnacknowledgedComments(detail.comments);
+  if (unacknowledged.length > 0) {
+    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage}`);
+    await postCommentFn(
+      cfg,
+      issueNumber,
+      `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan. The reviewer will see these as context. If they represent a change in scope, add a scope override or address them before re-running.${cfgFooter(cfg)}`,
+    );
+  }
 
   // Diff-hash cache check (#228).
   const diffHash = computeDiffHash(diff);
@@ -871,9 +902,10 @@ async function invokePromptHarnessReview(
   opts: AdvanceReviewOpts,
 ): Promise<ReviewerInvocation> {
   const specContext = openspecContextFromDiff(cfg, cwd, diffFilePaths(diff));
+  const contextSnapshot = opts.contextSnapshot;
   const prompt = round === 1
-    ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext })
-    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext });
+    ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext, contextSnapshot })
+    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext, contextSnapshot });
   if (opts.stateDir) {
     await recordPrompt(
       opts.stateDir,

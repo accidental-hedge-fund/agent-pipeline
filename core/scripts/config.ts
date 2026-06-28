@@ -227,6 +227,16 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Auto-merge eligibility gate: classifies PRs as auto-merge-eligible or needs-human after deterministic policy checks and LLM judge evaluation (#306)."),
+  // Stage-aware issue context snapshots (#318). Optional per-repo override for
+  // the character cap on the human-comment context snapshot injected into
+  // planning, review, and shipcheck prompts. Absent → default (8000) applies.
+  context_snapshot: z
+    .object({
+      max_chars: z.number().int().positive().describe("Maximum total character count for human comment bodies in the context snapshot. Oldest entries are dropped first when the cap is exceeded."),
+    })
+    .strict()
+    .optional()
+    .describe("Stage-aware issue context snapshot settings (#318)."),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
@@ -435,6 +445,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       : fileConfig.roadmap,
     sweep: fileConfig.sweep,
     queue: fileConfig.queue,
+    context_snapshot: fileConfig.context_snapshot,
     auto_merge_eligibility: {
       enabled: fileConfig.auto_merge_eligibility?.enabled ?? DEFAULT_CONFIG.auto_merge_eligibility.enabled,
       max_diff_lines: fileConfig.auto_merge_eligibility?.max_diff_lines ?? DEFAULT_CONFIG.auto_merge_eligibility.max_diff_lines,

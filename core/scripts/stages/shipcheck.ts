@@ -19,6 +19,7 @@ import {
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
+import { PRE_PLANNING_CONTEXT_HEADER } from "../issue-context-snapshot.ts";
 import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle, patchBundleIdentity as defaultPatchBundleIdentity } from "../evidence-bundle.ts";
@@ -58,12 +59,15 @@ export interface BuildShipcheckPromptOpts {
   changedFiles: string;
   evalSummary?: string;
   openspecDeltas?: string;
+  /** Pre-rendered context snapshot block for prompt injection (#318). */
+  contextSnapshot?: string;
 }
 
 export function buildShipcheckPrompt(opts: BuildShipcheckPromptOpts): string {
   return substitute(loadShipcheckTemplate(), {
     rubric: opts.rubric || "(no rubric provided)",
     issue_body: opts.issueBody || "(no issue body)",
+    context_snapshot: opts.contextSnapshot || "",
     plan_and_acs: opts.planAndAcs || "(not available)",
     changed_files: opts.changedFiles || "(not available)",
     eval_summary: opts.evalSummary ?? "eval results: not available",
@@ -288,6 +292,18 @@ export async function advance(
   const detail = await getIssueDetailFn(cfg, issueNumber);
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
 
+  // Extract pre-planning context snapshot (#318).
+  const prePlanningCtxComment = detail.comments.find(
+    (c) => c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER),
+  );
+  const contextSnapshot = prePlanningCtxComment
+    ? prePlanningCtxComment.body
+        .slice(PRE_PLANNING_CONTEXT_HEADER.length)
+        .trimStart()
+        .replace(/\n\n---\n.*$/s, '')
+        .trimEnd()
+    : undefined;
+
   // Resolve the issue worktree; reviewer runs inside it when present.
   const wt = await getForIssueFn(cfg, issueNumber);
   const worktreeDir = wt?.path ?? cfg.repo_dir;
@@ -320,6 +336,7 @@ export async function advance(
     changedFiles: changedFilesSummary,
     evalSummary,
     openspecDeltas,
+    contextSnapshot,
   });
 
   // Run reviewer harness up to max_rounds.

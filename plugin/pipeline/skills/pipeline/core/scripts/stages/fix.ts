@@ -10,9 +10,11 @@
 import {
   findLatestCommentMatching,
   getIssueDetail,
+  postComment,
   setBlocked,
   transition,
 } from "../gh.ts";
+import { findUnacknowledgedComments } from "../issue-context-snapshot.ts";
 import { invoke } from "../harness.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
@@ -90,6 +92,18 @@ export async function advanceFix(
   }
 
   const detail = await getIssueDetail(cfg, issueNumber);
+
+  // Advisory warning for new human comments posted after the plan (#318).
+  const unacknowledged = findUnacknowledgedComments(detail.comments);
+  if (unacknowledged.length > 0) {
+    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage}`);
+    await postComment(
+      cfg,
+      issueNumber,
+      `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan. The fix harness is proceeding; if these comments change the scope or approach, address them before re-running.`,
+    );
+  }
+
   const findings = extractBlockingReviewFindings(detail.comments, round);
   if (!findings) {
     // No findings → just advance.

@@ -9,7 +9,7 @@ Repository conventions:
 {{conventions}}
 
 Issue body:
-{{body}}
+{{body}}{{context_snapshot}}
 
 Proposed implementation plan:
 {{plan}}

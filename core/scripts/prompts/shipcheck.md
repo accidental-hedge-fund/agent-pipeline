@@ -8,7 +8,7 @@ You are independent of the implementing harness — do NOT give the implementati
 
 ## Issue
 
-{{issue_body}}
+{{issue_body}}{{context_snapshot}}
 
 ## Plan and Acceptance Criteria
 
