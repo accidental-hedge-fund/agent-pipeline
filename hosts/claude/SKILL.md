@@ -56,6 +56,7 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline N --repo-path <path>           target a different repo working tree
 /pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
 /pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
+/pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh (no number)
 /pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
 /pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
 /pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
@@ -95,6 +96,12 @@ pipeline labels via `ensurePipelineLabels` and scaffolds a commented
 notice, if the file already exists). It is idempotent and additive — a normal
 `/pipeline N` run still self-creates any missing labels, so `init` is a
 convenience, not a precondition.
+
+`config sync` also takes no number. It refreshes an existing
+`.github/pipeline.yml` against the current init scaffold while preserving
+effective configured behavior. Preview is the default and prints a diff without
+writing; `--apply` writes only after the existing file and rendered candidate
+both validate.
 
 `doctor` takes no number either. It runs a **deterministic, model-free** preflight
 that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
@@ -373,6 +380,7 @@ opened. Also send one final PushNotification with the terminal state.
 - `--dry-run` — logs what would happen, no harness calls
 - `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
 - `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
+- `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
 
 Run those synchronously, no Monitor, no background, no Push.

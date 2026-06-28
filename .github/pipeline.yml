@@ -1,100 +1,109 @@
-# Pipeline config for agent-pipeline itself — kept current with the latest
-# accepted `.github/pipeline.yml` schema (mirrors `pipeline init` / config.ts).
-#
-# Only the keys this repo actually overrides are set below; every other accepted
-# key is shown commented at its built-in default for reference (delete or
-# uncomment to change behavior). `harnesses:` is intentionally omitted and is
-# rejected at config-parse time if present — the invoking install profile owns
-# the implementer/reviewer split. OpenSpec auto-activates because an `openspec/`
-# workspace exists in this repo; this file just makes that explicit and gives the
-# planning prompts some domain context.
+# Pipeline configuration for this repo — synced with `pipeline config sync`.
+# Every key is shown at its current default value; edit any line to override.
+# Delete a key to fall back to the built-in default. Lines that are commented
+# out (e.g. the `command:` entries) are optional overrides — uncomment to set.
 
-# --- Repo context (embedded in planning/review prompts) ---
-domain_name: agent-pipeline
-domain_description: a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex)
+domain_name: agent-pipeline # human-readable project name used in prompts
+domain_description: a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex) # short project description used in prompts
 
-# --- Active overrides ---
+base_branch: main # branch PRs target and worktrees branch from
+worktree_root: .worktrees # dir (relative to repo) holding pipeline worktrees
+max_concurrent_worktrees: 5 # cap on simultaneous in-flight worktrees
+auto_recovery_max_retries: 2 # auto-recovery attempts when implementation blocks
+implementation_timeout: 2400 # seconds for the implementation harness
+review_timeout: 1500 # seconds per review stage
+plan_review_timeout: 900 # seconds for the plan-review harness (shorter cap; fails fast on runaway review)
+fix_timeout: 2400 # seconds per fix stage
+intake_timeout: 600 # seconds for the intake harness call before timing out
+sweep_timeout: 600 # seconds for the sweep harness call before timing out
+ci_timeout: 900 # seconds to wait for CI at pre-merge
+ci_poll_interval: 30 # seconds between CI status polls
+ci_no_run_grace_s: 60 # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately
+
+models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning).
+  planning: opus # implementer harness
+  implementing: sonnet # implementer harness
+  review: sonnet # reviewer harness
+  fix: sonnet # implementer harness
+#   intake: sonnet # intake spec-generation — always the claude harness (never inert)
+#   sweep: sonnet # sweep spec-generation — always the claude harness (never inert)
+
+# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
+
 openspec:
-  enabled: auto # auto | on | off  (auto already activates when openspec/ exists)
-  # bootstrap: false # if true, run `openspec init` on repos lacking openspec/
+  enabled: auto # auto | on | off
+  bootstrap: false # if true, run `openspec init` on repos lacking openspec/
 
-test_gate:
-  # Run the repo's full CI surface, not just the auto-detected `npm test`: this
-  # repo's CI also runs `node scripts/build.mjs --check` (plugin-mirror sync) and
-  # an install smoke test. `command` is run through `bash -c` with `set -o
-  # pipefail`, so compound operators like `&&` and pipes `|` are valid AND a
-  # failing stage in a pipeline fails the gate — using `npm run ci` (a single
-  # npm script that wraps all steps) remains the canonical form for this repo.
-  command: "npm run ci"
-  # enabled: true # set false to disable the pre-PR test gate entirely
-  # max_attempts: 3 # fix-harness invocations before blocking
-  # timeout: 300 # seconds per test/build run
+last30days:
+  enabled: false # opt-in pre-planning activity brief
+  timeout: 600 # seconds
 
-plan_review_timeout: 900 # seconds; default 300 is too short for Opus reviewing a full OpenSpec change
+steps: # turn optional steps off for speed/preference (default: all on)
+  plan_review: true # cross-harness review of the plan before coding
+  standard_review: true # review-1 (and its fix round)
+  adversarial_review: true # review-2 (and its fix round)
+  docs: true # include the docs-update instruction in the implementing prompt
+
+test_gate: # run the repo's tests/build before opening a PR
+  enabled: true # set false to disable entirely
+  command: npm run ci # explicit command; auto-detected when absent
+  max_attempts: 3 # fix-harness invocations before blocking
+  timeout: 300 # seconds per test/build run
+
+eval_gate: # run the repo's eval harness after pre-merge
+  enabled: false # set true to enable (one-time declaration per repo)
+  # command: pnpm evals # shell command to run; required when enabled
+  mode: gate # gate: block on fail | advisory: record and advance
+  timeout: 300 # stage-level budget in seconds (shared across attempts)
+  max_attempts: 2 # total attempts before giving up (1 = no retry)
+
+# shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148). Disabled by default.
+#   enabled: false # set true to enable
+#   mode: advisory # advisory: record findings without blocking | gate: block on fail
+#   max_rounds: 1 # max reviewer invocations before needs-human
+#   rubric_path: .github/shipcheck-rubric.md # repo-root-relative path to Markdown rubric file
+#   block_on_partial: false # when true and mode=gate, partial verdict also blocks
 
 review_policy: # which review findings block progression vs. merely advise (#17)
-  # Tightened from the defaults (medium / 0.7): only high+ severity findings at
-  # >= 0.85 confidence block; everything below advises rather than routing to a
-  # fix round. Trims medium/low-confidence review-round churn ("severity is the dial").
-  block_threshold: high # critical|high|medium|low — findings below this advise, not block
+  block_threshold: high # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
   min_confidence: 0.85 # 0..1 — findings below this confidence advise, not block
-  # max_adversarial_rounds: 3 # (default) cap review-round re-runs; after this, still-blocking findings go advisory → needs-human
-  # risk_proportional: true # (#232) scale review-2 threshold by review-1 risk tier (enable after #232 merges)
+  max_adversarial_rounds: 3 # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
+  # risk_proportional: false # when true and review-1 approved with 0 findings, review-2 only blocks on high/critical findings (#232)
+  # ceiling_action: park # park (default): hard-park at needs-human; demote_and_advance: auto-demote below-high findings and advance (#233)
+  # surface_recurrence_rounds: 3 # same-surface recurrence guard; 0 disables (#234)
 
-# --- Everything below is at its built-in default; shown for reference. ---
+doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here
+  runOnStart: false # if true, run the preflight checks before planning and abort the run on any failure
+  failFast: false # if true, stop at the first failing check instead of collecting all failures
 
-# base_branch: main # branch PRs target and worktrees branch from
-# worktree_root: .worktrees # dir (relative to repo) holding pipeline worktrees
-# max_concurrent_worktrees: 5 # cap on simultaneous in-flight worktrees
-# auto_recovery_max_retries: 2 # auto-recovery attempts when implementation blocks
-# implementation_timeout: 2400 # seconds for the implementation harness
-# review_timeout: 1500 # seconds per review stage
-# fix_timeout: 2400 # seconds per fix stage
-# ci_timeout: 900 # seconds to wait for CI at pre-merge
-# ci_poll_interval: 30 # seconds between CI status polls
+# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default
+#   enabled: false # set true to enable; when false (default) the advance loop is byte-for-byte unchanged
+#   max_rounds: 3 # maximum automatic continuations per run before parking at needs-human
+#   max_wallclock_minutes: 60 # wall-clock budget in minutes (independent of max_rounds)
+#   # stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation
+#   #   Known stages: backlog, ready, planning, plan-review, implementing,
+#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,
+#   #                 shipcheck-gate, ready-to-deploy, needs-human
 
-# models: # per-phase model alias — honored only when the role's harness is claude (codex ignores it; setting an inert one prints a warning)
-#   planning: sonnet # implementer harness
-#   implementing: sonnet # implementer harness (#70)
-#   review: opus # reviewer harness
-#   fix: sonnet # implementer harness
+# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)
+#   Auto-detected from lockfile when absent (pnpm-lock.yaml -> pnpm install, yarn.lock -> yarn install, package-lock.json -> npm ci)
+#   Set to "" to skip the install step entirely (opt-out). Examples:
+#     setup_command: ""                                       # opt-out
+#     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
+#     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
 
-# review_harness: my-reviewer # (#40) override the reviewer CLI for the review step; default = the install profile's reviewer. The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
-
-# last30days: # opt-in pre-planning public-activity brief for the issue topic
-#   enabled: false
-#   timeout: 600 # seconds
-
-# steps: # turn optional steps off for speed/preference (default: all on)
-#   plan_review: true # cross-harness review of the plan before coding
-#   standard_review: true # review-1 (and its fix round)
-#   adversarial_review: true # review-2 (and its fix round)
-#   docs: true # include the docs-update instruction in the implementing prompt
-
-# eval_gate: # run the repo's eval harness after pre-merge (one-time opt-in)
-#   enabled: false
-#   command: npm run evals # shell command to run; required when enabled
-#   mode: gate # gate: block on fail | advisory: record and advance
-#   timeout: 300 # stage-level budget in seconds (shared across attempts)
-#   max_attempts: 2 # total attempts before giving up (1 = no retry)
-
-# review_policy is set as an active override above (block_threshold: high, min_confidence: 0.85).
-#   max_adversarial_rounds: 3 # default cap on review-round re-runs (left at default; uncomment under review_policy to change)
-
-# format_gate: [] # run formatter/linter commands after implementing and fix-round harnesses (#182)
-#   Entries run in the worktree root in declaration order. auto_fix: true commits any changes and
-#   re-runs to verify stability; auto_fix: false blocks immediately on non-zero exit.
-#   Default: [] (no gate; existing behavior unchanged).
-#   Examples for Rust repos:
+# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)
+#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;
+#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).
+#   Examples (Rust repo):
 #     - command: cargo fmt
 #       auto_fix: true
 #     - command: cargo clippy -D warnings
 #       auto_fix: false
-#   Examples for JS/TS repos:
+#   Examples (JS/TS repo):
 #     - command: eslint --fix src/
 #       auto_fix: true
-#   (agent-pipeline has no active formatter/linter configured; see README for details.)
 
-# doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here
-#   runOnStart: false # if true, run the preflight checks before planning and abort the run on any failure
-#   failFast: false # if true, stop at the first failing check instead of collecting all failures
+# harness_sandbox: false # set true to run the claude implementer with --permission-mode default
+#   instead of bypassPermissions (#21). The codex harness is already sandboxed
+#   via --full-auto and is unaffected. Default false -> current invocation unchanged.

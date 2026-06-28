@@ -12,8 +12,12 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import { findGitRoot } from "../scripts/config.ts";
+import { findGitRoot, syncConfig } from "../scripts/config.ts";
+
+const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-cfg-test-"));
 
@@ -1208,6 +1212,142 @@ test("findGitRoot: returns null when no .git ancestor exists", () => {
   // Use a temp dir that is NOT under any git repo
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "no-git-"));
   assert.equal(findGitRoot(isolated), null);
+});
+
+// ---------------------------------------------------------------------------
+// config sync — behavior-preserving scaffold refresh
+// ---------------------------------------------------------------------------
+
+test("syncConfig: preview reports drift and does not write", () => {
+  const original = "base_branch: staging\n";
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.equal(result.applied, false);
+  assert.match(result.diff ?? "", /--- a\/\.github\/pipeline\.yml/);
+  assert.match(result.diff ?? "", /-base_branch: staging/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original, "preview must not mutate pipeline.yml");
+});
+
+test("syncConfig: apply writes a validated behavior-preserving candidate", () => {
+  const repo = makeFakeRepo(`base_branch: staging
+models:
+  review: sonnet
+test_gate:
+  command: npm run ci
+  max_attempts: 4
+review_policy:
+  block_threshold: high
+  min_confidence: 0.8
+format_gate: []
+`);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.equal(result.applied, true);
+  assert.match(synced, /# Pipeline configuration for this repo — synced with `pipeline config sync`\./);
+  assert.match(synced, /^base_branch: staging/m);
+  assert.match(synced, /^models:/m);
+  assert.match(synced, /^  review: sonnet # reviewer harness/m);
+  assert.doesNotMatch(synced, /^  planning:/m, "absent model aliases must stay commented, not become explicit");
+  assert.match(synced, /^  command: npm run ci # explicit command/m);
+  assert.match(synced, /^  max_attempts: 4 # fix-harness/m);
+  assert.match(synced, /^  block_threshold: high #/m);
+  assert.match(synced, /^  min_confidence: 0\.8 #/m);
+  assert.match(synced, /^format_gate: \[\]/m);
+});
+
+test("syncConfig: invalid current config is not rewritten", () => {
+  const original = "unknown_key: bad-value\n";
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.changed, false);
+  assert.equal(result.applied, false);
+  assert.ok(result.diagnostics.some((d) => d.path === "unknown_key"));
+  assert.equal(fs.readFileSync(configPath, "utf8"), original, "invalid config must be preserved");
+});
+
+test("syncConfig: missing config directs the user to run init", () => {
+  const repo = makeFakeRepo(null);
+
+  const result = syncConfig(repo);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.changed, false);
+  assert.equal(result.applied, false);
+  assert.match(result.diagnostics[0]?.message ?? "", /pipeline init/);
+});
+
+test("syncConfig: newline scalar overrides render as valid inline YAML", () => {
+  const repo = makeFakeRepo('domain_description: "first line\\nsecond line"\n');
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.applied, true);
+  assert.match(synced, /^domain_description: "first line\\nsecond line" #/m);
+});
+
+test("CLI: `pipeline config sync` previews without mutating", () => {
+  const original = "base_branch: staging\n";
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "sync", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /pipeline config sync: preview/);
+  assert.match(result.stdout, /-base_branch: staging/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original, "CLI preview must not mutate pipeline.yml");
+});
+
+test("CLI: `pipeline config sync --apply` writes refreshed config", () => {
+  const repo = makeFakeRepo("base_branch: staging\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "sync", "--apply", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /pipeline config sync: updated/);
+  assert.match(synced, /# Pipeline configuration for this repo — synced with `pipeline config sync`\./);
+  assert.match(synced, /^base_branch: staging/m);
+});
+
+test("CLI: `pipeline config --help` advertises sync preview/apply", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "--help"],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /schema/);
+  assert.match(result.stdout, /validate/);
+  assert.match(result.stdout, /sync/);
+  assert.match(result.stdout, /--apply/);
 });
 
 // ---------------------------------------------------------------------------
