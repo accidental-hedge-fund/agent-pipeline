@@ -1469,7 +1469,7 @@ export async function gatherCarryForward(
 async function gatherContextSnapshot(
   cfg: PipelineConfig,
   issueNumber: number,
-  _body: string,
+  body: string,
   deps: RunPlanningPhasesDeps,
 ): Promise<string> {
   try {
@@ -1479,9 +1479,11 @@ async function gatherContextSnapshot(
     const detail = await doGetIssueDetail(cfg, issueNumber);
     const comments = detail.comments;
 
-    // Idempotent: skip if a Pre-Planning Context comment already exists.
+    // Idempotent: skip if a Pre-Planning Context snapshot comment already exists.
+    // Use startsWith(header + '\n') to avoid matching the last30days comment
+    // (## Pre-Planning Context — last30days) which has different text after the header.
     const existing = comments.find((c) =>
-      c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER),
+      c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER + '\n'),
     );
     if (existing) {
       // Re-use the body (strip the header) as the rendered block.
@@ -1495,14 +1497,14 @@ async function gatherContextSnapshot(
 
     if (!rendered) return '';
 
-    const conflicts = detectConflicts(snapshot);
+    const conflicts = detectConflicts(snapshot, body);
     const conflictBlock = renderConflictWarningBlock(conflicts);
 
     const commentBody = `${PRE_PLANNING_CONTEXT_HEADER}\n\n${rendered}${conflictBlock}${footer(cfg)}`;
     await doPostComment(cfg, issueNumber, commentBody);
     console.log(`[pipeline] #${issueNumber}: pre-planning context snapshot posted (${snapshot.entries.length} human comment(s))`);
 
-    return rendered;
+    return rendered + conflictBlock;
   } catch (err) {
     // Non-fatal: snapshot is advisory; don't block planning if this fails.
     console.warn(`[pipeline] #${issueNumber}: context snapshot collection failed (non-fatal): ${(err as Error).message}`);
