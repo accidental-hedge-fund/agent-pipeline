@@ -1,0 +1,198 @@
+// Unit tests for command-registry.ts (#263).
+//
+// Covers:
+//   2.1  Coverage guard: every recognized dispatch keyword has a registry entry.
+//   2.2  merge entry shape: mutatesGitHub=true, allowedFlags excludes json/isOk/detach/jsonEvents.
+//   2.3  lookupCommand: undefined and numeric strings → advance entry (allowedFlags: "all").
+//   2.4  lookupCommand: unknown keyword → null.
+//   2.5  validateFlags: returns offending key when flag is not in allowlist and is "cli"-sourced.
+//   2.6  validateFlags: advance entry returns [] (allowedFlags: "all").
+//   2.7  Cross-check: every attribute name in every allowedFlags Set exists in buildCmd().options.
+//   2.8  needsIssueNumber: true only for advance and run; false for all named sub-commands.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  COMMAND_REGISTRY,
+  lookupCommand,
+  validateFlags,
+  type CommandEntry,
+} from "../scripts/command-registry.ts";
+import { buildCmd } from "../scripts/pipeline.ts";
+
+// ---------------------------------------------------------------------------
+// 2.1  Coverage guard
+// ---------------------------------------------------------------------------
+
+// These are the named keywords the dispatch block in pipeline.ts recognizes.
+const DISPATCH_KEYWORDS = [
+  "init", "doctor", "release", "intake", "sweep", "triage", "merge",
+  "refine-spec", "logs", "summary", "path", "config", "run", "improve",
+  "scoreboard", "roadmap",
+];
+
+test("command-registry: every recognized dispatch keyword has a registry entry", () => {
+  for (const kw of DISPATCH_KEYWORDS) {
+    assert.ok(
+      kw in COMMAND_REGISTRY,
+      `keyword "${kw}" is recognized by the dispatch block but has no COMMAND_REGISTRY entry`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2.2  merge entry shape
+// ---------------------------------------------------------------------------
+
+test("command-registry: merge entry has mutatesGitHub:true", () => {
+  assert.equal(COMMAND_REGISTRY.merge.mutatesGitHub, true);
+});
+
+test("command-registry: merge allowedFlags does not include jsonEvents, detach, json, isOk", () => {
+  const af = COMMAND_REGISTRY.merge.allowedFlags;
+  assert.notEqual(af, "all", "merge must have an explicit allowedFlags Set, not 'all'");
+  const set = af as Set<string>;
+  for (const forbidden of ["jsonEvents", "detach", "json", "isOk"]) {
+    assert.equal(
+      set.has(forbidden),
+      false,
+      `merge.allowedFlags must not contain "${forbidden}"`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2.3  lookupCommand: numeric / undefined → advance entry
+// ---------------------------------------------------------------------------
+
+test("command-registry: lookupCommand(undefined) returns advance entry", () => {
+  const entry = lookupCommand(undefined);
+  assert.ok(entry !== null, "should return advance entry, not null");
+  assert.equal(entry, COMMAND_REGISTRY.advance);
+  assert.equal(entry.allowedFlags, "all");
+});
+
+test("command-registry: lookupCommand('123') returns advance entry", () => {
+  const entry = lookupCommand("123");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.advance);
+  assert.equal(entry.allowedFlags, "all");
+});
+
+test("command-registry: lookupCommand('0') returns advance entry", () => {
+  const entry = lookupCommand("0");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.advance);
+});
+
+// ---------------------------------------------------------------------------
+// 2.4  lookupCommand: unknown keyword → null
+// ---------------------------------------------------------------------------
+
+test("command-registry: lookupCommand('unknown-cmd') returns null", () => {
+  assert.equal(lookupCommand("unknown-cmd"), null);
+});
+
+test("command-registry: lookupCommand('') returns null (empty string is not numeric, not registered)", () => {
+  assert.equal(lookupCommand(""), null);
+});
+
+// ---------------------------------------------------------------------------
+// 2.5  validateFlags: returns offending key for non-allowlisted "cli"-sourced flag
+// ---------------------------------------------------------------------------
+
+/** Build a minimal CmdLike with one explicit CLI flag. */
+function fakeCmdWithCliFlag(flagKey: string): { options: { attributeName(): string }[]; getOptionValueSource(k: string): string } {
+  return {
+    options: [
+      { attributeName: () => flagKey },
+    ],
+    getOptionValueSource: (k: string) => (k === flagKey ? "cli" : "default"),
+  };
+}
+
+test("command-registry: validateFlags returns offending key when flag is outside allowlist", () => {
+  const entry = COMMAND_REGISTRY.merge;
+  const cmd = fakeCmdWithCliFlag("jsonEvents"); // not in merge's allowlist
+  const offending = validateFlags(entry, cmd);
+  assert.deepEqual(offending, ["jsonEvents"]);
+});
+
+test("command-registry: validateFlags returns [] when flag is inside allowlist", () => {
+  const entry = COMMAND_REGISTRY.merge;
+  const cmd = fakeCmdWithCliFlag("repoPath"); // in merge's allowlist
+  const offending = validateFlags(entry, cmd);
+  assert.deepEqual(offending, []);
+});
+
+test("command-registry: validateFlags returns [] when flag is default-sourced (not explicitly CLI-set)", () => {
+  const entry = COMMAND_REGISTRY.doctor;
+  const cmd = {
+    options: [{ attributeName: () => "cleanup" }],
+    getOptionValueSource: (_k: string) => "default" as string,
+  };
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+// ---------------------------------------------------------------------------
+// 2.6  validateFlags: advance entry with allowedFlags:"all" always returns []
+// ---------------------------------------------------------------------------
+
+test("command-registry: validateFlags returns [] for advance entry (allowedFlags:all)", () => {
+  const entry = COMMAND_REGISTRY.advance;
+  const cmd = fakeCmdWithCliFlag("jsonEvents");
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("command-registry: validateFlags returns [] for run entry (allowedFlags:all)", () => {
+  const entry = COMMAND_REGISTRY.run;
+  const cmd = fakeCmdWithCliFlag("model");
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+// ---------------------------------------------------------------------------
+// 2.7  Cross-check: attribute names in every allowedFlags Set exist in buildCmd()
+// ---------------------------------------------------------------------------
+
+test("command-registry: every attribute name in every allowedFlags Set exists in buildCmd().options", () => {
+  const cmd = buildCmd();
+  const knownAttrNames = new Set(cmd.options.map((o) => o.attributeName()));
+
+  const stale: Array<{ command: string; attr: string }> = [];
+  for (const [keyword, entry] of Object.entries(COMMAND_REGISTRY)) {
+    if (entry.allowedFlags === "all") continue;
+    for (const attr of entry.allowedFlags) {
+      if (!knownAttrNames.has(attr)) {
+        stale.push({ command: keyword, attr });
+      }
+    }
+  }
+
+  assert.deepEqual(
+    stale,
+    [],
+    `Stale attribute names in COMMAND_REGISTRY allowedFlags sets: ${JSON.stringify(stale)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 2.8  needsIssueNumber: advance and run require an issue number; named sub-commands do not
+// ---------------------------------------------------------------------------
+
+test("command-registry: needsIssueNumber is true for advance and run", () => {
+  assert.equal(COMMAND_REGISTRY.advance.needsIssueNumber, true);
+  assert.equal(COMMAND_REGISTRY.run.needsIssueNumber, true);
+});
+
+test("command-registry: needsIssueNumber is false for all named sub-commands", () => {
+  const namedSubCommands = Object.entries(COMMAND_REGISTRY).filter(
+    ([key]) => key !== "advance" && key !== "run",
+  );
+  for (const [key, entry] of namedSubCommands) {
+    assert.equal(
+      (entry as CommandEntry).needsIssueNumber,
+      false,
+      `${key}.needsIssueNumber should be false`,
+    );
+  }
+});

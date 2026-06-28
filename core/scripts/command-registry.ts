@@ -1,0 +1,234 @@
+// Declarative command registry for the pipeline CLI.
+//
+// Each `CommandEntry` declares per-command metadata including the allowlist of
+// Commander option attribute names the command accepts. Flag validation uses
+// Commander's `getOptionValueSource` to check only explicitly-provided CLI
+// options — defaults and env-sourced values are ignored.
+//
+// This module intentionally has NO import of "commander" so it can be imported
+// in test and tooling contexts without triggering CLI initialization.
+
+export interface CommandEntry {
+  needsIssueNumber: boolean;
+  /** Attribute names (Commander camelCase) of options this command accepts,
+   *  or "all" for the advance command which passes through every flag. */
+  allowedFlags: Set<string> | "all";
+  needsConfig: boolean;
+  needsGhAuth: boolean;
+  mutatesGitHub: boolean;
+  supportsJson: boolean;
+}
+
+/** Minimal duck-type for Commander's Command — no "commander" import needed. */
+interface CmdLike {
+  options: ReadonlyArray<{ attributeName(): string; long?: string }>;
+  getOptionValueSource(key: string): string | undefined;
+}
+
+export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
+  // Default/numeric path — accepts every flag so new global flags work automatically.
+  advance: {
+    needsIssueNumber: true,
+    allowedFlags: "all",
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  init: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "init"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  doctor: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "json", "isOk", "failFast", "doctor"]),
+    needsConfig: true,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  release: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release"]),
+    needsConfig: false,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  intake: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "dryRun", "description", "release"]),
+    needsConfig: false,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  triage: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "stage"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  // merge uses an allowlist (not "all") so new global flags are rejected by default —
+  // the exact property that prevents accidental flag leakage to an irreversible squash merge.
+  merge: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  sweep: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "apply", "repo", "dryRun"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
+  "refine-spec": {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "title", "body", "json"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  logs: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "follow"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
+  summary: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
+  path: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["json", "repoPath"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  config: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "profile", "json"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  // run is an alias for advance in non-detach mode; allow all flags so that
+  // `pipeline run <N> [advance-flags...]` behaves identically to `pipeline <N>`.
+  run: {
+    needsIssueNumber: true,
+    allowedFlags: "all",
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  improve: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath", "apply", "top", "since", "minOccurrences", "json", "interventions",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  scoreboard: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "since", "until", "days", "json", "estimateCost"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  roadmap: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "apply", "next", "dryRun"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
+  // cleanup and remove-worktree are flag-based modes (not positional keywords),
+  // but are registered here for completeness and to enable future registry-driven
+  // dispatch of these modes.
+  cleanup: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "cleanup"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
+  "remove-worktree": {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "removeWorktree", "force", "json"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+};
+
+/**
+ * Return the registry entry for `keyword`, or `null` for unrecognized keywords.
+ * A numeric string (e.g. "123") or `undefined` maps to the advance entry — both
+ * represent the default "advance issue N" mode.
+ */
+export function lookupCommand(keyword: string | undefined): CommandEntry | null {
+  if (keyword === undefined || /^\d+$/.test(keyword)) {
+    return COMMAND_REGISTRY.advance;
+  }
+  return COMMAND_REGISTRY[keyword] ?? null;
+}
+
+/**
+ * Return the attribute names of options that were explicitly provided on the CLI
+ * (via `cmd.getOptionValueSource(key) === "cli"`) but are not in
+ * `entry.allowedFlags`. Returns an empty array when `allowedFlags === "all"`.
+ */
+export function validateFlags(entry: CommandEntry, cmd: CmdLike): string[] {
+  if (entry.allowedFlags === "all") return [];
+  const allowed = entry.allowedFlags;
+  return cmd.options
+    .map((o) => o.attributeName())
+    .filter((key) => !allowed.has(key) && cmd.getOptionValueSource(key) === "cli");
+}
