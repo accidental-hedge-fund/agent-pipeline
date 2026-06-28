@@ -203,6 +203,7 @@ $pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --remove-worktree --force       same, discarding uncommitted changes with a warning
 /pipeline N --remove-worktree --json        machine-readable JSON result (stable contract)
 /pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline config sync [--apply]             preview/apply a safe .github/pipeline.yml scaffold refresh
 /pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
 /pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
 /pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
@@ -536,7 +537,7 @@ $pipeline --init    # Codex primary
 1. **Creates all pipeline labels** (`pipeline:<stage>`, `blocked`, `harness:claude`, `harness:codex`) in the target repo via `gh label create`. Labels that already exist are left untouched.
 2. **Writes `.github/pipeline.yml`** with all configurable keys at their default values. If the file already exists it is preserved and a notice is printed — `init` never clobbers an existing config.
 
-Safe to re-run: a second `init` on the same repo finds all labels present and the config file already there, and exits cleanly. A normal `/pipeline N` run still creates any missing labels as a side-effect even if you never ran `init` — `init` is additive, not a new precondition.
+Safe to re-run: a second `init` on the same repo finds all labels present and the config file already there, and exits cleanly. A normal `/pipeline N` run still creates any missing labels as a side-effect even if you never ran `init` — `init` is additive, not a new precondition. For repos with an older existing config, run `pipeline config sync` to preview a current scaffold refresh, then `pipeline config sync --apply` to write it after validation.
 
 After running `init`, commit `.github/pipeline.yml` (edit as needed), add `pipeline:ready` to an issue, and start the pipeline.
 
@@ -1229,7 +1230,7 @@ scripts/
 
 ## Editor / Desktop integration
 
-Pipeline Desk and other editor integrations can delegate all schema and validation knowledge back to the engine via two commands, avoiding any duplication of Zod schema logic.
+Pipeline Desk and other editor integrations can delegate all schema, validation, and config-refresh knowledge back to the engine, avoiding any duplication of Zod schema logic or scaffold rendering.
 
 ### `pipeline config schema`
 
@@ -1275,6 +1276,17 @@ Each `Diagnostic` object has the shape:
 - Inert-model alias warnings (`models.*` set while the backing harness is `codex`) are `severity: "warning"` and do not affect the exit code when they are the only findings.
 
 Without `--json`, a human-readable summary is printed (one line per diagnostic). The same exit-code rules apply.
+
+### `pipeline config sync [--repo-path <path>] [--apply] [--json]`
+
+Refreshes an existing `.github/pipeline.yml` against the current `pipeline init` scaffold while preserving effective configured behavior. Preview is the default and performs no writes.
+
+```bash
+pipeline config sync --repo-path /path/to/repo
+pipeline config sync --repo-path /path/to/repo --apply
+```
+
+The command validates the current file, renders a refreshed candidate, validates the candidate, and refuses to write if the file is missing, invalid, or the candidate would change effective config. With `--json`, it emits `{ ok, changed, applied, configPath, candidate, diff, diagnostics }`.
 
 ## Uninstall
 

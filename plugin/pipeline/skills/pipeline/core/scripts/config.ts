@@ -229,6 +229,8 @@ const PartialConfigSchema = z.object({
     .describe("Auto-merge eligibility gate: classifies PRs as auto-merge-eligible or needs-human after deterministic policy checks and LLM judge evaluation (#306)."),
 }).strict();
 
+type PartialConfig = z.infer<typeof PartialConfigSchema>;
+
 export interface ResolveOptions {
   repoPath?: string;        // path to the target repo's working tree
   domainOverride?: string;  // --domain X (used as the "domain" name in logs)
@@ -716,12 +718,31 @@ export interface ValidateConfigDeps {
   profile?: string;
 }
 
+export interface SyncConfigDeps extends ValidateConfigDeps {
+  /** Write file contents. Defaults to fs.writeFileSync. */
+  writeFile?: (filePath: string, content: string) => void;
+}
+
+export interface SyncConfigResult {
+  ok: boolean;
+  changed: boolean;
+  applied: boolean;
+  configPath: string;
+  candidate?: string;
+  diff?: string;
+  diagnostics: Diagnostic[];
+}
+
 const defaultReadFile = (fp: string): string | null => {
   try {
     return fs.readFileSync(fp, "utf8");
   } catch {
     return null;
   }
+};
+
+const defaultWriteFile = (fp: string, content: string): void => {
+  fs.writeFileSync(fp, content, "utf8");
 };
 
 /** Convert a 0-based character offset in `text` to a 1-indexed line number. */
@@ -925,6 +946,407 @@ export function validateConfig(
   return { valid: !hasError, diagnostics };
 }
 
+function parseValidPartialConfig(text: string): PartialConfig | null {
+  const parsed = yaml.load(text);
+  if (parsed == null) return {};
+  if (typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const result = PartialConfigSchema.safeParse(parsed);
+  return result.success ? result.data : null;
+}
+
+function yamlScalar(value: unknown): string {
+  if (typeof value === "string" && value.includes("\n")) return JSON.stringify(value);
+  return yaml.dump(value, { lineWidth: -1 }).trim();
+}
+
+function yamlInline(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => yamlScalar(item)).join(", ")}]`;
+  return yamlScalar(value);
+}
+
+function yamlBlock(value: unknown, indent = 0): string {
+  const pad = " ".repeat(indent);
+  return yaml
+    .dump(value, { lineWidth: -1, noRefs: true })
+    .trimEnd()
+    .split("\n")
+    .map((line) => `${pad}${line}`)
+    .join("\n");
+}
+
+function hasOwn(obj: object | undefined, key: string): boolean {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function renderModelLines(models: PartialConfig["models"]): string {
+  const d = DEFAULT_CONFIG.models;
+  const keys = ["planning", "implementing", "review", "fix", "intake", "sweep"] as const;
+  const comments: Record<typeof keys[number], string> = {
+    planning: "implementer harness",
+    implementing: "implementer harness",
+    review: "reviewer harness",
+    fix: "implementer harness",
+    intake: "intake spec-generation — always the claude harness (never inert)",
+    sweep: "sweep spec-generation — always the claude harness (never inert)",
+  };
+  if (!models) {
+    return [
+      "# models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Uncomment to override.",
+      ...keys.map((key) => `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`),
+    ].join("\n");
+  }
+  return [
+    "models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning).",
+    ...keys.map((key) =>
+      hasOwn(models, key)
+        ? `  ${key}: ${yamlScalar(models[key])} # ${comments[key]}`
+        : `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`,
+    ),
+  ].join("\n");
+}
+
+function renderMaybeScalar(key: string, value: unknown, comment: string): string {
+  return `${key}: ${yamlScalar(value)} # ${comment}`;
+}
+
+function renderOptionalArray(key: string, value: unknown, commentedTemplate: string[]): string {
+  if (value === undefined) return commentedTemplate.join("\n");
+  if (Array.isArray(value) && value.length === 0) return `${key}: []`;
+  return `${key}:\n${yamlBlock(value, 2)}`;
+}
+
+function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync" = "sync"): string {
+  const d = DEFAULT_CONFIG;
+  const openspec = { ...d.openspec, ...config.openspec };
+  const last30days = { ...d.last30days, ...config.last30days };
+  const steps = { ...d.steps, ...config.steps };
+  const testGate = { ...d.test_gate, ...config.test_gate };
+  const evalGate = { ...d.eval_gate, ...config.eval_gate };
+  const shipcheckGate = { ...d.shipcheck_gate, ...config.shipcheck_gate };
+  const reviewPolicy = { ...d.review_policy, ...config.review_policy };
+  const doctor = { ...d.doctor, ...config.doctor };
+  const autoLoop = { ...d.auto_loop, ...config.auto_loop };
+
+  const optionalTop: string[] = [];
+  if (config.repo !== undefined) optionalTop.push(renderMaybeScalar("repo", config.repo, "GitHub repo override (owner/name)"));
+  if (config.domain_name !== undefined) optionalTop.push(renderMaybeScalar("domain_name", config.domain_name, "human-readable project name used in prompts"));
+  if (config.domain_description !== undefined) optionalTop.push(renderMaybeScalar("domain_description", config.domain_description, "short project description used in prompts"));
+  if (config.conventions_md_path !== undefined) optionalTop.push(renderMaybeScalar("conventions_md_path", config.conventions_md_path, "repo-root-relative conventions file embedded in prompts"));
+
+  const reviewPolicyOptional: string[] = [];
+  if (hasOwn(config.review_policy, "risk_proportional")) {
+    reviewPolicyOptional.push(`  risk_proportional: ${yamlScalar(reviewPolicy.risk_proportional)} # when true and review-1 approved with 0 findings, review-2 only blocks on high/critical findings (#232)`);
+  } else {
+    reviewPolicyOptional.push(`  # risk_proportional: ${yamlScalar(d.review_policy.risk_proportional)} # when true and review-1 approved with 0 findings, review-2 only blocks on high/critical findings (#232)`);
+  }
+  if (hasOwn(config.review_policy, "ceiling_action")) {
+    reviewPolicyOptional.push(`  ceiling_action: ${yamlScalar(reviewPolicy.ceiling_action)} # park | demote_and_advance (#233)`);
+  } else {
+    reviewPolicyOptional.push(`  # ceiling_action: ${yamlScalar(d.review_policy.ceiling_action)} # park (default): hard-park at needs-human; demote_and_advance: auto-demote below-high findings and advance (#233)`);
+  }
+  if (hasOwn(config.review_policy, "surface_recurrence_rounds")) {
+    reviewPolicyOptional.push(`  surface_recurrence_rounds: ${yamlScalar(reviewPolicy.surface_recurrence_rounds)} # same-surface recurrence guard; 0 disables (#234)`);
+  } else {
+    reviewPolicyOptional.push(`  # surface_recurrence_rounds: ${yamlScalar(d.review_policy.surface_recurrence_rounds)} # same-surface recurrence guard; 0 disables (#234)`);
+  }
+
+  const parts = [
+    source === "init"
+      ? "# Pipeline configuration for this repo — created by `pipeline init`."
+      : "# Pipeline configuration for this repo — synced with `pipeline config sync`.",
+    "# Every key is shown at its current default value; edit any line to override.",
+    "# Delete a key to fall back to the built-in default. Lines that are commented",
+    "# out (e.g. the `command:` entries) are optional overrides — uncomment to set.",
+    "",
+    ...optionalTop,
+    optionalTop.length ? "" : undefined,
+    `base_branch: ${yamlScalar(config.base_branch ?? d.base_branch)} # branch PRs target and worktrees branch from`,
+    `worktree_root: ${yamlScalar(config.worktree_root ?? d.worktree_root)} # dir (relative to repo) holding pipeline worktrees`,
+    `max_concurrent_worktrees: ${yamlScalar(config.max_concurrent_worktrees ?? d.max_concurrent_worktrees)} # cap on simultaneous in-flight worktrees`,
+    `auto_recovery_max_retries: ${yamlScalar(config.auto_recovery_max_retries ?? d.auto_recovery_max_retries)} # auto-recovery attempts when implementation blocks`,
+    `implementation_timeout: ${yamlScalar(config.implementation_timeout ?? d.implementation_timeout)} # seconds for the implementation harness`,
+    `review_timeout: ${yamlScalar(config.review_timeout ?? d.review_timeout)} # seconds per review stage`,
+    `plan_review_timeout: ${yamlScalar(config.plan_review_timeout ?? d.plan_review_timeout)} # seconds for the plan-review harness (shorter cap; fails fast on runaway review)`,
+    `fix_timeout: ${yamlScalar(config.fix_timeout ?? d.fix_timeout)} # seconds per fix stage`,
+    `intake_timeout: ${yamlScalar(config.intake_timeout ?? d.intake_timeout)} # seconds for the intake harness call before timing out`,
+    `sweep_timeout: ${yamlScalar(config.sweep_timeout ?? d.sweep_timeout)} # seconds for the sweep harness call before timing out`,
+    `ci_timeout: ${yamlScalar(config.ci_timeout ?? d.ci_timeout)} # seconds to wait for CI at pre-merge`,
+    `ci_poll_interval: ${yamlScalar(config.ci_poll_interval ?? d.ci_poll_interval)} # seconds between CI status polls`,
+    `ci_no_run_grace_s: ${yamlScalar(config.ci_no_run_grace_s ?? d.ci_no_run_grace_s)} # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately`,
+    "",
+    renderModelLines(config.models),
+    "",
+    config.review_harness !== undefined
+      ? `review_harness: ${yamlScalar(config.review_harness)} # override the reviewer CLI for the review step`
+      : "# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.",
+    "",
+    "openspec:",
+    `  enabled: ${yamlScalar(openspec.enabled)} # auto | on | off`,
+    `  bootstrap: ${yamlScalar(openspec.bootstrap)} # if true, run \`openspec init\` on repos lacking openspec/`,
+    "",
+    "last30days:",
+    `  enabled: ${yamlScalar(last30days.enabled)} # opt-in pre-planning activity brief`,
+    `  timeout: ${yamlScalar(last30days.timeout)} # seconds`,
+    "",
+    "steps: # turn optional steps off for speed/preference (default: all on)",
+    `  plan_review: ${yamlScalar(steps.plan_review)} # cross-harness review of the plan before coding`,
+    `  standard_review: ${yamlScalar(steps.standard_review)} # review-1 (and its fix round)`,
+    `  adversarial_review: ${yamlScalar(steps.adversarial_review)} # review-2 (and its fix round)`,
+    `  docs: ${yamlScalar(steps.docs)} # include the docs-update instruction in the implementing prompt`,
+    "",
+    "test_gate: # run the repo's tests/build before opening a PR",
+    `  enabled: ${yamlScalar(testGate.enabled)} # set false to disable entirely`,
+    testGate.command !== undefined
+      ? `  command: ${yamlScalar(testGate.command)} # explicit command; auto-detected when absent`
+      : "  # command: pnpm test # explicit command; auto-detected when absent",
+    `  max_attempts: ${yamlScalar(testGate.max_attempts)} # fix-harness invocations before blocking`,
+    `  timeout: ${yamlScalar(testGate.timeout)} # seconds per test/build run`,
+    "",
+    "eval_gate: # run the repo's eval harness after pre-merge",
+    `  enabled: ${yamlScalar(evalGate.enabled)} # set true to enable (one-time declaration per repo)`,
+    evalGate.command !== undefined
+      ? `  command: ${yamlScalar(evalGate.command)} # shell command to run; required when enabled`
+      : "  # command: pnpm evals # shell command to run; required when enabled",
+    `  mode: ${yamlScalar(evalGate.mode)} # gate: block on fail | advisory: record and advance`,
+    `  timeout: ${yamlScalar(evalGate.timeout)} # stage-level budget in seconds (shared across attempts)`,
+    `  max_attempts: ${yamlScalar(evalGate.max_attempts)} # total attempts before giving up (1 = no retry)`,
+    "",
+    config.shipcheck_gate !== undefined
+      ? [
+        "shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148)",
+        `  enabled: ${yamlScalar(shipcheckGate.enabled)} # set true to enable`,
+        `  mode: ${yamlScalar(shipcheckGate.mode)} # advisory: record findings without blocking | gate: block on fail`,
+        `  max_rounds: ${yamlScalar(shipcheckGate.max_rounds)} # max reviewer invocations before needs-human`,
+        `  rubric_path: ${yamlScalar(shipcheckGate.rubric_path)} # repo-root-relative path to Markdown rubric file`,
+        `  block_on_partial: ${yamlScalar(shipcheckGate.block_on_partial)} # when true and mode=gate, partial verdict also blocks`,
+      ].join("\n")
+      : [
+        "# shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148). Disabled by default.",
+        `#   enabled: ${yamlScalar(d.shipcheck_gate.enabled)} # set true to enable`,
+        `#   mode: ${yamlScalar(d.shipcheck_gate.mode)} # advisory: record findings without blocking | gate: block on fail`,
+        `#   max_rounds: ${yamlScalar(d.shipcheck_gate.max_rounds)} # max reviewer invocations before needs-human`,
+        `#   rubric_path: ${yamlScalar(d.shipcheck_gate.rubric_path)} # repo-root-relative path to Markdown rubric file`,
+        `#   block_on_partial: ${yamlScalar(d.shipcheck_gate.block_on_partial)} # when true and mode=gate, partial verdict also blocks`,
+      ].join("\n"),
+    "",
+    "review_policy: # which review findings block progression vs. merely advise (#17)",
+    `  block_threshold: ${yamlScalar(reviewPolicy.block_threshold)} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)`,
+    `  min_confidence: ${yamlScalar(reviewPolicy.min_confidence)} # 0..1 — findings below this confidence advise, not block`,
+    `  max_adversarial_rounds: ${yamlScalar(reviewPolicy.max_adversarial_rounds)} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human`,
+    ...reviewPolicyOptional,
+    "",
+    "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
+    `  runOnStart: ${yamlScalar(doctor.runOnStart)} # if true, run the preflight checks before planning and abort the run on any failure`,
+    `  failFast: ${yamlScalar(doctor.failFast)} # if true, stop at the first failing check instead of collecting all failures`,
+    "",
+    config.auto_loop !== undefined
+      ? [
+        "auto_loop: # bounded auto-loop mode (#149)",
+        `  enabled: ${yamlScalar(autoLoop.enabled)} # set true to enable`,
+        `  max_rounds: ${yamlScalar(autoLoop.max_rounds)} # maximum automatic continuations per run before parking at needs-human`,
+        `  max_wallclock_minutes: ${yamlScalar(autoLoop.max_wallclock_minutes)} # wall-clock budget in minutes (independent of max_rounds)`,
+        `  stages: ${yamlInline(autoLoop.stages)} # allowlisted stages eligible for automatic continuation`,
+      ].join("\n")
+      : [
+        "# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default",
+        `#   enabled: ${yamlScalar(d.auto_loop.enabled)} # set true to enable; when false (default) the advance loop is byte-for-byte unchanged`,
+        `#   max_rounds: ${yamlScalar(d.auto_loop.max_rounds)} # maximum automatic continuations per run before parking at needs-human`,
+        `#   max_wallclock_minutes: ${yamlScalar(d.auto_loop.max_wallclock_minutes)} # wall-clock budget in minutes (independent of max_rounds)`,
+        "#   # stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation",
+        "#   #   Known stages: backlog, ready, planning, plan-review, implementing,",
+        "#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,",
+        "#   #                 shipcheck-gate, ready-to-deploy, needs-human",
+      ].join("\n"),
+    "",
+    config.setup_command !== undefined
+      ? `setup_command: ${yamlScalar(config.setup_command)} # shell command to run in the worktree after creation, before the test gate; empty string skips`
+      : [
+        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)',
+        "#   Auto-detected from lockfile when absent (pnpm-lock.yaml -> pnpm install, yarn.lock -> yarn install, package-lock.json -> npm ci)",
+        '#   Set to "" to skip the install step entirely (opt-out). Examples:',
+        '#     setup_command: ""                                       # opt-out',
+        '#     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection',
+        '#     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup',
+      ].join("\n"),
+    "",
+    renderOptionalArray("format_gate", config.format_gate, [
+      "# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)",
+      "#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;",
+      "#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).",
+      "#   Examples (Rust repo):",
+      "#     - command: cargo fmt",
+      "#       auto_fix: true",
+      "#     - command: cargo clippy -D warnings",
+      "#       auto_fix: false",
+      "#   Examples (JS/TS repo):",
+      "#     - command: eslint --fix src/",
+      "#       auto_fix: true",
+    ]),
+    "",
+    config.harness_sandbox !== undefined
+      ? `harness_sandbox: ${yamlScalar(config.harness_sandbox)} # set true to run the claude implementer with --permission-mode default`
+      : [
+        "# harness_sandbox: false # set true to run the claude implementer with --permission-mode default",
+        "#   instead of bypassPermissions (#21). The codex harness is already sandboxed",
+        "#   via --full-auto and is unaffected. Default false -> current invocation unchanged.",
+      ].join("\n"),
+    config.roadmap !== undefined ? `\nroadmap:\n${yamlBlock(config.roadmap, 2)}` : undefined,
+    config.sweep !== undefined ? `\nsweep:\n${yamlBlock(config.sweep, 2)}` : undefined,
+    config.trusted_override_actors !== undefined ? `\ntrusted_override_actors:\n${yamlBlock(config.trusted_override_actors, 2)}` : undefined,
+  ].filter((line): line is string => line !== undefined);
+
+  return `${parts.join("\n")}\n`;
+}
+
+function configPathFor(repoRoot: string): string {
+  return path.join(repoRoot, ".github", "pipeline.yml");
+}
+
+function normalizeForSync(config: PartialConfig): unknown {
+  const d = DEFAULT_CONFIG;
+  return {
+    repo: config.repo,
+    base_branch: config.base_branch ?? d.base_branch,
+    worktree_root: config.worktree_root ?? d.worktree_root,
+    max_concurrent_worktrees: config.max_concurrent_worktrees ?? d.max_concurrent_worktrees,
+    auto_recovery_max_retries: config.auto_recovery_max_retries ?? d.auto_recovery_max_retries,
+    implementation_timeout: config.implementation_timeout ?? d.implementation_timeout,
+    review_timeout: config.review_timeout ?? d.review_timeout,
+    plan_review_timeout: config.plan_review_timeout ?? d.plan_review_timeout,
+    fix_timeout: config.fix_timeout ?? d.fix_timeout,
+    intake_timeout: config.intake_timeout ?? d.intake_timeout,
+    sweep_timeout: config.sweep_timeout ?? d.sweep_timeout,
+    ci_timeout: config.ci_timeout ?? d.ci_timeout,
+    ci_poll_interval: config.ci_poll_interval ?? d.ci_poll_interval,
+    ci_no_run_grace_s: config.ci_no_run_grace_s ?? d.ci_no_run_grace_s,
+    models: { ...d.models, ...config.models },
+    openspec: { ...d.openspec, ...config.openspec },
+    last30days: { ...d.last30days, ...config.last30days },
+    steps: { ...d.steps, ...config.steps },
+    test_gate: { ...d.test_gate, ...config.test_gate },
+    eval_gate: { ...d.eval_gate, ...config.eval_gate },
+    shipcheck_gate: { ...d.shipcheck_gate, ...config.shipcheck_gate },
+    review_policy: { ...d.review_policy, ...config.review_policy },
+    doctor: { ...d.doctor, ...config.doctor },
+    setup_command: config.setup_command,
+    conventions_md_path: config.conventions_md_path,
+    domain_name: config.domain_name,
+    domain_description: config.domain_description,
+    format_gate: config.format_gate ?? d.format_gate,
+    harness_sandbox: config.harness_sandbox ?? d.harness_sandbox,
+    trusted_override_actors: config.trusted_override_actors,
+    auto_loop: { ...d.auto_loop, ...config.auto_loop },
+    roadmap: config.roadmap
+      ? { ...config.roadmap, release_model: config.roadmap.release_model ?? "semver" }
+      : undefined,
+    sweep: config.sweep,
+  };
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function configSyncDiff(before: string, after: string, relPath = ".github/pipeline.yml"): string {
+  if (before === after) return "";
+  const beforeLines = before.trimEnd().split("\n");
+  const afterLines = after.trimEnd().split("\n");
+  return [
+    `--- a/${relPath}`,
+    `+++ b/${relPath}`,
+    "@@",
+    ...beforeLines.map((line) => `-${line}`),
+    ...afterLines.map((line) => `+${line}`),
+    "",
+  ].join("\n");
+}
+
+export function syncConfig(
+  repoPath: string,
+  opts: { apply?: boolean } = {},
+  deps: SyncConfigDeps = {},
+): SyncConfigResult {
+  const findGitRootFn = deps.findGitRoot ?? findGitRoot;
+  const readFileFn = deps.readFile ?? defaultReadFile;
+  const writeFileFn = deps.writeFile ?? defaultWriteFile;
+  const resolvedStart = path.resolve(repoPath);
+  const gitRoot = findGitRootFn(resolvedStart);
+  const fallbackPath = configPathFor(gitRoot ?? resolvedStart);
+  if (!gitRoot) {
+    return {
+      ok: false,
+      changed: false,
+      applied: false,
+      configPath: fallbackPath,
+      diagnostics: [{ severity: "error", path: "", message: `No git repository found at or above ${resolvedStart}.` }],
+    };
+  }
+
+  const configPath = configPathFor(gitRoot);
+  const current = readFileFn(configPath);
+  if (current === null) {
+    return {
+      ok: false,
+      changed: false,
+      applied: false,
+      configPath,
+      diagnostics: [{ severity: "error", path: "", message: `Config file not found: ${configPath}. Run \`pipeline init\` to create one.` }],
+    };
+  }
+
+  const validation = validateConfig(gitRoot, deps);
+  const blocking = validation.diagnostics.filter((d) => d.severity === "error");
+  if (blocking.length > 0) {
+    return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
+  }
+
+  const parsed = parseValidPartialConfig(current);
+  if (!parsed) {
+    return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
+  }
+
+  const candidate = renderConfigTemplate(parsed);
+  const candidateValidation = validateConfig(gitRoot, {
+    ...deps,
+    readFile: (p) => (path.resolve(p) === path.resolve(configPath) ? candidate : readFileFn(p)),
+  });
+  const candidateErrors = candidateValidation.diagnostics.filter((d) => d.severity === "error");
+  if (candidateErrors.length > 0) {
+    return { ok: false, changed: false, applied: false, configPath, candidate, diagnostics: candidateValidation.diagnostics };
+  }
+
+  const reparsed = parseValidPartialConfig(candidate);
+  if (!reparsed || stableJson(normalizeForSync(parsed)) !== stableJson(normalizeForSync(reparsed))) {
+    return {
+      ok: false,
+      changed: false,
+      applied: false,
+      configPath,
+      candidate,
+      diagnostics: [{ severity: "error", path: "", message: "Synced config candidate would change effective configuration; refusing to write." }],
+    };
+  }
+
+  const changed = current !== candidate;
+  if (opts.apply && changed) writeFileFn(configPath, candidate);
+  return {
+    ok: true,
+    changed,
+    applied: Boolean(opts.apply && changed),
+    configPath,
+    candidate,
+    diff: configSyncDiff(current, candidate),
+    diagnostics: validation.diagnostics,
+  };
+}
+
 /**
  * Write a commented starter `.github/pipeline.yml` to the repo if absent.
  * Uses exclusive-create (`flag: "wx"`) so a concurrent second call never
@@ -946,112 +1368,6 @@ export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created:
   }
 }
 
-function buildConfigTemplate(): string {
-  const d = DEFAULT_CONFIG;
-  return `# Pipeline configuration for this repo — created by \`pipeline init\`.
-# Every key is shown at its current default value; edit any line to override.
-# Delete a key to fall back to the built-in default. Lines that are commented
-# out (e.g. the \`command:\` entries) are optional overrides — uncomment to set.
-
-base_branch: ${d.base_branch} # branch PRs target and worktrees branch from
-worktree_root: ${d.worktree_root} # dir (relative to repo) holding pipeline worktrees
-max_concurrent_worktrees: ${d.max_concurrent_worktrees} # cap on simultaneous in-flight worktrees
-auto_recovery_max_retries: ${d.auto_recovery_max_retries} # auto-recovery attempts when implementation blocks
-implementation_timeout: ${d.implementation_timeout} # seconds for the implementation harness
-review_timeout: ${d.review_timeout} # seconds per review stage
-plan_review_timeout: ${d.plan_review_timeout} # seconds for the plan-review harness (shorter cap; fails fast on runaway review)
-fix_timeout: ${d.fix_timeout} # seconds per fix stage
-intake_timeout: ${d.intake_timeout} # seconds for the intake harness call before timing out
-sweep_timeout: ${d.sweep_timeout} # seconds for the sweep harness call before timing out
-ci_timeout: ${d.ci_timeout} # seconds to wait for CI at pre-merge
-ci_poll_interval: ${d.ci_poll_interval} # seconds between CI status polls
-ci_no_run_grace_s: ${d.ci_no_run_grace_s} # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately
-
-# models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Uncomment to override.
-#   planning: ${d.models.planning} # implementer harness
-#   implementing: ${d.models.implementing} # implementer harness
-#   review: ${d.models.review} # reviewer harness
-#   fix: ${d.models.fix} # implementer harness
-#   intake: ${d.models.intake} # intake spec-generation — always the claude harness (never inert)
-#   sweep: ${d.models.sweep} # sweep spec-generation — always the claude harness (never inert)
-
-# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
-
-openspec:
-  enabled: ${d.openspec.enabled} # auto | on | off
-  bootstrap: ${d.openspec.bootstrap} # if true, run \`openspec init\` on repos lacking openspec/
-
-last30days:
-  enabled: ${d.last30days.enabled} # opt-in pre-planning activity brief
-  timeout: ${d.last30days.timeout} # seconds
-
-steps: # turn optional steps off for speed/preference (default: all on)
-  plan_review: ${d.steps.plan_review} # cross-harness review of the plan before coding
-  standard_review: ${d.steps.standard_review} # review-1 (and its fix round)
-  adversarial_review: ${d.steps.adversarial_review} # review-2 (and its fix round)
-  docs: ${d.steps.docs} # include the docs-update instruction in the implementing prompt
-
-test_gate: # run the repo's tests/build before opening a PR
-  enabled: ${d.test_gate.enabled} # set false to disable entirely
-  # command: pnpm test # explicit command; auto-detected when absent
-  max_attempts: ${d.test_gate.max_attempts} # fix-harness invocations before blocking
-  timeout: ${d.test_gate.timeout} # seconds per test/build run
-
-eval_gate: # run the repo's eval harness after pre-merge
-  enabled: ${d.eval_gate.enabled} # set true to enable (one-time declaration per repo)
-  # command: pnpm evals # shell command to run; required when enabled
-  mode: ${d.eval_gate.mode} # gate: block on fail | advisory: record and advance
-  timeout: ${d.eval_gate.timeout} # stage-level budget in seconds (shared across attempts)
-  max_attempts: ${d.eval_gate.max_attempts} # total attempts before giving up (1 = no retry)
-
-# shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148). Disabled by default.
-#   enabled: ${d.shipcheck_gate.enabled} # set true to enable
-#   mode: ${d.shipcheck_gate.mode} # advisory: record findings without blocking | gate: block on fail
-#   max_rounds: ${d.shipcheck_gate.max_rounds} # max reviewer invocations before needs-human
-#   rubric_path: ${d.shipcheck_gate.rubric_path} # repo-root-relative path to Markdown rubric file
-#   block_on_partial: ${d.shipcheck_gate.block_on_partial} # when true and mode=gate, partial verdict also blocks
-
-review_policy: # which review findings block progression vs. merely advise (#17)
-  block_threshold: ${d.review_policy.block_threshold} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)
-  min_confidence: ${d.review_policy.min_confidence} # 0..1 — findings below this confidence advise, not block
-  max_adversarial_rounds: ${d.review_policy.max_adversarial_rounds} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human
-  # risk_proportional: ${d.review_policy.risk_proportional} # when true and review-1 approved with 0 findings (low risk), review-2 only blocks on high/critical findings (#232)
-  # ceiling_action: ${d.review_policy.ceiling_action} # park (default): hard-park at needs-human at the round ceiling; demote_and_advance: auto-demote below-high findings to advisory, file a follow-up issue, and advance to pre-merge (high/critical always park) (#233)
-  # surface_recurrence_rounds: ${d.review_policy.surface_recurrence_rounds} # (file+category) surface-recurrence guard: after N consecutive rounds of new-key blocking findings on the same surface, routes the cluster through ceiling_action; 0 disables (#234)
-
-doctor: # deterministic preflight capability check (#146) — run \`pipeline doctor\` standalone, or enable run-start gating here
-  runOnStart: ${d.doctor.runOnStart} # if true, run the preflight checks before planning and abort the run on any failure
-  failFast: ${d.doctor.failFast} # if true, stop at the first failing check instead of collecting all failures
-
-# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default
-#   enabled: false # set true to enable; when false (default) the advance loop is byte-for-byte unchanged
-#   max_rounds: 3 # maximum automatic continuations per run before parking at needs-human
-#   max_wallclock_minutes: 60 # wall-clock budget in minutes (independent of max_rounds)
-#   # stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation
-#   #   Known stages: backlog, ready, planning, plan-review, implementing,
-#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,
-#   #                 shipcheck-gate, ready-to-deploy, needs-human
-
-# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)
-#   Auto-detected from lockfile when absent (pnpm-lock.yaml → pnpm install, yarn.lock → yarn install, package-lock.json → npm ci)
-#   Set to "" to skip the install step entirely (opt-out). Examples:
-#     setup_command: ""                                       # opt-out
-#     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection
-#     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup
-
-# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)
-#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;
-#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).
-#   Examples (Rust repo):
-#     - command: cargo fmt
-#       auto_fix: true
-#     - command: cargo clippy -D warnings
-#       auto_fix: false
-#   Examples (JS/TS repo):
-#     - command: eslint --fix src/
-#       auto_fix: true
-# harness_sandbox: false # set true to run the claude implementer with --permission-mode default
-#   instead of bypassPermissions (#21). The codex harness is already sandboxed
-#   via --full-auto and is unaffected. Default false → current invocation unchanged.
-`;
+export function buildConfigTemplate(): string {
+  return renderConfigTemplate({}, "init");
 }

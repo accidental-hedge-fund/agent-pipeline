@@ -1,30 +1,24 @@
-# Issue #301 Review 2 Fix Plan
-
-## Goal
-
-Address the blocking adversarial-review finding that `pipeline scoreboard --days N`
-without `--since` or `--until` reports an N-day window but scans the default
-30-day span.
+# Config Sync Implementation Plan
 
 ## Checklist
 
-- [x] Inspect the scoreboard window parser and adjacent tests.
-- [x] Update `parseScoreboardWindow` so days-only windows use `--days`.
-- [x] Add a regression test asserting the actual since-to-until span for `--days`.
-- [x] Run `node scripts/build.mjs` after core edits and include regenerated `plugin/`.
-- [x] Run targeted scoreboard tests from `core`.
-- [x] Run `npm run ci` from the repo root.
-- [ ] Perform the pre-commit self-check, document review results, and commit with the required trailers.
+- [x] Update `.github/pipeline.yml` with active model aliases.
+- [x] Create OpenSpec change artifacts for `config-sync-command`.
+- [x] Implement the `pipeline config sync` command.
+- [x] Refresh this repo's `.github/pipeline.yml` scaffold drift while preserving active overrides.
+- [x] Add tests and documentation.
+- [x] Regenerate generated plugin mirror.
+- [x] Verify OpenSpec, targeted tests, and full CI.
+- [x] Review the final diff.
 
 ## Review Results
 
-- OpenSpec delta already describes configurable `--days` windows and the
-  no-window 30-day default; no spec edit required.
-- Targeted verification passed: `node --test --experimental-strip-types test/scoreboard.test.ts`.
-- Full verification passed: `npm run ci`.
-- Diff hygiene passed: `git diff --check`.
-- Pre-commit self-check found no broader change and no higher-severity issue
-  introduced by this diff.
-- Commit blocked by sandbox permissions: `git add` could not create
-  `.git/worktrees/pipeline-301-factory-scoreboard-for-autonomous-develo/index.lock`
-  (`Operation not permitted`).
+- Initial config validation passed with expected warnings for model aliases on
+  Codex-owned implementer phases.
+- OpenSpec change `config-sync-command` was created and validated before
+  implementation.
+- Focused config/init tests pass with sync coverage: 96 tests.
+- `.github/pipeline.yml` was refreshed via `pipeline config sync --apply`; a
+  follow-up preview reports it is already current.
+- Final verification passed: OpenSpec validation, config validation, sync no-op,
+  `git diff --check`, focused config/init tests, and full `npm run ci`.

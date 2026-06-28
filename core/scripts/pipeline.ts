@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig } from "./config.ts";
+import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -162,7 +162,7 @@ export interface CliOpts {
   /** Internal: pre-allocated #155 run-store run id, set by the detached launcher so
    *  the inner run uses the same `.agent-pipeline/runs/<run-id>` the caller was told. */
   runId?: string;
-  /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate`). */
+  /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate/sync`). */
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
   isOk?: boolean;
@@ -267,7 +267,7 @@ export function buildCmd(): Command {
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap/sweep/improve: execute GitHub write-backs (issue updates, roadmap PR, improve issues); default is dry-run")
+    .option("--apply", "roadmap/sweep/improve/config sync: execute write-backs; default is dry-run/preview")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
@@ -289,7 +289,7 @@ export function buildCmd(): Command {
     .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
-  // `pipeline path`, and `pipeline config validate` (path/config are exempted from
+  // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
   // second positional of `run <N>`, `path`, `config <verb>`, and `logs <id>`.
   return cmd;
@@ -349,6 +349,21 @@ async function main(): Promise<void> {
       "  --repo-path <path>          override the target repo working tree\n\n" +
       "The command never modifies pipeline labels, branches, PRs, worktrees, config, or run artifacts.\n" +
       "Exit code: 0 on success, non-zero only for invalid flags or unreadable report setup.\n",
+    );
+    process.exit(0);
+  }
+  if (rawArgs[0] === "config" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
+    process.stdout.write(
+      "Usage: pipeline config <schema|validate|sync> [--repo-path <path>] [--apply] [--json]\n\n" +
+      "Config maintenance commands:\n" +
+      "  schema                 print the JSON Schema for .github/pipeline.yml\n" +
+      "  validate               validate .github/pipeline.yml and print diagnostics\n" +
+      "  sync                   preview a current scaffold refresh; use --apply to write\n\n" +
+      "Options:\n" +
+      "  --repo-path <path>      operate on the git root containing this path\n" +
+      "  --apply                 config sync only: write the refreshed file after safe validation\n" +
+      "  --json                  validate/sync: emit machine-readable JSON\n\n" +
+      "Exit code: 0 on success; non-zero for invalid config, unsafe sync, or invalid usage.\n",
     );
     process.exit(0);
   }
@@ -473,7 +488,7 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  // `pipeline path --json`, `pipeline config validate --json`, `pipeline refine-spec --json`,
+  // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
   // `pipeline improve --json`, `pipeline scoreboard --json`, and `--remove-worktree --json` legitimately emit JSON —
   // exempt from the status-only guard.
   if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard") {
@@ -526,7 +541,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // `pipeline config schema` and `pipeline config validate` — dispatch before
+  // `pipeline config schema`, `pipeline config validate`, and `pipeline config sync` — dispatch before
   // resolveConfig() so they work without gh auth or a fully resolvable repo.
   if (numArg === "config") {
     await runConfigCommand(cmd.args.slice(1), opts);
@@ -1178,8 +1193,9 @@ export async function runInit(cfg: PipelineConfig): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * `pipeline config schema`  — print JSON Schema for .github/pipeline.yml
+ * `pipeline config schema`   — print JSON Schema for .github/pipeline.yml
  * `pipeline config validate` — validate config and print structured diagnostics
+ * `pipeline config sync`     — preview/apply a scaffold refresh preserving behavior
  */
 export async function runConfigCommand(args: string[], opts: CliOpts): Promise<void> {
   const subcmd = args[0];
@@ -1230,8 +1246,38 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
     return;
   }
 
+  if (subcmd === "sync") {
+    if (args.length > 1) {
+      console.error(`pipeline config sync: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const repoPath = opts.repoPath ?? process.cwd();
+    const result = syncConfig(repoPath, { apply: !!opts.apply }, { profile: opts.profile });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else if (!result.ok) {
+      console.log("pipeline config sync: blocked");
+      for (const d of result.diagnostics) {
+        const prefix = d.severity === "error" ? "ERROR" : "WARN ";
+        const loc = d.path ? ` [${d.path}]` : "";
+        const lineStr = d.line != null ? ` (line ${d.line})` : "";
+        console.log(`  ${prefix}${loc}${lineStr}: ${d.message}`);
+      }
+    } else if (!result.changed) {
+      console.log(`pipeline config sync: already current (${result.configPath})`);
+    } else if (result.applied) {
+      console.log(`pipeline config sync: updated ${result.configPath}`);
+    } else {
+      console.log(`pipeline config sync: preview for ${result.configPath} (no writes; re-run with --apply to update)`);
+      if (result.diff) process.stdout.write(result.diff);
+    }
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
+
   const sub = subcmd ? `"${subcmd}"` : "(none)";
-  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate`);
+  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate, sync`);
   process.exitCode = 2;
 }
 
