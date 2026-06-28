@@ -30,6 +30,8 @@ test_gate:
   # max_attempts: 3 # fix-harness invocations before blocking
   # timeout: 300 # seconds per test/build run
 
+plan_review_timeout: 900 # seconds; default 300 is too short for Opus reviewing a full OpenSpec change
+
 review_policy: # which review findings block progression vs. merely advise (#17)
   # Tightened from the defaults (medium / 0.7): only high+ severity findings at
   # >= 0.85 confidence block; everything below advises rather than routing to a
