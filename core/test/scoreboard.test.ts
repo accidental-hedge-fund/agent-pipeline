@@ -117,6 +117,16 @@ test("parseScoreboardWindow: defaults to last 30 days ending at command start (#
   assert.equal(window.days, 30);
 });
 
+test("parseScoreboardWindow: days-only window spans the requested day count (#301)", () => {
+  const window = parseScoreboardWindow({ days: 7, now: new Date("2026-06-28T15:31:56Z") });
+  const spanDays = (Date.parse(window.until) - Date.parse(window.since)) / (24 * 60 * 60 * 1000);
+
+  assert.equal(window.until, "2026-06-28T15:31:56.000Z");
+  assert.equal(window.since, "2026-06-21T15:31:56.000Z");
+  assert.equal(spanDays, 7);
+  assert.equal(window.days, 7);
+});
+
 test("scanRunStore: filters explicit window and honors start timestamp fallback order (#301)", async () => {
   const files: Record<string, string> = {};
   addRun(files, "301-2026-06-10T00-00-00-000Z", {

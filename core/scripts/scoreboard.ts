@@ -187,8 +187,9 @@ export function parseScoreboardWindow(
     until = parsedUntil;
     since = new Date(parsedUntil.getTime() - 30 * MS_PER_DAY);
   } else {
+    const span = effectiveDays ?? 30;
     until = now;
-    since = new Date(now.getTime() - 30 * MS_PER_DAY);
+    since = new Date(now.getTime() - span * MS_PER_DAY);
   }
 
   if (since.getTime() > until.getTime()) {
