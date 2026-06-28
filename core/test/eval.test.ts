@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { advanceEval, type EvalDeps, type EvalRunResult } from "../scripts/stages/eval.ts";
 import { readBundle } from "../scripts/evidence-bundle.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -95,6 +96,22 @@ function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; 
   };
 }
 
+function appendOnlyRunStore(appended: string[]): RunStoreDeps {
+  return {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async (_p, data) => { appended.push(data); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+  };
+}
+
+function appendedEvents(appended: string[]): Record<string, unknown>[] {
+  return appended.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -153,8 +170,9 @@ test("eval-gate: non-zero exit + advisory mode → comment posted, transitions t
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
   const deps = makeDeps(log, [failResult("1 eval failed")]);
+  const appended: string[] = [];
 
-  const out = await advanceEval(cfg, 45, {}, deps);
+  const out = await advanceEval(cfg, 45, { runDir: "/runs/45", runStoreDeps: appendOnlyRunStore(appended) }, deps);
 
   assert.equal(out.advanced, true);
   assert.equal((out as { to: string }).to, "ready-to-deploy");
@@ -162,6 +180,10 @@ test("eval-gate: non-zero exit + advisory mode → comment posted, transitions t
   assert.equal(log.comments.length, 1);
   assert.ok(log.comments[0].includes("FAIL"), "advisory comment must say FAIL");
   assert.ok(log.comments[0].includes("advisory"), "advisory comment must include mode");
+  assert.deepEqual(
+    appendedEvents(appended).map((event) => ({ type: event.type, gate: event.gate, result: event.result, mode: event.mode })),
+    [{ type: "gate_result", gate: "eval-gate", result: "fail", mode: "advisory" }],
+  );
 });
 
 test("eval-gate: retry on transient fail — first attempt fails, second passes → pass outcome", async () => {

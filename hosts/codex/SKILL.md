@@ -63,6 +63,7 @@ $pipeline N --doctor                     run the preflight before advancing; abo
 $pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
 $pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
+$pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
