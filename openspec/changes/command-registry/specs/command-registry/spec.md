@@ -7,7 +7,7 @@ The pipeline CLI SHALL maintain a `COMMAND_REGISTRY` constant in `core/scripts/c
 #### Scenario: Every recognized command keyword has a registry entry
 
 - **WHEN** the `COMMAND_REGISTRY` is inspected
-- **THEN** it SHALL contain entries for every keyword the pipeline CLI recognizes: advance (the default/numeric case), init, doctor, release, intake, triage, merge, sweep, refine-spec, logs, summary, path, config, run, improve, scoreboard, cleanup, remove-worktree
+- **THEN** it SHALL contain entries for every keyword the pipeline CLI recognizes: advance (the default/numeric case), init, doctor, release, intake, triage, merge, sweep, refine-spec, logs, summary, path, config, run, improve, scoreboard, roadmap, cleanup, remove-worktree
 - **AND** `lookupCommand("unknown-cmd")` SHALL return `null`
 - **AND** `lookupCommand(undefined)` SHALL return the advance entry
 
@@ -47,6 +47,39 @@ For every registered command whose `allowedFlags` is NOT the `"all"` sentinel, t
 - **WHEN** the user invokes `pipeline merge 42` with any option other than `--repo-path`, `--base`, or `--profile`
 - **THEN** the CLI SHALL exit with code 2 and an error naming the offending option BEFORE the squash merge is attempted
 - **AND** the error message SHALL state that `pipeline merge` does not support the flag
+
+---
+
+### Requirement: The CLI SHALL resolve flag-only modes to their registry entries before flag validation
+
+When `numArg` is absent or numeric (i.e., no named subcommand is present) and a flag-only mode option is active (`--removeWorktree`, `--cleanup`, or `--init`), the CLI SHALL derive an `effectiveCommandKey` mapping to the respective registry entry (`"remove-worktree"`, `"cleanup"`, or `"init"`) and use that entry for flag validation. This prevents flag-only modes from silently inheriting the advance entry's `allowedFlags: "all"` sentinel, which would allow any flag to pass through unchecked.
+
+When a named subcommand is present in `numArg`, the subcommand entry governs validation and the flag-only mode override SHALL NOT apply.
+
+#### Scenario: --init flag-only mode rejects flags outside its allowlist
+
+- **WHEN** the user invokes `pipeline --init --dry-run`
+- **THEN** the CLI SHALL resolve the effective command key to `"init"` (not `"advance"`)
+- **AND** `--dry-run` (attribute name `dryRun`) SHALL cause exit with code 2 because `dryRun` is not in `init.allowedFlags`
+- **AND** the error message SHALL state that `--init` mode does not support the flag
+
+#### Scenario: --cleanup flag-only mode rejects flags outside its allowlist
+
+- **WHEN** the user invokes `pipeline --cleanup --dry-run`
+- **THEN** the CLI SHALL resolve the effective command key to `"cleanup"`
+- **AND** `--dry-run` SHALL cause exit with code 2 because `dryRun` is not in `cleanup.allowedFlags`
+
+#### Scenario: --remove-worktree flag-only mode rejects flags outside its allowlist
+
+- **WHEN** the user invokes `pipeline 42 --remove-worktree --dry-run`
+- **THEN** the CLI SHALL resolve the effective command key to `"remove-worktree"`
+- **AND** `--dry-run` SHALL cause exit with code 2 because `dryRun` is not in `remove-worktree.allowedFlags`
+
+#### Scenario: Named subcommand governs validation when combined with a flag-only mode option
+
+- **WHEN** the user invokes `pipeline intake --cleanup`
+- **THEN** the `intake` registry entry SHALL govern validation (not the `cleanup` entry)
+- **AND** `--cleanup` (attribute name `cleanup`) SHALL be rejected because it is not in `intake.allowedFlags`
 
 ---
 
