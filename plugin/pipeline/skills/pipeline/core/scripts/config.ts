@@ -212,6 +212,21 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Bounded auto-loop mode: continue recoverable stops at allowlisted stages within explicit budgets, then park at needs-human on exhaustion (#149)."),
+  // Auto-merge eligibility gate (#306). Opt-in; disabled by default. When enabled,
+  // classifies a PR as auto-merge-eligible or needs-human inside shipcheck-gate.
+  // Does NOT block ready-to-deploy; produces a classification artifact only.
+  auto_merge_eligibility: z
+    .object({
+      enabled: z.boolean().optional().describe("Enable the auto-merge eligibility gate (default false). When false, the gate is a no-op."),
+      max_diff_lines: z.number().int().positive().optional().describe("Hard-deny if total PR diff lines (additions + deletions) exceed this threshold (default 300)."),
+      max_files: z.number().int().positive().optional().describe("Hard-deny if changed file count exceeds this threshold (default 10)."),
+      deny_paths: z.array(z.string()).optional().describe("Additional glob patterns that always trigger needs-human regardless of other checks (default [])."),
+      allow_paths: z.array(z.string()).optional().describe("When non-empty, any changed file not covered by this list triggers needs-human (default [])."),
+      min_confidence: z.number().min(0).max(1).optional().describe("LLM judge confidence floor (0–1); outputs below this route to needs-human (default 0.8)."),
+    })
+    .strict()
+    .optional()
+    .describe("Auto-merge eligibility gate: classifies PRs as auto-merge-eligible or needs-human after deterministic policy checks and LLM judge evaluation (#306)."),
 }).strict();
 
 export interface ResolveOptions {
@@ -418,6 +433,14 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       : fileConfig.roadmap,
     sweep: fileConfig.sweep,
     queue: fileConfig.queue,
+    auto_merge_eligibility: {
+      enabled: fileConfig.auto_merge_eligibility?.enabled ?? DEFAULT_CONFIG.auto_merge_eligibility.enabled,
+      max_diff_lines: fileConfig.auto_merge_eligibility?.max_diff_lines ?? DEFAULT_CONFIG.auto_merge_eligibility.max_diff_lines,
+      max_files: fileConfig.auto_merge_eligibility?.max_files ?? DEFAULT_CONFIG.auto_merge_eligibility.max_files,
+      deny_paths: fileConfig.auto_merge_eligibility?.deny_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.deny_paths,
+      allow_paths: fileConfig.auto_merge_eligibility?.allow_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.allow_paths,
+      min_confidence: fileConfig.auto_merge_eligibility?.min_confidence ?? DEFAULT_CONFIG.auto_merge_eligibility.min_confidence,
+    },
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;

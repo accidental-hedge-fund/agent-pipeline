@@ -346,6 +346,18 @@ export interface PipelineConfig {
     max_wallclock_minutes: number;
     stages: Stage[];
   };
+  // Auto-merge eligibility gate (#306). When enabled, classifies a PR as
+  // `auto-merge-eligible` or `needs-human` after all existing gates pass.
+  // The gate runs inside shipcheck-gate and does NOT block ready-to-deploy.
+  // Default: disabled (no classification, no artifact).
+  auto_merge_eligibility: {
+    enabled: boolean;
+    max_diff_lines: number;
+    max_files: number;
+    deny_paths: string[];
+    allow_paths: string[];
+    min_confidence: number;
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -394,6 +406,14 @@ export const DEFAULT_CONFIG: Omit<
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,
   auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] as Stage[] },
+  auto_merge_eligibility: {
+    enabled: false,
+    max_diff_lines: 300,
+    max_files: 10,
+    deny_paths: [] as string[],
+    allow_paths: [] as string[],
+    min_confidence: 0.8,
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -669,6 +689,46 @@ export interface RecoveryRecord {
   at: string;
 }
 
+// ---------------------------------------------------------------------------
+// Auto-merge eligibility gate (#306) — types for the deterministic policy
+// envelope + LLM risk judge that classifies PRs as eligible or needs-human.
+// ---------------------------------------------------------------------------
+
+/** One deterministic policy check result recorded in the eligibility artifact. */
+export interface EligibilityCheckResult {
+  check: string;
+  passed: boolean;
+  reason?: string;
+}
+
+/** Structured risk classification emitted by the LLM eligibility judge.
+ *  Field names and order MUST match ELIGIBILITY_JUDGE_SCHEMA_BLOCK in
+ *  auto-merge-eligibility-schema.ts; the drift guard test fails if they diverge. */
+export interface EligibilityJudgeOutput {
+  scope_size: "tiny" | "small" | "medium" | "large";
+  blast_radius: "low" | "medium" | "high";
+  semantic_risk: "mechanical" | "localized_behavior" | "cross_cutting_behavior";
+  reversibility: "trivial" | "normal" | "painful";
+  confidence: number;
+  reasons: string[];
+  denial_reasons: string[];
+}
+
+/** Durable decision artifact written to the evidence bundle after gate evaluation. */
+export interface AutoMergeEligibilityArtifact {
+  eligibility: "auto-merge-eligible" | "needs-human";
+  evaluated_at: string;
+  deterministic_checks: EligibilityCheckResult[];
+  denial_reasons: string[];
+  judge_output: EligibilityJudgeOutput | null;
+  ci_status_snapshot: { sha: string; conclusion: string; checked_at: string };
+  review_verdict_snapshot: { verdict: string; finding_count: number; recorded_at: string };
+  linked_run_id: string;
+  linked_issue: number;
+  linked_pr: number;
+  revert_note: string;
+}
+
 /** The complete per-run evidence bundle written to `<stateDir>/<issue>/evidence.json`. */
 export interface EvidenceBundle {
   schema_version: number;
@@ -695,6 +755,14 @@ export interface EvidenceBundle {
   /** Finalized stage accounting copied from `stage_accounting` events by
    *  `finalizeRun`. Additive and optional for older bundles. */
   accounting?: StageAccountingSummary;
+  /** Auto-merge eligibility artifact written by the eligibility gate when
+   *  `auto_merge_eligibility.enabled` is true. Absent when gate is disabled. */
+  auto_merge_eligibility?: AutoMergeEligibilityArtifact;
+  /** Optional rationale recorded when a behavioral change intentionally ships
+   *  without accompanying tests (e.g. pure refactors, generated code). When
+   *  present, the eligibility gate's behavioral-change-without-tests hard-deny
+   *  is suppressed. */
+  no_test_rationale?: string;
 }
 
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry
