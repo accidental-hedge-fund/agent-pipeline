@@ -574,6 +574,71 @@ test("in-flight runs complete after budget gate fires", async () => {
   assert.equal(summary.halt_reason, "budget_exhausted");
 });
 
+test("Finding 1 regression: --base is forwarded to every runPipeline call", async () => {
+  const issues = [makeIssue(1), makeIssue(2)];
+  const receivedOpts: import("../scripts/stages/queue.ts").RunOpts[] = [];
+
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    runPipeline: async (n, opts) => {
+      receivedOpts.push(opts);
+      return { issueNumber: n, finalState: "ready-to-deploy", costUsd: 0.10, durationMs: 50 };
+    },
+  });
+
+  await runQueue(makeOpts({ maxIssues: 2, concurrency: 1, base: "release/x" }), deps);
+
+  assert.equal(receivedOpts.length, 2, "both issues should have been run");
+  assert.ok(
+    receivedOpts.every((o) => o.base === "release/x"),
+    "every runPipeline call should receive base='release/x'",
+  );
+});
+
+test("Finding 2 regression: budgetDollars=0 launches no runs at all", async () => {
+  const issues = [makeIssue(1), makeIssue(2)].map((i) => i);
+  const launched: number[] = [];
+
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    runPipeline: async (n) => {
+      launched.push(n);
+      return { issueNumber: n, finalState: "ready-to-deploy", costUsd: 0.10, durationMs: 50 };
+    },
+  });
+
+  await runQueue(makeOpts({ maxIssues: 2, concurrency: 1, budgetDollars: 0 }), deps);
+
+  assert.equal(launched.length, 0, "zero-dollar budget should block all launches");
+  const summaryStr = [...deps.written.values()][0];
+  const summary = JSON.parse(summaryStr);
+  assert.equal(summary.halt_reason, "budget_exhausted");
+  assert.equal(summary.aggregate.total_issues, 0);
+});
+
+test("Finding 3 regression: aggregate.excluded_count is present in batch summary", () => {
+  const results: RunResult[] = [
+    { issueNumber: 1, finalState: "ready-to-deploy", costUsd: 0.10, durationMs: 100 },
+    { issueNumber: 2, finalState: "ready-to-deploy", costUsd: 0.10, durationMs: 100 },
+  ];
+  const titles = new Map(results.map((r) => [r.issueNumber, `Issue ${r.issueNumber}`]));
+  const summary = buildBatchSummary(results, titles, makeOpts(), null, 7, 0, 1000);
+
+  assert.equal(summary.excluded_count, 7, "top-level excluded_count must equal 7");
+  assert.equal(
+    (summary.aggregate as { excluded_count?: number }).excluded_count,
+    7,
+    "aggregate.excluded_count must equal 7",
+  );
+  const json = JSON.stringify(summary);
+  const parsed = JSON.parse(json);
+  assert.equal(
+    parsed.aggregate.excluded_count,
+    7,
+    "JSON-serialized aggregate.excluded_count must equal 7",
+  );
+});
+
 test("stdout includes per-issue table and aggregate line", async () => {
   const issues = [makeIssue(42)];
   issues[0].title = "My special issue";

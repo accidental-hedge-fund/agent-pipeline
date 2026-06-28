@@ -738,6 +738,7 @@ async function main(): Promise<void> {
           repoDir: queueCfg.repo_dir,
           profile: opts.profile,
           batchId,
+          base: opts.base,
         },
         realQueueDeps(queueCfg.repo_dir, opts.profile),
       );

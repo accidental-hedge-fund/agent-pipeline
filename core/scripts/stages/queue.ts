@@ -33,6 +33,7 @@ export interface EligibleIssue {
 export interface RunOpts {
   profile?: string;
   repoPath?: string;
+  base?: string;
 }
 
 export interface RunResult {
@@ -52,6 +53,7 @@ export interface QueueOpts {
   repoDir: string;
   profile?: string;
   batchId: string;
+  base?: string;
 }
 
 export interface PerIssueSummary {
@@ -75,6 +77,7 @@ export interface BatchSummary {
     total_issues: number;
     succeeded: number;
     failed: number;
+    excluded_count: number;
     failure_rate: number;
     total_cost_usd: number;
     total_duration_ms: number;
@@ -179,6 +182,7 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
       ];
       if (opts.profile) args.push("--profile", opts.profile);
       if (opts.repoPath) args.push("--repo-path", opts.repoPath);
+      if (opts.base) args.push("--base", opts.base);
 
       const exitCode = await new Promise<number>((resolve) => {
         const child = spawn("node", args, {
@@ -376,6 +380,7 @@ export function buildBatchSummary(
       total_issues: results.length,
       succeeded,
       failed,
+      excluded_count: excludedCount,
       failure_rate: failureRate,
       total_cost_usd: totalCostUsd,
       total_duration_ms: totalDurationMs,
@@ -462,7 +467,7 @@ export async function runQueue(opts: QueueOpts, deps: QueueDeps): Promise<void> 
 
   function fillSlot(issue: EligibleIssue): void {
     const slotStart = deps.clock();
-    const p = deps.runPipeline(issue.number, { profile: opts.profile, repoPath: opts.repoDir })
+    const p = deps.runPipeline(issue.number, { profile: opts.profile, repoPath: opts.repoDir, base: opts.base })
       .catch((err): RunResult => ({
         issueNumber: issue.number,
         finalState: "error",
@@ -487,6 +492,15 @@ export async function runQueue(opts: QueueOpts, deps: QueueDeps): Promise<void> 
   while (true) {
     // Fill available slots (only when not halted).
     while (!haltReason && active.size < opts.concurrency && queue.length > 0) {
+      // Pre-launch budget guard: check before every fillSlot, including the first.
+      if (opts.budgetDollars !== null && cumulativeCostUsd >= opts.budgetDollars) {
+        haltReason = "budget_exhausted";
+        deps.log(
+          `[pipeline queue] budget exhausted: cumulative $${cumulativeCostUsd.toFixed(4)} >= ` +
+            `$${opts.budgetDollars} — no further runs launched`,
+        );
+        break;
+      }
       fillSlot(queue.shift()!);
     }
 
