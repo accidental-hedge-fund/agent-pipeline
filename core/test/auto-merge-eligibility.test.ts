@@ -177,6 +177,8 @@ function makeDeps(overrides: Partial<EligibilityGateDeps> = {}): { deps: Eligibi
     getPrDetail: async () => makePrDetail(),
     getPrChecks: async () => PASSING_CI,
     getPrDiff: async () => SIMPLE_DIFF,
+    getPrUnresolvedThreadCount: async () => 0,
+    readEvidenceBundle: async () => ({ runId: "test-run-1" }),
     invokeJudge: async () => {
       rec.judgeInvocations++;
       return { stdout: JSON.stringify(VALID_JUDGE_OUTPUT), success: true };
@@ -698,4 +700,193 @@ test("config: auto_merge_eligibility defaults to disabled when not set", async (
   assert.equal(DEFAULT_CONFIG.auto_merge_eligibility.max_diff_lines, 300);
   assert.equal(DEFAULT_CONFIG.auto_merge_eligibility.max_files, 10);
   assert.equal(DEFAULT_CONFIG.auto_merge_eligibility.min_confidence, 0.8);
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for review-1 findings
+// ---------------------------------------------------------------------------
+
+// Finding 1: judge high blast_radius → needs-human even with no denial_reasons
+test("finding1: judge blast_radius=high with no denial_reasons → needs-human", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const HIGH_BLAST: EligibilityJudgeOutput = {
+    ...VALID_JUDGE_OUTPUT,
+    blast_radius: "high",
+    denial_reasons: [],
+  };
+  const { deps, rec } = makeDeps({
+    invokeJudge: async () => {
+      rec.judgeInvocations++;
+      return { stdout: JSON.stringify(HIGH_BLAST), success: true };
+    },
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("blast_radius")),
+    `expected blast_radius denial, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 1);
+});
+
+// Finding 1: judge semantic_risk=cross_cutting_behavior → needs-human
+test("finding1: judge semantic_risk=cross_cutting_behavior → needs-human", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const CC_OUTPUT: EligibilityJudgeOutput = {
+    ...VALID_JUDGE_OUTPUT,
+    blast_radius: "low",
+    semantic_risk: "cross_cutting_behavior",
+    denial_reasons: [],
+  };
+  const { deps, rec } = makeDeps({
+    invokeJudge: async () => {
+      rec.judgeInvocations++;
+      return { stdout: JSON.stringify(CC_OUTPUT), success: true };
+    },
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("semantic_risk")),
+    `expected semantic_risk denial, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 1);
+});
+
+// Finding 2: empty CI checks → needs-human (parseChecksAggregate([]) is true but no runs exist)
+test("finding2: empty CI check runs → needs-human with ci: no passing run", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const { deps, rec } = makeDeps({
+    getPrChecks: async () => [],
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("ci: no passing run")),
+    `expected ci: no passing run denial, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 0, "judge must not be invoked when CI has no runs");
+});
+
+// Finding 3: unresolved review threads → needs-human
+test("finding3: unresolved review threads → needs-human with unresolved_review_comments", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts();
+  const { deps, rec } = makeDeps({
+    getPrUnresolvedThreadCount: async () => 2,
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("unresolved_review_comments: 2")),
+    `expected unresolved_review_comments denial, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 0, "judge must not be invoked when review threads are unresolved");
+});
+
+// Finding 3: unresolved threads check in runDeterministicChecks
+test("runDeterministicChecks: unresolved review threads → denial", () => {
+  const cfg = makeBaseCfg();
+  const pr = makePrDetail();
+  const files = ["src/utils.ts", "src/utils.test.ts"];
+  const result = runDeterministicChecks(cfg, pr, files, 15, true, "abc123", true, true, SIMPLE_DIFF, {
+    unresolvedThreadCount: 3,
+  });
+
+  assert.equal(result.passed, false);
+  assert.ok(result.denial_reasons.some((r) => r.includes("unresolved_review_comments: 3")));
+});
+
+// Finding 3: zero unresolved threads → passes the check
+test("runDeterministicChecks: zero unresolved threads → check passes", () => {
+  const cfg = makeBaseCfg();
+  const pr = makePrDetail();
+  const files = ["src/utils.ts", "src/utils.test.ts"];
+  const result = runDeterministicChecks(cfg, pr, files, 15, true, "abc123", true, true, SIMPLE_DIFF, {
+    unresolvedThreadCount: 0,
+  });
+
+  assert.equal(result.passed, true);
+  assert.ok(result.checks.find((c) => c.check === "unresolved_review_comments")?.passed);
+});
+
+// Finding 4: stateDir set but bundle is null (missing) → needs-human
+test("finding4: stateDir set but evidence bundle missing → needs-human with missing_evidence", async () => {
+  const cfg = makeBaseCfg();
+  const opts = makeOpts({ stateDir: "/tmp/state" });
+  const { deps, rec } = makeDeps({
+    readEvidenceBundle: async () => null,
+  });
+
+  const artifact = await runEligibilityGate(cfg, 123, 42, opts, deps);
+
+  assert.equal(artifact.eligibility, "needs-human");
+  assert.ok(
+    artifact.denial_reasons.some((r) => r.includes("missing_evidence")),
+    `expected missing_evidence denial, got: ${JSON.stringify(artifact.denial_reasons)}`,
+  );
+  assert.equal(rec.judgeInvocations, 0, "judge must not be invoked when evidence bundle is missing");
+});
+
+// Finding 4: bundle present + no_test_rationale bypasses behavioral-change denial
+test("finding4: no_test_rationale in bundle → behavioral-change check passes", () => {
+  const cfg = makeBaseCfg();
+  const pr = makePrDetail();
+  const noTestDiff = `diff --git a/src/generated.ts b/src/generated.ts
+index abc..def 100644
+--- a/src/generated.ts
++++ b/src/generated.ts
+@@ -1,2 +1,2 @@
+-const x = 1;
++const x = 2;
+`;
+  const files = ["src/generated.ts"]; // no test files, but rationale is present
+  const result = runDeterministicChecks(
+    cfg, pr, files, 2, true, "abc123", true, true, noTestDiff,
+    { noTestRationale: "generated code — tests are snapshot-tested separately" },
+  );
+
+  assert.equal(result.passed, true, "should pass when no_test_rationale is provided");
+  assert.ok(result.checks.find((c) => c.check === "behavioral_change_without_tests")?.passed);
+});
+
+// Finding 5: package.json at any path triggers hard deny
+test("finding5: package.json at nested path triggers built-in deny pattern", () => {
+  const packageJsonPaths = [
+    "package.json",
+    "core/package.json",
+    "packages/web/package.json",
+  ];
+  for (const p of packageJsonPaths) {
+    assert.ok(
+      BUILT_IN_DENY_PATTERNS.some((r) => r.test(p)),
+      `expected ${p} to match a built-in deny pattern`,
+    );
+  }
+});
+
+// Finding 5: nested lockfiles trigger hard deny
+test("finding5: nested lockfile at any path triggers built-in deny pattern", () => {
+  const nestedLockPaths = [
+    "core/package-lock.json",
+    "packages/api/yarn.lock",
+    "services/auth/pnpm-lock.yaml",
+  ];
+  for (const p of nestedLockPaths) {
+    assert.ok(
+      BUILT_IN_DENY_PATTERNS.some((r) => r.test(p)),
+      `expected ${p} to match a built-in deny pattern`,
+    );
+  }
 });

@@ -16,6 +16,7 @@ import {
   getPrChecks as defaultGetPrChecks,
   getPrDetail as defaultGetPrDetail,
   getPrDiff as defaultGetPrDiff,
+  getUnresolvedReviewThreadCount as defaultGetUnresolvedThreadCount,
   parseChecksAggregate,
 } from "../gh.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
@@ -53,8 +54,9 @@ export const BUILT_IN_DENY_PATTERNS: readonly RegExp[] = [
   // Secrets / env files
   /(?:^|\/)secrets?\//i,
   /(?:^|\/)\.env(?:$|\.)/,
-  // Dependency lock files (root level)
-  /^(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|Pipfile\.lock|Gemfile\.lock|composer\.lock)$/,
+  // Dependency manifests and lock files at any path depth
+  /(?:^|\/)package\.json$/,
+  /(?:^|\/)(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|Pipfile\.lock|Gemfile\.lock|composer\.lock)$/,
   // Cron / schedulers
   /(?:^|\/)cron(?:tab)?\//i,
   /(?:^|\/)schedulers?\//i,
@@ -140,6 +142,7 @@ export function runDeterministicChecks(
   hasCleanReviewVerdict: boolean,
   hasEvidenceBundle: boolean,
   diffText: string,
+  opts?: { unresolvedThreadCount?: number; noTestRationale?: string },
 ): DeterministicCheckResult {
   const checks: EligibilityCheckResult[] = [];
   const denial_reasons: string[] = [];
@@ -242,7 +245,8 @@ export function runDeterministicChecks(
     (f) => !isTestFile(f) && isSourceFile(f),
   );
   const testFiles = changedFiles.filter((f) => isTestFile(f));
-  if (sourceFiles.length > 0 && testFiles.length === 0) {
+  const noTestRationale = opts?.noTestRationale;
+  if (sourceFiles.length > 0 && testFiles.length === 0 && !noTestRationale) {
     addCheck(
       "behavioral_change_without_tests",
       false,
@@ -250,6 +254,18 @@ export function runDeterministicChecks(
     );
   } else {
     addCheck("behavioral_change_without_tests", true);
+  }
+
+  // 10. Unresolved review comment threads
+  const unresolvedCount = opts?.unresolvedThreadCount ?? 0;
+  if (unresolvedCount > 0) {
+    addCheck(
+      "unresolved_review_comments",
+      false,
+      `unresolved_review_comments: ${unresolvedCount}`,
+    );
+  } else {
+    addCheck("unresolved_review_comments", true);
   }
 
   const passed = denial_reasons.length === 0;
@@ -264,7 +280,7 @@ function patternLabel(pattern: RegExp): string {
   if (/security/i.test(src)) return "security";
   if (/infra|deploy|terraform|kubernetes|k8s/i.test(src)) return "infrastructure";
   if (/secret|\.env/i.test(src)) return "secrets";
-  if (/package-lock|yarn\.lock|pnpm|Cargo\.lock|go\.sum|Pipfile|Gemfile|composer/i.test(src)) return "dependency_manifest";
+  if (/package(?:\.json|-lock)|yarn\.lock|pnpm|Cargo\.lock|go\.sum|Pipfile|Gemfile|composer/i.test(src)) return "dependency_manifest";
   if (/cron|schedule/i.test(src)) return "cron_scheduler";
   if (/openapi|swagger|graphql/i.test(src)) return "public_api";
   if (/github\/workflow|CHANGELOG|release/i.test(src)) return "release_config";
@@ -434,6 +450,16 @@ export interface EligibilityGateDeps {
   getPrDetail?: typeof defaultGetPrDetail;
   getPrChecks?: typeof defaultGetPrChecks;
   getPrDiff?: typeof defaultGetPrDiff;
+  /** Return the count of unresolved review-comment threads on the PR. */
+  getPrUnresolvedThreadCount?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+  ) => Promise<number>;
+  /** Read the evidence bundle for the run. Returns null when absent. */
+  readEvidenceBundle?: (
+    stateDir: string,
+    issue: number,
+  ) => Promise<{ runId: string; no_test_rationale?: string } | null>;
   /** Invoke the reviewer/judge harness. Returns stdout and success flag. */
   invokeJudge?: (
     prompt: string,
@@ -483,6 +509,7 @@ export async function runEligibilityGate(
   const getPrDetailFn = deps.getPrDetail ?? defaultGetPrDetail;
   const getPrChecksFn = deps.getPrChecks ?? defaultGetPrChecks;
   const getPrDiffFn = deps.getPrDiff ?? defaultGetPrDiff;
+  const getUnresolvedFn = deps.getPrUnresolvedThreadCount ?? defaultGetUnresolvedThreadCount;
 
   let prDetail: PrDetail;
   let diffText: string;
@@ -510,15 +537,57 @@ export async function runEligibilityGate(
     return artifact;
   }
 
+  // Finding 3: fetch unresolved review thread count; fail-safe deny on error.
+  let unresolvedThreadCount: number;
+  try {
+    unresolvedThreadCount = await getUnresolvedFn(cfg, prNumber);
+  } catch (err) {
+    const artifact = buildEligibilityArtifact({
+      eligibility: "needs-human",
+      evaluatedAt,
+      deterministicChecks: [],
+      denialReasons: [`unresolved_review_comments: query failed — ${(err as Error).message}`],
+      judgeOutput: null,
+      ciStatusSnapshot: { sha: prDetail.head_sha, conclusion: "unknown", checked_at: evaluatedAt },
+      reviewVerdictSnapshot: {
+        verdict: opts.reviewVerdict?.verdict ?? "unknown",
+        finding_count: opts.reviewVerdict?.findingCount ?? 0,
+        recorded_at: opts.reviewVerdict?.recordedAt ?? evaluatedAt,
+      },
+      linkedRunId: opts.runId,
+      linkedIssue: issueNumber,
+      linkedPr: prNumber,
+      headSha: prDetail.head_sha,
+    });
+    await tryRecordArtifact(cfg, opts, issueNumber, artifact, deps);
+    return artifact;
+  }
+
+  // Finding 4: load and validate the evidence bundle before deterministic checks.
+  let hasEvidenceBundle = false;
+  let noTestRationale: string | undefined;
+  if (opts.stateDir) {
+    const readBundleFn = deps.readEvidenceBundle ?? (async (sd: string, iss: number) => {
+      const { readBundle } = await import("../evidence-bundle.ts");
+      return readBundle(sd, iss);
+    });
+    const bundle = await readBundleFn(opts.stateDir, issueNumber).catch(() => null);
+    hasEvidenceBundle = bundle !== null && !!bundle.runId;
+    noTestRationale = bundle?.no_test_rationale;
+  }
+
   const headSha = prDetail.head_sha;
   const changedFiles = parseDiffFiles(diffText);
   const diffLines = countDiffLines(diffText);
   const ciAgg = parseChecksAggregate(checks);
   const checkedAt = evaluatedAt;
 
+  // Finding 2: require at least one check-run to exist before treating CI as passing.
+  const ciPassed = checks.length > 0 && ciAgg.passed;
+
   const ciStatusSnapshot = {
     sha: headSha,
-    conclusion: ciAgg.passed ? "success" : ciAgg.pending ? "pending" : "failure",
+    conclusion: ciPassed ? "success" : ciAgg.pending ? "pending" : "failure",
     checked_at: checkedAt,
   };
   const reviewVerdictSnapshot = {
@@ -529,18 +598,18 @@ export async function runEligibilityGate(
 
   const hasCleanReviewVerdict =
     opts.reviewVerdict?.verdict === "approve" || opts.reviewVerdict?.verdict === "approved";
-  const hasEvidenceBundle = opts.stateDir !== undefined;
 
   const detResult = runDeterministicChecks(
     cfg,
     prDetail,
     changedFiles,
     diffLines,
-    ciAgg.passed,
+    ciPassed,
     headSha,
     hasCleanReviewVerdict,
     hasEvidenceBundle,
     diffText,
+    { unresolvedThreadCount, noTestRationale },
   );
 
   if (!detResult.passed) {
@@ -690,6 +759,34 @@ export async function runEligibilityGate(
       evaluatedAt,
       deterministicChecks: detResult.checks,
       denialReasons: judgeOutput.denial_reasons,
+      judgeOutput,
+      ciStatusSnapshot,
+      reviewVerdictSnapshot,
+      linkedRunId: opts.runId,
+      linkedIssue: issueNumber,
+      linkedPr: prNumber,
+      headSha,
+    });
+    await tryRecordArtifact(cfg, opts, issueNumber, artifact, deps);
+    return artifact;
+  }
+
+  // Finding 1: explicitly deny non-low blast_radius and cross-cutting semantic_risk.
+  // The confidence and denial_reasons checks above are not sufficient — a judge that
+  // returns an empty denial_reasons but high blast_radius would otherwise slip through.
+  const judgeDenials: string[] = [];
+  if (judgeOutput.blast_radius !== "low") {
+    judgeDenials.push(`judge: blast_radius "${judgeOutput.blast_radius}" is not "low"`);
+  }
+  if (judgeOutput.semantic_risk === "cross_cutting_behavior") {
+    judgeDenials.push(`judge: semantic_risk "cross_cutting_behavior" is not allowed`);
+  }
+  if (judgeDenials.length > 0) {
+    const artifact = buildEligibilityArtifact({
+      eligibility: "needs-human",
+      evaluatedAt,
+      deterministicChecks: detResult.checks,
+      denialReasons: judgeDenials,
       judgeOutput,
       ciStatusSnapshot,
       reviewVerdictSnapshot,

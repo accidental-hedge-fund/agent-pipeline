@@ -945,6 +945,35 @@ export async function getSuccessfulCheckRunCount(
   return isNaN(n) ? 0 : n;
 }
 
+/**
+ * Return the number of unresolved review-comment threads on a pull request.
+ * Uses the GraphQL `reviewThreads` API (the REST API has no equivalent).
+ * Returns 0 on query failure — callers that need a hard-deny on failure should
+ * wrap this in their own error boundary.
+ */
+export async function getUnresolvedReviewThreadCount(
+  cfg: PipelineConfig,
+  prNumber: number,
+): Promise<number> {
+  const [owner, repo] = cfg.repo.split("/");
+  const stdout = await ghRun([
+    "api",
+    "graphql",
+    "-f",
+    "query=query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$num){reviewThreads(first:100){nodes{isResolved}}}}}",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `repo=${repo}`,
+    "-F",
+    `num=${prNumber}`,
+    "--jq",
+    "[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length",
+  ]);
+  const n = parseInt(stdout.trim(), 10);
+  return isNaN(n) ? 0 : n;
+}
+
 export async function closePr(cfg: PipelineConfig, prNumber: number): Promise<void> {
   await ghRun(["pr", "close", String(prNumber), "-R", cfg.repo]);
 }

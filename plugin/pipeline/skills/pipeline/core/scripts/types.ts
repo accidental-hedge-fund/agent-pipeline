@@ -758,6 +758,11 @@ export interface EvidenceBundle {
   /** Auto-merge eligibility artifact written by the eligibility gate when
    *  `auto_merge_eligibility.enabled` is true. Absent when gate is disabled. */
   auto_merge_eligibility?: AutoMergeEligibilityArtifact;
+  /** Optional rationale recorded when a behavioral change intentionally ships
+   *  without accompanying tests (e.g. pure refactors, generated code). When
+   *  present, the eligibility gate's behavioral-change-without-tests hard-deny
+   *  is suppressed. */
+  no_test_rationale?: string;
 }
 
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry
