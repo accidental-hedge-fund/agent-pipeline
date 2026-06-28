@@ -118,3 +118,18 @@ test("step config (#13): review skip targets keep a valid forward path", () => {
   // review-2 disabled → always pre-merge
   assert.equal(reviewStageSkipTarget(cfg({ adversarial_review: false }), "review-2"), "pre-merge");
 });
+
+test("stage accounting is observational and cannot alter review skip routing (#304)", () => {
+  const cfg = {
+    steps: { plan_review: true, standard_review: false, adversarial_review: true, docs: true },
+  };
+  const expensiveAccounting = { cost_source: "actual", cost_usd: 999 };
+  const unknownAccounting = { cost_source: "unknown", cost_usd: null };
+  const route = (_accounting: typeof expensiveAccounting | typeof unknownAccounting, stage: "review-1" | "review-2") =>
+    reviewStageSkipTarget(cfg, stage);
+
+  assert.equal(route(expensiveAccounting, "review-1"), route(unknownAccounting, "review-1"));
+  assert.equal(route(expensiveAccounting, "review-1"), "review-2");
+  assert.equal(route(expensiveAccounting, "review-2"), route(unknownAccounting, "review-2"));
+  assert.equal(route(expensiveAccounting, "review-2"), "pre-merge");
+});

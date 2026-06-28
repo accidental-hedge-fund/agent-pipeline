@@ -158,10 +158,21 @@ export async function advanceFix(
       makePromptRecord(`fix-${round}`, harness, prompt),
     ).catch(() => {});
   }
+  const model = opts.model ?? cfg.models.fix;
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
-    model: opts.model ?? cfg.models.fix,
+    model,
     sandbox: cfg.harness_sandbox,
+    accounting: opts.runDir
+      ? {
+          runDir: opts.runDir,
+          runStoreDeps: opts.runStoreDeps,
+          issue: issueNumber,
+          stage,
+          modelSlot: "fix",
+          model,
+        }
+      : undefined,
   });
 
   if (!result.success) {
@@ -222,6 +233,7 @@ export async function advanceFix(
   const gates = await gatesRunner(
     cfg, issueNumber, wt.path, stage, pipelineRunId, opts.stateDir,
     { runFormatGate: fmtGateFn },
+    opts.runDir, opts.runStoreDeps,
   );
   if (!gates.ok) {
     await setBlocked(cfg, issueNumber, gates.reason, stage,

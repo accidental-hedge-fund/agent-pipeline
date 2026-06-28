@@ -180,10 +180,21 @@ test("eval-gate: non-zero exit + advisory mode → comment posted, transitions t
   assert.equal(log.comments.length, 1);
   assert.ok(log.comments[0].includes("FAIL"), "advisory comment must say FAIL");
   assert.ok(log.comments[0].includes("advisory"), "advisory comment must include mode");
+  const events = appendedEvents(appended);
   assert.deepEqual(
-    appendedEvents(appended).map((event) => ({ type: event.type, gate: event.gate, result: event.result, mode: event.mode })),
+    events
+      .filter((event) => event.type === "gate_result")
+      .map((event) => ({ type: event.type, gate: event.gate, result: event.result, mode: event.mode })),
     [{ type: "gate_result", gate: "eval-gate", result: "fail", mode: "advisory" }],
   );
+  const accounting = events.find((event) => event.type === "stage_accounting");
+  assert.ok(accounting, "eval subprocess should emit stage accounting when runDir is provided");
+  assert.equal(accounting.stage, "eval-gate");
+  assert.equal(accounting.harness, "eval-gate");
+  assert.equal(accounting.outcome, "failure");
+  assert.equal(accounting.blocker_kind, "eval-gate-failed");
+  assert.equal(accounting.cost_source, "unknown");
+  assert.equal(accounting.cost_usd, null);
 });
 
 test("eval-gate: retry on transient fail — first attempt fails, second passes → pass outcome", async () => {
@@ -257,12 +268,16 @@ test("eval-gate: timeout in gate mode → blocked", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
   const deps = makeDeps(log, [timeoutResult()]);
+  const appended: string[] = [];
 
-  const out = await advanceEval(cfg, 49, {}, deps);
+  const out = await advanceEval(cfg, 49, { runDir: "/runs/49", runStoreDeps: appendOnlyRunStore(appended) }, deps);
 
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1, "timeout must block in gate mode");
   assert.ok(log.comments[0].includes("FAIL"), "timeout comment must say FAIL");
+  const accounting = appendedEvents(appended).find((event) => event.type === "stage_accounting");
+  assert.equal(accounting?.outcome, "timeout");
+  assert.equal(accounting?.blocker_kind, "harness-failure");
 });
 
 // Regression test for Finding 1: timeouts must ALWAYS block, even in advisory mode.

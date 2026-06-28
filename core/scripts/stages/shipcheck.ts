@@ -319,8 +319,20 @@ export async function advance(
     if (deps.invokeReviewer) {
       result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
     } else {
+      const model = cfg.models.review;
       const harnessResult = await defaultInvoke(reviewerHarness, worktreeDir, prompt, {
         timeoutSec,
+        model,
+        accounting: opts.runDir
+          ? {
+              runDir: opts.runDir,
+              runStoreDeps: opts.runStoreDeps,
+              issue: issueNumber,
+              stage: "shipcheck-gate",
+              modelSlot: "review",
+              model,
+            }
+          : undefined,
       });
       result = {
         stdout: harnessResult.stdout,

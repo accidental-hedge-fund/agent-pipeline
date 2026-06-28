@@ -23,6 +23,8 @@ import {
 import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import { trySalvageUncommittedWork } from "./salvage-harness-work.ts";
 import { makeCommandRecord, recordCommand } from "./evidence-bundle.ts";
+import { buildStageAccountingRecord } from "./accounting.ts";
+import { emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -163,6 +165,8 @@ export async function runTestGate(
   // then a no-op, so the gate has no filesystem side effects in tests.
   stageLabel: string = "test-gate",
   stateDir?: string,
+  runDir?: string,
+  runStoreDeps?: RunStoreDeps,
 ): Promise<TestGateResult> {
   if (!cfg.test_gate.enabled) return { skipped: true };
 
@@ -219,13 +223,36 @@ export async function runTestGate(
   // `runTests` has no exit code (it reports pass/fail), so synthesize 0/1.
   // Best-effort: recording never affects the gate outcome.
   const runAndRecord = async (): Promise<RunTestsResult> => {
+    const startedAt = new Date();
     const res = await runTestsFn(wtPath, command, cfg.test_gate.timeout, killProcessGroup);
+    const endedAt = new Date();
     if (stateDir) {
       await recordCommand(
         stateDir,
         issueNumber,
         stageLabel,
         makeCommandRecord(label, res.passed ? 0 : 1, res.durationSec * 1000, res.output),
+      ).catch(() => {});
+    }
+    if (runDir) {
+      await emitStageAccounting(
+        runDir,
+        buildStageAccountingRecord({
+          runId: path.basename(runDir),
+          issue: issueNumber,
+          stage: stageLabel,
+          harness: "test-gate",
+          modelSlot: null,
+          model: null,
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+          durationMs: res.durationSec * 1000,
+          commandCount: 1,
+          subprocessCount: 1,
+          outcome: res.passed ? "success" : "failure",
+          blockerKind: res.passed ? null : "test-gate-exhausted",
+        }),
+        runStoreDeps,
       ).catch(() => {});
     }
     return res;
@@ -284,10 +311,21 @@ export async function runTestGate(
     });
     // Capture HEAD before the harness runs so we can inspect only its commits.
     const headBefore = await gitHeadFn(wtPath);
+    const fixModel = cfg.models.fix;
     const fixRes = await invokeFn(harness, wtPath, prompt, {
       timeoutSec: cfg.fix_timeout,
-      model: cfg.models.fix,
+      model: fixModel,
       sandbox: cfg.harness_sandbox,
+      accounting: runDir
+        ? {
+            runDir,
+            runStoreDeps,
+            issue: issueNumber,
+            stage: stageLabel,
+            modelSlot: "fix",
+            model: fixModel,
+          }
+        : undefined,
     });
     if (!fixRes.success) {
       const reason = fixRes.timed_out

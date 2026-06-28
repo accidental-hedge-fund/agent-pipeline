@@ -12,10 +12,11 @@
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { EvidenceBundle, ReviewFindingRecord } from "./types.ts";
+import type { EvidenceBundle, ReviewFindingRecord, StageAccountingRecord } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
+import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -122,6 +123,9 @@ export interface GhMetricsSummaryEvent extends RunEventBase {
   p95_ms: number;
   slowest_calls: { category: string; elapsed_ms: number }[];
 }
+export interface StageAccountingEvent extends RunEventBase, StageAccountingRecord {
+  type: "stage_accounting";
+}
 
 export type { HumanInterventionEvent };
 
@@ -139,6 +143,7 @@ export type RunEvent =
   | BlockerSetEvent
   | BlockerClearedEvent
   | GhMetricsSummaryEvent
+  | StageAccountingEvent
   | HumanInterventionEvent;
 
 // ---------------------------------------------------------------------------
@@ -341,6 +346,31 @@ export async function emitGhMetrics(
 }
 
 // ---------------------------------------------------------------------------
+// emitStageAccounting
+// ---------------------------------------------------------------------------
+
+/** Append a sanitized stage_accounting event to events.jsonl. Non-fatal on I/O
+ *  error and streams via appendEvent's existing --json-events path. */
+export async function emitStageAccounting(
+  runDir: string,
+  record: StageAccountingRecord,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  const event: StageAccountingEvent = {
+    ...sanitizeStageAccountingRecord(record),
+    type: "stage_accounting",
+    at: nowIso(),
+  };
+  try {
+    await appendEvent(runDir, event, deps);
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: emitStageAccounting failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // finalizeRun
 // ---------------------------------------------------------------------------
 
@@ -374,16 +404,20 @@ export async function finalizeRun(
   };
   await appendEvent(runDir, completeEvent, deps);
 
-  // Collect human_intervention events from events.jsonl to embed in summary.json.
-  // Non-fatal: if the read fails, interventions is an empty array.
+  // Collect additive event-derived records from events.jsonl to embed in
+  // summary.json. Non-fatal: if the read fails, arrays stay empty.
   let interventions: HumanInterventionEvent[] = [];
+  let accountingRecords: StageAccountingRecord[] = [];
   try {
     const eventsForSummary = await readEvents(runDir, deps);
     interventions = eventsForSummary.filter(
       (e): e is HumanInterventionEvent => e.type === "human_intervention",
     );
+    accountingRecords = eventsForSummary
+      .filter((e): e is StageAccountingEvent => e.type === "stage_accounting")
+      .map((e) => sanitizeStageAccountingRecord(e));
   } catch {
-    // Non-fatal: missing or unreadable events.jsonl → empty array
+    // Non-fatal: missing or unreadable events.jsonl → empty arrays
   }
 
   // Serialize bundle — same sanitization as evidence-bundle.ts writeBundle.
@@ -396,6 +430,7 @@ export async function finalizeRun(
     schema_version: RUN_SCHEMA_VERSION,
     run_id: fileRunId,
     interventions,
+    accounting: accountingSummary(accountingRecords),
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
