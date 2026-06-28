@@ -882,9 +882,20 @@ async function invokePromptHarnessReview(
       makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", cfg.harnesses.reviewer, prompt),
     ).catch(() => {});
   }
+  const model = opts.model ?? cfg.models.review;
   return invokeReviewer(cfg.harnesses.reviewer, cfg.harnesses.implementer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
-    model: opts.model ?? cfg.models.review,
+    model,
+    accounting: opts.runDir
+      ? {
+          runDir: opts.runDir,
+          runStoreDeps: opts.runStoreDeps,
+          issue: issueNumber,
+          stage: `review-${round}`,
+          modelSlot: "review",
+          model,
+        }
+      : undefined,
   });
 }
 

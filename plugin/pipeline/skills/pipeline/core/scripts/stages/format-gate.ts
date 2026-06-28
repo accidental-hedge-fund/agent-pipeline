@@ -11,6 +11,7 @@ import { gitInWorktree } from "../worktree.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import type { TestGateResult } from "../testgate.ts";
 import type { PipelineConfig, Stage } from "../types.ts";
+import type { RunStoreDeps } from "../run-store.ts";
 
 export type FormatGateResult =
   | { status: "ok"; committed: boolean }
@@ -149,6 +150,8 @@ export async function runFormatAndTestGates(
   pipelineRunId: string,
   stateDir: string | undefined,
   deps: FormatTestGateDeps = {},
+  runDir?: string,
+  runStoreDeps?: RunStoreDeps,
 ): Promise<FormatTestGateResult> {
   const fmt = deps.runFormatGate ?? runFormatGate;
   const test = deps.runTestGate ?? runTestGate;
@@ -161,7 +164,7 @@ export async function runFormatAndTestGates(
       return { ok: false, reason: fmtResult.reason, source: "format" };
     }
 
-    gate = await test(cfg, issueNumber, wtPath, {}, pipelineRunId, stage, stateDir);
+    gate = await test(cfg, issueNumber, wtPath, {}, pipelineRunId, stage, stateDir, runDir, runStoreDeps);
     if (!gate.skipped && !gate.passed) {
       return { ok: false, reason: testGateBlockReason(gate), source: "test" };
     }

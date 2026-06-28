@@ -8,6 +8,7 @@
 // only the remaining budget, so total wall-time never exceeds `timeout` seconds.
 // The command is run through `sh -c` so normal shell syntax works.
 
+import * as path from "node:path";
 import {
   getOnDiskForIssue as defaultGetForIssue,
 } from "../worktree.ts";
@@ -21,6 +22,8 @@ import { runCapped } from "../harness.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { buildStageAccountingRecord } from "../accounting.ts";
+import { emitStageAccounting } from "../run-store.ts";
 
 /** Next stage after eval-gate: shipcheck-gate when opted in, else ready-to-deploy. */
 function nextAfterEval(cfg: PipelineConfig): Stage {
@@ -202,6 +205,7 @@ export async function advanceEval(
           makeCommandRecord(cfg.eval_gate.command, 1, 0, lastResult.output),
         ).catch(() => {});
       }
+      await recordEvalAccounting(opts, issueNumber, cfg.eval_gate.command, lastResult, new Date(), new Date());
       break;
     }
 
@@ -210,7 +214,9 @@ export async function advanceEval(
     } else {
       console.log(`[pipeline] #${issueNumber}: eval-gate running \`${cfg.eval_gate.command}\``);
     }
+    const startedAt = new Date();
     lastResult = await runFn(cfg.eval_gate.command, wt.path, remainingSec);
+    const endedAt = new Date();
 
     // Record each attempt immediately so retries are not collapsed into one record.
     if (opts.stateDir) {
@@ -226,6 +232,7 @@ export async function advanceEval(
         ),
       ).catch(() => {});
     }
+    await recordEvalAccounting(opts, issueNumber, cfg.eval_gate.command, lastResult, startedAt, endedAt);
 
     if (lastResult.passed) break;
   }
@@ -333,6 +340,41 @@ function buildEvalComment(opts: {
     "---",
     "*Automated by Claude Code Pipeline Skill*",
   ].join("\n");
+}
+
+async function recordEvalAccounting(
+  opts: AdvanceEvalOpts,
+  issueNumber: number,
+  command: string,
+  result: EvalRunResult,
+  startedAt: Date,
+  endedAt: Date,
+): Promise<void> {
+  if (!opts.runDir) return;
+  await emitStageAccounting(
+    opts.runDir,
+    buildStageAccountingRecord({
+      runId: path.basename(opts.runDir),
+      issue: issueNumber,
+      stage: "eval-gate",
+      harness: "eval-gate",
+      modelSlot: null,
+      model: null,
+      startedAt: startedAt.toISOString(),
+      endedAt: endedAt.toISOString(),
+      durationMs: result.durationSec * 1000,
+      commandCount: 1,
+      subprocessCount: 1,
+      outcome: result.passed ? "success" : result.timedOut ? "timeout" : result.spawnError ? "spawn_error" : "failure",
+      blockerKind: result.passed
+        ? null
+        : result.timedOut || result.spawnError
+          ? "harness-failure"
+          : "eval-gate-failed",
+      usage: { command },
+    }),
+    opts.runStoreDeps,
+  ).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------

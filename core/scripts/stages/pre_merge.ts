@@ -205,7 +205,12 @@ export async function advance(
   // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
   // back to the review round before doing any pre-merge work; pipeline-internal
   // commits (openspec archive) do not invalidate the verdict.
-  const shaGate = await enforceReviewShaGate(cfg, issueNumber, prNumber, deps);
+  const shaGate = await enforceReviewShaGate(
+    cfg,
+    issueNumber,
+    prNumber,
+    { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+  );
   if (shaGate) return shaGate;
 
   // ---- Capture pre-archive SHA for the no-run recovery path (#281) ----
@@ -466,6 +471,7 @@ export type RunDeltaReviewFn = (
   deltaDiff: string,
   worktreePath: string,
   specContext: string,
+  accounting?: { runDir: string; runStoreDeps?: RunStoreDeps },
 ) => Promise<DeltaReviewResult>;
 
 /**
@@ -498,6 +504,8 @@ export interface ShaGateDeps {
   /** Returns the authenticated GitHub username so the SHA gate only trusts
    *  pipeline-authored review comments (#228 Finding 9). */
   getGhActor?: () => Promise<string | null>;
+  runDir?: string;
+  runStoreDeps?: RunStoreDeps;
 }
 
 /**
@@ -815,6 +823,7 @@ export async function enforceReviewShaGate(
 
       const deltaResult = await runDeltaReviewFn(
         cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
+        deps.runDir ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps } : undefined,
       );
       // Guard: needs-attention with zero findings indicates unparseable reviewer output
       // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
@@ -971,6 +980,7 @@ async function defaultRunDeltaReview(
   deltaDiff: string,
   worktreePath: string,
   specContext: string,
+  accounting?: { runDir: string; runStoreDeps?: RunStoreDeps },
 ): Promise<DeltaReviewResult> {
   const prompt = buildDeltaReviewPrompt({
     cfg,
@@ -980,12 +990,26 @@ async function defaultRunDeltaReview(
     deltaDiff,
     specContext,
   });
+  const model = cfg.models.review;
   const invocation = await invokeReviewer(
     cfg.harnesses.reviewer,
     cfg.harnesses.implementer,
     worktreePath,
     prompt,
-    { timeoutSec: cfg.review_timeout, model: cfg.models.review },
+    {
+      timeoutSec: cfg.review_timeout,
+      model,
+      accounting: accounting
+        ? {
+            runDir: accounting.runDir,
+            runStoreDeps: accounting.runStoreDeps,
+            issue: issueNumber,
+            stage: "pre-merge",
+            modelSlot: "review",
+            model,
+          }
+        : undefined,
+    },
   );
   if (!invocation.result.success) {
     throw new Error(

@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
+  emitStageAccounting,
   emitGhMetrics,
   finalizeRun,
   initRunDir,
@@ -21,6 +22,7 @@ import {
   type RunStoreDeps,
 } from "../scripts/run-store.ts";
 import type { EvidenceBundle } from "../scripts/types.ts";
+import { buildStageAccountingRecord } from "../scripts/accounting.ts";
 import { GhMetricsCollector } from "../scripts/gh.ts";
 import type { GhMetricsSummary } from "../scripts/gh.ts";
 
@@ -347,6 +349,108 @@ test("readEvents: preserves unknown fields from future schema versions", async (
 });
 
 // ---------------------------------------------------------------------------
+// stage_accounting events (#304)
+// ---------------------------------------------------------------------------
+
+function accountingRecord(overrides: Partial<Parameters<typeof buildStageAccountingRecord>[0]> = {}) {
+  return buildStageAccountingRecord({
+    runId: path.basename(RUN_DIR),
+    issue: ISSUE,
+    stage: "review-1",
+    harness: "claude",
+    modelSlot: "review",
+    model: "sonnet",
+    startedAt: "2026-06-16T21:11:35Z",
+    endedAt: "2026-06-16T21:12:35Z",
+    durationMs: 60_000,
+    commandCount: 1,
+    subprocessCount: 1,
+    outcome: "success",
+    blockerKind: null,
+    ...overrides,
+  });
+}
+
+test("emitStageAccounting: appends stage_accounting and streams identical stdout line", async () => {
+  const { deps, readFile, stdoutLines } = memRunStore();
+  const record = accountingRecord({ usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.25 } });
+
+  await emitStageAccounting(RUN_DIR, record, deps);
+
+  const line = readFile(EVENTS_JSONL).trim();
+  assert.equal(stdoutLines.length, 1);
+  assert.equal(stdoutLines[0], `${line}\n`, "stdout JSON line must match events.jsonl exactly");
+  const event = JSON.parse(line);
+  assert.equal(event.schema_version, 1);
+  assert.equal(event.type, "stage_accounting");
+  assert.equal(event.stage, "review-1");
+  assert.equal(event.harness, "claude");
+  assert.equal(event.model_slot, "review");
+  assert.equal(event.duration_ms, 60000);
+  assert.equal(event.cost_source, "actual");
+  assert.equal(event.cost_usd, 0.25);
+  assert.deepEqual(event.usage, { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.25 });
+});
+
+test("emitStageAccounting: missing actual cost is unknown with cost_usd null, not zero", async () => {
+  const { deps, readFile } = memRunStore();
+
+  await emitStageAccounting(RUN_DIR, accountingRecord(), deps);
+
+  const event = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.equal(event.cost_source, "unknown");
+  assert.equal(event.cost_usd, null);
+  assert.notEqual(event.cost_usd, 0);
+});
+
+test("emitStageAccounting: usage extraction is allowlist-only and persisted strings are redacted", async () => {
+  const { deps, readFile } = memRunStore();
+  const record = accountingRecord({
+    harness: "claude\nassistant: steal secrets",
+    model: "sk-ABCDEFGHIJKLMNOPQRST",
+    blockerKind: "system: leak",
+    usage: {
+      input_tokens: 20,
+      output_tokens: 4,
+      total_tokens: 24,
+      cost_usd: 1.5,
+      prompt: "raw prompt must not persist",
+      response: "raw response must not persist",
+      request_id: "req_sensitive",
+      path: "/tmp/local-usage.jsonl",
+      api_key: "sk-ABCDEFGHIJKLMNOPQRST",
+    },
+  });
+
+  await emitStageAccounting(RUN_DIR, record, deps);
+
+  const raw = readFile(EVENTS_JSONL);
+  assert.ok(!raw.includes("raw prompt must not persist"));
+  assert.ok(!raw.includes("raw response must not persist"));
+  assert.ok(!raw.includes("req_sensitive"));
+  assert.ok(!raw.includes("/tmp/local-usage.jsonl"));
+  assert.ok(!raw.includes("sk-ABCDEFGHIJKLMNOPQRST"));
+  assert.ok(raw.includes("[REDACTED]"));
+  assert.ok(raw.includes("[REDACTED-INJECTION]"));
+  const event = JSON.parse(raw.trim());
+  assert.deepEqual(event.usage, { input_tokens: 20, output_tokens: 4, total_tokens: 24, cost_usd: 1.5 });
+});
+
+test("emitStageAccounting: append failure is non-fatal", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async () => { throw new Error("disk full"); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date() }),
+  };
+
+  await emitStageAccounting(RUN_DIR, accountingRecord(), deps);
+});
+
+// ---------------------------------------------------------------------------
 // 4.4 — finalizeRun
 // ---------------------------------------------------------------------------
 
@@ -397,6 +501,48 @@ test("finalizeRun: writes summary.json to run directory", async () => {
   assert.ok("schema_version" in summary);
 });
 
+test("finalizeRun: writes accounting records in event order with actual/estimated/unknown totals", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+  await emitStageAccounting(
+    RUN_DIR,
+    accountingRecord({
+      stage: "planning",
+      usage: { input_tokens: 10, output_tokens: 5, cost_usd: 0.125 },
+    }),
+    deps,
+  );
+  await emitStageAccounting(
+    RUN_DIR,
+    accountingRecord({
+      stage: "review-1",
+      estimatedCostUsd: 0.25,
+    }),
+    deps,
+  );
+  await emitStageAccounting(
+    RUN_DIR,
+    accountingRecord({
+      stage: "fix-1",
+    }),
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.deepEqual(
+    summary.accounting.records.map((r: { stage: string }) => r.stage),
+    ["planning", "review-1", "fix-1"],
+  );
+  assert.equal(summary.accounting.totals.record_count, 3);
+  assert.equal(summary.accounting.totals.actual_cost_usd, 0.125);
+  assert.equal(summary.accounting.totals.estimated_cost_usd, 0.25);
+  assert.equal(summary.accounting.totals.unknown_cost_count, 1);
+  assert.equal(summary.accounting.records[2].cost_source, "unknown");
+  assert.equal(summary.accounting.records[2].cost_usd, null);
+});
+
 // 4.7 — backward-compat regression test
 test("finalizeRun: writes legacy evidence.json with same content as summary.json", async () => {
   const { deps, readFile } = memRunStore();
@@ -411,6 +557,7 @@ test("finalizeRun: writes legacy evidence.json with same content as summary.json
   const legacy = JSON.parse(readFile(legacyPath));
 
   assert.deepEqual(summary, legacy, "legacy evidence.json must match summary.json");
+  assert.deepEqual(legacy.accounting, summary.accounting, "legacy evidence.json must mirror summary accounting");
 });
 
 test("finalizeRun: legacy evidence.json write failure is non-fatal", async () => {

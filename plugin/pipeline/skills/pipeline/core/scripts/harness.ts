@@ -14,6 +14,9 @@
 // Captured stdout/stderr is capped at MAX_OUTPUT to bound memory.
 
 import { spawn } from "node:child_process";
+import * as path from "node:path";
+import { buildStageAccountingRecord } from "./accounting.ts";
+import { emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness } from "./types.ts";
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
@@ -71,6 +74,18 @@ export interface InvokeOptions {
    * Silently ignored for claude and custom reviewer CLIs.
    */
   reasoningEffort?: string;
+  accounting?: {
+    runDir: string;
+    runStoreDeps?: RunStoreDeps;
+    issue: number;
+    stage: string;
+    modelSlot?: string | null;
+    model?: string | null;
+    commandCount?: number;
+    subprocessCount?: number;
+    usage?: unknown;
+    estimatedCostUsd?: number | null;
+  };
 }
 
 export async function invoke(
@@ -112,7 +127,34 @@ export async function invoke(
     custom = true;
   }
 
+  const startedAt = new Date();
   const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness, { killProcessGroup: true });
+  const endedAt = new Date();
+  if (opts.accounting) {
+    const model = opts.accounting.model ?? opts.model ?? null;
+    const record = buildStageAccountingRecord({
+      runId: path.basename(opts.accounting.runDir),
+      issue: opts.accounting.issue,
+      stage: opts.accounting.stage,
+      harness,
+      modelSlot: opts.accounting.modelSlot ?? null,
+      model,
+      startedAt: startedAt.toISOString(),
+      endedAt: endedAt.toISOString(),
+      durationMs: result.duration * 1000,
+      commandCount: opts.accounting.commandCount ?? 1,
+      subprocessCount: opts.accounting.subprocessCount ?? 1,
+      outcome: harnessOutcome(result),
+      blockerKind: result.success ? null : "harness-failure",
+      usage: opts.accounting.usage,
+      estimatedCostUsd: opts.accounting.estimatedCostUsd,
+    });
+    await emitStageAccounting(
+      opts.accounting.runDir,
+      record,
+      opts.accounting.runStoreDeps,
+    ).catch(() => {});
+  }
   // When a configured reviewer CLI cannot be spawned at all (ENOENT / not
   // executable), surface a specific, actionable message that names the CLI —
   // never a bare "Unknown harness". The `spawn_error` flag is preserved so the
@@ -126,6 +168,13 @@ export async function invoke(
     };
   }
   return result;
+}
+
+function harnessOutcome(result: HarnessResult): string {
+  if (result.success) return "success";
+  if (result.timed_out) return "timeout";
+  if (result.spawn_error) return "spawn_error";
+  return "failure";
 }
 
 export async function runCapped(

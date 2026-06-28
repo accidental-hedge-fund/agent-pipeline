@@ -597,6 +597,53 @@ export interface ReviewRecord {
   selfReview?: boolean;
 }
 
+export type StageAccountingCostSource = "actual" | "estimated" | "unknown";
+
+export interface StageAccountingUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  cost_usd?: number | null;
+}
+
+/** Stage-level cost/accounting observation. Observational only: routing code
+ *  must not read these records to decide labels, stages, reviewers, or merges. */
+export interface StageAccountingRecord {
+  schema_version: number;
+  run_id: string;
+  issue: number;
+  stage: string;
+  harness: string;
+  model_slot: string | null;
+  model: string | null;
+  started_at: string;
+  ended_at: string | null;
+  duration_ms: number;
+  command_count: number;
+  subprocess_count: number;
+  outcome: string;
+  blocker_kind: string | null;
+  cost_source: StageAccountingCostSource;
+  cost_usd: number | null;
+  usage?: StageAccountingUsage;
+}
+
+export interface StageAccountingTotals {
+  record_count: number;
+  actual_cost_usd: number;
+  estimated_cost_usd: number;
+  unknown_cost_count: number;
+}
+
+export interface StageAccountingSummary {
+  records: StageAccountingRecord[];
+  totals: StageAccountingTotals;
+}
+
 /** An operator `--override` disposition applied during the run. */
 export interface OverrideRecord {
   key: string;
@@ -637,6 +684,9 @@ export interface EvidenceBundle {
    *  order. Populated by `finalizeRun` from `events.jsonl`. Additive and
    *  optional: consumers that do not recognize this field SHALL ignore it. */
   interventions?: import("./intervention.ts").HumanInterventionEvent[];
+  /** Finalized stage accounting copied from `stage_accounting` events by
+   *  `finalizeRun`. Additive and optional for older bundles. */
+  accounting?: StageAccountingSummary;
 }
 
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry

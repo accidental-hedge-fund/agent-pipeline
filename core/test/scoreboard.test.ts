@@ -412,6 +412,154 @@ test("buildScoreboardReport: missing cost estimate makes cost per ready PR unava
   assert.ok(report.diagnostics.some((d) => d.code === "missing_cost_estimate" && d.message.includes("claude")));
 });
 
+test("buildScoreboardReport: groups summary accounting by issue stage harness model slot model and outcome (#304)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "304-2026-06-15T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-15T00:00:00Z", issue: 304 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-15T00:00:00Z", issue: 304, repo: "owner/repo" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-15T00:10:00Z", final_state: "ready-to-deploy", elapsed_ms: 600000 },
+    ],
+    summary: {
+      issue: 304,
+      pr: 304,
+      finalState: "ready-to-deploy",
+      stages: [],
+      reviews: [],
+      overrides: [],
+      recoveries: [],
+      accounting: {
+        records: [
+          {
+            schema_version: 1,
+            run_id: "304-2026-06-15T00-00-00-000Z",
+            issue: 304,
+            stage: "review-1",
+            harness: "claude",
+            model_slot: "review",
+            model: "opus",
+            started_at: "2026-06-15T00:01:00Z",
+            ended_at: "2026-06-15T00:02:00Z",
+            duration_ms: 60000,
+            command_count: 1,
+            subprocess_count: 1,
+            outcome: "success",
+            blocker_kind: null,
+            cost_source: "actual",
+            cost_usd: 1.25,
+          },
+          {
+            schema_version: 1,
+            run_id: "304-2026-06-15T00-00-00-000Z",
+            issue: 304,
+            stage: "review-1",
+            harness: "claude",
+            model_slot: "review",
+            model: "opus",
+            started_at: "2026-06-15T00:02:00Z",
+            ended_at: "2026-06-15T00:03:00Z",
+            duration_ms: 30000,
+            command_count: 2,
+            subprocess_count: 2,
+            outcome: "success",
+            blocker_kind: null,
+            cost_source: "estimated",
+            cost_usd: 0.75,
+          },
+          {
+            schema_version: 1,
+            run_id: "304-2026-06-15T00-00-00-000Z",
+            issue: 304,
+            stage: "fix-1",
+            harness: "codex",
+            model_slot: "fix",
+            model: "sonnet",
+            started_at: "2026-06-15T00:03:00Z",
+            ended_at: "2026-06-15T00:04:00Z",
+            duration_ms: 45000,
+            command_count: 1,
+            subprocess_count: 1,
+            outcome: "failure",
+            blocker_kind: "harness-failure",
+            cost_source: "unknown",
+            cost_usd: null,
+          },
+        ],
+      },
+    },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+
+  assert.equal(report.metrics.cost_accounting.totals.invocation_count, 3);
+  assert.equal(report.metrics.cost_accounting.totals.total_duration_ms, 135000);
+  assert.equal(report.metrics.cost_accounting.totals.command_count, 4);
+  assert.equal(report.metrics.cost_accounting.totals.subprocess_count, 4);
+  assert.equal(report.metrics.cost_accounting.totals.actual_cost_usd, 1.25);
+  assert.equal(report.metrics.cost_accounting.totals.estimated_cost_usd, 0.75);
+  assert.equal(report.metrics.cost_accounting.totals.unknown_cost_count, 1);
+
+  const reviewGroup = report.metrics.cost_accounting.groups.find((g) => g.stage === "review-1");
+  assert.ok(reviewGroup, "expected review accounting group");
+  assert.equal(reviewGroup.invocation_count, 2);
+  assert.equal(reviewGroup.actual_cost_usd, 1.25);
+  assert.equal(reviewGroup.estimated_cost_usd, 0.75);
+  assert.equal(reviewGroup.unknown_cost_count, 0);
+
+  const fixGroup = report.metrics.cost_accounting.groups.find((g) => g.stage === "fix-1");
+  assert.ok(fixGroup, "expected fix accounting group");
+  assert.equal(fixGroup.unknown_cost_count, 1);
+  assert.equal(fixGroup.actual_cost_usd, 0);
+  assert.equal(fixGroup.estimated_cost_usd, 0);
+  assert.ok(report.diagnostics.some((d) => d.code === "unknown_accounting_cost" && d.message.includes("not counted as free")));
+});
+
+test("buildScoreboardReport: missing or corrupt summary falls back to stage_accounting events (#304)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "304-2026-06-16T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-16T00:00:00Z", issue: 304 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-16T00:00:00Z", issue: 304, repo: "owner/repo" },
+      {
+        schema_version: 1,
+        type: "stage_accounting",
+        at: "2026-06-16T00:01:00Z",
+        run_id: "304-2026-06-16T00-00-00-000Z",
+        issue: 304,
+        stage: "planning",
+        harness: "codex",
+        model_slot: "planning",
+        model: "sonnet",
+        started_at: "2026-06-16T00:00:10Z",
+        ended_at: "2026-06-16T00:00:40Z",
+        duration_ms: 30000,
+        command_count: 1,
+        subprocess_count: 1,
+        outcome: "success",
+        blocker_kind: null,
+        cost_source: "unknown",
+        cost_usd: null,
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-16T00:10:00Z", final_state: "ready-to-deploy", elapsed_ms: 600000, pr: 304 },
+    ],
+    summaryRaw: "{not-json",
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+
+  assert.equal(report.metrics.cost_accounting.groups.length, 1);
+  assert.equal(report.metrics.cost_accounting.groups[0].stage, "planning");
+  assert.equal(report.metrics.cost_accounting.groups[0].unknown_cost_count, 1);
+  assert.ok(report.diagnostics.some((d) => d.code === "corrupt_summary"));
+  assert.ok(report.diagnostics.some((d) => d.code === "unknown_accounting_cost"));
+});
+
 test("parseEstimateCosts: rejects malformed estimates (#301)", () => {
   assert.deepEqual(parseEstimateCosts(["codex=0.75", "claude=1"]), { codex: 0.75, claude: 1 });
   assert.throws(() => parseEstimateCosts(["codex"]), /--estimate-cost/);
@@ -430,6 +578,7 @@ test("formatScoreboardHuman: contains every required metric heading (#301)", asy
     "Successful PRs:",
     "Ready-to-deploy without human intervention:",
     "Cost per ready PR:",
+    "Cost/accounting by group:",
     "Full-run wall-clock duration:",
     "Stage wall-clock duration:",
     "Harness calls per successful PR:",
@@ -462,6 +611,7 @@ test("CLI: pipeline scoreboard --json emits exactly one parseable object without
     assert.ok(parsed.window);
     assert.ok(parsed.totals);
     assert.ok(parsed.metrics);
+    assert.ok(Array.isArray(parsed.metrics.cost_accounting.groups));
     assert.ok(Array.isArray(parsed.diagnostics));
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
@@ -480,6 +630,7 @@ test("CLI: pipeline scoreboard human output includes required headings without g
     assert.match(result.stdout, /Report window:/);
     assert.match(result.stdout, /Ready-to-deploy without human intervention:/);
     assert.match(result.stdout, /Cost per ready PR:/);
+    assert.match(result.stdout, /Cost\/accounting by group:/);
     assert.match(result.stdout, /Shipcheck pass rate:/);
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });

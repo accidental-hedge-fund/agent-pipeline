@@ -21,7 +21,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { invoke, formatStderrExcerpt, type HarnessResult } from "../harness.ts";
+import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
   branchName,
@@ -228,6 +228,7 @@ export interface PlanningPhaseHooks {
     cfg: PipelineConfig,
     opts: AdvanceOpts,
     deps: RunPlanningPhasesDeps,
+    issueNumber?: number,
   ): Promise<HarnessResult>;
 }
 
@@ -355,6 +356,7 @@ export async function runPlanningPhases(
         timeoutSec: cfg.plan_review_timeout,
         model: opts.model ?? cfg.models.review,
         reasoningEffort: "medium",
+        accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", opts.model ?? cfg.models.review),
       });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
@@ -386,8 +388,8 @@ export async function runPlanningPhases(
 
     const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
     const revisionResult = hooks.invokeRevision
-      ? await hooks.invokeRevision(primary, wt, revisionPrompt, cfg, opts, deps)
-      : await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts, { invoke: deps.invoke });
+      ? await hooks.invokeRevision(primary, wt, revisionPrompt, cfg, opts, deps, issueNumber)
+      : await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "plan-review" });
     if (!revisionResult.success || !revisionResult.stdout.trim()) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
@@ -444,7 +446,7 @@ export async function runPlanningPhases(
   const implHeadBefore = (
     await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
-  const result = await invokeImplementer(primary, wt.path, implPrompt, cfg, opts, { invoke: deps.invoke });
+  const result = await invokeImplementer(primary, wt.path, implPrompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "implementing" });
 
   if (!result.success) {
     const reason = result.timed_out
@@ -605,7 +607,7 @@ export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, bo
       const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward });
       let planResult: HarnessResult;
       try {
-        planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke });
+        planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "planning" });
       } catch (err) {
         const e = err as Error;
         return { ok: false, reason: `Plan generation failed: ${e.message}`, tag: "harness-failure" };
@@ -729,14 +731,16 @@ export function makeOpenspecPlanningHooks(
       ).stdout.trim();
 
       const inv = deps.invoke ?? invoke;
+      const planModel = opts.model ?? innerCfg.models.planning;
       const planResult = await inv(
         primary,
         wt.path,
         buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, pipelineRunId }),
         {
           timeoutSec: innerCfg.implementation_timeout,
-          model: opts.model ?? innerCfg.models.planning,
+          model: planModel,
           sandbox: innerCfg.harness_sandbox,
+          accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
         },
       );
       if (!planResult.success) {
@@ -883,12 +887,15 @@ export function makeOpenspecPlanningHooks(
     // OpenSpec change files (proposal.md, spec deltas, tasks.md) in wt.path.
     // Freeform does not implement this hook and falls back to invokePlanStep,
     // which uses cfg.repo_dir for non-sandboxed runs.
-    async invokeRevision(primary, wt, prompt, innerCfg, opts, deps) {
+    async invokeRevision(primary, wt, prompt, innerCfg, opts, deps, issueNumber) {
       const inv = deps.invoke ?? invoke;
       return inv(primary, wt.path, prompt, {
         timeoutSec: innerCfg.implementation_timeout,
         model: opts.model ?? innerCfg.models.planning,
         sandbox: innerCfg.harness_sandbox,
+        accounting: issueNumber === undefined
+          ? undefined
+          : accountingForInvoke(opts, issueNumber, "plan-review", "planning", opts.model ?? innerCfg.models.planning),
       });
     },
   };
@@ -990,6 +997,7 @@ export async function resumeFromImplementing(
   const gates = await runFormatAndTestGates(
     cfg, issueNumber, wt.path, "planning", opts.pipelineRunId, opts.stateDir,
     { runFormatGate: fmtGateFn, runTestGate: gateRunner },
+    opts.runDir, opts.runStoreDeps,
   );
   if (!gates.ok) {
     await blocker(
@@ -1165,6 +1173,11 @@ export interface ImplementerInvokeDeps {
   invoke?: typeof invoke;
 }
 
+interface InvokeAccountingStage {
+  issue: number;
+  stage: string;
+}
+
 /**
  * Invoke the implementer harness for the implementation step. The model is
  * resolved as `opts.model ?? cfg.models.implementing` — the per-repo
@@ -1180,12 +1193,17 @@ export async function invokeImplementer(
   cfg: PipelineConfig,
   opts: AdvanceOpts,
   deps: ImplementerInvokeDeps = {},
+  accounting?: InvokeAccountingStage,
 ): Promise<HarnessResult> {
   const inv = deps.invoke ?? invoke;
+  const model = opts.model ?? cfg.models.implementing;
   return inv(harness, wtPath, prompt, {
     timeoutSec: cfg.implementation_timeout,
-    model: opts.model ?? cfg.models.implementing,
+    model,
     sandbox: cfg.harness_sandbox,
+    accounting: accounting
+      ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
+      : undefined,
   });
 }
 
@@ -1215,14 +1233,37 @@ export async function invokePlanStep(
   cfg: PipelineConfig,
   opts: AdvanceOpts,
   deps: PlanStepDeps = {},
+  accounting?: InvokeAccountingStage,
 ): Promise<HarnessResult> {
   const inv = deps.invoke ?? invoke;
   const dir = (cfg.harness_sandbox && harness === "claude") ? wtPath : cfg.repo_dir;
+  const model = opts.model ?? cfg.models.planning;
   return inv(harness, dir, prompt, {
     timeoutSec: cfg.implementation_timeout,
-    model: opts.model ?? cfg.models.planning,
+    model,
     sandbox: cfg.harness_sandbox,
+    accounting: accounting
+      ? accountingForInvoke(opts, accounting.issue, accounting.stage, "planning", model)
+      : undefined,
   });
+}
+
+function accountingForInvoke(
+  opts: AdvanceOpts,
+  issue: number,
+  stage: string,
+  modelSlot: string,
+  model: string | null,
+): InvokeOptions["accounting"] | undefined {
+  if (!opts.runDir) return undefined;
+  return {
+    runDir: opts.runDir,
+    runStoreDeps: opts.runStoreDeps,
+    issue,
+    stage,
+    modelSlot,
+    model,
+  };
 }
 
 // ---------------------------------------------------------------------------

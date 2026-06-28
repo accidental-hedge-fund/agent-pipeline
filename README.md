@@ -434,7 +434,7 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Scoreboard sub-command
 
-`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
 
 ```bash
 /pipeline scoreboard
@@ -446,7 +446,7 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 When no window flags are supplied, the window is the last 30 days ending at command start. `--since`, `--until`, and `--days` select the reporting window. `--json` emits exactly one unfenced JSON object with `schema_version`, `window`, `totals`, `metrics`, and `diagnostics`; the human report prints the same metric headings plus diagnostics when present.
 
-Cost metrics use recorded `cost_usd` or `usage.cost_usd` values when present. For harness calls without actual cost, pass repeatable `--estimate-cost <harness>=<usd-per-call>` values. Actual cost wins over estimates. If a successful PR has a recorded harness call with neither actual nor estimated cost, `cost_per_ready_pr_usd.value` is `null` and diagnostics name the missing harness estimate instead of silently using zero.
+Cost metrics use recorded `cost_usd` or `usage.cost_usd` values when present. For harness calls without actual cost, pass repeatable `--estimate-cost <harness>=<usd-per-call>` values. Actual cost wins over estimates. If a successful PR has a recorded harness call with neither actual nor estimated cost, `cost_per_ready_pr_usd.value` is `null` and diagnostics name the missing harness estimate instead of silently using zero. Stage accounting records also distinguish `actual`, `estimated`, and `unknown` costs; unknown-cost invocations are counted explicitly and are not treated as free.
 
 Historical artifact problems are reported as diagnostics, not crashes: missing run stores, missing/corrupt `summary.json`, missing/corrupt `run.json`, missing `events.jsonl`, partial final event lines, missing start times, and ready runs without PR numbers all surface with stable reason codes and file paths.
 
@@ -785,9 +785,9 @@ Every run writes a **run directory** under `.agent-pipeline/runs/<run-id>/` in t
 | File | Written | Contents |
 |------|---------|----------|
 | `run.json` | At startup | Immutable identity: `schema_version`, `run_id`, `issue`, `repo`, `profile`, `started_at` |
-| `events.jsonl` | Incrementally | Append-only event log — one JSON object per line; each has `schema_version`, `type`, `at`. Event types: `run_start`, `run_complete`, `stage_start`, `stage_complete` (with `outcome` and `commits`), `pr_created`, `pr_updated`, `worktree_created`, `review_verdict` (with `round`, `sha`, `verdict`, `finding_counts`). |
+| `events.jsonl` | Incrementally | Append-only event log — one JSON object per line; each has `schema_version`, `type`, `at`. Event types: `run_start`, `run_complete`, `stage_start`, `stage_complete` (with `outcome` and `commits`), `stage_accounting` (sanitized stage/harness/model/timing/count/cost fields), `pr_created`, `pr_updated`, `worktree_created`, `review_verdict` (with `round`, `sha`, `verdict`, `finding_counts`). |
 | `terminal.log` | Incrementally | Raw combined stdout/stderr of the pipeline run, identical to what appears in the terminal. |
-| `summary.json` | At finalization | Full evidence bundle: all stage records, review verdicts, overrides, recovery events, and `final_state`. Absent for crashed runs; treat a missing `summary.json` as in-progress or crashed. |
+| `summary.json` | At finalization | Full evidence bundle: all stage records, review verdicts, overrides, recovery events, finalized `accounting.records` and `accounting.totals`, and `final_state`. Absent for crashed runs; treat a missing `summary.json` as in-progress or crashed. |
 
 The `run_id` field in `summary.json` matches the directory name so the two can be joined by a single stable identifier.
 

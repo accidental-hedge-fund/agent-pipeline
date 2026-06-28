@@ -56,9 +56,34 @@ export interface CostMetric {
   missing_call_count: number;
 }
 
+export interface CostAccountingTotals {
+  invocation_count: number;
+  total_duration_ms: number;
+  command_count: number;
+  subprocess_count: number;
+  actual_cost_usd: number;
+  estimated_cost_usd: number;
+  unknown_cost_count: number;
+}
+
+export interface CostAccountingGroup extends CostAccountingTotals {
+  issue: number;
+  stage: string;
+  harness: string;
+  model_slot: string;
+  model: string;
+  outcome: string;
+}
+
+export interface CostAccountingMetric {
+  totals: CostAccountingTotals;
+  groups: CostAccountingGroup[];
+}
+
 export interface ScoreboardMetrics {
   ready_to_deploy_without_human_intervention: RateValue;
   cost_per_ready_pr_usd: CostMetric;
+  cost_accounting: CostAccountingMetric;
   full_run_duration_ms: DurationAggregate;
   stage_duration_ms: Record<string, DurationAggregate>;
   harness_calls_per_successful_pr: RateValue;
@@ -143,6 +168,12 @@ interface HarnessCall {
   harness: string;
   record: JsonRecord;
   path: string;
+}
+
+interface AccountingRecordRef {
+  record: JsonRecord;
+  path: string;
+  index: number;
 }
 
 interface PrGroup {
@@ -460,6 +491,7 @@ function aggregateRuns(
   let needsHuman = 0;
   let reviewRounds = 0;
   let sameHarnessFallbacks = 0;
+  const costAccounting = aggregateCostAccounting(scan.runs, diagnostics);
 
   for (const run of scan.runs) {
     const fullDuration = fullRunDurationMs(run);
@@ -587,6 +619,7 @@ function aggregateRuns(
       estimated_call_count: cost.estimatedCalls,
       missing_call_count: cost.missingCalls,
     },
+    cost_accounting: costAccounting,
     full_run_duration_ms: fullRunDuration.value(),
     stage_duration_ms: stageDurationMetrics,
     harness_calls_per_successful_pr: rate(harnessCalls, successfulPrs),
@@ -617,6 +650,170 @@ function aggregateRuns(
     },
     metrics,
     diagnostics,
+  };
+}
+
+function aggregateCostAccounting(
+  runs: IncludedRun[],
+  diagnostics: ScoreboardDiagnostic[],
+): CostAccountingMetric {
+  const groups = new Map<string, CostAccountingGroup>();
+  const totals = newCostAccountingTotals();
+  const unknownCostKeys = new Set<string>();
+
+  for (const run of runs) {
+    for (const ref of collectAccountingRecords(run)) {
+      const normalized = normalizeAccountingRecord(ref.record, run);
+      if (!normalized) {
+        diagnostics.push({
+          severity: "warning",
+          code: "invalid_accounting_record",
+          path: ref.path,
+          message: `Stage accounting record ${ref.index} in run ${run.runId} is missing required grouping fields.`,
+        });
+        continue;
+      }
+      const key = [
+        normalized.issue,
+        normalized.stage,
+        normalized.harness,
+        normalized.model_slot,
+        normalized.model,
+        normalized.outcome,
+      ].join("|");
+      const group = groups.get(key) ?? {
+        issue: normalized.issue,
+        stage: normalized.stage,
+        harness: normalized.harness,
+        model_slot: normalized.model_slot,
+        model: normalized.model,
+        outcome: normalized.outcome,
+        ...newCostAccountingTotals(),
+      };
+      addAccounting(group, normalized);
+      addAccounting(totals, normalized);
+      groups.set(key, group);
+
+      if (normalized.cost_source === "unknown") {
+        const unknownKey = `${key}|${ref.path}`;
+        if (!unknownCostKeys.has(unknownKey)) {
+          unknownCostKeys.add(unknownKey);
+          diagnostics.push({
+            severity: "warning",
+            code: "unknown_accounting_cost",
+            path: ref.path,
+            message: `Stage accounting for #${normalized.issue} ${normalized.stage}/${normalized.harness} has unknown cost; it is not counted as free.`,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    totals: roundAccountingTotals(totals),
+    groups: [...groups.values()]
+      .map(roundAccountingTotals)
+      .sort((a, b) =>
+        a.issue - b.issue ||
+        a.stage.localeCompare(b.stage) ||
+        a.harness.localeCompare(b.harness) ||
+        a.model_slot.localeCompare(b.model_slot) ||
+        a.model.localeCompare(b.model) ||
+        a.outcome.localeCompare(b.outcome)
+      ),
+  };
+}
+
+function collectAccountingRecords(run: IncludedRun): AccountingRecordRef[] {
+  const summaryAccounting = isRecord(run.summary?.["accounting"]) ? run.summary?.["accounting"] : null;
+  const summaryRecords = arrayRecords(summaryAccounting?.["records"]);
+  if (summaryRecords.length > 0) {
+    return summaryRecords.map((record, index) => ({ record, path: run.summaryPath, index }));
+  }
+  return run.events
+    .map((record, index) => ({ record, path: run.eventsPath, index }))
+    .filter((ref) => ref.record["type"] === "stage_accounting");
+}
+
+function normalizeAccountingRecord(
+  record: JsonRecord,
+  run: IncludedRun,
+): (CostAccountingTotals & {
+  issue: number;
+  stage: string;
+  harness: string;
+  model_slot: string;
+  model: string;
+  outcome: string;
+  cost_source: string;
+  cost_usd: number | null;
+}) | null {
+  const issue = numberField(record, "issue") ?? run.issue;
+  const stage = stringField(record, "stage");
+  const harness = stringField(record, "harness");
+  const outcome = stringField(record, "outcome");
+  if (issue === null || !stage || !harness || !outcome) return null;
+  const source = stringField(record, "cost_source") ?? "unknown";
+  const costUsd = numberField(record, "cost_usd");
+  const normalized: CostAccountingTotals & {
+    issue: number;
+    stage: string;
+    harness: string;
+    model_slot: string;
+    model: string;
+    outcome: string;
+    cost_source: string;
+    cost_usd: number | null;
+  } = {
+    issue,
+    stage,
+    harness,
+    model_slot: stringField(record, "model_slot") ?? stringField(record, "modelSlot") ?? "unknown",
+    model: stringField(record, "model") ?? "unknown",
+    outcome,
+    invocation_count: 1,
+    total_duration_ms: Math.max(0, Math.round(numberField(record, "duration_ms") ?? numberField(record, "durationMs") ?? 0)),
+    command_count: Math.max(0, Math.round(numberField(record, "command_count") ?? numberField(record, "commandCount") ?? 0)),
+    subprocess_count: Math.max(0, Math.round(numberField(record, "subprocess_count") ?? numberField(record, "subprocessCount") ?? 0)),
+    actual_cost_usd: 0,
+    estimated_cost_usd: 0,
+    unknown_cost_count: 0,
+    cost_source: source,
+    cost_usd: costUsd,
+  };
+  if (source === "actual" && costUsd !== null) normalized.actual_cost_usd = costUsd;
+  else if (source === "estimated" && costUsd !== null) normalized.estimated_cost_usd = costUsd;
+  else normalized.unknown_cost_count = 1;
+  return normalized;
+}
+
+function newCostAccountingTotals(): CostAccountingTotals {
+  return {
+    invocation_count: 0,
+    total_duration_ms: 0,
+    command_count: 0,
+    subprocess_count: 0,
+    actual_cost_usd: 0,
+    estimated_cost_usd: 0,
+    unknown_cost_count: 0,
+  };
+}
+
+function addAccounting(target: CostAccountingTotals, source: CostAccountingTotals): void {
+  target.invocation_count += source.invocation_count;
+  target.total_duration_ms += source.total_duration_ms;
+  target.command_count += source.command_count;
+  target.subprocess_count += source.subprocess_count;
+  target.actual_cost_usd += source.actual_cost_usd;
+  target.estimated_cost_usd += source.estimated_cost_usd;
+  target.unknown_cost_count += source.unknown_cost_count;
+}
+
+function roundAccountingTotals<T extends CostAccountingTotals>(value: T): T {
+  return {
+    ...value,
+    actual_cost_usd: roundUsd(value.actual_cost_usd),
+    estimated_cost_usd: roundUsd(value.estimated_cost_usd),
   };
 }
 
@@ -1105,6 +1302,23 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   lines.push("");
   lines.push(`Ready-to-deploy without human intervention: ${formatRate(report.metrics.ready_to_deploy_without_human_intervention)}`);
   lines.push(`Cost per ready PR: ${formatCostMetric(report.metrics.cost_per_ready_pr_usd)}`);
+  lines.push("Cost/accounting by group:");
+  if (report.metrics.cost_accounting.groups.length === 0) {
+    lines.push("  (no stage accounting records)");
+  } else {
+    lines.push(
+      `  total: invocations ${report.metrics.cost_accounting.totals.invocation_count}; ` +
+        `actual $${report.metrics.cost_accounting.totals.actual_cost_usd.toFixed(4)}; ` +
+        `estimated $${report.metrics.cost_accounting.totals.estimated_cost_usd.toFixed(4)}; ` +
+        `unknown ${report.metrics.cost_accounting.totals.unknown_cost_count}; ` +
+        `duration ${formatMs(report.metrics.cost_accounting.totals.total_duration_ms)}; ` +
+        `commands ${report.metrics.cost_accounting.totals.command_count}; ` +
+        `subprocesses ${report.metrics.cost_accounting.totals.subprocess_count}`,
+    );
+    for (const group of report.metrics.cost_accounting.groups) {
+      lines.push(`  ${formatAccountingGroup(group)}`);
+    }
+  }
   lines.push(`Full-run wall-clock duration: ${formatDuration(report.metrics.full_run_duration_ms)}`);
   lines.push("Stage wall-clock duration:");
   const stageEntries = Object.entries(report.metrics.stage_duration_ms);
@@ -1156,6 +1370,19 @@ function formatRatioValue(value: RateValue): string {
 function formatCostMetric(value: CostMetric): string {
   const rendered = value.value === null ? "n/a" : `$${value.value.toFixed(4)}`;
   return `${rendered} (actual $${value.actual_usd.toFixed(4)}, estimated $${value.estimated_usd.toFixed(4)}, missing calls ${value.missing_call_count}, denominator ${value.denominator})`;
+}
+
+function formatAccountingGroup(group: CostAccountingGroup): string {
+  return (
+    `#${group.issue} ${group.stage} ${group.harness} ${group.model_slot} ${group.model} ${group.outcome}: ` +
+    `invocations ${group.invocation_count}; ` +
+    `actual $${group.actual_cost_usd.toFixed(4)}; ` +
+    `estimated $${group.estimated_cost_usd.toFixed(4)}; ` +
+    `unknown ${group.unknown_cost_count}; ` +
+    `duration ${formatMs(group.total_duration_ms)}; ` +
+    `commands ${group.command_count}; ` +
+    `subprocesses ${group.subprocess_count}`
+  );
 }
 
 function formatDuration(value: DurationAggregate): string {
