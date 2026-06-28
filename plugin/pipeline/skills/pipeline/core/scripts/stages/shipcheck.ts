@@ -21,7 +21,7 @@ import {
 } from "../gh.ts";
 import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
-import { readBundle as defaultReadBundle } from "../evidence-bundle.ts";
+import { readBundle as defaultReadBundle, patchBundleIdentity as defaultPatchBundleIdentity } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
 import { substitute } from "../prompts/index.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
@@ -195,6 +195,8 @@ export interface ShipcheckDeps {
   runEligibilityGateFn?: typeof runEligibilityGate;
   /** Deps forwarded to the eligibility gate (for deep test injection). */
   eligibilityGateDeps?: EligibilityGateDeps;
+  /** Patch the evidence bundle's PR identity before the eligibility gate runs. Injectable for tests. */
+  patchBundleIdentityFn?: (stateDir: string, issue: number, patch: { pr?: number | null }) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +528,18 @@ async function maybeRunEligibilityGate(
         };
       }
       if (bundle?.runId) actualRunId = bundle.runId;
+      // Refresh bundle PR identity when the bundle was created before the PR existed
+      // (bundle.pr is null at run-start; the finalizer patches it only after all stages
+      // complete, but shipcheck runs before that). Refresh now so the eligibility gate
+      // identity check (bundle.pr === prNumber) can pass.
+      if (bundle !== null && (bundle.pr === null || bundle.pr === undefined)) {
+        const patchFn = deps.patchBundleIdentityFn ?? defaultPatchBundleIdentity;
+        await patchFn(opts.stateDir, issueNumber, { pr: prNumber }).catch((e: unknown) => {
+          console.warn(
+            `[pipeline] #${issueNumber}: auto-merge-eligibility: failed to refresh bundle PR identity (non-fatal): ${(e as Error).message}`,
+          );
+        });
+      }
     }
     const gateFn = deps.runEligibilityGateFn ?? runEligibilityGate;
     const artifact = await gateFn(

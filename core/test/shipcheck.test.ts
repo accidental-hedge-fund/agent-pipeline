@@ -1204,3 +1204,131 @@ test("shipcheck-gate: OpenSpec disabled (enabled:off) → archive lookup skipped
 
   assert.equal(readSpecDeltasCalled, false, "archive lookup must be skipped when openspec is disabled");
 });
+
+// Finding 73177a03: bundle.pr is null at run-start; shipcheck must refresh it before eligibility gate
+test("shipcheck-gate: bundle pr:null → patchBundleIdentityFn called before eligibility gate", async () => {
+  const log = makeCallLog();
+  const cfg: PipelineConfig = {
+    ...baseCfg({ enabled: true, mode: "advisory" }),
+    auto_merge_eligibility: {
+      enabled: true,
+      max_diff_lines: 300,
+      max_files: 10,
+      deny_paths: [],
+      allow_paths: [],
+      min_confidence: 0.8,
+    },
+  };
+
+  let patchCalledWith: { stateDir: string; issue: number; patch: { pr?: number | null } } | null = null;
+  let eligibilityGateCalled = false;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 77,
+    getForIssue: async () => null,
+    readEvidenceBundle: async () => ({
+      schema_version: 1,
+      schemaVersion: 1,
+      runId: "test-run-id",
+      issue: 42,
+      pr: null, // null — bundle created before PR existed
+      branch: null,
+      harnesses: [],
+      stages: [],
+      reviews: [],
+      overrides: [],
+      recoveries: [],
+      finalState: null,
+      finalizedAt: null,
+      notifiedAt: null,
+    }),
+    patchBundleIdentityFn: async (stateDir, issue, patch) => {
+      patchCalledWith = { stateDir, issue, patch };
+    },
+    runEligibilityGateFn: async () => {
+      eligibilityGateCalled = true;
+      return {
+        eligibility: "needs-human",
+        evaluated_at: "2026-06-28T00:00:00Z",
+        deterministic_checks: [],
+        denial_reasons: ["ci_not_passing"],
+        judge_output: null,
+        ci_status_snapshot: { sha: "abc", conclusion: "failure", checked_at: "2026-06-28T00:00:00Z" },
+        review_verdict_snapshot: { verdict: "unknown", finding_count: 0, recorded_at: "2026-06-28T00:00:00Z" },
+        linked_run_id: "test-run-id",
+        linked_issue: 42,
+        linked_pr: 77,
+        revert_note: "git revert abc",
+      };
+    },
+  };
+
+  await advance(cfg, 42, { stateDir: "/tmp/state42" }, deps);
+
+  assert.ok(patchCalledWith !== null, "patchBundleIdentityFn must be called when bundle.pr is null");
+  assert.equal(patchCalledWith!.stateDir, "/tmp/state42", "patch must use the correct stateDir");
+  assert.equal(patchCalledWith!.issue, 42, "patch must use the correct issue number");
+  assert.equal(patchCalledWith!.patch.pr, 77, "patch must set pr to the current prNumber");
+  assert.ok(eligibilityGateCalled, "eligibility gate must still be called after the patch");
+});
+
+// Finding 73177a03: bundle.pr already set → patchBundleIdentityFn NOT called (no unnecessary writes)
+test("shipcheck-gate: bundle pr already set → patchBundleIdentityFn NOT called", async () => {
+  const log = makeCallLog();
+  const cfg: PipelineConfig = {
+    ...baseCfg({ enabled: true, mode: "advisory" }),
+    auto_merge_eligibility: {
+      enabled: true,
+      max_diff_lines: 300,
+      max_files: 10,
+      deny_paths: [],
+      allow_paths: [],
+      min_confidence: 0.8,
+    },
+  };
+
+  let patchCalled = false;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 77,
+    getForIssue: async () => null,
+    readEvidenceBundle: async () => ({
+      schema_version: 1,
+      schemaVersion: 1,
+      runId: "test-run-id",
+      issue: 42,
+      pr: 77, // already set — no patch needed
+      branch: null,
+      harnesses: [],
+      stages: [],
+      reviews: [],
+      overrides: [],
+      recoveries: [],
+      finalState: null,
+      finalizedAt: null,
+      notifiedAt: null,
+    }),
+    patchBundleIdentityFn: async () => {
+      patchCalled = true;
+    },
+    runEligibilityGateFn: async () => ({
+      eligibility: "needs-human",
+      evaluated_at: "2026-06-28T00:00:00Z",
+      deterministic_checks: [],
+      denial_reasons: ["ci_not_passing"],
+      judge_output: null,
+      ci_status_snapshot: { sha: "abc", conclusion: "failure", checked_at: "2026-06-28T00:00:00Z" },
+      review_verdict_snapshot: { verdict: "unknown", finding_count: 0, recorded_at: "2026-06-28T00:00:00Z" },
+      linked_run_id: "test-run-id",
+      linked_issue: 42,
+      linked_pr: 77,
+      revert_note: "git revert abc",
+    }),
+  };
+
+  await advance(cfg, 42, { stateDir: "/tmp/state42" }, deps);
+
+  assert.equal(patchCalled, false, "patchBundleIdentityFn must NOT be called when bundle.pr is already set");
+});
