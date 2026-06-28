@@ -10,6 +10,7 @@ import {
   selectIssues,
   buildBatchSummary,
   computePriorityScore,
+  validateQueueOpts,
   STAGE_PRIORITY_SCORE,
   runQueue,
   type EligibleIssue,
@@ -637,6 +638,95 @@ test("Finding 3 regression: aggregate.excluded_count is present in batch summary
     7,
     "JSON-serialized aggregate.excluded_count must equal 7",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Review-2 regression tests
+// ---------------------------------------------------------------------------
+
+test("Review-2 Finding 1 regression: blocked issues are excluded from selectIssues", () => {
+  const candidates = [
+    makeIssue(1, ["pipeline:ready"]),
+    makeIssue(2, ["pipeline:ready", "blocked"]),
+    makeIssue(3, ["pipeline:ready", "blocked"]),
+    makeIssue(4, ["pipeline:ready"]),
+  ];
+  const result = selectIssues(candidates, {}, 10);
+  assert.equal(result.length, 2, "blocked issues must be excluded");
+  assert.ok(result.every((i) => !i.labels.includes("blocked")), "no blocked issue in result");
+  assert.ok(result.find((i) => i.number === 1), "non-blocked #1 should be included");
+  assert.ok(result.find((i) => i.number === 4), "non-blocked #4 should be included");
+});
+
+test("Review-2 Finding 1 regression: blocked issues counted in excludedCount", async () => {
+  const issues = [
+    makeIssue(1, ["pipeline:ready"]),
+    makeIssue(2, ["pipeline:ready", "blocked"]),
+    makeIssue(3, ["pipeline:ready"]),
+  ];
+  const launched: number[] = [];
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    runPipeline: async (n) => {
+      launched.push(n);
+      return { issueNumber: n, finalState: "ready-to-deploy", costUsd: 0.10, durationMs: 50 };
+    },
+  });
+
+  await runQueue(makeOpts({ maxIssues: 10 }), deps);
+
+  assert.equal(launched.length, 2, "blocked issue #2 must not be launched");
+  assert.ok(!launched.includes(2), "blocked #2 must not be dispatched");
+
+  const summaryStr = [...deps.written.values()][0];
+  const summary = JSON.parse(summaryStr);
+  assert.equal(summary.excluded_count, 1, "blocked issue counted as excluded");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects NaN maxIssues", () => {
+  const err = validateQueueOpts(NaN, null, 1, 1.0, undefined);
+  assert.ok(typeof err === "string" && err.length > 0, "NaN maxIssues must be rejected");
+  assert.ok(err!.includes("--max-issues"), "error mentions --max-issues");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects NaN maxFailureRate (disables gate)", () => {
+  const err = validateQueueOpts(10, null, 1, NaN, undefined);
+  assert.ok(typeof err === "string" && err.length > 0, "NaN maxFailureRate must be rejected");
+  assert.ok(err!.includes("--max-failure-rate"), "error mentions --max-failure-rate");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects NaN budgetDollars", () => {
+  const err = validateQueueOpts(10, NaN, 1, 1.0, undefined);
+  assert.ok(typeof err === "string" && err.length > 0, "NaN budgetDollars must be rejected");
+  assert.ok(err!.includes("--budget-dollars"), "error mentions --budget-dollars");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects Infinity concurrency", () => {
+  const err = validateQueueOpts(10, null, Infinity, 1.0, undefined);
+  assert.ok(typeof err === "string" && err.length > 0, "Infinity concurrency must be rejected");
+  assert.ok(err!.includes("--concurrency"), "error mentions --concurrency");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects negative maxIssues", () => {
+  const err = validateQueueOpts(-1, null, 1, 1.0, undefined);
+  assert.ok(typeof err === "string", "negative maxIssues must be rejected");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects maxFailureRate > 1", () => {
+  const err = validateQueueOpts(10, null, 1, 1.5, undefined);
+  assert.ok(typeof err === "string", "maxFailureRate > 1 must be rejected");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts rejects invalid risk value", () => {
+  const err = validateQueueOpts(10, null, 1, 1.0, "extreme");
+  assert.ok(typeof err === "string", "invalid risk must be rejected");
+  assert.ok(err!.includes("--risk"), "error mentions --risk");
+});
+
+test("Review-2 Finding 3 regression: validateQueueOpts accepts valid inputs", () => {
+  assert.equal(validateQueueOpts(5, 1.0, 2, 0.5, "low"), null, "valid inputs should return null");
+  assert.equal(validateQueueOpts(1, null, 1, 0.0, undefined), null, "null budget is valid");
+  assert.equal(validateQueueOpts(100, 0, 4, 1.0, "high"), null, "zero budget is valid (blocks immediately)");
 });
 
 test("stdout includes per-issue table and aggregate line", async () => {

@@ -712,7 +712,7 @@ async function main(): Promise<void> {
       console.error(`pipeline queue: config error: ${(err as Error).message}`);
       process.exit(1);
     }
-    const { runQueue, realQueueDeps } = await import("./stages/queue.ts");
+    const { runQueue, realQueueDeps, validateQueueOpts } = await import("./stages/queue.ts");
     // Precedence: CLI flag > config value > built-in default.
     const queueConfig = queueCfg.queue ?? {};
     const maxIssues: number = opts.maxIssues ?? queueConfig.max_issues ?? 10;
@@ -722,6 +722,11 @@ async function main(): Promise<void> {
       null;
     const concurrency: number = opts.concurrency ?? queueConfig.concurrency ?? 1;
     const maxFailureRate: number = opts.maxFailureRate ?? queueConfig.max_failure_rate ?? 1.0;
+    const validationError = validateQueueOpts(maxIssues, budgetDollars, concurrency, maxFailureRate, opts.risk);
+    if (validationError) {
+      console.error(`pipeline queue: ${validationError}`);
+      process.exit(2);
+    }
     const batchId = new Date().toISOString().replace(/[:.]/g, "-");
     try {
       await runQueue(

@@ -10,7 +10,8 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { runsDir } from "../run-store.ts";
+import { runsDir, runIdFor } from "../run-store.ts";
+import { BLOCKED_LABEL } from "../types.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -100,6 +101,39 @@ export interface QueueDeps {
 }
 
 // ---------------------------------------------------------------------------
+// CLI option validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate queue operator limits before dispatching.
+ * Returns a user-facing error string if any value is invalid, or null if all ok.
+ */
+export function validateQueueOpts(
+  maxIssues: number,
+  budgetDollars: number | null,
+  concurrency: number,
+  maxFailureRate: number,
+  risk?: string,
+): string | null {
+  if (!Number.isFinite(maxIssues) || !Number.isInteger(maxIssues) || maxIssues < 1) {
+    return `--max-issues must be a positive integer (got: ${maxIssues})`;
+  }
+  if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency < 1) {
+    return `--concurrency must be a positive integer (got: ${concurrency})`;
+  }
+  if (budgetDollars !== null && (!Number.isFinite(budgetDollars) || budgetDollars < 0)) {
+    return `--budget-dollars must be a non-negative number (got: ${budgetDollars})`;
+  }
+  if (!Number.isFinite(maxFailureRate) || maxFailureRate < 0 || maxFailureRate > 1) {
+    return `--max-failure-rate must be in 0.0–1.0 (got: ${maxFailureRate})`;
+  }
+  if (risk !== undefined && !["low", "medium", "high"].includes(risk)) {
+    return `--risk must be one of low|medium|high (got: ${risk})`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Priority scoring formula (static constant — auditable without a model call)
 // ---------------------------------------------------------------------------
 
@@ -171,6 +205,9 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
 
     runPipeline: async (issueNumber: number, opts: RunOpts): Promise<RunResult> => {
       const startMs = Date.now();
+      // Pin the run-id before spawning so we read the exact summary.json this child
+      // writes — not a stale artifact from a prior or concurrent run for the same issue.
+      const runId = runIdFor(issueNumber, new Date());
       const pipelineScript = path.resolve(
         path.dirname(fileURLToPath(import.meta.url)),
         "../pipeline.ts",
@@ -179,6 +216,7 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
         "--experimental-strip-types",
         pipelineScript,
         String(issueNumber),
+        "--run-id", runId,
       ];
       if (opts.profile) args.push("--profile", opts.profile);
       if (opts.repoPath) args.push("--repo-path", opts.repoPath);
@@ -196,31 +234,29 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
 
       const durationMs = Date.now() - startMs;
 
-      // Read the final state and cost from the most recent run summary.
-      let finalState = exitCode === 0 ? "ready-to-deploy" : "error";
+      // Read final state and cost from the pinned run summary only.
+      // If summary is missing or corrupt, record as "unknown" rather than
+      // inferring ready-to-deploy from exit code 0 — a non-terminal stop can exit 0.
+      let finalState: string;
       let costUsd: number | null = null;
+      let errorMsg: string | undefined;
       try {
-        const entries = fs.readdirSync(runsDir(repoDir))
-          .filter((e) => e.startsWith(`${issueNumber}-`))
-          .sort();
-        const latest = entries.at(-1);
-        if (latest) {
-          const raw = fs.readFileSync(
-            path.join(runsDir(repoDir), latest, "summary.json"),
-            "utf8",
-          );
-          const summary = JSON.parse(raw) as {
-            finalState?: string;
-            accounting?: { totals?: { actual_cost_usd?: number; estimated_cost_usd?: number } };
-          };
-          if (summary.finalState) finalState = summary.finalState;
-          const totals = summary.accounting?.totals;
-          if (totals) {
-            costUsd = (totals.actual_cost_usd ?? 0) + (totals.estimated_cost_usd ?? 0);
-          }
+        const summaryPath = path.join(runsDir(repoDir), runId, "summary.json");
+        const raw = fs.readFileSync(summaryPath, "utf8");
+        const summary = JSON.parse(raw) as {
+          finalState?: string;
+          accounting?: { totals?: { actual_cost_usd?: number; estimated_cost_usd?: number } };
+        };
+        finalState = summary.finalState ?? "unknown";
+        const totals = summary.accounting?.totals;
+        if (totals) {
+          costUsd = (totals.actual_cost_usd ?? 0) + (totals.estimated_cost_usd ?? 0);
         }
       } catch {
-        // Summary not available — use exit-code-based fallback
+        finalState = "unknown";
+        errorMsg = exitCode !== 0
+          ? `exit code ${exitCode}, summary not found or unreadable`
+          : "summary not found or unreadable";
       }
 
       return {
@@ -228,7 +264,7 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
         finalState,
         costUsd,
         durationMs,
-        ...(exitCode !== 0 && finalState === "error" ? { error: `exit code ${exitCode}` } : {}),
+        ...(errorMsg !== undefined ? { error: errorMsg } : {}),
       };
     },
 
@@ -296,7 +332,8 @@ export function selectIssues(
   filters: IssueFilters,
   maxIssues: number,
 ): EligibleIssue[] {
-  let filtered = candidates;
+  // Blocked issues are not autonomous-eligible regardless of pipeline stage.
+  let filtered = candidates.filter((issue) => !issue.labels.includes(BLOCKED_LABEL));
 
   if (filters.labels && filters.labels.length > 0) {
     filtered = filtered.filter((issue) =>
