@@ -75,6 +75,9 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 /pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
+/pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits (no number)
+/pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
+/pipeline queue --label team:backend --milestone v2.0 --risk medium
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 

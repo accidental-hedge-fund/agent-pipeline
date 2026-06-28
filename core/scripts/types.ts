@@ -322,6 +322,14 @@ export interface PipelineConfig {
     min_body_length?: number;
     required_sections?: string[];
   };
+  // Queue batch factory operation mode (#305). Optional operator defaults that
+  // CLI flags override. All keys are optional; built-in defaults apply when absent.
+  queue?: {
+    max_issues?: number;
+    budget_dollars?: number | null;
+    concurrency?: number;
+    max_failure_rate?: number;
+  };
   // Additional GitHub identities whose `## Pipeline: Finding override` and
   // `## Pipeline: Scope override` comments are trusted in addition to the current
   // pipeline actor (#229). Useful for multi-actor setups (e.g., a CI bot and a

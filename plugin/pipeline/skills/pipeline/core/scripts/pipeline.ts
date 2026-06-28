@@ -203,6 +203,21 @@ export interface CliOpts {
   minOccurrences?: number;
   /** improve: print an intervention summary (--interventions). */
   interventions?: boolean;
+  // Queue batch factory operation mode (#305).
+  /** queue: maximum issues to start in the batch. */
+  maxIssues?: number;
+  /** queue: stop launching new runs when cumulative cost reaches this USD limit. */
+  budgetDollars?: number;
+  /** queue: maximum simultaneous pipeline runs. */
+  concurrency?: number;
+  /** queue: halt new launches when failure rate (failed/completed) meets this threshold (0.0–1.0). */
+  maxFailureRate?: number;
+  /** queue: filter eligible issues to those carrying all specified labels (repeatable). */
+  label?: string[];
+  /** queue: filter eligible issues to those belonging to this milestone title. */
+  milestone?: string;
+  /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
+  risk?: string;
 }
 
 /**
@@ -219,7 +234,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -264,7 +279,15 @@ export function buildCmd(): Command {
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
     .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
-    .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)");
+    .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)")
+    // queue batch factory operation mode (#305)
+    .option("--max-issues <N>", "queue: maximum issues to start in the batch (default: 10)", Number)
+    .option("--budget-dollars <D>", "queue: stop launching new runs when cumulative cost (USD) reaches this limit", Number)
+    .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
+    .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
+    .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
+    .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
+    .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -676,6 +699,61 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early queue dispatch — batch factory operation mode (#305). No issue number;
+  // derives repo/config from local git state. Runs pipeline for a set of eligible
+  // issues within explicit budget, concurrency, and failure-rate limits.
+  if (numArg === "queue") {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    let queueCfg: import("./types.ts").PipelineConfig;
+    try {
+      queueCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline queue: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const { runQueue, realQueueDeps, validateQueueOpts } = await import("./stages/queue.ts");
+    // Precedence: CLI flag > config value > built-in default.
+    const queueConfig = queueCfg.queue ?? {};
+    const maxIssues: number = opts.maxIssues ?? queueConfig.max_issues ?? 10;
+    const budgetDollars: number | null =
+      opts.budgetDollars !== undefined ? opts.budgetDollars :
+      queueConfig.budget_dollars !== undefined ? queueConfig.budget_dollars :
+      null;
+    const concurrency: number = opts.concurrency ?? queueConfig.concurrency ?? 1;
+    const maxFailureRate: number = opts.maxFailureRate ?? queueConfig.max_failure_rate ?? 1.0;
+    const validationError = validateQueueOpts(maxIssues, budgetDollars, concurrency, maxFailureRate, opts.risk);
+    if (validationError) {
+      console.error(`pipeline queue: ${validationError}`);
+      process.exit(2);
+    }
+    const batchId = new Date().toISOString().replace(/[:.]/g, "-");
+    try {
+      await runQueue(
+        {
+          maxIssues,
+          budgetDollars,
+          concurrency,
+          maxFailureRate,
+          filters: {
+            labels: opts.label && opts.label.length > 0 ? opts.label : undefined,
+            milestone: opts.milestone,
+            risk: opts.risk as "low" | "medium" | "high" | undefined,
+          },
+          repoDir: queueCfg.repo_dir,
+          profile: opts.profile,
+          batchId,
+          base: opts.base,
+        },
+        realQueueDeps(queueCfg.repo_dir, opts.profile),
+      );
+    } catch (err) {
+      console.error(`pipeline queue: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early roadmap dispatch — no issue number, derives repo/config from local git state.
   if (numArg === "roadmap") {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
@@ -813,7 +891,7 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard"];
+    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue"];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
