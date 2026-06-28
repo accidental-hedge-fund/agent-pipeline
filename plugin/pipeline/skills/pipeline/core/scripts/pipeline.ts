@@ -398,7 +398,19 @@ async function main(): Promise<void> {
   // advance ("all") and run ("all") always return no offending flags.
   // Semantic cross-flag checks (--is-ok, --json, --force, --remove-worktree) remain
   // below as they cannot be expressed as per-command allowlists.
-  const entry = lookupCommand(numArg);
+  //
+  // Flag-only modes (--init, --cleanup, --remove-worktree) must resolve to their
+  // registry entries rather than the advance entry, because numArg is undefined or
+  // numeric for these modes and lookupCommand would otherwise return advance (allowedFlags:"all").
+  // The override only applies when numArg is absent or numeric — if a named subcommand
+  // (e.g. "intake", "release") is in numArg, the subcommand entry governs validation.
+  const isNumericOrAbsent = !numArg || /^\d+$/.test(numArg);
+  const effectiveCommandKey: string | undefined =
+    (opts.removeWorktree && isNumericOrAbsent) ? "remove-worktree" :
+    (opts.cleanup && isNumericOrAbsent)        ? "cleanup" :
+    (opts.init && isNumericOrAbsent)           ? "init" :
+    numArg;
+  const entry = lookupCommand(effectiveCommandKey);
   if (entry !== null) {
     const offendingKeys = validateFlags(entry, cmd);
     if (offendingKeys.length > 0) {
@@ -410,6 +422,12 @@ async function main(): Promise<void> {
           `pipeline: 'pipeline merge' does not support ${flags}. ` +
             `'pipeline merge <pr>' is a human-invoked squash merge; only --repo-path, --base, and --profile apply.`,
         );
+      } else if (opts.removeWorktree && isNumericOrAbsent) {
+        console.error(`pipeline: '--remove-worktree' mode does not support ${flags}. These are separate modes.`);
+      } else if (opts.cleanup && isNumericOrAbsent) {
+        console.error(`pipeline: '--cleanup' does not support ${flags}. These are separate modes.`);
+      } else if (opts.init && isNumericOrAbsent) {
+        console.error(`pipeline: '--init' does not support ${flags}. These are separate modes.`);
       } else {
         console.error(
           `pipeline: '${numArg}' cannot be combined with ${flags}. These are separate commands.`,

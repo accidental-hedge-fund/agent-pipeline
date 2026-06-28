@@ -37,12 +37,22 @@ function parseCli(args: string[]): { opts: CliOpts; numArg: string | undefined; 
 
 /**
  * Full round-trip: parse args, look up entry, run validateFlags, return offending keys.
+ * Mirrors the effective-command-key logic from pipeline.ts so flag-only modes
+ * (--init, --cleanup, --remove-worktree) resolve to their registry entries when
+ * numArg is absent or numeric (i.e., no named subcommand is present).
  */
 function roundTrip(args: string[]): string[] {
   const cmd = buildCmd();
   cmd.parse(["node", "pipeline", ...args]);
+  const opts = cmd.opts<CliOpts>();
   const numArg = cmd.args[0];
-  const entry = lookupCommand(numArg);
+  const isNumericOrAbsent = !numArg || /^\d+$/.test(numArg);
+  const effectiveKey: string | undefined =
+    (opts.removeWorktree && isNumericOrAbsent) ? "remove-worktree" :
+    (opts.cleanup && isNumericOrAbsent)        ? "cleanup" :
+    (opts.init && isNumericOrAbsent)           ? "init" :
+    numArg;
+  const entry = lookupCommand(effectiveKey);
   if (!entry) return [];
   return validateFlags(entry, cmd);
 }
@@ -186,4 +196,41 @@ test("pipeline-cli 5.7: 'merge 42 --repo-path /tmp/repo' → merge entry, valida
   assert.ok(entry !== null);
   assert.equal(entry, COMMAND_REGISTRY.merge);
   assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+// ---------------------------------------------------------------------------
+// 5.8  Flag-only modes: --init, --cleanup, --remove-worktree resolve to their
+//      registry entries (not the advance entry) so unsupported flags are caught.
+// ---------------------------------------------------------------------------
+
+test("pipeline-cli 5.8a: '--init' alone → init entry, validateFlags returns []", () => {
+  assert.deepEqual(roundTrip(["--init"]), []);
+});
+
+test("pipeline-cli 5.8b: '--init --dry-run' → init entry, validateFlags returns ['dryRun']", () => {
+  assert.deepEqual(roundTrip(["--init", "--dry-run"]), ["dryRun"]);
+});
+
+test("pipeline-cli 5.8c: '--cleanup' alone → cleanup entry, validateFlags returns []", () => {
+  assert.deepEqual(roundTrip(["--cleanup"]), []);
+});
+
+test("pipeline-cli 5.8d: '--cleanup --dry-run' → cleanup entry, validateFlags returns ['dryRun']", () => {
+  assert.deepEqual(roundTrip(["--cleanup", "--dry-run"]), ["dryRun"]);
+});
+
+test("pipeline-cli 5.8e: '42 --remove-worktree' → remove-worktree entry, validateFlags returns []", () => {
+  assert.deepEqual(roundTrip(["42", "--remove-worktree"]), []);
+});
+
+test("pipeline-cli 5.8f: '42 --remove-worktree --dry-run' → remove-worktree entry, validateFlags returns ['dryRun']", () => {
+  assert.deepEqual(roundTrip(["42", "--remove-worktree", "--dry-run"]), ["dryRun"]);
+});
+
+test("pipeline-cli 5.8g: 'logs --dry-run' → logs entry, validateFlags returns ['dryRun']", () => {
+  assert.deepEqual(roundTrip(["logs", "--dry-run"]), ["dryRun"]);
+});
+
+test("pipeline-cli 5.8h: 'summary run-123 --dry-run' → summary entry, validateFlags returns ['dryRun']", () => {
+  assert.deepEqual(roundTrip(["summary", "run-123", "--dry-run"]), ["dryRun"]);
 });
