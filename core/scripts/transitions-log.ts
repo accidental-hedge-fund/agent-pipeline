@@ -27,3 +27,14 @@ export function appendTransitionLine(filePath: string, line: string): void {
 export function makeTransitionsLogger(filePath: string): (line: string) => void {
   return (line: string) => appendTransitionLine(filePath, line);
 }
+
+/** Return the single physical lifecycle line from a (possibly multiline) string.
+ *  Strips leading whitespace (the done line uses a leading \n for terminal visual
+ *  spacing) then returns only the content before the first embedded newline.
+ *  Blocked-outcome reason fields can embed multiline gate output that must not
+ *  appear in the transitions log. */
+export function singleLifecycleLine(line: string): string {
+  const head = line.trimStart();
+  const nl = head.indexOf("\n");
+  return nl === -1 ? head : head.slice(0, nl);
+}

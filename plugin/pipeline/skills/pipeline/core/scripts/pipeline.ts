@@ -1069,7 +1069,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runUnblock(cfg, issueNumber, opts.unblock);
+    await runUnblock(cfg, issueNumber, opts.unblock, number);
     return;
   }
   if (opts.override !== undefined) {
@@ -1081,7 +1081,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runOverride(cfg, issueNumber, opts.override, opts);
+    await runOverride(cfg, issueNumber, opts.override, opts, undefined, number);
     return;
   }
 
@@ -1916,7 +1916,7 @@ async function appendBlockerCleared(repoDir: string, issueNumber: number): Promi
   ).catch(() => {});
 }
 
-async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
+async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string, originalN?: number): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
@@ -1941,7 +1941,7 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   await appendBlockerCleared(cfg.repo_dir, issueNumber);
   const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
   console.log(unblockLine);
-  appendTransitionLine(transitionsLogPath(cfg.domain, issueNumber), unblockLine);
+  appendTransitionLine(transitionsLogPath(cfg.domain, originalN ?? issueNumber), unblockLine);
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,6 +1973,7 @@ export async function runOverride(
   spec: string,
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
+  originalN?: number,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2056,7 +2057,7 @@ export async function runOverride(
       `[pipeline] #${issueNumber}: needs-human → ${to} (resuming the round that hit the ceiling)`,
     );
   }
-  await deps.runAdvance(cfg, issueNumber, opts);
+  await deps.runAdvance(cfg, issueNumber, opts, { transitionsLogN: originalN ?? issueNumber });
 }
 
 /** ISO 8601 timestamp at seconds precision — local copy for appendBlockerCleared. */

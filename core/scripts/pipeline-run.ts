@@ -6,7 +6,7 @@
 // auto-loop helpers and AdvanceDeps so existing import paths continue to work.
 
 import * as path from "node:path";
-import { makeTransitionsLogger, transitionsLogPath } from "./transitions-log.ts";
+import { makeTransitionsLogger, singleLifecycleLine, transitionsLogPath } from "./transitions-log.ts";
 import {
   GhMetricsCollector,
   buildAuditSentinel,
@@ -414,7 +414,11 @@ export async function runAdvance(
     const logT = deps.logTransition ?? (stateDir ? makeTransitionsLogger(transitionsLogPath(cfg.domain, deps.transitionsLogN ?? issueNumber)) : undefined);
     function tlog(line: string): void {
       console.log(line);
-      logT?.(line);
+      // Mirror only a single physical lifecycle line to the transitions log.
+      // Blocked-outcome reason fields can embed newlines with non-lifecycle gate output;
+      // the done line uses a leading \n for terminal visual spacing. Both are stripped
+      // here so only the [pipeline] #N: header appears in the transitions log (#324).
+      logT?.(singleLifecycleLine(line));
     }
 
     // Run directory (#155): stable artifact directory per dispatch. Initialized

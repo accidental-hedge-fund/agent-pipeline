@@ -11,13 +11,15 @@
 //   5.8  Cleanup pattern: unlinkSync removes transitions log; missing file is tolerated.
 //   5.9  printOutcome calls tlog for advancing and non-advancing outcomes (regression for line-735 bug).
 //   5.10 AdvanceDeps.transitionsLogN seam accepted; PR-resolves-to-issue path uses original arg.
+//   5.11 singleLifecycleLine: strips leading whitespace and returns only the first physical line.
+//   5.12 Regression: blocked outcome with multiline reason does not leak non-lifecycle content.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { transitionsLogPath, appendTransitionLine, makeTransitionsLogger } from "../scripts/transitions-log.ts";
+import { transitionsLogPath, appendTransitionLine, makeTransitionsLogger, singleLifecycleLine } from "../scripts/transitions-log.ts";
 import { printOutcome } from "../scripts/pipeline-run.ts";
 import type { AdvanceDeps } from "../scripts/pipeline-run.ts";
 
@@ -225,4 +227,66 @@ test("transitions log path: PR-resolved-to-issue scenario uses original arg numb
   // Confirm the resolved-issue path would differ, so the fix is meaningful.
   const resolvedIssuePath = transitionsLogPath("agent-pipeline", 64);
   assert.notEqual(path, resolvedIssuePath);
+});
+
+// ---------------------------------------------------------------------------
+// 5.11 singleLifecycleLine: first physical line after stripping leading whitespace
+// ---------------------------------------------------------------------------
+
+test("singleLifecycleLine: single-line string is returned verbatim", () => {
+  const line = "[pipeline] #42: ready → review-1: PR #7 opened";
+  assert.equal(singleLifecycleLine(line), line);
+});
+
+test("singleLifecycleLine: strips leading newline (done-line pattern)", () => {
+  // The done line uses a leading \n for terminal visual spacing; the lifecycle content
+  // is on the second physical line. singleLifecycleLine must return that content.
+  const done = "\n[pipeline] #42: done — ready → review-1 (1 transitions, 5s)";
+  assert.equal(singleLifecycleLine(done), "[pipeline] #42: done — ready → review-1 (1 transitions, 5s)");
+});
+
+test("singleLifecycleLine: returns only the first line when reason embeds newlines", () => {
+  const reason = "gate failed\n```\n[pipeline] #999: fixture line\n→ ready-to-deploy\n```";
+  const line = `[pipeline] #42: at review-1 — blocked: ${reason}`;
+  assert.equal(singleLifecycleLine(line), "[pipeline] #42: at review-1 — blocked: gate failed");
+});
+
+// ---------------------------------------------------------------------------
+// 5.12 Regression: multiline blocked outcome does not leak non-lifecycle lines
+//      into the transitions log.
+//
+//      tlog calls singleLifecycleLine before writing to logT, so a blocked
+//      outcome whose reason contains embedded test fixture output (including
+//      fake [pipeline] #999: and → ready-to-deploy strings) does not pollute
+//      the transitions log with non-lifecycle content.
+// ---------------------------------------------------------------------------
+
+test("regression: blocked outcome with multiline reason — only lifecycle header goes to transitions log", () => {
+  // Simulate the content that testGateBlockReason may produce in a blocked outcome.
+  const embeddedFixtureOutput =
+    "test gate failed\n" +
+    "```\n" +
+    "[pipeline] #999: fake lifecycle line from fixture output\n" +
+    "→ ready-to-deploy\n" +
+    "```";
+  const fullOutcomeLine = `[pipeline] #42: at review-1 — blocked: ${embeddedFixtureOutput}`;
+
+  const transitionsLogLines: string[] = [];
+  // singleLifecycleLine is what tlog applies before writing to logT
+  transitionsLogLines.push(singleLifecycleLine(fullOutcomeLine));
+
+  assert.equal(transitionsLogLines.length, 1);
+  assert.equal(
+    transitionsLogLines[0],
+    "[pipeline] #42: at review-1 — blocked: test gate failed",
+  );
+  // Non-lifecycle content from embedded fixture output must not appear.
+  assert.ok(
+    !transitionsLogLines.join("").includes("[pipeline] #999:"),
+    "fixture [pipeline] #999: must not appear in transitions log",
+  );
+  assert.ok(
+    !transitionsLogLines.join("").includes("→ ready-to-deploy"),
+    "fixture → ready-to-deploy must not appear in transitions log",
+  );
 });
