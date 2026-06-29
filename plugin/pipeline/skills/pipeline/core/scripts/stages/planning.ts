@@ -953,6 +953,8 @@ export function makeOpenspecPlanningHooks(
           issueNumber,
           pathConstraint: {
             allowPattern: /^openspec\//,
+            // tasks/ planning notes left dirty by the scoped salvage (#321) are expected
+            allowDirtyPattern: /^tasks\//,
             description:
               "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
           },

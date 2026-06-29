@@ -285,6 +285,42 @@ test("salvage [scoped, 3.3]: scoped authoring salvage commit passes the authorin
   assert.equal(ok.ok, true, "scoped salvage commit (openspec/ only) passes the authoring gate");
 });
 
+test("salvage [scoped, 3.3b regression #321]: dirty tasks/todo.md after scoped salvage does not trip authoring gate when allowDirtyPattern is set; bites without it", async () => {
+  const msg = buildSalvageCommitMessage(321, RUN_ID, "OpenSpec authoring");
+  // After a scoped salvage: only openspec/ committed, tasks/todo.md left dirty
+  const depsWithDirty: VerifyDeps = {
+    gitMessages: async () => [msg],
+    gitDiffFiles: async () => ["openspec/changes/x/proposal.md", "openspec/changes/x/tasks.md"],
+    gitDirtyFiles: async () => ["tasks/todo.md"],
+    gitCommitShas: async () => [],
+  };
+
+  // With allowDirtyPattern: tasks/todo.md is exempt — gate must pass
+  const ok = await verifyHarnessCommits("/wt", "abc", {
+    issueNumber: 321,
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      allowDirtyPattern: /^tasks\//,
+      description: "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+    },
+  }, depsWithDirty);
+  assert.equal(ok.ok, true, "dirty tasks/todo.md is exempt via allowDirtyPattern — authoring gate passes");
+
+  // Without allowDirtyPattern: dirty tasks/todo.md trips the gate (bites)
+  const blocked = await verifyHarnessCommits("/wt", "abc", {
+    issueNumber: 321,
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+    },
+  }, depsWithDirty);
+  assert.equal(blocked.ok, false, "without allowDirtyPattern, dirty tasks/todo.md blocks the authoring gate");
+  assert.ok(
+    "reason" in blocked && blocked.reason.includes("OpenSpec authoring step"),
+    `unexpected reason: ${JSON.stringify(blocked)}`,
+  );
+});
+
 test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-openspec/ files unchanged", async () => {
   let capturedArgs: string[] | null = null;
   const deps: SalvageDeps = {
