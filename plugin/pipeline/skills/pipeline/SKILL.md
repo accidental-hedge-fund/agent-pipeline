@@ -72,6 +72,9 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline:sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
 /pipeline:sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
 /pipeline:sweep --apply --repo other/r   sweep a different repository
+/pipeline backfill                       preview OpenSpec coverage for legacy behavior (non-mutating)
+/pipeline backfill --apply               author a spec-only PR for missing-coverage behaviors
+/pipeline backfill --apply --capability auth  scope the apply slice to a named capability
 /pipeline:roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run)
 /pipeline:roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
 /pipeline:roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
@@ -187,6 +190,23 @@ Default is preview-only (dry-run). With `--apply`: thin issue bodies are updated
 in place; the ROADMAP reconciliation is delivered as a branch + PR for human
 review (never committed directly to the default branch). Re-running sweep is
 idempotent — already-specced issues are recognized as sufficient and skipped.
+
+`backfill` is a safe maintenance flow for adding OpenSpec coverage to repositories
+whose accepted behavior predates OpenSpec adoption. It classifies legacy behaviors
+into four groups and optionally opens a spec-only PR for the missing-coverage slice:
+
+```bash
+/pipeline backfill                        # preview: four-group coverage report (no writes)
+/pipeline backfill --apply                # apply: open a spec-only PR for missing behaviors
+/pipeline backfill --apply --capability auth  # scope the slice to a named capability
+```
+
+Default is non-mutating preview. With `--apply`: authors an OpenSpec change with
+additive requirement deltas, validates with `openspec validate`, and opens a
+spec-only PR. Never commits directly to the default branch; never merges.
+The diff is asserted to touch only paths under `openspec/` before the PR is created.
+Re-running after a slice lands is idempotent — applied requirements are recognized
+as already-covered and not duplicated.
 
 ## Setup (zero install after first run)
 
