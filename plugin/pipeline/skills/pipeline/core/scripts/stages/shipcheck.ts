@@ -433,9 +433,28 @@ export async function advance(
         c.author === actor && extractRevalidationSha(c.body) === prHeadSha ? i : acc,
       -1,
     );
+    // Fix 3 (#317, override-key b121c417): scope the pre-merge audit search window to
+    // after the preceding revalidation marker (any head). Without this, a successful
+    // route-back for H2 (audit+marker for H2) followed by an orphaned H3 marker lets
+    // the H2 audit satisfy the guard for H3 — the H2 audit is in the post-verdict window
+    // so the old window [lastVerdictIdx+1, lastH3MarkerIdx) finds it and returns true,
+    // incorrectly skipping the route-back for H3. Anchoring at
+    // max(lastVerdictIdx, prevAnyHeadMarkerIdx) ensures the audit is coupled to the
+    // specific route-back attempt that produced the current-head marker.
+    const prevAnyHeadMarkerIdx = lastRevalidationMarkerIdx !== -1
+      ? detail.comments.reduce(
+          (acc, c, i) =>
+            i < lastRevalidationMarkerIdx &&
+            c.author === actor &&
+            extractRevalidationSha(c.body) !== null
+              ? i
+              : acc,
+          -1,
+        )
+      : -1;
     const alreadyRoutedForCurrentHead =
       lastRevalidationMarkerIdx !== -1 &&
-      detail.comments.slice(lastVerdictIdx + 1, lastRevalidationMarkerIdx).some(
+      detail.comments.slice(Math.max(lastVerdictIdx, prevAnyHeadMarkerIdx) + 1, lastRevalidationMarkerIdx).some(
         (c) =>
           c.author === actor &&
           c.body.includes("<!-- pipeline-audit:") &&

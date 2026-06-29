@@ -1984,6 +1984,67 @@ test("shipcheck-gate #317 review-3-F1: historical pre-merge audit (before verdic
   assert.equal(log.transitions[0].to, "pre-merge");
 });
 
+// ---------------------------------------------------------------------------
+// Review-4 regression test (#317, override-key b121c417)
+// ---------------------------------------------------------------------------
+
+// Finding (HIGH, b121c417): valid H2 route-back (audit+marker for H2) followed by an
+// orphaned H3 marker must NOT satisfy the guard for H3. The H2 audit falls in the
+// post-verdict window so the old [lastVerdictIdx+1, lastH3MarkerIdx) window finds it
+// and returns alreadyRoutedForCurrentHead=true — incorrectly skipping the H3 route-back
+// and invoking the reviewer on an unvalidated head.
+// With the fix the window starts at max(lastVerdictIdx, H2MarkerIdx)+1, which places the
+// start AFTER the H2 marker and leaves the window empty → false → routes back.
+test("shipcheck-gate #317 b121c417: valid H2 audit+marker + orphaned H3 marker → routes back to pre-merge, reviewer NOT invoked", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+  const SHA_H3 = "3".repeat(40);
+
+  const verdictForH1 = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  // Successful H2 route-back: transition posts audit first, then notice is posted.
+  const auditForH2Route = `## Pipeline: pre merge\n**Transition**: \`shipcheck-gate\` → \`pre-merge\`\n<!-- pipeline-audit: run=run-h2 state=pre-merge -->`;
+  const markerForH2 = `**Shipcheck re-validation notice**: stale ${SHA_H1.slice(0, 8)}, current ${SHA_H2.slice(0, 8)}.\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+  // Orphaned H3 marker: no pre-merge audit between the H2 marker and this marker.
+  const orphanedMarkerForH3 = `**Shipcheck re-validation notice**: stale ${SHA_H2.slice(0, 8)}, current ${SHA_H3.slice(0, 8)}.\n<!-- shipcheck-revalidation-sha: ${SHA_H3} -->`;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H3, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H3, // no drift — fix for H3 is pushed
+    getGhActor: async () => "pipeline-bot",
+    // A developer commit present at H3 so the route-back fires once the guard returns false.
+    getPrCommits: async () => [{ oid: SHA_H3, messageHeadline: "fix: H3 developer work" }],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        // Comment 0: verdict for H1 (lastVerdictIdx = 0)
+        { author: "pipeline-bot", body: verdictForH1, createdAt: "2026-01-01T00:00:00Z" },
+        // Comment 1: pre-merge audit from the H2 route-back (index 1)
+        { author: "pipeline-bot", body: auditForH2Route, createdAt: "2026-01-01T12:00:00Z" },
+        // Comment 2: revalidation marker for H2 (prevAnyHeadMarkerIdx = 2)
+        { author: "pipeline-bot", body: markerForH2, createdAt: "2026-01-02T00:00:00Z" },
+        // Comment 3: orphaned marker for H3 — no post-H2-marker audit precedes it
+        { author: "pipeline-bot", body: orphanedMarkerForH3, createdAt: "2026-01-03T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  // Old code: window [lastVerdictIdx+1=1, lastH3MarkerIdx=3) = comments 1,2 → finds H2 audit → true → reviewer called → WRONG
+  // New code: window [max(0,2)+1=3, 3) = empty → false → dev commit found → routes to pre-merge → CORRECT
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked — orphaned H3 marker must not be satisfied by H2 audit");
+  assert.equal(out.advanced, true, "must advance via routing to pre-merge");
+  assert.equal((out as { to: string }).to, "pre-merge", "must route back to pre-merge for H3, not proceed to ready-to-deploy");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].from, "shipcheck-gate");
+  assert.equal(log.transitions[0].to, "pre-merge");
+});
+
 // Finding 2 regression (#317 review-3): orphaned first marker followed by a valid
 // audit+marker pair for the same SHA must converge (alreadyRoutedForCurrentHead = true).
 // Without the fix, findIndex returns the first (orphaned) marker; the guard sees no
