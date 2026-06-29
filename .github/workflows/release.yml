@@ -71,8 +71,17 @@ jobs:
           else
             flag="--latest"
           fi
-          gh release create "${GITHUB_REF_NAME}" \
-            --verify-tag \
-            --notes-file /tmp/notes.md \
-            --title "${GITHUB_REF_NAME}" \
-            $flag
+          # Create or update: a force-pushed tag re-triggers this workflow against an
+          # existing release (422 on create). Edit it in that case.
+          if gh release view "${GITHUB_REF_NAME}" &>/dev/null; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --notes-file /tmp/notes.md \
+              --title "${GITHUB_REF_NAME}" \
+              $flag
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --notes-file /tmp/notes.md \
+              --title "${GITHUB_REF_NAME}" \
+              $flag
+          fi
