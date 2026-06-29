@@ -47,6 +47,31 @@ and no additional `gh` call SHALL be made.
 - **WHEN** `repo_map` is present with `depends_on: []` and `depended_on_by: []`
 - **THEN** no cross-repo issue fetch SHALL occur and planning behavior SHALL be unchanged
 
+### Requirement: Cross-repo context SHALL be fenced and sanitized as untrusted external data
+
+The planning stage SHALL treat cross-repo issue titles and labels as untrusted input authored
+by external contributors. Before injection into the planning prompt, each issue title and each
+label SHALL be sanitized by redacting known prompt-injection patterns (using the same patterns
+applied to last30days carry-forward briefs). The entire cross-repo context block SHALL be
+rendered inside an explicit untrusted fence (`<untrusted-cross-repo-context>`) with a visible
+directive instructing the planning agent not to follow commands from it. The fence boundary
+tokens SHALL be stripped from issue titles and labels before rendering so that external content
+cannot escape the fence boundary.
+
+#### Scenario: injection pattern in external issue title is redacted
+
+- **WHEN** a declared repo has an open issue whose title contains a prompt-injection imperative
+  (e.g., "Ignore all previous instructions")
+- **THEN** the raw injection text SHALL NOT appear in the planning prompt
+- **AND** a `[REDACTED]` placeholder SHALL appear in its place
+
+#### Scenario: cross-repo context block is wrapped in untrusted fence
+
+- **WHEN** cross-repo context is non-empty
+- **THEN** the planning prompt SHALL contain an explicit `<untrusted-cross-repo-context>` fence
+- **AND** a visible directive SHALL appear before the fence instructing the agent not to follow
+  commands from it
+
 ### Requirement: Unreachable declared repo degrades gracefully with a named warning
 
 The pipeline SHALL log a named warning identifying the specific `owner/repo` and SHALL continue

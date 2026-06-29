@@ -1671,8 +1671,12 @@ export async function gatherCrossRepoContext(
     }
     if (issues.length === 0) continue;
     const lines = issues.map((i) => {
-      const labelStr = i.labels.length > 0 ? ` [${i.labels.join(", ")}]` : "";
-      return `- #${i.number} ${i.title}${labelStr}`;
+      // Sanitize titles and labels before prompt injection: these originate from external
+      // contributors in declared repos and must be treated as untrusted input.
+      const safeTitle = sanitizeBriefForPrompt(i.title);
+      const safeLabels = i.labels.map((l) => sanitizeBriefForPrompt(l));
+      const labelStr = safeLabels.length > 0 ? ` [${safeLabels.join(", ")}]` : "";
+      return `- #${i.number} ${safeTitle}${labelStr}`;
     });
     sections.push(`### ${repo}\n\n${lines.join("\n")}`);
   }
