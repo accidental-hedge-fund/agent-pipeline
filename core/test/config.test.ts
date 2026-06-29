@@ -1662,3 +1662,97 @@ test("resolveConfig: plan_review_timeout: -1 is rejected (negative integer)", as
     process.env.PATH = oldPath;
   }
 });
+
+// ---- repo_map (#312) ----
+
+test("resolveConfig: repo_map absent → undefined (no defaults)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/rm0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.repo_map, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: valid repo_map with depends_on and depended_on_by resolves", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - acme/shared-lib\n  depended_on_by:\n    - acme/consumer-app\n`);
+  const binDir = makeFakeGh("acme/rm1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map?.depends_on, ["acme/shared-lib"]);
+    assert.deepEqual(cfg.repo_map?.depended_on_by, ["acme/consumer-app"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map with same repo in both lists is preserved", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - acme/shared\n  depended_on_by:\n    - acme/shared\n`);
+  const binDir = makeFakeGh("acme/rm2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map?.depends_on, ["acme/shared"]);
+    assert.deepEqual(cfg.repo_map?.depended_on_by, ["acme/shared"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map entry missing slash is rejected", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - notaslashrepo\n`);
+  const binDir = makeFakeGh("acme/rm3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map entry with two slashes is rejected", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - acme/shared/extra\n`);
+  const binDir = makeFakeGh("acme/rm4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map unknown sub-key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  unknown_key: []\n`);
+  const binDir = makeFakeGh("acme/rm5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

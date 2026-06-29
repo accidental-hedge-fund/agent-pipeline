@@ -846,7 +846,7 @@ async function main(): Promise<void> {
         roadmapCfg.repo_dir,
         roadmapCfg.base_branch,
         roadmapCfg.roadmap ?? {},
-        { apply: !!opts.apply, next: opts.next, dryRun: opts.dryRun },
+        { apply: !!opts.apply, next: opts.next, dryRun: opts.dryRun, repoMap: roadmapCfg.repo_map },
         realRoadmapDeps(roadmapCfg),
       );
     } catch (err) {

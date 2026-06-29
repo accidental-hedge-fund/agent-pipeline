@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { runNext, runRoadmap } from "../scripts/roadmap/index.ts";
 import type { RoadmapDeps, RoadmapOpts } from "../scripts/roadmap/index.ts";
-import type { PlanJson, Issue } from "../scripts/roadmap/types.ts";
+import type { CrossRepoDep, PlanJson, Issue } from "../scripts/roadmap/types.ts";
 
 function makeIssue(n: number): Issue {
   return {
@@ -577,5 +577,84 @@ describe("runRoadmap - --next validation", () => {
     const opts: RoadmapOpts = { apply: false, next: 3, outputDir: "/tmp/test-next-valid" };
     await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
     assert.ok(!enginePhaseRan, "engine phases must not run for a valid --next");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-repo dependency annotations (#312)
+// ---------------------------------------------------------------------------
+
+describe("runRoadmap: cross-repo (repo_map)", () => {
+  it("absent repoMap → plan.json has empty cross_repo array", async () => {
+    const written: Record<string, string> = {};
+    const deps = makeDeps({ writeFile: async (p, c) => { written[p] = c; } });
+    const opts: RoadmapOpts = { apply: false, dryRun: true, outputDir: "/tmp/test-xr-absent" };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+    const planJson = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planJson, "plan.json must be written");
+    const plan = JSON.parse(planJson!) as PlanJson;
+    assert.deepEqual(plan.dependency_graph.cross_repo, [], "cross_repo must be empty when no repoMap");
+  });
+
+  it("repoMap with declared repo, issue text references it → cross_repo entry in plan", async () => {
+    const written: Record<string, string> = {};
+
+    const deps = makeDeps({
+      // Primary repo has issue that mentions "acme/shared-lib"
+      getOpenIssues: async (repo) => {
+        if (repo === "example/repo") {
+          return [{
+            number: 1, title: "Integrate acme/shared-lib", body: "We depend on acme/shared-lib for this feature.",
+            labels: [], url: "https://github.com/example/repo/issues/1", state: "open" as const,
+          }];
+        }
+        if (repo === "acme/shared-lib") {
+          return [{ number: 10, title: "Shared lib issue", body: "", labels: [], url: "https://github.com/acme/shared-lib/issues/10", state: "open" as const }];
+        }
+        return [];
+      },
+      writeFile: async (p, c) => { written[p] = c; },
+    });
+
+    const opts: RoadmapOpts = {
+      apply: false, dryRun: true,
+      outputDir: "/tmp/test-xr-match",
+      repoMap: { depends_on: ["acme/shared-lib"], depended_on_by: [] },
+    };
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+
+    const planJson = Object.values(written).find((c) => {
+      try { return JSON.parse(c)?.dependency_graph !== undefined; } catch { return false; }
+    });
+    assert.ok(planJson, "plan.json must be written");
+    const plan = JSON.parse(planJson!) as PlanJson;
+    const crossRepo: CrossRepoDep[] = plan.dependency_graph.cross_repo ?? [];
+    const entry = crossRepo.find((e) => e.repo === "acme/shared-lib" && e.local_issue === 1);
+    assert.ok(entry, `expected cross_repo entry for local #1 → acme/shared-lib; got: ${JSON.stringify(crossRepo)}`);
+    assert.equal(entry!.direction, "depends_on");
+    assert.ok(!plan.dependency_graph.must_precede.some((e) => e.after === 1 || e.before === 1),
+      "cross-repo annotation must not appear in must_precede");
+  });
+
+  it("unreachable declared repo → named warning logged, run continues", async () => {
+    const logs: string[] = [];
+    const deps = makeDeps({
+      getOpenIssues: async (repo) => {
+        if (repo === "acme/bad-lib") throw new Error("HTTP 404");
+        return [makeIssue(1), makeIssue(2)];
+      },
+      log: (msg) => logs.push(msg),
+    });
+    const opts: RoadmapOpts = {
+      apply: false, dryRun: true,
+      outputDir: "/tmp/test-xr-unreachable",
+      repoMap: { depends_on: ["acme/bad-lib"], depended_on_by: [] },
+    };
+    // Should not throw
+    await runRoadmap("example/repo", "/repo", "main", {}, opts, deps);
+    const warning = logs.find((m) => m.includes("acme/bad-lib") && m.includes("unreachable"));
+    assert.ok(warning, `expected named unreachable warning; got: ${logs.join(" | ")}`);
   });
 });

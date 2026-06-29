@@ -58,6 +58,8 @@ export interface BuildPlanArgs {
   carryForward?: string;
   /** Pre-rendered context snapshot block (human comments, fenced). When absent, omitted. */
   contextSnapshot?: string;
+  /** Cross-repo context summary from repo_map-declared repos. When absent, omitted. */
+  crossRepoContext?: string;
 }
 
 export function buildPlanningPrompt(a: BuildPlanArgs): string {
@@ -71,6 +73,7 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
     body: a.body || "(no description)",
     context_snapshot: contextSnapshotSection(a.contextSnapshot),
     carry_forward_context: carryForwardSection(a.carryForward),
+    cross_repo_context: crossRepoContextSection(a.crossRepoContext),
   });
 }
 
@@ -91,6 +94,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanningOpenspecArgs): strin
     body: a.body || "(no description)",
     context_snapshot: contextSnapshotSection(a.contextSnapshot),
     carry_forward_context: carryForwardSection(a.carryForward),
+    cross_repo_context: crossRepoContextSection(a.crossRepoContext),
     pipeline_run_id: a.pipelineRunId,
   });
 }
@@ -395,6 +399,11 @@ function contextSnapshotSection(rendered?: string): string {
   // {{context_snapshot}} immediately after {{body}} with no intervening blank line,
   // so the section contributes the separator when present and nothing when absent.
   return '\n\n' + rendered.trim();
+}
+
+function crossRepoContextSection(s?: string): string {
+  if (!s || !s.trim()) return "";
+  return "\n\n" + s.trim();
 }
 
 function carryForwardSection(s?: string): string {

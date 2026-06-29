@@ -15,6 +15,7 @@ import {
   createPr,
   extractHumanPlanComments,
   getIssueDetail,
+  getOpenIssues,
   getPrForBranch,
   getPrForIssue,
   postComment,
@@ -159,6 +160,7 @@ export interface PlanningPhaseHooks {
     pipelineRunId: string,
     deps: RunPlanningPhasesDeps,
     contextSnapshot?: string,
+    crossRepoContext?: string,
   ): Promise<
     | {
         ok: true;
@@ -249,7 +251,8 @@ export interface PlanningPhaseHooks {
 type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
   PlanStepDeps &
   ImplementerInvokeDeps &
-  ResumeFromImplementingDeps & {
+  ResumeFromImplementingDeps &
+  CrossRepoContextDeps & {
     getIssueDetail?: typeof getIssueDetail;
     setBlocked?: typeof setBlocked;
     transition?: typeof transition;
@@ -413,8 +416,11 @@ export async function runPlanningPhases(
 
   try {
 
-  // ---- Step 0: optional carry-forward context (last30days) ----
-  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
+  // ---- Step 0: optional carry-forward context (last30days) + cross-repo context ----
+  const [carryForward, crossRepoContext] = await Promise.all([
+    gatherCarryForward(cfg, issueNumber, title, body),
+    gatherCrossRepoContext(cfg, issueNumber, deps),
+  ]);
 
   // ---- Worktree bootstrap: create + dependency install ----
   // NOTE: snapshot is gathered AFTER bootstrap so any human comments posted
@@ -440,7 +446,7 @@ export async function runPlanningPhases(
   const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
 
   // ---- Author the planning artifact ----
-  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot);
+  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext);
   if (!authorResult.ok) {
     await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
@@ -769,9 +775,9 @@ async function advanceOpenspec(
  */
 export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, body: string): PlanningPhaseHooks {
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot, crossRepoContext) {
       const primary: Harness = innerCfg.harnesses.implementer;
-      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot });
+      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext });
       let planResult: HarnessResult;
       try {
         planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "planning" });
@@ -854,7 +860,7 @@ export function makeOpenspecPlanningHooks(
   let changeId = "";
 
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext) {
       const primary: Harness = innerCfg.harnesses.implementer;
       const doGit = deps.gitInWorktree ?? gitInWorktree;
       const isInit = deps.openspecIsInitialized ?? openspec.isInitialized;
@@ -902,7 +908,7 @@ export function makeOpenspecPlanningHooks(
       const planResult = await inv(
         primary,
         wt.path,
-        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, pipelineRunId }),
+        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId }),
         {
           timeoutSec: innerCfg.implementation_timeout,
           model: planModel,
@@ -1613,6 +1619,70 @@ export async function gatherCarryForward(
   );
   console.log(`[pipeline] #${issueNumber}: last30days brief posted + carried into planning`);
   return sanitizedBrief;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-repo context (#312): open issues from declared repo_map repos
+// ---------------------------------------------------------------------------
+
+/** Injectable seam for unit-testing `gatherCrossRepoContext` without real gh calls. */
+export interface CrossRepoContextDeps {
+  getOpenIssues?: typeof getOpenIssues;
+}
+
+/**
+ * When `cfg.repo_map` declares related repos, fetch open issues from each declared
+ * repo (`depends_on` ∪ `depended_on_by`) and return a formatted context block for
+ * injection into the planning prompt. Non-blocking: an unreachable repo logs a named
+ * warning and is skipped; the run continues with whatever context was fetched.
+ *
+ * Returns "" when `repo_map` is absent/empty (no gh call is made).
+ */
+export async function gatherCrossRepoContext(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: CrossRepoContextDeps = {},
+): Promise<string> {
+  const repoMap = cfg.repo_map;
+  if (!repoMap) return "";
+  const allDeclared = [...(repoMap.depends_on ?? []), ...(repoMap.depended_on_by ?? [])];
+  if (allDeclared.length === 0) return "";
+
+  const getIssuesFn = deps.getOpenIssues ?? getOpenIssues;
+
+  // Deduplicate repos; depends_on wins over depended_on_by for same repo.
+  const repoSet = new Set<string>();
+  for (const r of (repoMap.depended_on_by ?? [])) repoSet.add(r);
+  for (const r of (repoMap.depends_on ?? [])) repoSet.add(r);
+
+  console.log(`[pipeline] #${issueNumber}: gathering cross-repo context from ${repoSet.size} declared repo(s)`);
+
+  const sections: string[] = [];
+
+  for (const repo of repoSet) {
+    let issues: Awaited<ReturnType<typeof getOpenIssues>>;
+    try {
+      issues = await getIssuesFn(repo);
+    } catch (err) {
+      console.warn(
+        `[pipeline] #${issueNumber}: repo_map: ${repo} unreachable — continuing without its cross-repo context: ${(err as Error).message}`,
+      );
+      continue;
+    }
+    if (issues.length === 0) continue;
+    const lines = issues.map((i) => {
+      const labelStr = i.labels.length > 0 ? ` [${i.labels.join(", ")}]` : "";
+      return `- #${i.number} ${i.title}${labelStr}`;
+    });
+    sections.push(`### ${repo}\n\n${lines.join("\n")}`);
+  }
+
+  if (sections.length === 0) return "";
+
+  const header = "## Cross-Repo Context (declared related repos — open issues only)";
+  const result = `${header}\n\n${sections.join("\n\n")}`;
+  console.log(`[pipeline] #${issueNumber}: cross-repo context gathered (${repoSet.size} repo(s))`);
+  return result;
 }
 
 /**

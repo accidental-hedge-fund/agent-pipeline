@@ -17,6 +17,8 @@ import type {
   RoadmapConfig,
   RoadmapEntry,
   InventoryItem,
+  CrossRepoDep,
+  DepGraph,
 } from "./types.ts";
 import { buildInventory, computeBacklogSha } from "./inventory.ts";
 import type { InventoryDeps } from "./inventory.ts";
@@ -37,6 +39,9 @@ export interface RoadmapOpts {
   next?: number;
   dryRun?: boolean;
   outputDir?: string;
+  /** Cross-repo dependency map from config.repo_map. When set and non-empty,
+   *  the engine gathers cross-repo annotations after the depgraph phase. */
+  repoMap?: { depends_on: string[]; depended_on_by: string[] };
 }
 
 export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps {
@@ -378,6 +383,71 @@ export async function runNext(
 }
 
 /**
+ * Gather cross-repo dependency annotations when repo_map is configured.
+ * Non-blocking: logs a named warning for unreachable repos and continues.
+ * Deduplicates repos across both directions, fetching each exactly once.
+ * Returns the dep graph with `cross_repo` populated.
+ */
+async function gatherCrossRepoDeps(
+  graph: DepGraph,
+  items: InventoryItem[],
+  opts: RoadmapOpts,
+  deps: Pick<RoadmapDeps, "getOpenIssues" | "log">,
+): Promise<DepGraph> {
+  const repoMap = opts.repoMap;
+  if (!repoMap) return graph;
+  const allDeclared = [...(repoMap.depends_on ?? []), ...(repoMap.depended_on_by ?? [])];
+  if (allDeclared.length === 0) return graph;
+
+  deps.log("[roadmap] phase 3b: gathering cross-repo dependency annotations...");
+
+  // Deduplicate repos; if a repo appears in both directions, favour depends_on.
+  const repoDirection = new Map<string, "depends_on" | "depended_on_by">();
+  for (const r of (repoMap.depended_on_by ?? [])) repoDirection.set(r, "depended_on_by");
+  for (const r of (repoMap.depends_on ?? [])) repoDirection.set(r, "depends_on");
+
+  const crossRepo: CrossRepoDep[] = [];
+
+  for (const [declaredRepo, direction] of repoDirection) {
+    let declaredIssues: { number: number; title: string }[];
+    try {
+      declaredIssues = await deps.getOpenIssues(declaredRepo);
+    } catch (err) {
+      deps.log(
+        `[roadmap] repo_map: ${declaredRepo} unreachable — continuing without its cross-repo edges: ${(err as Error).message}`,
+      );
+      continue;
+    }
+
+    const declaredIssueNumbers = new Set(declaredIssues.map((i) => i.number));
+    const repoLower = declaredRepo.toLowerCase();
+
+    for (const item of items) {
+      const text = `${item.issue.title} ${item.issue.body}`;
+      const textLower = text.toLowerCase();
+      const mentionsRepo = textLower.includes(repoLower);
+      const mentionedIssueNums = [...text.matchAll(/#(\d+)/g)]
+        .map((m) => Number.parseInt(m[1]!, 10))
+        .filter((n) => declaredIssueNumbers.has(n));
+
+      if (mentionsRepo || mentionedIssueNums.length > 0) {
+        crossRepo.push({
+          local_issue: item.issue.number,
+          repo: declaredRepo,
+          direction,
+          rationale: mentionsRepo
+            ? `local issue text references \`${declaredRepo}\``
+            : `local issue references #${mentionedIssueNums[0]} from \`${declaredRepo}\``,
+        });
+      }
+    }
+  }
+
+  deps.log(`[roadmap] phase 3b: ${crossRepo.length} cross-repo annotation(s) identified`);
+  return { ...graph, cross_repo: crossRepo };
+}
+
+/**
  * Main roadmap engine: orchestrates all 7 phases.
  */
 export async function runRoadmap(
@@ -442,6 +512,11 @@ export async function runRoadmap(
     buildDepgraph(items, deps, config),
   );
   let depGraph = depGraphResult;
+
+  // Phase 3b: Cross-repo dependency annotations (non-blocking, opt-in via repo_map)
+  depGraph = await timed("cross-repo", () =>
+    gatherCrossRepoDeps(depGraph, items, opts, deps),
+  );
 
   // Phase 4: Score
   const scored_result = await timed("score", async () => {

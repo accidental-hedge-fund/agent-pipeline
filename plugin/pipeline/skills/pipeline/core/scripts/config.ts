@@ -237,6 +237,25 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Stage-aware issue context snapshot settings (#318)."),
+  // Cross-repo dependency map (#312). Declares inter-repo relationships for
+  // supplemental planning context and roadmap cross-repo dependency annotations.
+  // Declarative only: no cross-repo write, PR creation, label/status sync, or
+  // CI gating. Relationships are declared independently per repo; no reverse-edge
+  // inference is performed.
+  repo_map: z
+    .object({
+      depends_on: z
+        .array(z.string().regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/repo format (exactly one '/')"))
+        .optional()
+        .describe("Repos this repo consumes (owner/repo strings). The planning stage fetches open issues from these repos as supplemental context."),
+      depended_on_by: z
+        .array(z.string().regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/repo format (exactly one '/')"))
+        .optional()
+        .describe("Repos that consume this repo (owner/repo strings). The planning stage fetches open issues from these repos as supplemental context."),
+    })
+    .strict()
+    .optional()
+    .describe("Cross-repo dependency map: declares inter-repo relationships for planning context and roadmap cross-repo dependency annotations (#312)."),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
@@ -454,6 +473,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       allow_paths: fileConfig.auto_merge_eligibility?.allow_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.allow_paths,
       min_confidence: fileConfig.auto_merge_eligibility?.min_confidence ?? DEFAULT_CONFIG.auto_merge_eligibility.min_confidence,
     },
+    repo_map: fileConfig.repo_map
+      ? {
+          depends_on: fileConfig.repo_map.depends_on ?? [],
+          depended_on_by: fileConfig.repo_map.depended_on_by ?? [],
+        }
+      : undefined,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
@@ -1207,6 +1232,21 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     config.queue !== undefined ? `\nqueue:\n${yamlBlock(config.queue, 2)}` : undefined,
     config.auto_merge_eligibility !== undefined ? `\nauto_merge_eligibility:\n${yamlBlock(config.auto_merge_eligibility, 2)}` : undefined,
     config.context_snapshot !== undefined ? `\ncontext_snapshot:\n${yamlBlock(config.context_snapshot, 2)}` : undefined,
+    config.repo_map !== undefined
+      ? [
+        "",
+        "repo_map: # cross-repo dependency map (#312) — declare inter-repo relationships for planning context",
+        `  depends_on: ${yamlInline(config.repo_map.depends_on ?? [])} # owner/repo strings this repo consumes`,
+        `  depended_on_by: ${yamlInline(config.repo_map.depended_on_by ?? [])} # owner/repo strings that consume this repo`,
+      ].join("\n")
+      : [
+        "",
+        "# repo_map: # cross-repo dependency map (#312) — uncomment to declare inter-repo relationships",
+        "#   # When set, the planning stage fetches open issues from declared repos as supplemental context.",
+        "#   # Relationships are declared independently per repo; no reverse-edge inference is performed.",
+        "#   depends_on: [] # owner/repo strings this repo consumes (e.g. - acme/shared-lib)",
+        "#   depended_on_by: [] # owner/repo strings that consume this repo (e.g. - acme/consumer-app)",
+      ].join("\n"),
   ].filter((line): line is string => line !== undefined);
 
   return `${parts.join("\n")}\n`;
@@ -1257,6 +1297,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     queue: config.queue,
     auto_merge_eligibility: config.auto_merge_eligibility,
     context_snapshot: config.context_snapshot,
+    repo_map: config.repo_map,
   };
 }
 

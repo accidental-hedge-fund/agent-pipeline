@@ -289,3 +289,31 @@ test("CLI: `pipeline init` with invalid pre-existing .github/pipeline.yml ensure
   // Invalid file must be preserved (not overwritten by scaffold).
   assert.equal(fs.readFileSync(configPath, "utf8"), invalidContent, "invalid config file must be preserved");
 });
+
+// ---- repo_map scaffold (#312) ----
+
+test("scaffoldDefaultConfig: scaffolded file includes commented-out repo_map block", async () => {
+  const repo = makeTempRepo();
+  await scaffoldDefaultConfig(repo);
+  const content = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  // The scaffold must include a commented-out repo_map block with depends_on and depended_on_by.
+  assert.ok(content.includes("repo_map"), "scaffold must mention repo_map");
+  assert.ok(content.includes("depends_on"), "scaffold must mention depends_on");
+  assert.ok(content.includes("depended_on_by"), "scaffold must mention depended_on_by");
+});
+
+test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map absent (undefined)", async () => {
+  const repo = makeTempRepo();
+  const binDir = makeFakeGhBin({ repoSlug: "acme/scaffold-rm" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    await scaffoldDefaultConfig(repo);
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    // The commented-out block must not activate — repo_map stays undefined.
+    assert.equal(cfg.repo_map, undefined, "repo_map must be undefined when scaffold comments it out");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

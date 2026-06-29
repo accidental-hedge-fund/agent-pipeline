@@ -11,6 +11,7 @@ import {
   buildSetupHint,
   formatHumanFeedback,
   gatherCarryForward,
+  gatherCrossRepoContext,
   HUMAN_FEEDBACK_ACK_HEADER,
   makeFreeformPlanningHooks,
   makeOpenspecPlanningHooks,
@@ -20,10 +21,12 @@ import {
   sanitizeBriefForPrompt,
   validateHumanFeedbackAck,
   type CarryForwardDeps,
+  type CrossRepoContextDeps,
   type PlanningPhaseHooks,
 } from "../scripts/stages/planning.ts";
 import type { BriefResult } from "../scripts/last30days.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
+import type { OpenIssue } from "../scripts/gh.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const enabledCfg = {
@@ -1255,4 +1258,102 @@ test("runPlanningPhases: context snapshot is gathered after bootstrap (#318 Find
     getIssueDetailCallsAfterBootstrap.every(Boolean),
     "all getIssueDetail calls (including snapshot) must occur after bootstrapWorktree completes",
   );
+});
+
+// ---------------------------------------------------------------------------
+// gatherCrossRepoContext (#312)
+// ---------------------------------------------------------------------------
+
+function makeOpenIssue(n: number, title = `Issue ${n}`, labels: string[] = []): OpenIssue {
+  return { number: n, title, body: "", labels, url: `https://github.com/example/repo/issues/${n}`, state: "open" };
+}
+
+function makeRepoMapCfg(depends_on: string[] = [], depended_on_by: string[] = []): PipelineConfig {
+  return { repo_map: { depends_on, depended_on_by } } as unknown as PipelineConfig;
+}
+
+async function captureWarnings(t: TestContext, fn: () => Promise<void>): Promise<string[]> {
+  const warned: string[] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    warned.push(args.map(String).join(" "));
+  });
+  await fn();
+  return warned;
+}
+
+test("gatherCrossRepoContext: absent repo_map returns '' without gh call", async () => {
+  const cfg = { } as unknown as PipelineConfig;
+  const fetched: string[] = [];
+  const deps: CrossRepoContextDeps = {
+    getOpenIssues: async (repo) => { fetched.push(repo); return []; },
+  };
+  const result = await gatherCrossRepoContext(cfg, 1, deps);
+  assert.equal(result, "");
+  assert.deepEqual(fetched, []);
+});
+
+test("gatherCrossRepoContext: empty depends_on/depended_on_by returns '' without gh call", async () => {
+  const cfg = makeRepoMapCfg([], []);
+  const fetched: string[] = [];
+  const deps: CrossRepoContextDeps = {
+    getOpenIssues: async (repo) => { fetched.push(repo); return []; },
+  };
+  const result = await gatherCrossRepoContext(cfg, 1, deps);
+  assert.equal(result, "");
+  assert.deepEqual(fetched, []);
+});
+
+test("gatherCrossRepoContext: single depends_on repo with issues formats output", async () => {
+  const cfg = makeRepoMapCfg(["acme/shared-lib"]);
+  const deps: CrossRepoContextDeps = {
+    getOpenIssues: async () => [
+      makeOpenIssue(10, "Add widget API", ["enhancement"]),
+      makeOpenIssue(11, "Fix null pointer"),
+    ],
+  };
+  const result = await gatherCrossRepoContext(cfg, 1, deps);
+  assert.ok(result.includes("## Cross-Repo Context"), "must include section header");
+  assert.ok(result.includes("acme/shared-lib"), "must include repo name");
+  assert.ok(result.includes("#10 Add widget API [enhancement]"), "must include issue with label");
+  assert.ok(result.includes("#11 Fix null pointer"), "must include issue without label");
+});
+
+test("gatherCrossRepoContext: both directions contribute, same repo deduplicated", async () => {
+  const cfg = makeRepoMapCfg(["acme/shared"], ["acme/shared"]);
+  const fetched: string[] = [];
+  const deps: CrossRepoContextDeps = {
+    getOpenIssues: async (repo) => { fetched.push(repo); return [makeOpenIssue(5)]; },
+  };
+  const result = await gatherCrossRepoContext(cfg, 1, deps);
+  // Same repo in both lists → only fetched once
+  assert.equal(fetched.length, 1, "deduplicated repo must be fetched exactly once");
+  assert.ok(result.includes("acme/shared"));
+});
+
+test("gatherCrossRepoContext: unreachable repo logs named warning and continues", async (t) => {
+  const cfg = makeRepoMapCfg(["acme/good-lib", "acme/bad-lib"]);
+  const deps: CrossRepoContextDeps = {
+    getOpenIssues: async (repo) => {
+      if (repo === "acme/bad-lib") throw new Error("Not Found");
+      return [makeOpenIssue(1)];
+    },
+  };
+  const warned = await captureWarnings(t, async () => {
+    const result = await gatherCrossRepoContext(cfg, 99, deps);
+    // good-lib still contributes
+    assert.ok(result.includes("acme/good-lib"), "reachable repo must appear in output");
+    assert.ok(!result.includes("acme/bad-lib"), "unreachable repo must not appear in output");
+  });
+  const warningMsg = warned.find((m) => m.includes("acme/bad-lib") && m.includes("unreachable"));
+  assert.ok(warningMsg, `expected named warning for unreachable repo, got: ${warned.join(" | ")}`);
+  assert.ok(warningMsg!.includes("Not Found"), "warning must include the error message");
+});
+
+test("gatherCrossRepoContext: repo with no open issues is omitted from output", async () => {
+  const cfg = makeRepoMapCfg(["acme/empty-repo"]);
+  const deps: CrossRepoContextDeps = {
+    getOpenIssues: async () => [],
+  };
+  const result = await gatherCrossRepoContext(cfg, 1, deps);
+  assert.equal(result, "");
 });
