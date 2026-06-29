@@ -171,7 +171,9 @@ function renderShim(profile) {
 // `skillPath` is the path prefix used in the Invoke line (differs between
 // personal install and plugin install).
 export function renderClaudeCommand(op, skillPath) {
-  const argHintLine = op.argHint ? `argument-hint: ${op.argHint}` : "";
+  // Single-quote the argHint value so YAML parsers don't misinterpret [ or : characters.
+  // None of the current argHint values contain single quotes, so '' escaping is not triggered.
+  const argHintLine = op.argHint ? `argument-hint: '${op.argHint.replace(/'/g, "''")}'` : "";
   const invocation = op.specialCli
     ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
     : op.argHint

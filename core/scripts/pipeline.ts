@@ -559,6 +559,20 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     if (opts.detach) {
+      // Guard: reject mode-selector flags before launching a detached advance,
+      // just as the `pipeline N --detach` canonical path does (lines ~591-602).
+      const runModeConflicts: Array<[string, boolean | string | undefined]> = [
+        ["--status", opts.status],
+        ["--summary", opts.summary],
+        ["--unblock", opts.unblock !== undefined],
+        ["--override", opts.override !== undefined],
+      ];
+      for (const [flag, active] of runModeConflicts) {
+        if (active) {
+          console.error(`pipeline run: --detach cannot be combined with ${flag}. These are separate modes.`);
+          process.exit(2);
+        }
+      }
       // Detach path: spawn a background wrapper and exit.
       await handleRunSubcommand(cmd.args[1] ?? "", opts);
       return;
@@ -1097,6 +1111,13 @@ async function main(): Promise<void> {
       );
       process.exit(2);
     }
+    // Kill-switch check: same gate as the legacy `pipeline N --unblock` form.
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
+    }
     const unblockN = Number.parseInt(unblockNumStr, 10);
     let unblockIssueNumber: number;
     try {
@@ -1130,6 +1151,13 @@ async function main(): Promise<void> {
           '  Example: pipeline override 42 "abc123: deferred #99"',
       );
       process.exit(2);
+    }
+    // Kill-switch check: same gate as the legacy `pipeline N --override` form.
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
     }
     const overrideN = Number.parseInt(overrideNumStr, 10);
     let overrideIssueNumber: number;

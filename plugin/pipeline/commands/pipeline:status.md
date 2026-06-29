@@ -1,6 +1,6 @@
 ---
 description: Read-only status of issue or PR N — stage, blocker, PR, last review
-argument-hint: <N>
+argument-hint: '<N>'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs status $ARGUMENTS`

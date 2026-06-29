@@ -1,6 +1,6 @@
 ---
 description: Prepare a release PR for the given version
-argument-hint: <version | major | minor | patch>
+argument-hint: '<version | major | minor | patch>'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs release $ARGUMENTS`

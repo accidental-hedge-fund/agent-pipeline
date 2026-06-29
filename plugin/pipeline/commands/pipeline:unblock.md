@@ -1,6 +1,6 @@
 ---
 description: Post the answer and clear the blocked label for issue N
-argument-hint: <N> "<answer>"
+argument-hint: '<N> "<answer>"'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs unblock $ARGUMENTS`

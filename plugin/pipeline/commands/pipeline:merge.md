@@ -1,6 +1,6 @@
 ---
 description: Human-only squash merge of a ready-to-deploy PR
-argument-hint: <pr>
+argument-hint: '<pr>'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs merge $ARGUMENTS`

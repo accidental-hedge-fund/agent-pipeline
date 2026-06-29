@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { load as yamlLoad } from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // core/test/ → ../../ = repo root, then plugin/pipeline/commands/
@@ -146,5 +147,37 @@ test("namespaced-commands 7.5c: each command file's front-matter slug matches it
       content.includes(opName),
       `${file}: content should reference the operation name "${opName}"`,
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7.5d  Every command file's YAML frontmatter parses without error (#273 review-2)
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5d: every command file's YAML frontmatter is valid and parseable", () => {
+  let files: string[];
+  try {
+    files = readdirSync(COMMANDS_DIR).filter((f) => f.endsWith(".md"));
+  } catch {
+    // Missing dir caught by 7.5a; skip here to keep error messages clean
+    return;
+  }
+
+  for (const file of files) {
+    const content = readFileSync(join(COMMANDS_DIR, file), "utf8");
+    // Extract the YAML frontmatter block (between the first two `---` lines)
+    const match = /^---\n([\s\S]*?)\n---/m.exec(content);
+    assert.ok(match, `${file}: no YAML frontmatter found`);
+    const frontmatter = match[1];
+    let parsed: unknown;
+    assert.doesNotThrow(() => {
+      parsed = yamlLoad(frontmatter);
+    }, `${file}: frontmatter failed YAML parsing`);
+    assert.ok(
+      parsed !== null && typeof parsed === "object",
+      `${file}: frontmatter parsed to a non-object`,
+    );
+    const fm = parsed as Record<string, unknown>;
+    assert.ok(typeof fm["description"] === "string", `${file}: frontmatter missing 'description' key`);
   }
 });

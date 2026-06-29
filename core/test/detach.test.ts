@@ -751,3 +751,30 @@ test("CLI: `pipeline 42 --status --detach` rejects incompatible mode flag (exit 
   assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
   assert.match(r.stderr, /--detach cannot be combined/i);
 });
+
+// ---------------------------------------------------------------------------
+// Review-2 finding (#273): legacy `run` alias must also apply the mode-selector
+// conflict check before calling handleRunSubcommand via the --detach path.
+// `pipeline run 42 --status --detach` must exit 2 without starting a background
+// advance, just as `pipeline 42 --status --detach` does.
+// ---------------------------------------------------------------------------
+
+test("CLI: `pipeline run 42 --status --detach` rejects incompatible mode flag via run alias (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "run", "42", "--status", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /--detach cannot be combined/i);
+});
+
+test("CLI: `pipeline run 42 --summary --detach` rejects incompatible mode flag via run alias (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "run", "42", "--summary", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /--detach cannot be combined/i);
+});

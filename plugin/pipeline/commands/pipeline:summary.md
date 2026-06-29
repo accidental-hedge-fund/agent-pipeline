@@ -1,6 +1,6 @@
 ---
 description: Print the evidence bundle for issue N
-argument-hint: <N>
+argument-hint: '<N>'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs $1 --summary`
