@@ -35,6 +35,11 @@ import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker } from "./review.ts";
 import type { RunStoreDeps } from "../run-store.ts";
+import {
+  computeBranchDeveloperCommits,
+  enforceSpecConsistencyGuard,
+  type FixCommit,
+} from "../openspec-consistency.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -56,6 +61,8 @@ export interface AdvanceFixDeps {
   gitDiffFiles?: (wtPath: string, from: string, to: string) => Promise<string[]>;
   /** Validate one OpenSpec change (defaults to `openspec.validateItem`). */
   openspecValidateItem?: (wtPath: string, id: string) => Promise<ValidateResult>;
+  /** Branch commits used by the stale OpenSpec-delta guard. */
+  branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
   /** Format/lint gate runner (#182); defaults to runFormatGate. */
   runFormatGate?: typeof runFormatGate;
   /** Format+test gate runner (defaults to runFormatAndTestGates); injectable for tests. */
@@ -272,6 +279,24 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: gates.reason,
       blockerKind: gates.source === "test" ? "test-gate-exhausted" : "needs-human" };
   }
+
+  const postGateDiff = await gitInWorktree(
+    wt.path,
+    ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+    { ignoreFailure: true },
+  );
+  const activeChangeIds = openspec
+    .changeIdsFromPaths(postGateDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
+    .filter((id) => openspec.changeDirExists(wt.path, id));
+  const consistencyGuard = await enforceFixOpenspecConsistency(
+    cfg,
+    issueNumber,
+    stage,
+    wt.path,
+    activeChangeIds,
+    deps,
+  );
+  if (consistencyGuard) return consistencyGuard;
 
   const branch = branchName(issueNumber, wt.slug);
   const push = await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
@@ -584,4 +609,25 @@ export async function enforceOpenspecSpecDeltaValidation(
     }
   }
   return { ok: true };
+}
+
+export async function enforceFixOpenspecConsistency(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  stage: Stage,
+  wtPath: string,
+  changeIds: string[],
+  deps: Pick<AdvanceFixDeps, "branchDeveloperCommits"> & {
+    getIssueDetail?: typeof getIssueDetail;
+    setBlocked?: typeof setBlocked;
+  } = {},
+): Promise<Outcome | null> {
+  if (changeIds.length === 0) return null;
+  return enforceSpecConsistencyGuard(cfg, issueNumber, wtPath, changeIds, {
+    branchDeveloperCommits:
+      deps.branchDeveloperCommits ?? ((innerWtPath, base) => computeBranchDeveloperCommits(gitInWorktree, innerWtPath, base)),
+    getIssueDetail: deps.getIssueDetail ?? getIssueDetail,
+    setBlocked: deps.setBlocked ?? setBlocked,
+    blockStage: stage,
+  });
 }

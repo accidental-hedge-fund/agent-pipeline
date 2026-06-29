@@ -6,6 +6,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   selectIssues,
   buildBatchSummary,
@@ -13,6 +16,8 @@ import {
   validateQueueOpts,
   STAGE_PRIORITY_SCORE,
   runQueue,
+  queueBatchLockPath,
+  withQueueBatchLock,
   type EligibleIssue,
   type QueueDeps,
   type QueueOpts,
@@ -615,6 +620,63 @@ test("Finding 2 regression: budgetDollars=0 launches no runs at all", async () =
   const summary = JSON.parse(summaryStr);
   assert.equal(summary.halt_reason, "budget_exhausted");
   assert.equal(summary.aggregate.total_issues, 0);
+});
+
+test("runQueue: executes the batch under the injected queue lock", async () => {
+  const issues = [makeIssue(1)];
+  const order: string[] = [];
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    withQueueLock: async (_repoDir, fn) => {
+      order.push("lock-start");
+      try {
+        return await fn();
+      } finally {
+        order.push("lock-end");
+      }
+    },
+    runPipeline: async (n) => {
+      order.push(`run-${n}`);
+      return { issueNumber: n, finalState: "ready-to-deploy", costUsd: 0.1, durationMs: 50 };
+    },
+  });
+
+  await runQueue(makeOpts({ maxIssues: 1 }), deps);
+
+  assert.deepEqual(order, ["lock-start", "run-1", "lock-end"]);
+});
+
+test("withQueueBatchLock: rejects a concurrent live queue lock", async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-queue-lock-live-"));
+  try {
+    fs.mkdirSync(path.dirname(queueBatchLockPath(repo)), { recursive: true });
+    fs.writeFileSync(queueBatchLockPath(repo), String(process.pid), "utf8");
+    let ran = false;
+
+    await assert.rejects(
+      () => withQueueBatchLock(repo, async () => { ran = true; }),
+      /another queue batch is already active/,
+    );
+    assert.equal(ran, false, "callback must not run when a live lock exists");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("withQueueBatchLock: clears stale queue lock and releases after callback", async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-queue-lock-stale-"));
+  try {
+    fs.mkdirSync(path.dirname(queueBatchLockPath(repo)), { recursive: true });
+    fs.writeFileSync(queueBatchLockPath(repo), "999999999", "utf8");
+    let ran = false;
+
+    await withQueueBatchLock(repo, async () => { ran = true; });
+
+    assert.equal(ran, true);
+    assert.equal(fs.existsSync(queueBatchLockPath(repo)), false, "lock must be released after callback");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("Finding 3 regression: aggregate.excluded_count is present in batch summary", () => {

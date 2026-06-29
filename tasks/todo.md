@@ -22,3 +22,25 @@
   follow-up preview reports it is already current.
 - Final verification passed: OpenSpec validation, config validation, sync no-op,
   `git diff --check`, focused config/init tests, and full `npm run ci`.
+
+# Pipeline Throughput Remediation
+
+- [x] Create OpenSpec change artifacts for throughput/stage observability remediation.
+- [x] Fix stage lifecycle labels and accounting for planning, plan-review, and implementing.
+- [x] Add early OpenSpec stale-delta guard to fix rounds.
+- [x] Add prompt-size telemetry to stage accounting and scoreboard reporting.
+- [x] Add safe queue batch locking.
+- [x] Update docs and generated plugin mirror.
+- [x] Run targeted tests and full npm run ci.
+- [x] Record verification results.
+
+## Verification
+
+- [x] `openspec validate pipeline-throughput-remediation`
+- [x] `node --test --experimental-strip-types test/planning.test.ts test/planning-crash-recovery.test.ts test/planning-resume.test.ts`
+- [x] `node --test --experimental-strip-types test/fix.test.ts test/pre-merge-spec-consistency.test.ts`
+- [x] `node --test --experimental-strip-types test/run-store.test.ts test/harness.test.ts test/scoreboard.test.ts`
+- [x] `node --test --experimental-strip-types test/queue.test.ts`
+- [x] `npm test` from `core/`
+- [x] `node scripts/build.mjs`
+- [x] `npm run ci`

@@ -10,6 +10,10 @@ backlog → ready → planning → plan-review → implementing
               → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
 ```
 
+`ready` is the queue/opt-in entry point. Once a run starts, long-running work is
+labelled and recorded under the concrete stages that are doing it: `planning`,
+`plan-review`, and `implementing`.
+
 ## Contents
 
 - [Prerequisites](#prerequisites)
@@ -438,7 +442,7 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Scoreboard sub-command
 
-`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
 
 ```bash
 /pipeline scoreboard
@@ -450,13 +454,18 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 When no window flags are supplied, the window is the last 30 days ending at command start. `--since`, `--until`, and `--days` select the reporting window. `--json` emits exactly one unfenced JSON object with `schema_version`, `window`, `totals`, `metrics`, and `diagnostics`; the human report prints the same metric headings plus diagnostics when present.
 
-Cost metrics use recorded `cost_usd` or `usage.cost_usd` values when present. For harness calls without actual cost, pass repeatable `--estimate-cost <harness>=<usd-per-call>` values. Actual cost wins over estimates. If a successful PR has a recorded harness call with neither actual nor estimated cost, `cost_per_ready_pr_usd.value` is `null` and diagnostics name the missing harness estimate instead of silently using zero. Stage accounting records also distinguish `actual`, `estimated`, and `unknown` costs; unknown-cost invocations are counted explicitly and are not treated as free.
+Cost metrics use recorded `cost_usd` or `usage.cost_usd` values when present. For harness calls without actual cost, pass repeatable `--estimate-cost <harness>=<usd-per-call>` values. Actual cost wins over estimates. If a successful PR has a recorded harness call with neither actual nor estimated cost, `cost_per_ready_pr_usd.value` is `null` and diagnostics name the missing harness estimate instead of silently using zero. Stage accounting records also distinguish `actual`, `estimated`, and `unknown` costs; unknown-cost invocations are counted explicitly and are not treated as free. Harness accounting also records numeric prompt-size telemetry (`prompt_chars`, `prompt_estimated_tokens`) and never stores raw prompt text.
 
 Historical artifact problems are reported as diagnostics, not crashes: missing run stores, missing/corrupt `summary.json`, missing/corrupt `run.json`, missing `events.jsonl`, partial final event lines, missing start times, and ready runs without PR numbers all surface with stable reason codes and file paths.
 
 ## Queue sub-command (batch factory)
 
 `pipeline queue` is the **batch factory operation mode**: it fetches every `pipeline:ready`-labelled issue from the repo's backlog, ranks them by pipeline stage priority (highest-score stages first; ties broken by issue number ascending for FIFO order within the same stage), applies optional filters, and dispatches up to `--max-issues` of them in concurrency-bounded parallel pipeline runs.
+
+Queue selection and launch are serialized by a repo-local lock at
+`.agent-pipeline/locks/queue.lock`. A second `pipeline queue` invocation in the
+same repo exits before launching work while a live queue batch owns the lock;
+stale locks from dead processes are cleared automatically.
 
 ```bash
 # Default run: up to 10 issues, concurrency 1, no budget cap
@@ -858,7 +867,7 @@ Every run writes a **run directory** under `.agent-pipeline/runs/<run-id>/` in t
 | File | Written | Contents |
 |------|---------|----------|
 | `run.json` | At startup | Immutable identity: `schema_version`, `run_id`, `issue`, `repo`, `profile`, `started_at` |
-| `events.jsonl` | Incrementally | Append-only event log — one JSON object per line; each has `schema_version`, `type`, `at`. Event types: `run_start`, `run_complete`, `stage_start`, `stage_complete` (with `outcome` and `commits`), `stage_accounting` (sanitized stage/harness/model/timing/count/cost fields), `pr_created`, `pr_updated`, `worktree_created`, `review_verdict` (with `round`, `sha`, `verdict`, `finding_counts`). |
+| `events.jsonl` | Incrementally | Append-only event log — one JSON object per line; each has `schema_version`, `type`, `at`. Event types: `run_start`, `run_complete`, `stage_start`, `stage_complete` (with `outcome` and `commits`), `stage_accounting` (sanitized stage/harness/model/timing/count/cost/prompt-size fields), `pr_created`, `pr_updated`, `worktree_created`, `review_verdict` (with `round`, `sha`, `verdict`, `finding_counts`). |
 | `terminal.log` | Incrementally | Raw combined stdout/stderr of the pipeline run, identical to what appears in the terminal. |
 | `summary.json` | At finalization | Full evidence bundle: all stage records, review verdicts, overrides, recovery events, finalized `accounting.records` and `accounting.totals`, and `final_state`. Absent for crashed runs; treat a missing `summary.json` as in-progress or crashed. |
 
@@ -1027,6 +1036,7 @@ If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/` d
 
 - **Planning** — instead of a freeform plan, the implementer authors an OpenSpec change (`proposal.md`, `tasks.md`, spec deltas) under `openspec/changes/<id>/`, which the *other* harness plan-reviews as intent before any code is written. The change is validated structurally (`openspec validate <id>`) at draft and after revision, and implementation works the change's `tasks.md`.
 - **Spec deltas as intended behavior** — once authored, the change's spec deltas are injected into every harness step that acts on the change — plan-review, plan-revision, implementing, the standard and adversarial review rounds, and the fix rounds — so each step checks its work against the spec, not just whether the code looks correct.
+- **Fix-round consistency** — if a structured review finding is tagged `category: spec-divergence` and fix commits move implementation files after the latest spec-delta update, the fix round blocks before pushing until `openspec/changes/<id>/specs/**` is updated.
 - **Finalize (pre-merge)** — folds the change into the living specs (`openspec archive`, committed to the PR), then runs `openspec validate --all` and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
 
 It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to require OpenSpec everywhere or `off` to disable. By default the pipeline only uses OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have **planning run `openspec init`** on repos that lack an `openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing the pre-merge gate is skipped (non-blocking) and planning blocks with an install hint. No `openspec/` dir (and no bootstrap) means no behavior change.

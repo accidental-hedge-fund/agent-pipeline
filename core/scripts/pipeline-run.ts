@@ -176,11 +176,15 @@ function evidenceOutcome(out: Outcome): StageOutcome {
   }
 }
 
-/** Audit stage name for a dispatched label. The `ready` label drives the
- *  planning+implementation arc, so record it under the clearer name "planning"
- *  — the same name the test gate records its commands under, so they merge. */
+/** Audit stage name for a dispatched label. */
 function evidenceStageName(stage: Stage): string {
-  return stage === "ready" ? "planning" : stage;
+  return stage;
+}
+
+/** The `ready` dispatch owns an internal planning → plan-review → implementing
+ *  lifecycle, so the outer loop must not wrap it in a single synthetic stage. */
+function dispatchOwnsStageLifecycle(stage: Stage): boolean {
+  return stage === "ready";
 }
 
 /** ISO 8601 timestamp at seconds precision (matches the CLI's other stamps). */
@@ -642,9 +646,11 @@ export async function runAdvance(
         continue;
       }
 
+      const dispatchOwnsLifecycle = dispatchOwnsStageLifecycle(stage);
+
       // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
       let headBeforeDispatch = "";
-      if (stateDir) {
+      if (!dispatchOwnsLifecycle && stateDir) {
         const wtBefore = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
         if (wtBefore) {
           headBeforeDispatch = (
@@ -655,13 +661,13 @@ export async function runAdvance(
 
       const auditStage = evidenceStageName(stage);
       const stageEnteredAt = evidenceTimestamp();
-      if (stateDir) {
+      if (!dispatchOwnsLifecycle && stateDir) {
         await recordStage(stateDir, issueNumber, {
           stage: auditStage,
           enteredAt: stageEnteredAt,
         }).catch(() => {});
       }
-      if (runDir) {
+      if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: stageEnteredAt, stage: auditStage }, runStoreDeps).catch(() => {});
       }
       let out: Outcome;
@@ -671,7 +677,7 @@ export async function runAdvance(
         // Stage threw — record an error outcome before rethrowing so the bundle
         // never shows a perpetually in-progress stage.
         const errAt = evidenceTimestamp();
-        if (stateDir) {
+        if (!dispatchOwnsLifecycle && stateDir) {
           await recordStage(stateDir, issueNumber, {
             stage: auditStage,
             exitedAt: errAt,
@@ -679,7 +685,7 @@ export async function runAdvance(
             commits: [],
           }).catch(() => {});
         }
-        if (runDir) {
+        if (!dispatchOwnsLifecycle && runDir) {
           await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: errAt, stage: auditStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
         }
         throw err;
@@ -690,7 +696,7 @@ export async function runAdvance(
       // for the stage_complete event appended to events.jsonl below.
       const stageExitedAt = evidenceTimestamp();
       let stageCommits: string[] = [];
-      if (stateDir) {
+      if (!dispatchOwnsLifecycle && stateDir) {
         const wtAfter = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
         if (wtAfter) {
           lastKnownBranch = branchName(issueNumber, wtAfter.slug);
@@ -711,7 +717,7 @@ export async function runAdvance(
           commits: stageCommits,
         }).catch(() => {});
       }
-      if (runDir) {
+      if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: stageExitedAt, stage: auditStage, outcome: evidenceOutcome(out), commits: stageCommits }, runStoreDeps).catch(() => {});
       }
       printOutcome(issueNumber, stage, out);

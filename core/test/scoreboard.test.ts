@@ -447,6 +447,8 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
             blocker_kind: null,
             cost_source: "actual",
             cost_usd: 1.25,
+            prompt_chars: 1200,
+            prompt_estimated_tokens: 300,
           },
           {
             schema_version: 1,
@@ -465,6 +467,8 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
             blocker_kind: null,
             cost_source: "estimated",
             cost_usd: 0.75,
+            prompt_chars: 800,
+            prompt_estimated_tokens: 200,
           },
           {
             schema_version: 1,
@@ -483,6 +487,8 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
             blocker_kind: "harness-failure",
             cost_source: "unknown",
             cost_usd: null,
+            prompt_chars: 400,
+            prompt_estimated_tokens: 100,
           },
         ],
       },
@@ -501,6 +507,9 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
   assert.equal(report.metrics.cost_accounting.totals.actual_cost_usd, 1.25);
   assert.equal(report.metrics.cost_accounting.totals.estimated_cost_usd, 0.75);
   assert.equal(report.metrics.cost_accounting.totals.unknown_cost_count, 1);
+  assert.equal(report.metrics.cost_accounting.totals.prompt_chars_total, 2400);
+  assert.equal(report.metrics.cost_accounting.totals.prompt_chars_max, 1200);
+  assert.equal(report.metrics.cost_accounting.totals.prompt_estimated_tokens_total, 600);
 
   const reviewGroup = report.metrics.cost_accounting.groups.find((g) => g.stage === "review-1");
   assert.ok(reviewGroup, "expected review accounting group");
@@ -508,12 +517,21 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
   assert.equal(reviewGroup.actual_cost_usd, 1.25);
   assert.equal(reviewGroup.estimated_cost_usd, 0.75);
   assert.equal(reviewGroup.unknown_cost_count, 0);
+  assert.equal(reviewGroup.prompt_chars_total, 2000);
+  assert.equal(reviewGroup.prompt_chars_max, 1200);
+  assert.equal(reviewGroup.prompt_estimated_tokens_total, 500);
 
   const fixGroup = report.metrics.cost_accounting.groups.find((g) => g.stage === "fix-1");
   assert.ok(fixGroup, "expected fix accounting group");
   assert.equal(fixGroup.unknown_cost_count, 1);
   assert.equal(fixGroup.actual_cost_usd, 0);
   assert.equal(fixGroup.estimated_cost_usd, 0);
+  assert.equal(fixGroup.prompt_chars_total, 400);
+  assert.equal(fixGroup.prompt_chars_max, 400);
+  assert.equal(fixGroup.prompt_estimated_tokens_total, 100);
+  const human = formatScoreboardHuman(report);
+  assert.match(human, /prompt chars 2400 \(max 1200\)/);
+  assert.match(human, /est prompt tokens 600/);
   assert.ok(report.diagnostics.some((d) => d.code === "unknown_accounting_cost" && d.message.includes("not counted as free")));
 });
 

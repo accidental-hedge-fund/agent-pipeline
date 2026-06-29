@@ -48,6 +48,31 @@ test("invoke(): the prompt is passed to a custom CLI as its first positional arg
   assert.equal(result.stdout, "THE-PROMPT-MARKER");
 });
 
+test("invoke(): accounting records prompt size without raw prompt content", async () => {
+  const cli = makeScript("ok", `printf 'done'`);
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  const prompt = "0123456789abcdef";
+
+  const result = await invoke(cli, tmpRoot, prompt, {
+    stream: false,
+    accounting: {
+      runDir,
+      issue: 42,
+      stage: "review-1",
+      modelSlot: "review",
+      model: "test-model",
+    },
+  });
+
+  assert.equal(result.success, true);
+  const raw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
+  assert.doesNotMatch(raw, new RegExp(prompt));
+  const event = JSON.parse(raw.trim());
+  assert.equal(event.type, "stage_accounting");
+  assert.equal(event.prompt_chars, 16);
+  assert.equal(event.prompt_estimated_tokens, 4);
+});
+
 test("invoke(): an unspawnable custom CLI yields a specific named error, not 'Unknown harness'", async () => {
   const missing = `definitely-not-a-real-cli-${path.basename(tmpRoot)}`;
   const result = await invoke(missing, tmpRoot, "prompt", { stream: false });

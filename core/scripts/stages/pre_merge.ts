@@ -12,7 +12,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   closePr,
-  findLatestCommentMatching,
   getGhActor,
   getHeadCheckRunCount,
   getSuccessfulCheckRunCount,
@@ -49,12 +48,21 @@ import {
   extractScopedOverrides,
   findingKey,
   partitionFindings,
-  reviewCommentFlagsSpecDivergence,
 } from "../review-policy.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { buildDeltaReviewPrompt } from "../prompts/index.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import * as openspec from "../openspec.ts";
+import {
+  computeBranchDeveloperCommits,
+  enforceSpecConsistencyGuard,
+} from "../openspec-consistency.ts";
+export {
+  enforceSpecConsistencyGuard,
+  specDeltaIsStale,
+  type FixCommit,
+  type SpecConsistencyDeps,
+} from "../openspec-consistency.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -1096,7 +1104,12 @@ export async function maybeArchiveOpenspec(
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
   const branchDeveloperCommitsFn =
-    deps.branchDeveloperCommits ?? ((wtPath, base) => computeBranchDeveloperCommits(gitFn, wtPath, base));
+    deps.branchDeveloperCommits ?? ((wtPath, base) => computeBranchDeveloperCommits(
+      gitFn,
+      wtPath,
+      base,
+      { skipSubjectsStartingWith: [OPENSPEC_ARCHIVE_PREFIX] },
+    ));
 
   const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt || !isActiveFn(cfg, wt.path)) return null;
@@ -1232,160 +1245,6 @@ export async function maybeArchiveOpenspec(
   }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
   return { advanced: false, status: "waiting", reason: "openspec change archived; CI re-running" };
-}
-
-// ---------------------------------------------------------------------------
-// OpenSpec spec/code consistency guard (#106)
-// ---------------------------------------------------------------------------
-
-/** One branch commit with the repo-relative paths it changed. Ordered: index 0
- * is the earliest commit in the range, last is HEAD. Exported for tests. */
-export interface FixCommit {
-  sha: string;
-  paths: string[];
-}
-
-/** Deps for {@link enforceSpecConsistencyGuard} — injectable fakes in tests. */
-export interface SpecConsistencyDeps {
-  branchDeveloperCommits: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
-  getIssueDetail: typeof getIssueDetail;
-  setBlocked: typeof setBlocked;
-}
-
-/**
- * Pre-archive backstop for "fix rounds don't revise the change" (#106). Returns a
- * blocked Outcome (and labels the issue) when a change's spec delta is stale
- * relative to the implementation, or null to proceed. "Stale" requires ALL of:
- *   1. developer/fix commits on the branch changed implementation files,
- *   2. the change's `specs/**` were NOT updated after the last implementation
- *      change (order-aware), and
- *   3. the most recent review verdict tagged a finding `category: spec-divergence`.
- *
- * Condition 3 is read from the STRUCTURED category marker that
- * `formatReviewComment` emits (`reviewCommentFlagsSpecDivergence`), never by
- * keyword-matching the reviewer's prose — prose inference is adversarially
- * unwinnable (the #109 failure). Missing any condition → proceed (conservative-
- * open: don't false-positive on fixes that correctly left an accurate spec
- * untouched). Exported for tests.
- */
-export async function enforceSpecConsistencyGuard(
-  cfg: PipelineConfig,
-  issueNumber: number,
-  wtPath: string,
-  changeIds: string[],
-  deps: SpecConsistencyDeps,
-): Promise<Outcome | null> {
-  const devCommits = await deps.branchDeveloperCommits(wtPath, cfg.base_branch);
-  // No non-internal commits → nothing moved since planning. Nothing to guard.
-  if (devCommits.length === 0) return null;
-
-  const stale = changeIds.find((id) => specDeltaIsStale(id, devCommits));
-  if (!stale) return null;
-
-  // The structural signal (code changed, spec didn't) only matters if the reviewer
-  // actually flagged the divergence — otherwise the spec is presumed consistent
-  // (reviewed against it, no objection) and the frozen delta is helping. Read the
-  // structured `category: spec-divergence` marker, NOT prose.
-  const detail = await deps.getIssueDetail(cfg, issueNumber);
-  const reviewBody = latestReviewBody(detail.comments);
-  if (!reviewBody || !reviewCommentFlagsSpecDivergence(reviewBody)) return null;
-
-  const staleMsg = staleSpecDeltaBlockReason(stale);
-  await deps.setBlocked(cfg, issueNumber, staleMsg, "pre-merge", "openspec-stale-delta");
-  return { advanced: false, status: "blocked", reason: staleMsg, blockerKind: "openspec-stale-delta" };
-}
-
-/**
- * Per-commit paths for all non-pipeline-internal commits on the branch, oldest
- * first. Excludes only the pipeline's own OpenSpec archive commits (which don't
- * change reviewed code). Per-commit (not a collapsed range) so the stale guard
- * can compare the order of the last impl-changing commit against the last
- * spec-delta-changing commit.
- */
-async function computeBranchDeveloperCommits(
-  gitFn: typeof gitInWorktree,
-  wtPath: string,
-  baseBranch: string,
-): Promise<FixCommit[]> {
-  const log = await gitFn(
-    wtPath,
-    ["log", "--reverse", "--format=%H%x1f%s", `origin/${baseBranch}..HEAD`],
-    { ignoreFailure: true },
-  );
-  const result: FixCommit[] = [];
-  for (const line of log.stdout.split("\n")) {
-    const sep = line.indexOf("\x1f");
-    if (sep === -1) continue;
-    const sha = line.slice(0, sep).trim();
-    if (!sha) continue;
-    const subj = line.slice(sep + 1).trim();
-    // Only skip the pipeline's own OpenSpec archive commits — auto-format commits
-    // can change implementation files and must remain visible to the stale-spec
-    // guard even though they are classified as pipeline-internal for the
-    // review-SHA gate (#182 finding 3).
-    if (subj.startsWith(OPENSPEC_ARCHIVE_PREFIX)) continue;
-    const d = await gitFn(wtPath, ["diff", "--name-only", `${sha}^`, sha], { ignoreFailure: true });
-    const paths = d.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-    result.push({ sha, paths });
-  }
-  return result;
-}
-
-/**
- * Structural half of the guard: did developer/fix commits change implementation
- * files (anything outside `openspec/`) in a commit that came AFTER the last
- * spec-delta update? Order-aware: an early spec edit in fix-1 does not protect
- * against a later fix-2 commit that moved the code without touching the spec.
- * Pure; exported for tests.
- */
-export function specDeltaIsStale(id: string, commits: FixCommit[]): boolean {
-  if (commits.length === 0) return false;
-  const specPrefix = `openspec/changes/${id}/specs/`;
-  let lastSpecIdx = -1;
-  let lastImplIdx = -1;
-  for (let i = 0; i < commits.length; i++) {
-    const paths = commits[i].paths.map((p) => p.replace(/\\/g, "/").trim()).filter(Boolean);
-    if (paths.some((p) => p.startsWith(specPrefix))) lastSpecIdx = i;
-    if (paths.some((p) => !p.startsWith("openspec/"))) lastImplIdx = i;
-  }
-  // Stale when impl changed AND the last impl commit is more recent (higher index)
-  // than the last spec commit. lastSpecIdx === -1 means the spec was never updated.
-  return lastImplIdx !== -1 && lastImplIdx > lastSpecIdx;
-}
-
-/**
- * Latest review verdict comment body (round 1, round 2, or pre-merge delta),
- * or null when none exists. Delta review comments are included so that a
- * `category: spec-divergence` finding in the most recent delta review is
- * visible to `enforceSpecConsistencyGuard` — without this, an older full-review
- * comment (without the marker) would be picked up instead (#228 finding 1).
- */
-function latestReviewBody(
-  comments: { author: string; body: string; createdAt: string }[],
-): string | null {
-  const m = findLatestCommentMatching(
-    comments,
-    (b) =>
-      b.startsWith("## Review 1") ||
-      b.startsWith("## Review 2") ||
-      b.startsWith(DELTA_REVIEW_MARKER_PREFIX),
-  );
-  return m?.body ?? null;
-}
-
-/** Operator-facing block reason naming the stale-delta condition and the fix. */
-function staleSpecDeltaBlockReason(id: string): string {
-  return [
-    `OpenSpec change \`${id}\` has a stale spec delta: fix rounds changed implementation files but did`,
-    `not update the change's \`specs/**\`, and the most recent review verdict tagged a finding`,
-    `\`category: spec-divergence\`. Archiving now would fold a delta into the living \`openspec/specs/\``,
-    `that does not describe the merged implementation.`,
-    ``,
-    `To resolve, update \`openspec/changes/${id}/specs/**\` (and \`tasks.md\`) so the spec matches the`,
-    `implemented behavior, then re-run \`openspec validate ${id}\` and push. Any commit that brings the`,
-    `spec delta into agreement clears this guard. If the divergence finding is a false positive, the`,
-    `correct resolution is still to update the delta so the living spec states the actual behavior.`,
-  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------

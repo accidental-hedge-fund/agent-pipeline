@@ -64,6 +64,9 @@ export interface CostAccountingTotals {
   actual_cost_usd: number;
   estimated_cost_usd: number;
   unknown_cost_count: number;
+  prompt_chars_total: number;
+  prompt_chars_max: number;
+  prompt_estimated_tokens_total: number;
 }
 
 export interface CostAccountingGroup extends CostAccountingTotals {
@@ -778,6 +781,12 @@ function normalizeAccountingRecord(
     actual_cost_usd: 0,
     estimated_cost_usd: 0,
     unknown_cost_count: 0,
+    prompt_chars_total: Math.max(0, Math.round(numberField(record, "prompt_chars") ?? numberField(record, "promptChars") ?? 0)),
+    prompt_chars_max: Math.max(0, Math.round(numberField(record, "prompt_chars") ?? numberField(record, "promptChars") ?? 0)),
+    prompt_estimated_tokens_total: Math.max(
+      0,
+      Math.round(numberField(record, "prompt_estimated_tokens") ?? numberField(record, "promptEstimatedTokens") ?? 0),
+    ),
     cost_source: source,
     cost_usd: costUsd,
   };
@@ -796,6 +805,9 @@ function newCostAccountingTotals(): CostAccountingTotals {
     actual_cost_usd: 0,
     estimated_cost_usd: 0,
     unknown_cost_count: 0,
+    prompt_chars_total: 0,
+    prompt_chars_max: 0,
+    prompt_estimated_tokens_total: 0,
   };
 }
 
@@ -807,6 +819,9 @@ function addAccounting(target: CostAccountingTotals, source: CostAccountingTotal
   target.actual_cost_usd += source.actual_cost_usd;
   target.estimated_cost_usd += source.estimated_cost_usd;
   target.unknown_cost_count += source.unknown_cost_count;
+  target.prompt_chars_total += source.prompt_chars_total;
+  target.prompt_chars_max = Math.max(target.prompt_chars_max, source.prompt_chars_max);
+  target.prompt_estimated_tokens_total += source.prompt_estimated_tokens_total;
 }
 
 function roundAccountingTotals<T extends CostAccountingTotals>(value: T): T {
@@ -1151,7 +1166,7 @@ function outcomeFromCommands(commands: JsonRecord[]): GateOutcome | null {
 
 function stageCanContainTestGateCommands(value: string | null): boolean {
   const normalized = normalizeStageName(value);
-  return normalized === "planning" || /^fix-\d+$/.test(normalized);
+  return normalized === "planning" || normalized === "implementing" || /^fix-\d+$/.test(normalized);
 }
 
 function outcomeForStageLifecycle(value: string | null): GateOutcome | null {
@@ -1311,6 +1326,9 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
         `actual $${report.metrics.cost_accounting.totals.actual_cost_usd.toFixed(4)}; ` +
         `estimated $${report.metrics.cost_accounting.totals.estimated_cost_usd.toFixed(4)}; ` +
         `unknown ${report.metrics.cost_accounting.totals.unknown_cost_count}; ` +
+        `prompt chars ${report.metrics.cost_accounting.totals.prompt_chars_total} ` +
+        `(max ${report.metrics.cost_accounting.totals.prompt_chars_max}); ` +
+        `est prompt tokens ${report.metrics.cost_accounting.totals.prompt_estimated_tokens_total}; ` +
         `duration ${formatMs(report.metrics.cost_accounting.totals.total_duration_ms)}; ` +
         `commands ${report.metrics.cost_accounting.totals.command_count}; ` +
         `subprocesses ${report.metrics.cost_accounting.totals.subprocess_count}`,
@@ -1379,6 +1397,8 @@ function formatAccountingGroup(group: CostAccountingGroup): string {
     `actual $${group.actual_cost_usd.toFixed(4)}; ` +
     `estimated $${group.estimated_cost_usd.toFixed(4)}; ` +
     `unknown ${group.unknown_cost_count}; ` +
+    `prompt chars ${group.prompt_chars_total} (max ${group.prompt_chars_max}); ` +
+    `est prompt tokens ${group.prompt_estimated_tokens_total}; ` +
     `duration ${formatMs(group.total_duration_ms)}; ` +
     `commands ${group.command_count}; ` +
     `subprocesses ${group.subprocess_count}`

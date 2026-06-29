@@ -96,6 +96,7 @@ export interface QueueDeps {
   runPipeline(issueNumber: number, opts: RunOpts): Promise<RunResult>;
   readRunCost(issueNumber: number): Promise<number | null>;
   writeFile(filePath: string, content: string): Promise<void>;
+  withQueueLock?<T>(repoDir: string, fn: () => Promise<T>): Promise<T>;
   log(msg: string): void;
   clock(): number;
 }
@@ -295,9 +296,83 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
       fs.writeFileSync(filePath, content, "utf8");
     },
 
+    withQueueLock: withQueueBatchLock,
     log: (msg: string) => process.stdout.write(msg + "\n"),
     clock: () => Date.now(),
   };
+}
+
+export function queueBatchLockPath(repoDir: string): string {
+  return path.join(repoDir, ".agent-pipeline", "locks", "queue.lock");
+}
+
+export async function withQueueBatchLock<T>(
+  repoDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockPath = queueBatchLockPath(repoDir);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  if (!tryAcquireQueueBatchLock(lockPath)) {
+    throw new Error(
+      `pipeline queue: another queue batch is already active (${lockPath}). ` +
+        "Wait for it to finish, or remove the lock if you are sure it is stale.",
+    );
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+    }
+  }
+}
+
+function tryAcquireQueueBatchLock(lockPath: string): boolean {
+  try {
+    const fd = fs.openSync(lockPath, "wx");
+    try {
+      fs.writeSync(fd, String(process.pid));
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "EEXIST") throw err;
+    if (queueLockOwnerIsAlive(lockPath)) return false;
+    try {
+      fs.unlinkSync(lockPath);
+    } catch (unlinkErr) {
+      const u = unlinkErr as NodeJS.ErrnoException;
+      if (u.code !== "ENOENT") throw unlinkErr;
+    }
+    return tryAcquireQueueBatchLock(lockPath);
+  }
+}
+
+function queueLockOwnerIsAlive(lockPath: string): boolean {
+  let pidText = "";
+  try {
+    pidText = fs.readFileSync(lockPath, "utf8").trim();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return false;
+    throw err;
+  }
+  const pid = Number.parseInt(pidText, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    if (e.code === "EPERM") return true;
+    return true;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +547,13 @@ function printHumanSummary(
  * and failure-rate gates, and write a machine-readable batch-summary.json.
  */
 export async function runQueue(opts: QueueOpts, deps: QueueDeps): Promise<void> {
+  if (deps.withQueueLock) {
+    return deps.withQueueLock(opts.repoDir, () => runQueueUnlocked(opts, deps));
+  }
+  return runQueueUnlocked(opts, deps);
+}
+
+async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void> {
   const startedAt = deps.clock();
   deps.log(`[pipeline queue] batch ${opts.batchId}: starting`);
   deps.log(

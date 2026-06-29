@@ -718,8 +718,78 @@ test("runPlanningPhases — blocker equivalence: plan-generation failure", async
   const o = await runAndCapture(openspecHooks(failAuthor));
   assert.equal(f?.tag, "plan-gen-failed", "freeform tag");
   assert.equal(o?.tag, f?.tag, "openspec tag matches freeform");
-  assert.equal(f?.stage, "ready", "freeform stage");
+  assert.equal(f?.stage, "planning", "freeform stage");
   assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
+});
+
+test("runPlanningPhases: transitions ready to planning before authoring", async () => {
+  let transitionedToPlanning = false;
+  let authorSawPlanning = false;
+  const hooks = freeformHooks({
+    async authorArtifact() {
+      authorSawPlanning = transitionedToPlanning;
+      return { ok: true, planText: "## Plan\n\nDo the thing.", specContext: "", readyToPlanningMsg: "unused" };
+    },
+  });
+  const deps = {
+    ...eqBaseDeps(),
+    transition: async (_cfg: unknown, _n: unknown, from: string, to: string) => {
+      if (from === "ready" && to === "planning") transitionedToPlanning = true;
+    },
+  };
+
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, hooks, deps as any);
+
+  assert.equal(authorSawPlanning, true, "planning label transition must happen before authorArtifact");
+});
+
+test("runPlanningPhases: records split lifecycle for planning plan-review and implementing", async () => {
+  const events: Array<{ type: string; stage?: string; outcome?: string }> = [];
+  const stageUpdates: Array<{ stage: string; enteredAt?: string; exitedAt?: string; outcome?: string }> = [];
+  const deps = {
+    ...eqBaseDeps(),
+    appendEvent: async (_runDir: string, event: { type: string; stage?: string; outcome?: string }) => {
+      events.push(event);
+    },
+    recordStage: async (_stateDir: string, _issue: number, update: { stage: string; enteredAt?: string; exitedAt?: string; outcome?: string }) => {
+      stageUpdates.push(update);
+    },
+  };
+
+  await runPlanningPhases(
+    eqCfg,
+    42,
+    "Test issue",
+    "test body",
+    "run-42",
+    { stateDir: "/state", runDir: "/run" },
+    freeformHooks(),
+    deps as any,
+  );
+
+  const lifecycle = events
+    .filter((event) => event.type === "stage_start" || event.type === "stage_complete")
+    .map((event) => `${event.type}:${event.stage}:${event.outcome ?? ""}`);
+  assert.deepEqual(lifecycle, [
+    "stage_start:planning:",
+    "stage_complete:planning:advanced",
+    "stage_start:plan-review:",
+    "stage_complete:plan-review:advanced",
+    "stage_start:implementing:",
+    "stage_complete:implementing:advanced",
+  ]);
+  assert.deepEqual(
+    stageUpdates.map((update) => `${update.stage}:${update.enteredAt ? "start" : "complete"}:${update.outcome ?? ""}`),
+    [
+      "planning:start:",
+      "planning:complete:advanced",
+      "plan-review:start:",
+      "plan-review:complete:advanced",
+      "implementing:start:",
+      "implementing:complete:advanced",
+    ],
+  );
+  assert.equal(stageUpdates.some((update) => update.stage === "ready"), false);
 });
 
 test("runPlanningPhases — blocker equivalence: plan-review failure", async () => {

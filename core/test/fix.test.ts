@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  enforceFixOpenspecConsistency,
   enforceFixCommitGate,
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
@@ -12,10 +13,11 @@ import {
   filterToBlockingFindings,
 } from "../scripts/stages/fix.ts";
 import { formatReviewComment } from "../scripts/stages/review.ts";
-import { findingKey } from "../scripts/review-policy.ts";
+import { categoryMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import type { ValidateResult } from "../scripts/openspec.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
+import type { FixCommit } from "../scripts/openspec-consistency.ts";
 
 function msgsDeps(messages: string[]): VerifyDeps {
   return {
@@ -225,6 +227,57 @@ test("enforceOpenspecSpecDeltaValidation: headBefore === headAfter → ok withou
   const result = await enforceOpenspecSpecDeltaValidation("/wt", "same", "same", deps);
   assert.equal(result.ok, true);
   assert.deepEqual(deps.validateCalls, [], "no diff when SHAs are equal");
+});
+
+// ---------------------------------------------------------------------------
+// enforceFixOpenspecConsistency — stale spec-delta guard before fix push
+// ---------------------------------------------------------------------------
+
+const fixCfg = { base_branch: "main", repo: "acme/x", repo_dir: "/repo" } as unknown as PipelineConfig;
+const specDivergenceReview =
+  `## Review 1 — needs-attention\n\n### Findings\n\n` +
+  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+
+function fixConsistencyDeps(commits: FixCommit[]) {
+  const blocked: Array<{ reason: string; stage: string; kind: string }> = [];
+  return {
+    blocked,
+    deps: {
+      branchDeveloperCommits: async () => commits,
+      getIssueDetail: async () => ({
+        comments: [{ author: "reviewer", body: specDivergenceReview, createdAt: "2026-06-28T00:00:00Z" }],
+      }),
+      setBlocked: async (_cfg: PipelineConfig, _issue: number, reason: string, stage: string, kind: string) => {
+        blocked.push({ reason, stage, kind });
+      },
+    },
+  };
+}
+
+test("enforceFixOpenspecConsistency: stale delta + spec-divergence marker blocks at fix stage", async () => {
+  const { deps, blocked } = fixConsistencyDeps([
+    { sha: "a", paths: ["core/scripts/foo.ts"] },
+  ]);
+  const out = await enforceFixOpenspecConsistency(fixCfg, 42, "fix-1", "/wt", ["c106"], deps as any);
+
+  assert.ok(out && !out.advanced && out.status === "blocked");
+  assert.equal(out?.blockerKind, "openspec-stale-delta");
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].stage, "fix-1");
+  assert.equal(blocked[0].kind, "openspec-stale-delta");
+  assert.match(blocked[0].reason, /stale spec delta/);
+});
+
+test("enforceFixOpenspecConsistency: spec delta updated after impl change passes", async () => {
+  const { deps, blocked } = fixConsistencyDeps([
+    { sha: "a", paths: ["core/scripts/foo.ts"] },
+    { sha: "b", paths: ["openspec/changes/c106/specs/cap/spec.md"] },
+  ]);
+
+  const out = await enforceFixOpenspecConsistency(fixCfg, 42, "fix-2", "/wt", ["c106"], deps as any);
+
+  assert.equal(out, null);
+  assert.deepEqual(blocked, []);
 });
 
 // ---------------------------------------------------------------------------

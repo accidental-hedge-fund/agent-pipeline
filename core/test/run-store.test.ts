@@ -373,7 +373,11 @@ function accountingRecord(overrides: Partial<Parameters<typeof buildStageAccount
 
 test("emitStageAccounting: appends stage_accounting and streams identical stdout line", async () => {
   const { deps, readFile, stdoutLines } = memRunStore();
-  const record = accountingRecord({ usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.25 } });
+  const record = accountingRecord({
+    usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.25 },
+    promptChars: 1234,
+    promptEstimatedTokens: 309,
+  });
 
   await emitStageAccounting(RUN_DIR, record, deps);
 
@@ -389,6 +393,8 @@ test("emitStageAccounting: appends stage_accounting and streams identical stdout
   assert.equal(event.duration_ms, 60000);
   assert.equal(event.cost_source, "actual");
   assert.equal(event.cost_usd, 0.25);
+  assert.equal(event.prompt_chars, 1234);
+  assert.equal(event.prompt_estimated_tokens, 309);
   assert.deepEqual(event.usage, { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.25 });
 });
 
@@ -433,6 +439,8 @@ test("emitStageAccounting: usage extraction is allowlist-only and persisted stri
   assert.ok(raw.includes("[REDACTED]"));
   assert.ok(raw.includes("[REDACTED-INJECTION]"));
   const event = JSON.parse(raw.trim());
+  assert.equal(event.prompt_chars, undefined);
+  assert.equal(event.prompt_estimated_tokens, undefined);
   assert.deepEqual(event.usage, { input_tokens: 20, output_tokens: 4, total_tokens: 24, cost_usd: 1.5 });
 });
 

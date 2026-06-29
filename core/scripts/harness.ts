@@ -148,6 +148,8 @@ export async function invoke(
       blockerKind: result.success ? null : "harness-failure",
       usage: opts.accounting.usage,
       estimatedCostUsd: opts.accounting.estimatedCostUsd,
+      promptChars: prompt.length,
+      promptEstimatedTokens: Math.ceil(prompt.length / 4),
     });
     await emitStageAccounting(
       opts.accounting.runDir,

@@ -35,6 +35,8 @@ export interface BuildStageAccountingRecordInput {
   blockerKind?: string | null;
   usage?: unknown;
   estimatedCostUsd?: number | null;
+  promptChars?: number | null;
+  promptEstimatedTokens?: number | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -137,6 +139,8 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     blocker_kind: cleanOptionalString(input.blockerKind ?? null),
     cost_source: cost.source,
     cost_usd: cost.usd,
+    ...(finiteNonNegative(input.promptChars) !== null ? { prompt_chars: nonNegativeInteger(input.promptChars) } : {}),
+    ...(finiteNonNegative(input.promptEstimatedTokens) !== null ? { prompt_estimated_tokens: nonNegativeInteger(input.promptEstimatedTokens) } : {}),
     ...(usage.usage ? { usage: usage.usage } : {}),
   };
   return sanitizeStageAccountingRecord(record);
@@ -166,6 +170,10 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
     cost_source: cost.source,
     cost_usd: cost.usd,
   };
+  const promptChars = finiteNonNegative(record.prompt_chars);
+  if (promptChars !== null) cleaned.prompt_chars = nonNegativeInteger(promptChars);
+  const promptEstimatedTokens = finiteNonNegative(record.prompt_estimated_tokens);
+  if (promptEstimatedTokens !== null) cleaned.prompt_estimated_tokens = nonNegativeInteger(promptEstimatedTokens);
   const usage = sanitizeUsage(record.usage);
   if (usage) cleaned.usage = usage;
   return cleaned;

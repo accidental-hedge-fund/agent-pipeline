@@ -62,8 +62,9 @@ import {
   type VerifyDeps,
   type VerifyResult,
 } from "../verify-harness-commits.ts";
-import type { Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
+import type { Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
 
 // ---------------------------------------------------------------------------
@@ -126,7 +127,7 @@ export interface AdvanceOpts {
   /** Dispatch-wide run id for the commit traceability trailers (#20). */
   pipelineRunId?: string;
   /** Evidence-bundle run/state dir (#147); when set, the test gate records its
-   *  command runs under the "planning" stage. Undefined → recording disabled. */
+   *  command runs under the active implementation stage. Undefined → recording disabled. */
   stateDir?: string;
   /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
   runDir?: string;
@@ -257,9 +258,115 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     invokeReviewer?: typeof invokeReviewer;
     hasCommitsAhead?: typeof hasCommitsAhead;
     gitInWorktree?: typeof gitInWorktree;
+    recordStage?: typeof recordStage;
+    appendEvent?: typeof appendEvent;
     /** Overrides `openspec.isInitialized` for unit tests that cannot set up a real worktree. */
     openspecIsInitialized?: (path: string) => boolean;
   };
+
+interface PlanningLifecycle {
+  stage: Stage;
+  headBefore: string;
+  closed: boolean;
+}
+
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+async function currentHead(
+  wtPath: string | undefined,
+  gitFn: typeof gitInWorktree,
+): Promise<string> {
+  if (!wtPath) return "";
+  const result = await gitFn(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  return result.stdout.trim();
+}
+
+async function commitsSince(
+  wtPath: string | undefined,
+  baseBranch: string,
+  headBefore: string,
+  gitFn: typeof gitInWorktree,
+): Promise<string[]> {
+  if (!wtPath) return [];
+  const rangeStart = headBefore || `origin/${baseBranch}`;
+  const result = await gitFn(
+    wtPath,
+    ["log", "--pretty=format:%H", `${rangeStart}..HEAD`],
+    { ignoreFailure: true },
+  );
+  return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+async function startPlanningLifecycle(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  stage: Stage,
+  opts: AdvanceOpts,
+  deps: RunPlanningPhasesDeps,
+  wtPath?: string,
+): Promise<PlanningLifecycle> {
+  const at = nowIso();
+  const doRecordStage = deps.recordStage ?? recordStage;
+  const doAppendEvent = deps.appendEvent ?? appendEvent;
+  const doGit = deps.gitInWorktree ?? gitInWorktree;
+  if (opts.stateDir) {
+    await doRecordStage(opts.stateDir, issueNumber, { stage, enteredAt: at }).catch(() => {});
+  }
+  if (opts.runDir) {
+    await doAppendEvent(
+      opts.runDir,
+      { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at, stage },
+      opts.runStoreDeps,
+    ).catch(() => {});
+  }
+  return {
+    stage,
+    headBefore: await currentHead(wtPath, doGit),
+    closed: false,
+  };
+}
+
+async function completePlanningLifecycle(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  lifecycle: PlanningLifecycle,
+  opts: AdvanceOpts,
+  deps: RunPlanningPhasesDeps,
+  outcome: StageOutcome,
+  wtPath?: string,
+): Promise<void> {
+  if (lifecycle.closed) return;
+  lifecycle.closed = true;
+  const at = nowIso();
+  const doRecordStage = deps.recordStage ?? recordStage;
+  const doAppendEvent = deps.appendEvent ?? appendEvent;
+  const doGit = deps.gitInWorktree ?? gitInWorktree;
+  const commits = await commitsSince(wtPath, cfg.base_branch, lifecycle.headBefore, doGit);
+  if (opts.stateDir) {
+    await doRecordStage(opts.stateDir, issueNumber, {
+      stage: lifecycle.stage,
+      exitedAt: at,
+      outcome,
+      commits,
+    }).catch(() => {});
+  }
+  if (opts.runDir) {
+    await doAppendEvent(
+      opts.runDir,
+      {
+        schema_version: RUN_SCHEMA_VERSION,
+        type: "stage_complete",
+        at,
+        stage: lifecycle.stage,
+        outcome,
+        commits,
+      },
+      opts.runStoreDeps,
+    ).catch(() => {});
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Shared planning-phase runner — exported for tests
@@ -290,6 +397,21 @@ export async function runPlanningPhases(
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: string = cfg.harnesses.reviewer;
+  let wt: { path: string; branch: string } | undefined;
+  let activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "planning", opts, deps);
+
+  if (!opts.dryRun) {
+    await doTransition(cfg, issueNumber, "ready", "planning", `Planning started by ${primary}.`);
+  }
+
+  // Tag the primary harness early for visibility in transition/blocker comments.
+  try {
+    await doAddLabel(cfg, issueNumber, `harness:${primary}`);
+  } catch {
+    /* idempotent */
+  }
+
+  try {
 
   // ---- Step 0: optional carry-forward context (last30days) ----
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
@@ -303,13 +425,14 @@ export async function runPlanningPhases(
     const bootstrapMsg = bootstrap.tag === "worktree-creation-failed"
       ? `Worktree creation failed: ${bootstrap.reason}`
       : `Worktree setup failed: ${bootstrap.reason}`;
-    await doSetBlocked(cfg, issueNumber, bootstrapMsg, "ready", bootstrap.tag);
+    await doSetBlocked(cfg, issueNumber, bootstrapMsg, "planning", bootstrap.tag);
+    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
     return { advanced: false, status: "blocked", reason: bootstrap.reason };
   }
-  const wt = bootstrap.wt;
+  wt = bootstrap.wt;
+  activeLifecycle.headBefore = await currentHead(wt.path, doGitInWorktree);
   if (opts.runDir) {
-    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
+    await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at: nowIso(), _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
   }
 
   // ---- Step 0b: pre-planning context snapshot (human comments) ----
@@ -319,7 +442,8 @@ export async function runPlanningPhases(
   // ---- Author the planning artifact ----
   const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot);
   if (!authorResult.ok) {
-    await doSetBlocked(cfg, issueNumber, authorResult.reason, "ready", authorResult.tag);
+    await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
+    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
     return { advanced: false, status: "blocked", reason: authorResult.reason };
   }
   let planText = authorResult.planText;
@@ -332,25 +456,19 @@ export async function runPlanningPhases(
   const validateResult = await hooks.validateArtifact(wt);
   if (!validateResult.ok) {
     await doSetBlocked(cfg, issueNumber, validateResult.reason, validateResult.blockStage, validateResult.tag);
+    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
     return { advanced: false, status: "blocked", reason: validateResult.reason };
   }
 
-  // ---- Transition ready → planning, post plan comment ----
-  await doTransition(cfg, issueNumber, "ready", "planning", authorResult.readyToPlanningMsg);
+  // ---- Post plan comment ----
   const planComment = `## Implementation Plan\n\n${planText}${footer(cfg)}`;
   await doPostComment(cfg, issueNumber, planComment);
-
-  // Tag the primary harness early for visibility in transition/blocker comments.
-  try {
-    await doAddLabel(cfg, issueNumber, `harness:${primary}`);
-  } catch {
-    /* idempotent */
-  }
 
   // ---- Plan review + revision (skippable via steps.plan_review) ----
   let revisedPlan = planText;
   let preImplStage: Stage = "planning";
   if (cfg.steps.plan_review) {
+    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "advanced", wt.path);
     await doTransition(
       cfg,
       issueNumber,
@@ -358,6 +476,7 @@ export async function runPlanningPhases(
       "plan-review",
       hooks.planToReviewMsg(primary, reviewer),
     );
+    activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "plan-review", opts, deps, wt.path);
     preImplStage = "plan-review";
 
     const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext, contextSnapshot });
@@ -382,12 +501,14 @@ export async function runPlanningPhases(
         ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
         : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
       await doSetBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason };
     }
     const planReview = reviewResult.stdout.trim();
     if (!planReview.includes("## Plan Review Verdict")) {
       const reason = `plan-review output missing required "## Plan Review Verdict" section — the reviewer returned prose instead of a structured verdict`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason };
     }
     const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
@@ -410,12 +531,14 @@ export async function runPlanningPhases(
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
         : `Plan revision failed (exit ${revisionResult.exit_code})`;
       await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason };
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
     const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
     if (!ackCheck.ok) {
       await doSetBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason: ackCheck.reason };
     }
     if (ackCheck.warning) {
@@ -426,6 +549,7 @@ export async function runPlanningPhases(
     const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());
     if (!rv.ok) {
       await doSetBlocked(cfg, issueNumber, rv.reason, "plan-review", rv.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason: rv.reason };
     }
     revisedPlan = rv.updatedPlanText;
@@ -435,6 +559,7 @@ export async function runPlanningPhases(
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
       const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason };
     }
     await doPostComment(
@@ -447,6 +572,7 @@ export async function runPlanningPhases(
   }
 
   // ---- → implementing ----
+  await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "advanced", wt.path);
   await doTransition(
     cfg,
     issueNumber,
@@ -454,6 +580,7 @@ export async function runPlanningPhases(
     "implementing",
     hooks.preImplTransitionMsg(primary, reviewer, cfg.steps.plan_review),
   );
+  activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "implementing", opts, deps, wt.path);
 
   // ---- Build implementation plan and invoke implementer harness ----
   const implPlan = await hooks.buildImplPlan(wt, revisedPlan);
@@ -474,6 +601,7 @@ export async function runPlanningPhases(
       "implementing",
       "harness-failure",
     );
+    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
     return { advanced: false, status: "blocked", reason };
   }
 
@@ -495,6 +623,7 @@ export async function runPlanningPhases(
       "implementing",
       "no-commits",
     );
+    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
     return { advanced: false, status: "blocked", reason: "no commits produced" };
   }
 
@@ -503,6 +632,7 @@ export async function runPlanningPhases(
     const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
     if (!implCheck.ok) {
       await doSetBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason: implCheck.reason };
     }
   }
@@ -511,7 +641,7 @@ export async function runPlanningPhases(
   const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
   const prBody = hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer);
 
-  return resumeFromImplementing(cfg, issueNumber, wt, {
+  const resumeOutcome = await resumeFromImplementing(cfg, issueNumber, wt, {
     prTitle: `[Pipeline] ${title} (#${issueNumber})`,
     prBody,
     transitionMessage: (prNumber) => hooks.buildTransitionMessage(prNumber, primary, reviewer),
@@ -520,6 +650,28 @@ export async function runPlanningPhases(
     runDir: opts.runDir,
     runStoreDeps: opts.runStoreDeps,
   }, deps);
+  await completePlanningLifecycle(
+    cfg,
+    issueNumber,
+    activeLifecycle,
+    opts,
+    deps,
+    resumeOutcome.advanced ? "advanced" : resumeOutcome.status === "blocked" ? "blocked" : resumeOutcome.status === "error" ? "error" : "skipped",
+    wt.path,
+  );
+  return resumeOutcome;
+  } catch (err) {
+    await completePlanningLifecycle(
+      cfg,
+      issueNumber,
+      activeLifecycle,
+      opts,
+      deps,
+      "error",
+      wt?.path,
+    );
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +1162,7 @@ export async function resumeFromImplementing(
   // simultaneously formatted and tested — no auto-format commit ships untested
   // and no test-fix commit ships unformatted.
   const gates = await runFormatAndTestGates(
-    cfg, issueNumber, wt.path, "planning", opts.pipelineRunId, opts.stateDir,
+    cfg, issueNumber, wt.path, "implementing", opts.pipelineRunId, opts.stateDir,
     { runFormatGate: fmtGateFn, runTestGate: gateRunner },
     opts.runDir, opts.runStoreDeps,
   );

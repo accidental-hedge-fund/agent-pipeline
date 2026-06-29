@@ -663,6 +663,8 @@ export interface StageAccountingRecord {
   blocker_kind: string | null;
   cost_source: StageAccountingCostSource;
   cost_usd: number | null;
+  prompt_chars?: number | null;
+  prompt_estimated_tokens?: number | null;
   usage?: StageAccountingUsage;
 }
 
