@@ -187,6 +187,122 @@ test("contract: salvage message satisfies the traceability-trailer validation (b
 });
 
 // ---------------------------------------------------------------------------
+// Scoped salvage (#321): optional staging scope for OpenSpec authoring
+// ---------------------------------------------------------------------------
+
+test("salvage [scoped, 3.1]: gitAddAll args restrict to scope and gitStatus receives scope when scope='openspec/'", async () => {
+  let capturedArgs: string[] | null = null;
+  let capturedStatusScope: string | undefined;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      capturedStatusScope = scope;
+      // Simulate scoped git status: only return in-scope changes
+      if (scope === "openspec/") return "A  openspec/changes/x/proposal.md\n";
+      return " M tasks/todo.md\nA  openspec/changes/x/proposal.md\n";
+    },
+    gitAddAll: async (_wt, args) => {
+      capturedArgs = [...args];
+    },
+    gitCommit: async () => {},
+  };
+
+  const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.equal(res.salvaged, true, "dirty-in-scope → salvage runs");
+  assert.equal(capturedStatusScope, "openspec/", "gitStatus receives the scope");
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  assert.ok(
+    (capturedArgs as string[]).includes("openspec/"),
+    `gitAddAll args must include scope; got ${JSON.stringify(capturedArgs)}`,
+  );
+  assert.ok(
+    (capturedArgs as string[]).includes(":(exclude)node_modules"),
+    "gitAddAll args must still exclude node_modules",
+  );
+});
+
+test("salvage [scoped, 3.1 bites]: unscoped salvage omits openspec/ restriction and fails the authoring gate", async () => {
+  let capturedArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async () => " M tasks/todo.md\nA  openspec/changes/x/proposal.md\n",
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+
+  // Unscoped: both files are staged
+  const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps);
+  assert.equal(res.salvaged, true, "unscoped dirty worktree → salvage runs");
+  assert.ok(!(capturedArgs as string[]).includes("openspec/"), "unscoped: args do not restrict to openspec/");
+
+  // A commit whose diff includes tasks/todo.md trips the authoring gate
+  const msg = buildSalvageCommitMessage(321, RUN_ID, "OpenSpec authoring");
+  const blocked = await verifyHarnessCommits("/wt", "abc", {
+    issueNumber: 321,
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+    },
+  }, msgsDeps([msg], ["openspec/changes/x/proposal.md", "tasks/todo.md"]));
+  assert.equal(blocked.ok, false, "unscoped salvage includes tasks/todo.md → authoring gate blocks");
+  assert.ok(
+    "reason" in blocked && blocked.reason.includes("OpenSpec authoring step"),
+    `unexpected reason: ${JSON.stringify(blocked)}`,
+  );
+});
+
+test("salvage [scoped, 3.2]: in-scope-clean worktree → {salvaged: false}, no gitAddAll/gitCommit called", async () => {
+  let addCalled = false;
+  let commitCalled = false;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      // Scoped to openspec/ → empty (no openspec/ changes on disk)
+      if (scope === "openspec/") return "";
+      return " M tasks/todo.md\n";
+    },
+    gitAddAll: async () => { addCalled = true; },
+    gitCommit: async () => { commitCalled = true; },
+  };
+
+  const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.deepEqual(res, { salvaged: false }, "in-scope-clean → no salvage");
+  assert.equal(addCalled, false, "gitAddAll must NOT be called");
+  assert.equal(commitCalled, false, "gitCommit must NOT be called");
+});
+
+test("salvage [scoped, 3.3]: scoped authoring salvage commit passes the authoring path-constraint gate", async () => {
+  const msg = buildSalvageCommitMessage(321, RUN_ID, "OpenSpec authoring");
+  const config = {
+    issueNumber: 321,
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
+    },
+  };
+  // Scoped salvage produced a commit with only openspec/ files
+  const ok = await verifyHarnessCommits(
+    "/wt", "abc", config,
+    msgsDeps([msg], ["openspec/changes/x/proposal.md", "openspec/changes/x/tasks.md"]),
+  );
+  assert.equal(ok.ok, true, "scoped salvage commit (openspec/ only) passes the authoring gate");
+});
+
+test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-openspec/ files unchanged", async () => {
+  let capturedArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async () => " M tasks/todo.md\n M core/scripts/foo.ts\n",
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+  // No scope (implement stage) — must use the unscoped default args exactly
+  const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true);
+  assert.deepEqual(
+    capturedArgs,
+    ["add", "-A", "--", ":(exclude)node_modules"],
+    "unscoped implement salvage args are byte-for-byte unchanged from the pre-#321 default",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Regression #180: salvage gitAddAll must exclude node_modules
 // ---------------------------------------------------------------------------
 

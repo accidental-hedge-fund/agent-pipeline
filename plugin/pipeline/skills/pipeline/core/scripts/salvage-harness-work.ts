@@ -14,8 +14,10 @@ import { gitInWorktree } from "./worktree.ts";
 import { withTrailers } from "./traceability.ts";
 
 export interface SalvageDeps {
-  /** `git status --porcelain` output for the worktree ("" when clean). */
-  gitStatus?: (wtPath: string) => Promise<string>;
+  /** `git status --porcelain` output for the worktree ("" when clean).
+   *  When the caller supplies a staging scope, `scope` is the pathspec so the
+   *  status check is restricted to in-scope paths only. */
+  gitStatus?: (wtPath: string, scope?: string) => Promise<string>;
   /**
    * Stage changes in the worktree using the provided git-add args array.
    * The default implementation passes `["add", "-A", "--", ":(exclude)node_modules"]`
@@ -35,10 +37,13 @@ export type SalvageResult = { salvaged: false } | { salvaged: true; message: str
 // Default git implementations
 // ---------------------------------------------------------------------------
 
-async function defaultGitStatus(wtPath: string): Promise<string> {
+async function defaultGitStatus(wtPath: string, scope?: string): Promise<string> {
   // ignoreFailure: a failing `git status` reads as clean → no salvage → the
   // caller falls through to its existing block path (never worse than today).
-  const res = await gitInWorktree(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
+  const args = scope
+    ? ["status", "--porcelain", "--", scope]
+    : ["status", "--porcelain"];
+  const res = await gitInWorktree(wtPath, args, { ignoreFailure: true });
   return res.stdout;
 }
 
@@ -104,11 +109,15 @@ export async function salvageUncommittedWork(
   pipelineRunId: string,
   stageLabel: string,
   deps: SalvageDeps = {},
+  scope?: string,
 ): Promise<SalvageResult> {
-  const status = await (deps.gitStatus ?? defaultGitStatus)(wtPath);
+  const status = await (deps.gitStatus ?? defaultGitStatus)(wtPath, scope);
   if (!status.trim()) return { salvaged: false };
   const message = buildSalvageCommitMessage(issueNumber, pipelineRunId, stageLabel);
-  await (deps.gitAddAll ?? defaultGitAddAll)(wtPath, SALVAGE_GIT_ADD_ARGS);
+  const addArgs = scope
+    ? ["add", "-A", "--", ":(exclude)node_modules", scope]
+    : SALVAGE_GIT_ADD_ARGS;
+  await (deps.gitAddAll ?? defaultGitAddAll)(wtPath, addArgs);
   await (deps.gitCommit ?? defaultGitCommit)(wtPath, message);
   return { salvaged: true, message };
 }
@@ -125,9 +134,10 @@ export async function trySalvageUncommittedWork(
   pipelineRunId: string,
   stageLabel: string,
   deps: SalvageDeps = {},
+  scope?: string,
 ): Promise<boolean> {
   try {
-    const res = await salvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, deps);
+    const res = await salvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, deps, scope);
     if (res.salvaged) {
       console.log(
         `[pipeline] #${issueNumber}: salvaged uncommitted ${stageLabel} harness work into a commit`,
