@@ -45,41 +45,55 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 
 ## Modes
 
+The primary invocation is the advance loop; all other operations are available as
+distinct `pipeline:<command>` entries in the skill/command menu.
+
 ```
 /pipeline N                              advance loop (default; up to 12 transitions)
-/pipeline N --status                     read-only — print stage, blocker, PR, last review
-/pipeline N --unblock "<answer>"         post answer + clear blocked label
 /pipeline N --once                       advance one stage and stop
 /pipeline N --dry-run                    log what would happen; no harness calls, no GitHub writes
 /pipeline N --domain <d>                 override domain name in lock/log paths
 /pipeline N --base <branch>              override base branch
 /pipeline N --repo-path <path>           target a different repo working tree
-/pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
-/pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
-/pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh (no number)
-/pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
+/pipeline N --detach                     run the advance loop in a detached background process
+
+/pipeline:status <N>                     read-only — print stage, blocker, PR, last review
+/pipeline:unblock <N> "<answer>"         post answer + clear blocked label
+/pipeline:override <N> "<key>: <reason>" disposition a review finding and auto-resume the advance loop
+/pipeline:summary <N>                    print the run's evidence bundle for issue N (local, offline)
+/pipeline:doctor                         deterministic preflight check; print summary, exit 0/1
 /pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
-/pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
-/pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
-/pipeline intake --description "<text>" --dry-run  preview only; no writes
-/pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output (no number)
-/pipeline refine-spec --help             probe for contract availability; exits 0 on supported installs
-/pipeline triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
-/pipeline triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
-/pipeline sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
-/pipeline sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
-/pipeline sweep --apply --repo other/r   sweep a different repository
-/pipeline roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run; no number)
-/pipeline roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
-/pipeline roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
-/pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
-/pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
+/pipeline:init                           ensure labels + scaffold .github/pipeline.yml
+/pipeline:cleanup                        sweep merged-PR worktrees
+/pipeline:intake [--description "<text>"]  spec a rough description into a GitHub issue + ROADMAP PR
+/pipeline:intake --description "<text>" --dry-run  preview only; no writes
+/pipeline:triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
+/pipeline:triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
+/pipeline:sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
+/pipeline:sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
+/pipeline:sweep --apply --repo other/r   sweep a different repository
+/pipeline:roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run)
+/pipeline:roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
+/pipeline:roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
+/pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+/pipeline:release <version>              prepare a release PR for the given version
+/pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
-/pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits (no number)
-/pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
-/pipeline queue --label team:backend --milestone v2.0 --risk medium
+/pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh
+/pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output
+/pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
 /pipeline --version                      print the package version, then exit (no number; -V alias)
+```
+
+**Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
+```
+/pipeline N --status        → use /pipeline:status N
+/pipeline N --summary       → use /pipeline:summary N
+/pipeline N --unblock "…"   → use /pipeline:unblock N "…"
+/pipeline N --override "…"  → use /pipeline:override N "…"
+/pipeline --init            → use /pipeline:init
+/pipeline --cleanup         → use /pipeline:cleanup
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are

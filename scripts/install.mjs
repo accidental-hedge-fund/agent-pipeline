@@ -29,6 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { OPERATION_SURFACE, renderClaudeCommand } from "./build.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOME = homedir();
@@ -298,6 +299,22 @@ function stageInto(stagingDir, host) {
   writeFileSync(join(stagingDir, MANAGED_MARKER), "");
 }
 
+// Install the namespaced pipeline:<command> command files for the Claude host (#273).
+// Each file is written to <claudeBase>/commands/pipeline:<name>.md.
+function installClaudeCommands(claudeBaseDir, dryRun) {
+  const commandsDir = join(claudeBaseDir, "commands");
+  if (dryRun) {
+    log(`  (dry-run) would write ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
+    return;
+  }
+  mkdirSync(commandsDir, { recursive: true });
+  for (const op of OPERATION_SURFACE) {
+    const content = renderClaudeCommand(op, "~/.claude/skills/pipeline");
+    writeFileSync(join(commandsDir, `pipeline:${op.name}.md`), content);
+  }
+  log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
+}
+
 function installHost(host, dryRun) {
   const cfg = HOSTS[host];
   const skillsDir = cfg.skillsDir();
@@ -305,6 +322,7 @@ function installHost(host, dryRun) {
   log(`→ ${cfg.label}: ${dest}`);
   if (dryRun) {
     log(`  (dry-run) would stage core + ${host} overlay, swap atomically, then npm ci in core/`);
+    if (host === "claude") installClaudeCommands(claudeBase(), true);
     return;
   }
   mkdirSync(skillsDir, { recursive: true });
@@ -331,6 +349,8 @@ function installHost(host, dryRun) {
   } else {
     warn("npm not found — dependencies will install on first run.");
   }
+  // Install the namespaced pipeline:<command> command files for the Claude host.
+  if (host === "claude") installClaudeCommands(claudeBase(), false);
   log(`  ✓ installed. ${cfg.postInstall}`);
 }
 

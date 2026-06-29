@@ -199,9 +199,40 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
-  // cleanup and remove-worktree are flag-based modes (not positional keywords),
-  // but are registered here for completeness and to enable future registry-driven
-  // dispatch of these modes.
+  // status, unblock, and override were previously flag-only modes; they are now
+  // also dispatched as positional keyword sub-commands so they can be exposed as
+  // discoverable pipeline:<command> host entries.
+  status: {
+    needsIssueNumber: true,
+    allowedFlags: new Set(["repoPath", "base", "profile", "domain", "json"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  unblock: {
+    needsIssueNumber: true,
+    allowedFlags: new Set(["repoPath", "base", "profile", "domain"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  // override re-enters the advance loop after recording the disposition, so it
+  // accepts all flags that the advance command accepts.
+  override: {
+    needsIssueNumber: true,
+    allowedFlags: "all",
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  // cleanup is registered both for the legacy --cleanup flag mode and as an
+  // actually-dispatched positional keyword (`pipeline cleanup`).
   cleanup: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "cleanup"]),

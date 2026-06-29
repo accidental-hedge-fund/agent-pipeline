@@ -1,0 +1,122 @@
+// Host-surface drift-guard tests (#273).
+//
+// Covers:
+//   7.5  The generated plugin/pipeline/commands/ directory contains exactly the
+//        operations defined by the namespaced-command-surface spec — no more,
+//        no less, and no pipeline:run entry.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// core/test/ → ../../ = repo root, then plugin/pipeline/commands/
+const COMMANDS_DIR = join(__dirname, "..", "..", "plugin", "pipeline", "commands");
+
+// Canonical operation names per the namespaced-command-surface spec.
+// run is intentionally absent — it is an undocumented alias only.
+const EXPECTED_OPERATIONS = new Set([
+  "status",
+  "unblock",
+  "override",
+  "summary",
+  "doctor",
+  "init",
+  "cleanup",
+  "intake",
+  "sweep",
+  "triage",
+  "merge",
+  "release",
+  "roadmap",
+  "logs",
+]);
+
+// ---------------------------------------------------------------------------
+// 7.5a  Every expected operation has a generated command file
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5a: plugin/pipeline/commands/ exists and contains exactly the expected operations", () => {
+  let files: string[];
+  try {
+    files = readdirSync(COMMANDS_DIR).filter((f) => f.endsWith(".md"));
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    assert.fail(
+      `plugin/pipeline/commands/ does not exist — run \`node scripts/build.mjs\` and commit the output. (${e.message})`,
+    );
+  }
+
+  // Extract operation names: "pipeline:status.md" → "status"
+  const actualOps = new Set(
+    files.map((f) => {
+      const match = /^pipeline:(.+)\.md$/.exec(f);
+      assert.ok(match, `Unexpected file name format in commands dir: ${f}`);
+      return match[1];
+    }),
+  );
+
+  // Every expected op must be present
+  for (const expected of EXPECTED_OPERATIONS) {
+    assert.ok(
+      actualOps.has(expected),
+      `Missing command file: pipeline:${expected}.md — run \`node scripts/build.mjs\` and commit`,
+    );
+  }
+
+  // No extra files beyond the expected set
+  for (const actual of actualOps) {
+    assert.ok(
+      EXPECTED_OPERATIONS.has(actual),
+      `Unexpected command file: pipeline:${actual}.md — remove it from OPERATION_SURFACE or add it to the spec`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7.5b  No pipeline:run host command exists (run is undocumented alias only)
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5b: no pipeline:run.md command file exists", () => {
+  let files: string[];
+  try {
+    files = readdirSync(COMMANDS_DIR);
+  } catch {
+    // If commands dir doesn't exist, run isn't there either — pass
+    files = [];
+  }
+  assert.equal(
+    files.includes("pipeline:run.md"),
+    false,
+    "pipeline:run.md must not exist — run is an undocumented alias, not a surface command",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 7.5c  Each command file starts with YAML front-matter referencing its operation name
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5c: each command file's front-matter slug matches its file name", () => {
+  let files: string[];
+  try {
+    files = readdirSync(COMMANDS_DIR).filter((f) => f.endsWith(".md"));
+  } catch {
+    // Missing dir is already caught by 7.5a; skip this check so error message is clean
+    return;
+  }
+
+  for (const file of files) {
+    const match = /^pipeline:(.+)\.md$/.exec(file);
+    if (!match) continue;
+    const opName = match[1];
+    const content = readFileSync(join(COMMANDS_DIR, file), "utf8");
+    // The generated file should reference the operation name in its Invoke line.
+    // summary uses --summary rather than a positional, so we check the op name appears anywhere.
+    assert.ok(
+      content.includes(opName),
+      `${file}: content should reference the operation name "${opName}"`,
+    );
+  }
+});
