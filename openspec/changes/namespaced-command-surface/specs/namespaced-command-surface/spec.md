@@ -140,3 +140,35 @@ documented solely in its legacy `--flag` form.
   `$pipeline:<command>`
 - **AND** the legacy flag forms (`--status`, `--summary`, `--unblock`,
   `--override`, `--init`, `--cleanup`) SHALL be annotated as deprecated
+
+---
+
+### Requirement: `renderCodexCommand` SHALL produce YAML agent files suitable for Codex host discovery
+
+The `scripts/build.mjs` module SHALL export a `renderCodexCommand(op)` function
+that returns a YAML string for each entry in `OPERATION_SURFACE`. The YAML SHALL
+contain an `interface:` block with `display_name`, `short_description`, and
+`default_prompt` fields. `scripts/install.mjs` SHALL write one such file per
+operation to `<codexSkillsDir>/pipeline/agents/pipeline-<name>.yaml` when
+installing the Codex host, so that Codex agent discovery surfaces each
+`$pipeline:<command>` as a distinct entry.
+
+To allow `renderCodexCommand` to be imported and unit-tested without triggering
+mirror-generation side effects, `scripts/build.mjs` SHALL guard its `main()`
+invocation behind an ESM entry-point check
+(`process.argv[1] === fileURLToPath(import.meta.url)`).
+
+#### Scenario: `renderCodexCommand` produces a YAML string with `interface:` block
+
+- **WHEN** `renderCodexCommand` is called for any operation in `OPERATION_SURFACE`
+- **THEN** it SHALL return a non-empty string
+- **AND** the string SHALL include an `interface:` key
+- **AND** the string SHALL reference `pipeline:<name>` in both the `display_name`
+  and `default_prompt` values
+
+#### Scenario: `build.mjs` can be safely imported without executing `main()`
+
+- **WHEN** `build.mjs` is imported as an ES module (e.g., via dynamic `import()`
+  in a test)
+- **THEN** the mirror-generation `main()` function SHALL NOT execute
+- **AND** `renderCodexCommand` SHALL be accessible as a named export

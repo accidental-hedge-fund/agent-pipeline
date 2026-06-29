@@ -65,3 +65,23 @@ The detached-launch surface SHALL be `pipeline N --detach`: the `--detach` modif
 - **WHEN** the host command surface is enumerated
 - **THEN** there SHALL be no `pipeline:run` / `$pipeline:run` entry
 - **AND** the legacy `pipeline run 42` keyword SHALL still dispatch (undocumented) without error
+
+---
+
+### Requirement: The `--detach` dispatch SHALL guard against incompatible arguments before launching
+
+The `--detach` mode-switch SHALL perform two safety checks **before** dispatching the detached-advance launch: first, it SHALL verify that the issue number is the only positional argument (no extra tokens such as `config validate`); second, it SHALL verify that no mode-selector flag (`--status`, `--summary`, `--unblock`, `--override`) is active alongside `--detach`. Both violations SHALL cause the process to exit with code 2 and print an explanatory message to stderr; no background process SHALL be launched.
+
+#### Scenario: Extra positionals with `--detach` are rejected before launch
+
+- **WHEN** the user runs `pipeline 42 config validate --detach`
+- **THEN** the process SHALL exit with code 2
+- **AND** stderr SHALL contain "unexpected argument" (case-insensitive)
+- **AND** no detached background process SHALL be launched
+
+#### Scenario: Mode-selector flag combined with `--detach` is rejected
+
+- **WHEN** the user runs `pipeline 42 --status --detach`
+- **THEN** the process SHALL exit with code 2
+- **AND** stderr SHALL contain a message naming the conflicting flag and explaining that `--detach` cannot be combined with it
+- **AND** no detached background process SHALL be launched
