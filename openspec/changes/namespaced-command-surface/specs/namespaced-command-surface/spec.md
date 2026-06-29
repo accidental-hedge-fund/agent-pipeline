@@ -143,6 +143,25 @@ documented solely in its legacy `--flag` form.
 
 ---
 
+### Requirement: `renderClaudeCommand` SHALL produce YAML frontmatter that is syntactically valid
+
+The `renderClaudeCommand(op, skillPath)` function in `scripts/build.mjs` SHALL emit command markdown files whose YAML frontmatter block (between the opening and closing `---` delimiters) is syntactically valid and parseable by a standard YAML parser. Specifically, the `argument-hint` field value SHALL be single-quoted when present so that YAML-significant characters — including `:` and `[` — in the hint string are not misinterpreted by parsers. Any single-quote characters within the hint value SHALL be escaped using the YAML single-quote escape convention (`''`).
+
+#### Scenario: Generated command file frontmatter parses without error
+
+- **WHEN** `renderClaudeCommand` is called for any operation in `OPERATION_SURFACE` that has an `argHint`
+- **THEN** the emitted markdown file's YAML frontmatter SHALL parse without error
+- **AND** the parsed frontmatter SHALL contain a `description` key whose value matches the operation's description string
+- **AND** if `argHint` is present, the parsed `argument-hint` value SHALL equal the raw hint string with no extraneous quoting characters
+
+#### Scenario: `argument-hint` values containing `:` or `[` are safe in YAML
+
+- **WHEN** an operation's `argHint` contains a `:` or `[` character
+- **THEN** `renderClaudeCommand` SHALL wrap the value in single quotes in the emitted frontmatter
+- **AND** a conformant YAML parser SHALL return the plain string value (not a parse error or a mapping/sequence type)
+
+---
+
 ### Requirement: `renderCodexCommand` SHALL produce YAML agent files suitable for Codex host discovery
 
 The `scripts/build.mjs` module SHALL export a `renderCodexCommand(op)` function

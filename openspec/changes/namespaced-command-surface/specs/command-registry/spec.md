@@ -70,7 +70,7 @@ The detached-launch surface SHALL be `pipeline N --detach`: the `--detach` modif
 
 ### Requirement: The `--detach` dispatch SHALL guard against incompatible arguments before launching
 
-The `--detach` mode-switch SHALL perform two safety checks **before** dispatching the detached-advance launch: first, it SHALL verify that the issue number is the only positional argument (no extra tokens such as `config validate`); second, it SHALL verify that no mode-selector flag (`--status`, `--summary`, `--unblock`, `--override`) is active alongside `--detach`. Both violations SHALL cause the process to exit with code 2 and print an explanatory message to stderr; no background process SHALL be launched.
+The `--detach` mode-switch SHALL perform two safety checks **before** dispatching the detached-advance launch: first, it SHALL verify that the issue number is the only positional argument (no extra tokens such as `config validate`); second, it SHALL verify that no mode-selector flag (`--status`, `--summary`, `--unblock`, `--override`) is active alongside `--detach`. Both violations SHALL cause the process to exit with code 2 and print an explanatory message to stderr; no background process SHALL be launched. These two safety checks SHALL apply uniformly whether `--detach` is invoked via the canonical `pipeline N --detach` form or via the legacy `pipeline run N --detach` alias.
 
 #### Scenario: Extra positionals with `--detach` are rejected before launch
 
@@ -85,3 +85,32 @@ The `--detach` mode-switch SHALL perform two safety checks **before** dispatchin
 - **THEN** the process SHALL exit with code 2
 - **AND** stderr SHALL contain a message naming the conflicting flag and explaining that `--detach` cannot be combined with it
 - **AND** no detached background process SHALL be launched
+
+#### Scenario: Mode-selector flag combined with `--detach` via the `run` alias is also rejected
+
+- **WHEN** the user runs `pipeline run 42 --status --detach`
+- **THEN** the process SHALL exit with code 2
+- **AND** stderr SHALL contain a message indicating that `--detach` cannot be combined with `--status`
+- **AND** no detached background process SHALL be launched
+
+---
+
+### Requirement: The `unblock` and `override` positional keywords SHALL honor the kill switch
+
+The positional `pipeline unblock <N> "<answer>"` and `pipeline override <N> "<spec>"` keyword handlers SHALL check the kill-switch state after validating their arguments and before performing any GitHub mutation. When the kill-switch file (`/tmp/pipeline-<domain>.disabled`) is present, each SHALL print an explanatory message to stderr and exit with code 0, mirroring the same guard applied in the legacy `pipeline N --unblock` / `pipeline N --override` flag paths.
+
+#### Scenario: `pipeline unblock` respects an active kill switch
+
+- **WHEN** the kill-switch file `/tmp/pipeline-<domain>.disabled` is present
+- **AND** the user runs `pipeline unblock 42 "fixed in #99"`
+- **THEN** the process SHALL exit with code 0
+- **AND** stderr SHALL contain a message indicating the kill switch is active
+- **AND** no GitHub mutation (block-clear) SHALL be performed
+
+#### Scenario: `pipeline override` respects an active kill switch
+
+- **WHEN** the kill-switch file `/tmp/pipeline-<domain>.disabled` is present
+- **AND** the user runs `pipeline override 42 "abc123: deferred #99"`
+- **THEN** the process SHALL exit with code 0
+- **AND** stderr SHALL contain a message indicating the kill switch is active
+- **AND** no GitHub mutation (disposition record) SHALL be performed
