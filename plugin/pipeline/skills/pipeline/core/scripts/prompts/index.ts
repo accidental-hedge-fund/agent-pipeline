@@ -597,6 +597,20 @@ export function buildRefineSpecPrompt(a: BuildRefineSpecArgs): string {
   });
 }
 
+export interface BuildBackfillArgs {
+  repoContext: string;
+  livingSpecInventory: string;
+  evidenceCorpus: string;
+}
+
+export function buildBackfillPrompt(a: BuildBackfillArgs): string {
+  return substitute(loadTemplate("backfill"), {
+    repo_context: a.repoContext,
+    living_spec_inventory: a.livingSpecInventory,
+    evidence_corpus: a.evidenceCorpus,
+  });
+}
+
 // Exported for tests. CONFIDENCE_CALIBRATION_BLOCK and NON_BLOCKING_GUIDANCE_BLOCK
 // are exposed so the drift test can assert both review prompts embed the shared
 // constants byte-for-byte. SEVERITY_RUBRIC is exposed for the rubric-content test.

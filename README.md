@@ -373,6 +373,58 @@ sweep:
     - Out of scope
 ```
 
+## Backfill sub-command
+
+`pipeline backfill` is a safe maintenance flow for adding OpenSpec coverage to repositories whose accepted behavior predates OpenSpec adoption. It previews which legacy behaviors are already covered, which are missing, which conflict with existing specs, and which are too uncertain to codify without human judgment. Without `--apply` it is fully **non-mutating**.
+
+```bash
+# Preview: analyze the repo and print a four-group coverage report (no writes):
+/pipeline backfill
+
+# Apply: author an OpenSpec change for missing-coverage behaviors and open a spec-only PR:
+/pipeline backfill --apply
+
+# Scope the apply slice to a named capability:
+/pipeline backfill --apply --capability auth
+
+# Target a different repository:
+/pipeline backfill --repo owner/other-repo
+```
+
+**What it does:**
+
+1. **Reads living specs (deterministic):** scans `openspec/specs/` for existing requirements. A partially-populated workspace is NOT treated as complete — coverage is computed from living-spec content, never from `openspec/` presence alone.
+2. **Behavior analysis (single model call):** invokes the claude harness once to enumerate candidate accepted behaviors from the evidence corpus (tests, docs, code, git history), draft each as a requirement with provenance, and grade evidence as `sufficient`, `conflicting`, or `uncertain`.
+3. **Classifies into four groups (deterministic):**
+   - **already-covered** — behavior maps to a living requirement; not proposed again.
+   - **missing-coverage** — sufficient evidence, no existing requirement; eligible for backfill.
+   - **conflicting-evidence** — contradicts a living requirement or evidence sources disagree; surfaced for human decision, NOT codified.
+   - **uncertain-evidence** — evidence too weak to justify codifying; surfaced for human decision, NOT codified.
+4. **Apply path (--apply only):** authors an OpenSpec change with additive `## ADDED Requirements` deltas for the `missing-coverage` slice, validates with `openspec validate`, creates a branch, and opens a spec-only PR targeting the default branch. Never commits directly to the default branch; never merges.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--apply` | Apply: author a spec-only PR for the missing-coverage slice. Default is preview-only (no writes). |
+| `--capability <name>` | Scope the apply slice to behaviors whose description contains `<name>`. |
+| `--repo <owner/repo>` | Override the target repository. Default: current repo from config. |
+
+**Non-mutating preview guarantee:** without `--apply`, the handler makes no write to the filesystem, no GitHub issue create/edit, no branch creation, and no PR creation. The output explicitly states "No specs, issues, branches, or PRs were changed."
+
+**Spec-only guarantee:** the apply path asserts the authored diff touches only paths under `openspec/` and aborts before opening any PR if a non-`openspec/` path would change.
+
+**Idempotency:** re-running backfill after a slice has landed recognizes previously-accepted requirements as `already-covered` and behaviors already proposed in an open backfill PR as already-proposed. Neither is duplicated.
+
+**Operator guidance:**
+
+- *When to use backfill:* use it when adopting OpenSpec in a repo with years of existing behavior, or when a partial `openspec/` workspace covers only recent changes and you want future pipeline runs checked against the full product contract.
+- *How to review provenance:* each candidate in the report includes a provenance reference (test name, doc section, code path, or commit). Verify the reference is real before approving the backfill PR — provenance is what distinguishes established behavior from an accidental implementation detail.
+- *How partial adoption is handled:* backfill computes coverage from living-spec content, not from the presence of an `openspec/` directory. A repo with 3 living requirements and 20 legacy behaviors will still show 17 candidates.
+- *Why low-confidence behavior is not auto-codified:* `conflicting-evidence` and `uncertain-evidence` candidates require human judgment. Codifying a behavior that contradicts a living requirement or lacks concrete evidence would introduce a spec that is immediately wrong. These groups are surfaced for manual review, not silently committed.
+
+The pipeline never merges — the spec-backfill PR requires a human to review and merge.
+
 ## Roadmap sub-command
 
 `pipeline roadmap` generates a dependency-aware scored roadmap from the open backlog and writes `plan.json` + `roadmap.md` to `.agent-pipeline/roadmap/<repo>/`. Without `--apply` it only previews.
