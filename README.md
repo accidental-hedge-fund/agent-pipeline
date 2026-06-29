@@ -440,7 +440,23 @@ roadmap:
   depgraph_concurrency: 4        # max concurrent harness calls during dep verification (default: 4)
   depgraph_verify_cap: 20        # max dep candidates to source-verify; excess go to open_questions (default: 20)
   release_model: semver          # semver (default) | continuous
+  release_capacity:              # capacity policy for the semver release model (#347)
+    effort_budget: 8             # per-milestone effort-points budget (XS=1 S=2 M=3 L=5 XL=8; default: 8)
+    isolate_breaking: true       # give each breaking-change issue its own milestone (default: true)
 ```
+
+**Semver release model — capacity-aware milestone grouping (#347):**
+
+When `release_model` is `semver` (the default), generated milestones are determined by *release substance* rather than a fixed issue count:
+
+| Signal | Effect |
+|--------|--------|
+| `breaking-change` / `semver:major` label, or `breaking change`/`migration` in text | Classified as **major** impact → bumps major version (`v{M+1}.0.0`), isolated into own milestone |
+| `chore` / `bug` / `maintenance` / `refactor` / `docs` label, or `cleanup` tier | Classified as **patch** impact → bumps patch version (`v{M}.{N}.{P+1}`) |
+| `feature` / `enhancement` / `semver:minor` label | Classified as **minor** impact → bumps minor version (`v{M}.{N+1}.0`) |
+| No impact-bearing signal (sparse metadata) | Conservative default: **minor** + uncertainty recorded in `plan.json` |
+
+Issues accumulate into a milestone until adding the next would exceed `effort_budget` (effort points: XS=1 S=2 M=3 L=5 XL=8). A breaking-change issue (when `isolate_breaking: true`) or an oversized issue (effort ≥ budget) is always placed alone. The `continuous` model is unaffected by these rules.
 
 ## Triage sub-command
 

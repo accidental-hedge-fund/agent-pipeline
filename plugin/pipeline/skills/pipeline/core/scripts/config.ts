@@ -163,6 +163,14 @@ const PartialConfigSchema = z.object({
       hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
       pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
       release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery."),
+      release_capacity: z
+        .object({
+          effort_budget: z.number().positive().optional().describe("Per-milestone effort-points capacity budget for the semver model (XS=1 S=2 M=3 L=5 XL=8). An issue with effort_points ≥ budget is isolated into its own milestone. Default: 8."),
+          isolate_breaking: z.boolean().optional().describe("When true (default), each breaking-change issue is given its own milestone instead of sharing one with unrelated issues. Tunes capacity-aware semver milestone grouping."),
+        })
+        .strict()
+        .optional()
+        .describe("Capacity policy for the semver release model. Controls per-milestone effort budget and breaking-change isolation. Absent block uses capacity-aware defaults."),
       inventory_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during inventory phase (default: 4)."),
       depgraph_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during dependency verification (default: 4)."),
       depgraph_verify_cap: z.number().int().positive().optional().describe("Maximum candidates to source-verify; excess go to open_questions (default: 20)."),
