@@ -37,6 +37,18 @@ Consecutive milestone titles SHALL be monotonically increasing valid semver vers
 - **THEN** `plan.json.milestones[]` SHALL be allowed to place all eight issues in a single milestone
 - **AND** the engine SHALL NOT split them solely because the count exceeds five
 
+#### Scenario: blocked_pending_decision issues are excluded from milestones
+
+- **WHEN** an issue number appears in `dependency_graph.blocked_pending_decision`
+- **THEN** that issue SHALL NOT be placed in any entry of `plan.json.milestones[]`
+- **AND** all other issues not in `blocked_pending_decision` SHALL still be eligible for placement
+
+#### Scenario: Local in-plan dependencies are not excluded from milestones
+
+- **WHEN** an issue has a local in-plan prerequisite (i.e. it appears in another issue's `must_precede` list) but is NOT in `blocked_pending_decision`
+- **THEN** that issue SHALL still be placed in `plan.json.milestones[]`
+- **AND** the engine SHALL honor the dependency order rather than exclude the dependent issue
+
 ## ADDED Requirements
 
 ### Requirement: The engine SHALL allow a single large, risky, or breaking-change issue to occupy its own milestone
@@ -59,6 +71,12 @@ cannot share a milestone without exceeding the budget.
 
 - **WHEN** an issue is classified as a breaking change and `roadmap.release_capacity.isolate_breaking` is enabled (default)
 - **THEN** that issue SHALL appear alone in its own `plan.json.milestones[]` entry
+
+#### Scenario: High-risk issue is isolated regardless of effort size
+
+- **WHEN** an issue carries a high-risk signal — specifically a risk entry matching `"Security-sensitive change"` or `"Wide blast radius"` — regardless of its effort size
+- **THEN** that issue SHALL appear alone in its own `plan.json.milestones[]` entry
+- **AND** other issues SHALL NOT share that milestone even if their combined effort would fit the capacity budget
 
 ### Requirement: The engine SHALL group more than five small, low-risk, cohesive issues into one milestone when they fit a release's capacity
 
