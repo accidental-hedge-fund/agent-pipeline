@@ -59,6 +59,7 @@ export const BLOCKER_KINDS = [
   "eval-gate-misconfigured",
   "eval-gate-failed",
   "shipcheck-failed",
+  "head-drift",
   "worktree-setup-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
@@ -150,6 +151,10 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "comment above for the specific concerns). Address the flagged concerns in " +
     "the worktree and commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
+  "head-drift":
+    "The worktree HEAD differs from the PR head (an unpushed local fix). Push the " +
+    "local commits so the PR head includes the fix (`git push`), remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
   "worktree-setup-failed":
     "The worktree dependency install step failed (see the error above). " +
     "Fix the root cause (package manager not installed, bad lockfile, network " +

@@ -136,6 +136,10 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "comment above for the specific concerns). Address the flagged concerns in " +
     "the worktree and commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
+  "head-drift":
+    "The worktree HEAD differs from the PR head (an unpushed local fix). Push the " +
+    "local commits so the PR head includes the fix (`git push`), remove the " +
+    "`blocked` label, then re-run `$pipeline 7`.",
   "worktree-setup-failed":
     "The worktree dependency install step failed (see the error above). " +
     "Fix the root cause (package manager not installed, bad lockfile, network " +
@@ -413,4 +417,15 @@ test("worktree-creation-failed directs to remove config lock, delete dangling br
   assert.ok(body.includes("`blocked`"), "must mention clearing the blocked label");
   assert.ok(body.includes("re-run `$pipeline 7`"), "must direct to re-run");
   assert.ok(!body.includes("--unblock"), "must not direct to --unblock");
+});
+
+// head-drift: must direct to push the local commits, not merely clear the label (#317).
+test("head-drift directs to push local commits, clear label, re-run — not merely clear the label", () => {
+  const body = comment("head-drift");
+  assert.ok(body.includes("git push"), "must direct to push the local commits");
+  assert.ok(body.includes("`blocked`"), "must mention clearing the blocked label");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "must direct to re-run");
+  assert.ok(!body.includes("--unblock"), "must not direct to --unblock");
+  // Recipe must NOT consist solely of a clear-the-label instruction.
+  assert.ok(body.includes("push"), "must mention pushing");
 });
