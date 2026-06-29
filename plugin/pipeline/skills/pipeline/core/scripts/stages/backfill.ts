@@ -75,9 +75,16 @@ export interface BackfillDeps {
   /** Return the list of files currently staged in the index (git diff --name-only --cached). */
   gitGetStagedFiles(repoDir: string): string[];
   /**
+   * Return untracked/modified files under openspec/ in the working tree
+   * (git status --porcelain openspec/). Used to detect pre-existing dirty state
+   * before authoring new files.
+   */
+  gitOpenspecDirtyFiles(repoDir: string): string[];
+  /**
    * Return requirement labels from open backfill PRs on remote branches. Used to
    * de-duplicate across in-flight backfill PRs that live on other branches and are
-   * not visible in the current checkout.
+   * not visible in the current checkout. Called in both preview and apply paths
+   * (read-only gh API calls — no filesystem or git mutation).
    */
   listOpenBackfillPRBehaviors(repoDir: string): string[];
   log(msg: string): void;
@@ -264,12 +271,25 @@ export function realBackfillDeps(
       return (result.stdout?.trim() ?? "").split("\n").filter(Boolean);
     },
 
+    gitOpenspecDirtyFiles: (dir) => {
+      const result = spawnSync("git", ["status", "--porcelain", "openspec/"], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (result.status !== 0) return []; // fail open if git command errors
+      return (result.stdout?.trim() ?? "")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => line.slice(3)); // strip the "XY " status prefix
+    },
+
     listOpenBackfillPRBehaviors: (dir) => {
       const behaviors: string[] = [];
       // Read-only: query open backfill PRs via gh API — no git fetch, no git mutation.
       const listResult = spawnSync(
         "gh",
-        ["pr", "list", "--json", "headRefName,number", "--state", "open"],
+        ["pr", "list", "--json", "headRefName,number", "--state", "open", "--limit", "200"],
         { encoding: "utf8", stdio: "pipe", cwd: dir },
       );
       if (listResult.status !== 0 || !listResult.stdout?.trim()) return [];
@@ -593,7 +613,11 @@ export async function runBackfill(
 
   const livingRequirements = d.readLivingSpecs(repoDir);
   const localOpenBehaviors = readOpenBackfillBehaviors(repoDir);
-  // Remote de-duplication is deferred to the apply path to keep preview filesystem-clean.
+  // Remote de-duplication runs in both preview and apply paths (read-only gh API — no git mutation).
+  const remoteOpenBehaviors = d.listOpenBackfillPRBehaviors(repoDir);
+  const allOpenBehaviors = remoteOpenBehaviors.length > 0
+    ? [...localOpenBehaviors, ...remoteOpenBehaviors]
+    : localOpenBehaviors;
 
   const hasWorkspace = isInitialized(repoDir);
   if (!hasWorkspace) {
@@ -657,7 +681,7 @@ export async function runBackfill(
 
   // ---- Step 4: Classify candidates (deterministic) ----
 
-  const classified = classifyCoverage(candidates, livingRequirements, localOpenBehaviors);
+  const classified = classifyCoverage(candidates, livingRequirements, allOpenBehaviors);
 
   // ---- Preview path ----
 
@@ -669,14 +693,8 @@ export async function runBackfill(
 
   // ---- Apply path ----
 
-  // Extend de-duplication with remote open backfill PR behaviors (apply-only — gh API, no git fetch).
-  const remoteOpenBehaviors = d.listOpenBackfillPRBehaviors(repoDir);
-  const classifiedForApply = remoteOpenBehaviors.length > 0
-    ? classifyCoverage(candidates, livingRequirements, [...localOpenBehaviors, ...remoteOpenBehaviors])
-    : classified;
-
-  // Step 5: Select the slice.
-  let slice = classifiedForApply.filter((c) => c.group === "missing-coverage" && !c.already_proposed);
+  // Step 5: Select the slice (remote de-duplication already applied in classified above).
+  let slice = classified.filter((c) => c.group === "missing-coverage" && !c.already_proposed);
 
   if (opts.capability) {
     const capLower = opts.capability.toLowerCase();
@@ -702,6 +720,16 @@ export async function runBackfill(
   const proposalPath = path.join(changeDir, "proposal.md");
   const tasksPath = path.join(changeDir, "tasks.md");
   const specPath = path.join(specDir, "spec.md");
+
+  // Step 5.5: Abort if pre-existing dirty openspec/ state would contaminate validation.
+  const dirtyOpenspecFiles = d.gitOpenspecDirtyFiles(repoDir);
+  if (dirtyOpenspecFiles.length > 0) {
+    throw new Error(
+      `[pipeline backfill] pre-existing dirty openspec/ state detected before authoring: ` +
+        `${dirtyOpenspecFiles.join(", ")}. ` +
+        `Stash or commit these changes before running backfill --apply.`,
+    );
+  }
 
   d.writeFile(proposalPath, buildProposalMd(slice, changeId));
   d.writeFile(tasksPath, buildTasksMd(changeId));
@@ -770,7 +798,7 @@ export async function runBackfill(
 
   d.log(`[pipeline backfill] PR opened: ${prUrl}`);
 
-  const report = formatReport(classifiedForApply, true, prUrl);
+  const report = formatReport(classified, true, prUrl);
   d.log("\n" + report);
 }
 

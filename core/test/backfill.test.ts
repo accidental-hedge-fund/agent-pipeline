@@ -61,6 +61,7 @@ function makeDeps(overrides: Partial<BackfillDeps> = {}): BackfillDeps & { state
       return "https://github.com/owner/repo/pull/999";
     },
     gitGetStagedFiles: (_dir) => [],
+    gitOpenspecDirtyFiles: (_dir) => [],
     listOpenBackfillPRBehaviors: (_dir) => {
       state.listBehaviorsCalled = true;
       return [];
@@ -497,13 +498,59 @@ test("runBackfill: apply — remote open PR behaviors are de-duplicated", async 
 });
 
 // ---------------------------------------------------------------------------
-// Finding 1 regression: preview must not call listOpenBackfillPRBehaviors (non-mutating)
+// Finding 1 regression: preview must call listOpenBackfillPRBehaviors for accurate de-duplication
 // ---------------------------------------------------------------------------
 
-test("runBackfill: preview — listOpenBackfillPRBehaviors is NOT called (preview stays filesystem-clean)", async () => {
+test("runBackfill: preview — listOpenBackfillPRBehaviors IS called for remote de-duplication", async () => {
   const { state, ...deps } = makeDeps();
   await runBackfill({ apply: false }, cfg, deps);
-  assert.equal(state.listBehaviorsCalled, false, "preview should not call listOpenBackfillPRBehaviors");
+  assert.equal(state.listBehaviorsCalled, true, "preview should call listOpenBackfillPRBehaviors for accurate de-duplication");
+});
+
+test("runBackfill: preview — behavior already proposed in remote PR appears as already-proposed", async () => {
+  const behavior = "The CLI exits 0 on success";
+  const candidates: BackfillCandidate[] = [
+    { behavior, provenance: "test/exit.test.ts", evidence_grade: "sufficient", conflicts_with: null },
+  ];
+  const { state, ...deps } = makeDeps({
+    runHarness: async () => ({ success: true, output: JSON.stringify(candidates) }),
+    listOpenBackfillPRBehaviors: (_dir) => {
+      state.listBehaviorsCalled = true;
+      return [behavior];
+    },
+  });
+  await runBackfill({ apply: false }, cfg, deps);
+  const output = state.logged.join("\n");
+  assert.ok(
+    output.includes("Already proposed in an open backfill PR"),
+    `expected 'already proposed' annotation in preview output, got:\n${output}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 regression: pre-existing dirty openspec/ state aborts before authoring
+// ---------------------------------------------------------------------------
+
+test("runBackfill: apply — aborts before writing when pre-existing openspec/ dirt is detected", async () => {
+  const { state, ...deps } = makeDeps({
+    gitOpenspecDirtyFiles: (_dir) => ["openspec/changes/old-backfill/specs/foo/spec.md"],
+  });
+
+  await assert.rejects(
+    () => runBackfill({ apply: true }, cfg, deps),
+    /pre-existing dirty openspec\/ state detected/,
+  );
+  assert.deepEqual(state.writtenFiles, {}, "no files should be written when dirty openspec/ state is detected");
+  assert.equal(state.prOpened, null, "no PR should be opened when dirty openspec/ state is detected");
+});
+
+test("runBackfill: apply — proceeds normally when openspec/ is clean", async () => {
+  const { state, ...deps } = makeDeps({
+    gitOpenspecDirtyFiles: (_dir) => [],
+  });
+
+  await runBackfill({ apply: true }, cfg, deps);
+  assert.ok(state.prOpened !== null, "PR should be opened when openspec/ is clean");
 });
 
 // ---------------------------------------------------------------------------
