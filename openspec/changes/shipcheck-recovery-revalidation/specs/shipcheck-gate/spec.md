@@ -80,6 +80,14 @@ the reviewer evaluation as before — it SHALL NOT route back. Only shipcheck ve
 comments authored by the authenticated `gh` actor SHALL be trusted as the recorded
 SHA source.
 
+When a prior verdict comment by the authenticated actor exists but carries no
+`shipcheck-sha` sentinel (a legacy comment posted by an older harness version), the
+stage SHALL treat it as an unknown prior verdict and SHALL transition
+`shipcheck-gate → pre-merge` once, posting a `<!-- shipcheck-revalidation-sha: <current-head> -->`
+notice after the transition, so the new head is validated before shipcheck proceeds.
+The existing idempotency guard (`alreadyRoutedForCurrentHead`) prevents this migration
+route from repeating once the notice is posted.
+
 #### Scenario: developer commit landed since the prior shipcheck verdict — route back to pre-merge
 
 - **WHEN** the current stage is `shipcheck-gate` and `cfg.shipcheck_gate.enabled` is `true`
@@ -107,6 +115,23 @@ SHA source.
 - **WHEN** the current stage is `shipcheck-gate` and no prior shipcheck verdict comment exists for the issue
 - **THEN** the stage SHALL proceed with the reviewer evaluation
 - **AND** the verdict comment it posts SHALL record the evaluated PR head SHA via the `shipcheck-sha` sentinel
+
+#### Scenario: legacy verdict comment (no sentinel) triggers migration routing to pre-merge
+
+- **WHEN** the current stage is `shipcheck-gate`
+- **AND** a prior shipcheck verdict comment authored by the authenticated actor exists but has no `shipcheck-sha` sentinel (legacy comment)
+- **AND** no `shipcheck-revalidation-sha` notice for the current head has been posted yet
+- **THEN** the stage SHALL transition `shipcheck-gate → pre-merge`
+- **AND** SHALL NOT proceed to the reviewer evaluation
+- **AND** SHALL NOT transition to `ready-to-deploy`
+- **AND** SHALL post a notice with `<!-- shipcheck-revalidation-sha: <current-head> -->` after the transition
+
+#### Scenario: revalidation notice is only posted after a successful transition (idempotency marker not orphaned)
+
+- **WHEN** the stage is routing to `pre-merge` (developer commit or legacy migration)
+- **AND** the label transition fails before completing
+- **THEN** the `<!-- shipcheck-revalidation-sha: … -->` notice SHALL NOT be posted
+- **AND** the next run SHALL still route to `pre-merge` (no orphaned idempotency marker)
 
 #### Scenario: a commit made after a failed shipcheck does not advance directly to ready-to-deploy
 

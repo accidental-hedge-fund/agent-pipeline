@@ -1756,3 +1756,121 @@ test("shipcheck-gate #317 F3: actor lookup returns null with PR linked → block
   assert.equal(invokerCalled, 0, "reviewer must NOT be invoked when actor lookup fails");
   assert.equal(log.transitions.length, 0, "must NOT transition to ready-to-deploy or pre-merge");
 });
+
+// ---------------------------------------------------------------------------
+// Review-2 regression tests (#317)
+// ---------------------------------------------------------------------------
+
+// Finding 1 (review-2): transition failure must prevent the idempotency notice from being posted.
+// Without the fix (notice before transition), a transition failure leaves an orphaned
+// shipcheck-revalidation-sha marker that suppresses the route-back on the next run,
+// allowing the reviewer to advance an unvalidated head to ready-to-deploy.
+test("shipcheck-gate #317 R2-F1: transition failure → no revalidation notice posted (idempotency marker not orphaned)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const priorVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+
+  let noticePosted = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2,
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [DEVELOPER_COMMIT],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+      ],
+    }),
+    postComment: async (_c, _n, body) => {
+      if (body.includes("shipcheck-revalidation-sha")) noticePosted = true;
+      log.comments.push(body);
+    },
+    transition: async () => { throw new Error("simulated transition failure"); },
+    invokeReviewer: async () => ({ stdout: fencedJson(PASS_VERDICT), success: true }),
+  };
+
+  // The function throws because the transition failed.
+  await assert.rejects(
+    () => advance(cfg, 317, {}, deps),
+    /simulated transition failure/,
+    "function must throw when transition fails",
+  );
+  // Prove the fix: notice is NOT posted when transition throws (transition-first ordering).
+  assert.equal(noticePosted, false, "revalidation notice must NOT be posted when transition fails — no orphaned idempotency marker");
+});
+
+// Finding 2 (review-2): legacy verdict comment (no sentinel) must route to pre-merge, not advance.
+// Without the fix, a legacy shipcheck failure comment (pre-sentinel) is invisible to the
+// revalidation check; the stage falls through to the reviewer and may advance directly.
+test("shipcheck-gate #317 R2-F2: legacy verdict comment (no sentinel) → routes to pre-merge, reviewer not invoked", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  // Legacy comment: has the ## Shipcheck header but no shipcheck-sha sentinel.
+  const legacyVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate"); // no prHeadSha → no sentinel
+  let invokerCalled = 0;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2, // fix is pushed, no drift
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        { author: "pipeline-bot", body: legacyVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "must advance (via routing to pre-merge)");
+  assert.equal((out as { to: string }).to, "pre-merge", "must route to pre-merge, NOT ready-to-deploy");
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked for legacy verdict migration");
+  assert.ok(log.comments.some((c) => c.includes("shipcheck-revalidation-sha")), "revalidation notice must be posted");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].from, "shipcheck-gate");
+  assert.equal(log.transitions[0].to, "pre-merge");
+});
+
+// Finding 2 (review-2): after legacy migration routing for H2, re-entry proceeds with reviewer (idempotency).
+test("shipcheck-gate #317 R2-F2-idempotent: legacy migration already routed for H2 → re-entry proceeds with reviewer", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const legacyVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate"); // no sentinel
+  // The revalidation notice posted during the first (migration) route-back.
+  const revalidationNoticeForH2 = `**Shipcheck re-validation notice**: legacy migration...\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+  let invokerCalled = 0;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2,
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        { author: "pipeline-bot", body: legacyVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+        { author: "pipeline-bot", body: revalidationNoticeForH2, createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(invokerCalled, 1, "reviewer MUST be invoked after idempotency guard fires on re-entry");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "must advance to ready-to-deploy, not loop back");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].to, "ready-to-deploy");
+});

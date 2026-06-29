@@ -438,16 +438,35 @@ export async function advance(
           const recordedIdx = commits.findIndex((c) => c.oid === recordedSha);
           const commitsSince = recordedIdx >= 0 ? commits.slice(recordedIdx + 1) : commits;
           if (commitsSince.some((c) => !isPipelineInternalCommit(c.messageHeadline))) {
-            // Embed the revalidation sentinel so the next entry's idempotency guard
-            // detects that we already routed for this head and skips the route-back.
+            console.log(`[pipeline] #${issueNumber}: shipcheck-gate: developer commit since prior verdict SHA ${recordedSha.slice(0, 8)}; routing to pre-merge`);
+            // Transition FIRST so the idempotency marker is only posted after a
+            // confirmed route. If transition throws, no notice is posted and the
+            // next run retries the route-back correctly (Finding 1, review-2).
+            await transitionFn(cfg, issueNumber, "shipcheck-gate", "pre-merge", `Developer commit(s) since last shipcheck verdict (${recordedSha.slice(0, 8)} → ${prHeadSha.slice(0, 8)}); re-validating through pre-merge.`);
             const notice =
               `**Shipcheck re-validation notice**: A developer commit has landed since the last shipcheck verdict (stale: \`${recordedSha.slice(0, 8)}\`, current: \`${prHeadSha.slice(0, 8)}\`). Routing back through pre-merge, eval-gate, and review-SHA validation for the new head.\n<!-- shipcheck-revalidation-sha: ${prHeadSha} -->`;
             await postCommentFn(cfg, issueNumber, notice);
-            console.log(`[pipeline] #${issueNumber}: shipcheck-gate: developer commit since prior verdict SHA ${recordedSha.slice(0, 8)}; routing to pre-merge`);
-            await transitionFn(cfg, issueNumber, "shipcheck-gate", "pre-merge", `Developer commit(s) since last shipcheck verdict (${recordedSha.slice(0, 8)} → ${prHeadSha.slice(0, 8)}); re-validating through pre-merge.`);
             return { advanced: true, from: "shipcheck-gate", to: "pre-merge", summary: `shipcheck: re-validation routing to pre-merge (${recordedSha.slice(0, 8)} → ${prHeadSha.slice(0, 8)})` };
           }
           // Only pipeline-internal commits — fall through to normal reviewer evaluation.
+        }
+      } else {
+        // No sentinel-bearing verdict found. Check for legacy verdict comments posted
+        // by older harness versions that predate the shipcheck-sha sentinel (#317 Finding 2,
+        // review-2). Treat them as an unknown prior verdict and route to pre-merge once so
+        // the current head is validated through CI/review-SHA/eval before shipcheck proceeds.
+        // The alreadyRoutedForCurrentHead guard (checked above) prevents looping after the
+        // first migration route.
+        const hasLegacyVerdict = detail.comments.some(
+          (c) => c.author === actor && isShipcheckVerdictBody(c.body),
+        );
+        if (hasLegacyVerdict) {
+          console.log(`[pipeline] #${issueNumber}: shipcheck-gate: legacy verdict comment (no sentinel); routing to pre-merge for migration`);
+          await transitionFn(cfg, issueNumber, "shipcheck-gate", "pre-merge", `Legacy shipcheck verdict comment found without SHA sentinel; re-validating through pre-merge.`);
+          const legacyNotice =
+            `**Shipcheck re-validation notice**: A prior shipcheck verdict comment without a recorded head SHA was found. The current head (\`${prHeadSha.slice(0, 8)}\`) must be validated through pre-merge, eval-gate, and review-SHA before shipcheck can proceed.\n<!-- shipcheck-revalidation-sha: ${prHeadSha} -->`;
+          await postCommentFn(cfg, issueNumber, legacyNotice);
+          return { advanced: true, from: "shipcheck-gate", to: "pre-merge", summary: `shipcheck: legacy verdict migration routing to pre-merge` };
         }
       }
     }
@@ -1006,6 +1025,15 @@ async function gatherOpenspecDeltas(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Returns true when the comment body is a shipcheck verdict comment (gate or advisory),
+ * regardless of whether it carries the `shipcheck-sha` sentinel. Used to detect legacy
+ * verdict comments posted before the sentinel was added (#317 Finding 2, review-2).
+ */
+function isShipcheckVerdictBody(body: string): boolean {
+  return body.startsWith("## Shipcheck\n") || body.startsWith("## Shipcheck (advisory)\n");
 }
 
 /** Default git diff --name-only implementation. */
