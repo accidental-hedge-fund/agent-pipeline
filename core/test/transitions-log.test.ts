@@ -9,6 +9,8 @@
 //   5.6  transitionsLogPath derives the correct /tmp path.
 //   5.7  AdvanceDeps.logTransition seam is accepted by the type (compile check).
 //   5.8  Cleanup pattern: unlinkSync removes transitions log; missing file is tolerated.
+//   5.9  printOutcome calls tlog for advancing and non-advancing outcomes (regression for line-735 bug).
+//   5.10 AdvanceDeps.transitionsLogN seam accepted; PR-resolves-to-issue path uses original arg.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -16,6 +18,7 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { transitionsLogPath, appendTransitionLine, makeTransitionsLogger } from "../scripts/transitions-log.ts";
+import { printOutcome } from "../scripts/pipeline-run.ts";
 import type { AdvanceDeps } from "../scripts/pipeline-run.ts";
 
 // ---------------------------------------------------------------------------
@@ -169,4 +172,57 @@ test("cleanup: tolerates missing transitions log (no throw)", () => {
   assert.doesNotThrow(() => {
     try { fs.unlinkSync(missing); } catch { /* non-fatal */ }
   });
+});
+
+// ---------------------------------------------------------------------------
+// 5.9  printOutcome calls tlog for advancing and non-advancing outcomes
+//      Regression test for the line-735 bug: printOutcome was called without
+//      tlog, causing tlog to be undefined and the dispatch loop to crash.
+// ---------------------------------------------------------------------------
+
+test("printOutcome: advancing outcome calls tlog with from → to line", () => {
+  const collected: string[] = [];
+  const tlog = (line: string) => collected.push(line);
+  printOutcome(42, "ready" as import("../scripts/types.ts").Stage, {
+    advanced: true,
+    from: "ready" as import("../scripts/types.ts").Stage,
+    to: "review-1" as import("../scripts/types.ts").Stage,
+    summary: "PR #7 opened",
+  }, tlog);
+  assert.deepEqual(collected, ["[pipeline] #42: ready → review-1: PR #7 opened"]);
+});
+
+test("printOutcome: non-advancing outcome calls tlog with at — status line", () => {
+  const collected: string[] = [];
+  const tlog = (line: string) => collected.push(line);
+  printOutcome(42, "review-1" as import("../scripts/types.ts").Stage, {
+    advanced: false,
+    status: "blocked",
+    reason: "review ceiling reached",
+  }, tlog);
+  assert.deepEqual(collected, ["[pipeline] #42: at review-1 — blocked: review ceiling reached"]);
+});
+
+// ---------------------------------------------------------------------------
+// 5.10 AdvanceDeps.transitionsLogN seam accepted; PR-resolves-to-issue path
+//      uses the original argument number for the transitions log path.
+// ---------------------------------------------------------------------------
+
+test("AdvanceDeps: transitionsLogN field is part of the interface", () => {
+  const deps: AdvanceDeps = {
+    transitionsLogN: 100,
+    logTransition: () => {},
+  };
+  assert.equal(deps.transitionsLogN, 100);
+});
+
+test("transitions log path: PR-resolved-to-issue scenario uses original arg number", () => {
+  // PR #100 resolves to issue #64; the transitions log path must use 100
+  // (the originally supplied argument) so operators can derive it from run args.
+  const originalArg = 100;
+  const path = transitionsLogPath("agent-pipeline", originalArg);
+  assert.equal(path, "/tmp/pipeline-agent-pipeline-100.transitions.log");
+  // Confirm the resolved-issue path would differ, so the fix is meaningful.
+  const resolvedIssuePath = transitionsLogPath("agent-pipeline", 64);
+  assert.notEqual(path, resolvedIssuePath);
 });

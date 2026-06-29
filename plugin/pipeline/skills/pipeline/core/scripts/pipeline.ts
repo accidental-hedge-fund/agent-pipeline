@@ -1105,7 +1105,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  await runAdvance(cfg, issueNumber, opts);
+  // Pass the original argument as transitionsLogN so the transitions log path
+  // uses the same <N> as the full operator log (e.g. for PR→issue resolution).
+  await runAdvance(cfg, issueNumber, opts, { transitionsLogN: number });
 }
 
 // ---------------------------------------------------------------------------

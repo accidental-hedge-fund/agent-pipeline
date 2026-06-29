@@ -141,6 +141,8 @@ export interface AdvanceDeps {
   now?: () => number;
   /** Inject a fake transitions-log writer in unit tests; real runs use the file-backed writer. */
   logTransition?: (line: string) => void;
+  /** Override the issue number used to derive the transitions log path (for PR→issue resolution). */
+  transitionsLogN?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +197,7 @@ function evidenceTimestamp(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
 }
 
-function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome, tlog: (line: string) => void): void {
+export function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome, tlog: (line: string) => void): void {
   if (out.advanced) {
     const oo = out as { from: Stage; to: Stage; summary: string };
     tlog(`[pipeline] #${issueNumber}: ${oo.from} → ${oo.to}: ${oo.summary}`);
@@ -409,7 +411,7 @@ export async function runAdvance(
     // Transitions log (#324): append lifecycle lines to a dedicated per-issue file so
     // operators can `tail -f` without a grep filter. Skipped under --dry-run (stateDir
     // undefined). The injected seam (deps.logTransition) lets unit tests use a fake.
-    const logT = deps.logTransition ?? (stateDir ? makeTransitionsLogger(transitionsLogPath(cfg.domain, issueNumber)) : undefined);
+    const logT = deps.logTransition ?? (stateDir ? makeTransitionsLogger(transitionsLogPath(cfg.domain, deps.transitionsLogN ?? issueNumber)) : undefined);
     function tlog(line: string): void {
       console.log(line);
       logT?.(line);
@@ -732,7 +734,7 @@ export async function runAdvance(
       if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: stageExitedAt, stage: auditStage, outcome: evidenceOutcome(out), commits: stageCommits }, runStoreDeps).catch(() => {});
       }
-      printOutcome(issueNumber, stage, out);
+      printOutcome(issueNumber, stage, out, tlog);
 
       if (out.advanced) {
         transitions++;
