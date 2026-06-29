@@ -929,7 +929,9 @@ export function makeOpenspecPlanningHooks(
 
       // #131: salvage authoring work the harness left uncommitted before the
       // commit-range verification below (the change folder may exist only on disk).
-      await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore);
+      // Scope to openspec/ so only intent files are staged — aligns with the
+      // path-constraint guard below and fixes the sandbox-lock contamination (#321).
+      await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore, "openspec/");
 
       // ---- Discover the change the implementer created. ----
       const after = openspec.listChangeDirs(wt.path);
@@ -951,6 +953,8 @@ export function makeOpenspecPlanningHooks(
           issueNumber,
           pathConstraint: {
             allowPattern: /^openspec\//,
+            // tasks/ planning notes left dirty by the scoped salvage (#321) are expected
+            allowDirtyPattern: /^tasks\//,
             description:
               "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
           },
@@ -1327,13 +1331,14 @@ async function salvageIfNoNewCommit(
   pipelineRunId: string,
   stageLabel: string,
   headBefore: string,
+  scope?: string,
 ): Promise<void> {
   if (!headBefore) return;
   const headAfter = (
     await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   if (headAfter && headAfter === headBefore) {
-    await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel);
+    await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, {}, scope);
   }
 }
 

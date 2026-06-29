@@ -39,8 +39,10 @@ export interface VerifyConfig {
   /**
    * Assert every file changed in `headBefore..HEAD` matches this allow-pattern.
    * Files that do not match cause a block with the provided description.
+   * `allowDirtyPattern`, when set, exempts matching dirty files from the constraint
+   * so that planning notes left dirty by a scoped salvage do not trip the guard.
    */
-  pathConstraint?: { allowPattern: RegExp; description: string };
+  pathConstraint?: { allowPattern: RegExp; description: string; allowDirtyPattern?: RegExp };
 }
 
 export interface VerifyDeps {
@@ -247,13 +249,19 @@ export async function verifyHarnessCommits(
   // Path constraint: every committed or dirty file must match the allow-pattern
   // (#68 review-2 finding 2: dirty files must also be checked so an authoring
   // harness cannot bypass the constraint by leaving application code uncommitted).
+  // `allowDirtyPattern`, when set, exempts matching dirty paths from the check
+  // so that planning notes left dirty by a scoped salvage do not trip the guard.
   if (config.pathConstraint) {
     const [diffFiles, dirtyFiles] = await Promise.all([
       getDiffFiles(wtPath, headBefore),
       getDirtyFiles(wtPath),
     ]);
-    const allFiles = [...new Set([...diffFiles, ...dirtyFiles])];
-    const denied = allFiles.filter((f) => !config.pathConstraint!.allowPattern.test(f));
+    const { allowPattern, allowDirtyPattern } = config.pathConstraint;
+    const filteredDirtyFiles = allowDirtyPattern
+      ? dirtyFiles.filter((f) => !allowDirtyPattern.test(f))
+      : dirtyFiles;
+    const allFiles = [...new Set([...diffFiles, ...filteredDirtyFiles])];
+    const denied = allFiles.filter((f) => !allowPattern.test(f));
     if (denied.length > 0) {
       return { ok: false, reason: config.pathConstraint.description };
     }
