@@ -1647,6 +1647,9 @@ test("shipcheck-gate #317 F1: re-entered after pre-merge routing with revalidati
   let invokerCalled = 0;
 
   const priorVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  // Simulate the pre-merge audit comment posted by transitionFn before the notice.
+  // The transition always posts its audit sentinel BEFORE postCommentFn posts the notice.
+  const preMergeAuditComment = `## Pipeline: pre merge\n**Transition**: \`shipcheck-gate\` → \`pre-merge\`\n<!-- pipeline-audit: run=run-xyz state=pre-merge -->`;
   // Simulate the notice posted when we first routed to pre-merge for H2.
   // The `extractRevalidationSha` must find SHA_H2 in this comment.
   const revalidationNoticeForH2 = `**Shipcheck re-validation notice**: stale ${SHA_H1.slice(0, 8)}, current ${SHA_H2.slice(0, 8)}.\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
@@ -1663,6 +1666,8 @@ test("shipcheck-gate #317 F1: re-entered after pre-merge routing with revalidati
       number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
       comments: [
         { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+        // pre-merge audit posted by transitionFn (always before the revalidation notice)
+        { author: "pipeline-bot", body: preMergeAuditComment, createdAt: "2026-01-01T12:00:00Z" },
         { author: "pipeline-bot", body: revalidationNoticeForH2, createdAt: "2026-01-02T00:00:00Z" },
       ],
     }),
@@ -1687,6 +1692,50 @@ test("extractRevalidationSha: returns 40-char SHA when sentinel is present", () 
 test("extractRevalidationSha: returns null when sentinel is absent", () => {
   const body = `**Shipcheck re-validation notice**: no sentinel here.`;
   assert.equal(extractRevalidationSha(body), null);
+});
+
+// Finding 7ca10c2e regression: orphaned revalidation marker (no preceding pre-merge audit)
+// must NOT be trusted — must route back to pre-merge so the head is properly validated.
+// Without the fix, alreadyRoutedForCurrentHead is true (marker found) and the reviewer is
+// invoked, advancing to ready-to-deploy. With the fix, the missing pre-merge audit makes
+// alreadyRoutedForCurrentHead false and the developer commit triggers the route-back.
+test("shipcheck-gate #317 7ca10c2e: orphaned revalidation marker (no preceding pre-merge audit) → routes back to pre-merge, reviewer NOT invoked", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+
+  const priorVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  // Orphaned marker: posted by pre-fix code BEFORE the transition (which then failed).
+  // No pre-merge audit comment precedes it.
+  const orphanedMarker = `**Shipcheck re-validation notice**: stale ${SHA_H1.slice(0, 8)}, current ${SHA_H2.slice(0, 8)}.\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2,
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [DEVELOPER_COMMIT],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+        // orphaned marker only — no pre-merge audit comment before it
+        { author: "pipeline-bot", body: orphanedMarker, createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked — orphaned marker must not bypass route-back");
+  assert.equal(out.advanced, true, "must advance via routing to pre-merge");
+  assert.equal((out as { to: string }).to, "pre-merge", "must route back to pre-merge, not ready-to-deploy");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].from, "shipcheck-gate");
+  assert.equal(log.transitions[0].to, "pre-merge");
 });
 
 // Finding 2 regression: PR head changes during reviewer run → route to pre-merge, not ready-to-deploy.
@@ -1845,7 +1894,9 @@ test("shipcheck-gate #317 R2-F2-idempotent: legacy migration already routed for 
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate" });
   const legacyVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate"); // no sentinel
-  // The revalidation notice posted during the first (migration) route-back.
+  // The pre-merge audit comment posted by transitionFn during the migration route-back.
+  const preMergeAuditComment = `## Pipeline: pre merge\n**Transition**: \`shipcheck-gate\` → \`pre-merge\`\n<!-- pipeline-audit: run=run-legacy state=pre-merge -->`;
+  // The revalidation notice posted during the first (migration) route-back, AFTER the transition.
   const revalidationNoticeForH2 = `**Shipcheck re-validation notice**: legacy migration...\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
   let invokerCalled = 0;
   const deps: ShipcheckDeps = {
@@ -1860,6 +1911,8 @@ test("shipcheck-gate #317 R2-F2-idempotent: legacy migration already routed for 
       number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
       comments: [
         { author: "pipeline-bot", body: legacyVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+        // pre-merge audit posted by transitionFn (always before the revalidation notice)
+        { author: "pipeline-bot", body: preMergeAuditComment, createdAt: "2026-01-01T12:00:00Z" },
         { author: "pipeline-bot", body: revalidationNoticeForH2, createdAt: "2026-01-02T00:00:00Z" },
       ],
     }),

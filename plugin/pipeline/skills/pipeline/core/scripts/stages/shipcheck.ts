@@ -406,14 +406,27 @@ export async function advance(
       await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "actor_lookup_failure");
       return { advanced: false, status: "blocked", reason: "shipcheck: actor lookup failure", blockerKind: "needs-human" as BlockerKind };
     }
-    // Finding 1 idempotency guard: if we already routed to pre-merge for the current
-    // head (the revalidation notice authored by the actor carries the current prHeadSha),
-    // skip the route-back and proceed with reviewer evaluation. Without this guard the
-    // second shipcheck entry after pre-merge/eval completes would loop back again because
-    // the prior verdict still records the pre-fix SHA.
-    const alreadyRoutedForCurrentHead = detail.comments.some(
+    // Finding 1 idempotency guard: if we already successfully routed to pre-merge
+    // for the current head (the transition posted a pre-merge audit sentinel AND
+    // the revalidation notice authored by the actor carries the current prHeadSha),
+    // skip the route-back and proceed with reviewer evaluation. Without this guard
+    // the second shipcheck entry after pre-merge/eval completes would loop back again
+    // because the prior verdict still records the pre-fix SHA.
+    // Require BOTH the marker AND a preceding pre-merge audit comment from the actor:
+    // an orphaned marker posted by pre-fix code before a failed transition has no
+    // preceding audit and must not be trusted — route back to properly validate
+    // the head (#317, override-key 7ca10c2e).
+    const revalidationMarkerIdx = detail.comments.findIndex(
       (c) => c.author === actor && extractRevalidationSha(c.body) === prHeadSha,
     );
+    const alreadyRoutedForCurrentHead =
+      revalidationMarkerIdx !== -1 &&
+      detail.comments.slice(0, revalidationMarkerIdx).some(
+        (c) =>
+          c.author === actor &&
+          c.body.includes("<!-- pipeline-audit:") &&
+          c.body.includes("state=pre-merge"),
+      );
     if (!alreadyRoutedForCurrentHead) {
       // Find the most recent shipcheck verdict comment authored by the pipeline actor
       // that carries a shipcheck-sha sentinel (i.e. posted by this harness, not legacy).
