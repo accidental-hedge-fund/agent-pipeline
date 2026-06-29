@@ -2,7 +2,7 @@
 
 ### Requirement: The `backfill` sub-command SHALL run without an issue number
 
-The pipeline CLI SHALL accept `backfill` as a positional sub-command keyword that requires no issue number and that does not read or advance any pipeline stage label. It SHALL be dispatched when the first positional argument is the string `backfill` (case-sensitive). The command SHALL accept an optional `--apply` flag (default off → preview), an optional `--capability <name>` flag to scope a slice, and an optional `--repo <owner/repo>` flag (default: the current repo). When `--apply` is supplied but no applicable slice can be resolved, the command SHALL exit non-zero with a usage error rather than silently doing nothing.
+The pipeline CLI SHALL accept `backfill` as a positional sub-command keyword that requires no issue number and that does not read or advance any pipeline stage label. It SHALL be dispatched when the first positional argument is the string `backfill` (case-sensitive). The command SHALL accept an optional `--apply` flag (default off → preview) and an optional `--capability <name>` flag to scope a slice. When `--apply` is supplied but no applicable slice can be resolved, the command SHALL exit non-zero with a usage error rather than silently doing nothing.
 
 #### Scenario: Invoked with no flags runs a preview
 

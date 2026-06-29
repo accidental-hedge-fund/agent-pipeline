@@ -58,6 +58,8 @@ function makeDeps(overrides: Partial<BackfillDeps> = {}): BackfillDeps & { state
       state.prOpened = "https://github.com/owner/repo/pull/999";
       return "https://github.com/owner/repo/pull/999";
     },
+    gitGetStagedFiles: (_dir) => [],
+    listOpenBackfillPRBehaviors: (_dir) => [],
     log: (msg) => { state.logged.push(msg); },
   };
 
@@ -398,12 +400,13 @@ test("pipeline-cli: backfill --capability foo → validateFlags returns []", () 
   assert.deepEqual(validateFlags(entry!, cmd), []);
 });
 
-test("pipeline-cli: backfill --repo owner/repo → validateFlags returns []", () => {
+test("pipeline-cli: backfill --repo is not a supported backfill flag → validateFlags returns non-empty", () => {
   const cmd = buildCmd();
   cmd.parse(["node", "pipeline", "backfill", "--repo", "owner/repo"]);
   const entry = lookupCommand("backfill");
   assert.ok(entry !== null);
-  assert.deepEqual(validateFlags(entry!, cmd), []);
+  const offending = validateFlags(entry!, cmd);
+  assert.ok(offending.includes("repo"), `expected repo to be disallowed for backfill, got: ${JSON.stringify(offending)}`);
 });
 
 test("pipeline-cli: backfill with unsupported flag → validateFlags returns non-empty", () => {
@@ -429,4 +432,94 @@ test("pipeline-cli: buildCmd includes --capability option", () => {
   const cmd = buildCmd();
   const capOpt = cmd.options.find((o) => o.long === "--capability");
   assert.ok(capOpt !== undefined, "--capability option should be defined in buildCmd");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2: staged-files guard (pre-staged non-openspec files abort before commit)
+// ---------------------------------------------------------------------------
+
+test("runBackfill: apply — aborts before commit when non-openspec files are pre-staged", async () => {
+  const { state, ...deps } = makeDeps({
+    gitGetStagedFiles: (_dir) => ["src/main.ts", "README.md"],
+  });
+
+  await assert.rejects(
+    () => runBackfill({ apply: true }, cfg, deps),
+    /spec-only guard.*non-openspec/,
+  );
+  assert.equal(state.prOpened, null, "no PR should be opened when staged non-spec files detected");
+});
+
+test("runBackfill: apply — proceeds normally when only openspec files are pre-staged", async () => {
+  const { state, ...deps } = makeDeps({
+    gitGetStagedFiles: (_dir) => ["openspec/specs/foo/spec.md"],
+  });
+
+  await runBackfill({ apply: true }, cfg, deps);
+  assert.ok(state.prOpened !== null, "PR should be opened when pre-staged files are all under openspec/");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3: open backfill PR de-duplication
+// ---------------------------------------------------------------------------
+
+test("classifyCoverage: capability-scoped already-proposed behavior is flagged", () => {
+  const candidates: BackfillCandidate[] = [
+    { behavior: "The CLI accepts a capability flag", provenance: "test/cli.test.ts", evidence_grade: "sufficient", conflicts_with: null },
+  ];
+  // Simulate a behavior from a capability-scoped spec (not backfill/spec.md)
+  const result = classifyCoverage(candidates, [], ["The CLI accepts a capability flag"]);
+  assert.equal(result[0]!.group, "missing-coverage");
+  assert.equal(result[0]!.already_proposed, true);
+});
+
+test("runBackfill: apply — remote open PR behaviors are de-duplicated", async () => {
+  const behavior = "The CLI exits 0 on success";
+  const candidates: BackfillCandidate[] = [
+    { behavior, provenance: "test/exit.test.ts", evidence_grade: "sufficient", conflicts_with: null },
+  ];
+  const { state, ...deps } = makeDeps({
+    runHarness: async () => ({ success: true, output: JSON.stringify(candidates) }),
+    listOpenBackfillPRBehaviors: (_dir) => [behavior],
+  });
+
+  // The only candidate is already proposed in a remote PR → slice is empty → throws
+  await assert.rejects(
+    () => runBackfill({ apply: true }, cfg, deps),
+    /no missing-coverage candidates/,
+  );
+  assert.equal(state.prOpened, null, "no duplicate PR should be opened");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 4: unknown evidence grade → uncertain-evidence
+// ---------------------------------------------------------------------------
+
+test("runBackfill: unknown evidence grade from model is demoted to uncertain-evidence", async () => {
+  const candidates = [
+    { behavior: "Some behavior", provenance: "test.ts", evidence_grade: "weak", conflicts_with: null },
+  ];
+  const { state, ...deps } = makeDeps({
+    runHarness: async () => ({ success: true, output: JSON.stringify(candidates) }),
+  });
+
+  await runBackfill({ apply: false }, cfg, deps);
+  const output = state.logged.join("\n");
+  assert.ok(output.includes("Uncertain Evidence"), "unknown grade should appear in Uncertain Evidence group");
+  assert.ok(!output.includes("Missing Coverage\n\n- **Some behavior**"), "unknown grade should NOT appear in Missing Coverage group");
+});
+
+test("runBackfill: apply — unknown evidence grade does not enter missing-coverage slice", async () => {
+  const candidates = [
+    { behavior: "Some weak behavior", provenance: "test.ts", evidence_grade: "insufficient", conflicts_with: null },
+  ];
+  const { _state, ...deps } = makeDeps({
+    runHarness: async () => ({ success: true, output: JSON.stringify(candidates) }),
+  });
+
+  // With only an unknown-grade candidate, no missing-coverage slice exists → exits non-zero
+  await assert.rejects(
+    () => runBackfill({ apply: true }, cfg, deps),
+    /no missing-coverage candidates/,
+  );
 });

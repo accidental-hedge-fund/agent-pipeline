@@ -253,7 +253,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   backfill: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "profile", "apply", "capability", "repo"]),
+    allowedFlags: new Set(["repoPath", "base", "profile", "apply", "capability"]),
     needsConfig: true,
     needsGhAuth: false,
     mutatesGitHub: false,

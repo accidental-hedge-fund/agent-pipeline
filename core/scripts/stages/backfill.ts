@@ -19,7 +19,7 @@ import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
 import { buildBackfillPrompt } from "../prompts/index.ts";
-import { isInitialized, listChangeDirs, readChangeFile, validate } from "../openspec.ts";
+import { isInitialized, listChangeDirs, readSpecDeltas, validate } from "../openspec.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -49,8 +49,6 @@ export interface BackfillOpts {
   apply?: boolean;
   /** Scope the apply slice to a named capability. */
   capability?: string;
-  /** Override the target repo (owner/repo). */
-  repo?: string;
 }
 
 export interface BackfillDeps {
@@ -74,6 +72,14 @@ export interface BackfillDeps {
   gitPushBranch(repoDir: string, branch: string): void;
   /** Open a PR; returns the PR URL. */
   createPR(repoDir: string, title: string, body: string, base: string, head: string): Promise<string>;
+  /** Return the list of files currently staged in the index (git diff --name-only --cached). */
+  gitGetStagedFiles(repoDir: string): string[];
+  /**
+   * Return requirement labels from open backfill PRs on remote branches. Used to
+   * de-duplicate across in-flight backfill PRs that live on other branches and are
+   * not visible in the current checkout.
+   */
+  listOpenBackfillPRBehaviors(repoDir: string): string[];
   log(msg: string): void;
 }
 
@@ -244,8 +250,80 @@ export function realBackfillDeps(
       return result.stdout.trim();
     },
 
+    gitGetStagedFiles: (dir) => {
+      const result = spawnSync("git", ["diff", "--name-only", "--cached"], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `[pipeline backfill] git diff --name-only --cached failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+        );
+      }
+      return (result.stdout?.trim() ?? "").split("\n").filter(Boolean);
+    },
+
+    listOpenBackfillPRBehaviors: (dir) => {
+      const behaviors: string[] = [];
+      // Fetch remote backfill branches to update local remote-tracking refs.
+      spawnSync("git", ["fetch", "--quiet", "origin", "refs/heads/backfill/*:refs/remotes/origin/backfill/*"], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      // List all remote backfill tracking refs.
+      const lsResult = spawnSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/backfill/"], {
+        encoding: "utf8",
+        stdio: "pipe",
+        cwd: dir,
+      });
+      if (lsResult.status !== 0 || !lsResult.stdout?.trim()) return [];
+      for (const ref of lsResult.stdout.trim().split("\n").filter(Boolean)) {
+        // List spec files under openspec/changes/ on this remote branch.
+        const treeResult = spawnSync("git", ["ls-tree", "-r", "--name-only", ref], {
+          encoding: "utf8",
+          stdio: "pipe",
+          cwd: dir,
+        });
+        if (treeResult.status !== 0) continue;
+        const specFiles = treeResult.stdout.trim().split("\n")
+          .filter(f => /^openspec\/changes\/[^/]+\/specs\/.*\.md$/.test(f));
+        for (const f of specFiles) {
+          const showResult = spawnSync("git", ["show", `${ref}:${f}`], {
+            encoding: "utf8",
+            stdio: "pipe",
+            cwd: dir,
+          });
+          if (showResult.status !== 0) continue;
+          for (const m of showResult.stdout.matchAll(/^###\s+Requirement:\s+(.+)$/gm)) {
+            behaviors.push(m[1].trim());
+          }
+        }
+      }
+      return behaviors;
+    },
+
     log: (msg) => process.stdout.write(msg + "\n"),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Evidence grade validation
+// ---------------------------------------------------------------------------
+
+const VALID_EVIDENCE_GRADES = new Set<string>(["sufficient", "conflicting", "uncertain"]);
+
+/**
+ * Parse and validate an evidence_grade value from model output. Unknown grades
+ * (e.g. "weak", "insufficient", typos) are demoted to "uncertain" so they cannot
+ * reach the missing-coverage group.
+ */
+function parseEvidenceGrade(raw: unknown): EvidenceGrade {
+  if (typeof raw === "string" && VALID_EVIDENCE_GRADES.has(raw)) {
+    return raw as EvidenceGrade;
+  }
+  return "uncertain";
 }
 
 // ---------------------------------------------------------------------------
@@ -321,18 +399,18 @@ export function classifyCoverage(
 // ---------------------------------------------------------------------------
 
 /**
- * Return the set of normalized behavior strings that are already proposed in
- * any open backfill change under openspec/changes/.
+ * Return the set of requirement labels already proposed in any local backfill
+ * change under openspec/changes/. Scans all specs/**\/spec.md files (not only
+ * specs/backfill/spec.md) so capability-scoped changes are included.
  */
 function readOpenBackfillBehaviors(repoDir: string): string[] {
   const behaviors: string[] = [];
   const changeDirs = listChangeDirs(repoDir);
   for (const id of changeDirs) {
     if (!id.startsWith("backfill")) continue;
-    const spec = readChangeFile(repoDir, id, "specs/backfill/spec.md");
-    if (!spec) continue;
-    const reqMatches = spec.matchAll(/^###\s+Requirement:\s+(.+)$/gm);
-    for (const m of reqMatches) {
+    const deltas = readSpecDeltas(repoDir, id);
+    if (!deltas) continue;
+    for (const m of deltas.matchAll(/^###\s+Requirement:\s+(.+)$/gm)) {
       behaviors.push(m[1].trim());
     }
   }
@@ -494,7 +572,9 @@ export async function runBackfill(
   // ---- Step 1: Read living specs and open backfill proposals ----
 
   const livingRequirements = d.readLivingSpecs(repoDir);
-  const openBackfillBehaviors = readOpenBackfillBehaviors(repoDir);
+  const localOpenBehaviors = readOpenBackfillBehaviors(repoDir);
+  const remoteOpenBehaviors = d.listOpenBackfillPRBehaviors(repoDir);
+  const openBackfillBehaviors = [...localOpenBehaviors, ...remoteOpenBehaviors];
 
   const hasWorkspace = isInitialized(repoDir);
   if (!hasWorkspace) {
@@ -538,17 +618,16 @@ export async function runBackfill(
     try {
       const parsed = JSON.parse(jsonMatch[0]) as unknown[];
       candidates = parsed
-        .filter((x): x is BackfillCandidate =>
+        .filter((x): x is Record<string, unknown> =>
           typeof x === "object" && x !== null &&
           typeof (x as Record<string, unknown>).behavior === "string" &&
-          typeof (x as Record<string, unknown>).provenance === "string" &&
-          typeof (x as Record<string, unknown>).evidence_grade === "string",
+          typeof (x as Record<string, unknown>).provenance === "string",
         )
         .map((x) => ({
-          behavior: (x as BackfillCandidate).behavior,
-          provenance: (x as BackfillCandidate).provenance || "",
-          evidence_grade: (x as BackfillCandidate).evidence_grade,
-          conflicts_with: (x as BackfillCandidate).conflicts_with ?? null,
+          behavior: x.behavior as string,
+          provenance: (x.provenance as string) || "",
+          evidence_grade: parseEvidenceGrade(x.evidence_grade),
+          conflicts_with: (x.conflicts_with as string | null) ?? null,
         }));
     } catch {
       throw new Error("[pipeline backfill] could not parse candidate JSON from harness output.");
@@ -640,6 +719,16 @@ export async function runBackfill(
     `OpenSpec adoption. Each requirement carries provenance and a backfill annotation.\n\n` +
     `Change: ${changeId}\n` +
     `Issue: #327\nPipeline-Run: 327/2026-06-29T12:36:34Z`;
+
+  // Guard: abort if any non-openspec files are already staged in the operator's
+  // index. git commit would include them even though git add only touches our files.
+  const preStagedFiles = d.gitGetStagedFiles(repoDir);
+  const preStagedNonSpec = nonOpenspecPaths(preStagedFiles.map(f => f.replace(/\\/g, "/")));
+  if (preStagedNonSpec.length > 0) {
+    throw new Error(
+      `[pipeline backfill] spec-only guard: the operator's git index has non-openspec/ files staged that would be included in the commit: ${preStagedNonSpec.join(", ")}. Unstage them before running backfill --apply.`,
+    );
+  }
 
   d.gitCommit(repoDir, authoredPaths, commitMsg);
   d.gitPushBranch(repoDir, branch);

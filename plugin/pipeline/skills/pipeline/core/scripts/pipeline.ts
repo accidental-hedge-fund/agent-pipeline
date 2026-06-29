@@ -904,8 +904,8 @@ async function main(): Promise<void> {
     const { runBackfill, realBackfillDeps } = await import("./stages/backfill.ts");
     try {
       await runBackfill(
-        { apply: !!opts.apply, capability: opts.capability, repo: opts.repo },
-        { repo_dir: backfillCfg.repo_dir, repo: opts.repo ?? backfillCfg.repo, base_branch: backfillCfg.base_branch },
+        { apply: !!opts.apply, capability: opts.capability },
+        { repo_dir: backfillCfg.repo_dir, repo: backfillCfg.repo, base_branch: backfillCfg.base_branch },
         realBackfillDeps(backfillCfg.repo_dir),
       );
     } catch (err) {
