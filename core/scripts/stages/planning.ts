@@ -294,10 +294,9 @@ export async function runPlanningPhases(
   // ---- Step 0: optional carry-forward context (last30days) ----
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
 
-  // ---- Step 0b: pre-planning context snapshot (human comments) ----
-  const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
-
   // ---- Worktree bootstrap: create + dependency install ----
+  // NOTE: snapshot is gathered AFTER bootstrap so any human comments posted
+  // during the bootstrap window (dep installs can be slow) are captured (#318).
   const slug = slugify(title) || `issue-${issueNumber}`;
   const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug, deps);
   if (!bootstrap.ok) {
@@ -312,6 +311,10 @@ export async function runPlanningPhases(
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
     await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
   }
+
+  // ---- Step 0b: pre-planning context snapshot (human comments) ----
+  // Gathered after bootstrap so comments posted during the bootstrap window are included.
+  const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
 
   // ---- Author the planning artifact ----
   const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot);

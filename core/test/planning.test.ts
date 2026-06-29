@@ -1142,3 +1142,27 @@ test("gatherContextSnapshot: last30days comment does NOT prevent human-comment s
   assert.ok(snapshot, "expected a '## Pre-Planning Context' snapshot to be posted even when a last30days comment exists");
   assert.match(snapshot!, /alice/, "snapshot must contain the human comment author");
 });
+
+test("runPlanningPhases: context snapshot is gathered after bootstrap (#318 Finding 4)", async () => {
+  let bootstrapDone = false;
+  const getIssueDetailCallsAfterBootstrap: boolean[] = [];
+  const base = eqBaseDeps();
+  const deps = {
+    ...base,
+    createWorktree: async () => {
+      const result = await base.createWorktree();
+      bootstrapDone = true;
+      return result;
+    },
+    getIssueDetail: async () => {
+      getIssueDetailCallsAfterBootstrap.push(bootstrapDone);
+      return { title: "Test", body: "test body", comments: [], number: 42, labels: [], state: "open" };
+    },
+  };
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(getIssueDetailCallsAfterBootstrap.length > 0, "getIssueDetail must be called at least once");
+  assert.ok(
+    getIssueDetailCallsAfterBootstrap.every(Boolean),
+    "all getIssueDetail calls (including snapshot) must occur after bootstrapWorktree completes",
+  );
+});

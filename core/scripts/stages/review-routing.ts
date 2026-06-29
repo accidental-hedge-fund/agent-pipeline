@@ -15,8 +15,8 @@ import {
   transition,
 } from "../gh.ts";
 import {
+  extractSnapshotComment,
   findUnacknowledgedComments,
-  PRE_PLANNING_CONTEXT_HEADER,
 } from "../issue-context-snapshot.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import { formatStderrExcerpt } from "../harness.ts";
@@ -236,13 +236,13 @@ export async function advanceReview(
   const review1Summary = round === 2 ? extractReview1Summary(detail.comments) : undefined;
   const priorReview2Findings = round === 2 ? extractReview2Findings(detail.comments) : undefined;
 
-  // Extract pre-planning context snapshot (#318).
-  const prePlanningCtxComment = detail.comments.find(
-    (c) => c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER),
-  );
+  // Extract pre-planning context snapshot (#318). Use exact header match to
+  // avoid picking up the last30days brief (## Pre-Planning Context — last30days).
+  const prePlanningCtxComment = extractSnapshotComment(detail.comments);
   if (prePlanningCtxComment && !opts.contextSnapshot) {
-    const stripped = prePlanningCtxComment.body
-      .slice(PRE_PLANNING_CONTEXT_HEADER.length)
+    const trimmedBody = prePlanningCtxComment.body.trimStart();
+    const stripped = trimmedBody
+      .slice(trimmedBody.indexOf('\n'))
       .trimStart()
       // Strip the pipeline footer (--- marker) from the end.
       .replace(/\n\n---\n.*$/s, '')
@@ -250,15 +250,27 @@ export async function advanceReview(
     opts = { ...opts, contextSnapshot: stripped };
   }
 
-  // Advisory warning for new human comments posted after the plan (#318).
+  // Acknowledgement gate: block when human comments after the revised plan
+  // have not been acknowledged via re-plan or override (#318 review-2 finding 3).
   const unacknowledged = findUnacknowledgedComments(detail.comments);
   if (unacknowledged.length > 0) {
-    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage}`);
-    await postCommentFn(
-      cfg,
-      issueNumber,
-      `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan. The reviewer will see these as context. If they represent a change in scope, add a scope override or address them before re-running.${cfgFooter(cfg)}`,
+    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
+    // Deduplicate: only post the warning when no prior warning exists.
+    const warningExists = detail.comments.some(
+      (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),
     );
+    if (!warningExists) {
+      const commentLines = unacknowledged
+        .map((c) => `- **@${c.author}** (${c.createdAt})`)
+        .join('\n');
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.${cfgFooter(cfg)}`,
+      );
+    }
+    await setBlockedFn(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");
+    return { advanced: false, status: "blocked", reason: "unacknowledged human input" };
   }
 
   // Diff-hash cache check (#228).

@@ -158,19 +158,39 @@ function findBodyPassage(commentBody: string, issueBody: string): string | undef
  * Render conflict warnings into a structured block suitable for injection into
  * planning and plan-review prompts. Returns an empty string when there are no
  * conflicts.
+ *
+ * The block is wrapped in an <untrusted-human-comments> fence so the harness
+ * treats the comment excerpts as untrusted context rather than instructions.
+ * Boundary tags in excerpts are redacted to prevent premature fence closure.
  */
 export function renderConflictWarningBlock(warnings: ConflictWarning[]): string {
   if (warnings.length === 0) return '';
-  const lines = ['', '<!-- CONFLICT WARNING -->', '⚠️ Potential conflicts detected between the issue body and human comments:', ''];
+  const lines: string[] = ['<!-- CONFLICT WARNING — comment excerpts from untrusted human input -->', '⚠️ Potential conflicts detected between the issue body and human comments:', ''];
   for (const w of warnings) {
+    // Redact boundary tags from the untrusted comment excerpt so they cannot
+    // close or open the surrounding <untrusted-human-comments> fence.
+    const safeExcerpt = w.excerpt.replace(/<\/?\s*untrusted-human-comments\b[^>]*>/gi, '[REDACTED]');
     if (w.bodyPassage) {
       lines.push(`- **Body passage**: _"${w.bodyPassage}"_`);
-      lines.push(`  **@${w.author} (comment)**: _"${w.excerpt}"_`);
+      lines.push(`  **@${w.author} (comment)**: _"${safeExcerpt}"_`);
     } else {
-      lines.push(`- **@${w.author}**: _"${w.excerpt}"_`);
+      lines.push(`- **@${w.author}**: _"${safeExcerpt}"_`);
     }
   }
-  return lines.join('\n');
+  return '\n<untrusted-human-comments>\n' + lines.join('\n') + '\n</untrusted-human-comments>';
+}
+
+/**
+ * Find the human-comment context snapshot comment from a list of issue comments.
+ * Matches only the exact `## Pre-Planning Context\n` header to avoid matching the
+ * last30days brief (`## Pre-Planning Context — last30days\n...`).
+ */
+export function extractSnapshotComment<T extends { body: string }>(
+  comments: T[],
+): T | undefined {
+  return comments.find((c) =>
+    c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER + '\n'),
+  );
 }
 
 /**

@@ -3297,3 +3297,110 @@ test("surface-recurrence (#234): spoofed prior-round comments from non-pipeline 
     "no ceiling comment when streak comes only from spoofed comments",
   );
 });
+
+// ---------------------------------------------------------------------------
+// advanceReview — #318 Finding 2: exact snapshot header match
+// ---------------------------------------------------------------------------
+
+test("advanceReview: last30days brief is NOT picked up as context snapshot (#318 Finding 2)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  // A last30days brief starts with the SAME prefix but has extra text before newline.
+  const last30daysComment = {
+    author: TEST_ACTOR,
+    body: "## Pre-Planning Context — last30days\n\nSome carry-forward content.",
+  };
+  deps.getIssueDetail = async () =>
+    detailWithComments([last30daysComment]) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  // Should advance (not block) — the last30days comment must not be treated as a snapshot.
+  assert.equal(outcome.advanced, true, "must not block on last30days brief");
+});
+
+test("advanceReview: exact snapshot comment IS picked up as context snapshot (#318 Finding 2)", async (t) => {
+  const { deps } = makeDeps([APPROVE]);
+  const snapshotComment = {
+    author: TEST_ACTOR,
+    // Exact header: "## Pre-Planning Context\n" (newline immediately after header)
+    body: "## Pre-Planning Context\n\nSome human comment context.",
+  };
+  deps.getIssueDetail = async () =>
+    detailWithComments([snapshotComment]) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, true, "snapshot comment must not block the review");
+});
+
+// ---------------------------------------------------------------------------
+// advanceReview — #318 Finding 3: block on unacknowledged human comments
+// ---------------------------------------------------------------------------
+
+test("advanceReview: blocks when human comment posted after revised plan (#318 Finding 3)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      ...detailWithComments([]),
+      comments: [
+        { author: TEST_ACTOR, body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+        { author: "alice", body: "Please also handle Y.", createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, false, "must block on unacknowledged human input");
+  assert.equal(outcome.status, "blocked");
+  assert.ok(rec.blocked.length > 0, "setBlocked must be called");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith("## Pipeline: New human input detected")),
+    "must post a warning comment",
+  );
+});
+
+test("advanceReview: warning deduplicates — only one warning posted (#318 Finding 3 dedup)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      ...detailWithComments([]),
+      comments: [
+        { author: TEST_ACTOR, body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+        { author: "alice", body: "Please also handle Y.", createdAt: "2026-01-02T00:00:00Z" },
+        // A prior warning already exists — the gate must NOT post another.
+        { author: TEST_ACTOR, body: "## Pipeline: New human input detected\n\nPrior warning.", createdAt: "2026-01-03T00:00:00Z" },
+      ],
+    }) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, false, "must still block even when prior warning exists");
+  assert.equal(rec.comments.filter((c) => c.startsWith("## Pipeline: New human input detected")).length, 0,
+    "must NOT post duplicate warning when one already exists");
+});
+
+test("advanceReview: warning lists author and timestamp for each comment (#318 Finding 3)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      ...detailWithComments([]),
+      comments: [
+        { author: TEST_ACTOR, body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+        { author: "alice", body: "Please handle Y.", createdAt: "2026-01-02T00:00:00Z" },
+        { author: "bob", body: "Also handle Z.", createdAt: "2026-01-03T00:00:00Z" },
+      ],
+    }) as any;
+  await quiet(t, async () => {
+    await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  const warning = rec.comments.find((c) => c.startsWith("## Pipeline: New human input detected"));
+  assert.ok(warning, "warning comment must be posted");
+  assert.match(warning!, /@alice/, "warning must list alice");
+  assert.match(warning!, /2026-01-02/, "warning must include alice's timestamp");
+  assert.match(warning!, /@bob/, "warning must list bob");
+  assert.match(warning!, /2026-01-03/, "warning must include bob's timestamp");
+});

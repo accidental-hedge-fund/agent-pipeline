@@ -19,7 +19,7 @@ import {
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
-import { PRE_PLANNING_CONTEXT_HEADER } from "../issue-context-snapshot.ts";
+import { extractSnapshotComment } from "../issue-context-snapshot.ts";
 import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle, patchBundleIdentity as defaultPatchBundleIdentity } from "../evidence-bundle.ts";
@@ -292,16 +292,18 @@ export async function advance(
   const detail = await getIssueDetailFn(cfg, issueNumber);
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
 
-  // Extract pre-planning context snapshot (#318).
-  const prePlanningCtxComment = detail.comments.find(
-    (c) => c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER),
-  );
+  // Extract pre-planning context snapshot (#318). Use exact header match to
+  // avoid picking up the last30days brief (## Pre-Planning Context — last30days).
+  const prePlanningCtxComment = extractSnapshotComment(detail.comments);
   const contextSnapshot = prePlanningCtxComment
-    ? prePlanningCtxComment.body
-        .slice(PRE_PLANNING_CONTEXT_HEADER.length)
-        .trimStart()
-        .replace(/\n\n---\n.*$/s, '')
-        .trimEnd()
+    ? (() => {
+        const trimmedBody = prePlanningCtxComment.body.trimStart();
+        return trimmedBody
+          .slice(trimmedBody.indexOf('\n'))
+          .trimStart()
+          .replace(/\n\n---\n.*$/s, '')
+          .trimEnd();
+      })()
     : undefined;
 
   // Resolve the issue worktree; reviewer runs inside it when present.
