@@ -2096,20 +2096,60 @@ export async function handlePathSubcommand(
 // Unblock mode
 // ---------------------------------------------------------------------------
 
-/** Append a blocker_cleared event to the most recent run directory for issueNumber.
+async function runJsonIssue(repoDir: string, runId: string, deps: RunStoreDeps): Promise<number | null> {
+  try {
+    const raw = await deps.readFile(path.join(runDirPath(repoDir, runId), "run.json"));
+    const parsed = JSON.parse(raw) as { issue?: unknown };
+    return typeof parsed.issue === "number" && Number.isFinite(parsed.issue) ? parsed.issue : null;
+  } catch {
+    return null;
+  }
+}
+
+async function findBlockerClearedRunId(
+  repoDir: string,
+  issueNumber: number,
+  originalNumber: number | undefined = issueNumber,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<string | null> {
+  const allIds = await listRunIds(repoDir, deps).catch(() => [] as string[]);
+  const prefixNumbers = [originalNumber, issueNumber].filter(
+    (n, idx, arr): n is number =>
+      typeof n === "number" && Number.isFinite(n) && n > 0 && arr.indexOf(n) === idx,
+  );
+  for (const n of prefixNumbers) {
+    const id = allIds.find((runId) => runId.startsWith(`${n}-`));
+    if (id) return id;
+  }
+  for (const id of allIds) {
+    if (await runJsonIssue(repoDir, id, deps) === issueNumber) return id;
+  }
+  return null;
+}
+
+/** Append a blocker_cleared event to the most relevant run directory.
  *  Best-effort: silently skips if no run directory is found. */
-async function appendBlockerCleared(repoDir: string, issueNumber: number): Promise<void> {
-  const allIds = await listRunIds(repoDir).catch(() => [] as string[]);
-  const id = allIds.find((runId) => runId.startsWith(`${issueNumber}-`));
+async function appendBlockerCleared(
+  repoDir: string,
+  issueNumber: number,
+  originalNumber: number | undefined = issueNumber,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  const id = await findBlockerClearedRunId(repoDir, issueNumber, originalNumber, deps);
   if (!id) return;
   await appendEvent(
     runDirPath(repoDir, id),
     { schema_version: RUN_SCHEMA_VERSION, type: "blocker_cleared", at: evidenceTimestamp() },
-    defaultRunStoreDeps,
+    deps,
   ).catch(() => {});
 }
 
-async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
+async function runUnblock(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  answer: string,
+  originalNumber: number = issueNumber,
+): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
@@ -2131,7 +2171,7 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   ].join("\n");
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
-  await appendBlockerCleared(cfg.repo_dir, issueNumber);
+  await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
   const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
   console.log(unblockLine);
 }
@@ -2165,6 +2205,7 @@ export async function runOverride(
   spec: string,
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
+  originalNumber: number = issueNumber,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2215,7 +2256,7 @@ export async function runOverride(
   // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
     await deps.clearBlocked(cfg, issueNumber);
-    await appendBlockerCleared(cfg.repo_dir, issueNumber);
+    await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
   }
   console.log(`[pipeline] #${issueNumber}: ${overrideLogMsg}`);
 
@@ -2268,7 +2309,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 // ---------------------------------------------------------------------------
 
 // dispatch and realPlanningRecoveryDeps are imported from pipeline-run.ts above.
-export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue, realPlanningRecoveryDeps };
+export const _internals = {
+  dispatch,
+  runInit,
+  isAutoLoopRecoverable,
+  isAutoLoopEligible,
+  canAutoLoopContinue,
+  realPlanningRecoveryDeps,
+  appendBlockerCleared,
+  findBlockerClearedRunId,
+};
 
 // Suppress unused import warnings for test-only helpers.
 void addLabel;

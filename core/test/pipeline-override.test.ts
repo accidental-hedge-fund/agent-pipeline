@@ -14,7 +14,11 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
+  _internals,
   ceilingRound,
   runOverride,
   type CliOpts,
@@ -235,6 +239,13 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<string[]>
 
 const OPTS: CliOpts = {};
 
+function writeRunJson(repoDir: string, runId: string, issue: number): string {
+  const dir = path.join(repoDir, ".agent-pipeline", "runs", runId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "run.json"), JSON.stringify({ schema_version: 1, run_id: runId, issue }));
+  return dir;
+}
+
 // ---------------------------------------------------------------------------
 // 2.1 all blockers overridden → the resumed loop advances
 // ---------------------------------------------------------------------------
@@ -435,4 +446,45 @@ test("runOverride: --dry-run --override is rejected as a usage error; no GitHub 
     errors.some((e) => e.includes("--override") && e.includes("--dry-run")),
     `error must mention both flags; got:\n${errors.join("\n")}`,
   );
+});
+
+test("appendBlockerCleared prefers the original PR-number run store over a resolved issue run store", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "blocker-cleared-"));
+  try {
+    const prRunDir = writeRunJson(tmp, "100-2026-06-29T00-00-00-000Z", 64);
+    const issueRunDir = writeRunJson(tmp, "64-2026-06-29T00-01-00-000Z", 64);
+
+    await _internals.appendBlockerCleared(tmp, 64, 100);
+
+    const event = JSON.parse(fs.readFileSync(path.join(prRunDir, "events.jsonl"), "utf8").trim());
+    assert.equal(event.type, "blocker_cleared");
+    assert.equal(
+      fs.existsSync(path.join(issueRunDir, "events.jsonl")),
+      false,
+      "original PR-number run store is the followed stream and must receive the event",
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runOverride appends blocker_cleared to the original PR-number run store", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "override-blocker-cleared-"));
+  try {
+    const prRunDir = writeRunJson(tmp, "100-2026-06-29T00-00-00-000Z", 64);
+    const detail = detailAt(["pipeline:review-1", "blocked"], []);
+    const { deps, rec } = makeOverrideDeps(detail);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+
+    await quiet(t, async () => {
+      await runOverride(cfg, 64, `${KEY_A}: rejected — false positive`, OPTS, deps, 100);
+    });
+
+    assert.equal(rec.clearedBlocked, 1);
+    const event = JSON.parse(fs.readFileSync(path.join(prRunDir, "events.jsonl"), "utf8").trim());
+    assert.equal(event.type, "blocker_cleared");
+    assert.equal(rec.advances, 1);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

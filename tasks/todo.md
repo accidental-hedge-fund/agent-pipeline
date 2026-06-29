@@ -63,3 +63,21 @@
 - [x] `npm test` from `core/`
 - [x] `node scripts/build.mjs`
 - [x] `npm run ci`
+
+# PR-Number Blocker Event Routing
+
+- [x] Inspect current unblock/override event routing and adjacent tests.
+- [x] Fix `blocker_cleared` event lookup for PR-number invocations without changing GitHub mutation semantics.
+- [x] Add regression coverage for PR-number run-store IDs.
+- [x] Regenerate the `plugin/` mirror so `build.mjs --check` passes.
+- [x] Run targeted tests, OpenSpec validation, mirror check, and full CI if feasible.
+- [x] Record review notes and final verification results.
+
+## Review Results
+
+- Focused regression tests passed: `node --test --experimental-strip-types test/pipeline-override.test.ts`.
+- Focused logging/CLI tests passed: `node --test --experimental-strip-types test/pipeline-override.test.ts test/run-logs.test.ts test/pipeline-cli.test.ts`.
+- Mirror check passed: `node scripts/build.mjs --check`.
+- OpenSpec validation passed: `npx openspec validate --all`.
+- Whitespace check passed: `git diff --check`.
+- Full CI passed: `npm run ci`.
