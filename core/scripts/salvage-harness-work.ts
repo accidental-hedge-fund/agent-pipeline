@@ -19,6 +19,14 @@ export interface SalvageDeps {
    *  status check is restricted to in-scope paths only. */
   gitStatus?: (wtPath: string, scope?: string) => Promise<string>;
   /**
+   * Unstage index entries outside the scope before the scoped git-add.
+   * Only invoked when a staging scope is provided. Args are the full
+   * `git restore --staged` argument array. Using `--staged` touches only
+   * the index; the working-tree content is left intact (no `git restore`
+   * without `--staged` is ever called).
+   */
+  gitRestoreStaged?: (wtPath: string, args: string[]) => Promise<void>;
+  /**
    * Stage changes in the worktree using the provided git-add args array.
    * The default implementation passes `["add", "-A", "--", ":(exclude)node_modules"]`
    * so that a node_modules symlink or directory is never staged even if
@@ -48,6 +56,10 @@ async function defaultGitStatus(wtPath: string, scope?: string): Promise<string>
 }
 
 const SALVAGE_GIT_ADD_ARGS = ["add", "-A", "--", ":(exclude)node_modules"];
+
+async function defaultGitRestoreStaged(wtPath: string, args: string[]): Promise<void> {
+  await gitInWorktree(wtPath, args);
+}
 
 async function defaultGitAddAll(wtPath: string, args: string[]): Promise<void> {
   await gitInWorktree(wtPath, args);
@@ -114,6 +126,15 @@ export async function salvageUncommittedWork(
   const status = await (deps.gitStatus ?? defaultGitStatus)(wtPath, scope);
   if (!status.trim()) return { salvaged: false };
   const message = buildSalvageCommitMessage(issueNumber, pipelineRunId, stageLabel);
+  if (scope) {
+    // Unstage any pre-staged out-of-scope index entries before the scoped add.
+    // git-commit stages ALL index entries, not just the ones added in this call,
+    // so a pre-staged tasks/todo.md would leak into the commit unless we clear it
+    // first. git-restore --staged only touches the index; working-tree content is
+    // left intact.
+    const restoreArgs = ["restore", "--staged", "--", ".", `:(exclude)${scope}`, ":(exclude)node_modules"];
+    await (deps.gitRestoreStaged ?? defaultGitRestoreStaged)(wtPath, restoreArgs);
+  }
   const addArgs = scope
     ? ["add", "-A", "--", ":(exclude)node_modules", scope]
     : SALVAGE_GIT_ADD_ARGS;

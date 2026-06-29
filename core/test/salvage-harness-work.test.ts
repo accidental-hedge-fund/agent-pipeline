@@ -200,6 +200,7 @@ test("salvage [scoped, 3.1]: gitAddAll args restrict to scope and gitStatus rece
       if (scope === "openspec/") return "A  openspec/changes/x/proposal.md\n";
       return " M tasks/todo.md\nA  openspec/changes/x/proposal.md\n";
     },
+    gitRestoreStaged: async () => {},
     gitAddAll: async (_wt, args) => {
       capturedArgs = [...args];
     },
@@ -319,6 +320,86 @@ test("salvage [scoped, 3.3b regression #321]: dirty tasks/todo.md after scoped s
     "reason" in blocked && blocked.reason.includes("OpenSpec authoring step"),
     `unexpected reason: ${JSON.stringify(blocked)}`,
   );
+});
+
+test("salvage [scoped, regression #321]: pre-staged tasks/todo.md is unstaged via gitRestoreStaged before scoped add — commit contains only openspec/ files", async () => {
+  // Reproduces the bug: authoring harness staged tasks/todo.md and an openspec/
+  // file before exiting. Without gitRestoreStaged, git-commit would include both.
+  const restoreCalls: string[][] = [];
+  let addArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      if (scope === "openspec/") return "A  openspec/changes/x/proposal.md\n";
+      return " M tasks/todo.md\nA  openspec/changes/x/proposal.md\n";
+    },
+    gitRestoreStaged: async (_wt, args) => { restoreCalls.push([...args]); },
+    gitAddAll: async (_wt, args) => { addArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+
+  const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.equal(res.salvaged, true, "dirty-in-scope → salvage runs");
+
+  // gitRestoreStaged must be called first to clear pre-staged out-of-scope entries
+  assert.equal(restoreCalls.length, 1, "gitRestoreStaged must be called exactly once for scoped salvage");
+  const restoreArgs = restoreCalls[0];
+  assert.ok(restoreArgs.includes("."), "restore args must include '.' to cover all files");
+  assert.ok(
+    restoreArgs.includes(":(exclude)openspec/"),
+    `restore args must exclude openspec/ (leave those staged); got ${JSON.stringify(restoreArgs)}`,
+  );
+  assert.ok(
+    restoreArgs.includes(":(exclude)node_modules"),
+    "restore args must exclude node_modules",
+  );
+
+  // gitAddAll must still run with scope restriction
+  assert.ok(addArgs !== null, "gitAddAll must be called");
+  assert.ok((addArgs as string[]).includes("openspec/"), "gitAddAll still restricts to scope");
+
+  // Bites: without gitRestoreStaged, the pre-staged tasks/todo.md leaks into
+  // the commit and trips the authoring path-constraint gate.
+  const msg = buildSalvageCommitMessage(321, RUN_ID, "OpenSpec authoring");
+  const leakedDiff = ["openspec/changes/x/proposal.md", "tasks/todo.md"];
+  const gateBlocked = await verifyHarnessCommits("/wt", "abc", {
+    issueNumber: 321,
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring step committed files outside `openspec/`",
+    },
+  }, msgsDeps([msg], leakedDiff));
+  assert.equal(
+    gateBlocked.ok,
+    false,
+    "without gitRestoreStaged, pre-staged tasks/todo.md leaks → authoring gate blocks",
+  );
+  assert.ok(
+    "reason" in gateBlocked && gateBlocked.reason.includes("OpenSpec authoring step"),
+    `unexpected reason: ${JSON.stringify(gateBlocked)}`,
+  );
+
+  // With gitRestoreStaged (fix in place), the salvaged commit contains only openspec/
+  const cleanDiff = ["openspec/changes/x/proposal.md"];
+  const gatePasses = await verifyHarnessCommits("/wt", "abc", {
+    issueNumber: 321,
+    pathConstraint: {
+      allowPattern: /^openspec\//,
+      description: "OpenSpec authoring step committed files outside `openspec/`",
+    },
+  }, msgsDeps([msg], cleanDiff));
+  assert.equal(gatePasses.ok, true, "with gitRestoreStaged applied, commit has only openspec/ files → gate passes");
+});
+
+test("salvage [scoped, regression #321 — gitRestoreStaged NOT called without scope]: unscoped salvage does not call gitRestoreStaged", async () => {
+  let restoreCalled = false;
+  const deps: SalvageDeps = {
+    gitStatus: async () => " M tasks/todo.md\n M core/scripts/foo.ts\n",
+    gitRestoreStaged: async () => { restoreCalled = true; },
+    gitAddAll: async () => {},
+    gitCommit: async () => {},
+  };
+  await salvageUncommittedWork("/wt", 321, RUN_ID, "implement", deps);
+  assert.equal(restoreCalled, false, "gitRestoreStaged must NOT be called for unscoped (implement) salvage");
 });
 
 test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-openspec/ files unchanged", async () => {
