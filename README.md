@@ -919,9 +919,19 @@ $pipeline logs <run-id>
 # stream new output as it is written (like tail -f)
 $pipeline logs <run-id> --follow
 
+# print structured events.jsonl for a run
+$pipeline logs <run-id> --events
+
+# follow structured lifecycle/event records without parsing terminal output
+$pipeline logs <run-id> --events --follow
+
 # list available run-ids (most recent first)
 $pipeline logs
 ```
+
+Use `--events` for stage/lifecycle monitoring. It reads the canonical run-store
+`events.jsonl`; no separate transitions log or grep-filtered terminal output is
+required.
 
 Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):
 
@@ -1191,9 +1201,10 @@ same `.agent-pipeline/runs/<run-id>/` run store a foreground run uses — the
 launch logs `structured run artifacts at <repo>/.agent-pipeline/runs/<run-id>/`.
 That directory's **`events.jsonl` and `terminal.log` are the Pipeline Desk
 contract** (not `pipeline.log`): render the stage timeline from `events.jsonl`
-with zero prose parsing, and follow live output with
+with zero prose parsing, follow structured events with
+`pipeline logs <run-id> --events --follow`, and follow live raw output with
 `pipeline logs <run-id> --follow`. Pass `--json-events` to also stream the event
-lines to the detached run's stdout (captured in `pipeline.log`).
+lines to the detached run's stdout (captured in the wrapper `pipeline.log`).
 
 ### Poll for completion — `sentinel.json`
 

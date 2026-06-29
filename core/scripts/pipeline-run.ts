@@ -6,7 +6,6 @@
 // auto-loop helpers and AdvanceDeps so existing import paths continue to work.
 
 import * as path from "node:path";
-import { makeTransitionsLogger, singleLifecycleLine, transitionsLogPath } from "./transitions-log.ts";
 import {
   GhMetricsCollector,
   buildAuditSentinel,
@@ -139,10 +138,6 @@ export function canAutoLoopContinue(
 /** IO seam for {@link runAdvance}: inject a fake clock for wall-clock budgeting in tests. */
 export interface AdvanceDeps {
   now?: () => number;
-  /** Inject a fake transitions-log writer in unit tests; real runs use the file-backed writer. */
-  logTransition?: (line: string) => void;
-  /** Override the issue number used to derive the transitions log path (for PR→issue resolution). */
-  transitionsLogN?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,17 +403,8 @@ export async function runAdvance(
     // GitHub labels/comments stay authoritative).
     const stateDir = opts.dryRun ? undefined : runStateDir(cfg.domain);
 
-    // Transitions log (#324): append lifecycle lines to a dedicated per-issue file so
-    // operators can `tail -f` without a grep filter. Skipped under --dry-run (stateDir
-    // undefined). The injected seam (deps.logTransition) lets unit tests use a fake.
-    const logT = deps.logTransition ?? (stateDir ? makeTransitionsLogger(transitionsLogPath(cfg.domain, deps.transitionsLogN ?? issueNumber)) : undefined);
     function tlog(line: string): void {
       console.log(line);
-      // Mirror only a single physical lifecycle line to the transitions log.
-      // Blocked-outcome reason fields can embed newlines with non-lifecycle gate output;
-      // the done line uses a leading \n for terminal visual spacing. Both are stripped
-      // here so only the [pipeline] #N: header appears in the transitions log (#324).
-      logT?.(singleLifecycleLine(line));
     }
 
     // Run directory (#155): stable artifact directory per dispatch. Initialized

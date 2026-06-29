@@ -1,6 +1,0 @@
-{"schema_version":1,"type":"run_start","at":"2026-06-19T15:39:24Z","run_id":"209-2026-06-19T15-39-24-281Z","issue":209,"repo":"accidental-hedge-fund/agent-pipeline"}
-{"schema_version":1,"type":"stage_start","at":"2026-06-19T15:39:26Z","stage":"pre-merge"}
-{"schema_version":1,"type":"stage_complete","at":"2026-06-19T15:42:06Z","stage":"pre-merge","outcome":"blocked","commits":[]}
-{"schema_version":1,"type":"blocker_set","at":"2026-06-19T15:42:07Z","reason":"pre-merge delta review: blocking findings"}
-{"schema_version":1,"type":"run_complete","at":"2026-06-19T15:42:08Z","final_state":"pre-merge","elapsed_ms":164000}
-{"schema_version":1,"type":"blocker_cleared","at":"2026-06-19T15:45:59Z"}

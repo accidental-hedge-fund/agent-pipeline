@@ -16,8 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync, unlinkSync } from "node:fs";
-import { appendTransitionLine, transitionsLogPath } from "./transitions-log.ts";
+import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig } from "./config.ts";
@@ -156,6 +155,8 @@ export interface CliOpts {
   jsonEvents?: boolean;
   /** Follow mode for `pipeline logs <run-id> --follow` (-f). */
   follow?: boolean;
+  /** Read/follow events.jsonl instead of terminal.log in `pipeline logs`. */
+  events?: boolean;
   // `pipeline run <N> --detach` options
   detach?: boolean;
   timeout?: number;
@@ -258,6 +259,7 @@ export function buildCmd(): Command {
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
     .option("-f, --follow", "follow mode for 'pipeline logs <run-id> --follow': stream new output as appended")
+    .option("--events", "logs mode: read/follow events.jsonl instead of terminal.log")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
@@ -406,7 +408,7 @@ async function main(): Promise<void> {
       typeof logsArg === "string" && logsArg.length > 0 && !logsArg.startsWith("-")
         ? logsArg
         : undefined;
-    await runLogs(repoDir, logsRunId, !!opts.follow);
+    await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events);
     return;
   }
 
@@ -1261,7 +1263,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runUnblock(cfg, issueNumber!, opts.unblock, number);
+    await runUnblock(cfg, issueNumber, opts.unblock, number);
     return;
   }
   if (opts.override !== undefined) {
@@ -1276,7 +1278,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runOverride(cfg, issueNumber!, opts.override, opts, undefined, number);
+    await runOverride(cfg, issueNumber, opts.override, opts, undefined, number);
     return;
   }
 
@@ -1300,9 +1302,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Pass the original argument as transitionsLogN so the transitions log path
-  // uses the same <N> as the full operator log (e.g. for PR→issue resolution).
-  await runAdvance(cfg, issueNumber, opts, { transitionsLogN: number });
+  await runAdvance(cfg, issueNumber, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,10 +1320,6 @@ async function runCleanup(cfg: PipelineConfig): Promise<void> {
     console.log(`Removed ${result.removed.length} worktree(s):`);
     for (const rec of result.removed) {
       console.log(`  - ${rec.branch}`);
-      // Remove the transitions log for this issue — best-effort, missing file is fine.
-      if (rec.issueNumber !== undefined) {
-        try { unlinkSync(transitionsLogPath(cfg.domain, rec.issueNumber)); } catch { /* non-fatal */ }
-      }
     }
   }
   if (result.skipped.length > 0) {
@@ -1892,6 +1888,7 @@ export async function runLogs(
   repoDir: string,
   runId: string | undefined,
   follow: boolean,
+  events = false,
 ): Promise<void> {
   // No run-id: list available runs, most recent first, then exit 0.
   if (runId === undefined) {
@@ -1905,7 +1902,8 @@ export async function runLogs(
   }
 
   const dir = runDirPath(repoDir, runId);
-  const logFile = path.join(dir, "terminal.log");
+  const fileName = events ? "events.jsonl" : "terminal.log";
+  const logFile = path.join(dir, fileName);
 
   // Check that the run directory exists.
   try {
@@ -1917,13 +1915,13 @@ export async function runLogs(
   }
 
   if (!follow) {
-    // Print terminal.log and exit.
+    // Print the selected run-store log and exit.
     let content: string;
     try {
       content = await defaultRunStoreDeps.readFile(logFile);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        console.error(`pipeline logs: terminal.log not yet written for run '${runId}'`);
+        console.error(`pipeline logs: ${fileName} not yet written for run '${runId}'`);
         process.exitCode = 1;
         return;
       }
@@ -1934,7 +1932,7 @@ export async function runLogs(
   }
 
   // --follow: tail -f, independent of the original pipeline process. Resolve when
-  // the tail child exits or errors — including the case where terminal.log does
+  // the tail child exits or errors — including the case where the selected log does
   // not exist yet — so a failed follow exits non-zero and releases the caller
   // instead of awaiting an unresolvable promise forever (#155).
   await new Promise<void>((resolve) => {
@@ -2111,7 +2109,7 @@ async function appendBlockerCleared(repoDir: string, issueNumber: number): Promi
   ).catch(() => {});
 }
 
-async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string, originalN?: number): Promise<void> {
+async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
@@ -2136,7 +2134,6 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   await appendBlockerCleared(cfg.repo_dir, issueNumber);
   const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
   console.log(unblockLine);
-  appendTransitionLine(transitionsLogPath(cfg.domain, originalN ?? issueNumber), unblockLine);
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,7 +2165,6 @@ export async function runOverride(
   spec: string,
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
-  originalN?: number,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2252,7 +2248,7 @@ export async function runOverride(
       `[pipeline] #${issueNumber}: needs-human → ${to} (resuming the round that hit the ceiling)`,
     );
   }
-  await deps.runAdvance(cfg, issueNumber, opts, { transitionsLogN: originalN ?? issueNumber });
+  await deps.runAdvance(cfg, issueNumber, opts);
 }
 
 /** ISO 8601 timestamp at seconds precision — local copy for appendBlockerCleared. */

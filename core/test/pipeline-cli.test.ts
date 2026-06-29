@@ -231,6 +231,10 @@ test("pipeline-cli 5.8g: 'logs --dry-run' → logs entry, validateFlags returns 
   assert.deepEqual(roundTrip(["logs", "--dry-run"]), ["dryRun"]);
 });
 
+test("pipeline-cli: logs --events --follow is valid", () => {
+  assert.deepEqual(roundTrip(["logs", "42-2026-06-16T00-00-00Z", "--events", "--follow"]), []);
+});
+
 test("pipeline-cli 5.8h: 'summary run-123 --dry-run' → summary entry, validateFlags returns ['dryRun']", () => {
   assert.deepEqual(roundTrip(["summary", "run-123", "--dry-run"]), ["dryRun"]);
 });
