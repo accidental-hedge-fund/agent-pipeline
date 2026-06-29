@@ -1,3 +1,24 @@
+# README state-machine diagram
+
+## Plan
+
+- [x] Inspect the README structure and decide where the diagram-equivalent belongs.
+- [x] Translate the supplied image into README-native content that renders well on GitHub.
+- [x] Update `README.md` with the visual flow, off-ramp, gates, and principles.
+- [x] Verify Markdown rendering/anchors and run the smallest meaningful docs check.
+- [x] Record results and changed files.
+
+## Notes
+
+- Scope is docs-only. No edits under `core/`, so the generated `plugin/` mirror does not apply.
+- The README should preserve the existing core message: bounded, cross-harness, human-gated, never auto-merging.
+
+## Review
+
+- Added `README.md` lifecycle section with Mermaid flow, stage-band table, and naive-loop comparison.
+- Preserved current implementation vocabulary: `pre-merge -> eval-gate -> shipcheck-gate -> ready-to-deploy`, with visual/E2E checks described as `eval-gate`/`shipcheck-gate` use cases rather than a current `visual-gate` label.
+- Verification passed: `git diff --check`, README lifecycle anchor check, and full `npm run ci`.
+
 # Config Sync Implementation Plan
 
 ## Checklist
