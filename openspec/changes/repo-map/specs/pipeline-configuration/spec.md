@@ -10,8 +10,14 @@ match the `owner/repo` shape (exactly one `/`, with non-empty owner and name seg
 entry that is not `owner/repo`-shaped SHALL cause `resolveConfig()` to throw a parse error
 identifying the offending entry. An unknown sub-key under `repo_map` SHALL be rejected by
 strict-schema validation, consistent with the other feature blocks. When the block is absent,
-`repo_map` SHALL resolve to its `DEFAULT_CONFIG` value (both lists empty) and behavior SHALL
-be unchanged.
+`repo_map` SHALL resolve to its `DEFAULT_CONFIG` value (`{ depends_on: [], depended_on_by: [] }`)
+and behavior SHALL be unchanged.
+
+`PipelineConfig.repo_map` SHALL be a required (non-optional) field on the resolved config —
+it SHALL never be `undefined` at runtime. The `DEFAULT_CONFIG.repo_map` value SHALL be
+`{ depends_on: [], depended_on_by: [] }`. Downstream consumers (planning stage, roadmap
+engine) SHALL test for empty lists, not for `undefined`, to determine whether cross-repo
+context gathering is active.
 
 The `repo_map` block is declarative context only. It SHALL NOT enable any cross-repo write,
 merge, PR creation, label propagation, or status sync; it SHALL NOT weaken the never-auto-merge

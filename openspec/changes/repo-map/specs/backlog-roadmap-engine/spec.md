@@ -26,9 +26,9 @@ backlog (running the advance loop across multiple repos is out of scope).
 - **THEN** the entry SHALL appear in `dependency_graph.cross_repo[]`
 - **AND** no `acme/shared-lib` issue SHALL be inserted into `dependency_graph.must_precede[]` or the local `roadmap[]` ordering
 
-#### Scenario: repo_map absent — cross_repo is empty and behavior unchanged
+#### Scenario: repo_map not configured — cross_repo is empty and behavior unchanged
 
-- **WHEN** `.github/pipeline.yml` has no `repo_map` block
+- **WHEN** `.github/pipeline.yml` has no `repo_map` block (resolves to both lists empty via DEFAULT_CONFIG)
 - **THEN** the engine SHALL make no cross-repo issue fetch
 - **AND** `plan.json.dependency_graph.cross_repo[]` SHALL be an empty array
 

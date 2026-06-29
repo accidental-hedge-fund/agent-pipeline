@@ -27,16 +27,18 @@ open issues only; recently merged or closed work SHALL NOT be fetched.
 - **WHEN** the same `owner/repo` appears in both `depends_on` and `depended_on_by`
 - **THEN** its open issues SHALL be fetched and summarized exactly once (no duplicate `gh` call, no duplicated lines)
 
-### Requirement: Cross-repo context is inert when repo_map is absent or empty
+### Requirement: Cross-repo context is inert when repo_map has no declared repos
 
-The planning stage SHALL NOT fetch any cross-repo issues when `repo_map` is absent, or present
-but with empty `depends_on` and `depended_on_by` lists. On this inert path the planning prompt
-SHALL be unchanged from its behavior before this capability, and no additional `gh` call SHALL
-be made.
+The planning stage SHALL NOT fetch any cross-repo issues when `repo_map.depends_on` and
+`repo_map.depended_on_by` are both empty. Because `PipelineConfig.repo_map` is always a
+non-optional resolved object (never `undefined`), the inert condition is exclusively "both
+lists empty" — absence of the YAML block produces this state via the DEFAULT_CONFIG. On this
+inert path the planning prompt SHALL be unchanged from its behavior before this capability,
+and no additional `gh` call SHALL be made.
 
-#### Scenario: repo_map absent — no cross-repo fetch
+#### Scenario: repo_map not configured — no cross-repo fetch
 
-- **WHEN** `.github/pipeline.yml` has no `repo_map` block
+- **WHEN** `.github/pipeline.yml` has no `repo_map` block (resolves to both lists empty)
 - **THEN** the planning stage SHALL make no cross-repo issue fetch
 - **AND** the planning prompt's cross-repo context section SHALL be empty (rendering identically to current behavior)
 
