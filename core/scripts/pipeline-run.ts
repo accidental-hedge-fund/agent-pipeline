@@ -6,6 +6,7 @@
 // auto-loop helpers and AdvanceDeps so existing import paths continue to work.
 
 import * as path from "node:path";
+import { makeTransitionsLogger, singleLifecycleLine, transitionsLogPath } from "./transitions-log.ts";
 import {
   GhMetricsCollector,
   buildAuditSentinel,
@@ -138,6 +139,10 @@ export function canAutoLoopContinue(
 /** IO seam for {@link runAdvance}: inject a fake clock for wall-clock budgeting in tests. */
 export interface AdvanceDeps {
   now?: () => number;
+  /** Inject a fake transitions-log writer in unit tests; real runs use the file-backed writer. */
+  logTransition?: (line: string) => void;
+  /** Override the issue number used to derive the transitions log path (for PR→issue resolution). */
+  transitionsLogN?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,13 +197,13 @@ function evidenceTimestamp(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
 }
 
-function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome): void {
+export function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome, tlog: (line: string) => void): void {
   if (out.advanced) {
     const oo = out as { from: Stage; to: Stage; summary: string };
-    console.log(`[pipeline] #${issueNumber}: ${oo.from} → ${oo.to}: ${oo.summary}`);
+    tlog(`[pipeline] #${issueNumber}: ${oo.from} → ${oo.to}: ${oo.summary}`);
   } else {
     const oo = out as { status: string; reason: string };
-    console.log(`[pipeline] #${issueNumber}: at ${fromStage} — ${oo.status}: ${oo.reason}`);
+    tlog(`[pipeline] #${issueNumber}: at ${fromStage} — ${oo.status}: ${oo.reason}`);
   }
 }
 
@@ -403,6 +408,19 @@ export async function runAdvance(
     // GitHub labels/comments stay authoritative).
     const stateDir = opts.dryRun ? undefined : runStateDir(cfg.domain);
 
+    // Transitions log (#324): append lifecycle lines to a dedicated per-issue file so
+    // operators can `tail -f` without a grep filter. Skipped under --dry-run (stateDir
+    // undefined). The injected seam (deps.logTransition) lets unit tests use a fake.
+    const logT = deps.logTransition ?? (stateDir ? makeTransitionsLogger(transitionsLogPath(cfg.domain, deps.transitionsLogN ?? issueNumber)) : undefined);
+    function tlog(line: string): void {
+      console.log(line);
+      // Mirror only a single physical lifecycle line to the transitions log.
+      // Blocked-outcome reason fields can embed newlines with non-lifecycle gate output;
+      // the done line uses a leading \n for terminal visual spacing. Both are stripped
+      // here so only the [pipeline] #N: header appears in the transitions log (#324).
+      logT?.(singleLifecycleLine(line));
+    }
+
     // Run directory (#155): stable artifact directory per dispatch. Initialized
     // before the first stage so it survives a mid-run crash. Also starts the
     // terminal.log tee here so it captures all subsequent output including the
@@ -441,14 +459,14 @@ export async function runAdvance(
     // that line is captured in terminal.log (the inner finally runs first).
     try {
 
-    console.log(`[pipeline] #${issueNumber}: starting at stage=${startStage}`);
+    tlog(`[pipeline] #${issueNumber}: starting at stage=${startStage}`);
 
     // One run id per dispatch (#20): generated before any stage runs and threaded
     // into every commit operation, so all commits this invocation produces — across
     // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
     const pipelineRunId = makePipelineRunId(issueNumber, runStartedAt);
     setGhRunId(pipelineRunId);
-    console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
+    tlog(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
     if (stateDir) {
       let bundlePr: number | null = null;
@@ -502,7 +520,7 @@ export async function runAdvance(
       const detail = await getIssueDetail(cfg, issueNumber);
       const stage = pickStage(detail.labels);
       if (!stage) {
-        console.log(`[pipeline] #${issueNumber}: pipeline label removed; stopping.`);
+        tlog(`[pipeline] #${issueNumber}: pipeline label removed; stopping.`);
         break;
       }
       finalStage = stage;
@@ -573,7 +591,7 @@ export async function runAdvance(
         if (runDir) {
           await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
         }
-        printOutcome(issueNumber, stage, out);
+        printOutcome(issueNumber, stage, out, tlog);
         break;
       }
 
@@ -596,7 +614,7 @@ export async function runAdvance(
         if (stage === "implementing") {
           console.log(`[pipeline] #${issueNumber}: blocked at implementing — attempting auto-recovery`);
           const out = await autoRecover.tryAutoRecover(cfg, issueNumber, stateDir);
-          printOutcome(issueNumber, stage, out);
+          printOutcome(issueNumber, stage, out, tlog);
           if (out.advanced) {
             transitions++;
             lastStage = (out as { to: Stage }).to;
@@ -626,7 +644,7 @@ export async function runAdvance(
         const skipStage = evidenceStageName(stage);
         const skipEnteredAt = evidenceTimestamp();
         await transition(cfg, issueNumber, stage, to, `${stage} step disabled in this repo's config; skipping.`);
-        console.log(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
+        tlog(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
         finalStage = to;
@@ -720,7 +738,7 @@ export async function runAdvance(
       if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: stageExitedAt, stage: auditStage, outcome: evidenceOutcome(out), commits: stageCommits }, runStoreDeps).catch(() => {});
       }
-      printOutcome(issueNumber, stage, out);
+      printOutcome(issueNumber, stage, out, tlog);
 
       if (out.advanced) {
         transitions++;
@@ -881,7 +899,7 @@ export async function runAdvance(
     }
 
     const elapsed = Math.round((nowFn() - t0) / 1000);
-    console.log(
+    tlog(
       `\n[pipeline] #${issueNumber}: done — ${startStage} → ${lastStage} (${transitions} transitions, ${elapsed}s)`,
     );
 

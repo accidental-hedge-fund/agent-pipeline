@@ -286,46 +286,50 @@ immediately; the pipeline runs detached.
 
 #### c. Stream stage transitions via Monitor
 
-Arm a persistent Monitor. The **log path** always uses the original argument
-`<N>` from section b (the same file that was opened for writing). The
-**grep filter** uses the **resolved issue number** `<resolved-N>` — identical
-to `<N>` when you passed an issue directly; look for the line
-`[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` near the top of
-the log when you passed a PR:
+Arm a persistent Monitor on the **transitions log** — a dedicated, grep-free
+file that contains only pipeline lifecycle lines and nothing else:
+
+```bash
+tail -f /tmp/pipeline-<domain>-<N>.transitions.log
+```
+
+The transitions log path always uses the original argument `<N>` (the same `<N>`
+used for the full log in section b). It contains only the run-start, transition,
+blocked/idle, unblocked, label-removed, and done lines — no harness prose, no
+test-runner output, no false matches from eval-gate fixtures. No grep filter is
+needed or appropriate.
+
+For example, `/pipeline 64` (issue passed directly):
+```bash
+tail -f /tmp/pipeline-<domain>-64.transitions.log
+```
+
+`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100):
+```bash
+tail -f /tmp/pipeline-<domain>-100.transitions.log
+```
+
+Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if
+needed). Each emitted line lands in Claude's notification stream.
+
+**Fallback — full log with grep filter:** If you need the full combined output
+(harness prose, CI stdout, stage output), the full log is still available:
 
 ```bash
 tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
   "^\[pipeline\] #<resolved-N>: "
 ```
 
-For example, `/pipeline 64` (issue passed directly, `<N>` = `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
+The grep filter uses `<resolved-N>` (the issue number, not the PR number when a
+PR was passed). Look for `[pipeline] #<N> is a PR → resolved to issue #<resolved-N>`
+near the top of the full log when you passed a PR number.
 
-`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100, `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-100.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
-
-Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if
-needed). Each emitted line lands in Claude's notification stream.
-
-**Why the tight filter?** The test-gate stage (`npm test` / `npm run ci`)
-dumps the full unit-test suite output to the same log. The eval-gate and
-state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
-`→ ready-to-deploy` substrings (they assert on the pipeline's own log
-format). The broad alternation matched hundreds of these fixture lines in
-rapid succession, triggering the Monitor tool's auto-stop threshold and
-silencing the rest of the run.
-
-**No real signal is lost:** every stage transition — including
-`[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
-`[pipeline] #N: → ready-to-deploy` — begins with `[pipeline] #N:`.
-Process exit (run-end) is independently signalled by the background bash
-task completing, not by log content.
+**Why the transitions log is preferred:** The test-gate stage (`npm test` /
+`npm run ci`) dumps the full unit-test suite output to the same full log. The
+eval-gate and state-machine test fixtures reproduce exact `[pipeline] #<other-N>:`
+and `→ ready-to-deploy` substrings, so a grep filter on the full log must be tight
+enough to not match those lines. The transitions log has no such risk — only the
+orchestrator writes to it, never the test runner.
 
 #### d. Push notification on every `[pipeline]` event
 

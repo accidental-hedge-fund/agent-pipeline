@@ -16,7 +16,8 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { appendTransitionLine, transitionsLogPath } from "./transitions-log.ts";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig } from "./config.ts";
@@ -1068,7 +1069,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runUnblock(cfg, issueNumber, opts.unblock);
+    await runUnblock(cfg, issueNumber, opts.unblock, number);
     return;
   }
   if (opts.override !== undefined) {
@@ -1080,7 +1081,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runOverride(cfg, issueNumber, opts.override, opts);
+    await runOverride(cfg, issueNumber, opts.override, opts, undefined, number);
     return;
   }
 
@@ -1104,7 +1105,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  await runAdvance(cfg, issueNumber, opts);
+  // Pass the original argument as transitionsLogN so the transitions log path
+  // uses the same <N> as the full operator log (e.g. for PR→issue resolution).
+  await runAdvance(cfg, issueNumber, opts, { transitionsLogN: number });
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1125,10 @@ async function runCleanup(cfg: PipelineConfig): Promise<void> {
     console.log(`Removed ${result.removed.length} worktree(s):`);
     for (const rec of result.removed) {
       console.log(`  - ${rec.branch}`);
+      // Remove the transitions log for this issue — best-effort, missing file is fine.
+      if (rec.issueNumber !== undefined) {
+        try { unlinkSync(transitionsLogPath(cfg.domain, rec.issueNumber)); } catch { /* non-fatal */ }
+      }
     }
   }
   if (result.skipped.length > 0) {
@@ -1909,7 +1916,7 @@ async function appendBlockerCleared(repoDir: string, issueNumber: number): Promi
   ).catch(() => {});
 }
 
-async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
+async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string, originalN?: number): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
@@ -1932,7 +1939,9 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
   await appendBlockerCleared(cfg.repo_dir, issueNumber);
-  console.log(`[pipeline] #${issueNumber}: unblocked at ${stage}`);
+  const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
+  console.log(unblockLine);
+  appendTransitionLine(transitionsLogPath(cfg.domain, originalN ?? issueNumber), unblockLine);
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,6 +1973,7 @@ export async function runOverride(
   spec: string,
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
+  originalN?: number,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2047,7 +2057,7 @@ export async function runOverride(
       `[pipeline] #${issueNumber}: needs-human → ${to} (resuming the round that hit the ceiling)`,
     );
   }
-  await deps.runAdvance(cfg, issueNumber, opts);
+  await deps.runAdvance(cfg, issueNumber, opts, { transitionsLogN: originalN ?? issueNumber });
 }
 
 /** ISO 8601 timestamp at seconds precision — local copy for appendBlockerCleared. */

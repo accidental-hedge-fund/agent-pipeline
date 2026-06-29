@@ -218,42 +218,49 @@ leave a live pipeline session running when the Codex turn ends.
 #### c. Poll stage transitions from the session or log
 
 Poll the PTY session with `write_stdin` and summarize material `[pipeline]`
-lines to the user. If the session output is too noisy, filter the log.
-The **log path** always uses the original argument `<N>` from section b
-(the same file that was opened for writing). The **grep filter** uses the
-**resolved issue number** `<resolved-N>` — identical to `<N>` when you
-passed an issue directly; check the log for
-`[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` when you
-passed a PR:
+lines to the user. For a grep-free view of lifecycle lines only, use the
+**transitions log** — a dedicated file that contains only pipeline lifecycle
+lines and nothing else:
+
+```bash
+tail -f /tmp/pipeline-<domain>-<N>.transitions.log
+```
+
+The transitions log path always uses the original argument `<N>` (the same `<N>`
+used for the full log in section b). It contains only the run-start, transition,
+blocked/idle, unblocked, label-removed, and done lines — no harness prose, no
+test-runner output, no false matches from eval-gate fixtures.
+
+For example, `/pipeline 64` (issue passed directly):
+```bash
+tail -f /tmp/pipeline-<domain>-64.transitions.log
+```
+
+`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100):
+```bash
+tail -f /tmp/pipeline-<domain>-100.transitions.log
+```
+
+**Fallback — full log with grep filter:** If you need the full combined output,
+filter the full log using the **resolved issue number** `<resolved-N>` (check the
+full log for `[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` when you
+passed a PR):
 
 ```bash
 tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
   "^\[pipeline\] #<resolved-N>: "
 ```
 
-For example, `/pipeline 64` (issue passed directly, `<N>` = `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
-
-`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100, `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-100.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
-
-**Why the tight filter?** The test-gate stage (`npm test` / `npm run ci`)
-dumps the full unit-test suite output to the same log. The eval-gate and
-state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
-`→ ready-to-deploy` substrings (they assert on the pipeline's own log
-format). The broad alternation matched hundreds of these fixture lines in
-rapid succession, triggering the Monitor tool's auto-stop threshold and
-silencing the rest of the run.
+**Why the transitions log is preferred:** The test-gate stage (`npm test` /
+`npm run ci`) dumps the full unit-test suite output to the same full log. The
+eval-gate and state-machine test fixtures reproduce exact `[pipeline] #<other-N>:`
+and `→ ready-to-deploy` substrings, so a grep filter on the full log must be tight.
+The transitions log has no such risk — only the orchestrator writes to it, never
+the test runner.
 
 **No real signal is lost:** every stage transition — including
 `[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
-`[pipeline] #N: → ready-to-deploy` — begins with `[pipeline] #N:`.
+`[pipeline] #N: → ready-to-deploy` — appears in the transitions log.
 The PTY session finishing signals run-end independently.
 
 #### d. User-visible progress updates
