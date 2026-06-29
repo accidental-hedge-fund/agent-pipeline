@@ -10,10 +10,12 @@ import {
   archiveNamesFromPaths,
   buildShipcheckPrompt,
   extractAcceptanceCriteria,
+  extractShipcheckSha,
   formatShipcheckComment,
   parseShipcheckVerdict,
   type ShipcheckDeps,
 } from "../scripts/stages/shipcheck.ts";
+import { blockerKindToInterventionKind } from "../scripts/intervention.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK, SHIPCHECK_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import type { PipelineConfig, ShipcheckVerdict } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
@@ -101,6 +103,10 @@ function fencedJson(v: ShipcheckVerdict): string {
   return "```json\n" + JSON.stringify(v, null, 2) + "\n```";
 }
 
+// Stable SHA used in default stubs — matches across getPrDetail and getWorktreeHead
+// so the head-drift check always passes in pre-existing tests.
+const STUB_PR_HEAD_SHA = "a".repeat(40);
+
 function makeDeps(
   log: CallLog,
   reviewerOutput: string,
@@ -119,6 +125,26 @@ function makeDeps(
     }),
     getPrForIssue: async () => null,
     getPrDiff: async () => "",
+    // Head-coherence gate stubs: matching SHA → no drift; no prior verdict comment → no route-back.
+    getPrDetail: async (_cfg, _n) => ({
+      number: _n,
+      title: "PR",
+      body: "",
+      state: "open",
+      url: "u",
+      head_ref: "branch",
+      head_sha: STUB_PR_HEAD_SHA,
+      base_ref: "main",
+      mergeable: true,
+      mergeable_state: "clean",
+      draft: false,
+      additions: 0,
+      deletions: 0,
+      changed_files: 0,
+    }),
+    getPrCommits: async () => [],
+    getGhActor: async () => "pipeline-bot",
+    getWorktreeHead: async () => STUB_PR_HEAD_SHA,
     getForIssue: async () => null,
     gitDiffNames: async () => [],
     readEvidenceBundle: async () => null,
@@ -1331,4 +1357,279 @@ test("shipcheck-gate: bundle pr already set → patchBundleIdentityFn NOT called
   await advance(cfg, 42, { stateDir: "/tmp/state42" }, deps);
 
   assert.equal(patchCalled, false, "patchBundleIdentityFn must NOT be called when bundle.pr is already set");
+});
+
+// ---------------------------------------------------------------------------
+// #317: Head-coherence gate regression tests
+// ---------------------------------------------------------------------------
+
+const SHA_H1 = "1".repeat(40);
+const SHA_H2 = "2".repeat(40);
+const DEVELOPER_COMMIT = { oid: SHA_H2, messageHeadline: "fix: address shipcheck concerns" };
+const INTERNAL_COMMIT = { oid: SHA_H2, messageHeadline: "chore: archive OpenSpec change(s) for #317" };
+
+// 4.1: worktree HEAD differs from PR head → blocked with head-drift, no advance.
+// Proves the gate: without it, the stage would proceed to the reviewer and advance to ready-to-deploy.
+test("shipcheck-gate #317 4.1: worktree HEAD ≠ PR head → blocked with head-drift, no advance", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H1, // local HEAD is H1, PR is H2 → drift
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, false, "must NOT advance when worktree head differs from PR head");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal((out as { blockerKind: string }).blockerKind, "head-drift");
+  assert.equal(log.blocked.length, 1);
+  assert.ok(log.blocked[0].reason.includes(SHA_H1), "block reason must include local HEAD SHA");
+  assert.ok(log.blocked[0].reason.includes(SHA_H2), "block reason must include PR head SHA");
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked when head-drift blocks");
+  assert.equal(log.transitions.length, 0, "must NOT transition to ready-to-deploy");
+});
+
+// 4.2: prior shipcheck-sha ≠ PR head with a developer commit → route to pre-merge.
+// Proves the gate: without it, the stage would re-run the reviewer and advance to ready-to-deploy.
+test("shipcheck-gate #317 4.2: developer commit since prior shipcheck-sha → transitions to pre-merge, not ready-to-deploy", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+  const priorVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2, // worktree matches PR head (fix is pushed)
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [DEVELOPER_COMMIT],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open",
+      url: "u", labels: [], comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "must advance (via routing)");
+  assert.equal((out as { to: string }).to, "pre-merge", "must route to pre-merge, NOT ready-to-deploy");
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked when routing back to pre-merge");
+  // Notice must be posted before routing.
+  assert.ok(log.comments.some((c) => c.includes("re-validation")), "notice must be posted before routing");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].from, "shipcheck-gate");
+  assert.equal(log.transitions[0].to, "pre-merge");
+});
+
+// 4.3: prior shipcheck-sha == PR head → proceeds to reviewer / normal advance (no route-back).
+test("shipcheck-gate #317 4.3: recorded shipcheck-sha equals current PR head → proceeds normally", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const priorVerdictComment = formatShipcheckComment(PASS_VERDICT, "gate", SHA_H1);
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H1, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H1, // no drift
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open",
+      url: "u", labels: [], comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+      ],
+    }),
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "must advance to ready-to-deploy when SHA matches");
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "must go to ready-to-deploy, not pre-merge");
+  assert.equal(log.blocked.length, 0, "must not block");
+});
+
+// 4.4: only pipeline-internal commits since prior shipcheck-sha → proceeds (convergence guard).
+test("shipcheck-gate #317 4.4: only pipeline-internal commits since prior sha → proceeds, no route-back", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const priorVerdictComment = formatShipcheckComment(PASS_VERDICT, "gate", SHA_H1);
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2, // no drift
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [INTERNAL_COMMIT], // only internal commits since SHA_H1
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open",
+      url: "u", labels: [], comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+      ],
+    }),
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "must advance to ready-to-deploy (pipeline-internal only → no route-back)");
+  assert.equal(log.blocked.length, 0, "must not block");
+  // No route-back notice should appear.
+  assert.ok(!log.comments.some((c) => c.includes("re-validation")), "must not post route-back notice for internal-only commits");
+});
+
+// 4.5: first entry (no prior shipcheck comment) → proceeds; verdict comment embeds shipcheck-sha.
+test("shipcheck-gate #317 4.5: first entry (no prior comment) → proceeds; verdict comment has shipcheck-sha sentinel", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => null,
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H1, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H1,
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [],
+    // No prior shipcheck comments.
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open",
+      url: "u", labels: [], comments: [],
+    }),
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "first entry must proceed to ready-to-deploy");
+  assert.equal((out as { to: string }).to, "ready-to-deploy");
+  assert.ok(log.comments.length > 0, "verdict comment must be posted");
+  const verdictComment = log.comments[0];
+  assert.ok(
+    verdictComment.includes(`<!-- shipcheck-sha: ${SHA_H1} -->`),
+    "verdict comment must contain shipcheck-sha sentinel with the evaluated PR head SHA",
+  );
+  assert.equal(extractShipcheckSha(verdictComment), SHA_H1, "extractShipcheckSha must return the embedded SHA");
+});
+
+// 4.6: no worktree → worktree-head check skipped; no PR → both checks skipped. No crash.
+test("shipcheck-gate #317 4.6a: no worktree → worktree-head check skipped, no crash", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+  let worktreeHeadCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => null, // no worktree
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "b", head_sha: SHA_H1, base_ref: "main", mergeable: null, mergeable_state: "", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async (p) => { worktreeHeadCalled = true; return p; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "must advance (no worktree → head check skipped)");
+  assert.equal(worktreeHeadCalled, false, "getWorktreeHead must NOT be called when no worktree");
+  assert.equal(log.blocked.length, 0);
+});
+
+test("shipcheck-gate #317 4.6b: no PR → both head checks skipped, no crash", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory" });
+  let prDetailCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => null, // no PR
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => { prDetailCalled = true; return { number: 0, title: "", body: "", state: "open", url: "", head_ref: "", head_sha: "", base_ref: "", mergeable: null, mergeable_state: "", draft: false, additions: 0, deletions: 0, changed_files: 0 }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "must advance (no PR → head checks skipped)");
+  assert.equal(prDetailCalled, false, "getPrDetail must NOT be called when prNumber is null");
+  assert.equal(log.blocked.length, 0);
+});
+
+// 4.7: blockerKindToInterventionKind("head-drift") === "merge-conflict-or-branch-drift".
+test("shipcheck-gate #317 4.7: blockerKindToInterventionKind('head-drift') === 'merge-conflict-or-branch-drift'", () => {
+  assert.equal(
+    blockerKindToInterventionKind("head-drift"),
+    "merge-conflict-or-branch-drift",
+    "head-drift must map to merge-conflict-or-branch-drift intervention kind",
+  );
+});
+
+// 4.8: Prove the tests bite.
+// With the head-coherence gate REMOVED, tests 4.1 and 4.2 would fail because:
+//   - 4.1: the stage would invoke the reviewer (PASS_VERDICT) and advance to ready-to-deploy
+//           instead of blocking with head-drift.
+//   - 4.2: the stage would invoke the reviewer (PASS_VERDICT) and advance to ready-to-deploy
+//           instead of transitioning to pre-merge.
+// The tests above assert the opposite outcome (blocked / pre-merge transition), so they WOULD
+// FAIL against code without the gate. We verify the gate is present by confirming the
+// reviewerOutput (PASS_VERDICT) would produce ready-to-deploy when the gate is not triggered.
+test("shipcheck-gate #317 4.8: gate bite proof — gate-not-triggered path still advances to ready-to-deploy", async () => {
+  // This test verifies the baseline: when the gate is NOT triggered (matching SHAs, no prior
+  // verdict), a pass verdict still advances to ready-to-deploy. This confirms 4.1 and 4.2 test
+  // the gate condition itself, not the reviewer result (which is always PASS_VERDICT in those tests).
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H1, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H1, // matches → no drift (gate NOT triggered)
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [],
+    // No prior verdict comment → no route-back (gate NOT triggered)
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open",
+      url: "u", labels: [], comments: [],
+    }),
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  // Without the gate: this same PASS_VERDICT + no gate triggers → ready-to-deploy.
+  // Tests 4.1 and 4.2 use this same PASS_VERDICT but different SHA conditions that DO trigger
+  // the gate → those tests assert blocked/pre-merge, proving the gate changes the outcome.
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "gate-not-triggered path must still advance to ready-to-deploy");
+});
+
+// ---------------------------------------------------------------------------
+// #317: extractShipcheckSha unit tests
+// ---------------------------------------------------------------------------
+
+test("extractShipcheckSha: returns 40-char SHA when sentinel is present", () => {
+  const sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+  const body = `## Shipcheck\n\n**Verdict**: ✅ PASS\n\n---\n<!-- shipcheck-sha: ${sha} -->`;
+  assert.equal(extractShipcheckSha(body), sha);
+});
+
+test("extractShipcheckSha: returns null when sentinel is absent", () => {
+  const body = "## Shipcheck\n\n**Verdict**: ✅ PASS\n\n---\n*Automated by Claude Code Pipeline Skill*";
+  assert.equal(extractShipcheckSha(body), null);
+});
+
+test("formatShipcheckComment: embeds shipcheck-sha sentinel when prHeadSha is provided", () => {
+  const sha = "1234567890abcdef1234567890abcdef12345678";
+  const comment = formatShipcheckComment(PASS_VERDICT, "gate", sha);
+  assert.ok(comment.includes(`<!-- shipcheck-sha: ${sha} -->`), "comment must embed shipcheck-sha sentinel");
+  assert.equal(extractShipcheckSha(comment), sha, "extractShipcheckSha must round-trip the embedded SHA");
+});
+
+test("formatShipcheckComment: no sentinel when prHeadSha is absent (backward-compat)", () => {
+  const comment = formatShipcheckComment(PASS_VERDICT, "gate");
+  assert.equal(extractShipcheckSha(comment), null, "absent prHeadSha must produce no sentinel");
 });

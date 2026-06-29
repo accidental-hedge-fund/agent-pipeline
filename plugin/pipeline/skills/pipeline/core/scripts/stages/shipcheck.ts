@@ -14,11 +14,15 @@ import {
   postPrComment as defaultPostPrComment,
   getPrForIssue as defaultGetPrForIssue,
   getPrDiff as defaultGetPrDiff,
+  getPrDetail as defaultGetPrDetail,
+  getPrCommits as defaultGetPrCommits,
+  getGhActor as defaultGetGhActor,
   getIssueDetail as defaultGetIssueDetail,
   setBlocked as defaultSetBlocked,
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
+import { isPipelineInternalCommit } from "./pre_merge.ts";
 import { extractSnapshotComment } from "../issue-context-snapshot.ts";
 import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
@@ -142,6 +146,7 @@ function isShipcheckVerdict(v: unknown): v is ShipcheckVerdict {
 export function formatShipcheckComment(
   verdict: ShipcheckVerdict,
   mode: "advisory" | "gate",
+  prHeadSha?: string,
 ): string {
   const header = mode === "advisory" ? "## Shipcheck (advisory)" : "## Shipcheck";
   const emoji = verdict.verdict === "pass" ? "✅" : verdict.verdict === "partial" ? "⚠️" : "❌";
@@ -166,7 +171,20 @@ export function formatShipcheckComment(
   }
 
   lines.push("", "---", "*Automated by Claude Code Pipeline Skill*");
+  if (prHeadSha) {
+    lines.push(`<!-- shipcheck-sha: ${prHeadSha} -->`);
+  }
   return lines.join("\n");
+}
+
+/**
+ * Extract the PR head SHA embedded in a shipcheck verdict comment.
+ * Returns the full 40-char SHA or null when absent (first-entry comments, legacy).
+ * Mirrors the `extractReviewedSha` pattern from review-sha-gating.
+ */
+export function extractShipcheckSha(commentBody: string): string | null {
+  const m = commentBody.match(/<!--\s*shipcheck-sha:\s*([0-9a-f]{40})\s*-->/);
+  return m ? m[1] : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +195,12 @@ export interface ShipcheckDeps {
   getIssueDetail?: typeof defaultGetIssueDetail;
   getPrForIssue?: typeof defaultGetPrForIssue;
   getPrDiff?: typeof defaultGetPrDiff;
+  getPrDetail?: typeof defaultGetPrDetail;
+  getPrCommits?: typeof defaultGetPrCommits;
+  /** Return the authenticated GitHub actor login, or null if unavailable. */
+  getGhActor?: () => Promise<string | null>;
+  /** Read the HEAD SHA of a worktree path. Throws on error (non-40-char output). */
+  getWorktreeHead?: (wtPath: string) => Promise<string>;
   getForIssue?: typeof defaultGetForIssue;
   postComment?: typeof defaultPostComment;
   postPrComment?: typeof defaultPostPrComment;
@@ -260,6 +284,10 @@ export async function advance(
   const getIssueDetailFn = deps.getIssueDetail ?? defaultGetIssueDetail;
   const getForIssueFn = deps.getForIssue ?? defaultGetForIssue;
   const getPrDiffFn = deps.getPrDiff ?? defaultGetPrDiff;
+  const getPrDetailFn = deps.getPrDetail ?? defaultGetPrDetail;
+  const getPrCommitsFn = deps.getPrCommits ?? defaultGetPrCommits;
+  const getGhActorFn = deps.getGhActor ?? defaultGetGhActor;
+  const getWorktreeHeadFn = deps.getWorktreeHead ?? defaultGetWorktreeHead;
   const readEvidenceBundleFn = deps.readEvidenceBundle ?? defaultReadBundle;
   const gitDiffNamesFn = deps.gitDiffNames ?? defaultGitDiffNames;
   const readSpecDeltasFnBound = deps.readSpecDeltasFn ?? readSpecDeltas;
@@ -309,6 +337,87 @@ export async function advance(
   // Resolve the issue worktree; reviewer runs inside it when present.
   const wt = await getForIssueFn(cfg, issueNumber);
   const worktreeDir = wt?.path ?? cfg.repo_dir;
+
+  // ---- HEAD-COHERENCE GATE (#317) ----
+  // Runs on the enabled path, before the reviewer is invoked and before any
+  // transition to ready-to-deploy. Guards against two failure modes:
+  //   3.2a: unpushed local fix marks a stale PR ready.
+  //   3.2b: pushed fix bypasses pre-merge/eval/review-SHA re-validation.
+
+  let prHeadSha: string | null = null;
+  if (prNumber !== null) {
+    try {
+      const prDetail = await getPrDetailFn(cfg, prNumber);
+      prHeadSha = prDetail.head_sha;
+    } catch (err) {
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate: could not fetch PR head SHA: ${err}`);
+      await setBlockedFn(cfg, issueNumber, `Shipcheck gate: could not fetch PR head SHA: ${String(err)}`, "shipcheck-gate", "needs-human" as BlockerKind);
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "pr_head_fetch_error");
+      return { advanced: false, status: "blocked", reason: "shipcheck: failed to fetch PR head SHA", blockerKind: "needs-human" as BlockerKind };
+    }
+  }
+
+  // 3.2a: Unpushed-fix block — worktree HEAD differs from PR head.
+  if (wt !== null && prHeadSha !== null) {
+    let worktreeHead: string;
+    try {
+      worktreeHead = await getWorktreeHeadFn(wt.path);
+    } catch (err) {
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate: could not read worktree head SHA: ${err}`);
+      await setBlockedFn(cfg, issueNumber, `Shipcheck gate: could not read worktree head SHA: ${String(err)}`, "shipcheck-gate", "needs-human" as BlockerKind);
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "worktree_head_error");
+      return { advanced: false, status: "blocked", reason: "shipcheck: failed to read worktree head", blockerKind: "needs-human" as BlockerKind };
+    }
+    if (worktreeHead !== prHeadSha) {
+      const reason = `Shipcheck gate: worktree HEAD (${worktreeHead}) differs from PR head (${prHeadSha}). Push the local commits so the PR head includes the fix before re-running.`;
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate: head drift detected (worktree=${worktreeHead.slice(0, 8)} pr=${prHeadSha.slice(0, 8)}); blocking`);
+      await setBlockedFn(cfg, issueNumber, reason, "shipcheck-gate", "head-drift" as BlockerKind);
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "head_drift");
+      return { advanced: false, status: "blocked", reason: "shipcheck: worktree head differs from PR head", blockerKind: "head-drift" as BlockerKind };
+    }
+  }
+
+  // 3.2b: Post-verdict re-validation routing — developer commit since prior verdict.
+  if (prHeadSha !== null) {
+    const actor = await getGhActorFn();
+    if (actor !== null) {
+      // Find the most recent shipcheck verdict comment authored by the pipeline actor
+      // that carries a shipcheck-sha sentinel (i.e. posted by this harness, not legacy).
+      const shipcheckedByActor = detail.comments.filter(
+        (c) => c.author === actor && extractShipcheckSha(c.body) !== null,
+      );
+      const lastVerdictComment = shipcheckedByActor[shipcheckedByActor.length - 1];
+      if (lastVerdictComment) {
+        const recordedSha = extractShipcheckSha(lastVerdictComment.body)!;
+        if (recordedSha !== prHeadSha) {
+          // Prior verdict evaluated a different SHA — check the commits since.
+          let commits: { oid: string; messageHeadline: string }[];
+          try {
+            commits = await getPrCommitsFn(cfg, prNumber!);
+          } catch (err) {
+            console.log(`[pipeline] #${issueNumber}: shipcheck-gate: could not fetch PR commits: ${err}`);
+            await setBlockedFn(cfg, issueNumber, `Shipcheck gate: could not fetch PR commits: ${String(err)}`, "shipcheck-gate", "needs-human" as BlockerKind);
+            await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "pr_commits_fetch_error");
+            return { advanced: false, status: "blocked", reason: "shipcheck: failed to fetch PR commits", blockerKind: "needs-human" as BlockerKind };
+          }
+          // Find commits since the recorded SHA (oldest-first list from gh).
+          const recordedIdx = commits.findIndex((c) => c.oid === recordedSha);
+          const commitsSince = recordedIdx >= 0 ? commits.slice(recordedIdx + 1) : commits;
+          if (commitsSince.some((c) => !isPipelineInternalCommit(c.messageHeadline))) {
+            const notice =
+              `**Shipcheck re-validation notice**: A developer commit has landed since the last shipcheck verdict (stale: \`${recordedSha.slice(0, 8)}\`, current: \`${prHeadSha.slice(0, 8)}\`). Routing back through pre-merge, eval-gate, and review-SHA validation for the new head.`;
+            await postCommentFn(cfg, issueNumber, notice);
+            console.log(`[pipeline] #${issueNumber}: shipcheck-gate: developer commit since prior verdict SHA ${recordedSha.slice(0, 8)}; routing to pre-merge`);
+            await transitionFn(cfg, issueNumber, "shipcheck-gate", "pre-merge", `Developer commit(s) since last shipcheck verdict (${recordedSha.slice(0, 8)} → ${prHeadSha.slice(0, 8)}); re-validating through pre-merge.`);
+            return { advanced: true, from: "shipcheck-gate", to: "pre-merge", summary: `shipcheck: re-validation routing to pre-merge (${recordedSha.slice(0, 8)} → ${prHeadSha.slice(0, 8)})` };
+          }
+          // Only pipeline-internal commits — fall through to normal reviewer evaluation.
+        }
+      }
+    }
+  }
+
+  // ---- END HEAD-COHERENCE GATE ----
 
   // Compute rubric fallback from issue body before loading the configured file.
   const rubricFallback = extractAcceptanceCriteria(detail.body) || detail.body || "(no rubric available)";
@@ -458,7 +567,8 @@ export async function advance(
 
   // Post verdict comment. Issue comment is authoritative; PR mirror is best-effort
   // so a transient PR API failure cannot strand the gate before it blocks/advances.
-  const comment = formatShipcheckComment(verdict, cfg.shipcheck_gate.mode);
+  // Embed prHeadSha so the next entry can detect post-verdict developer commits.
+  const comment = formatShipcheckComment(verdict, cfg.shipcheck_gate.mode, prHeadSha ?? undefined);
   await postCommentFn(cfg, issueNumber, comment);
   if (prNumber) {
     try {
@@ -817,4 +927,14 @@ async function defaultGitDiffNames(wtPath: string, base: string): Promise<string
     { ignoreFailure: true },
   );
   return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Default worktree HEAD reader. Throws when git returns a non-40-char SHA. */
+async function defaultGetWorktreeHead(wtPath: string): Promise<string> {
+  const result = await defaultGitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  const sha = result.stdout.trim();
+  if (sha.length !== 40) {
+    throw new Error(`git rev-parse HEAD in ${wtPath} returned invalid SHA: "${sha}"`);
+  }
+  return sha;
 }
