@@ -9,7 +9,7 @@ The pipeline orchestrator SHALL append every `[pipeline] #N:` lifecycle line it 
 
 #### Scenario: A blocked outcome is mirrored
 - **WHEN** the orchestrator prints `[pipeline] #N: at <stage> — blocked: <reason>` to stdout
-- **THEN** the identical line SHALL be appended to the transitions log
+- **THEN** the first physical line of that string (the lifecycle header before any embedded newline in `<reason>`) SHALL be appended to the transitions log
 
 #### Scenario: Run-start and run-done lines are mirrored
 - **WHEN** the orchestrator prints the `starting at stage=…`, `run id …`, or terminal `done — …` lifecycle line
@@ -27,6 +27,21 @@ The pipeline orchestrator SHALL append every `[pipeline] #N:` lifecycle line it 
 - **WHEN** the test gate dumps unit-test fixture output containing substrings like `[pipeline] #999:` or `→ ready-to-deploy`
 - **THEN** none of that fixture output SHALL appear in the transitions log
 
+### Requirement: The tlog closure normalizes each lifecycle string to its first physical line before writing
+Before appending any lifecycle string to the transitions log, the orchestrator's `tlog` closure SHALL apply `singleLifecycleLine()` — which strips leading whitespace then returns only the content before the first embedded newline — so that multiline outputs (blocked-outcome reasons embedding test-gate fixture text, and the terminal done line that prefixes a leading `\n` for terminal visual spacing) are each written as a single unambiguous line.
+
+#### Scenario: Single-line lifecycle string written verbatim
+- **WHEN** `tlog` is called with a string containing no leading whitespace and no embedded newlines
+- **THEN** the string written to the transitions log SHALL equal the input verbatim
+
+#### Scenario: Done line has leading newline stripped
+- **WHEN** `tlog` is called with the terminal done line (which carries a leading `\n` for terminal visual spacing)
+- **THEN** the string written to the transitions log SHALL be the lifecycle content with the leading whitespace stripped, containing no leading newline
+
+#### Scenario: Blocked outcome with embedded multiline reason — only header written
+- **WHEN** a blocked-outcome reason string embeds one or more newlines (e.g., test-gate fixture output appended after the lifecycle header line)
+- **THEN** only the content up to (but not including) the first embedded newline SHALL be written to the transitions log
+
 ### Requirement: The transitions log path follows the per-issue /tmp naming convention
 The transitions log SHALL be located at `/tmp/pipeline-<domain>-<N>.transitions.log`, where `<domain>` is the active `cfg.domain` and `<N>` is the issue number the run was invoked with. This mirrors the existing `/tmp/pipeline-<domain>.lock`, `/tmp/pipeline-<domain>.disabled`, and `/tmp/pipeline-<domain>-<N>.log` naming so an operator can derive the path from the run arguments alone.
 
@@ -42,6 +57,14 @@ The transitions log SHALL be located at `/tmp/pipeline-<domain>-<N>.transitions.
 - **WHEN** `runAdvance` is called after PR→issue resolution and a `transitionsLogN` value is provided via `AdvanceDeps`
 - **THEN** the transitions log path SHALL be derived from `transitionsLogN` rather than the resolved `issueNumber`, so unit tests and callers can independently verify both the GitHub operations (which use `issueNumber`) and the transitions log path (which uses the original argument)
 
+#### Scenario: runUnblock uses original argument number for transitions log path
+- **WHEN** `runUnblock` is called with an `originalN` parameter that differs from the resolved `issueNumber`
+- **THEN** the `unblocked at <stage>` lifecycle line SHALL be appended to `/tmp/pipeline-<domain>-<originalN>.transitions.log`, not the path derived from the resolved `issueNumber`
+
+#### Scenario: runOverride threads original argument as transitionsLogN to runAdvance
+- **WHEN** `runOverride` is called with an `originalN` parameter that differs from the resolved `issueNumber`
+- **THEN** it SHALL pass `transitionsLogN: originalN` to `runAdvance`, so all advance-loop lifecycle lines produced by the resumed run use the original argument's transitions log path
+
 ### Requirement: The transitions log is append-only and additive to the full log
 The transitions log SHALL be opened in append mode and SHALL NOT truncate existing content, so successive dispatches for the same issue accumulate in one file. Mirroring SHALL be strictly additive: every line written to the full log (stdout) before this change SHALL still be written there, and each mirrored line SHALL be byte-for-byte identical to the line written to stdout.
 
@@ -53,9 +76,13 @@ The transitions log SHALL be opened in append mode and SHALL NOT truncate existi
 - **WHEN** the pipeline runs with the transitions log enabled
 - **THEN** stdout / the full log SHALL contain exactly the lines it contained before this change, with no lines removed or reformatted
 
-#### Scenario: Mirrored line matches the stdout line verbatim
-- **WHEN** a lifecycle line is written to both destinations
+#### Scenario: Mirrored line matches the stdout line verbatim for single-line output
+- **WHEN** a lifecycle string is a single physical line (no leading whitespace, no embedded newlines)
 - **THEN** the transitions-log copy SHALL equal the stdout copy with no added prefix, timestamp, or reformatting
+
+#### Scenario: Mirrored line is normalized for multiline output
+- **WHEN** a lifecycle string contains leading whitespace or embedded newlines
+- **THEN** the transitions-log copy SHALL be the first physical line of that string after leading-whitespace stripping, as produced by `singleLifecycleLine()`
 
 ### Requirement: A transitions-log write failure is non-fatal
 A failure to open or append to the transitions log SHALL NOT abort the run or alter the full-log output. The orchestrator SHALL continue the dispatch and SHALL still print the lifecycle line to stdout.
