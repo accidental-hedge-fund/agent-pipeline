@@ -126,6 +126,18 @@ be recorded on the milestone in a machine-readable field (e.g. `version_impact`)
 - **THEN** that milestone's `title` SHALL be `v1.6.1` (a patch bump)
 - **AND** its `version_impact` SHALL be `patch`
 
+#### Scenario: Explicit semver:minor label takes precedence over co-present maintenance labels
+
+- **WHEN** an issue carries both a `semver:minor` label and a generic maintenance label (e.g. `bug`)
+- **THEN** the engine SHALL classify its compatibility impact as `minor`
+- **AND** the co-present maintenance label SHALL NOT downgrade the classification to `patch`
+
+#### Scenario: Feature label outranks co-present maintenance label
+
+- **WHEN** an issue carries both a feature label (e.g. `enhancement`) and a maintenance label (e.g. `chore`)
+- **THEN** the engine SHALL classify its compatibility impact as `minor` (feature wins)
+- **AND** the maintenance label SHALL NOT downgrade the classification to `patch`
+
 #### Scenario: Backward-compatible feature milestone bumps minor
 
 - **WHEN** a milestone's highest-impact issue is a backward-compatible feature and the prior version is `v1.6.0`
