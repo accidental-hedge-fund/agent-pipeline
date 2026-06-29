@@ -369,8 +369,8 @@ export interface PipelineConfig {
   // roadmap engine can identify cross-repo sequencing hints. Declarative only —
   // no cross-repo write, merge, PR creation, label propagation, or CI gating.
   // Relationships are declared independently per repo; no reverse-edge inference.
-  // Absent (undefined) when not declared in .github/pipeline.yml.
-  repo_map?: {
+  // Resolves to { depends_on: [], depended_on_by: [] } when absent from .github/pipeline.yml.
+  repo_map: {
     depends_on: string[];      // owner/repo strings this repo consumes
     depended_on_by: string[];  // owner/repo strings that consume this repo
   };
@@ -430,7 +430,7 @@ export const DEFAULT_CONFIG: Omit<
     allow_paths: [] as string[],
     min_confidence: 0.8,
   },
-  repo_map: undefined,
+  repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
 };
 
 // ---------------------------------------------------------------------------

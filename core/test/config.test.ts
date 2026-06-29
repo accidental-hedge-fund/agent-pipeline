@@ -1665,7 +1665,7 @@ test("resolveConfig: plan_review_timeout: -1 is rejected (negative integer)", as
 
 // ---- repo_map (#312) ----
 
-test("resolveConfig: repo_map absent → undefined (no defaults)", async () => {
+test("resolveConfig: repo_map absent → empty-list defaults", async () => {
   const repo = makeFakeRepo(null);
   const binDir = makeFakeGh("acme/rm0");
   const oldPath = process.env.PATH;
@@ -1673,7 +1673,8 @@ test("resolveConfig: repo_map absent → undefined (no defaults)", async () => {
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
-    assert.equal(cfg.repo_map, undefined);
+    assert.deepEqual(cfg.repo_map.depends_on, []);
+    assert.deepEqual(cfg.repo_map.depended_on_by, []);
   } finally {
     process.env.PATH = oldPath;
   }

@@ -302,7 +302,7 @@ test("scaffoldDefaultConfig: scaffolded file includes commented-out repo_map blo
   assert.ok(content.includes("depended_on_by"), "scaffold must mention depended_on_by");
 });
 
-test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map absent (undefined)", async () => {
+test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map at empty-list defaults", async () => {
   const repo = makeTempRepo();
   const binDir = makeFakeGhBin({ repoSlug: "acme/scaffold-rm" });
   const oldPath = process.env.PATH;
@@ -311,8 +311,9 @@ test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map absent (u
     await scaffoldDefaultConfig(repo);
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
-    // The commented-out block must not activate — repo_map stays undefined.
-    assert.equal(cfg.repo_map, undefined, "repo_map must be undefined when scaffold comments it out");
+    // The commented-out block must not activate — repo_map resolves to empty-list defaults.
+    assert.deepEqual(cfg.repo_map.depends_on, [], "depends_on must be empty when scaffold comments it out");
+    assert.deepEqual(cfg.repo_map.depended_on_by, [], "depended_on_by must be empty when scaffold comments it out");
   } finally {
     process.env.PATH = oldPath;
   }

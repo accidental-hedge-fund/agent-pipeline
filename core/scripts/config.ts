@@ -473,12 +473,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       allow_paths: fileConfig.auto_merge_eligibility?.allow_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.allow_paths,
       min_confidence: fileConfig.auto_merge_eligibility?.min_confidence ?? DEFAULT_CONFIG.auto_merge_eligibility.min_confidence,
     },
-    repo_map: fileConfig.repo_map
-      ? {
-          depends_on: fileConfig.repo_map.depends_on ?? [],
-          depended_on_by: fileConfig.repo_map.depended_on_by ?? [],
-        }
-      : undefined,
+    repo_map: {
+      depends_on: fileConfig.repo_map?.depends_on ?? DEFAULT_CONFIG.repo_map.depends_on,
+      depended_on_by: fileConfig.repo_map?.depended_on_by ?? DEFAULT_CONFIG.repo_map.depended_on_by,
+    },
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
