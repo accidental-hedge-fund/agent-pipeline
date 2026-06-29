@@ -132,7 +132,7 @@ export async function salvageUncommittedWork(
     // so a pre-staged tasks/todo.md would leak into the commit unless we clear it
     // first. git-restore --staged only touches the index; working-tree content is
     // left intact.
-    const restoreArgs = ["restore", "--staged", "--", ".", `:(exclude)${scope}`, ":(exclude)node_modules"];
+    const restoreArgs = ["restore", "--staged", "--", ".", `:(exclude)${scope}`];
     await (deps.gitRestoreStaged ?? defaultGitRestoreStaged)(wtPath, restoreArgs);
   }
   const addArgs = scope

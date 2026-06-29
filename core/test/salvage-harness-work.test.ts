@@ -348,9 +348,12 @@ test("salvage [scoped, regression #321]: pre-staged tasks/todo.md is unstaged vi
     restoreArgs.includes(":(exclude)openspec/"),
     `restore args must exclude openspec/ (leave those staged); got ${JSON.stringify(restoreArgs)}`,
   );
+  // node_modules must NOT be excluded from restore: the restore should unstage ALL
+  // out-of-scope entries (including any pre-staged node_modules). The subsequent
+  // gitAddAll excludes node_modules so they are never re-staged.
   assert.ok(
-    restoreArgs.includes(":(exclude)node_modules"),
-    "restore args must exclude node_modules",
+    !restoreArgs.includes(":(exclude)node_modules"),
+    `restore args must NOT exclude node_modules — restore must unstage them; got ${JSON.stringify(restoreArgs)}`,
   );
 
   // gitAddAll must still run with scope restriction
@@ -422,6 +425,46 @@ test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-o
 // ---------------------------------------------------------------------------
 // Regression #180: salvage gitAddAll must exclude node_modules
 // ---------------------------------------------------------------------------
+
+test("salvage [scoped, regression #321 — node_modules not excluded from restore]: pre-staged node_modules/foo.js is unstaged before scoped add and not included in commit", async () => {
+  // Reproduces the bug: gitRestoreStaged previously excluded node_modules from
+  // the restore, which left pre-staged node_modules/ entries in the index. Those
+  // entries then leaked into the salvage commit even though gitAddAll excludes
+  // node_modules. The fix: remove :(exclude)node_modules from the restore args so
+  // ALL out-of-scope index entries (including node_modules) are unstaged first.
+  const restoreCalls: string[][] = [];
+  let addArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      // Scoped to openspec/ → only the openspec file appears
+      if (scope === "openspec/") return "A  openspec/changes/x/proposal.md\n";
+      // Full status: node_modules pre-staged alongside an openspec file
+      return "A  node_modules/foo.js\nA  openspec/changes/x/proposal.md\n";
+    },
+    gitRestoreStaged: async (_wt, args) => { restoreCalls.push([...args]); },
+    gitAddAll: async (_wt, args) => { addArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+
+  const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.equal(res.salvaged, true, "dirty-in-scope → salvage runs");
+  assert.equal(restoreCalls.length, 1, "gitRestoreStaged called once");
+
+  const restoreArgs = restoreCalls[0];
+  // node_modules must NOT be in the exclude list so the restore unstages them
+  assert.ok(
+    !restoreArgs.includes(":(exclude)node_modules"),
+    `restore args must NOT exclude node_modules — must unstage them; got ${JSON.stringify(restoreArgs)}`,
+  );
+  assert.ok(restoreArgs.includes(":(exclude)openspec/"), "restore keeps openspec/ staged");
+
+  // gitAddAll must still exclude node_modules so they are never re-staged
+  assert.ok(addArgs !== null, "gitAddAll must be called");
+  assert.ok(
+    (addArgs as string[]).includes(":(exclude)node_modules"),
+    `gitAddAll must still exclude node_modules; got ${JSON.stringify(addArgs)}`,
+  );
+});
 
 test("salvage: gitAddAll receives :(exclude)node_modules pathspec when worktree contains node_modules (#180)", async () => {
   // Simulates: harness exits with a node_modules symlink AND a real modified file.
