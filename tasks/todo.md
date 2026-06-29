@@ -1,3 +1,22 @@
+# Logging Surface Consolidation
+
+- [x] Inspect the post-#334 logging implementation and documentation.
+- [x] Identify open backlog issues that could compound logging fragmentation.
+- [x] Remove tracked runtime run artifacts from `.agent-pipeline/runs/` without deleting local ignored output.
+- [x] Consolidate host/operator docs away from `/tmp` log redirection and toward the run store / `pipeline logs`.
+- [x] Replace the dedicated transitions-log surface with run-store event visibility, or remove it if redundant.
+- [x] Update tests/docs and regenerate the generated plugin mirror.
+- [x] Run focused tests, mirror check, and full `npm run ci`.
+- [x] Commit changes and open a PR against `main`.
+
+## Review Results
+
+- Focused logging/CLI tests passed: `node --test --experimental-strip-types test/run-logs.test.ts test/pipeline-cli.test.ts test/pipeline-override.test.ts`.
+- Mirror check passed: `node scripts/build.mjs --check`.
+- OpenSpec validation passed: `openspec validate --all`.
+- Whitespace check passed: `git diff --check`.
+- Full CI passed: `npm run ci`.
+
 # Config Sync Implementation Plan
 
 ## Checklist

@@ -36,3 +36,57 @@ test("runLogs --follow returns (does not hang) when terminal.log is missing (#15
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("runLogs --events prints events.jsonl from the run store", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runlogs-events-"));
+  const runId = "42-2026-06-16T00-00-00Z";
+  const runDir = path.join(tmp, ".agent-pipeline", "runs", runId);
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "run.json"), "{}");
+  const eventLine = JSON.stringify({
+    schema_version: 1,
+    type: "stage_start",
+    at: "2026-06-16T00:00:00Z",
+    stage: "pre-merge",
+  }) + "\n";
+  fs.writeFileSync(path.join(runDir, "events.jsonl"), eventLine);
+
+  const originalWrite = process.stdout.write;
+  let output = "";
+  try {
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      output += chunk.toString();
+      return true;
+    }) as typeof process.stdout.write;
+    await runLogs(tmp, runId, false, true);
+    assert.ok(output.includes(eventLine), `expected output to include event line; got:\n${output}`);
+  } finally {
+    process.stdout.write = originalWrite;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runLogs --events reports missing events.jsonl by name", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runlogs-events-missing-"));
+  const runId = "42-2026-06-16T00-00-00Z";
+  const runDir = path.join(tmp, ".agent-pipeline", "runs", runId);
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "run.json"), "{}");
+
+  const originalError = console.error;
+  const savedExit = process.exitCode;
+  const errors: string[] = [];
+  try {
+    console.error = (msg?: unknown) => { errors.push(String(msg)); };
+    await runLogs(tmp, runId, false, true);
+    assert.ok(
+      errors.some((line) => line.includes("events.jsonl not yet written")),
+      `expected events.jsonl diagnostic, got:\n${errors.join("\n")}`,
+    );
+    assert.equal(process.exitCode, 1);
+  } finally {
+    console.error = originalError;
+    process.exitCode = savedExit;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
