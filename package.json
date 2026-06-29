@@ -29,10 +29,11 @@
     "test": "(cd core && npm install --no-audit --no-fund && npm test) && node --test scripts/*.test.mjs",
     "ci:core": "(cd core && npm ci --no-audit --no-fund && npm test)",
     "ci:fast": "npm run ci:core && npm run build:check",
-    "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke && npm run ci:launcher-smoke && npm run ci:openspec",
+    "ci": "npm run ci:core && node scripts/build.mjs --check && npm run ci:install-smoke && npm run ci:launcher-smoke && npm run ci:openspec && npm run ci:scripts",
     "ci:install-smoke": "node scripts/ci-install-smoke.mjs",
     "ci:launcher-smoke": "node scripts/launcher-smoke.mjs",
-    "ci:openspec": "node scripts/ci-openspec.mjs"
+    "ci:openspec": "node scripts/ci-openspec.mjs",
+    "ci:scripts": "node --test scripts/*.test.mjs"
   },
   "repository": {
     "type": "git",

@@ -29,9 +29,11 @@ let result = runValidate("openspec", ["validate", "--all"]);
 
 if (result.error?.code === "ENOENT") {
   // openspec not on PATH — fall back to npx (works on fresh CI runners).
+  // Version is pinned so the fallback is deterministic and cannot silently
+  // execute changed or compromised code published under the @latest tag.
   result = runValidate("npx", [
     "--yes",
-    "@fission-ai/openspec@latest",
+    "@fission-ai/openspec@1.4.1",
     "validate",
     "--all",
   ]);
