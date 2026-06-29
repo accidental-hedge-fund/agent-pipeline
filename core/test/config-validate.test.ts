@@ -738,3 +738,25 @@ test("validateConfig: roadmap concurrency keys absent → valid (defaults applie
   );
   assert.equal(concurrencyDiags.length, 0, "absent concurrency keys should not produce diagnostics");
 });
+
+// ---- repo_map (#312) schema observability ----
+
+test("generateConfigSchema: repo_map property exists with depends_on and depended_on_by sub-properties", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const props = schema.properties as Record<string, unknown>;
+  assert.ok(props["repo_map"], "repo_map must exist in schema");
+  const rmDef = props["repo_map"] as Record<string, unknown>;
+  assert.ok(typeof rmDef["description"] === "string" && rmDef["description"].length > 0, "repo_map must have a description");
+  // repo_map may be wrapped as anyOf (optional/nullable in zod-to-json-schema)
+  const rmProps = (rmDef["properties"] as Record<string, unknown> | undefined) ??
+    ((rmDef["anyOf"] as Array<Record<string, unknown>> | undefined)?.find((s) => s["properties"])?.["properties"] as Record<string, unknown> | undefined);
+  assert.ok(rmProps, "repo_map must have nested properties (possibly via anyOf)");
+  assert.ok(rmProps["depends_on"], "repo_map must have depends_on sub-property");
+  assert.ok(rmProps["depended_on_by"], "repo_map must have depended_on_by sub-property");
+});
+
+test("generateConfigSchema: repo_map is not in top-level required array", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const required = (schema.required ?? []) as string[];
+  assert.ok(!required.includes("repo_map"), "repo_map must not be in the required array");
+});

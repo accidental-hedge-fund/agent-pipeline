@@ -364,6 +364,16 @@ export interface PipelineConfig {
   context_snapshot?: {
     max_chars: number;
   };
+  // Cross-repo dependency map (#312). Declares inter-repo relationships so the
+  // planning stage can surface open-issue context from related repos, and the
+  // roadmap engine can identify cross-repo sequencing hints. Declarative only —
+  // no cross-repo write, merge, PR creation, label propagation, or CI gating.
+  // Relationships are declared independently per repo; no reverse-edge inference.
+  // Resolves to { depends_on: [], depended_on_by: [] } when absent from .github/pipeline.yml.
+  repo_map: {
+    depends_on: string[];      // owner/repo strings this repo consumes
+    depended_on_by: string[];  // owner/repo strings that consume this repo
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -420,6 +430,7 @@ export const DEFAULT_CONFIG: Omit<
     allow_paths: [] as string[],
     min_confidence: 0.8,
   },
+  repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
 };
 
 // ---------------------------------------------------------------------------

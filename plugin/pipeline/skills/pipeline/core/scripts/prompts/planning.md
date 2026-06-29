@@ -6,7 +6,7 @@ You are a senior engineer planning the implementation of a GitHub issue for {{do
 
 {{body}}{{context_snapshot}}
 
-{{carry_forward_context}}
+{{carry_forward_context}}{{cross_repo_context}}
 
 ## Research first (before drafting)
 

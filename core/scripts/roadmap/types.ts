@@ -41,6 +41,18 @@ export interface OpenQuestion {
   rationale?: string;
 }
 
+/** One cross-repo dependency annotation emitted when repo_map is configured. */
+export interface CrossRepoDep {
+  /** Local issue that relates to a declared repo. */
+  local_issue: IssueNumber;
+  /** The declared owner/repo that the local issue depends on or is depended on by. */
+  repo: string;
+  /** Relationship direction from the local repo's perspective. */
+  direction: "depends_on" | "depended_on_by";
+  /** Human-readable rationale for why this cross-repo relationship was identified. */
+  rationale: string;
+}
+
 export interface DepGraph {
   must_precede: DepEdge[];
   should_precede: DepEdge[];
@@ -50,6 +62,8 @@ export interface DepGraph {
   conflict_pairs: [IssueNumber, IssueNumber][];
   cycle_reports: CycleReport[];
   open_questions: OpenQuestion[];
+  /** Cross-repo dependency annotations (populated when repo_map is configured). */
+  cross_repo: CrossRepoDep[];
 }
 
 export type Tier = "enablers" | "dependency-unlock" | "high-value/low-risk" | "larger-bets" | "cleanup";

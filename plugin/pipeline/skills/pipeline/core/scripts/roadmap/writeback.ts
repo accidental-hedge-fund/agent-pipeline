@@ -9,6 +9,7 @@ import type {
   RoadmapEntry,
   Tier,
   EffortSize,
+  CrossRepoDep,
 } from "./types.ts";
 
 export interface WritebackDeps {
@@ -127,6 +128,21 @@ export function renderRoadmapMd(plan: PlanJson): string {
     lines.push("");
     for (const h of plan.hygiene) {
       lines.push(`- **#${h.issue_number}** — Action: \`${h.action}\` | Evidence: ${h.evidence}`);
+    }
+    lines.push("");
+  }
+
+  // Cross-repo dependencies (populated when repo_map is configured)
+  const crossRepo: CrossRepoDep[] = plan.dependency_graph.cross_repo ?? [];
+  if (crossRepo.length > 0) {
+    lines.push("---");
+    lines.push("");
+    lines.push("## Cross-Repo Dependencies");
+    lines.push("");
+    lines.push("_Declared inter-repo relationships for human sequencing. These are annotations only — the roadmap ordering above covers this repo's local backlog exclusively._");
+    lines.push("");
+    for (const dep of crossRepo) {
+      lines.push(`- **#${dep.local_issue}** → \`${dep.repo}\` (${dep.direction}): ${dep.rationale}`);
     }
     lines.push("");
   }
