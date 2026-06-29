@@ -1178,10 +1178,14 @@ export async function maybeArchiveOpenspec(
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
     if (res.unavailable) {
-      console.log(
-        `[pipeline] #${issueNumber}: openspec CLI unavailable; skipping archive (non-blocking)`,
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `openspec CLI unavailable — cannot archive change '${id}'. Install the openspec CLI and re-run.`,
+        "pre-merge",
+        "openspec-invalid",
       );
-      return null;
+      return { advanced: false, status: "blocked", reason: `openspec CLI unavailable (${id})` };
     }
     if (!res.success) {
       await setBlockedFn(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge", "openspec-invalid");
