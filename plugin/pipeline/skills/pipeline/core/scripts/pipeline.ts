@@ -566,6 +566,8 @@ async function main(): Promise<void> {
         ["--summary", opts.summary],
         ["--unblock", opts.unblock !== undefined],
         ["--override", opts.override !== undefined],
+        ["--cleanup", opts.cleanup],
+        ["--init", opts.init],
       ];
       for (const [flag, active] of runModeConflicts) {
         if (active) {

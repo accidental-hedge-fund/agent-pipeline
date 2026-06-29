@@ -778,3 +778,29 @@ test("CLI: `pipeline run 42 --summary --detach` rejects incompatible mode flag v
   assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
   assert.match(r.stderr, /--detach cannot be combined/i);
 });
+
+// ---------------------------------------------------------------------------
+// Regression (#273 fix): --cleanup and --init must also be rejected in the
+// run-alias --detach guard. Previously the guard only covered --status,
+// --summary, --unblock, --override — leaving --cleanup and --init as a bypass.
+// ---------------------------------------------------------------------------
+
+test("CLI: `pipeline run 42 --cleanup --detach` rejects incompatible mode flag via run alias (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "run", "42", "--cleanup", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /--detach cannot be combined/i);
+});
+
+test("CLI: `pipeline run 42 --init --detach` rejects incompatible mode flag via run alias (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "run", "42", "--init", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /--detach cannot be combined/i);
+});
