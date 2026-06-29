@@ -775,10 +775,12 @@ Two tiers, so you can verify the right amount before pushing and let CI run less
 | Command | What it runs | When |
 |---------|--------------|------|
 | `npm run ci:fast` | core unit tests + `plugin/` mirror check | **default, per commit** — the quick local gate (~16s) |
-| `npm run ci` | clean install + core tests + mirror check + install-smoke + launcher-smoke | **before opening a PR / cutting a release** — the exact gate GitHub Actions runs |
+| `npm run ci` | clean install + core tests + mirror check + install-smoke + launcher-smoke + `openspec validate --all` (if `openspec/` present) | **before opening a PR / cutting a release** — the exact gate GitHub Actions runs |
 | `cd core && node --test --experimental-strip-types test/<file>.test.ts` | a single test file | **targeted** — iterating on one area |
 
 `ci:fast` catches the vast majority of failures (logic regressions and a stale `plugin/` mirror) without the packaging install/launcher smoke-tests, which rarely break from a normal `core/` change and are reserved for the full gate. `ci` is the CI-equivalent: the GitHub Actions workflow runs this identical script, so a green `npm run ci` locally means a green CI run. Run `ci:fast` while iterating; run `ci` once before you push a PR.
+
+The full `ci` gate also runs `openspec validate --all` when an `openspec/` directory is present at the repo root. A structurally invalid living spec or active change fails `npm run ci` and therefore blocks the PR in GitHub Actions. The step is a no-op when no `openspec/` directory exists, so non-OpenSpec repos and the install smoke test are unaffected.
 
 > CI runs the full gate on **every** commit (including the pipeline's OpenSpec-archive commits — the pre-merge gate depends on it) and cancels superseded runs automatically, so the cheapest way to save Actions minutes is to catch failures with `ci:fast` locally before pushing.
 

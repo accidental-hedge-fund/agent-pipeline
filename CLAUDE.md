@@ -13,8 +13,9 @@ review steps must follow.
    fails the build if the mirror is stale (`node scripts/build.mjs --check`). A core-only
    commit that forgets the mirror is the single most common wasted review/CI round.
 2. **`npm run ci` must pass before a change is done.** It runs: `ci:core` (`cd core && npm ci
-   && npm test`) → `build.mjs --check` (mirror in sync) → `ci:install-smoke`. Run it from the
-   repo root; treat a red `ci` as not-done.
+   && npm test`) → `build.mjs --check` (mirror in sync) → `ci:install-smoke` →
+   `ci:openspec` (`openspec validate --all` when an `openspec/` directory is present). Run it
+   from the repo root; treat a red `ci` as not-done.
 3. **Rigor over latency.** This pipeline's product *is* its review rigor. Do not disable or
    default-demote review steps to go faster. Speed work must be rigor-preserving (better
    prompts, removing dead/deterministic asks, fixing real convergence bugs) — never by
