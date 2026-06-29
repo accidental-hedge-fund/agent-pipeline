@@ -203,103 +203,84 @@ Confirms target exists, has a `pipeline:*` label, isn't already at a
 terminal/blocked state. If anything looks wrong, surface it and stop —
 do not start an advance.
 
-#### b. Start the advance in a PTY session with logging
+#### b. Launch the advance through detached run-store mode
 
 ```bash
 cd <repo_dir>
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs <N> \
-  > /tmp/pipeline-<domain>-<N>.log 2>&1
+RUN_DIR=$(node ~/.codex/skills/pipeline/scripts/pipeline.mjs run <N> --detach)
+cat "$RUN_DIR/run-store.json"
 ```
 
-Run with `exec_command` using `tty: true` and a long enough yield window to
-capture the session id. Keep the session open until the pipeline exits. Do not
-leave a live pipeline session running when the Codex turn ends.
+This command returns quickly. `RUN_DIR` is a supervision wrapper under
+`~/.pipeline/runs/...`; `run-store.json` points at the canonical
+`.agent-pipeline/runs/<run-id>/` run store. Use that `run_store_run_id` for all
+log and summary commands below. Do not leave a live pipeline session running
+when the Codex turn ends.
 
-#### c. Poll stage transitions from the session or log
+#### c. Poll structured run events
 
-Poll the PTY session with `write_stdin` and summarize material `[pipeline]`
-lines to the user. For a grep-free view of lifecycle lines only, use the
-**transitions log** — a dedicated file that contains only pipeline lifecycle
-lines and nothing else:
+Follow the run-store event stream and summarize material lifecycle records to
+the user:
 
 ```bash
-tail -f /tmp/pipeline-<domain>-<N>.transitions.log
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
 ```
 
-The transitions log path always uses the original argument `<N>` (the same `<N>`
-used for the full log in section b). It contains only the run-start, transition,
-blocked/idle, unblocked, label-removed, and done lines — no harness prose, no
-test-runner output, no false matches from eval-gate fixtures.
+`--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
+structured stream for lifecycle, gate, blocker, PR, review, accounting, and
+completion events. It is not a grep-filtered terminal log and it is not a
+separate `/tmp` transitions artifact.
 
-For example, `/pipeline 64` (issue passed directly):
-```bash
-tail -f /tmp/pipeline-<domain>-64.transitions.log
-```
-
-`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100):
-```bash
-tail -f /tmp/pipeline-<domain>-100.transitions.log
-```
-
-**Fallback — full log with grep filter:** If you need the full combined output,
-filter the full log using the **resolved issue number** `<resolved-N>` (check the
-full log for `[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` when you
-passed a PR):
+**Fallback — raw terminal output:** If you need the full combined output, follow
+`terminal.log` from the same run store:
 
 ```bash
-tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
-  "^\[pipeline\] #<resolved-N>: "
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
 ```
 
-**Why the transitions log is preferred:** The test-gate stage (`npm test` /
-`npm run ci`) dumps the full unit-test suite output to the same full log. The
-eval-gate and state-machine test fixtures reproduce exact `[pipeline] #<other-N>:`
-and `→ ready-to-deploy` substrings, so a grep filter on the full log must be tight.
-The transitions log has no such risk — only the orchestrator writes to it, never
-the test runner.
-
-**No real signal is lost:** every stage transition — including
-`[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
-`[pipeline] #N: → ready-to-deploy` — appears in the transitions log.
-The PTY session finishing signals run-end independently.
+Do not create or recommend extra `/tmp/pipeline-<domain>-<N>.log` files for
+normal monitoring. If a human manually redirects output for local debugging,
+that file is scratch output, not the pipeline evidence contract.
 
 #### d. User-visible progress updates
 
-For every material `[pipeline]` line, send a concise chat update. The state
-machine has only 9 transitions max and each emits a small number of visible
-`[pipeline]` lines, so this gives enough signal without flooding the user.
+For every material event record, send a concise chat update. The state machine
+has only a bounded number of stage transitions, so this gives enough signal
+without flooding the user.
 
 Examples that should be surfaced:
-- `[pipeline] #N: starting at stage=<x>`
-- `[pipeline] #N: planning (impl=codex)`
-- `[pipeline] #N: worktree at <path>`
-- `[pipeline] #N: implementation done (Xs, harness=Y)`
-- `[pipeline] #N: PR #M created`
-- `[pipeline] #N: ready → review-1: PR #M opened`
-- `[pipeline] #N: review-1 by claude`
-- `[pipeline] #N: verdict=approve findings=0`
-- `[pipeline] #N: review-1 → review-2: standard review approved`
-- … and so on, all the way through `→ ready-to-deploy`
+- `run_start`
+- `stage_start`
+- `stage_complete`
+- `pr_created` / `pr_updated`
+- `review_verdict`
+- `gate_result`
+- `blocker_set` / `blocker_cleared`
+- `run_complete`
 
 Examples to suppress or summarize:
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
-  re-enters the gate check every `ci_poll_interval` seconds (default 30s)
-  and emits `[pipeline] #N: pre-merge gate` each time. Surface the FIRST
-  occurrence per stage entry; suppress subsequent identical lines in the
-  same polling burst. The next material event is the eventual
-  `→ ready-to-deploy` or `→ blocked` transition.
+  re-enters the gate check every `ci_poll_interval` seconds (default 30s).
+  Surface the first material stage/gate event per stage entry; suppress
+  subsequent identical polling updates in the same burst. The next material
+  event is the eventual advancing or blocked stage outcome.
 
-#### e. Finish the session
+#### e. Finish the run
 
-When the pipeline process exits, stop polling and surface the final summary
-inline by reading the tail of the log.
+When a `run_complete` event appears, or when the wrapper
+`$RUN_DIR/sentinel.json` reports completion, stop polling and surface the final
+summary.
 
 #### f. Final summary
 
-Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` (same path as
-section b — the original argument) and surface inline: starting stage →
-ending stage, transitions made, wall-clock elapsed, PR URL if one was
-opened, and the terminal state.
+Read the run-store summary and surface inline:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
+URL if one was opened, and the terminal state.
 
 ### 5. Modes that DON'T need this orchestration
 

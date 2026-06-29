@@ -112,7 +112,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   logs: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "follow"]),
+    allowedFlags: new Set(["repoPath", "follow", "events"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

@@ -22,7 +22,6 @@ import {
 } from "../scripts/pipeline.ts";
 import { advanceReview, type AdvanceReviewDeps } from "../scripts/stages/review.ts";
 import { findingKey } from "../scripts/review-policy.ts";
-import type { AdvanceDeps } from "../scripts/pipeline-run.ts";
 import type { Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
 
 type Comment = { author: string; body: string; createdAt: string };
@@ -435,34 +434,5 @@ test("runOverride: --dry-run --override is rejected as a usage error; no GitHub 
   assert.ok(
     errors.some((e) => e.includes("--override") && e.includes("--dry-run")),
     `error must mention both flags; got:\n${errors.join("\n")}`,
-  );
-});
-
-// ---------------------------------------------------------------------------
-// PR-to-issue resolution: runOverride passes originalN as transitionsLogN
-// ---------------------------------------------------------------------------
-
-test("runOverride (#324): passes originalN as transitionsLogN to runAdvance (PR→issue resolution)", async (t) => {
-  // PR #100 resolves to issue #64; runOverride is called with issueNumber=64 but
-  // originalN=100. The transitions log path must use 100 so operators can derive it
-  // from the original run argument, not the resolved issue number.
-  const detail = detailAt(["pipeline:review-1"], []);
-  let capturedAdvanceDeps: AdvanceDeps | undefined;
-  const deps: RunOverrideDeps = {
-    getIssueDetail: (async () => detail) as RunOverrideDeps["getIssueDetail"],
-    postComment: async () => {},
-    clearBlocked: async () => {},
-    silentTransition: async () => {},
-    runAdvance: async (_cfg, _n, _opts, d) => {
-      capturedAdvanceDeps = d;
-    },
-  };
-  await quiet(t, async () => {
-    await runOverride(CFG, 64, `${KEY_A}: rejected — false positive`, OPTS, deps, 100);
-  });
-  assert.equal(
-    capturedAdvanceDeps?.transitionsLogN,
-    100,
-    "runAdvance must receive transitionsLogN=100 (the original PR argument), not 64 (the resolved issue)",
   );
 });
