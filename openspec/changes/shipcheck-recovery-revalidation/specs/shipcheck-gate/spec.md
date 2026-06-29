@@ -114,3 +114,37 @@ SHA source.
 - **AND** shipcheck-gate is re-entered with the worktree HEAD equal to `H2` (the fix is pushed)
 - **THEN** the stage SHALL NOT transition directly to `ready-to-deploy`
 - **AND** SHALL transition `shipcheck-gate → pre-merge` to re-validate `H2` through CI status checks, the review-SHA gate, and eval-gate
+
+#### Scenario: re-entered after routing to pre-merge for the same head — idempotency guard proceeds with reviewer
+
+- **WHEN** the stage previously routed `shipcheck-gate → pre-merge` for PR head `H2` (posting a notice with `<!-- shipcheck-revalidation-sha: H2 -->`)
+- **AND** pre-merge/eval completes and shipcheck-gate is re-entered still at head `H2`
+- **THEN** the stage SHALL detect the revalidation-sha notice authored by the authenticated actor and SHALL NOT route back to `pre-merge` again
+- **AND** SHALL proceed with the reviewer evaluation for `H2`
+- **AND** on a pass verdict SHALL transition to `ready-to-deploy`
+- (This prevents the route-back from looping: the prior shipcheck verdict still records `H1`, so without this guard the same developer-commit condition would trigger indefinitely.)
+
+#### Scenario: authenticated actor cannot be resolved — fail closed
+
+- **WHEN** the current stage is `shipcheck-gate`
+- **AND** a PR is linked (`prNumber` is non-null)
+- **AND** the `gh` actor lookup returns null (transient auth failure)
+- **THEN** the stage SHALL call `setBlocked` with blocker kind `needs-human`
+- **AND** SHALL NOT proceed to the reviewer evaluation
+- **AND** SHALL NOT transition to `ready-to-deploy`
+
+#### Scenario: PR head changes during reviewer run — post-review head-coherence recheck routes to pre-merge
+
+- **WHEN** the reviewer harness completes evaluation of PR head `H2`
+- **AND** the PR head has since been updated to `H3` during the reviewer run (a push after the pre-review head fetch)
+- **THEN** the stage SHALL re-fetch the PR head after the reviewer completes
+- **AND** SHALL NOT transition to `ready-to-deploy`
+- **AND** SHALL transition `shipcheck-gate → pre-merge` to re-validate the new head `H3`
+
+#### Scenario: worktree head changes during reviewer run — post-review recheck blocks with head-drift
+
+- **WHEN** the reviewer harness completes evaluation of PR head `H2`
+- **AND** the worktree HEAD has since been updated (a local commit during the reviewer run)
+- **AND** the worktree HEAD no longer matches the evaluated PR head `H2`
+- **THEN** the stage SHALL call `setBlocked` with blocker kind `head-drift`
+- **AND** SHALL NOT transition to `ready-to-deploy`

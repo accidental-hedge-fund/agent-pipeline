@@ -187,6 +187,19 @@ export function extractShipcheckSha(commentBody: string): string | null {
   return m ? m[1] : null;
 }
 
+/**
+ * Extract the revalidation-requested sentinel from a notice comment body.
+ * When the stage routes to pre-merge for a given PR head, it embeds
+ * `<!-- shipcheck-revalidation-sha: <sha> -->` in the notice so the next
+ * entry can detect that routing already occurred for that head and skip
+ * the route-back (idempotency guard, #317 Finding 1).
+ * Returns the 40-char SHA or null when absent.
+ */
+export function extractRevalidationSha(commentBody: string): string | null {
+  const m = commentBody.match(/<!--\s*shipcheck-revalidation-sha:\s*([0-9a-f]{40})\s*-->/);
+  return m ? m[1] : null;
+}
+
 // ---------------------------------------------------------------------------
 // Deps seam
 // ---------------------------------------------------------------------------
@@ -380,7 +393,28 @@ export async function advance(
   // 3.2b: Post-verdict re-validation routing — developer commit since prior verdict.
   if (prHeadSha !== null) {
     const actor = await getGhActorFn();
-    if (actor !== null) {
+    // Finding 3: fail closed when actor lookup fails with a PR linked.
+    // Without a verified actor, provenance of prior shipcheck verdict comments cannot
+    // be confirmed; advancing risks blessing an unvalidated head on a transient auth failure.
+    if (actor === null) {
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate: actor lookup failed; cannot verify prior verdict provenance; blocking`);
+      await setBlockedFn(
+        cfg, issueNumber,
+        `Shipcheck gate: could not resolve authenticated gh actor; cannot verify prior shipcheck verdict provenance. Restore gh auth and retry.`,
+        "shipcheck-gate", "needs-human" as BlockerKind,
+      );
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "actor_lookup_failure");
+      return { advanced: false, status: "blocked", reason: "shipcheck: actor lookup failure", blockerKind: "needs-human" as BlockerKind };
+    }
+    // Finding 1 idempotency guard: if we already routed to pre-merge for the current
+    // head (the revalidation notice authored by the actor carries the current prHeadSha),
+    // skip the route-back and proceed with reviewer evaluation. Without this guard the
+    // second shipcheck entry after pre-merge/eval completes would loop back again because
+    // the prior verdict still records the pre-fix SHA.
+    const alreadyRoutedForCurrentHead = detail.comments.some(
+      (c) => c.author === actor && extractRevalidationSha(c.body) === prHeadSha,
+    );
+    if (!alreadyRoutedForCurrentHead) {
       // Find the most recent shipcheck verdict comment authored by the pipeline actor
       // that carries a shipcheck-sha sentinel (i.e. posted by this harness, not legacy).
       const shipcheckedByActor = detail.comments.filter(
@@ -404,8 +438,10 @@ export async function advance(
           const recordedIdx = commits.findIndex((c) => c.oid === recordedSha);
           const commitsSince = recordedIdx >= 0 ? commits.slice(recordedIdx + 1) : commits;
           if (commitsSince.some((c) => !isPipelineInternalCommit(c.messageHeadline))) {
+            // Embed the revalidation sentinel so the next entry's idempotency guard
+            // detects that we already routed for this head and skips the route-back.
             const notice =
-              `**Shipcheck re-validation notice**: A developer commit has landed since the last shipcheck verdict (stale: \`${recordedSha.slice(0, 8)}\`, current: \`${prHeadSha.slice(0, 8)}\`). Routing back through pre-merge, eval-gate, and review-SHA validation for the new head.`;
+              `**Shipcheck re-validation notice**: A developer commit has landed since the last shipcheck verdict (stale: \`${recordedSha.slice(0, 8)}\`, current: \`${prHeadSha.slice(0, 8)}\`). Routing back through pre-merge, eval-gate, and review-SHA validation for the new head.\n<!-- shipcheck-revalidation-sha: ${prHeadSha} -->`;
             await postCommentFn(cfg, issueNumber, notice);
             console.log(`[pipeline] #${issueNumber}: shipcheck-gate: developer commit since prior verdict SHA ${recordedSha.slice(0, 8)}; routing to pre-merge`);
             await transitionFn(cfg, issueNumber, "shipcheck-gate", "pre-merge", `Developer commit(s) since last shipcheck verdict (${recordedSha.slice(0, 8)} → ${prHeadSha.slice(0, 8)}); re-validating through pre-merge.`);
@@ -529,6 +565,59 @@ export async function advance(
     verdict = parsed;
     parseFailure = true;
   }
+
+  // ---- POST-REVIEW HEAD-COHERENCE RECHECK (#317 Finding 2) ----
+  // Guard against a push to the PR or worktree during the reviewer run (which can
+  // take minutes). The reviewer evaluated prHeadSha; if either the PR head or the
+  // worktree head has since changed, the evaluated state is no longer the merged state,
+  // and advancing to ready-to-deploy would bless an unvalidated head.
+  if (prHeadSha !== null && prNumber !== null) {
+    let postReviewPrHeadSha: string;
+    try {
+      const finalPrDetail = await getPrDetailFn(cfg, prNumber);
+      postReviewPrHeadSha = finalPrDetail.head_sha;
+    } catch (err) {
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate: post-review PR head re-fetch failed: ${err}`);
+      await setBlockedFn(
+        cfg, issueNumber,
+        `Shipcheck gate: could not re-verify PR head after review: ${String(err)}`,
+        "shipcheck-gate", "needs-human" as BlockerKind,
+      );
+      await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "post_review_head_error");
+      return { advanced: false, status: "blocked", reason: "shipcheck: post-review PR head re-fetch failed", blockerKind: "needs-human" as BlockerKind };
+    }
+    if (postReviewPrHeadSha !== prHeadSha) {
+      const driftNotice =
+        `**Shipcheck head-drift notice**: The PR head changed from \`${prHeadSha.slice(0, 8)}\` to \`${postReviewPrHeadSha.slice(0, 8)}\` while the reviewer was running. Routing back to pre-merge to re-validate the new head.`;
+      await postCommentFn(cfg, issueNumber, driftNotice);
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate: PR head drifted post-review (was=${prHeadSha.slice(0, 8)} now=${postReviewPrHeadSha.slice(0, 8)}); routing to pre-merge`);
+      await transitionFn(cfg, issueNumber, "shipcheck-gate", "pre-merge", `PR head drifted during reviewer run (${prHeadSha.slice(0, 8)} → ${postReviewPrHeadSha.slice(0, 8)}); re-validating.`);
+      return { advanced: true, from: "shipcheck-gate", to: "pre-merge", summary: `shipcheck: post-review head drift, re-routing to pre-merge (${prHeadSha.slice(0, 8)} → ${postReviewPrHeadSha.slice(0, 8)})` };
+    }
+    if (wt !== null) {
+      let postReviewWorktreeHead: string;
+      try {
+        postReviewWorktreeHead = await getWorktreeHeadFn(wt.path);
+      } catch (err) {
+        console.log(`[pipeline] #${issueNumber}: shipcheck-gate: post-review worktree head re-read failed: ${err}`);
+        await setBlockedFn(
+          cfg, issueNumber,
+          `Shipcheck gate: could not re-verify worktree head after review: ${String(err)}`,
+          "shipcheck-gate", "needs-human" as BlockerKind,
+        );
+        await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "post_review_worktree_head_error");
+        return { advanced: false, status: "blocked", reason: "shipcheck: post-review worktree head re-read failed", blockerKind: "needs-human" as BlockerKind };
+      }
+      if (postReviewWorktreeHead !== prHeadSha) {
+        const driftReason = `Shipcheck gate: worktree HEAD (${postReviewWorktreeHead}) drifted from the evaluated PR head (${prHeadSha}) during the reviewer run. Push the local commits so the PR head includes the fix before re-running.`;
+        console.log(`[pipeline] #${issueNumber}: shipcheck-gate: worktree head drifted post-review (worktree=${postReviewWorktreeHead.slice(0, 8)} pr=${prHeadSha.slice(0, 8)}); blocking`);
+        await setBlockedFn(cfg, issueNumber, driftReason, "shipcheck-gate", "head-drift" as BlockerKind);
+        await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "post_review_head_drift");
+        return { advanced: false, status: "blocked", reason: "shipcheck: worktree head drifted post-review", blockerKind: "head-drift" as BlockerKind };
+      }
+    }
+  }
+  // ---- END POST-REVIEW HEAD-COHERENCE RECHECK ----
 
   // If all rounds produced parse failures, handle per mode.
   if (parseFailure && verdict && verdict.verdict === "fail" && verdict.criteria.length === 0) {

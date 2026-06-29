@@ -10,6 +10,7 @@ import {
   archiveNamesFromPaths,
   buildShipcheckPrompt,
   extractAcceptanceCriteria,
+  extractRevalidationSha,
   extractShipcheckSha,
   formatShipcheckComment,
   parseShipcheckVerdict,
@@ -1632,4 +1633,126 @@ test("formatShipcheckComment: embeds shipcheck-sha sentinel when prHeadSha is pr
 test("formatShipcheckComment: no sentinel when prHeadSha is absent (backward-compat)", () => {
   const comment = formatShipcheckComment(PASS_VERDICT, "gate");
   assert.equal(extractShipcheckSha(comment), null, "absent prHeadSha must produce no sentinel");
+});
+
+// ---------------------------------------------------------------------------
+// Review-1 regression tests (#317 findings)
+// ---------------------------------------------------------------------------
+
+// Finding 1 regression: re-entered after routing to pre-merge for the same head
+// (revalidation-sha marker present) → proceeds with reviewer, no infinite loop.
+test("shipcheck-gate #317 F1: re-entered after pre-merge routing with revalidation marker → proceeds with reviewer, not infinite loop", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+
+  const priorVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  // Simulate the notice posted when we first routed to pre-merge for H2.
+  // The `extractRevalidationSha` must find SHA_H2 in this comment.
+  const revalidationNoticeForH2 = `**Shipcheck re-validation notice**: stale ${SHA_H1.slice(0, 8)}, current ${SHA_H2.slice(0, 8)}.\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2, // fix is pushed and matches PR head
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [DEVELOPER_COMMIT], // dev commit still present in commit list
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+        { author: "pipeline-bot", body: revalidationNoticeForH2, createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(invokerCalled, 1, "reviewer MUST be invoked on second entry — idempotency guard skipped the route-back");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "must advance to ready-to-deploy, not loop back to pre-merge");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].to, "ready-to-deploy");
+});
+
+// Finding 1 helper: extractRevalidationSha round-trips the sentinel.
+test("extractRevalidationSha: returns 40-char SHA when sentinel is present", () => {
+  const body = `some text\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->\nmore text`;
+  assert.equal(extractRevalidationSha(body), SHA_H2);
+});
+
+test("extractRevalidationSha: returns null when sentinel is absent", () => {
+  const body = `**Shipcheck re-validation notice**: no sentinel here.`;
+  assert.equal(extractRevalidationSha(body), null);
+});
+
+// Finding 2 regression: PR head changes during reviewer run → route to pre-merge, not ready-to-deploy.
+test("shipcheck-gate #317 F2: PR head drifts during reviewer run → routes to pre-merge, not ready-to-deploy", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  const SHA_H3 = "3".repeat(40);
+  let getPrDetailCallCount = 0;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => null,
+    // First call (pre-review): returns H2. Second call (post-review): returns H3.
+    getPrDetail: async () => {
+      getPrDetailCallCount++;
+      const sha = getPrDetailCallCount === 1 ? SHA_H2 : SHA_H3;
+      return { number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: sha, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 };
+    },
+    getGhActor: async () => "pipeline-bot",
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [], comments: [],
+    }),
+    invokeReviewer: async () => ({ stdout: fencedJson(PASS_VERDICT), success: true }),
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, true, "must advance (via route to pre-merge)");
+  assert.equal((out as { to: string }).to, "pre-merge", "must route to pre-merge when PR head drifted during reviewer run");
+  assert.ok(log.transitions.some((t) => t.to === "pre-merge"), "transition to pre-merge must be recorded");
+  assert.ok(!log.transitions.some((t) => t.to === "ready-to-deploy"), "must NOT transition to ready-to-deploy");
+  assert.ok(log.comments.some((c) => c.includes("head-drift")), "head-drift notice must be posted");
+  assert.equal(getPrDetailCallCount, 2, "getPrDetail must be called twice: once before and once after the reviewer");
+});
+
+// Finding 3 regression: actor lookup returns null with PR linked → blocked with needs-human.
+test("shipcheck-gate #317 F3: actor lookup returns null with PR linked → blocked with needs-human, reviewer not invoked", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+  const priorVerdictComment = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => null,
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2,
+    getGhActor: async () => null, // actor lookup fails
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        { author: "pipeline-bot", body: priorVerdictComment, createdAt: "2026-01-01T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  assert.equal(out.advanced, false, "must NOT advance when actor lookup fails with a PR linked");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal((out as { blockerKind: string }).blockerKind, "needs-human", "must block with needs-human kind");
+  assert.equal(log.blocked.length, 1);
+  assert.ok(log.blocked[0].reason.includes("authenticated gh actor"), "block reason must mention actor lookup failure");
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked when actor lookup fails");
+  assert.equal(log.transitions.length, 0, "must NOT transition to ready-to-deploy or pre-merge");
 });
