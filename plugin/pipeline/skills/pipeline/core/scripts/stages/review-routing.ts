@@ -255,6 +255,11 @@ export async function advanceReview(
   const unacknowledged = findUnacknowledgedComments(detail.comments);
   if (unacknowledged.length > 0) {
     console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
+    // Dry-run: log only — no GitHub writes (#318 fix 937b9d25).
+    if (opts.dryRun) {
+      console.log(`[pipeline] #${issueNumber}: [dry-run] would post warning and set blocked for ${unacknowledged.length} unacknowledged human comment(s)`);
+      return { advanced: false, status: "blocked", reason: "unacknowledged human input" };
+    }
     // Deduplicate: only post the warning when no prior warning exists.
     const warningExists = detail.comments.some(
       (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),

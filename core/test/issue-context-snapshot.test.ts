@@ -338,3 +338,47 @@ test("findUnacknowledgedComments: mix of human and pipeline after plan → only 
   assert.equal(unacked[0].author, "alice");
   assert.equal(unacked[1].author, "bob");
 });
+
+// ---------------------------------------------------------------------------
+// findUnacknowledgedComments — scope override acknowledgement (#318 fix d2012430)
+// ---------------------------------------------------------------------------
+
+test("findUnacknowledgedComments: scope override after plan acts as ack anchor — prior human comment dismissed (#318 d2012430)", () => {
+  // Scenario: human posted a concern after the plan; operator responded with a
+  // scope override to explicitly dismiss it. The gate must NOT re-block.
+  const scopeOverrideBody = [
+    "## Pipeline: Scope override",
+    "",
+    "**Scope**: `category:testing`",
+    "**Disposition**: defer",
+    "**Stage**: review-1",
+    "**Recorded at**: 2026-01-04T00:00:00Z",
+    "",
+    "### Reason",
+    "Out of scope for this change.",
+    "",
+    "<!-- pipeline-override-scope: category:testing defer | Out of scope -->",
+  ].join("\n");
+
+  const comments = [
+    makeComment("bot", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("alice", "Please also handle Y.", ts(1)),
+    makeComment("bot", "## Pipeline: New human input detected\n\nWarning.", ts(2)),
+    makeComment("operator", scopeOverrideBody, ts(3)),
+  ];
+  const unacked = findUnacknowledgedComments(comments);
+  assert.equal(unacked.length, 0, "scope override dismisses prior human comment — gate must not re-block");
+});
+
+test("findUnacknowledgedComments: scope override only dismisses comments before it — new human comment after scope override still unacknowledged (#318 d2012430)", () => {
+  const scopeOverrideBody = "## Pipeline: Scope override\n\n<!-- pipeline-override-scope: category:testing defer | reason -->";
+  const comments = [
+    makeComment("bot", "## Implementation Plan\n\nplan", ts(0)),
+    makeComment("alice", "Old concern", ts(1)),
+    makeComment("operator", scopeOverrideBody, ts(2)),
+    makeComment("bob", "New concern after scope override", ts(3)),
+  ];
+  const unacked = findUnacknowledgedComments(comments);
+  assert.equal(unacked.length, 1, "only the post-scope-override human comment is unacknowledged");
+  assert.equal(unacked[0].author, "bob");
+});

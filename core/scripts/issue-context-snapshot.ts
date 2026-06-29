@@ -13,6 +13,11 @@ export const PRE_PLANNING_CONTEXT_HEADER = "## Pre-Planning Context";
 const REVISED_PLAN_HEADER = "## Revised Implementation Plan";
 const PLAN_HEADER = "## Implementation Plan";
 
+// Header used by scope-override comments (#229). When a scope override is posted
+// after the plan anchor, it acts as an acknowledgement anchor: human comments at
+// or before the scope override are considered explicitly dismissed.
+const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
+
 export interface SnapshotEntry {
   author: string;
   body: string;
@@ -221,6 +226,19 @@ export function findUnacknowledgedComments(
   }
 
   if (anchorIdx === -1) return [];
+
+  // If the operator posted a scope-override comment after the plan anchor, treat
+  // it as an acknowledgement anchor — human comments at or before it have been
+  // explicitly dismissed and are no longer considered unacknowledged (#318 fix
+  // d2012430). The scope-override comment already carries a machine-readable
+  // sentinel (`<!-- pipeline-override-scope: ... -->`), so detecting it by its
+  // heading is safe and consistent with extractScopedOverrides in review-policy.ts.
+  for (let i = comments.length - 1; i > anchorIdx; i--) {
+    if (comments[i].body.trimStart().startsWith(SCOPE_OVERRIDE_HEADING)) {
+      anchorIdx = i;
+      break;
+    }
+  }
 
   const result: { author: string; body: string; createdAt: string }[] = [];
   for (let i = anchorIdx + 1; i < comments.length; i++) {
