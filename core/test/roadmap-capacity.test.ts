@@ -200,6 +200,32 @@ describe("classifyCompatibilityImpact: feature signals → minor", () => {
   });
 });
 
+describe("classifyCompatibilityImpact: mixed labels — explicit semver:* overrides generic type labels", () => {
+  it("bug + semver:minor → minor (explicit semver:minor beats generic maintenance)", () => {
+    const entry = makeEntry(1);
+    const item = makeItem(1, ["bug", "semver:minor"]);
+    const result = classifyCompatibilityImpact(entry, item);
+    assert.equal(result.impact, "minor");
+    assert.equal(result.uncertain, false);
+  });
+
+  it("enhancement + semver:patch → patch (explicit semver:patch beats generic feature)", () => {
+    const entry = makeEntry(1);
+    const item = makeItem(1, ["enhancement", "semver:patch"]);
+    const result = classifyCompatibilityImpact(entry, item);
+    assert.equal(result.impact, "patch");
+    assert.equal(result.uncertain, false);
+  });
+
+  it("bug + feature → minor (highest generic impact wins)", () => {
+    const entry = makeEntry(1);
+    const item = makeItem(1, ["bug", "feature"]);
+    const result = classifyCompatibilityImpact(entry, item);
+    assert.equal(result.impact, "minor");
+    assert.equal(result.uncertain, false);
+  });
+});
+
 describe("classifyCompatibilityImpact: sparse metadata", () => {
   it("no impact-bearing label or text → minor, uncertain: true", () => {
     const entry = makeEntry(1);

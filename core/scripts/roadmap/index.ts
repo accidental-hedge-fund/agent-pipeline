@@ -106,20 +106,21 @@ export function classifyCompatibilityImpact(
     return { impact: "major", uncertain: false };
   }
 
-  // Maintenance signals → patch
-  const MAINTENANCE_LABELS = ["chore", "maintenance", "bug", "bugfix", "refactor", "documentation", "docs", "semver:patch"];
-  if (labels.some((l) => MAINTENANCE_LABELS.includes(l))) {
-    return { impact: "patch", uncertain: false };
+  // Explicit semver:* labels take precedence over generic type labels (semver:major already handled above)
+  if (labels.includes("semver:minor")) {
+    return { impact: "minor", uncertain: false };
   }
-  if (entry.tier === "cleanup") {
+  if (labels.includes("semver:patch")) {
     return { impact: "patch", uncertain: false };
   }
 
-  // Feature signals → minor
-  const FEATURE_LABELS = ["feature", "enhancement", "feat", "semver:minor"];
-  if (labels.some((l) => FEATURE_LABELS.includes(l))) {
-    return { impact: "minor", uncertain: false };
-  }
+  // Generic labels: compute highest impact — minor beats patch
+  const FEATURE_LABELS = ["feature", "enhancement", "feat"];
+  const MAINTENANCE_LABELS = ["chore", "maintenance", "bug", "bugfix", "refactor", "documentation", "docs"];
+  const hasFeature = labels.some((l) => FEATURE_LABELS.includes(l));
+  const hasMaintenance = labels.some((l) => MAINTENANCE_LABELS.includes(l)) || entry.tier === "cleanup";
+  if (hasFeature) return { impact: "minor", uncertain: false };
+  if (hasMaintenance) return { impact: "patch", uncertain: false };
 
   // Sparse metadata → conservative minor + uncertainty marker
   return { impact: "minor", uncertain: true };
