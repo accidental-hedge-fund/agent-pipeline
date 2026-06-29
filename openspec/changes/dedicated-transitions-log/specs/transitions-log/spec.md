@@ -19,6 +19,10 @@ The pipeline orchestrator SHALL append every `[pipeline] #N:` lifecycle line it 
 - **WHEN** the orchestrator prints `[pipeline] #N: unblocked at <stage>`
 - **THEN** the identical line SHALL be appended to the transitions log
 
+#### Scenario: Outcome from the common post-dispatch path is mirrored
+- **WHEN** the dispatch loop's shared post-dispatch path calls `printOutcome` after a stage returns any outcome (advancing or non-advancing)
+- **THEN** the `tlog` callback SHALL be supplied to `printOutcome` at every call site — including the common post-dispatch path — so no stage-completion outcome line escapes mirroring
+
 #### Scenario: Non-lifecycle output is not mirrored
 - **WHEN** the test gate dumps unit-test fixture output containing substrings like `[pipeline] #999:` or `→ ready-to-deploy`
 - **THEN** none of that fixture output SHALL appear in the transitions log
@@ -33,6 +37,10 @@ The transitions log SHALL be located at `/tmp/pipeline-<domain>-<N>.transitions.
 #### Scenario: PR resolved to its linked issue uses the original argument number
 - **WHEN** the pipeline is invoked with a number that resolves to a different linked issue
 - **THEN** the transitions log path SHALL use the same `<N>` that the full operator log path uses (the originally supplied argument), so both logs share the same `<N>`
+
+#### Scenario: transitionsLogN seam decouples log path from resolved issue number
+- **WHEN** `runAdvance` is called after PR→issue resolution and a `transitionsLogN` value is provided via `AdvanceDeps`
+- **THEN** the transitions log path SHALL be derived from `transitionsLogN` rather than the resolved `issueNumber`, so unit tests and callers can independently verify both the GitHub operations (which use `issueNumber`) and the transitions log path (which uses the original argument)
 
 ### Requirement: The transitions log is append-only and additive to the full log
 The transitions log SHALL be opened in append mode and SHALL NOT truncate existing content, so successive dispatches for the same issue accumulate in one file. Mirroring SHALL be strictly additive: every line written to the full log (stdout) before this change SHALL still be written there, and each mirrored line SHALL be byte-for-byte identical to the line written to stdout.
