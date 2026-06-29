@@ -207,9 +207,9 @@ describe("buildSemverLanes", () => {
     assert.ok(lanes.length > 0, "expected at least one lane");
   });
 
-  it("returns empty array when all issues are blocked", () => {
-    const roadmap = [makeEntry(1, "enablers", [99]), makeEntry(2, "enablers", [99])];
-    const lanes = buildSemverLanes(roadmap, "v1.6.0");
+  it("returns empty array when all issues are in blocked_pending_decision", () => {
+    const roadmap = [makeEntry(1, "enablers"), makeEntry(2, "enablers")];
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", [], undefined, new Set([1, 2]));
     assert.equal(lanes.length, 0);
   });
 
@@ -251,9 +251,10 @@ describe("buildSemverLanes", () => {
     assert.equal(lanes[0].title, "v1.6.0");
   });
 
-  it("blocked issues are excluded from lanes", () => {
-    const roadmap = [makeEntry(1), makeEntry(2, "enablers", [3]), makeEntry(3)];
-    const lanes = buildSemverLanes(roadmap, "v1.0.0");
+  it("issues in blocked_pending_decision are excluded from lanes", () => {
+    const roadmap = [makeEntry(1), makeEntry(2, "enablers"), makeEntry(3)];
+    // Issue 2 is an unresolved/external blocked decision
+    const lanes = buildSemverLanes(roadmap, "v1.0.0", [], undefined, new Set([2]));
     const allNums = lanes.flatMap((l) => l.issue_numbers);
     assert.ok(!allNums.includes(2), "blocked issue #2 should be excluded");
     assert.ok(allNums.includes(1));

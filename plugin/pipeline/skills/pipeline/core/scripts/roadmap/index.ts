@@ -70,6 +70,7 @@ export const EFFORT_POINTS: Record<import("./types.ts").EffortSize, number> = {
 
 const DEFAULT_EFFORT_BUDGET = 8;
 const DEFAULT_ISOLATE_BREAKING = true;
+const HIGH_RISK_SIGNALS = ["Security-sensitive change", "Wide blast radius"];
 
 /**
  * Parse a semver tag (e.g. "v1.6.0" or "1.6.0") into [major, minor, patch].
@@ -170,8 +171,10 @@ export function buildSemverLanes(
   latestTag: string,
   items: InventoryItem[] = [],
   capacity?: { effort_budget?: number; isolate_breaking?: boolean },
+  blockedPendingDecision?: Set<number>,
 ): MilestoneSpec[] {
-  const unblocked = roadmap.filter((e) => e.blocked_by.length === 0);
+  const excluded = blockedPendingDecision ?? new Set<number>();
+  const unblocked = roadmap.filter((e) => !excluded.has(e.issue_number));
   if (unblocked.length === 0) return [];
 
   const budget = capacity?.effort_budget ?? DEFAULT_EFFORT_BUDGET;
@@ -244,8 +247,9 @@ export function buildSemverLanes(
 
     const isBreaking = issueImpact === "major" && isolateBreaking;
     const isOversized = points >= budget;
+    const isHighRisk = entry.risks.some((r) => HIGH_RISK_SIGNALS.includes(r));
 
-    if (isBreaking || isOversized) {
+    if (isBreaking || isOversized || isHighRisk) {
       closeMilestone(current);
       current = [];
       currentPoints = 0;
@@ -905,7 +909,7 @@ export async function runRoadmap(
     deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
   } else {
     const latestTag = await deps.getLatestTag(repoDir);
-    milestones = buildSemverLanes(roadmap, latestTag, items, config.release_capacity);
+    milestones = buildSemverLanes(roadmap, latestTag, items, config.release_capacity, new Set(depGraph.blocked_pending_decision));
     deps.log(`[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"})`);
     for (const m of milestones) {
       if (m.uncertainty) {

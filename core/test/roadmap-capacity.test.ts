@@ -46,6 +46,7 @@ function makeEntry(
     tier?: RoadmapEntry["tier"];
     effort?: RoadmapEntry["effort"];
     blocked_by?: number[];
+    risks?: string[];
   } = {},
 ): RoadmapEntry {
   return {
@@ -58,7 +59,7 @@ function makeEntry(
     dep_rationale: "none",
     touched_files: [],
     effort: opts.effort ?? "M",
-    risks: [],
+    risks: opts.risks ?? [],
     unblocks: [],
     blocked_by: opts.blocked_by ?? [],
   };
@@ -479,11 +480,10 @@ describe("buildSemverLanes: rationale and uncertainty", () => {
 
 describe("buildSemverLanes: dependency order preservation", () => {
   it("B blocked by A places A in earlier-or-equal milestone index", () => {
-    // A (issue 1) must precede B (issue 2)
-    // Both unblocked in roadmap, but A ranked first
+    // A (issue 1) ranked first; dep order from rank (topo sort in applyDepAdjustment)
     const roadmap = [
       makeEntry(1, { effort: "M" }),
-      makeEntry(2, { effort: "M", blocked_by: [] }), // blocked_by is used for exclusion; dep order from rank
+      makeEntry(2, { effort: "M", blocked_by: [1] }),
     ];
     const items = [makeItem(1, ["enhancement"]), makeItem(2, ["enhancement"])];
     // Force each to separate milestone with budget=3 (M=3 exactly at budget limit)
@@ -496,17 +496,30 @@ describe("buildSemverLanes: dependency order preservation", () => {
     assert.ok(idxA <= idxB, `A's milestone index (${idxA}) must be ≤ B's (${idxB})`);
   });
 
-  it("blocked issues are excluded from milestones (blocked_by.length > 0)", () => {
+  it("issues in blocked_pending_decision are excluded from milestones", () => {
     const roadmap = [
       makeEntry(1, { effort: "M" }),
-      makeEntry(2, { effort: "M", blocked_by: [99] }), // blocked
+      makeEntry(2, { effort: "M" }),
       makeEntry(3, { effort: "M" }),
+    ];
+    // Issue 2 is an unresolved/external blocked decision — must be excluded
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", [], undefined, new Set([2]));
+    const allNums = lanes.flatMap((l) => l.issue_numbers);
+    assert.ok(!allNums.includes(2), "issue in blocked_pending_decision must be excluded");
+    assert.ok(allNums.includes(1));
+    assert.ok(allNums.includes(3));
+  });
+
+  it("issue with local blocked_by dependency is included in milestones (not excluded)", () => {
+    // Issue 2 has a local in-plan dependency on issue 1 but is not in blocked_pending_decision
+    const roadmap = [
+      makeEntry(1, { effort: "M" }),
+      makeEntry(2, { effort: "M", blocked_by: [1] }),
     ];
     const lanes = buildSemverLanes(roadmap, "v1.6.0");
     const allNums = lanes.flatMap((l) => l.issue_numbers);
-    assert.ok(!allNums.includes(2), "blocked issue #2 must be excluded");
-    assert.ok(allNums.includes(1));
-    assert.ok(allNums.includes(3));
+    assert.ok(allNums.includes(1), "prerequisite must be in a milestone");
+    assert.ok(allNums.includes(2), "dependent with local blocked_by must be included (not excluded)");
   });
 
   it("isolating a breaking issue does not reorder its position relative to earlier-ranked issues", () => {
@@ -523,6 +536,33 @@ describe("buildSemverLanes: dependency order preservation", () => {
     const idxBreaking = lanes.findIndex((l) => l.issue_numbers.includes(1));
     const idxFeature = lanes.findIndex((l) => l.issue_numbers.includes(2));
     assert.ok(idxBreaking <= idxFeature, "breaking issue (ranked first) must remain in earlier milestone");
+  });
+
+  it("small high-risk issue (Security-sensitive change) is isolated into its own milestone", () => {
+    // Issue 1 is XS effort but carries a security risk — must be isolated regardless of size
+    const roadmap = [
+      makeEntry(1, { effort: "XS", risks: ["Security-sensitive change"] }),
+      makeEntry(2, { effort: "XS" }),
+      makeEntry(3, { effort: "XS" }),
+    ];
+    const items = [makeItem(1, []), makeItem(2, ["enhancement"]), makeItem(3, ["enhancement"])];
+    // Without risk isolation, three XS (1+1+1=3 ≤ budget=8) would all fit one milestone
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
+    const riskLane = lanes.find((l) => l.issue_numbers.includes(1));
+    assert.ok(riskLane, "high-risk issue must be placed in a milestone");
+    assert.equal(riskLane.issue_numbers.length, 1, "Security-sensitive issue must be isolated alone");
+  });
+
+  it("small high-risk issue (Wide blast radius) is isolated into its own milestone", () => {
+    const roadmap = [
+      makeEntry(1, { effort: "XS", risks: ["Wide blast radius"] }),
+      makeEntry(2, { effort: "XS" }),
+    ];
+    const items = [makeItem(1, []), makeItem(2, ["chore"])];
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
+    const riskLane = lanes.find((l) => l.issue_numbers.includes(1));
+    assert.ok(riskLane, "wide-blast-radius issue must be placed in a milestone");
+    assert.equal(riskLane.issue_numbers.length, 1, "Wide blast radius issue must be isolated alone");
   });
 });
 
