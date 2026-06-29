@@ -200,6 +200,19 @@ When a slice is applied, the handler SHALL run `openspec validate` on the author
 - **AND** SHALL NOT open a PR
 - **AND** SHALL NOT report the slice as successfully applied
 
+#### Scenario: Validation unavailable blocks apply
+
+- **WHEN** backfill applies a slice and the `openspec` command is not installed or cannot be spawned
+- **THEN** the handler SHALL surface a blocker naming the missing `openspec` command
+- **AND** SHALL NOT open a PR
+- **AND** SHALL NOT report the slice as successfully applied
+
+#### Scenario: Validation runs on the PR base branch
+
+- **WHEN** backfill applies a slice
+- **THEN** validation SHALL run after the PR branch is created at the resolved target base
+- **AND** the validation result SHALL reflect the authored change on that base, not an arbitrary current checkout
+
 ---
 
 ### Requirement: Backfill SHALL emit a scale-aware summary report

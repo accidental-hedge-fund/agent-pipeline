@@ -25,6 +25,7 @@ interface DepsState {
   gitBranches: string[];
   prOpened: string | null;
   logged: string[];
+  listBehaviorsCalled: boolean;
 }
 
 function makeDeps(overrides: Partial<BackfillDeps> = {}): BackfillDeps & { state: DepsState } {
@@ -34,6 +35,7 @@ function makeDeps(overrides: Partial<BackfillDeps> = {}): BackfillDeps & { state
     gitBranches: [],
     prOpened: null,
     logged: [],
+    listBehaviorsCalled: false,
   };
 
   const defaultCandidates: BackfillCandidate[] = [
@@ -48,7 +50,7 @@ function makeDeps(overrides: Partial<BackfillDeps> = {}): BackfillDeps & { state
     },
     readLivingSpecs: (_dir) => [],
     readEvidenceCorpus: (_dir) => "test evidence corpus",
-    validate: async (_dir) => ({ valid: true, issues: [], raw: "" }),
+    validate: async (_dir) => ({ valid: true, unavailable: false, issues: [], raw: "" }),
     writeFile: (filePath, content) => { state.writtenFiles[filePath] = content; },
     gitResolveBaseSha: (_dir, _branch) => "abc1234",
     gitCreateBranch: (_dir, branch, _fromRef) => { state.gitBranches.push(branch); },
@@ -59,7 +61,10 @@ function makeDeps(overrides: Partial<BackfillDeps> = {}): BackfillDeps & { state
       return "https://github.com/owner/repo/pull/999";
     },
     gitGetStagedFiles: (_dir) => [],
-    listOpenBackfillPRBehaviors: (_dir) => [],
+    listOpenBackfillPRBehaviors: (_dir) => {
+      state.listBehaviorsCalled = true;
+      return [];
+    },
     log: (msg) => { state.logged.push(msg); },
   };
 
@@ -281,7 +286,7 @@ test("runBackfill: apply — validation failure blocks PR and reports blocker", 
     /openspec validate failed/,
   );
   assert.equal(state.prOpened, null, "no PR should be opened on validation failure");
-  assert.deepEqual(state.gitBranches, [], "no branch should be created on validation failure");
+  // Branch is created before validation runs (Finding 3 fix) — spec only prohibits PR creation on failure.
 });
 
 test("runBackfill: apply — validation failure message names the validation error", async () => {
@@ -489,6 +494,32 @@ test("runBackfill: apply — remote open PR behaviors are de-duplicated", async 
     /no missing-coverage candidates/,
   );
   assert.equal(state.prOpened, null, "no duplicate PR should be opened");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression: preview must not call listOpenBackfillPRBehaviors (non-mutating)
+// ---------------------------------------------------------------------------
+
+test("runBackfill: preview — listOpenBackfillPRBehaviors is NOT called (preview stays filesystem-clean)", async () => {
+  const { state, ...deps } = makeDeps();
+  await runBackfill({ apply: false }, cfg, deps);
+  assert.equal(state.listBehaviorsCalled, false, "preview should not call listOpenBackfillPRBehaviors");
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 regression: unavailable openspec CLI blocks apply with actionable error
+// ---------------------------------------------------------------------------
+
+test("runBackfill: apply — unavailable openspec CLI blocks PR with actionable error", async () => {
+  const { state, ...deps } = makeDeps({
+    validate: async () => ({ valid: true, unavailable: true, issues: [], raw: "" }),
+  });
+
+  await assert.rejects(
+    () => runBackfill({ apply: true }, cfg, deps),
+    /openspec.*not installed|openspec.*not on PATH/i,
+  );
+  assert.equal(state.prOpened, null, "no PR should be opened when openspec is unavailable");
 });
 
 // ---------------------------------------------------------------------------

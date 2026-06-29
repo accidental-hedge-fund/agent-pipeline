@@ -58,8 +58,8 @@ export interface BackfillDeps {
   readLivingSpecs(repoDir: string): string[];
   /** Read an evidence corpus from the repo (tests, docs, code, history summary). */
   readEvidenceCorpus(repoDir: string): string;
-  /** Run openspec validate --all --json; returns { valid, issues, raw }. */
-  validate(repoDir: string): Promise<{ valid: boolean; issues: { message: string }[]; raw: string }>;
+  /** Run openspec validate --all --json; returns { valid, unavailable, issues, raw }. */
+  validate(repoDir: string): Promise<{ valid: boolean; unavailable?: boolean; issues: { message: string }[]; raw: string }>;
   /** Write a file to disk. */
   writeFile(filePath: string, content: string): void;
   /** Create and checkout a new git branch from the given ref. */
@@ -266,38 +266,58 @@ export function realBackfillDeps(
 
     listOpenBackfillPRBehaviors: (dir) => {
       const behaviors: string[] = [];
-      // Fetch remote backfill branches to update local remote-tracking refs.
-      spawnSync("git", ["fetch", "--quiet", "origin", "refs/heads/backfill/*:refs/remotes/origin/backfill/*"], {
-        encoding: "utf8",
-        stdio: "pipe",
-        cwd: dir,
-      });
-      // List all remote backfill tracking refs.
-      const lsResult = spawnSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/backfill/"], {
-        encoding: "utf8",
-        stdio: "pipe",
-        cwd: dir,
-      });
-      if (lsResult.status !== 0 || !lsResult.stdout?.trim()) return [];
-      for (const ref of lsResult.stdout.trim().split("\n").filter(Boolean)) {
-        // List spec files under openspec/changes/ on this remote branch.
-        const treeResult = spawnSync("git", ["ls-tree", "-r", "--name-only", ref], {
-          encoding: "utf8",
-          stdio: "pipe",
-          cwd: dir,
-        });
-        if (treeResult.status !== 0) continue;
-        const specFiles = treeResult.stdout.trim().split("\n")
-          .filter(f => /^openspec\/changes\/[^/]+\/specs\/.*\.md$/.test(f));
-        for (const f of specFiles) {
-          const showResult = spawnSync("git", ["show", `${ref}:${f}`], {
-            encoding: "utf8",
-            stdio: "pipe",
-            cwd: dir,
-          });
-          if (showResult.status !== 0) continue;
-          for (const m of showResult.stdout.matchAll(/^###\s+Requirement:\s+(.+)$/gm)) {
-            behaviors.push(m[1].trim());
+      // Read-only: query open backfill PRs via gh API — no git fetch, no git mutation.
+      const listResult = spawnSync(
+        "gh",
+        ["pr", "list", "--json", "headRefName,number", "--state", "open"],
+        { encoding: "utf8", stdio: "pipe", cwd: dir },
+      );
+      if (listResult.status !== 0 || !listResult.stdout?.trim()) return [];
+      let prs: Array<{ headRefName: string; number: number }>;
+      try {
+        prs = JSON.parse(listResult.stdout) as Array<{ headRefName: string; number: number }>;
+      } catch {
+        return [];
+      }
+      for (const pr of prs.filter(p => p.headRefName.startsWith("backfill/"))) {
+        // Get the list of files changed in this PR (read-only gh CLI call).
+        const filesResult = spawnSync(
+          "gh",
+          ["pr", "view", String(pr.number), "--json", "files"],
+          { encoding: "utf8", stdio: "pipe", cwd: dir },
+        );
+        if (filesResult.status !== 0) continue;
+        let prFiles: { path: string }[];
+        try {
+          const parsed = JSON.parse(filesResult.stdout ?? "{}") as { files?: { path: string }[] };
+          prFiles = parsed.files ?? [];
+        } catch {
+          continue;
+        }
+        const specFiles = prFiles
+          .map(f => f.path)
+          .filter(p => /^openspec\/changes\/[^/]+\/specs\/.*\.md$/.test(p));
+        for (const specFile of specFiles) {
+          // Read spec file content via GitHub API (read-only, no git fetch).
+          const contentResult = spawnSync(
+            "gh",
+            ["api", `repos/{owner}/{repo}/contents/${specFile}?ref=${pr.headRefName}`],
+            { encoding: "utf8", stdio: "pipe", cwd: dir },
+          );
+          if (contentResult.status !== 0) continue;
+          try {
+            const apiResp = JSON.parse(contentResult.stdout ?? "{}") as { content?: string };
+            if (apiResp.content) {
+              const decoded = Buffer.from(
+                apiResp.content.replace(/\n/g, ""),
+                "base64",
+              ).toString("utf8");
+              for (const m of decoded.matchAll(/^###\s+Requirement:\s+(.+)$/gm)) {
+                behaviors.push(m[1].trim());
+              }
+            }
+          } catch {
+            // skip unreadable
           }
         }
       }
@@ -573,8 +593,7 @@ export async function runBackfill(
 
   const livingRequirements = d.readLivingSpecs(repoDir);
   const localOpenBehaviors = readOpenBackfillBehaviors(repoDir);
-  const remoteOpenBehaviors = d.listOpenBackfillPRBehaviors(repoDir);
-  const openBackfillBehaviors = [...localOpenBehaviors, ...remoteOpenBehaviors];
+  // Remote de-duplication is deferred to the apply path to keep preview filesystem-clean.
 
   const hasWorkspace = isInitialized(repoDir);
   if (!hasWorkspace) {
@@ -638,7 +657,7 @@ export async function runBackfill(
 
   // ---- Step 4: Classify candidates (deterministic) ----
 
-  const classified = classifyCoverage(candidates, livingRequirements, openBackfillBehaviors);
+  const classified = classifyCoverage(candidates, livingRequirements, localOpenBehaviors);
 
   // ---- Preview path ----
 
@@ -650,8 +669,14 @@ export async function runBackfill(
 
   // ---- Apply path ----
 
+  // Extend de-duplication with remote open backfill PR behaviors (apply-only — gh API, no git fetch).
+  const remoteOpenBehaviors = d.listOpenBackfillPRBehaviors(repoDir);
+  const classifiedForApply = remoteOpenBehaviors.length > 0
+    ? classifyCoverage(candidates, livingRequirements, [...localOpenBehaviors, ...remoteOpenBehaviors])
+    : classified;
+
   // Step 5: Select the slice.
-  let slice = classified.filter((c) => c.group === "missing-coverage" && !c.already_proposed);
+  let slice = classifiedForApply.filter((c) => c.group === "missing-coverage" && !c.already_proposed);
 
   if (opts.capability) {
     const capLower = opts.capability.toLowerCase();
@@ -695,9 +720,21 @@ export async function runBackfill(
     );
   }
 
-  // Step 8: Validate.
+  // Step 8: Create branch at the PR base BEFORE validation so validation runs on the correct base.
+  const baseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
+  const branch = `backfill/${changeId}`;
+  d.log(`[pipeline backfill] creating branch ${branch}...`);
+  d.gitCreateBranch(repoDir, branch, baseSha);
+
+  // Step 9: Validate on the PR base.
   d.log("[pipeline backfill] running openspec validate...");
   const validResult = await d.validate(repoDir);
+  if (validResult.unavailable) {
+    throw new Error(
+      `[pipeline backfill] openspec validate cannot run — the \`openspec\` command is not installed or not on PATH. ` +
+        `Install the openspec CLI before applying a backfill slice.`,
+    );
+  }
   if (!validResult.valid) {
     const details = validResult.issues.map((i) => `  - ${i.message}`).join("\n");
     throw new Error(
@@ -706,12 +743,6 @@ export async function runBackfill(
     );
   }
   d.log("[pipeline backfill] validation passed.");
-
-  // Step 9: Create branch, commit, push, open PR.
-  const baseSha = d.gitResolveBaseSha(repoDir, cfg.base_branch);
-  const branch = `backfill/${changeId}`;
-  d.log(`[pipeline backfill] creating branch ${branch}...`);
-  d.gitCreateBranch(repoDir, branch, baseSha);
 
   const commitMsg =
     `chore: add OpenSpec backfill coverage for ${opts.capability ?? "legacy"} behavior\n\n` +
@@ -739,7 +770,7 @@ export async function runBackfill(
 
   d.log(`[pipeline backfill] PR opened: ${prUrl}`);
 
-  const report = formatReport(classified, true, prUrl);
+  const report = formatReport(classifiedForApply, true, prUrl);
   d.log("\n" + report);
 }
 
