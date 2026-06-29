@@ -693,6 +693,8 @@ test("runPlanningPhases — blocker equivalence: bootstrap creation failure", as
   assert.equal(o?.tag, f?.tag, "openspec tag matches freeform");
   assert.ok(f?.reason.startsWith("Worktree creation failed:"), `freeform reason: ${f?.reason}`);
   assert.ok(o?.reason.startsWith("Worktree creation failed:"), `openspec reason: ${o?.reason}`);
+  assert.equal(f?.stage, "planning", "freeform stage");
+  assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
 });
 
 test("runPlanningPhases — blocker equivalence: bootstrap setup failure", async () => {
@@ -706,6 +708,8 @@ test("runPlanningPhases — blocker equivalence: bootstrap setup failure", async
   assert.equal(o?.tag, f?.tag, "openspec tag matches freeform");
   assert.ok(f?.reason.startsWith("Worktree setup failed:"), `freeform reason: ${f?.reason}`);
   assert.ok(o?.reason.startsWith("Worktree setup failed:"), `openspec reason: ${o?.reason}`);
+  assert.equal(f?.stage, "planning", "freeform stage");
+  assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
 });
 
 test("runPlanningPhases — blocker equivalence: plan-generation failure", async () => {
@@ -720,6 +724,22 @@ test("runPlanningPhases — blocker equivalence: plan-generation failure", async
   assert.equal(o?.tag, f?.tag, "openspec tag matches freeform");
   assert.equal(f?.stage, "planning", "freeform stage");
   assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
+});
+
+test("runPlanningPhases — blocker equivalence: openspec validation failure", async () => {
+  const failValidate: Partial<PlanningPhaseHooks> = {
+    async validateArtifact() {
+      return { ok: false, reason: "OpenSpec change `test-change` is invalid: - spec.md: missing SHALL", tag: "openspec-invalid", blockStage: "planning" as any };
+    },
+  };
+  const f = await runAndCapture(freeformHooks(failValidate));
+  const o = await runAndCapture(openspecHooks(failValidate));
+  assert.equal(f?.tag, "openspec-invalid", "freeform tag");
+  assert.equal(o?.tag, f?.tag, "openspec tag matches freeform");
+  assert.equal(f?.stage, "planning", "freeform stage");
+  assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
+  assert.ok(f?.reason.includes("is invalid:"), `freeform reason: ${f?.reason}`);
+  assert.ok(o?.reason.includes("is invalid:"), `openspec reason: ${o?.reason}`);
 });
 
 test("runPlanningPhases: transitions ready to planning before authoring", async () => {
