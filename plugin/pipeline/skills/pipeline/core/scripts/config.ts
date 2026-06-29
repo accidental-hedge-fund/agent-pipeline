@@ -1204,6 +1204,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     config.roadmap !== undefined ? `\nroadmap:\n${yamlBlock(config.roadmap, 2)}` : undefined,
     config.sweep !== undefined ? `\nsweep:\n${yamlBlock(config.sweep, 2)}` : undefined,
     config.trusted_override_actors !== undefined ? `\ntrusted_override_actors:\n${yamlBlock(config.trusted_override_actors, 2)}` : undefined,
+    config.queue !== undefined ? `\nqueue:\n${yamlBlock(config.queue, 2)}` : undefined,
+    config.auto_merge_eligibility !== undefined ? `\nauto_merge_eligibility:\n${yamlBlock(config.auto_merge_eligibility, 2)}` : undefined,
+    config.context_snapshot !== undefined ? `\ncontext_snapshot:\n${yamlBlock(config.context_snapshot, 2)}` : undefined,
   ].filter((line): line is string => line !== undefined);
 
   return `${parts.join("\n")}\n`;
@@ -1251,6 +1254,9 @@ function normalizeForSync(config: PartialConfig): unknown {
       ? { ...config.roadmap, release_model: config.roadmap.release_model ?? "semver" }
       : undefined,
     sweep: config.sweep,
+    queue: config.queue,
+    auto_merge_eligibility: config.auto_merge_eligibility,
+    context_snapshot: config.context_snapshot,
   };
 }
 
