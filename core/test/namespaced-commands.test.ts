@@ -95,6 +95,34 @@ test("namespaced-commands 7.5b: no pipeline:run.md command file exists", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 7.5b2  Codex and Claude operation sets are symmetric (both from OPERATION_SURFACE)
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5b2: renderCodexCommand produces entries for every Claude operation", async () => {
+  // Safe to import now that build.mjs has an ESM main guard (Finding 1 fix).
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE, renderCodexCommand } = buildMjs;
+
+  for (const op of OPERATION_SURFACE) {
+    const content = renderCodexCommand(op);
+    assert.ok(typeof content === "string" && content.length > 0, `renderCodexCommand returned empty for operation ${op.name}`);
+    assert.ok(content.includes(`pipeline:${op.name}`), `renderCodexCommand output missing pipeline:${op.name}`);
+    // Must be valid YAML — at minimum it must contain the interface key
+    assert.ok(content.includes("interface:"), `renderCodexCommand output for ${op.name} missing 'interface:' key`);
+  }
+
+  // Codex operation names must match the Claude expected set
+  const codexNames = new Set(OPERATION_SURFACE.map((op) => op.name));
+  for (const expected of EXPECTED_OPERATIONS) {
+    assert.ok(codexNames.has(expected), `OPERATION_SURFACE missing operation: ${expected} (Codex would be missing it too)`);
+  }
+  for (const actual of codexNames) {
+    if (actual === "run") continue; // run is undocumented alias; excluded from both surfaces
+    assert.ok(EXPECTED_OPERATIONS.has(actual), `OPERATION_SURFACE has unexpected operation: ${actual}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 7.5c  Each command file starts with YAML front-matter referencing its operation name
 // ---------------------------------------------------------------------------
 

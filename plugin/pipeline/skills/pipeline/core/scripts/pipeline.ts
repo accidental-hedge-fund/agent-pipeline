@@ -579,7 +579,27 @@ async function main(): Promise<void> {
   // `pipeline N --detach`: detach the advance loop to a background process.
   // Equivalent to the legacy `pipeline run N --detach`; `run` is retained as an
   // undocumented alias but `N --detach` is the canonical detached-launch surface.
+  // Guard: require exactly one positional (the issue number) and reject incompatible
+  // mode-selector flags before dispatching, so e.g. `pipeline 42 config validate --detach`
+  // or `pipeline 42 --status --detach` never accidentally start a mutating advance.
   if (opts.detach && numArg && /^\d+$/.test(numArg)) {
+    if (cmd.args.length > 1) {
+      const extra = cmd.args.slice(1).join(", ");
+      console.error(`pipeline: unexpected argument(s): ${extra}`);
+      process.exit(2);
+    }
+    const detachModeConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--status", opts.status],
+      ["--summary", opts.summary],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+    ];
+    for (const [flag, active] of detachModeConflicts) {
+      if (active) {
+        console.error(`pipeline: --detach cannot be combined with ${flag}. These are separate modes.`);
+        process.exit(2);
+      }
+    }
     await handleRunSubcommand(numArg, opts);
     return;
   }

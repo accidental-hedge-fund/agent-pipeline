@@ -726,3 +726,28 @@ test("CLI: `pipeline run 123 extra` (non-detach) also rejects extra positionals 
   assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
   assert.match(r.stderr, /unexpected argument/i);
 });
+
+// ---------------------------------------------------------------------------
+// Finding 3 (#273 review-1): `pipeline N --detach` must not run before extra-args
+// guard or before legacy mode-selector flag checks.
+// ---------------------------------------------------------------------------
+
+test("CLI: `pipeline 42 config validate --detach` rejects extra positionals (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "42", "config", "validate", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /unexpected argument/i);
+});
+
+test("CLI: `pipeline 42 --status --detach` rejects incompatible mode flag (exit 2)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "42", "--status", "--detach"],
+    { encoding: "utf8" },
+  );
+  assert.equal(r.status, 2, `expected exit 2; stdout=${r.stdout} stderr=${r.stderr}`);
+  assert.match(r.stderr, /--detach cannot be combined/i);
+});

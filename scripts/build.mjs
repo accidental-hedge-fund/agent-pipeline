@@ -197,6 +197,20 @@ export function renderClaudeCommand(op, skillPath) {
   ].join("\n") + "\n";
 }
 
+// Generate a Codex agent YAML file for one operation entry.
+// Written to <codexSkills>/pipeline/agents/pipeline-<name>.yaml at install time.
+export function renderCodexCommand(op) {
+  const hint = op.argHint ? ` ${op.argHint}` : "";
+  const escapedDesc = op.desc.replace(/"/g, '\\"');
+  const escapedHint = hint.replace(/"/g, '\\"');
+  return [
+    "interface:",
+    `  display_name: "pipeline:${op.name}"`,
+    `  short_description: "${escapedDesc}"`,
+    `  default_prompt: "$pipeline:${op.name}${escapedHint}"`,
+  ].join("\n") + "\n";
+}
+
 // Rewrite personal-skill paths in a command file to the plugin runtime path.
 function pluginifyCommandFile(content) {
   return content.replaceAll("~/.claude/skills/pipeline", "${CLAUDE_PLUGIN_ROOT}/skills/pipeline");
@@ -311,4 +325,6 @@ function main() {
   }
 }
 
-main();
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main();
+}

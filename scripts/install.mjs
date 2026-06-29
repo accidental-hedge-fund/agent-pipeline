@@ -29,7 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { OPERATION_SURFACE, renderClaudeCommand } from "./build.mjs";
+import { OPERATION_SURFACE, renderClaudeCommand, renderCodexCommand } from "./build.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOME = homedir();
@@ -315,6 +315,22 @@ function installClaudeCommands(claudeBaseDir, dryRun) {
   log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
 }
 
+// Install the namespaced pipeline:<command> agent YAML files for the Codex host (#273).
+// Each file is written to <codexSkillsDir>/pipeline/agents/pipeline-<name>.yaml so that
+// Codex's agent discovery surface includes each $pipeline:<command> as a distinct entry.
+function installCodexCommands(agentsDir, dryRun) {
+  if (dryRun) {
+    log(`  (dry-run) would write ${OPERATION_SURFACE.length} pipeline:<command> agent files to ${agentsDir}`);
+    return;
+  }
+  mkdirSync(agentsDir, { recursive: true });
+  for (const op of OPERATION_SURFACE) {
+    const content = renderCodexCommand(op);
+    writeFileSync(join(agentsDir, `pipeline-${op.name}.yaml`), content);
+  }
+  log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> agent files to ${agentsDir}`);
+}
+
 function installHost(host, dryRun) {
   const cfg = HOSTS[host];
   const skillsDir = cfg.skillsDir();
@@ -323,6 +339,7 @@ function installHost(host, dryRun) {
   if (dryRun) {
     log(`  (dry-run) would stage core + ${host} overlay, swap atomically, then npm ci in core/`);
     if (host === "claude") installClaudeCommands(claudeBase(), true);
+    if (host === "codex") installCodexCommands(join(dest, "agents"), true);
     return;
   }
   mkdirSync(skillsDir, { recursive: true });
@@ -349,8 +366,9 @@ function installHost(host, dryRun) {
   } else {
     warn("npm not found — dependencies will install on first run.");
   }
-  // Install the namespaced pipeline:<command> command files for the Claude host.
+  // Install the namespaced pipeline:<command> command/agent files for each host.
   if (host === "claude") installClaudeCommands(claudeBase(), false);
+  if (host === "codex") installCodexCommands(join(dest, "agents"), false);
   log(`  ✓ installed. ${cfg.postInstall}`);
 }
 
