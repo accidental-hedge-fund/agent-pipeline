@@ -192,55 +192,72 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 
 ## Usage
 
+Each operation is available as its own discoverable `/pipeline:<command>` (Claude Code)
+or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
+
 ```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
-/pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
-/pipeline N --status --json                   machine-readable JSON status envelope (stable contract)
-/pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
-/pipeline summary <run-id>                    print the evidence bundle for an exact run (domain-independent)
-/pipeline N --unblock "<answer>"              post answer + clear the blocked label
-$pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
-/pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
+/pipeline N --detach                          run the advance loop in a detached background process
+
+/pipeline:status N     $pipeline:status N     read-only: stage, blocker, PR, last review
+/pipeline:status N --json                     machine-readable JSON status envelope (stable contract)
+/pipeline:unblock N "<answer>"                post answer + clear the blocked label
+/pipeline:override N "<key>: <reason>"        disposition a review finding and auto-resume the advance loop
+/pipeline:summary N    $pipeline:summary N    print the run's evidence bundle for issue N (local, offline)
+/pipeline summary <run-id>                    print the evidence bundle for an exact run (domain-independent)
 /pipeline N --remove-worktree               remove issue N's on-disk worktree + local branch (bypasses kill switch)
 /pipeline N --remove-worktree --force       same, discarding uncommitted changes with a warning
 /pipeline N --remove-worktree --json        machine-readable JSON result (stable contract)
-/pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline:init         $pipeline:init         onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline:cleanup      $pipeline:cleanup      sweep merged-PR worktrees
 /pipeline config sync [--apply]             preview/apply a safe .github/pipeline.yml scaffold refresh
-/pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
+/pipeline:doctor       $pipeline:doctor       deterministic preflight check; print pass/fail summary, exit
 /pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
 /pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
 /pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
-/pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
-/pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
-/pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
-/pipeline refine-spec --title "<t>" --body "<b>"  refine an existing issue's spec preview; non-mutating JSON output (no number)
+/pipeline:intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR
+/pipeline:intake "<text>" --release v1.6.0    same, pinning the target release slot
+/pipeline:intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
+/pipeline refine-spec --title "<t>" --body "<b>"  refine an existing issue's spec preview; non-mutating JSON output
 /pipeline refine-spec --help                  probe for contract availability; exits 0 on supported installs
-/pipeline triage <N> --stage ready            set pipeline:ready on issue N; remove any other pipeline:* stage label
-/pipeline triage <N> --stage backlog          set pipeline:backlog on issue N; idempotent, no model call
-/pipeline sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
-/pipeline sweep --apply                       same, updating issue bodies and opening a ROADMAP reconciliation PR
-/pipeline sweep --apply --repo other/repo     sweep a different repository
-/pipeline roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run; no number)
-/pipeline roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
-/pipeline roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
-/pipeline merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
-/pipeline improve                             read run artifacts; print dry-run cluster report (no number; read-only)
+/pipeline:triage N --stage ready              set pipeline:ready on issue N; remove any other pipeline:* stage label
+/pipeline:triage N --stage backlog            set pipeline:backlog on issue N; idempotent, no model call
+/pipeline:sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
+/pipeline:sweep --apply                       same, updating issue bodies and opening a ROADMAP reconciliation PR
+/pipeline:sweep --apply --repo other/repo     sweep a different repository
+/pipeline:roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run)
+/pipeline:roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
+/pipeline:roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
+/pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
+/pipeline:release <version>                   prepare a release PR for the given version
+/pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
+/pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
 /pipeline improve --top 10 --since 2026-06-01 --json  limit scope + emit JSON array of clusters
 /pipeline scoreboard                          read run artifacts; print factory throughput/cost/reliability metrics
 /pipeline scoreboard --days 14 --json         emit one JSON scoreboard object for the last 14 days
 /pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
-/pipeline queue                               batch factory: dispatch all pipeline:ready issues up to limits (no number)
+/pipeline queue                               batch factory: dispatch all pipeline:ready issues up to limits
 /pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
 /pipeline queue --label team:backend --milestone v2.0 --risk medium
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
+**Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
+```
+/pipeline N --status      → /pipeline:status N
+/pipeline N --summary     → /pipeline:summary N
+/pipeline N --unblock "…" → /pipeline:unblock N "…"
+/pipeline N --override "…"→ /pipeline:override N "…"
+/pipeline --init          → /pipeline:init
+/pipeline --cleanup       → /pipeline:cleanup
+```
+
 The number is auto-detected as an issue or PR. PRs resolve to their linked closing issue; PRs with no `Closes #N` are refused. Items must carry a `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
 
-`--cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
+`/pipeline:cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
 
 ## Intake sub-command
 

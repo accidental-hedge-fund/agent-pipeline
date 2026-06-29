@@ -236,7 +236,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -492,9 +492,9 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
-  // `pipeline improve --json`, `pipeline scoreboard --json`, and `--remove-worktree --json` legitimately emit JSON —
-  // exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard") {
+  // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
+  // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -561,6 +561,22 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     if (opts.detach) {
+      // Guard: reject mode-selector flags before launching a detached advance,
+      // just as the `pipeline N --detach` canonical path does (lines ~591-602).
+      const runModeConflicts: Array<[string, boolean | string | undefined]> = [
+        ["--status", opts.status],
+        ["--summary", opts.summary],
+        ["--unblock", opts.unblock !== undefined],
+        ["--override", opts.override !== undefined],
+        ["--cleanup", opts.cleanup],
+        ["--init", opts.init],
+      ];
+      for (const [flag, active] of runModeConflicts) {
+        if (active) {
+          console.error(`pipeline run: --detach cannot be combined with ${flag}. These are separate modes.`);
+          process.exit(2);
+        }
+      }
       // Detach path: spawn a background wrapper and exit.
       await handleRunSubcommand(cmd.args[1] ?? "", opts);
       return;
@@ -578,6 +594,34 @@ async function main(): Promise<void> {
     numArg = runIssueArg;
   }
 
+  // `pipeline N --detach`: detach the advance loop to a background process.
+  // Equivalent to the legacy `pipeline run N --detach`; `run` is retained as an
+  // undocumented alias but `N --detach` is the canonical detached-launch surface.
+  // Guard: require exactly one positional (the issue number) and reject incompatible
+  // mode-selector flags before dispatching, so e.g. `pipeline 42 config validate --detach`
+  // or `pipeline 42 --status --detach` never accidentally start a mutating advance.
+  if (opts.detach && numArg && /^\d+$/.test(numArg)) {
+    if (cmd.args.length > 1) {
+      const extra = cmd.args.slice(1).join(", ");
+      console.error(`pipeline: unexpected argument(s): ${extra}`);
+      process.exit(2);
+    }
+    const detachModeConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--status", opts.status],
+      ["--summary", opts.summary],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+    ];
+    for (const [flag, active] of detachModeConflicts) {
+      if (active) {
+        console.error(`pipeline: --detach cannot be combined with ${flag}. These are separate modes.`);
+        process.exit(2);
+      }
+    }
+    await handleRunSubcommand(numArg, opts);
+    return;
+  }
+
   // `pipeline path [--json]` — probe installed hosts and print the result.
   if (numArg === "path") {
     await handlePathSubcommand(opts);
@@ -589,13 +633,18 @@ async function main(): Promise<void> {
   // `intake [description]` legitimately have two positionals; `config`/`path`
   // already returned above. `sweep` is a bulk command with no issue number —
   // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
+  // `status <N>` takes two positionals; `unblock <N> "<answer>"` and
+  // `override <N> "<spec>"` take three.
   const maxPositionals =
     cmd.args[0] === "run" ||
     cmd.args[0] === "release" ||
     cmd.args[0] === "intake" ||
     cmd.args[0] === "triage" ||
-    cmd.args[0] === "merge"
+    cmd.args[0] === "merge" ||
+    cmd.args[0] === "status"
       ? 2
+      : cmd.args[0] === "unblock" || cmd.args[0] === "override"
+      ? 3
       : 1; // refine-spec takes only flags (no extra positionals)
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
@@ -909,7 +958,11 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue"];
+    const recognized = [
+      "init", "doctor", "status", "unblock", "override", "cleanup",
+      "logs", "path", "config", "run", "release", "intake", "refine-spec",
+      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue",
+    ];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
@@ -978,18 +1031,148 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  if (opts.cleanup) {
+  // Legacy `--cleanup` flag form — deprecated; use `pipeline cleanup` or
+  // `/pipeline:cleanup` instead.
+  if (opts.cleanup && isNumericOrAbsent) {
+    process.stderr.write(
+      "Deprecated: `pipeline --cleanup` is deprecated. Use `pipeline cleanup` or `/pipeline:cleanup` instead.\n",
+    );
+    await runCleanup(cfg);
+    return;
+  }
+
+  // Positional `pipeline cleanup` keyword dispatch.
+  if (numArg === "cleanup") {
     await runCleanup(cfg);
     return;
   }
 
   if (isInit) {
+    // Legacy `--init` flag form — deprecated; use `pipeline init` or `/pipeline:init` instead.
+    if (opts.init && isNumericOrAbsent) {
+      process.stderr.write(
+        "Deprecated: `pipeline --init` is deprecated. Use `pipeline init` or `/pipeline:init` instead.\n",
+      );
+    }
     await runInit(cfg);
     return;
   }
 
   if (isDoctorCommand) {
     await runDoctor(cfg, opts);
+    return;
+  }
+
+  // Positional `pipeline status <N> [--json]` keyword dispatch.
+  // Equivalent to the legacy `pipeline <N> --status [--json]`.
+  if (numArg === "status") {
+    const statusNumStr = cmd.args[1];
+    if (!statusNumStr || !/^\d+$/.test(statusNumStr)) {
+      console.error(
+        "pipeline status: an issue or PR number is required.\n" +
+          "  Usage: pipeline status <N>\n" +
+          "  Example: pipeline status 42",
+      );
+      process.exit(2);
+    }
+    const statusN = Number.parseInt(statusNumStr, 10);
+    let statusIssueNumber: number;
+    try {
+      statusIssueNumber = await resolveIssueNumber(cfg, statusN, { quiet: !!opts.json });
+    } catch (err) {
+      const e = err as Error;
+      if (opts.json) {
+        console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+        process.exitCode = 1;
+      } else {
+        console.error(`pipeline: ${e.message}`);
+        process.exit(1);
+      }
+      return;
+    }
+    await runStatus(cfg, statusIssueNumber, defaultRunStatusDeps, { json: opts.json });
+    return;
+  }
+
+  // Positional `pipeline unblock <N> "<answer>"` keyword dispatch.
+  // Equivalent to the legacy `pipeline <N> --unblock "<answer>"`.
+  if (numArg === "unblock") {
+    const unblockNumStr = cmd.args[1];
+    const unblockAnswer = cmd.args[2];
+    if (!unblockNumStr || !/^\d+$/.test(unblockNumStr)) {
+      console.error(
+        "pipeline unblock: an issue or PR number is required.\n" +
+          '  Usage: pipeline unblock <N> "<answer>"\n' +
+          '  Example: pipeline unblock 42 "The fix is in branch feat/foo"',
+      );
+      process.exit(2);
+    }
+    if (unblockAnswer === undefined) {
+      console.error(
+        "pipeline unblock: an answer string is required.\n" +
+          '  Usage: pipeline unblock <N> "<answer>"\n' +
+          '  Example: pipeline unblock 42 "The fix is in branch feat/foo"',
+      );
+      process.exit(2);
+    }
+    // Kill-switch check: same gate as the legacy `pipeline N --unblock` form.
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
+    }
+    const unblockN = Number.parseInt(unblockNumStr, 10);
+    let unblockIssueNumber: number;
+    try {
+      unblockIssueNumber = await resolveIssueNumber(cfg, unblockN);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runUnblock(cfg, unblockIssueNumber!, unblockAnswer, unblockN);
+    return;
+  }
+
+  // Positional `pipeline override <N> "<spec>"` keyword dispatch.
+  // Equivalent to the legacy `pipeline <N> --override "<spec>"`.
+  if (numArg === "override") {
+    const overrideNumStr = cmd.args[1];
+    const overrideSpec = cmd.args[2];
+    if (!overrideNumStr || !/^\d+$/.test(overrideNumStr)) {
+      console.error(
+        "pipeline override: an issue or PR number is required.\n" +
+          '  Usage: pipeline override <N> "<key>: <reason>"\n' +
+          '  Example: pipeline override 42 "abc123: deferred #99"',
+      );
+      process.exit(2);
+    }
+    if (overrideSpec === undefined) {
+      console.error(
+        "pipeline override: a spec string is required.\n" +
+          '  Usage: pipeline override <N> "<key>: <reason>"\n' +
+          '  Example: pipeline override 42 "abc123: deferred #99"',
+      );
+      process.exit(2);
+    }
+    // Kill-switch check: same gate as the legacy `pipeline N --override` form.
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
+    }
+    const overrideN = Number.parseInt(overrideNumStr, 10);
+    let overrideIssueNumber: number;
+    try {
+      overrideIssueNumber = await resolveIssueNumber(cfg, overrideN);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runOverride(cfg, overrideIssueNumber!, overrideSpec, opts, undefined, overrideN);
     return;
   }
 
@@ -1006,6 +1189,9 @@ async function main(): Promise<void> {
   // kill-switch check, label-ensure, or lock — and treats <number> as the issue
   // number the bundle is keyed by.
   if (opts.summary) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --summary\` is deprecated. Use \`/pipeline:summary ${number}\` instead.\n`,
+    );
     await runSummary(cfg, number, cfg.repo_dir);
     return;
   }
@@ -1017,6 +1203,9 @@ async function main(): Promise<void> {
   // for a stuck run; blocking them with a kill-switch check would prevent
   // recovery, so they also bypass it (below).
   if (opts.status) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --status\` is deprecated. Use \`pipeline status ${number}\` or \`/pipeline:status\` instead.\n`,
+    );
     let issueNumber: number;
     try {
       issueNumber = await resolveIssueNumber(cfg, number, { quiet: !!opts.json });
@@ -1063,6 +1252,9 @@ async function main(): Promise<void> {
   }
 
   if (opts.unblock !== undefined) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --unblock\` is deprecated. Use \`pipeline unblock ${number} "<answer>"\` or \`/pipeline:unblock\` instead.\n`,
+    );
     let issueNumber: number;
     try {
       issueNumber = await resolveIssueNumber(cfg, number);
@@ -1071,10 +1263,13 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runUnblock(cfg, issueNumber, opts.unblock);
+    await runUnblock(cfg, issueNumber, opts.unblock, number);
     return;
   }
   if (opts.override !== undefined) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --override\` is deprecated. Use \`pipeline override ${number} "<spec>"\` or \`/pipeline:override\` instead.\n`,
+    );
     let issueNumber: number;
     try {
       issueNumber = await resolveIssueNumber(cfg, number);
@@ -1083,7 +1278,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runOverride(cfg, issueNumber, opts.override, opts);
+    await runOverride(cfg, issueNumber, opts.override, opts, undefined, number);
     return;
   }
 
