@@ -406,22 +406,36 @@ export async function advance(
       await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "actor_lookup_failure");
       return { advanced: false, status: "blocked", reason: "shipcheck: actor lookup failure", blockerKind: "needs-human" as BlockerKind };
     }
-    // Finding 1 idempotency guard: if we already successfully routed to pre-merge
-    // for the current head (the transition posted a pre-merge audit sentinel AND
-    // the revalidation notice authored by the actor carries the current prHeadSha),
-    // skip the route-back and proceed with reviewer evaluation. Without this guard
-    // the second shipcheck entry after pre-merge/eval completes would loop back again
-    // because the prior verdict still records the pre-fix SHA.
-    // Require BOTH the marker AND a preceding pre-merge audit comment from the actor:
-    // an orphaned marker posted by pre-fix code before a failed transition has no
-    // preceding audit and must not be trusted — route back to properly validate
-    // the head (#317, override-key 7ca10c2e).
-    const revalidationMarkerIdx = detail.comments.findIndex(
-      (c) => c.author === actor && extractRevalidationSha(c.body) === prHeadSha,
+    // Idempotency guard: if we already successfully routed to pre-merge for the
+    // current head (transition posted a pre-merge audit AND the revalidation notice
+    // carries the current prHeadSha), skip the route-back and proceed with the
+    // reviewer. Without this guard the second shipcheck entry after pre-merge/eval
+    // completes would loop back again because the prior verdict still records the
+    // pre-fix SHA.
+    //
+    // Fix 1 (#317 review-3, override-key 0f8c2e3f): the pre-merge audit must appear
+    // AFTER the most recent sentinel-bearing shipcheck verdict, not anywhere before
+    // the marker. An older pre-merge audit from the original validation pass (which
+    // predates the current-head verdict) must not satisfy the guard for a subsequent
+    // route-back attempt — that historical audit proves nothing about the route-back.
+    const lastVerdictIdx = detail.comments.reduce(
+      (acc, c, i) =>
+        c.author === actor && extractShipcheckSha(c.body) !== null ? i : acc,
+      -1,
+    );
+    // Fix 2 (#317 review-3, override-key 0f8c2e3f): evaluate the LAST current-head
+    // marker, not the first. If an orphaned first marker exists and a subsequent
+    // successful route-back posts a valid audit+marker pair for the same SHA,
+    // findIndex (first marker) would anchor on the orphan and keep re-routing.
+    // Using the last marker correctly converges when the successful pair is present.
+    const lastRevalidationMarkerIdx = detail.comments.reduce(
+      (acc, c, i) =>
+        c.author === actor && extractRevalidationSha(c.body) === prHeadSha ? i : acc,
+      -1,
     );
     const alreadyRoutedForCurrentHead =
-      revalidationMarkerIdx !== -1 &&
-      detail.comments.slice(0, revalidationMarkerIdx).some(
+      lastRevalidationMarkerIdx !== -1 &&
+      detail.comments.slice(lastVerdictIdx + 1, lastRevalidationMarkerIdx).some(
         (c) =>
           c.author === actor &&
           c.body.includes("<!-- pipeline-audit:") &&

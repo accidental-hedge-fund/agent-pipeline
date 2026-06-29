@@ -1927,3 +1927,109 @@ test("shipcheck-gate #317 R2-F2-idempotent: legacy migration already routed for 
   assert.equal(log.transitions.length, 1);
   assert.equal(log.transitions[0].to, "ready-to-deploy");
 });
+
+// ---------------------------------------------------------------------------
+// Review-3 regression tests (#317, override-key 0f8c2e3f)
+// ---------------------------------------------------------------------------
+
+// Finding 1 regression (#317 review-3): historical pre-merge audit (before the
+// current-head verdict) PLUS an orphaned revalidation marker must NOT satisfy the
+// idempotency guard. The guard must require the pre-merge audit to appear AFTER
+// the most recent sentinel-bearing verdict, not just anywhere before the marker.
+// Without the fix the historical audit triggers alreadyRoutedForCurrentHead = true,
+// causing the reviewer to be invoked and the issue to advance to ready-to-deploy
+// despite the orphaned marker not representing a completed route-back.
+test("shipcheck-gate #317 review-3-F1: historical pre-merge audit (before verdict) + orphaned marker → routes back to pre-merge, reviewer NOT invoked", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+
+  // Pre-merge audit from the ORIGINAL validation pass — predates the shipcheck verdict.
+  const originalPreMergeAudit = `## Pipeline: pre merge\n**Transition**: ...\n<!-- pipeline-audit: run=run-original state=pre-merge -->`;
+  // Shipcheck verdict for SHA_H1 (posted after the original pre-merge audit).
+  const verdictForH1 = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  // Orphaned revalidation marker for SHA_H2 with no post-verdict pre-merge audit before it.
+  const orphanedMarkerForH2 = `**Shipcheck re-validation notice**: stale ${SHA_H1.slice(0, 8)}, current ${SHA_H2.slice(0, 8)}.\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2,
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [DEVELOPER_COMMIT],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        // Original pre-merge audit — BEFORE the shipcheck verdict.
+        { author: "pipeline-bot", body: originalPreMergeAudit, createdAt: "2026-01-01T00:00:00Z" },
+        // Shipcheck verdict for SHA_H1 — after the original audit.
+        { author: "pipeline-bot", body: verdictForH1, createdAt: "2026-01-01T06:00:00Z" },
+        // Orphaned marker for SHA_H2 — no post-verdict pre-merge audit precedes it.
+        { author: "pipeline-bot", body: orphanedMarkerForH2, createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  // The historical pre-merge audit (before the verdict) must NOT satisfy the guard.
+  assert.equal(invokerCalled, 0, "reviewer must NOT be invoked — historical pre-merge audit before verdict must not satisfy the guard");
+  assert.equal(out.advanced, true, "must advance via routing to pre-merge");
+  assert.equal((out as { to: string }).to, "pre-merge", "must route back to pre-merge to properly validate the head");
+  assert.equal(log.transitions.length, 1);
+  assert.equal(log.transitions[0].from, "shipcheck-gate");
+  assert.equal(log.transitions[0].to, "pre-merge");
+});
+
+// Finding 2 regression (#317 review-3): orphaned first marker followed by a valid
+// audit+marker pair for the same SHA must converge (alreadyRoutedForCurrentHead = true).
+// Without the fix, findIndex returns the first (orphaned) marker; the guard sees no
+// post-verdict audit before it and keeps re-routing to pre-merge indefinitely.
+// With the fix, the last marker is evaluated; its preceding audit satisfies the guard.
+test("shipcheck-gate #317 review-3-F2: orphaned first marker + subsequent valid audit+marker for same head → converges (reviewer invoked, not re-routed)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate" });
+  let invokerCalled = 0;
+
+  const verdictForH1 = formatShipcheckComment(FAIL_VERDICT, "gate", SHA_H1);
+  // First marker: orphaned (e.g. posted by old code before transition, which then failed).
+  const orphanedMarkerForH2 = `**Shipcheck re-validation notice**: first attempt...\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+  // Successful second route-back: transition posted audit, then notice was posted.
+  const successfulPreMergeAudit = `## Pipeline: pre merge\n**Transition**: \`shipcheck-gate\` → \`pre-merge\`\n<!-- pipeline-audit: run=run-second state=pre-merge -->`;
+  const validMarkerForH2 = `**Shipcheck re-validation notice**: second attempt...\n<!-- shipcheck-revalidation-sha: ${SHA_H2} -->`;
+
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, fencedJson(PASS_VERDICT)),
+    getPrForIssue: async () => 42,
+    getForIssue: async () => ({ path: "/tmp/wt", slug: "317-test" }),
+    getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
+    getWorktreeHead: async () => SHA_H2,
+    getGhActor: async () => "pipeline-bot",
+    getPrCommits: async () => [DEVELOPER_COMMIT],
+    getIssueDetail: async (_cfg, _n) => ({
+      number: _n, type: "issue", title: "T", body: "body", state: "open", url: "u", labels: [],
+      comments: [
+        // Shipcheck verdict for SHA_H1.
+        { author: "pipeline-bot", body: verdictForH1, createdAt: "2026-01-01T00:00:00Z" },
+        // Orphaned first marker for SHA_H2 — no preceding post-verdict audit.
+        { author: "pipeline-bot", body: orphanedMarkerForH2, createdAt: "2026-01-01T12:00:00Z" },
+        // Successful second route-back: pre-merge audit then valid marker.
+        { author: "pipeline-bot", body: successfulPreMergeAudit, createdAt: "2026-01-02T00:00:00Z" },
+        { author: "pipeline-bot", body: validMarkerForH2, createdAt: "2026-01-02T06:00:00Z" },
+      ],
+    }),
+    invokeReviewer: async () => { invokerCalled++; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+
+  const out = await advance(cfg, 317, {}, deps);
+
+  // The last marker (valid) must satisfy the guard → reviewer invoked → ready-to-deploy.
+  assert.equal(invokerCalled, 1, "reviewer MUST be invoked — last valid marker + preceding audit satisfy the guard");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy", "must converge to ready-to-deploy, not re-route to pre-merge");
+  assert.equal(log.blocked.length, 0);
+  assert.ok(!log.transitions.some((t) => t.to === "pre-merge"), "must NOT transition to pre-merge again");
+});
