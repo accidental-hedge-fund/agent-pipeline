@@ -1262,6 +1262,16 @@ function isPipelineComment(body: string): boolean {
 }
 
 /**
+ * Classify a comment body as 'human' or 'pipeline'.
+ * Empty bodies are treated as pipeline-authored (no human wrote a blank comment).
+ */
+export function classifyComment(body: string): 'human' | 'pipeline' {
+  const head = body.trimStart();
+  if (!head) return 'pipeline';
+  return PIPELINE_COMMENT_HEADERS.some((h) => head.startsWith(h)) ? 'pipeline' : 'human';
+}
+
+/**
  * Identify human comments left on the posted plan (#26). Comments arrive in
  * chronological order, so the function anchors on the plan comment — the exact
  * body we posted if present, else the most recent comment opening with

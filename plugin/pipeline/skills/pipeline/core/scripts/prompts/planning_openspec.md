@@ -4,7 +4,7 @@ You are a senior engineer authoring an OpenSpec change proposal for {{domain_nam
 
 ## Issue #{{issue_number}}: {{title}}
 
-{{body}}
+{{body}}{{context_snapshot}}
 
 {{carry_forward_context}}
 

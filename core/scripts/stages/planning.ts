@@ -21,6 +21,14 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
+import {
+  buildContextSnapshot,
+  renderContextSnapshotBlock,
+  detectConflicts,
+  renderConflictWarningBlock,
+  CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT,
+  PRE_PLANNING_CONTEXT_HEADER,
+} from "../issue-context-snapshot.ts";
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
@@ -149,6 +157,7 @@ export interface PlanningPhaseHooks {
     carryForward: string,
     pipelineRunId: string,
     deps: RunPlanningPhasesDeps,
+    contextSnapshot?: string,
   ): Promise<
     | {
         ok: true;
@@ -286,6 +295,8 @@ export async function runPlanningPhases(
   const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
 
   // ---- Worktree bootstrap: create + dependency install ----
+  // NOTE: snapshot is gathered AFTER bootstrap so any human comments posted
+  // during the bootstrap window (dep installs can be slow) are captured (#318).
   const slug = slugify(title) || `issue-${issueNumber}`;
   const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug, deps);
   if (!bootstrap.ok) {
@@ -301,8 +312,12 @@ export async function runPlanningPhases(
     await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_created", at, _localPath: wt.path }, opts.runStoreDeps).catch(() => {});
   }
 
+  // ---- Step 0b: pre-planning context snapshot (human comments) ----
+  // Gathered after bootstrap so comments posted during the bootstrap window are included.
+  const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
+
   // ---- Author the planning artifact ----
-  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps);
+  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot);
   if (!authorResult.ok) {
     await doSetBlocked(cfg, issueNumber, authorResult.reason, "ready", authorResult.tag);
     return { advanced: false, status: "blocked", reason: authorResult.reason };
@@ -345,7 +360,7 @@ export async function runPlanningPhases(
     );
     preImplStage = "plan-review";
 
-    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext });
+    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext, contextSnapshot });
     // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
     // implementing harness reviews the plan, clearly labeled below.
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
@@ -602,9 +617,9 @@ async function advanceOpenspec(
  */
 export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, body: string): PlanningPhaseHooks {
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot) {
       const primary: Harness = innerCfg.harnesses.implementer;
-      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward });
+      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot });
       let planResult: HarnessResult;
       try {
         planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "planning" });
@@ -687,7 +702,7 @@ export function makeOpenspecPlanningHooks(
   let changeId = "";
 
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot) {
       const primary: Harness = innerCfg.harnesses.implementer;
       const doGit = deps.gitInWorktree ?? gitInWorktree;
       const isInit = deps.openspecIsInitialized ?? openspec.isInitialized;
@@ -735,7 +750,7 @@ export function makeOpenspecPlanningHooks(
       const planResult = await inv(
         primary,
         wt.path,
-        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, pipelineRunId }),
+        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, pipelineRunId }),
         {
           timeoutSec: innerCfg.implementation_timeout,
           model: planModel,
@@ -1446,6 +1461,58 @@ export async function gatherCarryForward(
   );
   console.log(`[pipeline] #${issueNumber}: last30days brief posted + carried into planning`);
   return sanitizedBrief;
+}
+
+/**
+ * Gather human-comment context snapshot for the planning stage (#318).
+ * Fetches current issue comments, builds a snapshot, posts a
+ * `## Pre-Planning Context` comment (idempotent: skipped when one already
+ * exists), and returns the rendered block for prompt injection.
+ */
+async function gatherContextSnapshot(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  body: string,
+  deps: RunPlanningPhasesDeps,
+): Promise<string> {
+  try {
+    const doGetIssueDetail = deps.getIssueDetail ?? getIssueDetail;
+    const doPostComment = deps.postComment ?? postComment;
+
+    const detail = await doGetIssueDetail(cfg, issueNumber);
+    const comments = detail.comments;
+
+    // Idempotent: skip if a Pre-Planning Context snapshot comment already exists.
+    // Use startsWith(header + '\n') to avoid matching the last30days comment
+    // (## Pre-Planning Context — last30days) which has different text after the header.
+    const existing = comments.find((c) =>
+      c.body.trimStart().startsWith(PRE_PLANNING_CONTEXT_HEADER + '\n'),
+    );
+    if (existing) {
+      // Re-use the body (strip the header) as the rendered block.
+      const stripped = existing.body.slice(PRE_PLANNING_CONTEXT_HEADER.length).trimStart();
+      return stripped;
+    }
+
+    const maxChars = cfg.context_snapshot?.max_chars ?? CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT;
+    const snapshot = buildContextSnapshot(comments, maxChars);
+    const rendered = renderContextSnapshotBlock(snapshot);
+
+    if (!rendered) return '';
+
+    const conflicts = detectConflicts(snapshot, body);
+    const conflictBlock = renderConflictWarningBlock(conflicts);
+
+    const commentBody = `${PRE_PLANNING_CONTEXT_HEADER}\n\n${rendered}${conflictBlock}${footer(cfg)}`;
+    await doPostComment(cfg, issueNumber, commentBody);
+    console.log(`[pipeline] #${issueNumber}: pre-planning context snapshot posted (${snapshot.entries.length} human comment(s))`);
+
+    return rendered + conflictBlock;
+  } catch (err) {
+    // Non-fatal: snapshot is advisory; don't block planning if this fails.
+    console.warn(`[pipeline] #${issueNumber}: context snapshot collection failed (non-fatal): ${(err as Error).message}`);
+    return '';
+  }
 }
 
 function footer(cfg: PipelineConfig): string {

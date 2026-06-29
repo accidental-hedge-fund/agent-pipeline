@@ -5,7 +5,7 @@ Round role: broad risk survey, first pass — sweep the whole change for materia
 
 ## Issue #{{issue_number}}: {{title}}
 
-{{body}}
+{{body}}{{context_snapshot}}
 
 ## Implementation Plan
 

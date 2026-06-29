@@ -1102,3 +1102,67 @@ test("runPlanningPhases — reasoningEffort: medium forwarded to invokeReviewer 
   const opts = capturedOpts[0] as Record<string, unknown>;
   assert.equal(opts.reasoningEffort, "medium", "reasoningEffort must be forwarded as 'medium'");
 });
+
+// ---------------------------------------------------------------------------
+// gatherContextSnapshot — last30days header collision regression (#318)
+//
+// A last30days comment starts with "## Pre-Planning Context — last30days".
+// Before fix, gatherContextSnapshot matched it as an existing snapshot via
+// startsWith(PRE_PLANNING_CONTEXT_HEADER), skipping the human-comment snapshot.
+// ---------------------------------------------------------------------------
+
+test("gatherContextSnapshot: last30days comment does NOT prevent human-comment snapshot from being posted (#318)", async () => {
+  const posted: string[] = [];
+  const last30daysComment = {
+    author: "bot",
+    body: "## Pre-Planning Context — last30days\n\n_Topic: \"Test issue\"_\n\nSome last30days content.",
+    createdAt: "2026-01-01T00:00:00Z",
+  };
+  const humanComment = {
+    author: "alice",
+    body: "Please also handle the edge case for null timeouts.",
+    createdAt: "2026-01-02T00:00:00Z",
+  };
+  const deps = {
+    ...eqBaseDeps(),
+    getIssueDetail: async () => ({
+      title: "Test issue",
+      body: "Fix the timeout handling.",
+      comments: [last30daysComment, humanComment],
+      number: 42,
+      labels: [],
+      state: "open",
+    }),
+    postComment: async (_cfg: unknown, _n: unknown, body: string) => {
+      posted.push(body);
+    },
+  };
+  await runPlanningPhases(eqCfg, 42, "Test issue", "Fix the timeout handling.", "run-42", {}, freeformHooks(), deps as any);
+  const snapshot = posted.find((b) => b.startsWith("## Pre-Planning Context\n"));
+  assert.ok(snapshot, "expected a '## Pre-Planning Context' snapshot to be posted even when a last30days comment exists");
+  assert.match(snapshot!, /alice/, "snapshot must contain the human comment author");
+});
+
+test("runPlanningPhases: context snapshot is gathered after bootstrap (#318 Finding 4)", async () => {
+  let bootstrapDone = false;
+  const getIssueDetailCallsAfterBootstrap: boolean[] = [];
+  const base = eqBaseDeps();
+  const deps = {
+    ...base,
+    createWorktree: async () => {
+      const result = await base.createWorktree();
+      bootstrapDone = true;
+      return result;
+    },
+    getIssueDetail: async () => {
+      getIssueDetailCallsAfterBootstrap.push(bootstrapDone);
+      return { title: "Test", body: "test body", comments: [], number: 42, labels: [], state: "open" };
+    },
+  };
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(getIssueDetailCallsAfterBootstrap.length > 0, "getIssueDetail must be called at least once");
+  assert.ok(
+    getIssueDetailCallsAfterBootstrap.every(Boolean),
+    "all getIssueDetail calls (including snapshot) must occur after bootstrapWorktree completes",
+  );
+});

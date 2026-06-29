@@ -358,6 +358,12 @@ export interface PipelineConfig {
     allow_paths: string[];
     min_confidence: number;
   };
+  // Stage-aware issue context snapshots (#318). When set, `max_chars` caps the
+  // total character count of human comments included in the context snapshot
+  // (oldest entries dropped first). When absent, the default (8000) applies.
+  context_snapshot?: {
+    max_chars: number;
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults

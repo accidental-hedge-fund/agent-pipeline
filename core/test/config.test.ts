@@ -1302,6 +1302,53 @@ test("syncConfig: newline scalar overrides render as valid inline YAML", () => {
   assert.match(synced, /^domain_description: "first line\\nsecond line" #/m);
 });
 
+// ---------------------------------------------------------------------------
+// Regression: sync --apply must NOT silently drop behavior-changing sections
+// that PartialConfigSchema accepts but that renderConfigTemplate + normalizeForSync
+// previously omitted. Finding 0a1f8d19 (#318).
+// ---------------------------------------------------------------------------
+
+test("syncConfig: context_snapshot.max_chars is preserved through sync --apply", () => {
+  const repo = makeFakeRepo("context_snapshot:\n  max_chars: 4000\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(result.applied, true);
+  assert.match(synced, /^context_snapshot:/m, "context_snapshot block must be present after sync");
+  assert.match(synced, /max_chars: 4000/, "max_chars value must be preserved");
+});
+
+test("syncConfig: queue settings are preserved through sync --apply", () => {
+  const repo = makeFakeRepo("queue:\n  max_issues: 5\n  concurrency: 2\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(result.applied, true);
+  assert.match(synced, /^queue:/m, "queue block must be present after sync");
+  assert.match(synced, /max_issues: 5/, "max_issues value must be preserved");
+  assert.match(synced, /concurrency: 2/, "concurrency value must be preserved");
+});
+
+test("syncConfig: auto_merge_eligibility settings are preserved through sync --apply", () => {
+  const repo = makeFakeRepo("auto_merge_eligibility:\n  enabled: true\n  max_diff_lines: 150\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(result.applied, true);
+  assert.match(synced, /^auto_merge_eligibility:/m, "auto_merge_eligibility block must be present after sync");
+  assert.match(synced, /enabled: true/, "enabled flag must be preserved");
+  assert.match(synced, /max_diff_lines: 150/, "max_diff_lines value must be preserved");
+});
+
 test("CLI: `pipeline config sync` previews without mutating", () => {
   const original = "base_branch: staging\n";
   const repo = makeFakeRepo(original);

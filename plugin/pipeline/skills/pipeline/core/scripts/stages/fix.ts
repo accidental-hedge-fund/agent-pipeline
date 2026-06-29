@@ -9,10 +9,14 @@
 
 import {
   findLatestCommentMatching,
+  getGhActor,
   getIssueDetail,
+  postComment,
   setBlocked,
   transition,
 } from "../gh.ts";
+import { findUnacknowledgedComments } from "../issue-context-snapshot.ts";
+import { buildTrustedOverrideComments } from "../review-policy.ts";
 import { invoke } from "../harness.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
@@ -90,6 +94,33 @@ export async function advanceFix(
   }
 
   const detail = await getIssueDetail(cfg, issueNumber);
+
+  // Acknowledgement gate: block when human comments after the revised plan
+  // have not been acknowledged via re-plan or override (#318 review-2 finding 3).
+  // Only trusted-author scope-override comments may act as ack anchors (#318 fix c5825398).
+  const fixActor = await getGhActor();
+  const trustedForAck = buildTrustedOverrideComments(detail.comments, fixActor, cfg.trusted_override_actors);
+  const unacknowledged = findUnacknowledgedComments(detail.comments, trustedForAck);
+  if (unacknowledged.length > 0) {
+    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
+    // Deduplicate: only post the warning when no prior warning exists.
+    const warningExists = detail.comments.some(
+      (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),
+    );
+    if (!warningExists) {
+      const commentLines = unacknowledged
+        .map((c) => `- **@${c.author}** (${c.createdAt})`)
+        .join('\n');
+      await postComment(
+        cfg,
+        issueNumber,
+        `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.`,
+      );
+    }
+    await setBlocked(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");
+    return { advanced: false, status: "blocked", reason: "unacknowledged human input", blockerKind: "needs-human" };
+  }
+
   const findings = extractBlockingReviewFindings(detail.comments, round);
   if (!findings) {
     // No findings → just advance.

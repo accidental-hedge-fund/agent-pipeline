@@ -4,7 +4,7 @@ You are a senior engineer planning the implementation of a GitHub issue for {{do
 
 ## Issue #{{issue_number}}: {{title}}
 
-{{body}}
+{{body}}{{context_snapshot}}
 
 {{carry_forward_context}}
 

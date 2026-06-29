@@ -56,6 +56,8 @@ export interface BuildPlanArgs {
   body: string;
   /** Optional carry-forward context (e.g. a last30days brief) for planning prompts. */
   carryForward?: string;
+  /** Pre-rendered context snapshot block (human comments, fenced). When absent, omitted. */
+  contextSnapshot?: string;
 }
 
 export function buildPlanningPrompt(a: BuildPlanArgs): string {
@@ -67,6 +69,7 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    context_snapshot: contextSnapshotSection(a.contextSnapshot),
     carry_forward_context: carryForwardSection(a.carryForward),
   });
 }
@@ -86,6 +89,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanningOpenspecArgs): strin
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    context_snapshot: contextSnapshotSection(a.contextSnapshot),
     carry_forward_context: carryForwardSection(a.carryForward),
     pipeline_run_id: a.pipelineRunId,
   });
@@ -108,6 +112,7 @@ export function buildPlanReviewPrompt(a: BuildPlanReviewArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    context_snapshot: contextSnapshotSection(a.contextSnapshot),
     plan: a.plan,
     reviewer: a.reviewer,
     implementer: a.implementer,
@@ -274,6 +279,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    context_snapshot: contextSnapshotSection(a.contextSnapshot),
     plan: a.plan,
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
@@ -310,6 +316,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    context_snapshot: contextSnapshotSection(a.contextSnapshot),
     review1_section: review1Section,
     prior_review2_findings: priorReview2Section,
     spec_context: specSection(a.specContext),
@@ -380,6 +387,14 @@ export function buildTestFixPrompt(a: BuildTestFixArgs): string {
     test_output: truncateDiff(a.output, 16_000),
     pipeline_run_id: a.pipelineRunId,
   });
+}
+
+function contextSnapshotSection(rendered?: string): string {
+  if (!rendered || !rendered.trim()) return '';
+  // Leading \n\n provides separation from the preceding content; templates place
+  // {{context_snapshot}} immediately after {{body}} with no intervening blank line,
+  // so the section contributes the separator when present and nothing when absent.
+  return '\n\n' + rendered.trim();
 }
 
 function carryForwardSection(s?: string): string {
@@ -511,6 +526,7 @@ export function buildDeltaReviewPrompt(a: BuildDeltaReviewArgs): string {
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
+    context_snapshot: "",
     review1_section: deltaScopeNote,
     prior_review2_findings: "",
     spec_context: specSection(a.specContext),

@@ -139,7 +139,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   config: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "profile", "json"]),
+    allowedFlags: new Set(["repoPath", "profile", "json", "apply"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

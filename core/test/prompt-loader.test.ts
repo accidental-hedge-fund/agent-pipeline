@@ -1541,3 +1541,65 @@ test("buildPlanningPrompt: carry-forward without injection passes through fence 
   assert.ok(out.includes("Redis cluster latency improved"), "clean context must be preserved");
   assert.ok(out.includes("UNTRUSTED"), "injection-resistance directive must appear");
 });
+
+// #318: fix prompt must NEVER contain {{context_snapshot}} — the snapshot is advisory
+// context for planning/review/shipcheck only, not fix rounds which follow a minimal-diff
+// discipline. If the fix.md template is accidentally given a context_snapshot placeholder,
+// it would require all callers to fill it (breaking the contract) and risk prompt injection.
+test("fix prompt: template never contains {{context_snapshot}} (#318)", () => {
+  const template = _testing.loadTemplate("fix");
+  assert.doesNotMatch(
+    template,
+    /\{\{\s*context_snapshot\s*\}\}/,
+    "fix.md must not contain {{context_snapshot}} — context snapshots are not injected into fix prompts",
+  );
+});
+
+// #318: planning, plan_review, review_standard, review_adversarial, and shipcheck
+// prompts accept and inject contextSnapshot; omitting it leaves no unfilled placeholder.
+test("planning prompt: injects contextSnapshot when provided (#318)", () => {
+  const snap = "<!-- HUMAN COMMENTS -->\n<untrusted-human-comments>\nhello</untrusted-human-comments>";
+  const out = buildPlanningPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 318,
+    title: "t",
+    body: "b",
+    contextSnapshot: snap,
+  });
+  assert.ok(out.includes("HUMAN COMMENTS"), "planning prompt must include contextSnapshot content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("planning prompt: no context_snapshot placeholder leftover when contextSnapshot absent (#318)", () => {
+  const out = buildPlanningPrompt({ cfg: dummyConfig(), issueNumber: 318, title: "t", body: "b" });
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("review_standard: injects contextSnapshot when provided (#318)", () => {
+  const snap = "<!-- HUMAN COMMENTS -->\n<untrusted-human-comments>\nedge case note</untrusted-human-comments>";
+  const out = buildReviewStandardPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 318,
+    title: "t",
+    body: "b",
+    plan: "p",
+    diff: "d",
+    contextSnapshot: snap,
+  });
+  assert.ok(out.includes("edge case note"), "review_standard must include contextSnapshot content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("review_adversarial: injects contextSnapshot when provided (#318)", () => {
+  const snap = "<!-- HUMAN COMMENTS -->\n<untrusted-human-comments>\ndisagree note</untrusted-human-comments>";
+  const out = buildReviewAdversarialPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 318,
+    title: "t",
+    body: "b",
+    diff: "d",
+    contextSnapshot: snap,
+  });
+  assert.ok(out.includes("disagree note"), "review_adversarial must include contextSnapshot content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
