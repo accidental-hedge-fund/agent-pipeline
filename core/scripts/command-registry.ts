@@ -250,6 +250,15 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     mutatesGitHub: false,
     supportsJson: true,
   },
+
+  backfill: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "apply", "capability"]),
+    needsConfig: true,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
 };
 
 /**

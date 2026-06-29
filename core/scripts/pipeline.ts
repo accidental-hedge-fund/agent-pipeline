@@ -220,6 +220,8 @@ export interface CliOpts {
   milestone?: string;
   /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
   risk?: string;
+  /** backfill: scope the apply slice to a named capability. */
+  capability?: string;
 }
 
 /**
@@ -236,7 +238,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -270,9 +272,9 @@ export function buildCmd(): Command {
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap/sweep/improve/config sync: execute write-backs; default is dry-run/preview")
+    .option("--apply", "roadmap/sweep/backfill/improve/config sync: execute write-backs; default is dry-run/preview")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
-    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
+    .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
@@ -290,7 +292,9 @@ export function buildCmd(): Command {
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
     .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
-    .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)");
+    .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
+    // backfill options (#327)
+    .option("--capability <name>", "backfill: scope the apply slice to a named capability");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -387,6 +391,8 @@ async function main(): Promise<void> {
   const isIntakeCommand = numArg === "intake";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
   const isSweepCommand = numArg === "sweep";
+  // `pipeline backfill [--apply] [--capability <name>] [--repo <owner/repo>]` — OpenSpec coverage backfill.
+  const isBackfillCommand = numArg === "backfill";
   // `pipeline triage <issue> --stage ready|backlog` — set an issue's pre-pipeline stage label.
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
@@ -885,6 +891,30 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early backfill dispatch — no issue number; derives repo/config from local git state.
+  // Preview by default (non-mutating); --apply opens a spec-only PR.
+  if (isBackfillCommand) {
+    let backfillCfg: import("./types.ts").PipelineConfig;
+    try {
+      backfillCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline backfill: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const { runBackfill, realBackfillDeps } = await import("./stages/backfill.ts");
+    try {
+      await runBackfill(
+        { apply: !!opts.apply, capability: opts.capability },
+        { repo_dir: backfillCfg.repo_dir, repo: backfillCfg.repo, base_branch: backfillCfg.base_branch },
+        realBackfillDeps(backfillCfg.repo_dir),
+      );
+    } catch (err) {
+      console.error(`pipeline backfill: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early triage dispatch — resolves config for cfg.repo so gh wrappers target the
   // configured repository. The handler validates issue number and stage, then makes
   // the gh calls to read/add/remove labels.
@@ -961,7 +991,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue",
+      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill",
     ];
     if (!recognized.includes(numArg)) {
       console.error(
