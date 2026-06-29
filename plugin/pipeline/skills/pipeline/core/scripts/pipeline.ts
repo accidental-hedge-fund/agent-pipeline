@@ -16,7 +16,8 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { appendTransitionLine, transitionsLogPath } from "./transitions-log.ts";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig } from "./config.ts";
@@ -1122,6 +1123,10 @@ async function runCleanup(cfg: PipelineConfig): Promise<void> {
     console.log(`Removed ${result.removed.length} worktree(s):`);
     for (const rec of result.removed) {
       console.log(`  - ${rec.branch}`);
+      // Remove the transitions log for this issue — best-effort, missing file is fine.
+      if (rec.issueNumber !== undefined) {
+        try { unlinkSync(transitionsLogPath(cfg.domain, rec.issueNumber)); } catch { /* non-fatal */ }
+      }
     }
   }
   if (result.skipped.length > 0) {
@@ -1932,7 +1937,9 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
   await appendBlockerCleared(cfg.repo_dir, issueNumber);
-  console.log(`[pipeline] #${issueNumber}: unblocked at ${stage}`);
+  const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
+  console.log(unblockLine);
+  appendTransitionLine(transitionsLogPath(cfg.domain, issueNumber), unblockLine);
 }
 
 // ---------------------------------------------------------------------------
