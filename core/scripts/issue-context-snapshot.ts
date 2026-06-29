@@ -202,9 +202,17 @@ export function extractSnapshotComment<T extends { body: string }>(
  * Find human comments posted after the most recent plan comment (revised plan
  * preferred, original plan as fallback). These are comments that the pipeline
  * has not yet acknowledged with a fix or revision round.
+ *
+ * @param trustedScopeOverrides - Pre-filtered scope-override comments that are
+ *   author-validated (produced by `buildTrustedOverrideComments`). Only comments
+ *   present in this list may act as acknowledgement anchors. Defaults to [] —
+ *   fail-closed: no scope-override comment anchors unless the caller explicitly
+ *   supplies the trusted set. Reuses the same trust path as review-routing (#318
+ *   fix c5825398).
  */
 export function findUnacknowledgedComments(
   comments: { author: string; body: string; createdAt: string }[],
+  trustedScopeOverrides: ReadonlyArray<{ author: string; body: string; createdAt: string }> = [],
 ): { author: string; body: string; createdAt: string }[] {
   let anchorIdx = -1;
 
@@ -227,14 +235,17 @@ export function findUnacknowledgedComments(
 
   if (anchorIdx === -1) return [];
 
-  // If the operator posted a scope-override comment after the plan anchor, treat
-  // it as an acknowledgement anchor — human comments at or before it have been
-  // explicitly dismissed and are no longer considered unacknowledged (#318 fix
-  // d2012430). The scope-override comment already carries a machine-readable
-  // sentinel (`<!-- pipeline-override-scope: ... -->`), so detecting it by its
-  // heading is safe and consistent with extractScopedOverrides in review-policy.ts.
+  // If a trusted operator posted a scope-override comment after the plan anchor,
+  // treat it as an acknowledgement anchor — human comments at or before it have
+  // been explicitly dismissed and are no longer considered unacknowledged (#318
+  // fix d2012430). Only comments present in `trustedScopeOverrides` (author-
+  // validated via buildTrustedOverrideComments) can act as anchors; an untrusted
+  // commenter faking the heading is ignored (#318 fix c5825398).
   for (let i = comments.length - 1; i > anchorIdx; i--) {
-    if (comments[i].body.trimStart().startsWith(SCOPE_OVERRIDE_HEADING)) {
+    if (
+      comments[i].body.trimStart().startsWith(SCOPE_OVERRIDE_HEADING) &&
+      trustedScopeOverrides.includes(comments[i])
+    ) {
       anchorIdx = i;
       break;
     }

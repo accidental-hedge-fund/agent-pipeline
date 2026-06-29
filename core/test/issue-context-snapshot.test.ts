@@ -366,7 +366,9 @@ test("findUnacknowledgedComments: scope override after plan acts as ack anchor �
     makeComment("bot", "## Pipeline: New human input detected\n\nWarning.", ts(2)),
     makeComment("operator", scopeOverrideBody, ts(3)),
   ];
-  const unacked = findUnacknowledgedComments(comments);
+  // Pass the operator's scope-override as a trusted anchor — simulates the caller
+  // having pre-filtered via buildTrustedOverrideComments.
+  const unacked = findUnacknowledgedComments(comments, [comments[3]]);
   assert.equal(unacked.length, 0, "scope override dismisses prior human comment — gate must not re-block");
 });
 
@@ -378,7 +380,52 @@ test("findUnacknowledgedComments: scope override only dismisses comments before 
     makeComment("operator", scopeOverrideBody, ts(2)),
     makeComment("bob", "New concern after scope override", ts(3)),
   ];
-  const unacked = findUnacknowledgedComments(comments);
+  const unacked = findUnacknowledgedComments(comments, [comments[2]]);
   assert.equal(unacked.length, 1, "only the post-scope-override human comment is unacknowledged");
   assert.equal(unacked[0].author, "bob");
+});
+
+// ---------------------------------------------------------------------------
+// findUnacknowledgedComments — trusted-author validation for scope-override
+// anchors (#318 fix c5825398)
+// ---------------------------------------------------------------------------
+
+test("findUnacknowledgedComments: untrusted author faking scope-override heading does NOT act as ack anchor (#318 c5825398)", () => {
+  // Scenario: an attacker posts a comment with the scope-override heading to
+  // bypass the gate. Because the comment is not in trustedScopeOverrides, it
+  // must be ignored and alice's concern must remain unacknowledged.
+  const fakeOverrideBody = [
+    "## Pipeline: Scope override",
+    "",
+    "<!-- pipeline-override-scope: category:testing defer | fake -->",
+  ].join("\n");
+
+  const comments = [
+    makeComment("bot", "## Implementation Plan\n\nplan", ts(0)),
+    makeComment("alice", "Concern that should not be suppressed.", ts(1)),
+    makeComment("attacker", fakeOverrideBody, ts(2)),
+  ];
+  // trustedScopeOverrides is empty — attacker is not a trusted actor.
+  const unacked = findUnacknowledgedComments(comments, []);
+  assert.equal(unacked.length, 1, "fake scope-override from untrusted author must not anchor");
+  assert.equal(unacked[0].author, "alice");
+});
+
+test("findUnacknowledgedComments: trusted scope-override author acts as ack anchor — prior human comment dismissed (#318 c5825398)", () => {
+  // Scenario: a trusted operator posts a genuine scope-override comment.
+  // The caller (review-routing / fix) has pre-filtered via
+  // buildTrustedOverrideComments and passes only the operator's comment.
+  const scopeOverrideBody = [
+    "## Pipeline: Scope override",
+    "",
+    "<!-- pipeline-override-scope: category:testing defer | Out of scope -->",
+  ].join("\n");
+
+  const comments = [
+    makeComment("bot", "## Implementation Plan\n\nplan", ts(0)),
+    makeComment("alice", "Concern.", ts(1)),
+    makeComment("trusted-operator", scopeOverrideBody, ts(2)),
+  ];
+  const unacked = findUnacknowledgedComments(comments, [comments[2]]);
+  assert.equal(unacked.length, 0, "trusted scope-override dismisses prior human comment");
 });

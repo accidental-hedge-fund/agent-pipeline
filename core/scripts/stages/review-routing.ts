@@ -252,7 +252,9 @@ export async function advanceReview(
 
   // Acknowledgement gate: block when human comments after the revised plan
   // have not been acknowledged via re-plan or override (#318 review-2 finding 3).
-  const unacknowledged = findUnacknowledgedComments(detail.comments);
+  // Only trusted-author scope-override comments may act as ack anchors (#318 fix c5825398).
+  const trustedForAck = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
+  const unacknowledged = findUnacknowledgedComments(detail.comments, trustedForAck);
   if (unacknowledged.length > 0) {
     console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
     // Dry-run: log only — no GitHub writes (#318 fix 937b9d25).

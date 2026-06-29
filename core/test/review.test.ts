@@ -3411,6 +3411,8 @@ test("advanceReview: warning lists author and timestamp for each comment (#318 F
 test("advanceReview: scope override after plan dismisses prior human comment — stage proceeds (#318 fix d2012430)", async (t) => {
   // Verify that a scope-override comment posted after the plan acks prior human
   // comments so the gate no longer blocks on the next pipeline run.
+  // "operator" is a trusted actor via trusted_override_actors (#318 fix c5825398).
+  const cfgWithOperator = { ...cfg, trusted_override_actors: ["operator"] } as unknown as PipelineConfig;
   const { deps, rec } = makeDeps([APPROVE]);
   const scopeOverrideBody = [
     "## Pipeline: Scope override",
@@ -3438,7 +3440,7 @@ test("advanceReview: scope override after plan dismisses prior human comment —
     }) as any;
   let outcome: any;
   await quiet(t, async () => {
-    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+    outcome = await advanceReview(cfgWithOperator, 1, 1, {}, 0, deps);
   });
   assert.equal(outcome.advanced, true, "scope override must allow the stage to proceed past the human-input gate");
   assert.equal(rec.blocked.length, 0, "setBlocked must NOT be called when scope override is present");

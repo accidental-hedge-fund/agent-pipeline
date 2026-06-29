@@ -9,12 +9,14 @@
 
 import {
   findLatestCommentMatching,
+  getGhActor,
   getIssueDetail,
   postComment,
   setBlocked,
   transition,
 } from "../gh.ts";
 import { findUnacknowledgedComments } from "../issue-context-snapshot.ts";
+import { buildTrustedOverrideComments } from "../review-policy.ts";
 import { invoke } from "../harness.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
@@ -95,7 +97,10 @@ export async function advanceFix(
 
   // Acknowledgement gate: block when human comments after the revised plan
   // have not been acknowledged via re-plan or override (#318 review-2 finding 3).
-  const unacknowledged = findUnacknowledgedComments(detail.comments);
+  // Only trusted-author scope-override comments may act as ack anchors (#318 fix c5825398).
+  const fixActor = await getGhActor();
+  const trustedForAck = buildTrustedOverrideComments(detail.comments, fixActor, cfg.trusted_override_actors);
+  const unacknowledged = findUnacknowledgedComments(detail.comments, trustedForAck);
   if (unacknowledged.length > 0) {
     console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
     // Deduplicate: only post the warning when no prior warning exists.
