@@ -4,24 +4,38 @@
 //  - ci_mode: github (default) still calls getPrChecks (regression guard)
 //  - ci_mode: local with a passing test-gate advances without calling getPrChecks
 //  - ci_mode: local with a failing test-gate blocks to needs-human
-//  - ci_mode: local with no test-gate event blocks (fail-closed; no runDir)
-//  - ci_mode: local with no test-gate event blocks (fail-closed; runDir present but no events)
+//  - ci_mode: local with no test-gate event + no worktree blocks fail-closed
+//  - ci_mode: local with no test-gate event + worktree runs inline gate (absent → recovered)
+//  - ci_mode: local with stale SHA + worktree runs inline gate (archive scenario recovered)
+//  - ci_mode: local with stale SHA + worktree + inline fails → blocks
+//  - ci_mode: local with stale SHA + no worktree → blocks fail-closed
 //  - ci_mode: local still blocks on a conflicting PR (mergeability gate still runs)
-//  - ci_mode: local blocks when PR head moved after test gate ran (OpenSpec archive scenario)
-//  - ci_mode: local blocks when PR head moved after test gate ran (BEHIND/conflict rebase scenario)
-//  - ci_mode: local blocks when pr_head_sha absent in event (old event format; fail-closed)
-//  - ci_mode: local blocks when developer push moves head before first pre-merge eval (review-2 regression)
+//  - ci_mode: local blocks when pr_head_sha absent in event (old event format) + no worktree → fail-closed
+//  - ci_mode: local final SHA re-check: push during mergeability re-fetch blocks (bug-1 fix)
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { advance, type AdvancePreMergeDeps } from "../scripts/stages/pre_merge.ts";
 import type { PipelineConfig, Stage } from "../scripts/types.ts";
 import type { RunEvent, StageAccountingEvent } from "../scripts/run-store.ts";
+import type { TestGateResult } from "../scripts/testgate.ts";
 
 const SHA_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 // SHA at which the test gate ran; differs from SHA_HEAD to simulate a pre-merge
 // mutation (archive commit or rebase) that moved the PR head after the test gate ran.
 const SHA_PRE_MUTATION = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+// SHA that arrives via a push during the mergeability re-fetch (used for bug-1 final SHA re-check test).
+const SHA_PUSHED_DURING_STEP2 = "cccccccccccccccccccccccccccccccccccccccc";
+
+// Fake runTestGate that immediately resolves with the given result.
+function fakeRunTestGate(result: TestGateResult): NonNullable<AdvancePreMergeDeps["runTestGate"]> {
+  return async () => result;
+}
+
+// Fake worktree returned from getForIssue for inline-gate tests.
+const FAKE_WT = { path: "/fake/wt", slug: "slug" } as Awaited<
+  ReturnType<NonNullable<AdvancePreMergeDeps["getForIssue"]>>
+>;
 const PR_NUMBER = 350;
 
 function makeStageAccountingEvent(
@@ -78,6 +92,9 @@ function makeBaseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): AdvancePreM
       >,
     getPrCommits: async () => [],
     getForIssue: async () => null,
+    // Default: throw to catch accidental inline gate invocations in tests that
+    // don't provide a worktree (getForIssue → null blocks before this is reached).
+    runTestGate: async () => { throw new Error("runTestGate should not be called in this test"); },
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},
@@ -162,14 +179,14 @@ test("pre-merge ci_mode: local with failing test-gate blocks to needs-human (#35
 });
 
 // ---------------------------------------------------------------------------
-// 3.5 — ci_mode: local with no test-gate event blocks (fail-closed)
+// 3.5 — ci_mode: local with no test-gate event: inline gate runs when worktree
+//        exists; blocks fail-closed when no worktree is available
 // ---------------------------------------------------------------------------
 
-test("pre-merge ci_mode: local with no test-gate event (runDir provided) blocks fail-closed (#350)", async (t) => {
+test("pre-merge ci_mode: local absent result + no worktree → blocks fail-closed (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
-  // No stage_accounting events for test-gate — only a run_start
   const emptyEvents: RunEvent[] = [
     { schema_version: 1, type: "run_start", at: "2026-06-30T00:00:00Z", run_id: "350-run", issue: 350, repo: "acme/test" },
   ];
@@ -178,11 +195,12 @@ test("pre-merge ci_mode: local with no test-gate event (runDir provided) blocks 
     getPrChecks: async () => { throw new Error("should not be called"); },
     setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
     readRunEvents: async (_runDir: string) => emptyEvents,
+    // getForIssue → null (default): blocks before reaching runTestGate
   });
 
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
-  assert.equal(out.advanced, false, "must not advance when no test-gate event present");
+  assert.equal(out.advanced, false, "must not advance: no worktree for inline gate");
   assert.equal((out as { status: string }).status, "blocked");
   assert.ok(
     blockedReasons.some((r) => r.includes("ci_mode: local")),
@@ -190,7 +208,7 @@ test("pre-merge ci_mode: local with no test-gate event (runDir provided) blocks 
   );
 });
 
-test("pre-merge ci_mode: local with no runDir blocks fail-closed (never silently advances) (#350)", async (t) => {
+test("pre-merge ci_mode: local no runDir + no worktree → blocks fail-closed (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
@@ -198,17 +216,57 @@ test("pre-merge ci_mode: local with no runDir blocks fail-closed (never silently
   const deps = makeBaseDeps({
     getPrChecks: async () => { throw new Error("should not be called"); },
     setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
-    // readRunEvents omitted — defaults to real readEvents which would get null runDir
+    // readRunEvents omitted; getForIssue → null: blocks before runTestGate
   });
 
-  // No runDir provided → latestTestGateOutcome returns null → fail-closed
   const out = await advance(makeCfg("local"), 350, {}, deps);
 
-  assert.equal(out.advanced, false, "must not advance without a runDir");
+  assert.equal(out.advanced, false, "must not advance without a runDir and no worktree");
   assert.equal((out as { status: string }).status, "blocked");
   assert.ok(
     blockedReasons.some((r) => r.includes("ci_mode: local")),
     `blocked reason must mention ci_mode: local; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+test("pre-merge ci_mode: local absent result + worktree + inline gate passes → advances (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const emptyEvents: RunEvent[] = [];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true }),
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, true, "absent result + inline gate pass must advance");
+});
+
+test("pre-merge ci_mode: local absent result + worktree + inline gate fails → blocks (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const emptyEvents: RunEvent[] = [];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: false }),
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "absent result + inline gate failure must block");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("inline")),
+    `blocked reason must mention ci_mode: local and inline; got: ${blockedReasons.join("; ")}`,
   );
 });
 
@@ -257,20 +315,19 @@ test("pre-merge ci_mode: local — mergeability gate still runs (conflicting PR 
 });
 
 // ---------------------------------------------------------------------------
-// SHA-aware guard: block when PR head moved after test gate ran (#350 review-2)
+// SHA-aware guard: stale test-gate event → run inline gate (#350 pre-merge fix)
 // ---------------------------------------------------------------------------
-// The guard now uses pr_head_sha recorded IN the test-gate event (not pollingCtx),
-// so it catches head movement that occurs before pollingCtx is populated (e.g. a
-// developer push while review runs → delta review passes → pre-merge is first call).
+// When the PR head moved after the test gate ran (archive commit, rebase, developer
+// push), the code used to block immediately ("re-run the pipeline") — a dead-end loop.
+// The fix runs the test gate inline against the current worktree so recovery is
+// deterministic. The final SHA re-check (bug-1 fix) catches any push that arrives
+// between the inline gate completion and the mergeability re-fetch.
 
-test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran (archive scenario) (#350)", async (t) => {
+test("pre-merge ci_mode: local stale SHA + worktree + inline gate passes → advances (archive scenario) (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
-  const blockedReasons: string[] = [];
-  // Test gate ran at SHA_PRE_MUTATION; event records that tested SHA.
+  // Test gate ran at SHA_PRE_MUTATION; archive commit moved head to SHA_HEAD.
   const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
-
-  // SHA gate passes: reviewed SHA matches current head (SHA_HEAD, the archive head).
   const reviewCommentWithCurrentHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
 
   const deps = makeBaseDeps({
@@ -278,41 +335,23 @@ test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran
       ({ comments: [{ body: reviewCommentWithCurrentHead }] }) as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
       >,
-    getPrDetail: async () =>
-      // Current head is SHA_HEAD (after the archive commit was pushed).
-      ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<
-        ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
-      >,
     getPrChecks: async () => { throw new Error("should not be called"); },
-    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
-    readRunEvents: async (_runDir: string) => passEvents,
+    readRunEvents: async () => passEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true }),
   });
 
-  // No pollingCtx needed: SHA comes from the event's pr_head_sha field.
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
-  assert.equal(out.advanced, false, "must not advance when head moved after test gate ran");
-  assert.equal((out as { status: string }).status, "blocked");
-  assert.ok(
-    blockedReasons.some(
-      (r) => r.includes("ci_mode: local") && r.includes("PR head changed") &&
-        r.includes(SHA_PRE_MUTATION.slice(0, 7)) && r.includes(SHA_HEAD.slice(0, 7)),
-    ),
-    `blocked reason must mention ci_mode: local, PR head changed, and both SHAs; got: ${blockedReasons.join("; ")}`,
-  );
+  // Stale SHA → inline gate runs on current worktree (archive commit is just spec files,
+  // tests still pass) → localTestedSha set → pipeline advances.
+  assert.equal(out.advanced, true, "stale SHA + inline gate pass must advance (archive scenario)");
 });
 
-// Models the second pre-merge poll iteration after a BEHIND rebase was pushed.
-// The test gate ran at SHA_PRE_MUTATION; after the rebase, current head = SHA_HEAD.
-// Local mode must block rather than advance with a result from the pre-rebase commit.
-
-test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran (BEHIND rebase scenario) (#350)", async (t) => {
+test("pre-merge ci_mode: local stale SHA + worktree + inline gate passes → advances (rebase scenario) (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
-  const blockedReasons: string[] = [];
-  // Event records the tested SHA (SHA_PRE_MUTATION, before the rebase).
   const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
-
   const reviewCommentWithCurrentHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
 
   const deps = makeBaseDeps({
@@ -320,81 +359,118 @@ test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran
       ({ comments: [{ body: reviewCommentWithCurrentHead }] }) as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
       >,
-    getPrDetail: async () =>
-      // Current head is SHA_HEAD (after the rebase commit was pushed).
-      ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<
-        ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
-      >,
     getPrChecks: async () => { throw new Error("should not be called"); },
-    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
-    readRunEvents: async (_runDir: string) => passEvents,
+    readRunEvents: async () => passEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true }),
   });
 
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
-  assert.equal(out.advanced, false, "must not advance when head moved after test gate ran (rebase)");
-  assert.equal((out as { status: string }).status, "blocked");
-  assert.ok(
-    blockedReasons.some(
-      (r) => r.includes("ci_mode: local") && r.includes("PR head changed"),
-    ),
-    `blocked reason must mention ci_mode: local and PR head changed; got: ${blockedReasons.join("; ")}`,
-  );
+  assert.equal(out.advanced, true, "stale SHA + inline gate pass must advance (rebase scenario)");
 });
 
-// ---------------------------------------------------------------------------
-// Regression test: developer push before first pre-merge eval (#350 review-2)
-// ---------------------------------------------------------------------------
-// Scenario: test gate ran at SHA_PRE_MUTATION → developer pushes new commit (SHA_HEAD)
-// → delta review accepts SHA_HEAD → pre-merge first call, pollingCtx unset.
-// With review-1 fix: preArchiveSha captured as SHA_HEAD (current) → SHA guard passes (BUG).
-// With review-2 fix: pr_head_sha in event = SHA_PRE_MUTATION ≠ SHA_HEAD → blocks (CORRECT).
-
-test("pre-merge ci_mode: local — blocks when developer push moves head before first pre-merge eval (#350 review-2)", async (t) => {
+test("pre-merge ci_mode: local stale SHA + worktree + inline gate fails → blocks (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
-  // Test gate ran at SHA_PRE_MUTATION and event records that SHA.
   const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
-
-  // Delta review passed at SHA_HEAD (developer's new commit).
-  const reviewCommentAtNewHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
+  const reviewCommentWithCurrentHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
 
   const deps = makeBaseDeps({
     getIssueDetail: async () =>
-      ({ comments: [{ body: reviewCommentAtNewHead }] }) as Awaited<
+      ({ comments: [{ body: reviewCommentWithCurrentHead }] }) as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
-      >,
-    getPrDetail: async () =>
-      // Current head = SHA_HEAD (developer's push, not the tested commit).
-      ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<
-        ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
       >,
     getPrChecks: async () => { throw new Error("should not be called"); },
     setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
-    readRunEvents: async (_runDir: string) => passEvents,
+    readRunEvents: async () => passEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: false }),
   });
 
-  // No pollingCtx (first call in this run): preArchiveSha would be set to SHA_HEAD
-  // by the review-1 implementation, making the old guard a no-op. The review-2
-  // fix reads pr_head_sha from the event (SHA_PRE_MUTATION) instead.
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
-  assert.equal(out.advanced, false, "must not certify untested developer commit");
+  assert.equal(out.advanced, false, "stale SHA + inline gate failure must block");
   assert.equal((out as { status: string }).status, "blocked");
   assert.ok(
-    blockedReasons.some(
-      (r) => r.includes("ci_mode: local") && r.includes("PR head changed"),
-    ),
-    `blocked reason must mention ci_mode: local and PR head changed; got: ${blockedReasons.join("; ")}`,
+    blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("inline")),
+    `blocked reason must mention ci_mode: local and inline; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+test("pre-merge ci_mode: local stale SHA + no worktree → blocks fail-closed (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  // Test gate ran at SHA_PRE_MUTATION; PR head now at SHA_HEAD (developer push).
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => passEvents,
+    // getForIssue → null (default): blocks before reaching runTestGate
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "stale SHA + no worktree must block fail-closed");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local")),
+    `blocked reason must mention ci_mode: local; got: ${blockedReasons.join("; ")}`,
   );
 });
 
 // ---------------------------------------------------------------------------
-// Fail-closed: block when pr_head_sha absent in event (old event format)
+// Bug-1 fix: final SHA re-check catches push that arrives during Step 2
 // ---------------------------------------------------------------------------
+// Scenario: test gate result has prHeadSha = SHA_HEAD (matches prDetail on Step 1).
+// A push arrives during the mergeability re-fetch → freshPrDetail.head_sha = SHA_PUSHED.
+// The final re-check must block rather than certify the freshly pushed (untested) commit.
 
-test("pre-merge ci_mode: local — blocks when event has no pr_head_sha (old format; fail-closed) (#350 review-2)", async (t) => {
+test("pre-merge ci_mode: local final SHA re-check: push during Step 2 mergeability re-fetch blocks (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  // Initial result matches SHA_HEAD → no inline run needed.
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_HEAD)];
+
+  let getPrDetailCallCount = 0;
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => passEvents,
+    getPrDetail: async () => {
+      getPrDetailCallCount++;
+      const sha = getPrDetailCallCount === 1
+        ? SHA_HEAD          // first fetch (Step 0.5 / Step 1): matches test-gate event
+        : SHA_PUSHED_DURING_STEP2; // second fetch (Step 2): push arrived during mergeability poll
+      return { head_sha: sha, mergeable: true, mergeable_state: "CLEAN" } as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
+      >;
+    },
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "push during Step 2 must not result in certifying an untested commit");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("PR head moved")),
+    `blocked reason must mention ci_mode: local and PR head moved; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed: absent pr_head_sha in event → treated as stale → inline gate path
+// ---------------------------------------------------------------------------
+// An old-format event (no pr_head_sha) is treated identically to a stale SHA:
+// !tgResult.prHeadSha → isStale = true → run inline gate. If no worktree is
+// available, this blocks fail-closed.
+
+test("pre-merge ci_mode: local absent pr_head_sha + no worktree → blocks fail-closed (old event format) (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
@@ -405,11 +481,12 @@ test("pre-merge ci_mode: local — blocks when event has no pr_head_sha (old for
     getPrChecks: async () => { throw new Error("should not be called"); },
     setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
     readRunEvents: async (_runDir: string) => passEvents,
+    // getForIssue → null (default): blocks before reaching runTestGate
   });
 
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
-  assert.equal(out.advanced, false, "must not advance when pr_head_sha is absent");
+  assert.equal(out.advanced, false, "must not advance when pr_head_sha is absent and no worktree");
   assert.equal((out as { status: string }).status, "blocked");
   assert.ok(
     blockedReasons.some((r) => r.includes("ci_mode: local")),

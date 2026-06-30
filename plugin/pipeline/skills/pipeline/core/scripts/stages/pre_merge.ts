@@ -68,6 +68,7 @@ import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { readEvents } from "../run-store.ts";
 import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
+import { runTestGate } from "../testgate.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
@@ -169,6 +170,10 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   /** Read events from the run-store JSONL log. Injected for tests; defaults to
    *  `readEvents` from run-store.ts. Used by the `ci_mode: local` gate (#350). */
   readRunEvents?: typeof readEvents;
+  /** Run the local test gate inline. Injected for tests; defaults to `runTestGate`
+   *  from testgate.ts. Used by the `ci_mode: local` gate when the cached result is
+   *  absent or stale (#350). */
+  runTestGate?: typeof runTestGate;
 }
 
 /**
@@ -294,33 +299,70 @@ export async function advance(
   }
 
   // ---- Step 1: CI ----
+  // localTestedSha is set by the local-mode branch and re-checked after the
+  // mergeability refetch to catch pushes that arrive during Step 2. It stays
+  // null in github mode (unused).
+  let localTestedSha: string | null = null;
+
   if ((cfg.ci_mode ?? "github") === "local") {
     // Local mode (#350): verify CI using the current run's recorded test-gate outcome
     // instead of polling GitHub Actions check-runs. The conflict pre-check, mergeability
     // gate, and OpenSpec-validation gate are unaffected and still run below.
     const readRunEventsFn = deps.readRunEvents ?? readEvents;
+    const runTestGateFn = deps.runTestGate ?? runTestGate;
     const tgResult = await latestTestGateOutcome(opts.runDir, readRunEventsFn);
 
-    if (tgResult === null) {
-      // Fail-closed: no test-gate result for this run → block rather than skip verification.
-      await setBlockedFn(
+    const isAbsent = tgResult === null;
+    // Only treat as stale when the result is a success: a failure blocks regardless
+    // of which commit was tested (the developer must fix the tests). A successful
+    // result from an old commit needs re-validation against the current PR head.
+    const isStale = tgResult !== null &&
+      tgResult.outcome === "success" &&
+      (!tgResult.prHeadSha || prDetail.head_sha !== tgResult.prHeadSha);
+
+    if (isAbsent || isStale) {
+      // No usable cached result (first entry to pre-merge, or PR head moved after
+      // an OpenSpec archive commit or rebase). Run the test gate inline against the
+      // current worktree so recovery is deterministic rather than a re-run dead-end.
+      const localWt = await getForIssueFn(cfg, issueNumber);
+      if (!localWt) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — no worktree found for this issue; cannot run the local test gate " +
+            "from pre-merge. Ensure the pipeline created a worktree, or switch to ci_mode: github.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — no worktree for inline gate" };
+      }
+      const inlineResult = await runTestGateFn(
         cfg,
         issueNumber,
-        "ci_mode: local is set but no local test-gate result was found for this run. " +
-          "The test gate must have completed before the pre-merge gate can proceed. " +
-          "Ensure the test gate ran (check that test_gate.enabled is true and a command is " +
-          "detected or configured), or switch to ci_mode: github to wait for GitHub Actions.",
+        localWt.path,
+        {},
+        pipelineRunId,
         "pre-merge",
-        "needs-human",
+        opts.stateDir,
+        opts.runDir,
       );
-      return {
-        advanced: false,
-        status: "blocked",
-        reason: "ci_mode: local — no test-gate result for this run",
-      };
-    }
-
-    if (tgResult.outcome !== "success") {
+      if (inlineResult.skipped) {
+        console.log(
+          `[pipeline] #${issueNumber}: ci_mode: local — inline test gate skipped (gate disabled); treating as pass`,
+        );
+      } else if (!inlineResult.passed) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the inline local test gate (run from pre-merge) failed. " +
+            "Fix the failing tests, push a new commit, and re-run the pipeline.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate failed" };
+      }
+      localTestedSha = prDetail.head_sha;
+    } else if (tgResult.outcome !== "success") {
       await setBlockedFn(
         cfg,
         issueNumber,
@@ -334,31 +376,8 @@ export async function advance(
         status: "blocked",
         reason: "ci_mode: local — local test gate failed",
       };
-    }
-
-    // SHA guard: compare the current PR head to the worktree HEAD SHA recorded
-    // in the test-gate accounting event. This is the exact commit that was tested,
-    // regardless of when pre-merge runs or what pollingCtx captured. If the recorded
-    // SHA is absent (old event without pr_head_sha), or the PR head has moved past
-    // the tested commit (developer push, archive commit, rebase), block rather than
-    // certify an untested commit. (#350 review-2 fix)
-    if (!tgResult.prHeadSha || prDetail.head_sha !== tgResult.prHeadSha) {
-      const testedAt = tgResult.prHeadSha ? tgResult.prHeadSha.slice(0, 7) : "unknown";
-      await setBlockedFn(
-        cfg,
-        issueNumber,
-        "ci_mode: local — the PR head changed after the local test gate ran " +
-          `(test gate at ${testedAt}, ` +
-          `current head ${prDetail.head_sha.slice(0, 7)}). ` +
-          "Re-run the pipeline to run the local test gate against the current head.",
-        "pre-merge",
-        "needs-human",
-      );
-      return {
-        advanced: false,
-        status: "blocked",
-        reason: "ci_mode: local — PR head moved after test gate ran",
-      };
+    } else {
+      localTestedSha = tgResult.prHeadSha!;
     }
 
     console.log(
@@ -464,6 +483,24 @@ export async function advance(
   // the next poll with a misleading "merge conflict — manual rebase needed"
   // reason for a PR that never had a real code conflict.
   const freshPrDetail = await getPrDetailFn(cfg, prNumber);
+
+  // Final SHA re-check for ci_mode: local: a developer push that arrives
+  // between the test-gate completion and this mergeability refetch would
+  // produce a freshPrDetail.head_sha that differs from the SHA we actually
+  // tested. Re-verify so we never certify an untested commit. (#350 pre-merge fix)
+  if (localTestedSha !== null && freshPrDetail.head_sha !== localTestedSha) {
+    const testedAt = localTestedSha.slice(0, 7);
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      "ci_mode: local — PR head moved after the local test gate ran " +
+        `(tested ${testedAt}, current head ${freshPrDetail.head_sha.slice(0, 7)}). ` +
+        "Re-run the pipeline to run the local test gate against the current head.",
+      "pre-merge",
+      "needs-human",
+    );
+    return { advanced: false, status: "blocked", reason: "ci_mode: local — PR head moved after SHA re-check" };
+  }
   const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
   const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
   if (isFreshConflict) {
