@@ -530,6 +530,10 @@ export async function runPlanningPhases(
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
     return { advanced: false, status: "blocked", reason: validateResult.reason };
   }
+  // #352 (round 2): openspec.validateItem inside validateArtifact can also trigger
+  // ensureDefaultConfig, leaving config.yaml dirty after the authorArtifact commit.
+  // Repeat the config-commit so no validate call leaves the file untracked.
+  await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
   // ---- Post plan comment ----
   const planComment = `## Implementation Plan\n\n${planText}${footer(cfg)}`;
@@ -625,6 +629,9 @@ export async function runPlanningPhases(
     }
     revisedPlan = rv.updatedPlanText;
     specContext = rv.updatedSpecContext || specContext;
+    // #352 (round 2): revalidateArtifact calls openspec.validateItem which can also
+    // trigger ensureDefaultConfig — commit any dirty config.yaml it leaves behind.
+    await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
     if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");

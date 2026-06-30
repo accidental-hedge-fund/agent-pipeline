@@ -1451,3 +1451,23 @@ test("commitOpenspecProjectConfig (bites): no-op path does NOT call gitAdd (cond
   await commitOpenspecProjectConfig("/wt/foo", 1, "1/t", deps);
   assert.ok(!addCalled, "gitAdd must not be called when status is empty (clean file)");
 });
+
+// #352 round-2 regression: config.yaml dirty after validateArtifact must be committed
+// ---------------------------------------------------------------------------
+
+test("runPlanningPhases (#352 regression): config.yaml dirty after validateArtifact triggers commit via injectable seams", async () => {
+  // Bites: without the commitOpenspecProjectConfig call after validateArtifact in
+  // runPlanningPhases, gitAdd would never be called when validateArtifact left
+  // openspec/config.yaml untracked. With the fix, the config-commit seam is called
+  // and gitAdd fires.
+  let addCalled = false;
+  const deps = {
+    ...eqBaseDeps(),
+    // Simulate: openspec.validateItem left config.yaml untracked after authoring.
+    gitStatus: async () => "?? openspec/config.yaml\n",
+    gitAdd: async () => { addCalled = true; },
+    gitCommit: async () => {},
+  };
+  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, openspecHooks(), deps as any);
+  assert.ok(addCalled, "gitAdd must be called after validateArtifact leaves config.yaml dirty (#352 round 2)");
+});

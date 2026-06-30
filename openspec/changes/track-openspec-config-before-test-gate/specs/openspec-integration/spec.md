@@ -11,10 +11,13 @@ salvage, the planning stage SHALL commit `openspec/config.yaml` if it exists in 
 untracked or modified file. The commit SHALL stage only `openspec/config.yaml` (no path outside
 `openspec/`), SHALL carry the `Issue:` and `Pipeline-Run:` traceability trailers, and SHALL occur
 before the authoring path-constraint verification so the committed config is part of the verified
-commit range and satisfies the `allowPattern: /^openspec\//` guard. When `openspec/config.yaml` is
-already tracked and unmodified, the step SHALL be a no-op — it SHALL NOT create an empty commit and
-SHALL NOT error. This step SHALL NOT alter the `openspec.bootstrap` path, which already commits
-`config.yaml` via `openspec init` + `git add -A`.
+commit range and satisfies the `allowPattern: /^openspec\//` guard. Additionally, the planning
+stage SHALL repeat the config-commit step after each structural-validation call (`validateArtifact`
+and `revalidateArtifact`) because those calls also invoke `openspec validate` and can trigger
+`ensureDefaultConfig`, leaving `openspec/config.yaml` untracked after the initial commit. When
+`openspec/config.yaml` is already tracked and unmodified, each config-commit step SHALL be a no-op
+— it SHALL NOT create an empty commit and SHALL NOT error. This step SHALL NOT alter the
+`openspec.bootstrap` path, which already commits `config.yaml` via `openspec init` + `git add -A`.
 
 #### Scenario: CLI created config.yaml untracked while the harness committed the change
 
