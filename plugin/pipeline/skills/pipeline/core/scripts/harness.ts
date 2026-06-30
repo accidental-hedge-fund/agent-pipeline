@@ -3,6 +3,9 @@
 //
 // claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] <prompt>
 // codex:   codex exec --full-auto -C <worktreeDir> <prompt>
+//          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
+//          --dangerously-bypass-approvals-and-sandbox mode on externally
+//          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
 // custom:  <name> <prompt>   (#40 — a user-configured reviewer CLI)
 //
 // The two built-in harnesses keep their exact invocation shapes. Any other
@@ -115,7 +118,13 @@ export async function invoke(
     args.push(prompt);
   } else if (harness === "codex") {
     cmd = "codex";
-    args = ["exec", "--full-auto", "-C", worktreeDir];
+    const noSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
+    args = [
+      "exec",
+      noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto",
+      "-C",
+      worktreeDir,
+    ];
     if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort=${opts.reasoningEffort}`);
     args.push(prompt);
   } else {
