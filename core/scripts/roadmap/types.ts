@@ -132,6 +132,10 @@ export interface MilestoneSpec {
   title: string;
   issue_numbers: IssueNumber[];
   rationale: string;
+  /** Compatibility impact driving the semver increment for this milestone. */
+  version_impact?: 'major' | 'minor' | 'patch';
+  /** Present when sparse metadata required a conservative classification. */
+  uncertainty?: string;
 }
 
 export interface NewIssueDraft {
@@ -185,6 +189,13 @@ export interface PlanJson {
   run_stats?: RunStats;
 }
 
+export interface ReleaseCapacity {
+  /** Per-milestone effort-points budget (XS=1 S=2 M=3 L=5 XL=8; default: 8). */
+  effort_budget?: number;
+  /** Give each breaking-change issue its own milestone (default: true). */
+  isolate_breaking?: boolean;
+}
+
 export interface RoadmapConfig {
   include_labels?: string[];
   exclude_labels?: string[];
@@ -192,6 +203,7 @@ export interface RoadmapConfig {
   hygiene_auto_apply?: boolean;
   pr_docs?: boolean;
   release_model?: 'semver' | 'continuous';
+  release_capacity?: ReleaseCapacity;
   inventory_concurrency?: number;
   depgraph_concurrency?: number;
   depgraph_verify_cap?: number;
