@@ -328,6 +328,37 @@ test("pre-merge ci_mode: local worktree ahead of remote PR head → blocks (retr
   );
 });
 
+// Regression: verify that the production fallback for getWorktreeHead (uses
+// deps.gitInWorktree ?? gitInWorktree) is correctly wired. Tests that provide
+// getWorktreeHead directly don't exercise this path — this test deliberately
+// omits getWorktreeHead and fakes gitInWorktree instead. (#350 pre-merge finding)
+test("pre-merge ci_mode: local worktree-HEAD check uses deps.gitInWorktree fallback when getWorktreeHead omitted (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const emptyEvents: RunEvent[] = [];
+  let gitInWorktreeCalls: string[][] = [];
+
+  const { getWorktreeHead: _omit, ...baseDepsWithoutWtHead } = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 0 }),
+    // Override gitInWorktree to return SHA_HEAD (matches prDetail.head_sha) and record calls.
+    gitInWorktree: async (cwd: string, args: string[]) => {
+      gitInWorktreeCalls.push(args);
+      return { stdout: SHA_HEAD + "\n", stderr: "", code: 0 };
+    },
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, baseDepsWithoutWtHead);
+
+  assert.equal(out.advanced, true, "fallback via deps.gitInWorktree must advance when worktree HEAD matches PR head");
+  assert.ok(
+    gitInWorktreeCalls.some((args) => args.includes("rev-parse")),
+    "deps.gitInWorktree must have been called for rev-parse HEAD",
+  );
+});
+
 test("pre-merge ci_mode: local absent result + worktree + inline gate fails → blocks (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 

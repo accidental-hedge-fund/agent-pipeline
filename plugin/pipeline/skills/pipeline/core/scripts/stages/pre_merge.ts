@@ -398,8 +398,9 @@ export async function advance(
       // retries without pushing, those commits remain in the worktree. A subsequent
       // run passes with attempts === 0 (no new harness calls needed) but tests the
       // ahead worktree, not the remote PR head. (#350 pre-merge finding)
+      const gitFnForHead = deps.gitInWorktree ?? gitInWorktree;
       const getWorktreeHeadFn = deps.getWorktreeHead ??
-        ((wt: string) => gitInWorktree(cfg, wt, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()));
+        ((wt: string) => gitFnForHead(wt, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()));
       const worktreeHead = await getWorktreeHeadFn(localWt.path);
       if (worktreeHead !== prDetail.head_sha) {
         await setBlockedFn(
