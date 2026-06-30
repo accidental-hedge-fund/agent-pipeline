@@ -37,6 +37,7 @@ export interface BuildStageAccountingRecordInput {
   estimatedCostUsd?: number | null;
   promptChars?: number | null;
   promptEstimatedTokens?: number | null;
+  prHeadSha?: string | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -142,6 +143,7 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(finiteNonNegative(input.promptChars) !== null ? { prompt_chars: nonNegativeInteger(input.promptChars) } : {}),
     ...(finiteNonNegative(input.promptEstimatedTokens) !== null ? { prompt_estimated_tokens: nonNegativeInteger(input.promptEstimatedTokens) } : {}),
     ...(usage.usage ? { usage: usage.usage } : {}),
+    ...(typeof input.prHeadSha === "string" && input.prHeadSha ? { pr_head_sha: input.prHeadSha } : {}),
   };
   return sanitizeStageAccountingRecord(record);
 }
@@ -176,6 +178,7 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (promptEstimatedTokens !== null) cleaned.prompt_estimated_tokens = nonNegativeInteger(promptEstimatedTokens);
   const usage = sanitizeUsage(record.usage);
   if (usage) cleaned.usage = usage;
+  if (typeof record.pr_head_sha === "string" && record.pr_head_sha) cleaned.pr_head_sha = record.pr_head_sha;
   return cleaned;
 }
 

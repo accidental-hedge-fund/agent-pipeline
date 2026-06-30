@@ -760,3 +760,22 @@ test("generateConfigSchema: repo_map is not in top-level required array", () => 
   const required = (schema.required ?? []) as string[];
   assert.ok(!required.includes("repo_map"), "repo_map must not be in the required array");
 });
+
+
+test("generateConfigSchema: ci_mode has github/local enum and non-empty description (#350)", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const props = schema.properties as Record<string, unknown>;
+  assert.ok(props["ci_mode"], "ci_mode must exist in schema");
+  const def = props["ci_mode"] as Record<string, unknown>;
+  // ci_mode may be wrapped in anyOf by zod-to-json-schema for optional fields
+  const resolved = (def["anyOf"] as Array<Record<string, unknown>> | undefined)
+    ?.find((s) => Array.isArray(s["enum"])) ?? def;
+  assert.ok(
+    Array.isArray(resolved["enum"]) && resolved["enum"].includes("github") && resolved["enum"].includes("local"),
+    "ci_mode enum must include github and local",
+  );
+  assert.ok(
+    typeof def["description"] === "string" && def["description"].length > 0,
+    "ci_mode must carry a non-empty description",
+  );
+});

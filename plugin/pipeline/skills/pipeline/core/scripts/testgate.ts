@@ -235,6 +235,10 @@ export async function runTestGate(
       ).catch(() => {});
     }
     if (runDir) {
+      // Capture the worktree HEAD at test time so ci_mode: local can verify
+      // the PR head hasn't moved since this gate ran (#350 review-2).
+      let prHeadSha: string | null = null;
+      try { prHeadSha = await gitHeadFn(wtPath); } catch { /* non-fatal */ }
       await emitStageAccounting(
         runDir,
         buildStageAccountingRecord({
@@ -251,6 +255,7 @@ export async function runTestGate(
           subprocessCount: 1,
           outcome: res.passed ? "success" : "failure",
           blockerKind: res.passed ? null : "test-gate-exhausted",
+          prHeadSha,
         }),
         runStoreDeps,
       ).catch(() => {});
