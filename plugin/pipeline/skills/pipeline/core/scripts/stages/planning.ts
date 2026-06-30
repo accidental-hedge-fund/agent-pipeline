@@ -69,6 +69,70 @@ import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
 
 // ---------------------------------------------------------------------------
+// OpenSpec project-config commit — exported for unit testing (#352)
+// ---------------------------------------------------------------------------
+
+/**
+ * Injectable seams for {@link commitOpenspecProjectConfig}.
+ * All three default to the real `gitInWorktree` wrappers.
+ */
+export interface CommitOpenspecConfigDeps {
+  /** `git status --porcelain -- openspec/config.yaml` — returns raw output. */
+  gitStatus?: (wtPath: string) => Promise<string>;
+  /** `git add -- openspec/config.yaml` */
+  gitAdd?: (wtPath: string) => Promise<void>;
+  /** `git commit -m <message>` in the worktree. */
+  gitCommit?: (wtPath: string, message: string) => Promise<void>;
+}
+
+async function defaultConfigGitStatus(wtPath: string): Promise<string> {
+  const res = await gitInWorktree(
+    wtPath,
+    ["status", "--porcelain", "--", "openspec/config.yaml"],
+    { ignoreFailure: true },
+  );
+  return res.stdout;
+}
+
+async function defaultConfigGitAdd(wtPath: string): Promise<void> {
+  await gitInWorktree(wtPath, ["add", "--", "openspec/config.yaml"]);
+}
+
+async function defaultConfigGitCommit(wtPath: string, message: string): Promise<void> {
+  await gitInWorktree(wtPath, ["commit", "-m", message]);
+}
+
+/**
+ * When `openspec/config.yaml` is untracked or modified after OpenSpec authoring,
+ * commit it so the test gate does not see it as a dirty file. When the file is
+ * already tracked and unmodified (or absent), this is a no-op (#352).
+ *
+ * The commit is scoped to `openspec/config.yaml` only, carries `Issue:` /
+ * `Pipeline-Run:` trailers, and is placed BEFORE `verifyHarnessCommits` so it
+ * falls inside the verified commit range and satisfies the `allowPattern:
+ * /^openspec\//` guard.
+ */
+export async function commitOpenspecProjectConfig(
+  wtPath: string,
+  issueNumber: number,
+  pipelineRunId: string,
+  deps: CommitOpenspecConfigDeps = {},
+): Promise<void> {
+  const doGitStatus = deps.gitStatus ?? defaultConfigGitStatus;
+  const doGitAdd = deps.gitAdd ?? defaultConfigGitAdd;
+  const doGitCommit = deps.gitCommit ?? defaultConfigGitCommit;
+
+  const status = (await doGitStatus(wtPath)).trim();
+  if (!status) return; // already tracked and unmodified — no-op
+
+  await doGitAdd(wtPath);
+  await doGitCommit(
+    wtPath,
+    withTrailers(`chore: track openspec/config.yaml (#${issueNumber})`, issueNumber, pipelineRunId),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
 // ---------------------------------------------------------------------------
 
@@ -252,7 +316,8 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
   PlanStepDeps &
   ImplementerInvokeDeps &
   ResumeFromImplementingDeps &
-  CrossRepoContextDeps & {
+  CrossRepoContextDeps &
+  CommitOpenspecConfigDeps & {
     getIssueDetail?: typeof getIssueDetail;
     setBlocked?: typeof setBlocked;
     transition?: typeof transition;
@@ -932,6 +997,14 @@ export function makeOpenspecPlanningHooks(
       // Scope to openspec/ so only intent files are staged — aligns with the
       // path-constraint guard below and fixes the sandbox-lock contamination (#321).
       await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore, "openspec/");
+
+      // #352: commit openspec/config.yaml when the CLI left it untracked/modified.
+      // The openspec CLI writes this file lazily (ensureDefaultConfig) on the first
+      // command invocation; the scoped salvage above only runs when HEAD did not
+      // advance, so config.yaml can be left dirty even when the harness committed
+      // its change. Commit it here — AFTER salvage, BEFORE verifyHarnessCommits —
+      // so it falls inside the verified range and satisfies allowPattern:/^openspec\//
+      await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
       // ---- Discover the change the implementer created. ----
       const after = openspec.listChangeDirs(wt.path);

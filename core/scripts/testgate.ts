@@ -80,6 +80,9 @@ export interface TestGateDeps {
     pipelineRunId: string,
     stageLabel: string,
   ) => Promise<boolean>;
+  /** Return raw `git status --porcelain` output for dirty-path surfacing in block
+   *  reasons (#352). Injectable so tests can verify path inclusion without real git. */
+  gitStatusPorcelain?: (cwd: string) => Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +178,7 @@ export async function runTestGate(
   const detectFn = deps.detectTestCommand ?? detectTestCommand;
   const gitHeadFn = deps.gitHead ?? defaultGitHead;
   const gitDirtyFn = deps.gitDirty ?? defaultGitDirty;
+  const gitStatusPorcelainFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
   const verifyTestFixFn =
     deps.verifyTestFix ??
     ((wt: string, hb: string) => enforceTestFixCommitFormat(issueNumber, wt, hb));
@@ -267,13 +271,16 @@ export async function runTestGate(
   // changes exist, what's tested diverges from what's committed, so the gate
   // result can't be trusted.
   if (await gitDirtyFn(wtPath)) {
+    const porcelainOut = truncate((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
+    const pathSuffix = porcelainOut ? `\n\nUncommitted paths:\n${porcelainOut}` : "";
     return {
       skipped: false,
       passed: false,
       attempts: 0,
       blockReason:
         "Worktree has uncommitted changes before the test gate ran. " +
-        "All changes must be committed so test results can be trusted.",
+        "All changes must be committed so test results can be trusted." +
+        pathSuffix,
     };
   }
 
@@ -283,6 +290,8 @@ export async function runTestGate(
     // snapshots, lock-file updates). If it does, the committed state diverges
     // from what was tested — block so artifacts are committed and the gate reruns.
     if (await gitDirtyFn(wtPath)) {
+      const porcelainOut = truncate((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
+      const pathSuffix = porcelainOut ? `\n\nUncommitted paths:\n${porcelainOut}` : "";
       return {
         skipped: false,
         passed: false,
@@ -290,7 +299,8 @@ export async function runTestGate(
         blockReason:
           "Test/build command left uncommitted changes in the working tree. " +
           "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
-          "so the gate certifies the exact committed state.",
+          "so the gate certifies the exact committed state." +
+          pathSuffix,
       };
     }
     console.log(`[pipeline] #${issueNumber}: test gate passed`);
@@ -633,6 +643,11 @@ async function defaultGitHead(cwd: string): Promise<string> {
 async function defaultGitDirty(cwd: string): Promise<boolean> {
   const res = await gitInWorktree(cwd, ["status", "--porcelain"], { ignoreFailure: true });
   return res.stdout.trim().length > 0;
+}
+
+async function defaultGitStatusPorcelain(cwd: string): Promise<string> {
+  const res = await gitInWorktree(cwd, ["status", "--porcelain"], { ignoreFailure: true });
+  return res.stdout;
 }
 
 /** Return the full commit messages for commits reachable from HEAD but not from

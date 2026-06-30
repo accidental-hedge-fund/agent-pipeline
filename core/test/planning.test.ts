@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   buildResearchTopic,
   buildSetupHint,
+  commitOpenspecProjectConfig,
   formatHumanFeedback,
   gatherCarryForward,
   gatherCrossRepoContext,
@@ -21,6 +22,7 @@ import {
   sanitizeBriefForPrompt,
   validateHumanFeedbackAck,
   type CarryForwardDeps,
+  type CommitOpenspecConfigDeps,
   type CrossRepoContextDeps,
   type PlanningPhaseHooks,
 } from "../scripts/stages/planning.ts";
@@ -1382,4 +1384,70 @@ test("gatherCrossRepoContext: injection pattern in label is redacted before prom
   assert.ok(!result.toLowerCase().includes("you are now"), "injection pattern must be redacted from label");
   assert.ok(result.includes("[REDACTED]"), "redaction placeholder must appear in output");
   assert.ok(result.includes("enhancement"), "non-injection label must be preserved");
+});
+
+// ---------------------------------------------------------------------------
+// commitOpenspecProjectConfig — config-commit step (#352)
+// ---------------------------------------------------------------------------
+
+test("commitOpenspecProjectConfig: untracked config.yaml causes gitAdd + gitCommit", async () => {
+  const calls: string[] = [];
+  let committed = false;
+  const deps: CommitOpenspecConfigDeps = {
+    gitStatus: async () => "?? openspec/config.yaml\n",
+    gitAdd: async (p) => { calls.push(`add:${p}`); },
+    gitCommit: async (p, msg) => {
+      calls.push(`commit:${p}`);
+      committed = true;
+      assert.match(msg, /chore: track openspec\/config\.yaml \(#352\)/);
+      assert.match(msg, /Issue: #352/);
+      assert.match(msg, /Pipeline-Run:/);
+    },
+  };
+  await commitOpenspecProjectConfig("/wt/foo", 352, "352/2026-06-30T20:07:51Z", deps);
+  assert.ok(calls.some((c) => c.startsWith("add:")), "gitAdd must be called");
+  assert.ok(committed, "gitCommit must be called");
+});
+
+test("commitOpenspecProjectConfig: modified (not untracked) config.yaml also triggers commit", async () => {
+  // 'M ' indicates a modified tracked file — also needs to be committed.
+  let addCalled = false;
+  let commitCalled = false;
+  const deps: CommitOpenspecConfigDeps = {
+    gitStatus: async () => " M openspec/config.yaml\n",
+    gitAdd: async () => { addCalled = true; },
+    gitCommit: async () => { commitCalled = true; },
+  };
+  await commitOpenspecProjectConfig("/wt/foo", 1, "1/2026-01-01T00:00:00Z", deps);
+  assert.ok(addCalled, "gitAdd must be called for modified file");
+  assert.ok(commitCalled, "gitCommit must be called for modified file");
+});
+
+test("commitOpenspecProjectConfig: no-op when config.yaml already tracked and clean", async () => {
+  // Bites: gitStatus returns "" → neither gitAdd nor gitCommit must be called.
+  let addCalled = false;
+  let commitCalled = false;
+  const deps: CommitOpenspecConfigDeps = {
+    gitStatus: async () => "", // file is clean — nothing to commit
+    gitAdd: async () => { addCalled = true; },
+    gitCommit: async () => { commitCalled = true; },
+  };
+  await commitOpenspecProjectConfig("/wt/foo", 1, "1/2026-01-01T00:00:00Z", deps);
+  assert.ok(!addCalled, "gitAdd must NOT be called when config.yaml is already tracked");
+  assert.ok(!commitCalled, "gitCommit must NOT be called when config.yaml is already tracked");
+});
+
+test("commitOpenspecProjectConfig (bites): no-op path does NOT call gitAdd (condition is correct)", async () => {
+  // The no-op path (empty gitStatus) must skip gitAdd. If the guard condition
+  // were inverted, gitAdd would be called on a clean file and would error in
+  // production (git add fails with nothing to add). This test ensures the
+  // condition is right: empty status → no calls.
+  let addCalled = false;
+  const deps: CommitOpenspecConfigDeps = {
+    gitStatus: async () => "", // already tracked
+    gitAdd: async () => { addCalled = true; },
+    gitCommit: async () => {},
+  };
+  await commitOpenspecProjectConfig("/wt/foo", 1, "1/t", deps);
+  assert.ok(!addCalled, "gitAdd must not be called when status is empty (clean file)");
 });
