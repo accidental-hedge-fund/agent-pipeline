@@ -95,6 +95,9 @@ function makeBaseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): AdvancePreM
     // Default: throw to catch accidental inline gate invocations in tests that
     // don't provide a worktree (getForIssue → null blocks before this is reached).
     runTestGate: async () => { throw new Error("runTestGate should not be called in this test"); },
+    // Default: return SHA_HEAD so the worktree-head check passes in inline-gate tests.
+    // Tests that need a mismatched worktree HEAD must override this.
+    getWorktreeHead: async () => SHA_HEAD,
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},
@@ -292,6 +295,36 @@ test("pre-merge ci_mode: local inline gate passes but attempts>0 → blocks (fix
   assert.ok(
     blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("implementer")),
     `blocked reason must mention ci_mode: local and implementer; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+// Regression: prior inline gate created fix commits (attempts>0) and blocked.
+// User retries without pushing → worktree is ahead of remote PR head.
+// Next run: attempts=0 (commits already there, tests pass first try) but worktree
+// HEAD !== prDetail.head_sha → must block, not advance. (#350 pre-merge finding)
+test("pre-merge ci_mode: local worktree ahead of remote PR head → blocks (retry-without-push regression) (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const emptyEvents: RunEvent[] = [];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 0 }),
+    // Worktree is ahead of remote PR head (prior fix commits not pushed).
+    getWorktreeHead: async () => SHA_PRE_MUTATION,
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "worktree ahead of remote PR head must block");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("worktree")),
+    `blocked reason must mention ci_mode: local and worktree; got: ${blockedReasons.join("; ")}`,
   );
 });
 

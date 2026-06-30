@@ -174,6 +174,10 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
    *  from testgate.ts. Used by the `ci_mode: local` gate when the cached result is
    *  absent or stale (#350). */
   runTestGate?: typeof runTestGate;
+  /** Read the HEAD SHA of a worktree by path. Injected for tests; defaults to
+   *  `git rev-parse HEAD` in the worktree. Used by the `ci_mode: local` inline gate
+   *  to verify the tested commit matches the remote PR head (#350). */
+  getWorktreeHead?: (worktreePath: string) => Promise<string>;
 }
 
 /**
@@ -388,6 +392,26 @@ export async function advance(
           "needs-human",
         );
         return { advanced: false, status: "blocked", reason: "ci_mode: local — inline gate created fix commits; push required" };
+      }
+      // Verify the actual worktree HEAD matches the remote PR head. A prior inline
+      // gate run may have created fix commits (attempts > 0) and blocked; if the user
+      // retries without pushing, those commits remain in the worktree. A subsequent
+      // run passes with attempts === 0 (no new harness calls needed) but tests the
+      // ahead worktree, not the remote PR head. (#350 pre-merge finding)
+      const getWorktreeHeadFn = deps.getWorktreeHead ??
+        ((wt: string) => gitInWorktree(cfg, wt, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()));
+      const worktreeHead = await getWorktreeHeadFn(localWt.path);
+      if (worktreeHead !== prDetail.head_sha) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the local worktree is ahead of the remote PR head " +
+            `(worktree HEAD ${worktreeHead.slice(0, 7)}, PR head ${prDetail.head_sha.slice(0, 7)}). ` +
+            "Push the worktree commits to the PR branch, then re-run the pipeline.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — worktree ahead of PR head; push required" };
       }
       localTestedSha = prDetail.head_sha;
     } else if (tgResult.outcome !== "success") {
