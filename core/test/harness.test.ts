@@ -162,15 +162,42 @@ test("invoke(): claude with sandbox absent (undefined) defaults to bypassPermiss
 test("invoke(): codex with sandbox:true produces args identical to sandbox:false (#21)", async () => {
   const cli = makeScript("codex", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  delete process.env.PIPELINE_CODEX_NO_SANDBOX;
   try {
     const [withSandbox, withoutSandbox] = await Promise.all([
       invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: true }),
       invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: false }),
     ]);
     assert.equal(withSandbox.stdout, withoutSandbox.stdout, "codex args must be identical regardless of sandbox flag");
+    assert.match(withSandbox.stdout, /--full-auto/, "default codex invocation must keep --full-auto");
   } finally {
     process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
+  }
+});
+
+test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbox automation mode", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
+  try {
+    const result = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
+    assert.match(
+      result.stdout,
+      /--dangerously-bypass-approvals-and-sandbox/,
+      "explicit env opt-in must use Codex's no-sandbox automation mode",
+    );
+    assert.doesNotMatch(result.stdout, /--full-auto/, "no-sandbox mode must not also pass --full-auto");
+    assert.match(result.stdout, /test-prompt/, "prompt must still be passed through");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
   }
 });
 
