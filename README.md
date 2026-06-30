@@ -813,7 +813,15 @@ harness_sandbox: true   # claude implementer uses --permission-mode default (san
 
 When `harness_sandbox` is `true`, the claude harness is invoked with `--permission-mode default` instead of `bypassPermissions`. All other flags are unchanged. The codex harness is already workspace-sandboxed via `--full-auto` and is unaffected by this setting in both modes.
 
-**Default** (`harness_sandbox: false` or absent): the invocation is byte-identical to the pre-change behaviour — `--permission-mode bypassPermissions`. No change to existing repos unless you opt in.
+On runners where Codex's bubblewrap/user-namespace sandbox cannot start because the host is already externally sandboxed, set this runner-local environment variable:
+
+```bash
+PIPELINE_CODEX_NO_SANDBOX=1
+```
+
+With that explicit operator opt-in, the codex harness uses Codex's automation no-sandbox mode (`codex exec --dangerously-bypass-approvals-and-sandbox`) instead of `--full-auto`. Use it only when the surrounding worker/supervisor already provides the required isolation.
+
+**Default** (`harness_sandbox: false` or absent, and no `PIPELINE_CODEX_NO_SANDBOX=1`): the invocation is byte-identical to the pre-change behaviour — `--permission-mode bypassPermissions` for claude and `--full-auto` for codex. No change to existing repos unless you opt in.
 
 ## Test/build gate (optional, default on)
 
