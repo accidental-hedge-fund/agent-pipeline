@@ -173,15 +173,15 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
 
 /**
  * Read the most-recent `stage_accounting` event with `harness === "test-gate"`
- * from the run's event log. Returns `"success"` when the latest test-gate event
- * has `outcome === "success"`, `"failure"` when it exists but did not pass, and
- * `null` when no test-gate event exists (run dir absent, log unreadable, or gate
- * never ran). Used by the `ci_mode: local` pre-merge CI gate (#350).
+ * from the run's event log. Returns the outcome and the worktree HEAD SHA that
+ * was recorded at test time (pr_head_sha, if present). Returns `null` when no
+ * test-gate event exists (run dir absent, log unreadable, or gate never ran).
+ * Used by the `ci_mode: local` pre-merge CI gate (#350).
  */
 async function latestTestGateOutcome(
   runDir: string | undefined,
   readRunEventsFn: typeof readEvents,
-): Promise<"success" | "failure" | null> {
+): Promise<{ outcome: "success" | "failure"; prHeadSha: string | null } | null> {
   if (!runDir) return null;
   let events: Awaited<ReturnType<typeof readEvents>>;
   try {
@@ -195,7 +195,10 @@ async function latestTestGateOutcome(
   );
   if (testGateEvents.length === 0) return null;
   const last = testGateEvents[testGateEvents.length - 1]!;
-  return last.outcome === "success" ? "success" : "failure";
+  return {
+    outcome: last.outcome === "success" ? "success" : "failure",
+    prHeadSha: last.pr_head_sha ?? null,
+  };
 }
 
 export async function advance(
@@ -296,9 +299,9 @@ export async function advance(
     // instead of polling GitHub Actions check-runs. The conflict pre-check, mergeability
     // gate, and OpenSpec-validation gate are unaffected and still run below.
     const readRunEventsFn = deps.readRunEvents ?? readEvents;
-    const tgOutcome = await latestTestGateOutcome(opts.runDir, readRunEventsFn);
+    const tgResult = await latestTestGateOutcome(opts.runDir, readRunEventsFn);
 
-    if (tgOutcome === null) {
+    if (tgResult === null) {
       // Fail-closed: no test-gate result for this run → block rather than skip verification.
       await setBlockedFn(
         cfg,
@@ -317,7 +320,7 @@ export async function advance(
       };
     }
 
-    if (tgOutcome !== "success") {
+    if (tgResult.outcome !== "success") {
       await setBlockedFn(
         cfg,
         issueNumber,
@@ -333,17 +336,19 @@ export async function advance(
       };
     }
 
-    // SHA guard: pre-merge mutations (OpenSpec archive commit, BEHIND/conflict rebase)
-    // push new commits and return `waiting`. On the next poll the same passing test-gate
-    // result would be read against a head the gate never tested. When the polling context
-    // recorded a pre-mutation head that now differs from the current PR head, block rather
-    // than certify an untested commit. (#350 review-1 fix)
-    if (opts.pollingCtx?.preArchiveSha && prDetail.head_sha !== opts.pollingCtx.preArchiveSha) {
+    // SHA guard: compare the current PR head to the worktree HEAD SHA recorded
+    // in the test-gate accounting event. This is the exact commit that was tested,
+    // regardless of when pre-merge runs or what pollingCtx captured. If the recorded
+    // SHA is absent (old event without pr_head_sha), or the PR head has moved past
+    // the tested commit (developer push, archive commit, rebase), block rather than
+    // certify an untested commit. (#350 review-2 fix)
+    if (!tgResult.prHeadSha || prDetail.head_sha !== tgResult.prHeadSha) {
+      const testedAt = tgResult.prHeadSha ? tgResult.prHeadSha.slice(0, 7) : "unknown";
       await setBlockedFn(
         cfg,
         issueNumber,
         "ci_mode: local — the PR head changed after the local test gate ran " +
-          `(test gate at ${opts.pollingCtx.preArchiveSha.slice(0, 7)}, ` +
+          `(test gate at ${testedAt}, ` +
           `current head ${prDetail.head_sha.slice(0, 7)}). ` +
           "Re-run the pipeline to run the local test gate against the current head.",
         "pre-merge",

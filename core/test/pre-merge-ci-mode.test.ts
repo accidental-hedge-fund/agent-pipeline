@@ -9,6 +9,8 @@
 //  - ci_mode: local still blocks on a conflicting PR (mergeability gate still runs)
 //  - ci_mode: local blocks when PR head moved after test gate ran (OpenSpec archive scenario)
 //  - ci_mode: local blocks when PR head moved after test gate ran (BEHIND/conflict rebase scenario)
+//  - ci_mode: local blocks when pr_head_sha absent in event (old event format; fail-closed)
+//  - ci_mode: local blocks when developer push moves head before first pre-merge eval (review-2 regression)
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -22,7 +24,10 @@ const SHA_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_PRE_MUTATION = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const PR_NUMBER = 350;
 
-function makeStageAccountingEvent(outcome: "success" | "failure"): StageAccountingEvent {
+function makeStageAccountingEvent(
+  outcome: "success" | "failure",
+  prHeadSha?: string | null,
+): StageAccountingEvent {
   return {
     schema_version: 1,
     type: "stage_accounting",
@@ -42,7 +47,8 @@ function makeStageAccountingEvent(outcome: "success" | "failure"): StageAccounti
     blocker_kind: outcome === "success" ? null : "test-gate-exhausted",
     cost_source: "unknown",
     cost_usd: null,
-  };
+    ...(prHeadSha !== undefined ? { pr_head_sha: prHeadSha } : {}),
+  } as StageAccountingEvent;
 }
 
 function makeCfg(ciMode: "github" | "local" = "github"): PipelineConfig {
@@ -111,7 +117,8 @@ test("pre-merge ci_mode: local with passing test-gate advances without calling g
   t.mock.method(console, "log", () => {});
 
   let getPrChecksCalled = false;
-  const passEvents: RunEvent[] = [makeStageAccountingEvent("success")];
+  // Include pr_head_sha matching the current PR head so the SHA guard passes.
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_HEAD)];
 
   const deps = makeBaseDeps({
     getPrChecks: async () => {
@@ -213,7 +220,7 @@ test("pre-merge ci_mode: local — mergeability gate still runs (conflicting PR 
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
-  const passEvents: RunEvent[] = [makeStageAccountingEvent("success")];
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_HEAD)];
   let getPrDetailCalls = 0;
 
   const deps = makeBaseDeps({
@@ -250,19 +257,20 @@ test("pre-merge ci_mode: local — mergeability gate still runs (conflicting PR 
 });
 
 // ---------------------------------------------------------------------------
-// SHA-aware guard: block when PR head moved after test gate ran (#350 review-1)
+// SHA-aware guard: block when PR head moved after test gate ran (#350 review-2)
 // ---------------------------------------------------------------------------
-// Models the second pre-merge poll iteration after an OpenSpec archive commit pushed
-// a new commit (SHA_HEAD). The test gate ran at SHA_PRE_MUTATION (older head); local
-// mode must block rather than certify the archive head with a stale test-gate result.
+// The guard now uses pr_head_sha recorded IN the test-gate event (not pollingCtx),
+// so it catches head movement that occurs before pollingCtx is populated (e.g. a
+// developer push while review runs → delta review passes → pre-merge is first call).
 
 test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran (archive scenario) (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
-  const passEvents: RunEvent[] = [makeStageAccountingEvent("success")];
+  // Test gate ran at SHA_PRE_MUTATION; event records that tested SHA.
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
 
-  // SHA gate passes: reviewed SHA matches current head (SHA_HEAD).
+  // SHA gate passes: reviewed SHA matches current head (SHA_HEAD, the archive head).
   const reviewCommentWithCurrentHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
 
   const deps = makeBaseDeps({
@@ -280,10 +288,8 @@ test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran
     readRunEvents: async (_runDir: string) => passEvents,
   });
 
-  // pollingCtx.preArchiveSha = SHA_PRE_MUTATION: test gate ran at this older head;
-  // current head (SHA_HEAD) differs → SHA guard must block.
-  const pollingCtx = { preArchiveSha: SHA_PRE_MUTATION };
-  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir", pollingCtx }, deps);
+  // No pollingCtx needed: SHA comes from the event's pr_head_sha field.
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
   assert.equal(out.advanced, false, "must not advance when head moved after test gate ran");
   assert.equal((out as { status: string }).status, "blocked");
@@ -304,7 +310,8 @@ test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
-  const passEvents: RunEvent[] = [makeStageAccountingEvent("success")];
+  // Event records the tested SHA (SHA_PRE_MUTATION, before the rebase).
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
 
   const reviewCommentWithCurrentHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
 
@@ -323,10 +330,7 @@ test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran
     readRunEvents: async (_runDir: string) => passEvents,
   });
 
-  // pollingCtx.preArchiveSha = SHA_PRE_MUTATION: the head captured at pre-merge entry
-  // before the rebase moved HEAD. Current head (SHA_HEAD) differs → SHA guard must block.
-  const pollingCtx = { preArchiveSha: SHA_PRE_MUTATION };
-  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir", pollingCtx }, deps);
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
   assert.equal(out.advanced, false, "must not advance when head moved after test gate ran (rebase)");
   assert.equal((out as { status: string }).status, "blocked");
@@ -335,5 +339,80 @@ test("pre-merge ci_mode: local — blocks when PR head moved after test gate ran
       (r) => r.includes("ci_mode: local") && r.includes("PR head changed"),
     ),
     `blocked reason must mention ci_mode: local and PR head changed; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Regression test: developer push before first pre-merge eval (#350 review-2)
+// ---------------------------------------------------------------------------
+// Scenario: test gate ran at SHA_PRE_MUTATION → developer pushes new commit (SHA_HEAD)
+// → delta review accepts SHA_HEAD → pre-merge first call, pollingCtx unset.
+// With review-1 fix: preArchiveSha captured as SHA_HEAD (current) → SHA guard passes (BUG).
+// With review-2 fix: pr_head_sha in event = SHA_PRE_MUTATION ≠ SHA_HEAD → blocks (CORRECT).
+
+test("pre-merge ci_mode: local — blocks when developer push moves head before first pre-merge eval (#350 review-2)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  // Test gate ran at SHA_PRE_MUTATION and event records that SHA.
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_PRE_MUTATION)];
+
+  // Delta review passed at SHA_HEAD (developer's new commit).
+  const reviewCommentAtNewHead = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
+
+  const deps = makeBaseDeps({
+    getIssueDetail: async () =>
+      ({ comments: [{ body: reviewCommentAtNewHead }] }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
+      >,
+    getPrDetail: async () =>
+      // Current head = SHA_HEAD (developer's push, not the tested commit).
+      ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
+      >,
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async (_runDir: string) => passEvents,
+  });
+
+  // No pollingCtx (first call in this run): preArchiveSha would be set to SHA_HEAD
+  // by the review-1 implementation, making the old guard a no-op. The review-2
+  // fix reads pr_head_sha from the event (SHA_PRE_MUTATION) instead.
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "must not certify untested developer commit");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some(
+      (r) => r.includes("ci_mode: local") && r.includes("PR head changed"),
+    ),
+    `blocked reason must mention ci_mode: local and PR head changed; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed: block when pr_head_sha absent in event (old event format)
+// ---------------------------------------------------------------------------
+
+test("pre-merge ci_mode: local — blocks when event has no pr_head_sha (old format; fail-closed) (#350 review-2)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  // Event without pr_head_sha (legacy format — no second arg).
+  const passEvents: RunEvent[] = [makeStageAccountingEvent("success")];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async (_runDir: string) => passEvents,
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "must not advance when pr_head_sha is absent");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local")),
+    `blocked reason must mention ci_mode: local; got: ${blockedReasons.join("; ")}`,
   );
 });

@@ -689,6 +689,10 @@ export interface StageAccountingRecord {
   prompt_chars?: number | null;
   prompt_estimated_tokens?: number | null;
   usage?: StageAccountingUsage;
+  /** Git HEAD SHA of the worktree at the time the test gate ran. Recorded by
+   *  the test-gate harness so `ci_mode: local` can verify that the current PR
+   *  head matches the commit that was actually tested (#350 review-2). */
+  pr_head_sha?: string | null;
 }
 
 export interface StageAccountingTotals {
