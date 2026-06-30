@@ -1396,17 +1396,33 @@ test("commitOpenspecProjectConfig: untracked config.yaml causes gitAdd + gitComm
   const deps: CommitOpenspecConfigDeps = {
     gitStatus: async () => "?? openspec/config.yaml\n",
     gitAdd: async (p) => { calls.push(`add:${p}`); },
-    gitCommit: async (p, msg) => {
+    gitCommit: async (p, msg, path) => {
       calls.push(`commit:${p}`);
       committed = true;
       assert.match(msg, /chore: track openspec\/config\.yaml \(#352\)/);
       assert.match(msg, /Issue: #352/);
       assert.match(msg, /Pipeline-Run:/);
+      assert.equal(path, "openspec/config.yaml", "gitCommit must receive path-specific arg");
     },
   };
   await commitOpenspecProjectConfig("/wt/foo", 352, "352/2026-06-30T20:07:51Z", deps);
   assert.ok(calls.some((c) => c.startsWith("add:")), "gitAdd must be called");
   assert.ok(committed, "gitCommit must be called");
+});
+
+// Regression: the config commit must be path-specific so unrelated staged files cannot sneak
+// into the commit (#352 pre-merge finding). The gitCommit seam receives "openspec/config.yaml"
+// as the path arg, which the production implementation passes to `git commit -- <path>`.
+test("commitOpenspecProjectConfig: gitCommit seam receives openspec/config.yaml path arg — prevents staged-file sweep (#352 pre-merge finding)", async () => {
+  let receivedPath: string | undefined;
+  const deps: CommitOpenspecConfigDeps = {
+    gitStatus: async () => "?? openspec/config.yaml\n",
+    gitAdd: async () => {},
+    gitCommit: async (_wtPath, _msg, path) => { receivedPath = path; },
+  };
+  await commitOpenspecProjectConfig("/wt/foo", 1, "1/t", deps);
+  assert.equal(receivedPath, "openspec/config.yaml",
+    "gitCommit must receive 'openspec/config.yaml' so the production git commit is path-scoped");
 });
 
 test("commitOpenspecProjectConfig: modified (not untracked) config.yaml also triggers commit", async () => {

@@ -81,8 +81,8 @@ export interface CommitOpenspecConfigDeps {
   gitStatus?: (wtPath: string) => Promise<string>;
   /** `git add -- openspec/config.yaml` */
   gitAdd?: (wtPath: string) => Promise<void>;
-  /** `git commit -m <message>` in the worktree. */
-  gitCommit?: (wtPath: string, message: string) => Promise<void>;
+  /** `git commit -m <message> -- <path>` in the worktree — path is always "openspec/config.yaml". */
+  gitCommit?: (wtPath: string, message: string, path: string) => Promise<void>;
 }
 
 async function defaultConfigGitStatus(wtPath: string): Promise<string> {
@@ -98,8 +98,8 @@ async function defaultConfigGitAdd(wtPath: string): Promise<void> {
   await gitInWorktree(wtPath, ["add", "--", "openspec/config.yaml"]);
 }
 
-async function defaultConfigGitCommit(wtPath: string, message: string): Promise<void> {
-  await gitInWorktree(wtPath, ["commit", "-m", message]);
+async function defaultConfigGitCommit(wtPath: string, message: string, path: string): Promise<void> {
+  await gitInWorktree(wtPath, ["commit", "-m", message, "--", path]);
 }
 
 /**
@@ -129,6 +129,7 @@ export async function commitOpenspecProjectConfig(
   await doGitCommit(
     wtPath,
     withTrailers(`chore: track openspec/config.yaml (#${issueNumber})`, issueNumber, pipelineRunId),
+    "openspec/config.yaml",
   );
 }
 
