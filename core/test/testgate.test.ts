@@ -986,3 +986,93 @@ test("gate (regression / #21, sandbox): harness_sandbox:false keeps opts.sandbox
     assert.equal(opts?.sandbox, false, "sandbox must be false when cfg.harness_sandbox is false");
   }
 });
+
+// ---------------------------------------------------------------------------
+// Dirty-path surfacing in block reasons (#352)
+// ---------------------------------------------------------------------------
+
+test("gate (#352): pre-run dirty block includes offending paths from gitStatusPorcelain", async () => {
+  // Bites test: without gitStatusPorcelain surfacing, the block reason lacks the path.
+  // With it, the reason includes '?? openspec/config.yaml'.
+  const out = await runTestGate(cfgWith({}), 352, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult,
+    gitDirty: async () => true, // dirty from the start
+    gitStatusPorcelain: async () => "?? openspec/config.yaml\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.match(out.blockReason ?? "", /uncommitted/i);
+  assert.match(
+    out.blockReason ?? "",
+    /openspec\/config\.yaml/,
+    "blockReason must name the offending file",
+  );
+  assert.match(out.blockReason ?? "", /Uncommitted paths:/);
+});
+
+test("gate (#352, bites): without gitStatusPorcelain seam, pre-run dirty block omits path info", async () => {
+  // Proves the test above is a real regression guard: before #352 the reason
+  // contained no path text. We simulate 'before the fix' by injecting a seam
+  // that returns empty output, so the paths label is absent.
+  const out = await runTestGate(cfgWith({}), 352, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult,
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "", // simulates missing paths (pre-fix behavior)
+  });
+  assert.equal(out.passed, false);
+  assert.ok(
+    !(out.blockReason ?? "").includes("Uncommitted paths:"),
+    "without paths output, Uncommitted paths: label must be absent",
+  );
+});
+
+test("gate (#352): passing-run-leaves-artifacts block includes offending paths", async () => {
+  let dirtyCall = 0;
+  const out = await runTestGate(cfgWith({}), 352, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult, // passes immediately
+    gitDirty: async () => {
+      dirtyCall++;
+      return dirtyCall > 1; // clean before run, dirty after (artifacts generated)
+    },
+    gitStatusPorcelain: async () => "?? openspec/config.yaml\n?? .tsbuildinfo\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.match(out.blockReason ?? "", /generated artifacts|committed state/i);
+  assert.match(out.blockReason ?? "", /openspec\/config\.yaml/);
+  assert.match(out.blockReason ?? "", /Uncommitted paths:/);
+});
+
+test("gate (#352): long porcelain output is truncated in blockReason", async () => {
+  // A worktree with many dirty files: the list must be capped.
+  const manyPaths = Array.from({ length: 2000 }, (_, i) => `?? file-${i}.ts`).join("\n");
+  const out = await runTestGate(cfgWith({}), 352, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult,
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => manyPaths,
+  });
+  assert.equal(out.passed, false);
+  assert.match(out.blockReason ?? "", /Uncommitted paths:/);
+  // Must be truncated: the raw list (thousands of chars) cannot fit in blockReason.
+  assert.match(out.blockReason ?? "", /output truncated/);
+  assert.ok(
+    (out.blockReason ?? "").length < manyPaths.length,
+    "blockReason must be shorter than the raw porcelain list",
+  );
+});
+
+test("gate (#352): clean worktree leaves no Uncommitted paths label in result", async () => {
+  const out = await runTestGate(cfgWith({}), 352, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => passResult,
+    gitDirty: async () => false,
+    gitStatusPorcelain: async () => "?? should-not-appear.ts\n",
+  });
+  assert.equal(out.passed, true);
+  // No blockReason when the gate passes.
+  assert.ok(!out.blockReason, "passed gate must not have a blockReason");
+});
