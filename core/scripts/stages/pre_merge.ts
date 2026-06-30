@@ -333,6 +333,29 @@ export async function advance(
       };
     }
 
+    // SHA guard: pre-merge mutations (OpenSpec archive commit, BEHIND/conflict rebase)
+    // push new commits and return `waiting`. On the next poll the same passing test-gate
+    // result would be read against a head the gate never tested. When the polling context
+    // recorded a pre-mutation head that now differs from the current PR head, block rather
+    // than certify an untested commit. (#350 review-1 fix)
+    if (opts.pollingCtx?.preArchiveSha && prDetail.head_sha !== opts.pollingCtx.preArchiveSha) {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        "ci_mode: local — the PR head changed after the local test gate ran " +
+          `(test gate at ${opts.pollingCtx.preArchiveSha.slice(0, 7)}, ` +
+          `current head ${prDetail.head_sha.slice(0, 7)}). ` +
+          "Re-run the pipeline to run the local test gate against the current head.",
+        "pre-merge",
+        "needs-human",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "ci_mode: local — PR head moved after test gate ran",
+      };
+    }
+
     console.log(
       `[pipeline] #${issueNumber}: ci_mode: local — local test gate passed; skipping GitHub Actions wait`,
     );

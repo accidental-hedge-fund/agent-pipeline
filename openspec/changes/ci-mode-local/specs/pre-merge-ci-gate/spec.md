@@ -19,11 +19,21 @@ The pre-merge CI gate SHALL consult `cfg.ci_mode` to decide how it verifies CI. 
 
 When `cfg.ci_mode` is `"local"`, the pre-merge gate SHALL read the current run's test-gate outcome from the run store (the `runDir` event log) and SHALL treat a recorded passing test-gate result as the CI signal. When the most-recent recorded test-gate outcome for the current run is a pass, the gate SHALL proceed to the mergeability and OpenSpec-validation steps exactly as the `github` path proceeds after CI passes (it SHALL NOT return early). When the most-recent recorded test-gate outcome is a failure, the gate SHALL NOT advance and SHALL call `setBlocked` with the `needs-human` label and a reason naming the failed local test gate.
 
+The gate SHALL be SHA-aware: when the pre-merge gate detects that the PR head has moved past the head at which the test gate ran (due to a pre-merge mutation such as an OpenSpec archive commit or a BEHIND/conflict rebase pushed in a prior iteration), it SHALL block with `needs-human` and SHALL NOT treat the earlier passing result as certification of the current head. The user SHALL re-run the pipeline to obtain a fresh test-gate result against the mutated head.
+
 #### Scenario: recorded local test-gate pass advances to mergeability
 
 - **WHEN** `cfg.ci_mode` is `"local"` and the current run's most-recent test-gate outcome is a pass
+- **AND** the PR head has not moved since the test gate ran
 - **THEN** the gate SHALL proceed to the mergeability step without calling `getPrChecks`
 - **AND** SHALL NOT block on the CI step
+
+#### Scenario: local mode blocks when PR head moved after test gate ran
+
+- **WHEN** `cfg.ci_mode` is `"local"`, the most-recent test-gate outcome is a pass, but the PR head has moved since the test gate ran (e.g. an OpenSpec archive commit was pushed, or a conflict/BEHIND rebase was performed in a prior pre-merge iteration)
+- **THEN** the gate SHALL call `setBlocked` with label `needs-human` and a reason naming the stale test-gate result and the pre-mutation head
+- **AND** SHALL return `{ advanced: false, status: "blocked" }`
+- **AND** SHALL NOT advance to the mergeability step
 
 #### Scenario: recorded local test-gate failure blocks
 
