@@ -229,7 +229,7 @@ test("pre-merge ci_mode: local no runDir + no worktree → blocks fail-closed (#
   );
 });
 
-test("pre-merge ci_mode: local absent result + worktree + inline gate passes → advances (#350)", async (t) => {
+test("pre-merge ci_mode: local absent result + worktree + inline gate passes (attempts=0) → advances (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const emptyEvents: RunEvent[] = [];
@@ -238,12 +238,61 @@ test("pre-merge ci_mode: local absent result + worktree + inline gate passes →
     getPrChecks: async () => { throw new Error("should not be called"); },
     readRunEvents: async () => emptyEvents,
     getForIssue: async () => FAKE_WT,
-    runTestGate: fakeRunTestGate({ skipped: false, passed: true }),
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 0 }),
   });
 
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
 
-  assert.equal(out.advanced, true, "absent result + inline gate pass must advance");
+  assert.equal(out.advanced, true, "absent result + inline gate pass (attempts=0) must advance");
+});
+
+test("pre-merge ci_mode: local inline gate skipped → blocks fail-closed (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const emptyEvents: RunEvent[] = [];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: true }),
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "skipped inline gate must block fail-closed");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("skipped")),
+    `blocked reason must mention ci_mode: local and skipped; got: ${blockedReasons.join("; ")}`,
+  );
+});
+
+test("pre-merge ci_mode: local inline gate passes but attempts>0 → blocks (fix commits not pushed) (#350)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const emptyEvents: RunEvent[] = [];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    // passed=true but attempts=1 means the implementer ran and may have created commits
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 1 }),
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false, "inline gate with attempts>0 must block (fix commits not pushed)");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("ci_mode: local") && r.includes("implementer")),
+    `blocked reason must mention ci_mode: local and implementer; got: ${blockedReasons.join("; ")}`,
+  );
 });
 
 test("pre-merge ci_mode: local absent result + worktree + inline gate fails → blocks (#350)", async (t) => {
@@ -338,7 +387,7 @@ test("pre-merge ci_mode: local stale SHA + worktree + inline gate passes → adv
     getPrChecks: async () => { throw new Error("should not be called"); },
     readRunEvents: async () => passEvents,
     getForIssue: async () => FAKE_WT,
-    runTestGate: fakeRunTestGate({ skipped: false, passed: true }),
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 0 }),
   });
 
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
@@ -362,7 +411,7 @@ test("pre-merge ci_mode: local stale SHA + worktree + inline gate passes → adv
     getPrChecks: async () => { throw new Error("should not be called"); },
     readRunEvents: async () => passEvents,
     getForIssue: async () => FAKE_WT,
-    runTestGate: fakeRunTestGate({ skipped: false, passed: true }),
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 0 }),
   });
 
   const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);

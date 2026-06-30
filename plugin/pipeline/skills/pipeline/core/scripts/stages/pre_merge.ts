@@ -347,10 +347,20 @@ export async function advance(
         opts.runDir,
       );
       if (inlineResult.skipped) {
-        console.log(
-          `[pipeline] #${issueNumber}: ci_mode: local — inline test gate skipped (gate disabled); treating as pass`,
+        // Fail-closed: skipped means the test gate is disabled or no command was detected.
+        // ci_mode: local must not advance without a verified local exit-0 result.
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the inline local test gate was skipped (test_gate is disabled or no " +
+            "test command was detected). ci_mode: local requires a verified local exit-0 result. " +
+            "Enable test_gate with a test command, or switch to ci_mode: github.",
+          "pre-merge",
+          "needs-human",
         );
-      } else if (!inlineResult.passed) {
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate skipped (fail-closed)" };
+      }
+      if (!inlineResult.passed) {
         await setBlockedFn(
           cfg,
           issueNumber,
@@ -360,6 +370,24 @@ export async function advance(
           "needs-human",
         );
         return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate failed" };
+      }
+      if ((inlineResult.attempts ?? 0) > 0) {
+        // The test gate invoked the implementer harness (test-and-fix mode) and may
+        // have created commits. Those commits exist only in the local worktree and are
+        // not on the remote PR head. Certifying the remote PR head would advance an
+        // untested commit. Block: push the fix commits and re-run the pipeline.
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the inline test gate invoked the implementer harness to fix " +
+            `failing tests (${inlineResult.attempts} attempt(s)). ` +
+            "Any fix commits exist only in the local worktree. " +
+            "Push the fix commits to the PR branch, then re-run the pipeline so the full " +
+            "review → pre-merge path covers the updated code.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline gate created fix commits; push required" };
       }
       localTestedSha = prDetail.head_sha;
     } else if (tgResult.outcome !== "success") {
