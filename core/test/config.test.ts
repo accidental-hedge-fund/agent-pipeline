@@ -1757,3 +1757,50 @@ test("resolveConfig: repo_map unknown sub-key is rejected (strict schema)", asyn
     process.env.PATH = oldPath;
   }
 });
+
+// ---- ci_mode (#350) ----
+
+test("resolveConfig: ci_mode absent defaults to 'github'", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/cim0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.ci_mode, "github");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: ci_mode: local is accepted and resolved correctly", async () => {
+  const repo = makeFakeRepo(`ci_mode: local\n`);
+  const binDir = makeFakeGh("acme/cim1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.ci_mode, "local");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: out-of-enum ci_mode value is rejected with error naming ci_mode", async () => {
+  const repo = makeFakeRepo(`ci_mode: skip\n`);
+  const binDir = makeFakeGh("acme/cim2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("ci_mode"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

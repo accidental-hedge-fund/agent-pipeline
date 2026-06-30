@@ -24,6 +24,7 @@ const PartialConfigSchema = z.object({
   ci_timeout: z.number().int().positive().optional().describe("Seconds to wait for CI at pre-merge."),
   ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
   ci_no_run_grace_s: z.number().int().min(0).optional().describe("Seconds to wait before checking for zero check-runs when CI is pending. Default 60; set to 0 to check immediately."),
+  ci_mode: z.enum(["github", "local"]).optional().describe("Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait."),
   // Each alias is independently optional so a partial `models:` block (e.g.
   // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
   // and the inert-alias warning keys off which sub-keys were explicitly set.
@@ -375,6 +376,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     ci_timeout: fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout,
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
     ci_no_run_grace_s: fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s,
+    ci_mode: fileConfig.ci_mode ?? DEFAULT_CONFIG.ci_mode,
     // Harness roles are profile-relative; the implementer can never be set by
     // repo config (the strict schema rejects a `harnesses:` key outright). The
     // reviewer defaults to the profile's value but is overridden here by the
@@ -1107,6 +1109,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `ci_timeout: ${yamlScalar(config.ci_timeout ?? d.ci_timeout)} # seconds to wait for CI at pre-merge`,
     `ci_poll_interval: ${yamlScalar(config.ci_poll_interval ?? d.ci_poll_interval)} # seconds between CI status polls`,
     `ci_no_run_grace_s: ${yamlScalar(config.ci_no_run_grace_s ?? d.ci_no_run_grace_s)} # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately`,
+    `ci_mode: ${yamlScalar(config.ci_mode ?? d.ci_mode)} # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait`,
     "",
     renderModelLines(config.models),
     "",
@@ -1271,6 +1274,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     ci_timeout: config.ci_timeout ?? d.ci_timeout,
     ci_poll_interval: config.ci_poll_interval ?? d.ci_poll_interval,
     ci_no_run_grace_s: config.ci_no_run_grace_s ?? d.ci_no_run_grace_s,
+    ci_mode: config.ci_mode ?? d.ci_mode,
     models: { ...d.models, ...config.models },
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },

@@ -66,7 +66,8 @@ export {
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
-import type { RunStoreDeps } from "../run-store.ts";
+import { readEvents } from "../run-store.ts";
+import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
@@ -165,6 +166,36 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   /** Sleep for the given ms. Injectable for tests to avoid real waits in
    *  `advancePolling` unit tests; defaults to setTimeout-based sleep. */
   sleepMs?: (ms: number) => Promise<void>;
+  /** Read events from the run-store JSONL log. Injected for tests; defaults to
+   *  `readEvents` from run-store.ts. Used by the `ci_mode: local` gate (#350). */
+  readRunEvents?: typeof readEvents;
+}
+
+/**
+ * Read the most-recent `stage_accounting` event with `harness === "test-gate"`
+ * from the run's event log. Returns `"success"` when the latest test-gate event
+ * has `outcome === "success"`, `"failure"` when it exists but did not pass, and
+ * `null` when no test-gate event exists (run dir absent, log unreadable, or gate
+ * never ran). Used by the `ci_mode: local` pre-merge CI gate (#350).
+ */
+async function latestTestGateOutcome(
+  runDir: string | undefined,
+  readRunEventsFn: typeof readEvents,
+): Promise<"success" | "failure" | null> {
+  if (!runDir) return null;
+  let events: Awaited<ReturnType<typeof readEvents>>;
+  try {
+    events = await readRunEventsFn(runDir);
+  } catch {
+    return null;
+  }
+  const testGateEvents = events.filter(
+    (e): e is StageAccountingEvent =>
+      e.type === "stage_accounting" && (e as StageAccountingEvent).harness === "test-gate",
+  );
+  if (testGateEvents.length === 0) return null;
+  const last = testGateEvents[testGateEvents.length - 1]!;
+  return last.outcome === "success" ? "success" : "failure";
 }
 
 export async function advance(
@@ -260,87 +291,137 @@ export async function advance(
   }
 
   // ---- Step 1: CI ----
-  let checks;
-  try {
-    checks = await getPrChecksFn(cfg, prNumber);
-  } catch (err) {
-    const e = err as Error;
-    return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
-  }
+  if ((cfg.ci_mode ?? "github") === "local") {
+    // Local mode (#350): verify CI using the current run's recorded test-gate outcome
+    // instead of polling GitHub Actions check-runs. The conflict pre-check, mergeability
+    // gate, and OpenSpec-validation gate are unaffected and still run below.
+    const readRunEventsFn = deps.readRunEvents ?? readEvents;
+    const tgOutcome = await latestTestGateOutcome(opts.runDir, readRunEventsFn);
 
-  const agg = parseChecksAggregate(checks);
-
-  // Record CI check result evidence; skip when still pending (no result yet).
-  if (opts.stateDir && !agg.pending) {
-    const ciSummary = agg.failed.length > 0
-      ? agg.failed.map((c) => `${c.name}: ${c.bucket}`).join(", ")
-      : `all ${checks.length} check(s) passed`;
-    await recordCommand(
-      opts.stateDir,
-      issueNumber,
-      "pre-merge",
-      makeCommandRecord(`gh pr checks #${prNumber}`, agg.failed.length > 0 ? 1 : 0, 0, ciSummary),
-    ).catch(() => {});
-  }
-
-  if (agg.pending) {
-    // No-run recovery (#281): when GitHub Actions never fires a run for the head
-    // SHA (e.g. after an archive-only commit), `getPrChecks` returns a stale
-    // pending state indefinitely. After the grace window, query the check-runs API
-    // directly. Zero runs → enter recovery rather than polling out ci_timeout.
-    // Only active when a polling context is present (advancePolling session).
-    const ctx = opts.pollingCtx;
-    if (ctx) {
-      const headSha = prDetail.head_sha;
-      if (ctx.ciGateEnteredAt === undefined) ctx.ciGateEnteredAt = nowMsFn();
-      const elapsed = nowMsFn() - ctx.ciGateEnteredAt;
-      if (elapsed >= (cfg.ci_no_run_grace_s ?? 60) * 1000) {
-        let runCount: number;
-        try {
-          runCount = await getHeadCheckRunCountFn(cfg, headSha);
-        } catch {
-          runCount = -1; // API failure → treat as "runs exist" (conservative-open)
-        }
-        if (runCount === 0) {
-          return handleZeroRunRecovery(cfg, issueNumber, prNumber, headSha, ctx,
-            setBlockedFn, closePrFn, reopenPrFn, getSuccessfulCheckRunCountFn, getDiffFilePathsFn);
-        }
-      }
+    if (tgOutcome === null) {
+      // Fail-closed: no test-gate result for this run → block rather than skip verification.
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        "ci_mode: local is set but no local test-gate result was found for this run. " +
+          "The test gate must have completed before the pre-merge gate can proceed. " +
+          "Ensure the test gate ran (check that test_gate.enabled is true and a command is " +
+          "detected or configured), or switch to ci_mode: github to wait for GitHub Actions.",
+        "pre-merge",
+        "needs-human",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "ci_mode: local — no test-gate result for this run",
+      };
     }
-    return { advanced: false, status: "waiting", reason: "CI still running" };
-  }
 
-  if (agg.failed.length > 0) {
-    const wt = await getForIssueFn(cfg, issueNumber);
-    const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
-    if (!alreadyRebased && wt) {
-      const ok = await tryRebaseAndPushFn(cfg, issueNumber);
-      if (opts.stateDir) {
-        await recordCommand(
-          opts.stateDir,
-          issueNumber,
-          "pre-merge",
-          makeCommandRecord(
-            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
-            ok ? 0 : 1,
-            0,
-            ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
-          ),
-        ).catch(() => {});
-      }
-      if (ok) {
-        markRebaseAttemptedFn(wt.path);
-        return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
-      }
+    if (tgOutcome !== "success") {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        "ci_mode: local is set but the most recent local test-gate result is a failure. " +
+          "Fix the failing tests, push a new commit to re-run the test gate, then re-run the pipeline.",
+        "pre-merge",
+        "needs-human",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "ci_mode: local — local test gate failed",
+      };
     }
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
-      "pre-merge",
-      "needs-human",
+
+    console.log(
+      `[pipeline] #${issueNumber}: ci_mode: local — local test gate passed; skipping GitHub Actions wait`,
     );
-    return { advanced: false, status: "blocked", reason: "CI failed" };
+    // Local test gate passed: fall through to Step 2 (mergeability) and Step 2.5 (OpenSpec).
+    // Do NOT return early — the downstream gates must still run.
+  } else {
+    // github mode (default): poll GitHub Actions check-runs.
+    let checks;
+    try {
+      checks = await getPrChecksFn(cfg, prNumber);
+    } catch (err) {
+      const e = err as Error;
+      return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
+    }
+
+    const agg = parseChecksAggregate(checks);
+
+    // Record CI check result evidence; skip when still pending (no result yet).
+    if (opts.stateDir && !agg.pending) {
+      const ciSummary = agg.failed.length > 0
+        ? agg.failed.map((c) => `${c.name}: ${c.bucket}`).join(", ")
+        : `all ${checks.length} check(s) passed`;
+      await recordCommand(
+        opts.stateDir,
+        issueNumber,
+        "pre-merge",
+        makeCommandRecord(`gh pr checks #${prNumber}`, agg.failed.length > 0 ? 1 : 0, 0, ciSummary),
+      ).catch(() => {});
+    }
+
+    if (agg.pending) {
+      // No-run recovery (#281): when GitHub Actions never fires a run for the head
+      // SHA (e.g. after an archive-only commit), `getPrChecks` returns a stale
+      // pending state indefinitely. After the grace window, query the check-runs API
+      // directly. Zero runs → enter recovery rather than polling out ci_timeout.
+      // Only active when a polling context is present (advancePolling session).
+      const ctx = opts.pollingCtx;
+      if (ctx) {
+        const headSha = prDetail.head_sha;
+        if (ctx.ciGateEnteredAt === undefined) ctx.ciGateEnteredAt = nowMsFn();
+        const elapsed = nowMsFn() - ctx.ciGateEnteredAt;
+        if (elapsed >= (cfg.ci_no_run_grace_s ?? 60) * 1000) {
+          let runCount: number;
+          try {
+            runCount = await getHeadCheckRunCountFn(cfg, headSha);
+          } catch {
+            runCount = -1; // API failure → treat as "runs exist" (conservative-open)
+          }
+          if (runCount === 0) {
+            return handleZeroRunRecovery(cfg, issueNumber, prNumber, headSha, ctx,
+              setBlockedFn, closePrFn, reopenPrFn, getSuccessfulCheckRunCountFn, getDiffFilePathsFn);
+          }
+        }
+      }
+      return { advanced: false, status: "waiting", reason: "CI still running" };
+    }
+
+    if (agg.failed.length > 0) {
+      const wt = await getForIssueFn(cfg, issueNumber);
+      const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
+      if (!alreadyRebased && wt) {
+        const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+        if (opts.stateDir) {
+          await recordCommand(
+            opts.stateDir,
+            issueNumber,
+            "pre-merge",
+            makeCommandRecord(
+              `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+              ok ? 0 : 1,
+              0,
+              ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
+            ),
+          ).catch(() => {});
+        }
+        if (ok) {
+          markRebaseAttemptedFn(wt.path);
+          return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+        }
+      }
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
+        "pre-merge",
+        "needs-human",
+      );
+      return { advanced: false, status: "blocked", reason: "CI failed" };
+    }
   }
 
   // ---- Step 2: mergeability ----

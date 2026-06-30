@@ -628,6 +628,7 @@ base_branch: main
 worktree_root: .worktrees
 review_timeout: 1200
 ci_timeout: 900
+ci_mode: github                    # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait (see "ci_mode: local" below)
 intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
 sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
 models:                            # per-phase model alias — only the claude harness honors these
@@ -702,6 +703,25 @@ When set, every review round (plan-review, review-1, review-2) invokes `my-revie
 - **Be an installed/authenticated CLI** — no API key is introduced; like `claude`/`codex`, the reviewer brings its own auth.
 
 If the configured CLI is **not installed or not executable**, the review step fails with a specific, named reason (`reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH`) and the [same-harness fallback](#prerequisites) applies — the implementing harness reviews instead, prominently labeled. When `review_harness` is absent, the profile's reviewer is used unchanged.
+
+### Local CI mode (`ci_mode: local`)
+
+By default (`ci_mode: github`) the pre-merge gate polls `gh pr checks` and waits for GitHub Actions to pass before advancing. For repos where the local gate (`npm run ci`, `pnpm test`, etc.) is **identical** to what Actions runs, this is a redundant second run of the same command. Set `ci_mode: local` to skip the GitHub Actions wait and rely on the current pipeline run's local test-gate result instead:
+
+```yaml
+ci_mode: local   # default: github
+```
+
+**When `ci_mode: local`:**
+- The pre-merge gate reads the current run's test-gate outcome from the run store instead of polling `gh pr checks`.
+- If the test gate passed in this run, pre-merge advances to the mergeability and OpenSpec-validation steps (those still run in both modes).
+- If the test gate failed, or if no test-gate result is recorded for this run (gate skipped, disabled, or log unreadable), the gate blocks with a clear message rather than silently skipping verification — it never advances with zero verification.
+
+**Operator responsibility:** only enable `ci_mode: local` when:
+- The local gate (`test_gate.command` or auto-detected) runs the same checks as GitHub Actions.
+- Branch protection rules are set appropriately for your team — the pipeline stops at `pipeline:ready-to-deploy` regardless of `ci_mode`; a human still merges the PR.
+
+For repos with matrix builds, environment-specific secrets, or CI steps that differ from the local command, stay on `ci_mode: github` (the default).
 
 ## Preflight (doctor)
 

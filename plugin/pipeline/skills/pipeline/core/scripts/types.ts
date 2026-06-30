@@ -189,6 +189,12 @@ export interface PipelineConfig {
   ci_timeout: number;
   ci_poll_interval: number;
   ci_no_run_grace_s: number;
+  // Pre-merge CI verification source (#350). "github" (default) waits for GitHub
+  // Actions check-runs via `gh pr checks`. "local" relies on the current run's
+  // recorded test-gate outcome and skips the GitHub Actions wait entirely.
+  // Only enable "local" when the local gate is identical to full CI and branch
+  // protection is operator-managed.
+  ci_mode: "github" | "local";
   // Harness roles + models. The implementer is always taken from the active
   // profile (repo config cannot set it). The reviewer defaults to the profile's
   // value but MAY be overridden per-repo by the `review_harness` config key
@@ -409,6 +415,7 @@ export const DEFAULT_CONFIG: Omit<
   ci_timeout: 900,
   ci_poll_interval: 30,
   ci_no_run_grace_s: 60,
+  ci_mode: "github",
   models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
