@@ -23,11 +23,14 @@ import {
 import {
   codeAlignmentBlockReason,
   enforceSpecConsistencyGuard,
+  performBoundedSpecRepair,
   specDeltaAlignmentBlockReason,
   specDeltaIsStale,
   type BoundedRepairResult,
   type FixCommit,
+  type InvokeFn,
   type SpecConsistencyDeps,
+  type ValidateFn,
 } from "../scripts/openspec-consistency.ts";
 import { formatReviewComment } from "../scripts/stages/review-rendering.ts";
 import {
@@ -481,10 +484,15 @@ test("guard: stale but no spec-divergence marker in latest review → not blocke
 test("guard: guard runs at pre-merge time via maybeArchiveOpenspec (stale-delta guard active)", async () => {
   // Verify the guard is still active at archive time: spec-behind-code stale delta
   // must block before archive is called.
+  // The review body must include a reviewed-sha that matches the mocked HEAD so the
+  // guard sees positive evidence the marker is current (#356 finding 2).
+  const HEAD_SHA = "aabbccddeeff00112233445566778899aabbccdd";
   const reviewBody = [
     "## Review 2 (Adversarial) — needs-attention",
     `**1. [HIGH] spec stale** \`override-key: deadbeef\``,
     ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
   ].join("\n");
 
   const archiveCalls: string[] = [];
@@ -493,6 +501,7 @@ test("guard: guard runs at pre-merge time via maybeArchiveOpenspec (stale-delta 
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
     gitInWorktree: (async (_wt: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
       if (args[0] === "diff" && args.some((a: string) => a.includes("..."))) {
         return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
       }
@@ -589,10 +598,15 @@ test("regression finding-2: spec-behind-code marker is valid when review SHA mat
 test("production path (pre-merge): maybeArchiveOpenspec calls attemptBoundedRepair for spec-behind-code", async () => {
   // Verify that maybeArchiveOpenspec wires the repair dep. When deps.attemptBoundedRepair
   // is provided, the guard must call it (not block immediately without attempting repair).
+  // The review body includes a reviewed-sha matching the mocked HEAD so the guard sees
+  // positive evidence the marker is current (#356 finding 2).
+  const HEAD_SHA = "deadbeef1122334455667788990011aabbccdd33";
   const reviewBody = [
     "## Review 2 — needs-attention",
     `**1. [HIGH] spec stale** \`override-key: deadbeef\``,
     ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
   ].join("\n");
 
   const repairCalls: string[] = [];
@@ -600,6 +614,7 @@ test("production path (pre-merge): maybeArchiveOpenspec calls attemptBoundedRepa
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
     gitInWorktree: (async (_wt: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
       if (args[0] === "diff" && args.some((a: string) => a.includes("..."))) {
         return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
       }
@@ -624,4 +639,195 @@ test("production path (pre-merge): maybeArchiveOpenspec calls attemptBoundedRepa
   assert.ok(out && !out.advanced && out.status === "blocked",
     "must block when repair returns still-stale");
   assert.match(out.reason ?? "", /stale-delta guard still shows/);
+});
+
+// ---- Finding 2 regression: no reviewed-sha in review body (#356) ----
+
+test("regression finding-2: spec-behind-code marker with no reviewed-sha is unclassified when getHeadSha is wired", async () => {
+  // Scenario: the review body has a spec-behind-code direction marker but NO
+  // <!-- reviewed-sha: ... --> sentinel (old-format review or manually crafted).
+  // When getHeadSha IS provided, the guard cannot confirm the marker is current →
+  // treat as unclassified → no block. This is the "no current-head signal" case.
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: abc12345\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    // Deliberately omit <!-- reviewed-sha: ... -->
+  ].join("\n");
+
+  const blocked: string[] = [];
+  const deps: SpecConsistencyDeps = {
+    branchDeveloperCommits: async () => [spec("a"), impl("b")], // structurally stale
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+    })) as unknown as SpecConsistencyDeps["getIssueDetail"],
+    setBlocked: (async (_c: unknown, _n: unknown, reason: string) => {
+      blocked.push(reason);
+    }) as unknown as SpecConsistencyDeps["setBlocked"],
+    getHeadSha: async () => "current-head-sha-1234567890ab",
+    // No reviewed-sha in review body → cannot confirm the marker is current
+  };
+
+  const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
+  assert.equal(out, null,
+    "guard must return null when review body has no reviewed-sha (no positive evidence the marker is current)");
+  assert.deepEqual(blocked, [], "setBlocked must NOT be called");
+});
+
+// ---- Finding 1: production-path tests for performBoundedSpecRepair (#356) ----
+
+const repairCfg = {
+  base_branch: "main",
+  repo: "acme/x",
+  repo_dir: "/repo",
+  fix_timeout: 120,
+  models: {},
+  harness_sandbox: false,
+  harnesses: { implementer: "claude", reviewer: "codex" },
+} as unknown as PipelineConfig;
+
+const successInvokeFn: InvokeFn = async () => ({ success: true, output: "" });
+const failInvokeFn: InvokeFn = async () => ({ success: false, output: "harness error" });
+const passValidateFn: ValidateFn = async () => ({ valid: true, issues: [], unavailable: false, raw: "" });
+const failValidateFn: ValidateFn = async () => ({ valid: false, issues: [{ level: "error", message: "missing SHALL", path: [] }], unavailable: false, raw: "" });
+
+function makeStatefulGit(
+  allowedSpecFile: string,
+  opts: { headChanges?: boolean; statusFiles?: string[]; disallowedFile?: string } = {},
+): typeof import("../scripts/worktree.ts").gitInWorktree {
+  let revParseCount = 0;
+  const SHA_BEFORE = "sha-before-aabbccddeeff0011";
+  const SHA_AFTER = opts.headChanges ? "sha-after-112233445566" : SHA_BEFORE;
+  return async (_wt: string, args: string[]) => {
+    const cmd = args[0];
+    if (cmd === "rev-parse") {
+      revParseCount++;
+      const sha = revParseCount === 1 ? SHA_BEFORE : SHA_AFTER;
+      return { stdout: sha + "\n", stderr: "", code: 0 };
+    }
+    if (cmd === "diff" && args[1] === "--name-only") {
+      const files = opts.disallowedFile
+        ? `${allowedSpecFile}\n${opts.disallowedFile}`
+        : opts.headChanges ? allowedSpecFile : "";
+      return { stdout: files, stderr: "", code: 0 };
+    }
+    if (cmd === "status") {
+      const lines = (opts.statusFiles ?? []).map((f) => `M  ${f}`).join("\n");
+      return { stdout: lines ? lines + "\n" : "", stderr: "", code: 0 };
+    }
+    // add / commit / reset / clean — always succeed
+    return { stdout: "", stderr: "", code: 0 };
+  };
+}
+
+test("performBoundedSpecRepair: no implementer configured → error", async () => {
+  const noCfg = { ...repairCfg, harnesses: undefined } as unknown as PipelineConfig;
+  const result = await performBoundedSpecRepair(
+    noCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(`openspec/changes/${ID}/specs/cap/spec.md`),
+    async () => [],
+    successInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(result, "error");
+});
+
+test("performBoundedSpecRepair: harness invocation fails → error", async () => {
+  const result = await performBoundedSpecRepair(
+    repairCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(`openspec/changes/${ID}/specs/cap/spec.md`),
+    async () => [],
+    failInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(result, "error");
+});
+
+test("performBoundedSpecRepair: harness makes no changes → not-verifiable", async () => {
+  // HEAD unchanged, status is clean → nothing to inspect → harness couldn't repair
+  const result = await performBoundedSpecRepair(
+    repairCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(`openspec/changes/${ID}/specs/cap/spec.md`, { headChanges: false, statusFiles: [] }),
+    async () => [],
+    successInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(result, "not-verifiable");
+});
+
+test("performBoundedSpecRepair: harness changes disallowed file → disallowed-files", async () => {
+  const specFile = `openspec/changes/${ID}/specs/cap/spec.md`;
+  const result = await performBoundedSpecRepair(
+    repairCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(specFile, { statusFiles: [specFile, "core/scripts/bad.ts"] }),
+    async () => [],
+    successInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(result, "disallowed-files");
+});
+
+test("performBoundedSpecRepair: allow-list respected, validate fails → invalid", async () => {
+  const specFile = `openspec/changes/${ID}/specs/cap/spec.md`;
+  const result = await performBoundedSpecRepair(
+    repairCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(specFile, { statusFiles: [specFile] }),
+    async () => [],
+    successInvokeFn,
+    failValidateFn,
+  );
+  assert.equal(result, "invalid");
+});
+
+test("performBoundedSpecRepair: valid repair, guard re-run clears staleness → cleared", async () => {
+  const specFile = `openspec/changes/${ID}/specs/cap/spec.md`;
+  // After repair the spec commit is after all impl commits → not stale
+  const branchDevFn = async () => [impl("impl-a"), spec("spec-b-after-repair")];
+  const result = await performBoundedSpecRepair(
+    repairCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(specFile, { statusFiles: [specFile] }),
+    branchDevFn,
+    successInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(result, "cleared");
+});
+
+test("performBoundedSpecRepair: valid repair, guard re-run still stale → still-stale", async () => {
+  const specFile = `openspec/changes/${ID}/specs/cap/spec.md`;
+  // After repair, impl is still after spec in commit order
+  const branchDevFn = async () => [spec("spec-a"), impl("impl-b-still-after")];
+  const result = await performBoundedSpecRepair(
+    repairCfg, ID, 1, "run1", "/wt",
+    makeStatefulGit(specFile, { statusFiles: [specFile] }),
+    branchDevFn,
+    successInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(result, "still-stale");
+});
+
+test("performBoundedSpecRepair: commit message carries Issue and Pipeline-Run trailers", async () => {
+  const specFile = `openspec/changes/${ID}/specs/cap/spec.md`;
+  const commitMessages: string[] = [];
+  const gitFnCapture = async (_wt: string, args: string[]) => {
+    if (args[0] === "rev-parse") return { stdout: "sha-fixed\n", stderr: "", code: 0 };
+    if (args[0] === "status") return { stdout: `M  ${specFile}\n`, stderr: "", code: 0 };
+    if (args[0] === "commit") {
+      const msgIdx = args.indexOf("-m");
+      if (msgIdx !== -1) commitMessages.push(args[msgIdx + 1] ?? "");
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  };
+  // No branchDevFn cleanup needed — we just check trailers
+  await performBoundedSpecRepair(
+    repairCfg, ID, 356, "356/2026-01-01T00:00:00Z", "/wt",
+    gitFnCapture as unknown as typeof import("../scripts/worktree.ts").gitInWorktree,
+    async () => [impl("a"), spec("b")], // not stale after repair
+    successInvokeFn,
+    passValidateFn,
+  );
+  assert.equal(commitMessages.length, 1, "exactly one commit must be made");
+  assert.match(commitMessages[0] ?? "", /Issue: #356/, "commit message must carry Issue: trailer");
+  assert.match(commitMessages[0] ?? "", /Pipeline-Run: 356\/2026-01-01T00:00:00Z/, "commit message must carry Pipeline-Run: trailer");
 });

@@ -147,10 +147,20 @@ test("guard: latest delta review has spec-divergence marker (spec-behind-code) b
 
 test("computeBranchDeveloperCommits (via guard): auto-format commit changing impl files IS visible to stale-spec guard", async () => {
   const blocked: string[] = [];
+  // The review body must include a reviewed-sha matching what fakeGit returns for
+  // rev-parse HEAD so the guard sees positive evidence the marker is current (#356).
+  const HEAD_SHA = "aabbccddeeff11223344556677889900aabbccdd";
+  const reviewBodyWithSha = [
+    reviewWithMarker.trimEnd(),
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
   // Build a fake log: one auto-format commit that touches an implementation file.
   // gitInWorktree is called for: "diff --name-only" (candidates), "log" (commits), and
   // "diff --name-only sha^..sha" (per-commit paths). We discriminate by the args.
   const fakeGit = (async (_wt: string, args: string[]) => {
+    // 0. rev-parse HEAD for the SHA correlation check (#356 finding 2)
+    if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
     // 1. diff for candidates (three-dot form: origin/main...HEAD)
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
       return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
@@ -175,7 +185,7 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
     changeDirExists: () => true,
     // No branchDeveloperCommits override → uses computeBranchDeveloperCommits default
     getIssueDetail: (async () => ({
-      comments: [{ author: "r", body: reviewWithMarker, createdAt: "t" }],
+      comments: [{ author: "r", body: reviewBodyWithSha, createdAt: "t" }],
     })) as AdvancePreMergeDeps["getIssueDetail"],
     setBlocked: (async (_c, _n, reason: string) => {
       blocked.push(reason);
@@ -422,19 +432,29 @@ test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty 
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
 
 test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, archive never called", async () => {
+  // The review body includes a reviewed-sha matching the mocked HEAD so the guard
+  // has positive evidence the marker is current before blocking (#356 finding 2).
+  const HEAD_SHA = "1122334455667788990011223344556677889900";
+  const reviewBodyWithSha = [
+    reviewWithMarker.trimEnd(),
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
   const archiveCalls: string[] = [];
   const blocked: string[] = [];
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
-    gitInWorktree: (async (_p: string, args: string[]) =>
-      args[0] === "diff" && args.includes("--name-only")
-        ? { stdout: `openspec/changes/${ID}/specs/cap/spec.md\ncore/scripts/foo.ts`, stderr: "", code: 0 }
-        : { stdout: "", stderr: "", code: 0 }) as AdvancePreMergeDeps["gitInWorktree"],
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
+      if (args[0] === "diff" && args.includes("--name-only"))
+        return { stdout: `openspec/changes/${ID}/specs/cap/spec.md\ncore/scripts/foo.ts`, stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [impl("a")],
     getIssueDetail: (async () => ({
-      comments: [{ author: "r", body: reviewWithMarker, createdAt: "t" }],
+      comments: [{ author: "r", body: reviewBodyWithSha, createdAt: "t" }],
     })) as AdvancePreMergeDeps["getIssueDetail"],
     setBlocked: (async (_c, _n, reason: string) => {
       blocked.push(reason);

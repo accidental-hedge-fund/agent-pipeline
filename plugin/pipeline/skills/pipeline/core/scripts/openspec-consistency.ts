@@ -120,9 +120,12 @@ export async function enforceSpecConsistencyGuard(
     const headSha = await deps.getHeadSha(wtPath);
     const reviewShaResult = extractReviewedSha([{ body: reviewBody }]);
     const reviewedSha = reviewShaResult?.sha ?? null;
-    if (reviewedSha && headSha && reviewedSha !== headSha) {
-      // The review was done on a different commit than the current HEAD.
-      // The direction marker does not correspond to the post-fix state.
+    if (!reviewedSha || !headSha || reviewedSha !== headSha) {
+      // Cannot confirm the direction marker corresponds to the current post-fix state:
+      // either the review body has no reviewed-sha (no current-head signal from the
+      // review side), HEAD SHA is unavailable, or the review predates the latest commit.
+      // Per spec (#356): the guard SHALL treat a direction as unclassified unless it
+      // has positive evidence the marker is current; absent positive evidence, do not block.
       return null;
     }
   }
