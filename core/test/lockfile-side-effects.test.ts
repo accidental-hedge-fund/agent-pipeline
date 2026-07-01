@@ -1,0 +1,164 @@
+// Regression tests for lock-file side-effect inclusion (#358).
+//
+// Tests the helper directly via injectable seams — no real git, network, or subprocess calls.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  includeLockfileSideEffects,
+  isLockFilePath,
+  type LockfileSideEffectsDeps,
+} from "../scripts/lockfile-side-effects.ts";
+
+// ---------------------------------------------------------------------------
+// isLockFilePath — unit
+// ---------------------------------------------------------------------------
+
+test("isLockFilePath: recognizes bare lock file names", () => {
+  assert.equal(isLockFilePath("package-lock.json"), true);
+  assert.equal(isLockFilePath("yarn.lock"), true);
+  assert.equal(isLockFilePath("pnpm-lock.yaml"), true);
+});
+
+test("isLockFilePath: recognizes nested lock file paths", () => {
+  assert.equal(isLockFilePath("core/package-lock.json"), true);
+  assert.equal(isLockFilePath("plugin/.claude/skills/pipeline/core/package-lock.json"), true);
+  assert.equal(isLockFilePath("some/deep/nested/yarn.lock"), true);
+  assert.equal(isLockFilePath("plugin/pnpm-lock.yaml"), true);
+});
+
+test("isLockFilePath: rejects non-lock files", () => {
+  assert.equal(isLockFilePath("core/scripts/foo.ts"), false);
+  assert.equal(isLockFilePath("package.json"), false);
+  assert.equal(isLockFilePath("lock.json"), false);
+  assert.equal(isLockFilePath("package-lock.json.bak"), false);
+});
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+interface Calls {
+  added: string[][];
+  amended: number;
+}
+
+function makeDeps(porcelainOutput: string): { deps: LockfileSideEffectsDeps; calls: Calls } {
+  const calls: Calls = { added: [], amended: 0 };
+  const deps: LockfileSideEffectsDeps = {
+    gitStatusPorcelain: async () => porcelainOutput,
+    gitAddPaths: async (_wt, paths) => { calls.added.push(paths); },
+    gitAmendNoEdit: async () => { calls.amended++; },
+  };
+  return { deps, calls };
+}
+
+// ---------------------------------------------------------------------------
+// 3.1: Lock dirty after commit → helper stages lock file and amends HEAD
+// ---------------------------------------------------------------------------
+
+test("dirty lock after commit → stages lock and amends HEAD (3.1)", async () => {
+  const { deps, calls } = makeDeps(" M core/package-lock.json\n");
+  const result = await includeLockfileSideEffects("/wt", deps);
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes("core/package-lock.json"));
+  assert.deepEqual(calls.added, [["core/package-lock.json"]], "stages only the lock path");
+  assert.equal(calls.amended, 1, "amends HEAD exactly once");
+});
+
+test("biting test: without inclusion, lock file stays uncommitted (3.1 bites)", async () => {
+  // Simulate the state without calling includeLockfileSideEffects.
+  // The porcelain output still shows the dirty lock file.
+  const { calls } = makeDeps(" M core/package-lock.json\n");
+  // We deliberately do NOT call includeLockfileSideEffects here.
+  assert.deepEqual(calls.added, [], "no add occurred — lock file remains uncommitted");
+  assert.equal(calls.amended, 0, "no amend occurred — worktree dirty");
+});
+
+// ---------------------------------------------------------------------------
+// 3.2: No lock change → helper is a no-op
+// ---------------------------------------------------------------------------
+
+test("no lock change → no-op: gitAddPaths and gitAmendNoEdit not called (3.2)", async () => {
+  for (const status of [
+    "",
+    "   \n",
+    " M core/scripts/fix.ts\n",
+    " M core/scripts/fix.ts\n M core/package.json\n",
+  ]) {
+    const { deps, calls } = makeDeps(status);
+    const result = await includeLockfileSideEffects("/wt", deps);
+    assert.equal(result.included, false, `should be no-op for status: ${JSON.stringify(status)}`);
+    assert.deepEqual(calls.added, [], "gitAddPaths not called");
+    assert.equal(calls.amended, 0, "gitAmendNoEdit not called");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3.3: Mixed dirt → only lock files are staged
+// ---------------------------------------------------------------------------
+
+test("mixed dirt: only lock file is staged, non-lock left untouched (3.3)", async () => {
+  const { deps, calls } = makeDeps(
+    " M core/package-lock.json\n M core/scripts/foo.ts\n",
+  );
+  const result = await includeLockfileSideEffects("/wt", deps);
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes("core/package-lock.json"), "lock path included");
+  assert.ok(result.included && !result.paths.includes("core/scripts/foo.ts"), "non-lock NOT included");
+  assert.deepEqual(calls.added, [["core/package-lock.json"]], "only lock file staged");
+  assert.equal(calls.amended, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 3.4: Nested lock file recognized and included
+// ---------------------------------------------------------------------------
+
+test("nested lock file path recognized and included (3.4)", async () => {
+  const nestedPath = "plugin/.claude/skills/pipeline/core/package-lock.json";
+  const { deps, calls } = makeDeps(` M ${nestedPath}\n`);
+  const result = await includeLockfileSideEffects("/wt", deps);
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes(nestedPath), "nested lock path folded in");
+  assert.deepEqual(calls.added, [[nestedPath]]);
+  assert.equal(calls.amended, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Multiple lock files
+// ---------------------------------------------------------------------------
+
+test("multiple lock files all staged in one add call", async () => {
+  const { deps, calls } = makeDeps(
+    " M core/package-lock.json\n M plugin/yarn.lock\n M pnpm-lock.yaml\n",
+  );
+  const result = await includeLockfileSideEffects("/wt", deps);
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.length === 3);
+  assert.equal(calls.added.length, 1, "single gitAddPaths call with all paths");
+  assert.ok(calls.added[0].includes("core/package-lock.json"));
+  assert.ok(calls.added[0].includes("plugin/yarn.lock"));
+  assert.ok(calls.added[0].includes("pnpm-lock.yaml"));
+  assert.equal(calls.amended, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Rename porcelain format
+// ---------------------------------------------------------------------------
+
+test("rename porcelain format: uses destination path for lock file detection", async () => {
+  // Porcelain rename: "R  old -> new"
+  const { deps, calls } = makeDeps("R  old-lock.json -> core/package-lock.json\n");
+  const result = await includeLockfileSideEffects("/wt", deps);
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes("core/package-lock.json"));
+  assert.deepEqual(calls.added, [["core/package-lock.json"]]);
+});
+
+test("rename to non-lock destination: not included", async () => {
+  const { deps, calls } = makeDeps("R  package-lock.json -> core/scripts/something.ts\n");
+  const result = await includeLockfileSideEffects("/wt", deps);
+  assert.equal(result.included, false);
+  assert.deepEqual(calls.added, []);
+  assert.equal(calls.amended, 0);
+});

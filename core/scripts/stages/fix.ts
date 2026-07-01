@@ -32,6 +32,7 @@ import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
+import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker } from "./review.ts";
 import type { RunStoreDeps } from "../run-store.ts";
@@ -86,6 +87,13 @@ export interface AdvanceFixDeps {
    * runtime. Tests inject a literal string to avoid a real GitHub API call.
    */
   trustedReviewAuthor?: string | null;
+  /**
+   * Lock-file side-effect inclusion deps (#358). Folds uncommitted lock-file
+   * changes into the round's HEAD commit before the format/test gates run.
+   * When absent, the real implementation is used. Tests inject fakes so no
+   * real git subprocess is invoked.
+   */
+  lockfileSideEffects?: LockfileSideEffectsDeps;
 }
 
 /**
@@ -278,6 +286,19 @@ export async function advanceFix(
     if (!specCheck.ok) {
       await setBlocked(cfg, issueNumber, specCheck.reason, stage, "openspec-invalid");
       return { advanced: false, status: "blocked", reason: specCheck.reason };
+    }
+  }
+
+  // ---- Lock-file side-effect inclusion (#358) ----
+  // After the harness commits source changes it may leave lock-file side-effects
+  // (package-lock.json / yarn.lock / pnpm-lock.yaml) uncommitted. Fold them into
+  // HEAD before the format/test gates so those gates see a clean worktree.
+  if (headBefore && headAfter && headBefore !== headAfter) {
+    const lockResult = await includeLockfileSideEffects(wt.path, deps.lockfileSideEffects ?? {});
+    if (lockResult.included) {
+      console.log(
+        `[pipeline] #${issueNumber}: folded uncommitted lock file(s) into round commit: ${lockResult.paths.join(", ")}`,
+      );
     }
   }
 
