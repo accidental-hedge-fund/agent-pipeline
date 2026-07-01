@@ -50,7 +50,7 @@ import {
   partitionFindings,
 } from "../review-policy.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
-import { buildDeltaReviewPrompt } from "../prompts/index.ts";
+import { buildDeltaReviewPrompt, buildFixPrompt } from "../prompts/index.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import * as openspec from "../openspec.ts";
 import {
@@ -79,6 +79,37 @@ const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
+ * Commit-subject prefix for the pre-merge bounded auto-fix round (#359).
+ * Every auto-fix commit starts with this prefix so the one-attempt bound can
+ * detect a prior attempt after a process restart by scanning PR commit subjects.
+ * MUST NOT match `isPipelineInternalCommit` — auto-fix commits are developer
+ * commits and must invalidate the review-SHA gate so the re-review runs.
+ */
+export const PRE_MERGE_AUTOFIX_PREFIX = "fix: pre-merge auto-fix";
+
+/**
+ * Result of a pre-merge bounded auto-fix attempt (#359).
+ * "fix-committed" — harness committed a fix and pushed it to the PR head.
+ *                   Caller should re-run the delta review exactly once.
+ * "error"         — harness failure, dirty worktree, push failure, or no
+ *                   commit produced. Worktree rolled back to pre-fix HEAD.
+ */
+export type PreMergeAutoFixResult = "fix-committed" | "error";
+
+/**
+ * Injectable seam for the bounded pre-merge auto-fix attempt (#359).
+ * Parameters: the blocking ReviewFinding objects, the issue title (for the
+ * fix prompt), and the delta review comment body (as reviewFindings text).
+ * Called by `enforceReviewShaGate` only when (a) all blocking findings pass
+ * `allBlockingAutoFixable` and (b) no prior auto-fix commit is present.
+ */
+export type AttemptPreMergeAutoFixFn = (
+  blockingFindings: ReviewFinding[],
+  issueTitle: string,
+  reviewComment: string,
+) => Promise<PreMergeAutoFixResult>;
+
+/**
  * True when a commit was authored by the pipeline itself in pre-merge (an
  * OpenSpec archive) rather than by a developer/fix step. These commits do not
  * change the code the reviewer evaluated, so they must not invalidate the
@@ -91,6 +122,139 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
   return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+}
+
+/**
+ * True iff a blocking finding's category is in the auto-fix allowlist
+ * `{ correctness, missing-dep }`. Absent/empty/unknown category → false
+ * (fail-closed: auto-fix only on positive signal). (#359)
+ */
+export function isAutoFixableFinding(f: ReviewFinding): boolean {
+  const cat = (f.category ?? "").toLowerCase().trim();
+  return cat === "correctness" || cat === "missing-dep";
+}
+
+/**
+ * True iff the blocking findings array is non-empty and every element
+ * passes `isAutoFixableFinding`. Empty array → false (no findings to fix).
+ * (#359)
+ */
+export function allBlockingAutoFixable(blocking: ReviewFinding[]): boolean {
+  return blocking.length > 0 && blocking.every(isAutoFixableFinding);
+}
+
+/**
+ * Perform one bounded pre-merge auto-fix attempt (#359).
+ *
+ * Invokes the implementer harness with the surgical-fix prompt (`buildFixPrompt`),
+ * amends the resulting commit to carry the `PRE_MERGE_AUTOFIX_PREFIX` subject
+ * (the durable crash-safe one-attempt marker), and pushes to the PR head.
+ *
+ * Pre-conditions: worktree must be clean (fail closed otherwise).
+ * On any failure (harness error, no commit produced, push error): rolls the
+ * worktree back to the pre-fix HEAD over a clean tree and returns "error".
+ * The surgical-fix discipline (#235) — minimal diff, destructive-operation guard,
+ * pre-commit self-check — applies via `buildFixPrompt` unchanged.
+ */
+export async function performPreMergeAutoFix(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  pipelineRunId: string,
+  findingsText: string,
+  issueTitle: string,
+  wt: { path: string; slug: string },
+  gitFn: typeof gitInWorktree,
+  invokeFn: InvokeFn,
+): Promise<PreMergeAutoFixResult> {
+  const harness = cfg.harnesses?.implementer;
+  if (!harness) return "error";
+
+  const headBefore = (
+    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+
+  // Pre-fix cleanliness check: a dirty worktree before the attempt fails closed
+  // (#235). Rollback uses `git reset --hard`; running that over pre-existing dirty
+  // work would irreversibly discard it.
+  const preStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return "error";
+
+  const prompt = buildFixPrompt({
+    cfg,
+    issueNumber,
+    title: issueTitle,
+    reviewFindings: findingsText,
+    fixRound: 1,
+    pipelineRunId,
+  });
+
+  const result = await invokeFn(harness, wt.path, prompt, {
+    timeoutSec: cfg.fix_timeout,
+    model: cfg.models?.fix ?? null,
+    sandbox: cfg.harness_sandbox,
+  });
+
+  if (!result.success) {
+    if (headBefore) {
+      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    }
+    return "error";
+  }
+
+  const headAfter = (
+    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  const hasUncommitted = statusAfter.stdout.trim() !== "";
+  const hasNewCommit = headAfter && headBefore && headAfter !== headBefore;
+
+  if (!hasNewCommit && !hasUncommitted) {
+    // Harness produced no change at all — treat as failure.
+    return "error";
+  }
+
+  // The auto-fix commit subject MUST start with PRE_MERGE_AUTOFIX_PREFIX so the
+  // one-attempt bound survives a process restart. Amend the HEAD commit (if the
+  // harness committed) or create a new commit (if it left uncommitted changes).
+  const autoFixMsg = withTrailers(
+    `${PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
+    issueNumber,
+    pipelineRunId,
+  );
+
+  if (hasUncommitted) {
+    await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
+    const commitRes = await gitFn(wt.path, ["commit", "-m", autoFixMsg], { ignoreFailure: true });
+    if (commitRes.code !== 0) {
+      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+      return "error";
+    }
+  } else {
+    // Harness already committed; amend to set the canonical subject so the
+    // one-attempt bound can detect this commit by subject prefix.
+    const amendRes = await gitFn(
+      wt.path, ["commit", "--amend", "-m", autoFixMsg], { ignoreFailure: true },
+    );
+    if (amendRes.code !== 0) {
+      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+      return "error";
+    }
+  }
+
+  // Push the fix commit to the PR head.
+  const branch = branchName(issueNumber, wt.slug);
+  const pushRes = await gitFn(wt.path, ["push", "origin", branch], { ignoreFailure: true });
+  if (pushRes.code !== 0) {
+    // Rollback: push failed, remove the local commit so the next attempt is clean.
+    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    return "error";
+  }
+
+  return "fix-committed";
 }
 
 /**
@@ -290,11 +454,42 @@ export async function advance(
   // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
   // back to the review round before doing any pre-merge work; pipeline-internal
   // commits (openspec archive) do not invalidate the verdict.
+
+  // Wire the bounded pre-merge auto-fix dep (#359): when the implementer harness
+  // is configured and no seam is injected by the caller, build a production closure
+  // that invokes `performPreMergeAutoFix` (fix + amend + push) for the gate to call.
+  const gitFnForAutoFix = deps.gitInWorktree ?? gitInWorktree;
+  const invokeFnForAutoFix = deps.invokeFn ?? invoke;
+  const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
+  const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
+    deps.attemptPreMergeAutoFix ??
+    (cfg.harnesses?.implementer
+      ? async (blockingFindings, issueTitle, findingsText) => {
+          const wt = await getForIssueForAutoFix(cfg, issueNumber);
+          if (!wt) return "error";
+          return performPreMergeAutoFix(
+            cfg,
+            issueNumber,
+            pipelineRunId,
+            findingsText,
+            issueTitle,
+            wt,
+            gitFnForAutoFix,
+            invokeFnForAutoFix,
+          );
+        }
+      : undefined);
+
   const shaGate = await enforceReviewShaGate(
     cfg,
     issueNumber,
     prNumber,
-    { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+    {
+      ...deps,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+      attemptPreMergeAutoFix: preAutoFixFn,
+    },
   );
   if (shaGate) return shaGate;
 
@@ -747,6 +942,16 @@ export interface ShaGateDeps {
   getGhActor?: () => Promise<string | null>;
   runDir?: string;
   runStoreDeps?: RunStoreDeps;
+  /**
+   * Injectable seam for the bounded pre-merge auto-fix round (#359).
+   * When provided, called when (a) all blocking delta-review findings pass
+   * `allBlockingAutoFixable` and (b) no prior auto-fix commit is present in
+   * the branch since the reviewed SHA. Production default: wired in
+   * `advance()` as a closure over the implementer harness and worktree.
+   * Tests inject this directly to exercise the blocking-branch routing without
+   * a real harness, git, or network.
+   */
+  attemptPreMergeAutoFix?: AttemptPreMergeAutoFixFn;
 }
 
 /**
@@ -1135,7 +1340,98 @@ export async function enforceReviewShaGate(
         return null;
       }
 
-      // Delta review found blocking findings: block pre-merge without routing to review-2.
+      // Delta review found blocking findings. Attempt one bounded auto-fix
+      // before blocking when all findings are in the category allowlist (#359).
+      const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
+      if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
+        // One-attempt bound (crash-safe): detect a prior auto-fix commit by
+        // scanning PR commits since the reviewed SHA for the PREFIX subject.
+        let priorAutoFix = false;
+        try {
+          const prCommits = await getPrCommitsFn(cfg, prNumber);
+          const revIdx = reviewed.sha
+            ? prCommits.findIndex((c) => c.oid === reviewed.sha)
+            : -1;
+          const since = revIdx !== -1 ? prCommits.slice(revIdx + 1) : prCommits;
+          priorAutoFix = since.some((c) =>
+            c.messageHeadline.startsWith(PRE_MERGE_AUTOFIX_PREFIX),
+          );
+        } catch {
+          // Cannot determine prior attempt — allow this attempt (fail open).
+        }
+
+        if (!priorAutoFix) {
+          const fixRes = await attemptAutoFixFn(
+            partition.blocking, detail.title, deltaCommentBody,
+          );
+          if (fixRes === "fix-committed") {
+            // Re-run the delta review exactly once (does NOT consume a review-2
+            // ceiling slot, consistent with the delta-review budget rule, #359).
+            const newPrHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+            const reReviewDiff = reviewed.sha
+              ? await getCommitDeltaDiffFn(
+                  cfg, prNumber, reviewed.sha, newPrHead,
+                ).catch(() => currentDiff)
+              : currentDiff;
+            const reResult = await runDeltaReviewFn(
+              cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
+              deps.runDir ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps } : undefined,
+            );
+            const rePartition = partitionFindings(
+              reResult.findings, cfg.review_policy, overrides, scopes,
+            );
+            // Post the re-review delta comment with updated sentinels.
+            const reNewHash = computeDiffHash(currentDiff);
+            const reBlockingKeys = new Set(rePartition.blocking.map((f) => findingKey(f)));
+            const reEffective = reResult.effectiveReviewer ?? cfg.harnesses.reviewer;
+            const reSelfReview = reResult.selfReview ?? false;
+            const reLabel = reSelfReview ? `${reEffective} (self-review)` : reEffective;
+            const reCommentBody = formatDeltaReviewComment(
+              cfg,
+              {
+                verdict: reResult.verdict,
+                summary: reResult.summary,
+                findings: reResult.findings,
+                next_steps: [],
+                commitSha: newPrHead,
+              },
+              `pre-merge delta review by ${reLabel}`,
+              reBlockingKeys.size > 0 ? reBlockingKeys : undefined,
+              reNewHash,
+            );
+            const reComment = reSelfReview
+              ? (() => {
+                  const nl = reCommentBody.indexOf("\n");
+                  return nl >= 0
+                    ? `${reCommentBody.slice(0, nl)}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}${reCommentBody.slice(nl)}`
+                    : `${reCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}`;
+                })()
+              : reCommentBody;
+            await postCommentFn(cfg, issueNumber, reComment);
+
+            if (rePartition.blocking.length === 0) {
+              // Re-validate HEAD (same guard as the normal approve path).
+              const postFixHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+              if (postFixHead !== newPrHead) {
+                throw new Error(
+                  `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
+                  `during pre-merge auto-fix re-review; re-entering SHA gate`,
+                );
+              }
+              console.log(
+                `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
+              );
+              return null;
+            }
+            // Re-review still blocks: fall through to block below (no second attempt).
+          }
+          // fixRes === "error": fall through to block below.
+        }
+        // Prior auto-fix attempt detected: fall through to block below.
+      }
+
+      // Non-auto-fixable category, no seam, or fix round exhausted:
+      // block pre-merge without routing to review-2.
       await setBlockedFn(
         cfg,
         issueNumber,
