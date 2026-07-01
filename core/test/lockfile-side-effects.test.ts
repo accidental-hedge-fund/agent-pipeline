@@ -233,6 +233,42 @@ test("staged rename (non-lock): both sides unstaged before amend, rename re-stag
   assert.equal(added.length, 2, "gitAddPaths called exactly twice");
 });
 
+test("staged copy (non-lock): src NOT deleted, dst re-staged as addition after amend (regression #358 pre-merge copy)", async () => {
+  // Bug: old code used isDeletion: true for the src side of any arrow-path entry,
+  // treating copies (C  src -> dst) the same as renames. For a copy the source is not
+  // staged for deletion; running git rm --cached on it would incorrectly remove it.
+  // Bites: with old code, rmCached would contain ["core/scripts/old.ts"] — the
+  // assert.deepEqual(rmCached, [], "src of copy must NOT be rm-cached") assertion fails.
+  const restoreStaged: string[][] = [];
+  const added: string[][] = [];
+  const rmCached: string[][] = [];
+  let amended = 0;
+  const deps: LockfileSideEffectsDeps = {
+    gitStatusPorcelain: async () =>
+      "C  core/scripts/old.ts -> core/scripts/new.ts\n M core/package-lock.json\n",
+    gitRestoreStaged: async (_wt, paths) => { restoreStaged.push([...paths]); },
+    gitAddPaths: async (_wt, paths) => { added.push([...paths]); },
+    gitAmendNoEdit: async () => { amended++; },
+    gitRmCached: async (_wt, paths) => { rmCached.push([...paths]); },
+  };
+  const result = await includeLockfileSideEffects("/wt", deps);
+
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes("core/package-lock.json"));
+  // Both paths unstaged before amend (src as non-deletion, dst as addition).
+  assert.equal(restoreStaged.length, 1, "gitRestoreStaged called once");
+  assert.ok(restoreStaged[0].includes("core/scripts/old.ts"), "src side of copy unstaged");
+  assert.ok(restoreStaged[0].includes("core/scripts/new.ts"), "dst side of copy unstaged");
+  // Only the lock file is staged for the amend.
+  assert.deepEqual(added[0], ["core/package-lock.json"], "lock file staged first");
+  assert.equal(amended, 1, "HEAD amended exactly once");
+  // Src of a copy is NOT staged as a deletion — gitRmCached must not be called for it.
+  assert.deepEqual(rmCached, [], "src of copy must NOT be rm-cached");
+  // Both src (non-deletion) and dst (addition) are re-staged together in one gitAddPaths call.
+  assert.ok(added[1].includes("core/scripts/old.ts"), "src of copy re-staged as addition (not deleted)");
+  assert.ok(added[1].includes("core/scripts/new.ts"), "dst of copy re-staged as addition");
+});
+
 test("pre-staged deletion: unstaged before amend, removed from index again after", async () => {
   // "D  core/scripts/gone.ts" = staged deletion (X=D)
   // " M core/package-lock.json" = dirty lock file

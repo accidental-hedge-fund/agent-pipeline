@@ -123,7 +123,8 @@ export async function includeLockfileSideEffects(
       if (isLockFilePath(dst)) {
         lockPaths.push(dst);
       } else if (x !== ' ' && x !== '?') {
-        preStagedNonLock.push({ path: src, isDeletion: true });
+        // Renames (R) stage the source as a deletion; copies (C) do not delete the source.
+        preStagedNonLock.push({ path: src, isDeletion: x === 'R' });
         preStagedNonLock.push({ path: dst, isDeletion: false });
       }
     } else {
