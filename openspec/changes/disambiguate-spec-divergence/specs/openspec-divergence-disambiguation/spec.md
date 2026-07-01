@@ -84,7 +84,7 @@ When there is positive `spec-behind-code` evidence for the current state, the pi
 
 ### Requirement: A bounded spec-delta repair SHALL touch only the active change's spec and tasks, validate, commit with traceability, and re-run the guard once
 
-An automatic spec-delta repair SHALL modify only files under the active change's `openspec/changes/<id>/specs/**` and that change's `tasks.md`. If the attempt changes any other file (including any application or test code), the attempt SHALL be rejected and SHALL NOT be committed. A committed repair SHALL pass `openspec validate <change-id>`, SHALL carry the run's `Issue:` and `Pipeline-Run:` traceability trailers, and the pipeline SHALL re-run the stale-delta guard exactly once afterward before the run advances.
+An automatic spec-delta repair SHALL modify only files under the active change's `openspec/changes/<id>/specs/**` and that change's `tasks.md`. If the attempt changes any other file (including any application or test code), the attempt SHALL be rejected and SHALL NOT be committed. A committed repair SHALL pass `openspec validate <change-id>`, SHALL carry the run's `Issue:` and `Pipeline-Run:` traceability trailers, and the pipeline SHALL re-run the stale-delta guard exactly once afterward before the run advances. The repair orchestrator SHALL be invokable through an injectable `invokeFn` dep (defaulting to the module-level `invoke`) and an injectable `openspecValidateItem` dep (defaulting to `openspec.validateItem`), so the production repair closure can be exercised end-to-end in unit tests without spawning a real harness or running the real OpenSpec CLI.
 
 #### Scenario: a valid, code-frozen repair clears the guard and advances
 
