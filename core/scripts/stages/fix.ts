@@ -40,6 +40,7 @@ import {
   enforceSpecConsistencyGuard,
   performBoundedSpecRepair,
   type FixCommit,
+  type InvokeFn,
   type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
 
@@ -69,6 +70,14 @@ export interface AdvanceFixDeps {
   runFormatGate?: typeof runFormatGate;
   /** Format+test gate runner (defaults to runFormatAndTestGates); injectable for tests. */
   _runFormatAndTestGates?: typeof runFormatAndTestGates;
+  /**
+   * Injectable harness invoker for the internal bounded-repair closure (#356).
+   * Defaults to `invoke` from harness.ts. Tests inject this to exercise the
+   * production-path repair closure (when `attemptBoundedRepair` is not in the
+   * consistency deps and `cfg.harnesses.implementer` is set) without spawning
+   * a real harness.
+   */
+  invokeFn?: InvokeFn;
 }
 
 /**
@@ -322,7 +331,7 @@ export async function advanceFix(
               wt.path,
               gitInWorktree,
               branchDevCommitsFn,
-              invoke,
+              deps.invokeFn ?? invoke,
               deps.openspecValidateItem ?? openspec.validateItem,
             );
           }

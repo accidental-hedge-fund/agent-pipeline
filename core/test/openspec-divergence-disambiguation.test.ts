@@ -831,3 +831,107 @@ test("performBoundedSpecRepair: commit message carries Issue and Pipeline-Run tr
   assert.match(commitMessages[0] ?? "", /Issue: #356/, "commit message must carry Issue: trailer");
   assert.match(commitMessages[0] ?? "", /Pipeline-Run: 356\/2026-01-01T00:00:00Z/, "commit message must carry Pipeline-Run: trailer");
 });
+
+// ---- Finding 1: production-closure tests for maybeArchiveOpenspec (#356) ----
+// These tests verify that maybeArchiveOpenspec constructs and uses the bounded-repair
+// closure internally when cfg.harnesses.implementer is set and deps.attemptBoundedRepair
+// is NOT provided. They inject invokeFn and openspecValidateItem (the two deps previously
+// hardcoded to module-level imports) to exercise the full production path without a real harness.
+
+test("production-closure (pre-merge): invokeFn called via internal closure when no deps.attemptBoundedRepair", async () => {
+  // Set up a spec-behind-code scenario with SHA matching HEAD (positive evidence).
+  const HEAD_SHA = "aabb1122ccddeeff001122334455deadbeefabcd";
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: deadbeef\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
+
+  const invokeCalls: string[] = [];
+  const fakeInvokeFn: InvokeFn = async (harness, _wt, _prompt) => {
+    invokeCalls.push(harness);
+    return { success: true, output: "" };
+  };
+
+  // Make git return no status changes so performBoundedSpecRepair gets "not-verifiable"
+  // (harness ran but produced no file changes). That is still a repair attempt.
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_wt: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
+      if (args[0] === "diff" && args.some((a: string) => a.includes("..."))) {
+        return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+      }
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [spec("s"), impl("i")],
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+    })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async () => {}) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+    // Production-path: invokeFn + openspecValidateItem injected; NO deps.attemptBoundedRepair.
+    invokeFn: fakeInvokeFn,
+    openspecValidateItem: async () => ({ valid: true, issues: [], unavailable: false, raw: "" }),
+  };
+
+  // cfg has implementer set → the internal closure is constructed and calls invokeFn.
+  const cfgWithImplementer = { ...cfg, harnesses: { implementer: "test-harness", reviewer: "codex" } } as unknown as PipelineConfig;
+
+  const out = await maybeArchiveOpenspec(cfgWithImplementer, 1, "run", deps);
+  assert.deepEqual(invokeCalls, ["test-harness"],
+    "production closure must call invokeFn with the configured implementer harness");
+  // Harness made no file changes → "not-verifiable" → block with spec-delta-alignment reason.
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "guard must block when repair cannot be verified (not-verifiable)");
+  assert.match(out.reason ?? "", /spec-delta alignment/,
+    "block reason must state spec-delta alignment");
+});
+
+test("production-closure (pre-merge): no repair attempt when cfg.harnesses.implementer is absent", async () => {
+  // When no implementer is configured AND no deps.attemptBoundedRepair is provided,
+  // the guard must block immediately without invoking any harness.
+  const HEAD_SHA = "1122334455667788990011aabbccddeeff001122";
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: aabbccdd\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
+
+  const invokeCalls: string[] = [];
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_wt: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
+      if (args[0] === "diff" && args.some((a: string) => a.includes("..."))) {
+        return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [spec("s"), impl("i")],
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+    })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async () => {}) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+    invokeFn: async (h) => { invokeCalls.push(h); return { success: true, output: "" }; },
+  };
+
+  // cfg has NO implementer → no closure constructed → no invokeFn call → block immediately.
+  const cfgNoImplementer = { ...cfg, harnesses: {} } as unknown as PipelineConfig;
+
+  const out = await maybeArchiveOpenspec(cfgNoImplementer, 1, "run", deps);
+  assert.deepEqual(invokeCalls, [],
+    "invokeFn must NOT be called when cfg.harnesses.implementer is absent");
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "guard must block without a repair attempt when no implementer is configured");
+});

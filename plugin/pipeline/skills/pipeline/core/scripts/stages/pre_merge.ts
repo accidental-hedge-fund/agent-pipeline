@@ -57,7 +57,9 @@ import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
   performBoundedSpecRepair,
+  type InvokeFn,
   type SpecConsistencyDeps,
+  type ValidateFn,
 } from "../openspec-consistency.ts";
 export {
   enforceSpecConsistencyGuard,
@@ -162,6 +164,19 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
    * Tests inject a mock to verify the dep is wired without a real harness.
    */
   attemptBoundedRepair?: SpecConsistencyDeps["attemptBoundedRepair"];
+  /**
+   * Injectable harness invoker for the internal bounded-repair closure (#356).
+   * Defaults to `invoke` from harness.ts. Tests inject this to exercise the
+   * production-path repair closure (when `attemptBoundedRepair` is not provided
+   * and `cfg.harnesses.implementer` is set) without spawning a real harness.
+   */
+  invokeFn?: InvokeFn;
+  /**
+   * Injectable OpenSpec change validator for the internal bounded-repair closure
+   * (#356). Defaults to `openspec.validateItem`. Tests inject this alongside
+   * `invokeFn` to exercise the production-path repair closure end-to-end.
+   */
+  openspecValidateItem?: ValidateFn;
   // Seams for the no-run recovery path (#281).
   getHeadCheckRunCount?: typeof getHeadCheckRunCount;
   /** Counts only successful (conclusion=success) check-runs for a SHA.
@@ -1364,8 +1379,8 @@ export async function maybeArchiveOpenspec(
             wt.path,
             gitFn,
             branchDeveloperCommitsFn,
-            invoke,
-            openspec.validateItem,
+            deps.invokeFn ?? invoke,
+            deps.openspecValidateItem ?? openspec.validateItem,
           );
         }
       : undefined);
