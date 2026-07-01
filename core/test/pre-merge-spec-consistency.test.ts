@@ -14,7 +14,7 @@ import {
   type FixCommit,
   type SpecConsistencyDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { SPEC_DIVERGENCE_CATEGORY, categoryMarker } from "../scripts/review-policy.ts";
+import { SPEC_DIVERGENCE_CATEGORY, categoryMarker, directionMarker } from "../scripts/review-policy.ts";
 import { DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -28,7 +28,12 @@ const spec = (sha: string): FixCommit => ({ sha, paths: [`openspec/changes/${ID}
 // carries no marker.
 const findingLine = (extra: string) =>
   `## Review 2 (Adversarial) — needs-attention\n\n### Findings\n\n**1. [HIGH] x** \`override-key: abc12345\`${extra}\n`;
-const reviewWithMarker = findingLine(` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}`);
+// The blocking case: category + spec-behind-code direction (#356).
+const reviewWithMarker = findingLine(
+  ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+);
+// Unclassified category marker only — no direction marker.
+const reviewWithCategoryOnly = findingLine(` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}`);
 const reviewProseOnly =
   `## Review 2 (Adversarial) — needs-attention\n\n### Findings\n\n` +
   `**1. [HIGH] the code diverges from the spec and is inconsistent with the requirement** \`override-key: abc12345\`\n`;
@@ -68,12 +73,20 @@ function guardDeps(commits: FixCommit[], reviewBody: string | null): {
   return { deps, blocked };
 }
 
-test("guard: stale + finding tagged category:spec-divergence → blocked", async () => {
+test("guard: stale + spec-divergence finding with spec-behind-code direction → blocked", async () => {
   const { deps, blocked } = guardDeps([impl("a")], reviewWithMarker);
   const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
   assert.ok(out && !out.advanced && out.status === "blocked");
   assert.equal(blocked.length, 1);
-  assert.match(blocked[0], /stale spec delta/);
+  assert.match(blocked[0], /spec-delta alignment/);
+});
+
+// Disambiguation (#356): unclassified spec-divergence marker (no direction) must NOT block.
+test("guard: stale + spec-divergence finding with no direction marker → NOT blocked (disambiguation)", async () => {
+  const { deps, blocked } = guardDeps([impl("a")], reviewWithCategoryOnly);
+  const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
+  assert.equal(out, null, "unclassified spec-divergence must NOT drive the stale-delta block");
+  assert.deepEqual(blocked, []);
 });
 
 test("guard: stale but divergence only in PROSE (no marker) → NOT blocked — the gate ignores prose", async () => {
@@ -97,10 +110,10 @@ test("guard: no developer commits → not blocked", async () => {
 // review comment, including pre-merge delta reviews. If the latest comment is a delta
 // review carrying `category: spec-divergence` and the prior full Review 2 does NOT
 // carry the marker, the guard must still block (not fall through to the old comment).
-test("guard: latest delta review has spec-divergence marker but older Review 2 does not → blocked (#228)", async () => {
+test("guard: latest delta review has spec-divergence marker (spec-behind-code) but older Review 2 does not → blocked (#228)", async () => {
   const deltaReviewWithMarker =
     `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention (commit abc1234)\n\n` +
-    `### Findings\n\n**1. [HIGH] spec divergence** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+    `### Findings\n\n**1. [HIGH] spec divergence** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}\n`;
   const olderReview2WithoutMarker = findingLine(""); // no spec-divergence category
 
   const blocked: string[] = [];
@@ -118,9 +131,9 @@ test("guard: latest delta review has spec-divergence marker but older Review 2 d
   };
   const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
   assert.ok(out && !out.advanced && out.status === "blocked",
-    "should block because the latest (delta) review has category:spec-divergence");
+    "should block because the latest (delta) review has spec-behind-code direction");
   assert.equal(blocked.length, 1);
-  assert.match(blocked[0], /stale spec delta/);
+  assert.match(blocked[0], /spec-delta alignment/);
 });
 
 // ---- computeBranchDeveloperCommits: auto-format commits visible to stale-spec guard (#182 review-2 finding 3) ----
@@ -175,7 +188,7 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
   assert.ok(out && !out.advanced && out.status === "blocked",
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.equal(blocked.length, 1);
-  assert.match(blocked[0], /stale spec delta/);
+  assert.match(blocked[0], /spec-delta alignment/);
 });
 
 // ---- maybeArchiveOpenspec: archive commit failure blocks and prevents push (#255) ----

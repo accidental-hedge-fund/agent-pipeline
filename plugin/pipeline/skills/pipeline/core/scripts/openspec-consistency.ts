@@ -1,5 +1,9 @@
 import { findLatestCommentMatching, getIssueDetail, setBlocked } from "./gh.ts";
-import { reviewCommentFlagsSpecDivergence } from "./review-policy.ts";
+import {
+  extractSpecDivergenceDirection,
+  reviewCommentFlagsSpecDivergence,
+  type SpecDivergenceDirection,
+} from "./review-policy.ts";
 import { gitInWorktree } from "./worktree.ts";
 import { DELTA_REVIEW_MARKER_PREFIX } from "./stages/review.ts";
 import type { Outcome, PipelineConfig, Stage } from "./types.ts";
@@ -11,6 +15,26 @@ export interface FixCommit {
   paths: string[];
 }
 
+/**
+ * Result of a bounded spec-delta repair attempt (#356).
+ * "cleared"           — repair committed and stale-delta re-check passed; advance.
+ * "disallowed-files"  — attempt changed files outside the allowed set; rejected/rolled back.
+ * "invalid"           — `openspec validate <id>` failed after repair; not committed.
+ * "still-stale"       — repair committed but the stale-delta re-check still shows staleness.
+ * "not-verifiable"    — bringing the delta into agreement cannot be verified without
+ *                       changing application code; repair not attempted.
+ * "already-attempted" — a repair was already attempted in this run; second attempt skipped.
+ * "error"             — unexpected failure during the repair orchestration.
+ */
+export type BoundedRepairResult =
+  | "cleared"
+  | "disallowed-files"
+  | "invalid"
+  | "still-stale"
+  | "not-verifiable"
+  | "already-attempted"
+  | "error";
+
 /** Deps for {@link enforceSpecConsistencyGuard} — injectable fakes in tests. */
 export interface SpecConsistencyDeps {
   branchDeveloperCommits: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
@@ -18,20 +42,39 @@ export interface SpecConsistencyDeps {
   setBlocked: typeof setBlocked;
   /** Stage to attach to the blocker. Defaults to pre-merge for the archive backstop. */
   blockStage?: Stage;
+  /**
+   * Optional: attempt one bounded automatic spec-delta repair when the direction is
+   * `spec-behind-code`. Called at most once per run; if absent the guard blocks
+   * immediately with a spec-delta-alignment reason without attempting repair.
+   * Returns the repair outcome which drives the final block decision (#356).
+   */
+  attemptBoundedRepair?: (
+    changeId: string,
+    issueNumber: number,
+    pipelineRunId: string,
+  ) => Promise<BoundedRepairResult>;
+  /** Pipeline-run ID for traceability trailers in repair commits. */
+  pipelineRunId?: string;
 }
 
 /**
- * Backstop for OpenSpec changes whose implementation outgrew their spec delta.
- * Returns a blocked Outcome when a change's spec delta is stale relative to the
- * implementation, or null to proceed. "Stale" requires ALL of:
- *   1. developer/fix commits on the branch changed implementation files,
- *   2. the change's `specs/**` were NOT updated after the last implementation
- *      change (order-aware), and
- *   3. the most recent review verdict tagged a finding `category: spec-divergence`.
+ * Disambiguating backstop for OpenSpec changes (#356). Classifies any
+ * `spec-divergence` finding by direction — `code-behind-spec` (the active spec
+ * already requires the target behavior; the implementation must change) or
+ * `spec-behind-code` (the accepted implementation moved past the delta; the spec
+ * delta must be updated) — and acts accordingly:
  *
- * Condition 3 is read from the STRUCTURED category marker that
- * `formatReviewComment` emits (`reviewCommentFlagsSpecDivergence`), never by
- * keyword-matching the reviewer's prose.
+ *   - `code-behind-spec` or unclassified → return null (advance); a fix round is
+ *     expected to change implementation; the guard does not block on file-order alone.
+ *   - `spec-behind-code` → attempt one bounded automatic spec-delta repair (if
+ *     deps.attemptBoundedRepair is provided), then block if the repair did not
+ *     clear the stale-delta condition.
+ *
+ * "Stale" is still gated by the structural file-order check (`specDeltaIsStale`)
+ * AND a `category: spec-divergence` marker in the latest review comment. Direction
+ * is read from the structured `direction: <token>` marker that `formatReviewComment`
+ * emits, never from reviewer prose. See #106 for the prior design; #356 for why
+ * the direction disambiguation is necessary.
  */
 export async function enforceSpecConsistencyGuard(
   cfg: PipelineConfig,
@@ -50,9 +93,45 @@ export async function enforceSpecConsistencyGuard(
   const reviewBody = latestReviewBody(detail.comments);
   if (!reviewBody || !reviewCommentFlagsSpecDivergence(reviewBody)) return null;
 
-  const staleMsg = staleSpecDeltaBlockReason(stale);
-  await deps.setBlocked(cfg, issueNumber, staleMsg, deps.blockStage ?? "pre-merge", "openspec-stale-delta");
-  return { advanced: false, status: "blocked", reason: staleMsg, blockerKind: "openspec-stale-delta" };
+  // Classify direction from the structured marker — never from prose (#356).
+  const direction = extractSpecDivergenceDirection(reviewBody);
+
+  // code-behind-spec: the spec already requires the behavior; the fix round is
+  // expected to change implementation to align with it. Do not block.
+  // Unclassified: insufficient positive evidence of spec staleness. Do not block.
+  if (direction !== "spec-behind-code") return null;
+
+  // spec-behind-code: the active delta is stale relative to accepted behavior.
+  // Attempt one bounded automatic repair before blocking (when the dep is wired).
+  if (deps.attemptBoundedRepair) {
+    const repairResult = await deps.attemptBoundedRepair(
+      stale,
+      issueNumber,
+      deps.pipelineRunId ?? "",
+    );
+    if (repairResult === "cleared") return null;
+
+    const reason = specDeltaAlignmentBlockReason(stale, repairResult);
+    await deps.setBlocked(
+      cfg,
+      issueNumber,
+      reason,
+      deps.blockStage ?? "pre-merge",
+      "openspec-stale-delta",
+    );
+    return { advanced: false, status: "blocked", reason, blockerKind: "openspec-stale-delta" };
+  }
+
+  // No repair capability: block with spec-delta-alignment reason.
+  const reason = specDeltaAlignmentBlockReason(stale, null);
+  await deps.setBlocked(
+    cfg,
+    issueNumber,
+    reason,
+    deps.blockStage ?? "pre-merge",
+    "openspec-stale-delta",
+  );
+  return { advanced: false, status: "blocked", reason, blockerKind: "openspec-stale-delta" };
 }
 
 /**
@@ -118,7 +197,93 @@ function latestReviewBody(
   return m?.body ?? null;
 }
 
-/** Operator-facing block reason naming the stale-delta condition and the fix. */
+/**
+ * Direction-specific block reason for the `spec-behind-code` case (#356).
+ * States that spec-delta alignment is required, with guidance on whether automatic
+ * repair was attempted and why it did not converge.
+ */
+export function specDeltaAlignmentBlockReason(
+  id: string,
+  repairResult: BoundedRepairResult | null,
+): string {
+  const intro = [
+    `OpenSpec change \`${id}\` has a **spec-delta alignment** issue: the active spec delta is stale`,
+    `relative to the accepted current implementation (\`direction: spec-behind-code\`). Archiving now`,
+    `would fold a delta into the living \`openspec/specs/\` that no longer describes the merged behavior.`,
+  ].join("\n");
+
+  let detail = "";
+  if (repairResult === "disallowed-files") {
+    detail = [
+      "",
+      `An automatic spec-delta repair was attempted but changed files outside the allowed set`,
+      `(\`openspec/changes/${id}/specs/**\` and \`tasks.md\`). The attempt was rejected and not committed.`,
+    ].join("\n");
+  } else if (repairResult === "invalid") {
+    detail = [
+      "",
+      `An automatic spec-delta repair was attempted but produced an invalid OpenSpec change`,
+      `(\`openspec validate ${id}\` failed). The attempt was not committed.`,
+    ].join("\n");
+  } else if (repairResult === "still-stale") {
+    detail = [
+      "",
+      `An automatic spec-delta repair was committed but the stale-delta guard still shows the delta`,
+      `as stale. Manual spec-delta alignment is required.`,
+    ].join("\n");
+  } else if (repairResult === "not-verifiable") {
+    detail = [
+      "",
+      `Bringing the spec delta into agreement cannot be verified without also changing application code,`,
+      `so automatic repair was not attempted.`,
+    ].join("\n");
+  } else if (repairResult === "already-attempted") {
+    detail = [
+      "",
+      `A bounded spec-delta repair was already attempted in this run and did not converge.`,
+      `A second automatic attempt is not allowed.`,
+    ].join("\n");
+  } else if (repairResult === "error") {
+    detail = [
+      "",
+      `An automatic spec-delta repair attempt encountered an unexpected error. Manual intervention is required.`,
+    ].join("\n");
+  }
+
+  const resolution = [
+    "",
+    `To resolve, update \`openspec/changes/${id}/specs/**\` (and \`tasks.md\`) so the spec delta matches`,
+    `the accepted implementation behavior, then run \`openspec validate ${id}\` and push.`,
+    `Any commit that brings the spec delta into agreement clears this guard.`,
+  ].join("\n");
+
+  return intro + detail + resolution;
+}
+
+/**
+ * Block reason for the `code-behind-spec` case (#356): the active spec delta
+ * already requires the target behavior but the implementation does not yet satisfy it.
+ * This reason is exported for callers that block when a `code-behind-spec` divergence
+ * persists beyond the run's fix-round limits; the consistency guard itself returns null
+ * (no block) for this direction so fix rounds can proceed.
+ */
+export function codeAlignmentBlockReason(id: string): string {
+  return [
+    `OpenSpec change \`${id}\` has a **code alignment** issue: the active spec delta already requires`,
+    `the target behavior, but the most recent review verdict flags the implementation for violating it`,
+    `(\`direction: code-behind-spec\`). The implementation must be changed to satisfy the spec.`,
+    ``,
+    `Update the implementation so it matches the requirement in \`openspec/changes/${id}/specs/**\`,`,
+    `then re-run the pipeline so the fix round can verify the alignment.`,
+  ].join("\n");
+}
+
+/**
+ * Legacy stale-delta block reason (kept for backward compatibility with callers
+ * that do not yet pass a direction-aware path). Prefer `specDeltaAlignmentBlockReason`
+ * or `codeAlignmentBlockReason` for new call sites.
+ * @deprecated Use the direction-specific reason functions instead.
+ */
 export function staleSpecDeltaBlockReason(id: string): string {
   return [
     `OpenSpec change \`${id}\` has a stale spec delta: fix rounds changed implementation files but did`,
@@ -132,3 +297,6 @@ export function staleSpecDeltaBlockReason(id: string): string {
     `correct resolution is still to update the delta so the living spec states the actual behavior.`,
   ].join("\n");
 }
+
+// Re-export SpecDivergenceDirection so guard callers can read direction from outcomes.
+export type { SpecDivergenceDirection };

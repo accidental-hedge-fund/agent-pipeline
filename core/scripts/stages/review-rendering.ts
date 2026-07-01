@@ -13,10 +13,12 @@ import {
 } from "./review-parsing.ts";
 import {
   categoryMarker,
+  directionMarker,
   findingKey,
   formatBlockingSurfacesMarker,
   type PartitionResult,
   type Review1Risk,
+  SPEC_DIVERGENCE_CATEGORY,
 } from "../review-policy.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../types.ts";
 
@@ -73,7 +75,11 @@ export function formatReviewComment(
         : f.file ?? "";
       const conf = f.confidence !== undefined ? ` (confidence: ${f.confidence})` : "";
       const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
+      const dir =
+        f.category === SPEC_DIVERGENCE_CATEGORY && f.spec_divergence_direction
+          ? ` ${directionMarker(f.spec_divergence_direction)}`
+          : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}`);
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
@@ -152,7 +158,11 @@ export function formatDeltaReviewComment(
         : f.file ?? "";
       const conf = f.confidence !== undefined ? ` (confidence: ${f.confidence})` : "";
       const cat = f.category ? ` ${categoryMarker(f.category)}` : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}`);
+      const dir =
+        f.category === SPEC_DIVERGENCE_CATEGORY && f.spec_divergence_direction
+          ? ` ${directionMarker(f.spec_divergence_direction)}`
+          : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}`);
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);

@@ -34,6 +34,7 @@ export const REVIEW_VERDICT_SCHEMA_BLOCK = `{
             "confidence": <0.0-1.0>,
             "recommendation": "<concrete fix>",
             "category": "<optional: spec-divergence|correctness|security|...>",
+            "spec_divergence_direction": "<optional: code-behind-spec|spec-behind-code>",
             "blocking": true | false
         }
     ],
@@ -57,6 +58,7 @@ const FINDING_FIELD_GUARD: Record<keyof ReviewFinding, true> = {
   confidence: true,
   recommendation: true,
   category: true,
+  spec_divergence_direction: true,
   blocking: true,
 };
 const VERDICT_FIELD_GUARD: Record<Exclude<keyof ReviewVerdict, "commitSha">, true> = {

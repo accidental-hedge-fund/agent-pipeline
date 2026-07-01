@@ -314,6 +314,7 @@ test("drift guard: schema block preserves the historical field order and nesting
     "confidence",
     "recommendation",
     "category",
+    "spec_divergence_direction",
     "blocking",
   ]);
   assert.deepEqual(parsed.verdict, REVIEW_SCHEMA_FIELDS.verdict);

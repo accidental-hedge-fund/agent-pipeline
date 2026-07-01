@@ -532,6 +532,12 @@ export interface ReviewFinding {
   // never converges (the #106 detector failure). Gates SHOULD key on this, never
   // on keyword-matching a finding's body.
   category?: string;
+  // When category is "spec-divergence", clarifies which entity must change (#356):
+  // "code-behind-spec" — the active spec delta already requires the behavior; the
+  // implementation must change. "spec-behind-code" — the accepted implementation
+  // moved past the active delta; the spec delta must change. Absent when category is
+  // not "spec-divergence" or when the direction cannot be determined with confidence.
+  spec_divergence_direction?: "code-behind-spec" | "spec-behind-code";
   // Non-blocking marker (#236). Absent or true = classify normally by
   // severity/confidence. false = advisory regardless of severity and confidence;
   // the finding is recorded but does NOT route to a fix round.

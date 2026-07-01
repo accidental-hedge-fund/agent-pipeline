@@ -13,7 +13,7 @@ import {
   filterToBlockingFindings,
 } from "../scripts/stages/fix.ts";
 import { formatReviewComment } from "../scripts/stages/review.ts";
-import { categoryMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
+import { categoryMarker, directionMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import type { ValidateResult } from "../scripts/openspec.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
@@ -236,7 +236,7 @@ test("enforceOpenspecSpecDeltaValidation: headBefore === headAfter → ok withou
 const fixCfg = { base_branch: "main", repo: "acme/x", repo_dir: "/repo" } as unknown as PipelineConfig;
 const specDivergenceReview =
   `## Review 1 — needs-attention\n\n### Findings\n\n` +
-  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}\n`;
 
 function fixConsistencyDeps(commits: FixCommit[]) {
   const blocked: Array<{ reason: string; stage: string; kind: string }> = [];
@@ -265,7 +265,7 @@ test("enforceFixOpenspecConsistency: stale delta + spec-divergence marker blocks
   assert.equal(blocked.length, 1);
   assert.equal(blocked[0].stage, "fix-1");
   assert.equal(blocked[0].kind, "openspec-stale-delta");
-  assert.match(blocked[0].reason, /stale spec delta/);
+  assert.match(blocked[0].reason, /spec-delta alignment/);
 });
 
 test("enforceFixOpenspecConsistency: spec delta updated after impl change passes", async () => {
