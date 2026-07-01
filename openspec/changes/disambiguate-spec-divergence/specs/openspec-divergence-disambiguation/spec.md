@@ -43,14 +43,15 @@ The guard SHALL require or attempt spec-delta repair only when there is positive
 
 ### Requirement: The stale-delta decision SHALL reflect the current post-fix state
 
-The guard SHALL treat a spec-divergence as unresolved only when it reflects the current post-fix head. A `spec-divergence` marker carried by a review verdict that predates a later fix commit SHALL NOT, by itself, drive the stale-delta decision; the decision SHALL be based on the divergence signal that corresponds to the current head.
+The guard SHALL treat a spec-divergence as unresolved only when it reflects the current post-fix head. A `spec-divergence` marker carried by a review verdict that predates a later fix commit SHALL NOT, by itself, drive the stale-delta decision; the decision SHALL be based on the divergence signal that corresponds to the current head. The guard SHALL correlate the review verdict with the current HEAD by comparing the `reviewed-sha` embedded in the review comment body against the worktree HEAD SHA (via an injectable `getHeadSha` dep); when these SHAs differ, the verdict predates the latest developer commit and its direction is treated as unclassified for the purpose of the stale-delta decision.
 
 #### Scenario: a pre-fix marker resolved by a later fix is not treated as stale
 
 - **WHEN** a review verdict tagged a `spec-divergence` finding
 - **AND** a later fix-round commit changed the implementation after that verdict
-- **AND** no divergence signal corresponds to the post-fix head
-- **THEN** the guard SHALL NOT treat the active delta as stale based on the earlier marker
+- **AND** the `reviewed-sha` in the review comment does not match the current worktree HEAD
+- **THEN** the guard SHALL treat the direction as unclassified for the post-fix state
+- **AND** SHALL NOT treat the active delta as stale based on the earlier marker
 - **AND** SHALL allow the advance
 
 #### Scenario: a divergence that persists against post-fix head is unresolved
