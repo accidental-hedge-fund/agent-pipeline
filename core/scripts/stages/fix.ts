@@ -79,6 +79,13 @@ export interface AdvanceFixDeps {
    * a real harness.
    */
   invokeFn?: InvokeFn;
+  /**
+   * GitHub login of the pipeline actor used to filter review comments to
+   * trusted-authored entries before extracting spec-divergence signals (#356
+   * finding 1). When absent, `advanceFix` resolves it via `getGhActor()` at
+   * runtime. Tests inject a literal string to avoid a real GitHub API call.
+   */
+  trustedReviewAuthor?: string | null;
 }
 
 /**
@@ -300,6 +307,10 @@ export async function advanceFix(
   const activeChangeIds = openspec
     .changeIdsFromPaths(postGateDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
     .filter((id) => openspec.changeDirExists(wt.path, id));
+  // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
+  // When the dep is provided (including null), use it directly so tests avoid a real network call.
+  const trustedReviewAuthor: string | null =
+    "trustedReviewAuthor" in deps ? (deps.trustedReviewAuthor ?? null) : await getGhActor();
   // enforceFixOpenspecConsistency creates the bounded-repair production closure
   // internally when cfg.harnesses.implementer is set (#356 finding 1).
   const consistencyGuard = await enforceFixOpenspecConsistency(
@@ -316,6 +327,7 @@ export async function advanceFix(
         const r = await gitInWorktree(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
         return r.stdout.trim() || null;
       },
+      trustedReviewAuthor,
     },
   );
   if (consistencyGuard) return consistencyGuard;
@@ -671,6 +683,13 @@ export async function enforceFixOpenspecConsistency(
      * Defaults to gitInWorktree.
      */
     gitFn?: typeof gitInWorktree;
+    /**
+     * GitHub login of the pipeline actor for the review-comment author filter
+     * (#356 finding 1). When absent, no author filter is applied (test compat).
+     * `advanceFix` resolves this via `getGhActor()` and passes it here; tests
+     * inject a literal to match the author they set on review comments.
+     */
+    trustedReviewAuthor?: string | null;
   } = {},
 ): Promise<Outcome | null> {
   if (changeIds.length === 0) return null;
@@ -712,5 +731,6 @@ export async function enforceFixOpenspecConsistency(
     attemptBoundedRepair: attemptRepairFn,
     pipelineRunId: deps.pipelineRunId,
     getHeadSha: deps.getHeadSha,
+    trustedReviewAuthor: deps.trustedReviewAuthor,
   });
 }

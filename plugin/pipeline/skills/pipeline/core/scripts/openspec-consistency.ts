@@ -65,6 +65,14 @@ export interface SpecConsistencyDeps {
    * do not provide it exercise the pre-correlation behaviour.
    */
   getHeadSha?: (wtPath: string) => Promise<string | null>;
+  /**
+   * The GitHub login of the pipeline's own actor. When set, review comments are
+   * filtered to only those authored by this identity before extracting the
+   * category/direction/reviewed-sha markers (#356 finding 1). When absent or null,
+   * no author filter is applied (preserves pre-fix behaviour for tests that do not
+   * wire this dep; production call sites always resolve and pass this value).
+   */
+  trustedReviewAuthor?: string | null;
 }
 
 /**
@@ -100,7 +108,12 @@ export async function enforceSpecConsistencyGuard(
   if (!stale) return null;
 
   const detail = await deps.getIssueDetail(cfg, issueNumber);
-  const reviewBody = latestReviewBody(detail.comments);
+  // Filter to trusted-author comments when identity is known (#356 finding 1).
+  // A non-null string means "only this author"; null/undefined means no filter.
+  const commentsToSearch = typeof deps.trustedReviewAuthor === "string"
+    ? detail.comments.filter((c) => c.author === deps.trustedReviewAuthor)
+    : detail.comments;
+  const reviewBody = latestReviewBody(commentsToSearch);
   if (!reviewBody || !reviewCommentFlagsSpecDivergence(reviewBody)) return null;
 
   // Classify direction from the structured marker — never from prose (#356).
@@ -407,6 +420,15 @@ export async function performBoundedSpecRepair(
 
   const headBefore = (await gitFn(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
 
+  // Pre-repair cleanliness check (#356 finding 2): if the worktree has uncommitted
+  // changes before repair starts, fail closed without touching git state. Rollback
+  // after a disallowed-path or validation failure uses `git reset --hard`; running
+  // that over pre-existing dirty work would irreversibly discard it.
+  const preRepairStatus = await gitFn(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
+  if (preRepairStatus.code !== 0 || preRepairStatus.stdout.trim() !== "") {
+    return "error";
+  }
+
   const prompt = buildSpecRepairPrompt(changeId, issueNumber, pipelineRunId);
   const result = await invokeFn(harness, wtPath, prompt, {
     timeoutSec: cfg.fix_timeout,
@@ -414,7 +436,16 @@ export async function performBoundedSpecRepair(
     sandbox: cfg.harness_sandbox,
   });
 
-  if (!result.success) return "error";
+  if (!result.success) {
+    // Roll back any changes the harness made before failing (#356 finding 3).
+    // The pre-repair check above confirmed the worktree was clean, so the reset
+    // only removes harness-introduced mutations.
+    if (headBefore) {
+      await gitFn(wtPath, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wtPath, ["clean", "-fd", `openspec/changes/${changeId}/`], { ignoreFailure: true });
+    }
+    return "error";
+  }
 
   // Determine the HEAD after the harness ran (it may have committed).
   const headAfter = (await gitFn(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();

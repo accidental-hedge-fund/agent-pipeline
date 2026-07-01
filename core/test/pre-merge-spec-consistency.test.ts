@@ -191,6 +191,7 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
       blocked.push(reason);
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "r", // match the author set on review comments above (#356 finding 1)
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -463,6 +464,7 @@ test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, ar
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "r", // match the author set on review comments above (#356 finding 1)
   };
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
   assert.ok(out && !out.advanced && out.status === "blocked");

@@ -177,6 +177,14 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
    * `invokeFn` to exercise the production-path repair closure end-to-end.
    */
   openspecValidateItem?: ValidateFn;
+  /**
+   * GitHub login of the pipeline actor used to filter review comments to
+   * trusted-authored entries before extracting spec-divergence signals (#356
+   * finding 1). When absent, `maybeArchiveOpenspec` resolves it via `getGhActor()`
+   * at runtime. Tests inject a literal string (matching the review-comment author
+   * they set up) to avoid a real GitHub API call.
+   */
+  trustedReviewAuthor?: string | null;
   // Seams for the no-run recovery path (#281).
   getHeadCheckRunCount?: typeof getHeadCheckRunCount;
   /** Counts only successful (conclusion=success) check-runs for a SHA.
@@ -1388,6 +1396,11 @@ export async function maybeArchiveOpenspec(
     const r = await gitFn(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
     return r.stdout.trim() || null;
   };
+  // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
+  // When the dep is provided (including null), use it directly so tests avoid a real network call.
+  // In production (no dep), resolve via the GitHub CLI; null means "can't determine" → no filter.
+  const trustedReviewAuthor: string | null =
+    "trustedReviewAuthor" in deps ? (deps.trustedReviewAuthor ?? null) : await getGhActor();
   const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
     branchDeveloperCommits: branchDeveloperCommitsFn,
     getIssueDetail: getIssueDetailFn,
@@ -1395,6 +1408,7 @@ export async function maybeArchiveOpenspec(
     pipelineRunId,
     attemptBoundedRepair: attemptRepairFn,
     getHeadSha: getHeadShaFn,
+    trustedReviewAuthor,
   });
   if (guard) return guard;
 
