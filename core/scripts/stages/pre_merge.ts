@@ -1404,7 +1404,8 @@ export async function maybeArchiveOpenspec(
   if ("trustedReviewAuthor" in deps) {
     trustedReviewAuthor = deps.trustedReviewAuthor ?? null;
   } else {
-    trustedReviewAuthor = await getGhActor();
+    const getGhActorFn = deps.getGhActor ?? getGhActor;
+    trustedReviewAuthor = await getGhActorFn();
     if (trustedReviewAuthor === null) {
       const reason =
         "cannot resolve the pipeline actor identity (gh auth may be degraded) — " +
