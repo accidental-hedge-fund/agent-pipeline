@@ -1398,9 +1398,21 @@ export async function maybeArchiveOpenspec(
   };
   // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
   // When the dep is provided (including null), use it directly so tests avoid a real network call.
-  // In production (no dep), resolve via the GitHub CLI; null means "can't determine" → no filter.
-  const trustedReviewAuthor: string | null =
-    "trustedReviewAuthor" in deps ? (deps.trustedReviewAuthor ?? null) : await getGhActor();
+  // In production (dep absent), fail closed: null from getGhActor() means auth is degraded,
+  // and proceeding without the filter would allow untrusted commenters to forge review markers.
+  let trustedReviewAuthor: string | null;
+  if ("trustedReviewAuthor" in deps) {
+    trustedReviewAuthor = deps.trustedReviewAuthor ?? null;
+  } else {
+    trustedReviewAuthor = await getGhActor();
+    if (trustedReviewAuthor === null) {
+      const reason =
+        "cannot resolve the pipeline actor identity (gh auth may be degraded) — " +
+        "trusted review-comment filtering requires a known actor; check `gh auth status`";
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+      return { advanced: false, status: "blocked", reason, blockerKind: "needs-human" };
+    }
+  }
   const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
     branchDeveloperCommits: branchDeveloperCommitsFn,
     getIssueDetail: getIssueDetailFn,

@@ -148,6 +148,7 @@ When the guard blocks, the block reason SHALL state whether the remaining work i
 - **AND** `getGhActor()` returns null (e.g. auth or network degradation)
 - **THEN** the pipeline SHALL block with a `needs-human` reason explaining the auth failure
 - **AND** SHALL NOT proceed with an unfiltered comment search
+- **AND** this behavior SHALL apply at BOTH the fix-round call site (`advanceFix`) and the pre-merge/archive call site (`maybeArchiveOpenspec`)
 
 ### Requirement: The bounded repair SHALL fail immediately if the worktree has uncommitted changes before repair starts
 
