@@ -29,3 +29,4 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 - Keep changes minimal and focused on the issue scope.
 - Do not make migrations, infra changes, or product-scope expansions unless the issue/plan actually calls for them.
 - If you encounter a blocker that prevents completion, describe it clearly in your final output.
+- **Injectable-dep rule:** Any new code path that calls an external CLI or API (`gh`, `git`, network, auth) MUST go through an injectable dep — never call the module-level function directly when a seam already exists on the `Deps` type. If no seam exists, add one. Tests that only pass because local auth is active are NOT passing tests — they will fail in CI. Every new test must cover the unauthenticated/no-network path and prove it fails without the injected fake.
