@@ -56,6 +56,8 @@ import * as openspec from "../openspec.ts";
 import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
+  performBoundedSpecRepair,
+  type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
 export {
   enforceSpecConsistencyGuard,
@@ -63,6 +65,7 @@ export {
   type FixCommit,
   type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
+import { invoke } from "../harness.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -151,6 +154,14 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
+  /**
+   * Injectable bounded spec-delta repair attempt (#356). When provided, the
+   * spec-divergence consistency guard calls this for a `spec-behind-code`
+   * direction instead of blocking immediately. Production default: uses the
+   * implementer harness to update only the active change's spec files.
+   * Tests inject a mock to verify the dep is wired without a real harness.
+   */
+  attemptBoundedRepair?: SpecConsistencyDeps["attemptBoundedRepair"];
   // Seams for the no-run recovery path (#281).
   getHeadCheckRunCount?: typeof getHeadCheckRunCount;
   /** Counts only successful (conclusion=success) check-runs for a SHA.
@@ -1334,10 +1345,41 @@ export async function maybeArchiveOpenspec(
   // AND a review finding is tagged `category: spec-divergence`, archiving would
   // fold a stale delta into the living specs (silent corruption) and re-review
   // would keep re-anchoring on the wrong delta. Block and surface it instead.
+  //
+  // Wire the bounded repair dep (#356): when direction is `spec-behind-code` the
+  // guard calls this once before blocking. Only created when the harness is
+  // configured; tests inject deps.attemptBoundedRepair directly.
+  let repairAttempted = false;
+  const attemptRepairFn: SpecConsistencyDeps["attemptBoundedRepair"] =
+    deps.attemptBoundedRepair ??
+    (cfg.harnesses?.implementer
+      ? async (changeId, issNo, runId) => {
+          if (repairAttempted) return "already-attempted";
+          repairAttempted = true;
+          return performBoundedSpecRepair(
+            cfg,
+            changeId,
+            issNo,
+            runId,
+            wt.path,
+            gitFn,
+            branchDeveloperCommitsFn,
+            invoke,
+            openspec.validateItem,
+          );
+        }
+      : undefined);
+  const getHeadShaFn = async (p: string): Promise<string | null> => {
+    const r = await gitFn(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    return r.stdout.trim() || null;
+  };
   const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
     branchDeveloperCommits: branchDeveloperCommitsFn,
     getIssueDetail: getIssueDetailFn,
     setBlocked: setBlockedFn,
+    pipelineRunId,
+    attemptBoundedRepair: attemptRepairFn,
+    getHeadSha: getHeadShaFn,
   });
   if (guard) return guard;
 

@@ -519,3 +519,109 @@ test("guard: guard runs at pre-merge time via maybeArchiveOpenspec (stale-delta 
   assert.deepEqual(archiveCalls, [], "archive must NOT run when the guard blocks");
   assert.match(blocked[0], /spec-delta alignment/);
 });
+
+// ---- Finding 2 regression: pre-fix marker staleness (#356) ----
+
+test("regression finding-2: spec-behind-code marker from pre-fix review does not block when review SHA predates HEAD", async () => {
+  // Scenario: review was done on commit "review-sha-old", then a fix commit
+  // landed ("fix-sha-new"). The review body carries <!-- reviewed-sha: review-sha-old -->.
+  // The guard must NOT block because the direction marker predates the fix commit.
+  const OLD_SHA = "aabbccddeeff00112233445566778899aabbccdd";
+  const NEW_SHA = "1122334455667788990011223344556677889900";
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: abc12345\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${OLD_SHA} -->`,
+  ].join("\n");
+
+  const blocked: string[] = [];
+  const deps: SpecConsistencyDeps = {
+    branchDeveloperCommits: async () => [spec("a"), impl(NEW_SHA)], // impl after spec → stale structurally
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+    })) as unknown as SpecConsistencyDeps["getIssueDetail"],
+    setBlocked: (async (_c: unknown, _n: unknown, reason: string) => {
+      blocked.push(reason);
+    }) as unknown as SpecConsistencyDeps["setBlocked"],
+    getHeadSha: async () => NEW_SHA, // HEAD is the fix commit, not the reviewed commit
+  };
+
+  const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
+  assert.equal(out, null,
+    "guard must return null (advance) when the spec-behind-code marker is from a pre-fix review");
+  assert.deepEqual(blocked, [], "setBlocked must NOT be called for a stale pre-fix marker");
+});
+
+test("regression finding-2: spec-behind-code marker is valid when review SHA matches HEAD", async () => {
+  // Scenario: review was done on the current HEAD; the direction marker is fresh.
+  // The guard must block (the spec is genuinely stale at the current head).
+  const HEAD_SHA = "aabbccddeeff00112233445566778899aabbccdd";
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: abc12345\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
+
+  const blocked: string[] = [];
+  const deps: SpecConsistencyDeps = {
+    branchDeveloperCommits: async () => [spec("a"), impl("b")],
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+    })) as unknown as SpecConsistencyDeps["getIssueDetail"],
+    setBlocked: (async (_c: unknown, _n: unknown, reason: string) => {
+      blocked.push(reason);
+    }) as unknown as SpecConsistencyDeps["setBlocked"],
+    getHeadSha: async () => HEAD_SHA, // HEAD matches the reviewed SHA → marker is current
+  };
+
+  const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "guard must block when the review SHA matches HEAD and direction is spec-behind-code");
+  assert.match(blocked[0], /spec-delta alignment/);
+});
+
+// ---- Finding 1 production-path: repair dep is wired at pre-merge (#356) ----
+
+test("production path (pre-merge): maybeArchiveOpenspec calls attemptBoundedRepair for spec-behind-code", async () => {
+  // Verify that maybeArchiveOpenspec wires the repair dep. When deps.attemptBoundedRepair
+  // is provided, the guard must call it (not block immediately without attempting repair).
+  const reviewBody = [
+    "## Review 2 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: deadbeef\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+  ].join("\n");
+
+  const repairCalls: string[] = [];
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_wt: string, args: string[]) => {
+      if (args[0] === "diff" && args.some((a: string) => a.includes("..."))) {
+        return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [spec("s"), impl("i")],
+    getIssueDetail: (async () => ({
+      comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+    })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async () => {}) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+    // Production-path test: inject a fake repair dep to prove it is wired and called.
+    attemptBoundedRepair: async (changeId) => {
+      repairCalls.push(changeId);
+      return "still-stale"; // block after repair attempt
+    },
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+  assert.deepEqual(repairCalls, [ID], "maybeArchiveOpenspec must call attemptBoundedRepair for spec-behind-code");
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "must block when repair returns still-stale");
+  assert.match(out.reason ?? "", /stale-delta guard still shows/);
+});

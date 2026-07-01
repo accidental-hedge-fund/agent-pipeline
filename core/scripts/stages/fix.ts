@@ -38,7 +38,9 @@ import type { RunStoreDeps } from "../run-store.ts";
 import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
+  performBoundedSpecRepair,
   type FixCommit,
+  type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
 
 export interface AdvanceFixOpts {
@@ -288,13 +290,44 @@ export async function advanceFix(
   const activeChangeIds = openspec
     .changeIdsFromPaths(postGateDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
     .filter((id) => openspec.changeDirExists(wt.path, id));
+  // Wire bounded spec-delta repair (#356): create a one-shot repair closure so
+  // enforceFixOpenspecConsistency can attempt repair before blocking on a
+  // spec-behind-code divergence. The closure tracks the single-attempt bound.
+  let specRepairAttempted = false;
+  const branchDevCommitsFn =
+    deps.branchDeveloperCommits ??
+    ((p, b) => computeBranchDeveloperCommits(gitInWorktree, p, b));
   const consistencyGuard = await enforceFixOpenspecConsistency(
     cfg,
     issueNumber,
     stage,
     wt.path,
     activeChangeIds,
-    deps,
+    {
+      ...deps,
+      pipelineRunId,
+      getHeadSha: async (p) => {
+        const r = await gitInWorktree(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
+        return r.stdout.trim() || null;
+      },
+      attemptBoundedRepair: cfg.harnesses?.implementer
+        ? async (changeId, issNo, runId) => {
+            if (specRepairAttempted) return "already-attempted";
+            specRepairAttempted = true;
+            return performBoundedSpecRepair(
+              cfg,
+              changeId,
+              issNo,
+              runId,
+              wt.path,
+              gitInWorktree,
+              branchDevCommitsFn,
+              invoke,
+              deps.openspecValidateItem ?? openspec.validateItem,
+            );
+          }
+        : undefined,
+    },
   );
   if (consistencyGuard) return consistencyGuard;
 
@@ -620,6 +653,11 @@ export async function enforceFixOpenspecConsistency(
   deps: Pick<AdvanceFixDeps, "branchDeveloperCommits"> & {
     getIssueDetail?: typeof getIssueDetail;
     setBlocked?: typeof setBlocked;
+    /** Wired by advanceFix for production repair attempts (#356). */
+    attemptBoundedRepair?: SpecConsistencyDeps["attemptBoundedRepair"];
+    pipelineRunId?: string;
+    /** Wired by advanceFix to correlate review SHA with post-fix HEAD (#356). */
+    getHeadSha?: (wtPath: string) => Promise<string | null>;
   } = {},
 ): Promise<Outcome | null> {
   if (changeIds.length === 0) return null;
@@ -629,5 +667,8 @@ export async function enforceFixOpenspecConsistency(
     getIssueDetail: deps.getIssueDetail ?? getIssueDetail,
     setBlocked: deps.setBlocked ?? setBlocked,
     blockStage: stage,
+    attemptBoundedRepair: deps.attemptBoundedRepair,
+    pipelineRunId: deps.pipelineRunId,
+    getHeadSha: deps.getHeadSha,
   });
 }

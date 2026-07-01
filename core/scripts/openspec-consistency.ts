@@ -5,8 +5,11 @@ import {
   type SpecDivergenceDirection,
 } from "./review-policy.ts";
 import { gitInWorktree } from "./worktree.ts";
-import { DELTA_REVIEW_MARKER_PREFIX } from "./stages/review.ts";
+import { DELTA_REVIEW_MARKER_PREFIX, extractReviewedSha } from "./stages/review.ts";
 import type { Outcome, PipelineConfig, Stage } from "./types.ts";
+import { withTrailers } from "./traceability.ts";
+import type { ValidateResult } from "./openspec.ts";
+import type { HarnessResult } from "./harness.ts";
 
 /** One branch commit with the repo-relative paths it changed. Ordered: index 0
  * is the earliest commit in the range, last is HEAD. */
@@ -55,6 +58,13 @@ export interface SpecConsistencyDeps {
   ) => Promise<BoundedRepairResult>;
   /** Pipeline-run ID for traceability trailers in repair commits. */
   pipelineRunId?: string;
+  /**
+   * Return the HEAD SHA of the worktree so the guard can correlate the review
+   * verdict with the current post-fix state (#356 finding 2). When absent the
+   * SHA staleness check is skipped. Production call sites inject this; tests that
+   * do not provide it exercise the pre-correlation behaviour.
+   */
+  getHeadSha?: (wtPath: string) => Promise<string | null>;
 }
 
 /**
@@ -100,6 +110,22 @@ export async function enforceSpecConsistencyGuard(
   // expected to change implementation to align with it. Do not block.
   // Unclassified: insufficient positive evidence of spec staleness. Do not block.
   if (direction !== "spec-behind-code") return null;
+
+  // Correlate the review SHA with the current HEAD (#356 finding 2): a direction
+  // marker from a review verdict that predates the latest developer commit is stale
+  // relative to the post-fix state. Without a current-head signal, treat the
+  // direction as unclassified — do not drive the stale-delta decision from a
+  // pre-fix marker alone.
+  if (deps.getHeadSha) {
+    const headSha = await deps.getHeadSha(wtPath);
+    const reviewShaResult = extractReviewedSha([{ body: reviewBody }]);
+    const reviewedSha = reviewShaResult?.sha ?? null;
+    if (reviewedSha && headSha && reviewedSha !== headSha) {
+      // The review was done on a different commit than the current HEAD.
+      // The direction marker does not correspond to the post-fix state.
+      return null;
+    }
+  }
 
   // spec-behind-code: the active delta is stale relative to accepted behavior.
   // Attempt one bounded automatic repair before blocking (when the dep is wired).
@@ -300,3 +326,153 @@ export function staleSpecDeltaBlockReason(id: string): string {
 
 // Re-export SpecDivergenceDirection so guard callers can read direction from outcomes.
 export type { SpecDivergenceDirection };
+
+// ---------------------------------------------------------------------------
+// Bounded spec-delta repair (#356)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the harness prompt for a bounded spec-delta repair attempt.
+ * Instructs the harness to update only the change's spec and tasks files.
+ */
+function buildSpecRepairPrompt(changeId: string, issueNumber: number, pipelineRunId: string): string {
+  return [
+    `## OpenSpec Spec-Delta Repair`,
+    ``,
+    `The OpenSpec change \`${changeId}\` for issue #${issueNumber} has a stale spec delta.`,
+    `The accepted implementation has moved past what the active spec delta describes,`,
+    `but the spec delta has not been updated to reflect the accepted behavior.`,
+    ``,
+    `**Your task**: Update the spec delta files to accurately describe the current`,
+    `accepted implementation behavior.`,
+    ``,
+    `**Critical constraints**:`,
+    `- You MUST ONLY modify files under \`openspec/changes/${changeId}/specs/**\` and`,
+    `  \`openspec/changes/${changeId}/tasks.md\``,
+    `- You MUST NOT modify any application source code, test files, or any other files.`,
+    `- If bringing the spec delta into agreement with the accepted implementation`,
+    `  requires changing application code, make NO changes and do nothing.`,
+    ``,
+    `**After updating**:`,
+    `1. Run \`openspec validate ${changeId}\` to confirm the delta is structurally valid.`,
+    `2. Commit all changes. The commit message must include these git trailers:`,
+    ``,
+    `   Issue: #${issueNumber}`,
+    `   Pipeline-Run: ${pipelineRunId}`,
+  ].join("\n");
+}
+
+/** Inject type — matches the real `invoke` from harness.ts. */
+export type InvokeFn = (
+  harness: string,
+  wtPath: string,
+  prompt: string,
+  opts?: { timeoutSec?: number; model?: string | null; sandbox?: boolean },
+) => Promise<HarnessResult>;
+
+/** Inject type — matches `openspec.validateItem` from openspec.ts. */
+export type ValidateFn = (dir: string, name: string) => Promise<ValidateResult>;
+
+/**
+ * Perform one bounded automatic spec-delta repair attempt (#356).
+ *
+ * Invokes the implementer harness with a constrained prompt, validates that
+ * only the active change's spec and tasks files were modified, runs
+ * `openspec validate <changeId>`, commits any remaining staged changes
+ * with traceability trailers, and re-runs the stale-delta structural check.
+ *
+ * Returns a {@link BoundedRepairResult} that the caller uses to determine
+ * whether to advance or block. All git mutations are rolled back on failure.
+ *
+ * @param gitFn - Injectable git wrapper (defaults to `gitInWorktree` in prod).
+ * @param invokeFn - Injectable harness invoker (defaults to `invoke` in prod).
+ * @param validateFn - Injectable spec validator (defaults to `openspec.validateItem`).
+ */
+export async function performBoundedSpecRepair(
+  cfg: PipelineConfig,
+  changeId: string,
+  issueNumber: number,
+  pipelineRunId: string,
+  wtPath: string,
+  gitFn: typeof gitInWorktree,
+  branchDeveloperCommitsFn: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>,
+  invokeFn: InvokeFn,
+  validateFn: ValidateFn,
+): Promise<BoundedRepairResult> {
+  const harness = cfg.harnesses?.implementer;
+  if (!harness) return "error";
+
+  const headBefore = (await gitFn(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+
+  const prompt = buildSpecRepairPrompt(changeId, issueNumber, pipelineRunId);
+  const result = await invokeFn(harness, wtPath, prompt, {
+    timeoutSec: cfg.fix_timeout,
+    model: cfg.models?.fix ?? null,
+    sandbox: cfg.harness_sandbox,
+  });
+
+  if (!result.success) return "error";
+
+  // Determine the HEAD after the harness ran (it may have committed).
+  const headAfter = (await gitFn(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+
+  const allowedFile = (p: string) =>
+    p.startsWith(`openspec/changes/${changeId}/specs/`) ||
+    p === `openspec/changes/${changeId}/tasks.md`;
+
+  // Collect all files changed since headBefore (committed + uncommitted).
+  const allChangedFiles = new Set<string>();
+
+  if (headBefore && headAfter && headBefore !== headAfter) {
+    const diffOut = await gitFn(wtPath, ["diff", "--name-only", headBefore, headAfter], { ignoreFailure: true });
+    for (const f of diffOut.stdout.split("\n").map((s) => s.trim().replace(/\\/g, "/")).filter(Boolean)) {
+      allChangedFiles.add(f);
+    }
+  }
+
+  const statusOut = await gitFn(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
+  for (const line of statusOut.stdout.split("\n").filter(Boolean)) {
+    const f = line.slice(3).trim().replace(/\\/g, "/");
+    if (f) allChangedFiles.add(f);
+  }
+
+  // No changes at all — harness could not determine how to repair the spec
+  // without touching application code.
+  if (allChangedFiles.size === 0) return "not-verifiable";
+
+  // Check the allow-list.
+  const disallowed = [...allChangedFiles].filter((f) => !allowedFile(f));
+  if (disallowed.length > 0) {
+    // Roll back ALL changes to headBefore to leave the worktree clean.
+    if (headBefore) {
+      await gitFn(wtPath, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wtPath, ["clean", "-fd", `openspec/changes/${changeId}/`], { ignoreFailure: true });
+    }
+    return "disallowed-files";
+  }
+
+  // Commit any uncommitted allowed changes left by the harness.
+  if (statusOut.stdout.trim()) {
+    await gitFn(wtPath, ["add", "-A"], { ignoreFailure: true });
+    const commitResult = await gitFn(
+      wtPath,
+      ["commit", "-m", withTrailers(`spec-delta repair: ${changeId}`, issueNumber, pipelineRunId)],
+      { ignoreFailure: true },
+    );
+    if (commitResult.code !== 0) return "error";
+  }
+
+  // Validate the openspec change in its post-repair state.
+  const validation = await validateFn(wtPath, changeId);
+  if (!validation.valid) {
+    // Roll back to headBefore.
+    if (headBefore) {
+      await gitFn(wtPath, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    }
+    return "invalid";
+  }
+
+  // Re-check the structural staleness after repair.
+  const freshCommits = await branchDeveloperCommitsFn(wtPath, cfg.base_branch);
+  return specDeltaIsStale(changeId, freshCommits) ? "still-stale" : "cleared";
+}

@@ -280,6 +280,24 @@ test("enforceFixOpenspecConsistency: spec delta updated after impl change passes
   assert.deepEqual(blocked, []);
 });
 
+test("enforceFixOpenspecConsistency: production path calls attemptBoundedRepair for spec-behind-code (#356)", async () => {
+  // Production-path test: verify that enforceFixOpenspecConsistency wires
+  // attemptBoundedRepair to the guard and that the dep is actually called.
+  const { deps } = fixConsistencyDeps([{ sha: "a", paths: ["core/scripts/foo.ts"] }]);
+  const repairCalls: string[] = [];
+  const extDeps = {
+    ...deps,
+    attemptBoundedRepair: async (changeId: string) => {
+      repairCalls.push(changeId);
+      return "cleared" as const; // repair succeeds → advance
+    },
+  };
+
+  const out = await enforceFixOpenspecConsistency(fixCfg, 42, "fix-1", "/wt", ["c106"], extDeps as any);
+  assert.deepEqual(repairCalls, ["c106"], "enforceFixOpenspecConsistency must call attemptBoundedRepair");
+  assert.equal(out, null, "guard must return null (advance) after a successful repair");
+});
+
 // ---------------------------------------------------------------------------
 // Mixed-verdict filtering: advisory (non-blocking) findings (#236)
 // ---------------------------------------------------------------------------
