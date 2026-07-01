@@ -142,6 +142,13 @@ When the guard blocks, the block reason SHALL state whether the remaining work i
 - **AND** the latest review comment was posted by that author
 - **THEN** the guard SHALL read the category, direction, and `reviewed-sha` from that comment as normal
 
+#### Scenario: production actor lookup failure blocks rather than disabling the filter
+
+- **WHEN** the pipeline is running in production (no `trustedReviewAuthor` dep injected)
+- **AND** `getGhActor()` returns null (e.g. auth or network degradation)
+- **THEN** the pipeline SHALL block with a `needs-human` reason explaining the auth failure
+- **AND** SHALL NOT proceed with an unfiltered comment search
+
 ### Requirement: The bounded repair SHALL fail immediately if the worktree has uncommitted changes before repair starts
 
 `performBoundedSpecRepair` SHALL check for uncommitted changes in the worktree before invoking the harness or touching any git state. If uncommitted changes are present, the function SHALL return `"error"` immediately without calling `git reset`, `git clean`, or any other destructive git operation. This prevents the rollback step from discarding pre-existing work that was present before the repair was attempted.
@@ -158,11 +165,12 @@ When the guard blocks, the block reason SHALL state whether the remaining work i
 
 If the harness invocation fails (non-success result), `performBoundedSpecRepair` SHALL roll back to the pre-repair HEAD with `git reset --hard <headBefore>` followed by `git clean -fd`, removing any uncommitted mutations the harness may have left. This matches the existing rollback behavior on disallowed-file detection.
 
-#### Scenario: failed harness result triggers rollback
+#### Scenario: failed harness result triggers unscoped rollback
 
 - **WHEN** the harness invocation inside `performBoundedSpecRepair` returns a non-success result
-- **THEN** the function SHALL run `git reset --hard <headBefore>` and `git clean -fd`
-- **AND** SHALL return `"error"` to the caller
+- **THEN** the function SHALL run `git reset --hard <headBefore>` followed by an unscoped `git clean -fd`
+- **AND** the `git clean -fd` SHALL NOT be scoped to the active OpenSpec change directory — it must remove all untracked files the harness may have introduced anywhere in the worktree
+- **AND** the function SHALL return `"error"` to the caller
 
 ### Requirement: The stale-delta guard SHALL remain active at fix-round and pre-merge and SHALL never archive a stale delta
 

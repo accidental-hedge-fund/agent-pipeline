@@ -309,8 +309,21 @@ export async function advanceFix(
     .filter((id) => openspec.changeDirExists(wt.path, id));
   // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
   // When the dep is provided (including null), use it directly so tests avoid a real network call.
-  const trustedReviewAuthor: string | null =
-    "trustedReviewAuthor" in deps ? (deps.trustedReviewAuthor ?? null) : await getGhActor();
+  // In production (dep absent), fail closed if the actor cannot be resolved: proceeding with
+  // null would disable the author filter and allow untrusted commenters to forge review markers.
+  let trustedReviewAuthor: string | null;
+  if ("trustedReviewAuthor" in deps) {
+    trustedReviewAuthor = deps.trustedReviewAuthor ?? null;
+  } else {
+    trustedReviewAuthor = await getGhActor();
+    if (trustedReviewAuthor === null) {
+      const reason =
+        "cannot resolve the pipeline actor identity (gh auth may be degraded) — " +
+        "trusted review-comment filtering requires a known actor; check `gh auth status`";
+      await setBlocked(cfg, issueNumber, reason, stage, "needs-human");
+      return { advanced: false, status: "blocked", reason, blockerKind: "needs-human" };
+    }
+  }
   // enforceFixOpenspecConsistency creates the bounded-repair production closure
   // internally when cfg.harnesses.implementer is set (#356 finding 1).
   const consistencyGuard = await enforceFixOpenspecConsistency(

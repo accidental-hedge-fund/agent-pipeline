@@ -442,7 +442,7 @@ export async function performBoundedSpecRepair(
     // only removes harness-introduced mutations.
     if (headBefore) {
       await gitFn(wtPath, ["reset", "--hard", headBefore], { ignoreFailure: true });
-      await gitFn(wtPath, ["clean", "-fd", `openspec/changes/${changeId}/`], { ignoreFailure: true });
+      await gitFn(wtPath, ["clean", "-fd"], { ignoreFailure: true });
     }
     return "error";
   }
