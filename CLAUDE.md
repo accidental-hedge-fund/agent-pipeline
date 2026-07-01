@@ -49,6 +49,12 @@ review steps must follow.
 - Tests inject I/O via dependency seams (a `deps`/`Deps` parameter with `gh`/harness/worktree
   fakes) — see `AdvanceReviewDeps`, `ShaGateDeps`, `VerifyDeps`. Unit tests do **no real network,
   git, or subprocess** calls. Mirror this pattern for new stage logic.
+- **Injectable-dep rule (hard):** Any new code path that calls an external CLI or API (`gh`,
+  `openspec`, `git`, `getGhActor`, etc.) MUST be reachable via an injectable dep — never call
+  the module-level function directly when a seam already exists on the `Deps` type. If no seam
+  exists, add one. Tests that only pass because local `gh auth` is active are **not passing
+  tests** — they will fail in CI. Verify every new test covers the unauthenticated / no-network
+  path by proving it fails without the injected fake.
 
 ## OpenSpec
 
