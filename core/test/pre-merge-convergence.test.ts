@@ -141,6 +141,7 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
     setBlocked: async () => {},
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
   };
 
   await quiet(t, async () => {
@@ -296,6 +297,7 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       setBlocked: async () => {},
       getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
       branchDeveloperCommits: async () => [],
+      trustedReviewAuthor: "test-actor",
     });
   });
 
@@ -326,6 +328,7 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       setBlocked: async () => {},
       getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
       branchDeveloperCommits: async () => [],
+      trustedReviewAuthor: "test-actor",
     });
   });
 
@@ -366,6 +369,7 @@ test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks wit
     }) as AdvancePreMergeDeps["setBlocked"],
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
   };
 
   let out;

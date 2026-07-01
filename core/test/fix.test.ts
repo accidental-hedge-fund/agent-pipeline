@@ -13,7 +13,7 @@ import {
   filterToBlockingFindings,
 } from "../scripts/stages/fix.ts";
 import { formatReviewComment } from "../scripts/stages/review.ts";
-import { categoryMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
+import { categoryMarker, directionMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import type { ValidateResult } from "../scripts/openspec.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
@@ -236,7 +236,7 @@ test("enforceOpenspecSpecDeltaValidation: headBefore === headAfter → ok withou
 const fixCfg = { base_branch: "main", repo: "acme/x", repo_dir: "/repo" } as unknown as PipelineConfig;
 const specDivergenceReview =
   `## Review 1 — needs-attention\n\n### Findings\n\n` +
-  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}\n`;
 
 function fixConsistencyDeps(commits: FixCommit[]) {
   const blocked: Array<{ reason: string; stage: string; kind: string }> = [];
@@ -265,7 +265,7 @@ test("enforceFixOpenspecConsistency: stale delta + spec-divergence marker blocks
   assert.equal(blocked.length, 1);
   assert.equal(blocked[0].stage, "fix-1");
   assert.equal(blocked[0].kind, "openspec-stale-delta");
-  assert.match(blocked[0].reason, /stale spec delta/);
+  assert.match(blocked[0].reason, /spec-delta alignment/);
 });
 
 test("enforceFixOpenspecConsistency: spec delta updated after impl change passes", async () => {
@@ -278,6 +278,24 @@ test("enforceFixOpenspecConsistency: spec delta updated after impl change passes
 
   assert.equal(out, null);
   assert.deepEqual(blocked, []);
+});
+
+test("enforceFixOpenspecConsistency: production path calls attemptBoundedRepair for spec-behind-code (#356)", async () => {
+  // Production-path test: verify that enforceFixOpenspecConsistency wires
+  // attemptBoundedRepair to the guard and that the dep is actually called.
+  const { deps } = fixConsistencyDeps([{ sha: "a", paths: ["core/scripts/foo.ts"] }]);
+  const repairCalls: string[] = [];
+  const extDeps = {
+    ...deps,
+    attemptBoundedRepair: async (changeId: string) => {
+      repairCalls.push(changeId);
+      return "cleared" as const; // repair succeeds → advance
+    },
+  };
+
+  const out = await enforceFixOpenspecConsistency(fixCfg, 42, "fix-1", "/wt", ["c106"], extDeps as any);
+  assert.deepEqual(repairCalls, ["c106"], "enforceFixOpenspecConsistency must call attemptBoundedRepair");
+  assert.equal(out, null, "guard must return null (advance) after a successful repair");
 });
 
 // ---------------------------------------------------------------------------

@@ -234,7 +234,12 @@ Rate each finding honestly against real-world impact — do NOT inflate. The pol
 
 > A single-operator CLI adds an \`--output json\` flag; the help text for the flag is missing a description of what the JSON shape looks like. No user data is at risk; the gap is purely observability/documentation.
 
-Set each finding's \`category\` to a short machine-readable class (e.g. \`spec-divergence\`, \`correctness\`, \`security\`, \`data-loss\`, \`concurrency\`, \`observability\`) so downstream gates can key on the field instead of parsing prose.`;
+Set each finding's \`category\` to a short machine-readable class (e.g. \`spec-divergence\`, \`correctness\`, \`security\`, \`data-loss\`, \`concurrency\`, \`observability\`) so downstream gates can key on the field instead of parsing prose.
+
+When \`category\` is \`spec-divergence\`, ALSO set \`spec_divergence_direction\` to one of:
+- \`"code-behind-spec"\` — the active spec delta already requires the target behavior; the implementation must change to satisfy it. Set this when the spec is correct and code is behind.
+- \`"spec-behind-code"\` — the accepted implementation behavior has moved past what the active spec delta states; the spec delta must be updated. Set this when the implementation is the accepted truth and the spec is stale.
+Only set \`spec_divergence_direction\` when you can determine the direction with high confidence from the diff and the \`## OpenSpec Context\` section. Omit the field when the direction is unclear — an unclassified marker is safer than a wrong one, and the gate will not block on an unclassified finding.`;
 
 // Single-sourced guidance on when to set `blocking: false` on a finding (#236).
 // Injected into BOTH review prompts via {{non_blocking_guidance}} so the standard

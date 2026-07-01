@@ -38,7 +38,11 @@ import type { RunStoreDeps } from "../run-store.ts";
 import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
+  performBoundedSpecRepair,
   type FixCommit,
+  type InvokeFn,
+  type SpecConsistencyDeps,
+  type ValidateFn,
 } from "../openspec-consistency.ts";
 
 export interface AdvanceFixOpts {
@@ -67,6 +71,21 @@ export interface AdvanceFixDeps {
   runFormatGate?: typeof runFormatGate;
   /** Format+test gate runner (defaults to runFormatAndTestGates); injectable for tests. */
   _runFormatAndTestGates?: typeof runFormatAndTestGates;
+  /**
+   * Injectable harness invoker for the internal bounded-repair closure (#356).
+   * Defaults to `invoke` from harness.ts. Tests inject this to exercise the
+   * production-path repair closure (when `attemptBoundedRepair` is not in the
+   * consistency deps and `cfg.harnesses.implementer` is set) without spawning
+   * a real harness.
+   */
+  invokeFn?: InvokeFn;
+  /**
+   * GitHub login of the pipeline actor used to filter review comments to
+   * trusted-authored entries before extracting spec-divergence signals (#356
+   * finding 1). When absent, `advanceFix` resolves it via `getGhActor()` at
+   * runtime. Tests inject a literal string to avoid a real GitHub API call.
+   */
+  trustedReviewAuthor?: string | null;
 }
 
 /**
@@ -288,13 +307,41 @@ export async function advanceFix(
   const activeChangeIds = openspec
     .changeIdsFromPaths(postGateDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
     .filter((id) => openspec.changeDirExists(wt.path, id));
+  // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
+  // When the dep is provided (including null), use it directly so tests avoid a real network call.
+  // In production (dep absent), fail closed if the actor cannot be resolved: proceeding with
+  // null would disable the author filter and allow untrusted commenters to forge review markers.
+  let trustedReviewAuthor: string | null;
+  if ("trustedReviewAuthor" in deps) {
+    trustedReviewAuthor = deps.trustedReviewAuthor ?? null;
+  } else {
+    trustedReviewAuthor = await getGhActor();
+    if (trustedReviewAuthor === null) {
+      const reason =
+        "cannot resolve the pipeline actor identity (gh auth may be degraded) — " +
+        "trusted review-comment filtering requires a known actor; check `gh auth status`";
+      await setBlocked(cfg, issueNumber, reason, stage, "needs-human");
+      return { advanced: false, status: "blocked", reason, blockerKind: "needs-human" };
+    }
+  }
+  // enforceFixOpenspecConsistency creates the bounded-repair production closure
+  // internally when cfg.harnesses.implementer is set (#356 finding 1).
   const consistencyGuard = await enforceFixOpenspecConsistency(
     cfg,
     issueNumber,
     stage,
     wt.path,
     activeChangeIds,
-    deps,
+    {
+      ...deps,
+      pipelineRunId,
+      gitFn: gitInWorktree,
+      getHeadSha: async (p) => {
+        const r = await gitInWorktree(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
+        return r.stdout.trim() || null;
+      },
+      trustedReviewAuthor,
+    },
   );
   if (consistencyGuard) return consistencyGuard;
 
@@ -620,14 +667,83 @@ export async function enforceFixOpenspecConsistency(
   deps: Pick<AdvanceFixDeps, "branchDeveloperCommits"> & {
     getIssueDetail?: typeof getIssueDetail;
     setBlocked?: typeof setBlocked;
+    /**
+     * When provided, passed directly to the guard. When absent and
+     * cfg.harnesses.implementer is set, an internal production closure is
+     * created using invokeFn, openspecValidateItem, and gitFn. This mirrors
+     * maybeArchiveOpenspec's repair wiring so enforceFixOpenspecConsistency
+     * can be tested end-to-end with an injected invokeFn without going through
+     * the full advanceFix call chain (#356 finding 1).
+     */
+    attemptBoundedRepair?: SpecConsistencyDeps["attemptBoundedRepair"];
+    pipelineRunId?: string;
+    /** Correlates the review verdict with the current post-fix HEAD (#356 finding 2). */
+    getHeadSha?: (wtPath: string) => Promise<string | null>;
+    /**
+     * Injectable harness invoker for the internal production repair closure (#356).
+     * Defaults to `invoke`. Tests inject this to exercise the closure end-to-end
+     * without spawning a real harness (when attemptBoundedRepair is NOT provided).
+     */
+    invokeFn?: InvokeFn;
+    /**
+     * Injectable OpenSpec change validator for the internal repair closure (#356).
+     * Defaults to `openspec.validateItem`.
+     */
+    openspecValidateItem?: ValidateFn;
+    /**
+     * Injectable git function for the internal repair closure and for
+     * computeBranchDeveloperCommits when branchDeveloperCommits is absent (#356).
+     * Defaults to gitInWorktree.
+     */
+    gitFn?: typeof gitInWorktree;
+    /**
+     * GitHub login of the pipeline actor for the review-comment author filter
+     * (#356 finding 1). When absent, no author filter is applied (test compat).
+     * `advanceFix` resolves this via `getGhActor()` and passes it here; tests
+     * inject a literal to match the author they set on review comments.
+     */
+    trustedReviewAuthor?: string | null;
   } = {},
 ): Promise<Outcome | null> {
   if (changeIds.length === 0) return null;
+
+  // Create the production repair closure when cfg.harnesses.implementer is set
+  // and deps.attemptBoundedRepair is not provided (to avoid shadowing a test fake).
+  // This mirrors the wiring in maybeArchiveOpenspec so the fix-stage repair path
+  // is exercisable in unit tests via injected invokeFn without the full advanceFix
+  // call chain (#356 finding 1).
+  const gitFn = deps.gitFn ?? gitInWorktree;
+  const branchDevCommits =
+    deps.branchDeveloperCommits ?? ((p: string, b: string) => computeBranchDeveloperCommits(gitFn, p, b));
+  let repairAttempted = false;
+  const attemptRepairFn: SpecConsistencyDeps["attemptBoundedRepair"] =
+    deps.attemptBoundedRepair ??
+    (cfg.harnesses?.implementer
+      ? async (changeId, issNo, runId) => {
+          if (repairAttempted) return "already-attempted";
+          repairAttempted = true;
+          return performBoundedSpecRepair(
+            cfg,
+            changeId,
+            issNo,
+            runId,
+            wtPath,
+            gitFn,
+            branchDevCommits,
+            deps.invokeFn ?? invoke,
+            deps.openspecValidateItem ?? openspec.validateItem,
+          );
+        }
+      : undefined);
+
   return enforceSpecConsistencyGuard(cfg, issueNumber, wtPath, changeIds, {
-    branchDeveloperCommits:
-      deps.branchDeveloperCommits ?? ((innerWtPath, base) => computeBranchDeveloperCommits(gitInWorktree, innerWtPath, base)),
+    branchDeveloperCommits: branchDevCommits,
     getIssueDetail: deps.getIssueDetail ?? getIssueDetail,
     setBlocked: deps.setBlocked ?? setBlocked,
     blockStage: stage,
+    attemptBoundedRepair: attemptRepairFn,
+    pipelineRunId: deps.pipelineRunId,
+    getHeadSha: deps.getHeadSha,
+    trustedReviewAuthor: deps.trustedReviewAuthor,
   });
 }
