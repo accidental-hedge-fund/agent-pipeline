@@ -27,7 +27,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
+import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   computeDiffHash,
@@ -179,6 +179,12 @@ export async function performPreMergeAutoFix(
   const preStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return "error";
 
+  // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
+  // made in a detached worktree don't move the branch ref, so the later push
+  // would silently leave the PR branch unchanged while returning success.
+  const reattach = await reattachIfDetached(wt, issueNumber, gitFn);
+  if (!reattach.ok) return "error";
+
   const prompt = buildFixPrompt({
     cfg,
     issueNumber,
@@ -209,39 +215,33 @@ export async function performPreMergeAutoFix(
   const hasUncommitted = statusAfter.stdout.trim() !== "";
   const hasNewCommit = headAfter && headBefore && headAfter !== headBefore;
 
-  if (!hasNewCommit && !hasUncommitted) {
-    // Harness produced no change at all — treat as failure.
+  // Spec (#359): a dirty post-harness worktree (uncommitted changes remaining) or
+  // no new commit is a failure — roll back. The harness MUST commit cleanly; a dirty
+  // state indicates the harness exited early or its pre-commit self-check withheld the
+  // commit, and we must not push a partial or self-check-rejected fix.
+  if (hasUncommitted || !hasNewCommit) {
+    if (headBefore) {
+      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    }
     return "error";
   }
 
-  // The auto-fix commit subject MUST start with PRE_MERGE_AUTOFIX_PREFIX so the
-  // one-attempt bound survives a process restart. Amend the HEAD commit (if the
-  // harness committed) or create a new commit (if it left uncommitted changes).
+  // Harness committed cleanly; amend to set the canonical subject so the
+  // one-attempt bound can detect this commit by subject prefix.
   const autoFixMsg = withTrailers(
     `${PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
     issueNumber,
     pipelineRunId,
   );
 
-  if (hasUncommitted) {
-    await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
-    const commitRes = await gitFn(wt.path, ["commit", "-m", autoFixMsg], { ignoreFailure: true });
-    if (commitRes.code !== 0) {
-      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-      return "error";
-    }
-  } else {
-    // Harness already committed; amend to set the canonical subject so the
-    // one-attempt bound can detect this commit by subject prefix.
-    const amendRes = await gitFn(
-      wt.path, ["commit", "--amend", "-m", autoFixMsg], { ignoreFailure: true },
-    );
-    if (amendRes.code !== 0) {
-      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-      return "error";
-    }
+  const amendRes = await gitFn(
+    wt.path, ["commit", "--amend", "-m", autoFixMsg], { ignoreFailure: true },
+  );
+  if (amendRes.code !== 0) {
+    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    return "error";
   }
 
   // Push the fix commit to the PR head.
@@ -1357,7 +1357,10 @@ export async function enforceReviewShaGate(
             c.messageHeadline.startsWith(PRE_MERGE_AUTOFIX_PREFIX),
           );
         } catch {
-          // Cannot determine prior attempt — allow this attempt (fail open).
+          // Cannot determine prior attempt — fail closed (#359): skipping the
+          // auto-fix is safer than risking a second attempt when the durable
+          // marker cannot be read (crash-safe at-most-one requirement).
+          priorAutoFix = true;
         }
 
         if (!priorAutoFix) {
@@ -1409,7 +1412,12 @@ export async function enforceReviewShaGate(
               : reCommentBody;
             await postCommentFn(cfg, issueNumber, reComment);
 
-            if (rePartition.blocking.length === 0) {
+            // Mirror the initial delta review guard (#228): needs-attention with zero
+            // findings is likely unparseable reviewer output — block conservatively
+            // rather than treating empty findings as an implicit approval.
+            const reIsUnparseable =
+              reResult.verdict === "needs-attention" && reResult.findings.length === 0;
+            if (rePartition.blocking.length === 0 && !reIsUnparseable) {
               // Re-validate HEAD (same guard as the normal approve path).
               const postFixHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
               if (postFixHead !== newPrHead) {
@@ -1423,7 +1431,7 @@ export async function enforceReviewShaGate(
               );
               return null;
             }
-            // Re-review still blocks: fall through to block below (no second attempt).
+            // Re-review still blocks or returned unparseable output: fall through to block below.
           }
           // fixRes === "error": fall through to block below.
         }

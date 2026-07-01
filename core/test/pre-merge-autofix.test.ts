@@ -4,11 +4,13 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import * as os from "node:os";
 import {
   allBlockingAutoFixable,
   enforceReviewShaGate,
   isAutoFixableFinding,
   isPipelineInternalCommit,
+  performPreMergeAutoFix,
   PRE_MERGE_AUTOFIX_PREFIX,
   type AttemptPreMergeAutoFixFn,
   type DeltaReviewResult,
@@ -17,6 +19,7 @@ import {
 } from "../scripts/stages/pre_merge.ts";
 import { computeDiffHash, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
+import type { InvokeFn } from "../scripts/openspec-consistency.ts";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -423,4 +426,259 @@ test("pre-merge auto-fix 5.9 (bite check): without auto-fix seam, correctness fi
     "without the auto-fix seam, correctness findings must block (proves 5.1 bites when seam is absent)",
   );
   assert.equal(rec.blocked.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// performPreMergeAutoFix unit tests (findings 1, 3)
+// ---------------------------------------------------------------------------
+
+// Minimal cfg for performPreMergeAutoFix — repo_dir points to a non-existent path
+// so readConventions returns the "no conventions file" placeholder (no real I/O).
+const autoFixCfg = {
+  repo_dir: os.tmpdir(),
+  harnesses: { implementer: "claude" },
+} as unknown as PipelineConfig;
+
+const autoFixWt = { path: "/fake/worktree", slug: "test-slug" };
+
+function makeSucceedInvoke(): InvokeFn {
+  return async () => ({
+    success: true,
+    stdout: "",
+    stderr: "",
+    exit_code: 0,
+    duration: 0,
+    timed_out: false,
+  });
+}
+
+// Build a gitFn that responds to calls in sequence.
+function makeSeqGitFn(
+  responses: Array<{ code?: number; stdout?: string; stderr?: string }>,
+): { fn: typeof import("../scripts/worktree.ts").gitInWorktree; calls: string[][] } {
+  const calls: string[][] = [];
+  let i = 0;
+  const fn = async (
+    _cwd: string,
+    args: string[],
+    _opts?: { ignoreFailure?: boolean },
+  ): Promise<{ code: number; stdout: string; stderr: string }> => {
+    calls.push([...args]);
+    const resp = responses[i++] ?? { code: 0, stdout: "", stderr: "" };
+    return { code: resp.code ?? 0, stdout: resp.stdout ?? "", stderr: resp.stderr ?? "" };
+  };
+  return { fn: fn as any, calls };
+}
+
+// Finding 1 regression: dirty post-harness worktree → "error", not "fix-committed"
+test("performPreMergeAutoFix finding-1: dirty post-harness worktree → rollback and return error", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfter — different = hasNewCommit)
+    { code: 0, stdout: "sha2" },
+    // status --porcelain (post-harness: DIRTY)
+    { code: 0, stdout: "M  core/scripts/foo.ts" },
+    // reset --hard sha1 (rollback)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: dirty state",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+  );
+
+  assert.equal(result, "error", "dirty post-harness worktree must return error, not fix-committed");
+  // Verify rollback was called (reset --hard sha1)
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.ok(resetCall, "git reset --hard must be called to roll back the dirty worktree");
+});
+
+// Finding 1 regression (bite check): WITHOUT the dirty-is-failure fix, the old
+// code would attempt git add -A + commit (not return error on dirty state).
+// This test documents that dirty state must NOT be committed.
+test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committed (no rollback)", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfter — different = hasNewCommit)
+    { code: 0, stdout: "sha2" },
+    // status --porcelain (post-harness: clean)
+    { code: 0, stdout: "" },
+    // commit --amend -m ... (amend succeeds)
+    { code: 0, stdout: "" },
+    // push origin <branch> (push succeeds)
+    { code: 0, stdout: "" },
+  ]);
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+  );
+
+  assert.equal(result, "fix-committed", "clean commit path must return fix-committed");
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.equal(resetCall, undefined, "clean path must NOT call reset --hard");
+});
+
+// Finding 3 regression: reattach failure → "error" (harness never invoked)
+test("performPreMergeAutoFix finding-3: reattach detached worktree fails → return error", async () => {
+  let invokeCalled = false;
+  const { fn: gitFn } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach FAILS)
+    { code: 1, stdout: "", stderr: "fatal: could not checkout" },
+  ]);
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: x",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    async () => {
+      invokeCalled = true;
+      return { success: true, stdout: "", stderr: "", exit_code: 0, duration: 0, timed_out: false };
+    },
+  );
+
+  assert.equal(result, "error", "failed reattach must return error");
+  assert.equal(invokeCalled, false, "harness must NOT be invoked when reattach fails");
+});
+
+// Finding 4 regression: getPrCommits throws → fail closed (auto-fix NOT called)
+test("pre-merge auto-fix finding-4: getPrCommits throws → fail closed, no auto-fix attempted", async (t) => {
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+
+  const runDeltaReview: RunDeltaReviewFn = async () => ({
+    verdict: "needs-attention",
+    findings: [blockingFinding("correctness")],
+    summary: "blocking correctness finding",
+  } as DeltaReviewResult);
+
+  const depsWithThrowingCommits: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "Test issue",
+        body: "Body",
+        comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () => { throw new Error("network failure reading PR commits"); },
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => { rec.autoFixCalls++; return "fix-committed"; },
+  };
+
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, depsWithThrowingCommits);
+  });
+
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    "getPrCommits failure must block, not attempt auto-fix",
+  );
+  assert.equal(rec.autoFixCalls, 0, "auto-fix seam must NOT be called when commit scan fails");
+  assert.equal(rec.blocked.length, 1, "must block pre-merge");
+});
+
+// Finding 2 regression: re-review returns needs-attention + zero findings → blocks
+test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings → blocks (not approved)", async (t) => {
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+
+  let deltaCallCount = 0;
+  const runDeltaReview: RunDeltaReviewFn = async () => {
+    deltaCallCount++;
+    rec.deltaReviewCalls++;
+    if (deltaCallCount === 1) {
+      // Initial review: blocking correctness finding
+      return {
+        verdict: "needs-attention",
+        findings: [blockingFinding("correctness")],
+        summary: "initial blocking",
+      } as DeltaReviewResult;
+    }
+    // Re-review: needs-attention with ZERO findings (unparseable output)
+    return {
+      verdict: "needs-attention",
+      findings: [],
+      summary: "re-review with empty findings",
+    } as DeltaReviewResult;
+  };
+
+  const commits = [
+    { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+    { oid: SHA_HEAD, messageHeadline: "fix: review 2" },
+  ];
+
+  const depsReReviewUnparseable: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "Test issue",
+        body: "Body",
+        comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+      }) as any,
+    getPrDetail: async () => ({
+      head_sha: rec.autoFixCalls > 0 ? SHA_AFTER_FIX : SHA_HEAD,
+    }) as any,
+    getPrCommits: async () => commits as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => { rec.autoFixCalls++; return "fix-committed"; },
+  };
+
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, depsReReviewUnparseable);
+  });
+
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    "re-review needs-attention with zero findings must block, not approve",
+  );
+  assert.equal(rec.autoFixCalls, 1, "auto-fix was attempted once");
+  assert.equal(rec.deltaReviewCalls, 2, "initial + re-review both ran");
+  assert.equal(rec.blocked.length, 1, "must block on unparseable re-review output");
 });
