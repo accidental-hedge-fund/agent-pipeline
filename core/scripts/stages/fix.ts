@@ -42,6 +42,7 @@ import {
   type FixCommit,
   type InvokeFn,
   type SpecConsistencyDeps,
+  type ValidateFn,
 } from "../openspec-consistency.ts";
 
 export interface AdvanceFixOpts {
@@ -299,13 +300,8 @@ export async function advanceFix(
   const activeChangeIds = openspec
     .changeIdsFromPaths(postGateDiff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
     .filter((id) => openspec.changeDirExists(wt.path, id));
-  // Wire bounded spec-delta repair (#356): create a one-shot repair closure so
-  // enforceFixOpenspecConsistency can attempt repair before blocking on a
-  // spec-behind-code divergence. The closure tracks the single-attempt bound.
-  let specRepairAttempted = false;
-  const branchDevCommitsFn =
-    deps.branchDeveloperCommits ??
-    ((p, b) => computeBranchDeveloperCommits(gitInWorktree, p, b));
+  // enforceFixOpenspecConsistency creates the bounded-repair production closure
+  // internally when cfg.harnesses.implementer is set (#356 finding 1).
   const consistencyGuard = await enforceFixOpenspecConsistency(
     cfg,
     issueNumber,
@@ -315,27 +311,11 @@ export async function advanceFix(
     {
       ...deps,
       pipelineRunId,
+      gitFn: gitInWorktree,
       getHeadSha: async (p) => {
         const r = await gitInWorktree(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
         return r.stdout.trim() || null;
       },
-      attemptBoundedRepair: cfg.harnesses?.implementer
-        ? async (changeId, issNo, runId) => {
-            if (specRepairAttempted) return "already-attempted";
-            specRepairAttempted = true;
-            return performBoundedSpecRepair(
-              cfg,
-              changeId,
-              issNo,
-              runId,
-              wt.path,
-              gitInWorktree,
-              branchDevCommitsFn,
-              deps.invokeFn ?? invoke,
-              deps.openspecValidateItem ?? openspec.validateItem,
-            );
-          }
-        : undefined,
     },
   );
   if (consistencyGuard) return consistencyGuard;
@@ -662,21 +642,74 @@ export async function enforceFixOpenspecConsistency(
   deps: Pick<AdvanceFixDeps, "branchDeveloperCommits"> & {
     getIssueDetail?: typeof getIssueDetail;
     setBlocked?: typeof setBlocked;
-    /** Wired by advanceFix for production repair attempts (#356). */
+    /**
+     * When provided, passed directly to the guard. When absent and
+     * cfg.harnesses.implementer is set, an internal production closure is
+     * created using invokeFn, openspecValidateItem, and gitFn. This mirrors
+     * maybeArchiveOpenspec's repair wiring so enforceFixOpenspecConsistency
+     * can be tested end-to-end with an injected invokeFn without going through
+     * the full advanceFix call chain (#356 finding 1).
+     */
     attemptBoundedRepair?: SpecConsistencyDeps["attemptBoundedRepair"];
     pipelineRunId?: string;
-    /** Wired by advanceFix to correlate review SHA with post-fix HEAD (#356). */
+    /** Correlates the review verdict with the current post-fix HEAD (#356 finding 2). */
     getHeadSha?: (wtPath: string) => Promise<string | null>;
+    /**
+     * Injectable harness invoker for the internal production repair closure (#356).
+     * Defaults to `invoke`. Tests inject this to exercise the closure end-to-end
+     * without spawning a real harness (when attemptBoundedRepair is NOT provided).
+     */
+    invokeFn?: InvokeFn;
+    /**
+     * Injectable OpenSpec change validator for the internal repair closure (#356).
+     * Defaults to `openspec.validateItem`.
+     */
+    openspecValidateItem?: ValidateFn;
+    /**
+     * Injectable git function for the internal repair closure and for
+     * computeBranchDeveloperCommits when branchDeveloperCommits is absent (#356).
+     * Defaults to gitInWorktree.
+     */
+    gitFn?: typeof gitInWorktree;
   } = {},
 ): Promise<Outcome | null> {
   if (changeIds.length === 0) return null;
+
+  // Create the production repair closure when cfg.harnesses.implementer is set
+  // and deps.attemptBoundedRepair is not provided (to avoid shadowing a test fake).
+  // This mirrors the wiring in maybeArchiveOpenspec so the fix-stage repair path
+  // is exercisable in unit tests via injected invokeFn without the full advanceFix
+  // call chain (#356 finding 1).
+  const gitFn = deps.gitFn ?? gitInWorktree;
+  const branchDevCommits =
+    deps.branchDeveloperCommits ?? ((p: string, b: string) => computeBranchDeveloperCommits(gitFn, p, b));
+  let repairAttempted = false;
+  const attemptRepairFn: SpecConsistencyDeps["attemptBoundedRepair"] =
+    deps.attemptBoundedRepair ??
+    (cfg.harnesses?.implementer
+      ? async (changeId, issNo, runId) => {
+          if (repairAttempted) return "already-attempted";
+          repairAttempted = true;
+          return performBoundedSpecRepair(
+            cfg,
+            changeId,
+            issNo,
+            runId,
+            wtPath,
+            gitFn,
+            branchDevCommits,
+            deps.invokeFn ?? invoke,
+            deps.openspecValidateItem ?? openspec.validateItem,
+          );
+        }
+      : undefined);
+
   return enforceSpecConsistencyGuard(cfg, issueNumber, wtPath, changeIds, {
-    branchDeveloperCommits:
-      deps.branchDeveloperCommits ?? ((innerWtPath, base) => computeBranchDeveloperCommits(gitInWorktree, innerWtPath, base)),
+    branchDeveloperCommits: branchDevCommits,
     getIssueDetail: deps.getIssueDetail ?? getIssueDetail,
     setBlocked: deps.setBlocked ?? setBlocked,
     blockStage: stage,
-    attemptBoundedRepair: deps.attemptBoundedRepair,
+    attemptBoundedRepair: attemptRepairFn,
     pipelineRunId: deps.pipelineRunId,
     getHeadSha: deps.getHeadSha,
   });

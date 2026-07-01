@@ -37,6 +37,9 @@ import {
   maybeArchiveOpenspec,
   type AdvancePreMergeDeps,
 } from "../scripts/stages/pre_merge.ts";
+import {
+  enforceFixOpenspecConsistency,
+} from "../scripts/stages/fix.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../scripts/types.ts";
 
 const cfg = { base_branch: "main", repo: "acme/x", repo_dir: "/repo" } as unknown as PipelineConfig;
@@ -930,6 +933,108 @@ test("production-closure (pre-merge): no repair attempt when cfg.harnesses.imple
   const cfgNoImplementer = { ...cfg, harnesses: {} } as unknown as PipelineConfig;
 
   const out = await maybeArchiveOpenspec(cfgNoImplementer, 1, "run", deps);
+  assert.deepEqual(invokeCalls, [],
+    "invokeFn must NOT be called when cfg.harnesses.implementer is absent");
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "guard must block without a repair attempt when no implementer is configured");
+});
+
+// ---- Production-path tests for enforceFixOpenspecConsistency (#356 finding 1) ----
+// Mirror of the pre-merge production-closure tests above, but exercising the fix-stage
+// path. The closure is now created inside enforceFixOpenspecConsistency (not in
+// advanceFix), so it can be verified end-to-end via injected invokeFn without
+// mocking the full advanceFix call chain.
+
+test("production-closure (fix-stage): invokeFn called via internal closure when no deps.attemptBoundedRepair", async () => {
+  // Set up a spec-behind-code scenario with SHA matching HEAD (positive evidence).
+  const HEAD_SHA = "1122334455aabbccddeeff0011223344556677aa";
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: deadbeef\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
+
+  const invokeCalls: string[] = [];
+  const fakeGitFn = async (_wt: string, args: string[]) => {
+    if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
+    if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+    return { stdout: "", stderr: "", code: 0 };
+  };
+
+  // cfg has implementer set → the internal closure is constructed and calls invokeFn.
+  const cfgWithImplementer = { ...cfg, harnesses: { implementer: "test-harness", reviewer: "codex" } } as unknown as PipelineConfig;
+
+  const out = await enforceFixOpenspecConsistency(
+    cfgWithImplementer,
+    1,
+    "fix-1",
+    "/wt",
+    [ID],
+    {
+      branchDeveloperCommits: async () => [spec("s"), impl("i")], // structurally stale
+      getIssueDetail: (async () => ({
+        comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+      })) as any,
+      setBlocked: (async () => {}) as any,
+      getHeadSha: async () => HEAD_SHA, // HEAD matches reviewed-sha → current-state evidence
+      gitFn: fakeGitFn as any,
+      // Production-path: invokeFn injected; NO deps.attemptBoundedRepair.
+      invokeFn: async (harness: string, _wt: string, _prompt: string) => {
+        invokeCalls.push(harness);
+        return { success: true, output: "" };
+      },
+      openspecValidateItem: async () => ({ valid: true, issues: [], unavailable: false, raw: "" }),
+    },
+  );
+
+  assert.deepEqual(invokeCalls, ["test-harness"],
+    "production closure must call invokeFn with the configured implementer harness");
+  // Harness made no file changes → "not-verifiable" → block with spec-delta-alignment reason.
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    "guard must block when repair cannot be verified (not-verifiable)");
+  assert.match(out.reason ?? "", /spec-delta alignment/,
+    "block reason must state spec-delta alignment");
+});
+
+test("production-closure (fix-stage): no repair attempt when cfg.harnesses.implementer is absent", async () => {
+  const HEAD_SHA = "aabbccddeeff00112233445566778899aabbccff";
+  const reviewBody = [
+    "## Review 1 — needs-attention",
+    `**1. [HIGH] spec stale** \`override-key: aabbccdd\``,
+    ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
+
+  const invokeCalls: string[] = [];
+  const fakeGitFn = async (_wt: string, args: string[]) => {
+    if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
+    return { stdout: "", stderr: "", code: 0 };
+  };
+
+  // cfg has NO implementer → no closure constructed → invokeFn not called → block immediately.
+  const cfgNoImplementer = { ...cfg, harnesses: {} } as unknown as PipelineConfig;
+
+  const out = await enforceFixOpenspecConsistency(
+    cfgNoImplementer,
+    1,
+    "fix-1",
+    "/wt",
+    [ID],
+    {
+      branchDeveloperCommits: async () => [spec("s"), impl("i")],
+      getIssueDetail: (async () => ({
+        comments: [{ author: "r", body: reviewBody, createdAt: "t" }],
+      })) as any,
+      setBlocked: (async () => {}) as any,
+      getHeadSha: async () => HEAD_SHA,
+      gitFn: fakeGitFn as any,
+      invokeFn: async (h: string) => { invokeCalls.push(h); return { success: true, output: "" }; },
+    },
+  );
+
   assert.deepEqual(invokeCalls, [],
     "invokeFn must NOT be called when cfg.harnesses.implementer is absent");
   assert.ok(out && !out.advanced && out.status === "blocked",
