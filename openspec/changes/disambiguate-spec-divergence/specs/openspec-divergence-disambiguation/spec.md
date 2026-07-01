@@ -125,6 +125,45 @@ When the guard blocks, the block reason SHALL state whether the remaining work i
 - **WHEN** an automatic spec-delta repair produces a change that fails `openspec validate <change-id>`
 - **THEN** the pipeline SHALL block rather than commit or archive the invalid delta
 
+### Requirement: The guard SHALL only read category and direction markers from comments authored by a trusted identity
+
+`enforceSpecConsistencyGuard` SHALL accept an injectable `trustedReviewAuthor` dep (a GitHub login string or null). When a non-null string is provided, the guard SHALL filter issue comments to those authored by that identity before extracting the category marker, direction marker, and `reviewed-sha`. When absent or null, no author filter is applied. Production call sites SHALL always resolve and inject the pipeline's own actor identity via `getGhActor()`. This prevents an untrusted commenter from injecting a fake review comment that carries a `spec-divergence` category marker and triggers automatic spec repair.
+
+#### Scenario: untrusted comment is ignored when trusted author is set
+
+- **WHEN** a `trustedReviewAuthor` is configured
+- **AND** an issue comment carrying a `spec-divergence` category marker was posted by a different author
+- **THEN** the guard SHALL NOT derive a direction or `reviewed-sha` from that comment
+- **AND** SHALL treat the divergence state as if no review comment were present
+
+#### Scenario: trusted-author comment is used when author matches
+
+- **WHEN** a `trustedReviewAuthor` is configured
+- **AND** the latest review comment was posted by that author
+- **THEN** the guard SHALL read the category, direction, and `reviewed-sha` from that comment as normal
+
+### Requirement: The bounded repair SHALL fail immediately if the worktree has uncommitted changes before repair starts
+
+`performBoundedSpecRepair` SHALL check for uncommitted changes in the worktree before invoking the harness or touching any git state. If uncommitted changes are present, the function SHALL return `"error"` immediately without calling `git reset`, `git clean`, or any other destructive git operation. This prevents the rollback step from discarding pre-existing work that was present before the repair was attempted.
+
+#### Scenario: dirty worktree before repair returns error without touching git
+
+- **WHEN** `performBoundedSpecRepair` is called
+- **AND** the worktree has uncommitted changes before the repair starts
+- **THEN** the function SHALL return `"error"` immediately
+- **AND** SHALL NOT invoke the harness
+- **AND** SHALL NOT run `git reset` or `git clean`
+
+### Requirement: The bounded repair SHALL roll back all harness-introduced mutations on harness failure
+
+If the harness invocation fails (non-success result), `performBoundedSpecRepair` SHALL roll back to the pre-repair HEAD with `git reset --hard <headBefore>` followed by `git clean -fd`, removing any uncommitted mutations the harness may have left. This matches the existing rollback behavior on disallowed-file detection.
+
+#### Scenario: failed harness result triggers rollback
+
+- **WHEN** the harness invocation inside `performBoundedSpecRepair` returns a non-success result
+- **THEN** the function SHALL run `git reset --hard <headBefore>` and `git clean -fd`
+- **AND** SHALL return `"error"` to the caller
+
 ### Requirement: The stale-delta guard SHALL remain active at fix-round and pre-merge and SHALL never archive a stale delta
 
 The disambiguation and bounded-repair behavior SHALL NOT remove, disable, or lower the stale-delta guard. The guard SHALL continue to run at both fix-round and pre-merge/archive time, and a change whose active delta is known to be stale SHALL NOT be archived into the living specs.
