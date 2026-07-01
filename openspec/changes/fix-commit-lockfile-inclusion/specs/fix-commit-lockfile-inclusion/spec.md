@@ -61,14 +61,24 @@ test-gate pre-run dirty blocks) applies to it unchanged.
 - **AND** `core/scripts/foo.ts` SHALL remain uncommitted in the worktree
 - **AND** the pre-gate dirty block SHALL still fire on the remaining uncommitted `core/scripts/foo.ts`
 
+#### Scenario: Pre-staged non-lock file is not swept into the amend
+
+- **WHEN** a fix round leaves a modified `core/package-lock.json` in the worktree (unstaged)
+- **AND** `core/scripts/foo.ts` is already staged in the index (e.g., `M  core/scripts/foo.ts`)
+- **THEN** the fix stage SHALL temporarily unstage `core/scripts/foo.ts` before amending
+- **AND** SHALL stage and amend only `core/package-lock.json`
+- **AND** SHALL restore `core/scripts/foo.ts` to staged after the amend
+- **AND** the amended HEAD commit SHALL NOT contain `core/scripts/foo.ts`
+
 ### Requirement: The lock-file inclusion behavior SHALL be injectable and have a biting regression test
 
 The lock-file inclusion logic SHALL accept injectable git seams (a porcelain-status reader, a path-scoped
-stager, and an amend-no-edit committer) so unit tests exercise it with fakes and perform no real git,
-network, or subprocess call. The test suite SHALL include a regression test that drives "fix harness
-committed source and left `core/package-lock.json` dirty" and asserts the lock file is folded into the round
-commit and the worktree is clean of lock-file changes afterward. The test SHALL bite: with the inclusion step
-removed, the same input SHALL leave the lock file uncommitted.
+stager, an amend-no-edit committer, a staged-path restorer, and a cached-removal committer) so unit tests
+exercise it with fakes and perform no real git, network, or subprocess call. The test suite SHALL include a
+regression test that drives "fix harness committed source and left `core/package-lock.json` dirty" and
+asserts the lock file is folded into the round commit and the worktree is clean of lock-file changes
+afterward. The test SHALL bite: with the inclusion step removed, the same input SHALL leave the lock file
+uncommitted.
 
 #### Scenario: Unit test exercises the dirty-lock inclusion path with fakes
 

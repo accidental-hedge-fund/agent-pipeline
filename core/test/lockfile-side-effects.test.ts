@@ -162,3 +162,60 @@ test("rename to non-lock destination: not included", async () => {
   assert.deepEqual(calls.added, []);
   assert.equal(calls.amended, 0);
 });
+
+// ---------------------------------------------------------------------------
+// 3.6: Pre-staged non-lock file is not swept into the amend (regression #358 finding 1)
+// ---------------------------------------------------------------------------
+
+test("pre-staged non-lock file: temporarily unstaged before amend, re-staged after (regression #358 f1)", async () => {
+  // "M  core/scripts/foo.ts" = staged modification (X=M, Y=space)
+  // " M core/package-lock.json" = worktree-modified lock file, not staged (X=space, Y=M)
+  // Without the fix: amendFn would amend with both foo.ts (pre-staged) and package-lock.json.
+  // With the fix: foo.ts is unstaged before the amend and re-staged after; only the
+  // lock file is folded in. Bites: remove the gitRestoreStaged call and restoreStaged stays [].
+  const restoreStaged: string[][] = [];
+  const added: string[][] = [];
+  let amended = 0;
+  const deps: LockfileSideEffectsDeps = {
+    gitStatusPorcelain: async () => "M  core/scripts/foo.ts\n M core/package-lock.json\n",
+    gitRestoreStaged: async (_wt, paths) => { restoreStaged.push([...paths]); },
+    gitAddPaths: async (_wt, paths) => { added.push([...paths]); },
+    gitAmendNoEdit: async () => { amended++; },
+  };
+  const result = await includeLockfileSideEffects("/wt", deps);
+
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes("core/package-lock.json"));
+  // Pre-staged non-lock path is restored before the amend so it is not swept in.
+  assert.deepEqual(restoreStaged, [["core/scripts/foo.ts"]], "gitRestoreStaged called with pre-staged non-lock path");
+  // Only the lock file is staged for the amend.
+  assert.deepEqual(added[0], ["core/package-lock.json"], "lock file staged first");
+  // HEAD is amended exactly once.
+  assert.equal(amended, 1, "amend called exactly once");
+  // Pre-staged non-lock path is re-staged after the amend (preserves its staged state).
+  assert.deepEqual(added[1], ["core/scripts/foo.ts"], "non-lock path re-staged after amend");
+  assert.equal(added.length, 2, "gitAddPaths called exactly twice");
+});
+
+test("pre-staged deletion: unstaged before amend, removed from index again after", async () => {
+  // "D  core/scripts/gone.ts" = staged deletion (X=D)
+  // " M core/package-lock.json" = dirty lock file
+  const restoreStaged: string[][] = [];
+  const added: string[][] = [];
+  const rmCached: string[][] = [];
+  let amended = 0;
+  const deps: LockfileSideEffectsDeps = {
+    gitStatusPorcelain: async () => "D  core/scripts/gone.ts\n M core/package-lock.json\n",
+    gitRestoreStaged: async (_wt, paths) => { restoreStaged.push([...paths]); },
+    gitAddPaths: async (_wt, paths) => { added.push([...paths]); },
+    gitAmendNoEdit: async () => { amended++; },
+    gitRmCached: async (_wt, paths) => { rmCached.push([...paths]); },
+  };
+  const result = await includeLockfileSideEffects("/wt", deps);
+
+  assert.equal(result.included, true);
+  assert.deepEqual(restoreStaged, [["core/scripts/gone.ts"]], "staged deletion unstaged before amend");
+  assert.deepEqual(added, [["core/package-lock.json"]], "only lock file staged for amend");
+  assert.equal(amended, 1);
+  assert.deepEqual(rmCached, [["core/scripts/gone.ts"]], "deletion re-applied via gitRmCached after amend");
+});

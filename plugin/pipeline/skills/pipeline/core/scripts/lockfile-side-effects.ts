@@ -5,8 +5,9 @@
 // detects and folds those into the round's HEAD commit so the worktree is clean
 // before the format/test gates run.
 //
-// Injectable seams (gitStatusPorcelain, gitAddPaths, gitAmendNoEdit) allow unit
-// tests to drive the logic with fakes — no real git, network, or subprocess calls.
+// Injectable seams (gitStatusPorcelain, gitAddPaths, gitAmendNoEdit, gitRestoreStaged,
+// gitRmCached) allow unit tests to drive the logic with fakes — no real git, network,
+// or subprocess calls.
 
 import { gitInWorktree } from "./worktree.ts";
 
@@ -17,6 +18,10 @@ export interface LockfileSideEffectsDeps {
   gitAddPaths?: (wtPath: string, paths: string[]) => Promise<void>;
   /** Amends HEAD without changing the commit message via `git commit --amend --no-edit`. */
   gitAmendNoEdit?: (wtPath: string) => Promise<void>;
+  /** Unstages the given paths via `git restore --staged -- <paths>`. */
+  gitRestoreStaged?: (wtPath: string, paths: string[]) => Promise<void>;
+  /** Removes paths from the index via `git rm --cached -- <paths>` (for staged deletions). */
+  gitRmCached?: (wtPath: string, paths: string[]) => Promise<void>;
 }
 
 export type LockfileInclusionResult =
@@ -52,6 +57,14 @@ async function defaultGitAmendNoEdit(wtPath: string): Promise<void> {
   await gitInWorktree(wtPath, ["commit", "--amend", "--no-edit"]);
 }
 
+async function defaultGitRestoreStaged(wtPath: string, paths: string[]): Promise<void> {
+  await gitInWorktree(wtPath, ["restore", "--staged", "--", ...paths]);
+}
+
+async function defaultGitRmCached(wtPath: string, paths: string[]): Promise<void> {
+  await gitInWorktree(wtPath, ["rm", "--cached", "--", ...paths]);
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -63,6 +76,10 @@ async function defaultGitAmendNoEdit(wtPath: string): Promise<void> {
  * `pnpm-lock.yaml`) appears in `git status --porcelain`, this function stages
  * only those paths and amends HEAD via `git commit --amend --no-edit`, preserving
  * the round commit's message and `Issue:`/`Pipeline-Run:` trailers.
+ *
+ * Any pre-existing staged non-lock entries are temporarily unstaged before the
+ * amend so they are not swept into the lock-file amend commit, then restored to
+ * staged afterward.
  *
  * Returns `{ included: false }` when no lock file is dirty (no git writes occur).
  * Returns `{ included: true; paths }` listing the lock-file paths that were folded in.
@@ -76,28 +93,54 @@ export async function includeLockfileSideEffects(
   const statusFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
   const addFn = deps.gitAddPaths ?? defaultGitAddPaths;
   const amendFn = deps.gitAmendNoEdit ?? defaultGitAmendNoEdit;
+  const restoreStagedFn = deps.gitRestoreStaged ?? defaultGitRestoreStaged;
+  const rmCachedFn = deps.gitRmCached ?? defaultGitRmCached;
 
   const raw = await statusFn(wtPath);
 
   // Parse porcelain output: each line is "XY path" or "XY old -> new" (rename).
+  // X = index (staged) status; Y = worktree status.
   // We only care about the working-tree filename (last segment after " -> " if any).
   const lockPaths: string[] = [];
+  // Pre-staged non-lock entries that must be temporarily unstaged before the amend
+  // so they are not swept into the lock-file amend commit.
+  const preStagedNonLock: Array<{ path: string; isDeletion: boolean }> = [];
+
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     // Porcelain v1: columns 0-1 are status codes, column 2 is a space, then the path.
+    const x = line[0];
     const pathPart = line.slice(3);
     // Handle rename: "old -> new" — we want the destination.
     const filePath = pathPart.includes(" -> ") ? pathPart.split(" -> ")[1] : pathPart;
     const trimmed = filePath.trim();
-    if (trimmed && isLockFilePath(trimmed)) {
+    if (!trimmed) continue;
+
+    if (isLockFilePath(trimmed)) {
       lockPaths.push(trimmed);
+    } else if (x !== ' ' && x !== '?') {
+      // Non-lock file already staged — preserve its staged state through the amend.
+      preStagedNonLock.push({ path: trimmed, isDeletion: x === 'D' });
     }
   }
 
   if (lockPaths.length === 0) return { included: false };
 
+  // Temporarily unstage non-lock staged entries so the amend only picks up lock files.
+  if (preStagedNonLock.length > 0) {
+    await restoreStagedFn(wtPath, preStagedNonLock.map((e) => e.path));
+  }
+
   await addFn(wtPath, lockPaths);
   await amendFn(wtPath);
+
+  // Restore the pre-existing staged state for non-lock entries.
+  if (preStagedNonLock.length > 0) {
+    const toAdd = preStagedNonLock.filter((e) => !e.isDeletion).map((e) => e.path);
+    const toRm = preStagedNonLock.filter((e) => e.isDeletion).map((e) => e.path);
+    if (toAdd.length > 0) await addFn(wtPath, toAdd);
+    if (toRm.length > 0) await rmCachedFn(wtPath, toRm);
+  }
 
   return { included: true, paths: lockPaths };
 }
