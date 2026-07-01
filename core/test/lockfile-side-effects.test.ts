@@ -197,6 +197,42 @@ test("pre-staged non-lock file: temporarily unstaged before amend, re-staged aft
   assert.equal(added.length, 2, "gitAddPaths called exactly twice");
 });
 
+test("staged rename (non-lock): both sides unstaged before amend, rename re-staged after (regression #358 f1-rename)", async () => {
+  // Bug: old code tracked only the dst path (new.ts) in preStagedNonLock.
+  // git restore --staged -- new.ts unstaged the addition but left the staged deletion
+  // of old.ts in the index; the amend then committed that deletion into HEAD.
+  // Fix: track both src (as deletion) and dst (as addition) for rename entries.
+  // Bites: with old code, restoreStaged[0] is ["core/scripts/new.ts"] only — the
+  // assert.ok(restoreStaged[0].includes("core/scripts/old.ts")) assertion fails.
+  const restoreStaged: string[][] = [];
+  const added: string[][] = [];
+  const rmCached: string[][] = [];
+  let amended = 0;
+  const deps: LockfileSideEffectsDeps = {
+    gitStatusPorcelain: async () =>
+      "R  core/scripts/old.ts -> core/scripts/new.ts\n M core/package-lock.json\n",
+    gitRestoreStaged: async (_wt, paths) => { restoreStaged.push([...paths]); },
+    gitAddPaths: async (_wt, paths) => { added.push([...paths]); },
+    gitAmendNoEdit: async () => { amended++; },
+    gitRmCached: async (_wt, paths) => { rmCached.push([...paths]); },
+  };
+  const result = await includeLockfileSideEffects("/wt", deps);
+
+  assert.equal(result.included, true);
+  assert.ok(result.included && result.paths.includes("core/package-lock.json"));
+  // Both sides of the rename must be unstaged before the amend.
+  assert.equal(restoreStaged.length, 1, "gitRestoreStaged called once");
+  assert.ok(restoreStaged[0].includes("core/scripts/old.ts"), "src side of rename unstaged");
+  assert.ok(restoreStaged[0].includes("core/scripts/new.ts"), "dst side of rename unstaged");
+  // Only the lock file is staged for the amend.
+  assert.deepEqual(added[0], ["core/package-lock.json"], "lock file staged first");
+  assert.equal(amended, 1, "HEAD amended exactly once");
+  // Rename is restored: src as deletion via gitRmCached, dst as addition via gitAddPaths.
+  assert.deepEqual(rmCached, [["core/scripts/old.ts"]], "src deletion re-applied via gitRmCached");
+  assert.deepEqual(added[1], ["core/scripts/new.ts"], "dst addition re-staged via gitAddPaths");
+  assert.equal(added.length, 2, "gitAddPaths called exactly twice");
+});
+
 test("pre-staged deletion: unstaged before amend, removed from index again after", async () => {
   // "D  core/scripts/gone.ts" = staged deletion (X=D)
   // " M core/package-lock.json" = dirty lock file

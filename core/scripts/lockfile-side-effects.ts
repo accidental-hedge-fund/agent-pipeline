@@ -111,16 +111,30 @@ export async function includeLockfileSideEffects(
     // Porcelain v1: columns 0-1 are status codes, column 2 is a space, then the path.
     const x = line[0];
     const pathPart = line.slice(3);
-    // Handle rename: "old -> new" — we want the destination.
-    const filePath = pathPart.includes(" -> ") ? pathPart.split(" -> ")[1] : pathPart;
-    const trimmed = filePath.trim();
-    if (!trimmed) continue;
 
-    if (isLockFilePath(trimmed)) {
-      lockPaths.push(trimmed);
-    } else if (x !== ' ' && x !== '?') {
-      // Non-lock file already staged — preserve its staged state through the amend.
-      preStagedNonLock.push({ path: trimmed, isDeletion: x === 'D' });
+    if (pathPart.includes(" -> ")) {
+      // Rename/copy porcelain entry: "src -> dst". Track both sides so neither
+      // the staged deletion (src) nor the staged addition (dst) is swept into
+      // the lock-file amend.
+      const arrowIdx = pathPart.indexOf(" -> ");
+      const src = pathPart.slice(0, arrowIdx).trim();
+      const dst = pathPart.slice(arrowIdx + 4).trim();
+      if (!dst) continue;
+      if (isLockFilePath(dst)) {
+        lockPaths.push(dst);
+      } else if (x !== ' ' && x !== '?') {
+        preStagedNonLock.push({ path: src, isDeletion: true });
+        preStagedNonLock.push({ path: dst, isDeletion: false });
+      }
+    } else {
+      const trimmed = pathPart.trim();
+      if (!trimmed) continue;
+      if (isLockFilePath(trimmed)) {
+        lockPaths.push(trimmed);
+      } else if (x !== ' ' && x !== '?') {
+        // Non-lock file already staged — preserve its staged state through the amend.
+        preStagedNonLock.push({ path: trimmed, isDeletion: x === 'D' });
+      }
     }
   }
 
