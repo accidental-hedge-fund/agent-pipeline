@@ -247,6 +247,7 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
       blocked.push(reason);
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async () => { archived = true; return { success: true, unavailable: false, output: "" }; }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -290,6 +291,7 @@ test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ �
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -334,6 +336,7 @@ test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollb
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -419,6 +422,7 @@ test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty 
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
