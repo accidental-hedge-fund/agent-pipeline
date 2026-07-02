@@ -1,33 +1,4 @@
-# pre-merge-delta-recheck Specification
-
-## Purpose
-TBD - created by archiving change cache-review-verdict-by-diff-hash. Update Purpose after archive.
-## Requirements
-### Requirement: Pre-merge SHA gate SHALL check the diff-hash cache before triggering re-review
-
-When `enforceReviewShaGate` detects that HEAD moved with non-pipeline-internal commits (triggering the re-review path), the pipeline SHALL perform a diff-hash cache check before routing back to a review stage. The pipeline SHALL fetch the current PR diff hash and compare it to the `verdict-diff-hash` sentinel in the most recent prior review comment. If the hashes match, the prior verdict SHALL be treated as valid and the gate SHALL return without triggering re-review. If the hashes differ, the gate SHALL proceed to the delta review path (not a full review-2 round).
-
-#### Scenario: SHA mismatch but same diff hash — verdict reused, no re-review
-
-- **WHEN** `enforceReviewShaGate` detects HEAD moved past the reviewed SHA with at least one non-pipeline-internal commit
-- **AND** the current PR diff hash matches the `verdict-diff-hash` sentinel in the prior review comment
-- **THEN** the gate SHALL return null (pre-merge proceeds)
-- **AND** SHALL NOT transition the issue to a review stage
-- **AND** SHALL post a brief notice of the form "Diff unchanged since last review; verdict reused."
-
-#### Scenario: SHA mismatch and diff hash changed — proceeds to delta review
-
-- **WHEN** `enforceReviewShaGate` detects HEAD moved with non-pipeline-internal commits
-- **AND** the current PR diff hash does NOT match the `verdict-diff-hash` sentinel in the prior review comment (or no sentinel is present)
-- **THEN** the gate SHALL NOT route the issue back to `review-2`
-- **AND** SHALL instead invoke the delta review path (see delta review requirements below)
-
-#### Scenario: Pipeline-internal commit exemption is checked first
-
-- **WHEN** HEAD moved only by OpenSpec archive commits since the review
-- **THEN** the gate SHALL return null without performing the diff-hash check (existing pipeline-internal exemption behavior is preserved and takes precedence)
-
----
+## MODIFIED Requirements
 
 ### Requirement: Pre-merge SHALL perform a focused adversarial delta review when the diff changed
 
@@ -59,14 +30,3 @@ When `enforceReviewShaGate` determines that the diff has changed (diff-hash mism
 - **WHEN** a pre-merge delta review runs
 - **THEN** the `max_adversarial_rounds` counter SHALL NOT be incremented
 - **AND** the issue's review-2 ceiling budget SHALL be preserved for full review-2 rounds
-
-### Requirement: Delta review SHALL clearly identify the unreviewed scope to the reviewer
-
-The prompt for a pre-merge delta review SHALL state that the diff presented is the unreviewed changes since the last approved review, and that the full PR diff was already reviewed and approved. This allows the adversarial reviewer to focus on the new code without treating previously-reviewed context as unreviewed.
-
-#### Scenario: Delta review prompt indicates delta scope
-
-- **WHEN** the pipeline invokes the adversarial reviewer for a pre-merge delta review
-- **THEN** the prompt SHALL contain a statement identifying the diff as changes since the last reviewed commit
-- **AND** SHALL indicate that the remainder of the PR diff was previously reviewed and approved
-
