@@ -212,7 +212,8 @@ export async function performPreMergeAutoFix(
     await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  const hasUncommitted = statusAfter.stdout.trim() !== "";
+  // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
+  const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
   const hasNewCommit = headAfter && headBefore && headAfter !== headBefore;
 
   // Spec (#359): a dirty post-harness worktree (uncommitted changes remaining) or
@@ -1364,17 +1365,29 @@ export async function enforceReviewShaGate(
         }
 
         if (!priorAutoFix) {
+          // Scope the fix prompt to blocking findings only — not the full delta
+          // comment which may include advisory/non-blocking findings (#359 R2 F3).
+          const blockingOnlyBody = formatDeltaReviewComment(
+            cfg,
+            { ...deltaCommentVerdict, findings: partition.blocking },
+            `pre-merge delta review by ${deltaReviewerLabel}`,
+            blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
+            newHash,
+          );
           const fixRes = await attemptAutoFixFn(
-            partition.blocking, detail.title, deltaCommentBody,
+            partition.blocking, detail.title, blockingOnlyBody,
           );
           if (fixRes === "fix-committed") {
             // Re-run the delta review exactly once (does NOT consume a review-2
             // ceiling slot, consistent with the delta-review budget rule, #359).
             const newPrHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+            // Do NOT fall back to the pre-fix `currentDiff` if the post-fix diff
+            // cannot be obtained (#359 R2 F1): a fallback would let the reviewer
+            // approve a stale diff while recording `newPrHead` as reviewed. Let
+            // the exception propagate to the outer catch, which routes to the
+            // conservative full re-review without recording the new head.
             const reReviewDiff = reviewed.sha
-              ? await getCommitDeltaDiffFn(
-                  cfg, prNumber, reviewed.sha, newPrHead,
-                ).catch(() => currentDiff)
+              ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, newPrHead)
               : currentDiff;
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
@@ -1383,8 +1396,17 @@ export async function enforceReviewShaGate(
             const rePartition = partitionFindings(
               reResult.findings, cfg.review_policy, overrides, scopes,
             );
+            // Mirror the initial delta review guard (#228): needs-attention with zero
+            // findings is likely unparseable reviewer output — block conservatively.
+            // Detect BEFORE formatting/posting the comment so we do not write a
+            // clean reviewed-sha artifact for unparseable output (#359 R2 F2).
+            const reIsUnparseable =
+              reResult.verdict === "needs-attention" && reResult.findings.length === 0;
             // Post the re-review delta comment with updated sentinels.
-            const reNewHash = computeDiffHash(currentDiff);
+            // Use the post-fix diff hash (reReviewDiff), not the pre-fix currentDiff (#359 R2 F1).
+            // Suppress commitSha for unparseable output so the reuse path cannot
+            // treat the artifact as a clean approval (#359 R2 F2).
+            const reNewHash = computeDiffHash(reReviewDiff);
             const reBlockingKeys = new Set(rePartition.blocking.map((f) => findingKey(f)));
             const reEffective = reResult.effectiveReviewer ?? cfg.harnesses.reviewer;
             const reSelfReview = reResult.selfReview ?? false;
@@ -1396,7 +1418,7 @@ export async function enforceReviewShaGate(
                 summary: reResult.summary,
                 findings: reResult.findings,
                 next_steps: [],
-                commitSha: newPrHead,
+                commitSha: reIsUnparseable ? undefined : newPrHead,
               },
               `pre-merge delta review by ${reLabel}`,
               reBlockingKeys.size > 0 ? reBlockingKeys : undefined,
@@ -1412,11 +1434,6 @@ export async function enforceReviewShaGate(
               : reCommentBody;
             await postCommentFn(cfg, issueNumber, reComment);
 
-            // Mirror the initial delta review guard (#228): needs-attention with zero
-            // findings is likely unparseable reviewer output — block conservatively
-            // rather than treating empty findings as an implicit approval.
-            const reIsUnparseable =
-              reResult.verdict === "needs-attention" && reResult.findings.length === 0;
             if (rePartition.blocking.length === 0 && !reIsUnparseable) {
               // Re-validate HEAD (same guard as the normal approve path).
               const postFixHead = (await getPrDetailFn(cfg, prNumber)).head_sha;

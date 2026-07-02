@@ -681,4 +681,190 @@ test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings �
   assert.equal(rec.autoFixCalls, 1, "auto-fix was attempted once");
   assert.equal(rec.deltaReviewCalls, 2, "initial + re-review both ran");
   assert.equal(rec.blocked.length, 1, "must block on unparseable re-review output");
+  // R2 Finding 2: the re-review comment must NOT embed a reviewed-sha sentinel when unparseable,
+  // so the reuse path cannot treat it as a clean approval on the next re-entry.
+  assert.equal(rec.comments.length, 2, "initial + re-review comments both posted");
+  assert.ok(
+    !rec.comments[1].includes("<!-- reviewed-sha:"),
+    "re-review comment for unparseable output must NOT embed reviewed-sha sentinel",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// R2 Finding 4: post-harness git status exits non-zero → fail closed
+// ---------------------------------------------------------------------------
+
+test("performPreMergeAutoFix R2-F4: post-harness git status exits non-zero (empty stdout) → rollback and return error", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfter — different = hasNewCommit)
+    { code: 0, stdout: "sha2" },
+    // status --porcelain (post-harness: exits code 1, empty stdout — cannot prove clean)
+    { code: 1, stdout: "", stderr: "fatal: not a git repository" },
+    // reset --hard sha1 (rollback)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: status failure",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+  );
+
+  assert.equal(result, "error", "non-zero git-status exit must return error even when stdout is empty");
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.ok(resetCall, "git reset --hard must be called to roll back when status exits non-zero");
+});
+
+// ---------------------------------------------------------------------------
+// R2 Finding 1: getCommitDeltaDiff failure in post-fix re-review → conservative
+// full re-review (no stale diff fallback, no approved-head recorded)
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix R2-F1: getCommitDeltaDiff fails post-fix → full re-review, no stale head recorded", async (t) => {
+  const transitions: Array<{ to: string }> = [];
+  let deltaCallCount = 0;
+  const runDeltaReview: RunDeltaReviewFn = async () => {
+    deltaCallCount++;
+    return {
+      verdict: "needs-attention",
+      findings: [blockingFinding("correctness")],
+      summary: "blocking",
+    } as DeltaReviewResult;
+  };
+
+  let diffCallCount = 0;
+  const depsF1: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "T",
+        body: "B",
+        comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_AFTER_FIX }) as any,
+    getPrCommits: async () =>
+      [
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+        { oid: SHA_HEAD, messageHeadline: "fix: review 2" },
+      ] as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => {
+      diffCallCount++;
+      if (diffCallCount >= 2) throw new Error("transient git diff failure");
+      return NEW_DIFF;
+    },
+    runDeltaReview,
+    postComment: async () => {},
+    transition: async (_cfg, _n, _from, to) => { transitions.push({ to: to as string }); },
+    setBlocked: async () => {},
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => "fix-committed",
+  };
+
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, depsF1);
+  });
+
+  // The failure in getCommitDeltaDiff propagates to the outer catch, which routes
+  // to a conservative full re-review instead of either proceeding or blocking.
+  assert.ok(
+    out?.advanced === true && (out?.to === "review-2" || out?.to === "review-1"),
+    `getCommitDeltaDiff failure must route to full re-review, got: ${JSON.stringify(out)}`,
+  );
+  // The post-fix re-review must NOT have run (diff fetch failed before it started).
+  assert.equal(deltaCallCount, 1, "only the initial delta review ran; re-review errored before start");
+  // Must NOT have transitioned to needs-human (that would record the stale head).
+  assert.ok(
+    !transitions.some((t) => t.to === "needs-human"),
+    "must NOT transition to needs-human when diff fetch fails — would leave stale head recorded",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// R2 Finding 3: fix prompt contains only blocking findings, not advisory findings
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix R2-F3: fix prompt scoped to blocking findings only, not advisory findings", async (t) => {
+  let capturedFindingsText = "";
+  const advisoryTitle = "Advisory: non-blocking security note";
+  const blockingTitle = "Blocking correctness bug";
+
+  let deltaCallCount = 0;
+  const runDeltaReview: RunDeltaReviewFn = async () => {
+    deltaCallCount++;
+    if (deltaCallCount === 1) {
+      return {
+        verdict: "needs-attention",
+        findings: [
+          { ...blockingFinding("correctness"), title: blockingTitle },
+          // Advisory finding: same severity but explicitly non-blocking.
+          { severity: "high", title: advisoryTitle, body: "Details", confidence: 0.9,
+            recommendation: "Consider fixing", category: "security", blocking: false } as ReviewFinding,
+        ],
+        summary: "one blocking, one advisory",
+      } as DeltaReviewResult;
+    }
+    // Re-review approves.
+    return { verdict: "approve", findings: [], summary: "approved" } as DeltaReviewResult;
+  };
+
+  const commits = [
+    { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+    { oid: SHA_HEAD, messageHeadline: "fix: review 2" },
+  ];
+
+  const depsF3: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "T",
+        body: "B",
+        comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: rec3.autoFixCalls > 0 ? SHA_AFTER_FIX : SHA_HEAD }) as any,
+    getPrCommits: async () => commits as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+    postComment: async () => {},
+    transition: async () => {},
+    setBlocked: async () => {},
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async (_blocking, _title, findingsText) => {
+      capturedFindingsText = findingsText;
+      rec3.autoFixCalls++;
+      return "fix-committed";
+    },
+  };
+
+  const rec3 = { autoFixCalls: 0 };
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, depsF3);
+  });
+
+  assert.equal(out, null, "fix + re-review approve → should proceed");
+  assert.equal(rec3.autoFixCalls, 1, "auto-fix seam called once");
+  assert.ok(
+    capturedFindingsText.includes(blockingTitle),
+    "fix prompt must include the blocking finding title",
+  );
+  assert.ok(
+    !capturedFindingsText.includes(advisoryTitle),
+    "fix prompt must NOT include the advisory (non-blocking) finding title",
+  );
 });
