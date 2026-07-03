@@ -34,7 +34,7 @@ import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
-import { extractBlockingKeysMarker } from "./review.ts";
+import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import type { RunStoreDeps } from "../run-store.ts";
 import {
   computeBranchDeveloperCommits,
@@ -94,6 +94,15 @@ export interface AdvanceFixDeps {
    * real git subprocess is invoked.
    */
   lockfileSideEffects?: LockfileSideEffectsDeps;
+  /**
+   * Verifies that `sha` is already present on `origin/<branch>` (#349 review-1
+   * finding 1). Used to confirm an external-commit advance decision was truly
+   * applied outside the fix harness (pushed to the remote by a human) rather
+   * than being a local-only leftover commit from a prior fix-harness run that
+   * was blocked before it could push. Defaults to `isCommitOnRemote`. Tests
+   * inject a fake so no real git fetch/subprocess runs.
+   */
+  verifyCommitOnRemote?: (wtPath: string, branch: string, sha: string) => Promise<boolean>;
 }
 
 /**
@@ -106,6 +115,82 @@ export interface AdvanceFixDeps {
  */
 export function fixHarnessFailureOutcome(reason: string): Outcome {
   return { advanced: false, status: "blocked", reason, blockerKind: "harness-failure" };
+}
+
+/** Decision from {@link decideExternalCommitAdvance} — either advance to the round's next stage, or fall through to the existing no-commits block. */
+export type ExternalCommitAdvanceDecision =
+  | { advance: true; to: Stage; reviewSha: string }
+  | { advance: false; reviewSha: string | null };
+
+/**
+ * #349: when a fix round's harness produces no new commit and salvage finds
+ * nothing, decide whether to advance (a human already pushed the fix the
+ * reviewer asked for) or fall through to the existing `no-commits` block.
+ *
+ * Filters `comments` to the trusted pipeline actor before extracting the
+ * reviewed SHA, mirroring the trust pattern used by the pre-merge SHA gate
+ * and the OpenSpec consistency guard — an untrusted commenter must not be
+ * able to forge a stale reviewed-SHA marker to force an advance. Fails
+ * closed (does not advance) when the actor cannot be resolved (`null`), when
+ * no trusted review SHA is extractable, or when HEAD already equals it.
+ */
+export function decideExternalCommitAdvance(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+  round: 1 | 2,
+  headAfter: string,
+): ExternalCommitAdvanceDecision {
+  const commentsToSearch = typeof actor === "string"
+    ? comments.filter((c) => c.author === actor)
+    : [];
+  const reviewShaResult = extractReviewedSha(commentsToSearch, round);
+  const reviewSha = reviewShaResult?.sha ?? null;
+  if (reviewSha && headAfter && reviewSha !== headAfter) {
+    return { advance: true, to: round === 1 ? "review-2" : "pre-merge", reviewSha };
+  }
+  return { advance: false, reviewSha };
+}
+
+/**
+ * Whether HEAD moving past the reviewed SHA (#349) was proven to have been
+ * applied outside the fix harness, and so may skip the harness-prescribed
+ * commit-subject check (`enforceExternalCommitGate`) rather than the normal
+ * fix-round gate (`enforceFixCommitGate`).
+ *
+ * A commit already present on `origin/<branch>` cannot be the local-only
+ * leftover from a prior fix-harness run that was blocked before it pushed
+ * (#349 review-1 finding 1: that path never reaches `git push`, so an
+ * unpushed bad-subject commit staying in the worktree must NOT get the
+ * subject exemption on a later no-op fix run). Fails closed to "harness"
+ * (the stricter gate) when the remote check cannot confirm the commit is
+ * already on the remote branch.
+ */
+export function resolveFixCommitGateMode(
+  decision: ExternalCommitAdvanceDecision,
+  verifiedOnRemote: boolean,
+): "external" | "harness" {
+  return decision.advance && verifiedOnRemote ? "external" : "harness";
+}
+
+/**
+ * Default `verifyCommitOnRemote` implementation (#349 review-1 finding 1):
+ * fetches `origin/<branch>` and checks whether `sha` is already an ancestor
+ * of it. Fails closed (returns false) on any fetch/lookup error so an
+ * unverifiable commit never gets the subject-check exemption.
+ */
+export async function isCommitOnRemote(wtPath: string, branch: string, sha: string): Promise<boolean> {
+  const fetch = await gitInWorktree(wtPath, ["fetch", "origin", branch], { ignoreFailure: true });
+  if (fetch.code !== 0) return false;
+  // Check against FETCH_HEAD (the tip the fetch just retrieved), not the
+  // origin/<branch> tracking ref — after a failed or partial fetch a stale
+  // cached tracking ref could otherwise prove remote presence (#349 pre-merge
+  // finding 0b679c48).
+  const check = await gitInWorktree(
+    wtPath,
+    ["merge-base", "--is-ancestor", sha, "FETCH_HEAD"],
+    { ignoreFailure: true },
+  );
+  return check.code === 0;
 }
 
 export async function advanceFix(
@@ -193,8 +278,11 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: "reattach failed" };
   }
 
-  // Capture HEAD before so we can detect non-commits.
-  const headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  // Capture HEAD before so we can detect non-commits. Mutable: the external-commit
+  // advance path (#349) rebases this to the reviewed SHA so the commit/openspec/
+  // format/test gates below validate the externally-applied commit(s) rather than
+  // seeing a no-op diff.
+  let headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -248,6 +336,17 @@ export async function advanceFix(
     return fixHarnessFailureOutcome(reason);
   }
 
+  // Set when the no-new-commits path (#349) decides the reviewed SHA is stale
+  // (fix already applied externally); carries the decided target stage through
+  // to the final transition once the normal gates below have validated it.
+  let externalAdvance: ExternalCommitAdvanceDecision & { advance: true } | null = null;
+  // Which commit-message gate to run when externalAdvance is set (#349 review-1
+  // finding 1): "external" only once verifyCommitOnRemote proves the commit(s)
+  // already reached origin outside the fix harness; otherwise "harness" keeps
+  // the subject-prescribed gate so an unpushed leftover commit from a prior
+  // blocked fix run still blocks, exactly as before #349.
+  let commitGateMode: "external" | "harness" = "harness";
+
   let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   if (headBefore && headAfter && headBefore === headAfter) {
     // #131: the harness reported success without committing — salvage real
@@ -260,16 +359,60 @@ export async function advanceFix(
       fixSalvageStageLabel(round, issueNumber),
     );
     if (!salvaged) {
-      const noCommitsMsg = `${stage} reported success but produced no new commits.`;
-      await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
-      return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
+      // #349: before blocking, check whether a human already pushed the fix the
+      // reviewer asked for. When HEAD is past the SHA the reviewer last saw,
+      // treat this as "fix already applied externally" and advance instead of
+      // blocking — recovering otherwise requires a manual label-advance for
+      // work that is already done. Fail closed (block) when no trusted review
+      // SHA is extractable, or when HEAD equals it (genuinely nothing done).
+      const decision = decideExternalCommitAdvance(detail.comments, fixActor, round, headAfter);
+      if (decision.advance) {
+        // #349 review-2: HEAD moving past the reviewed SHA only proves *some*
+        // local commit exists after review — it does not prove that commit
+        // ever passed the pre-push gates (e.g. an earlier fix run committed
+        // locally, then blocked at the commit-message/openspec/format/test
+        // gate before pushing). Do NOT push directly here. Instead, rebase
+        // `headBefore` to the reviewed SHA and fall through to the normal
+        // gate sequence below, so the externally-applied commit(s) are
+        // validated exactly like a harness-authored commit before any push.
+        headBefore = decision.reviewSha;
+        externalAdvance = decision;
+        // #349 review-1 finding 1: confirm the commit(s) already reached the
+        // remote branch before granting the subject-check exemption below —
+        // otherwise a bad-subject commit left over from a prior blocked fix
+        // run (never pushed) would bypass the #68 prompt-compliance gate on
+        // this no-op retry.
+        const verifyOnRemote = deps.verifyCommitOnRemote ?? isCommitOnRemote;
+        const verifiedOnRemote = await verifyOnRemote(
+          wt.path,
+          branchName(issueNumber, wt.slug),
+          headAfter,
+        );
+        commitGateMode = resolveFixCommitGateMode(decision, verifiedOnRemote);
+      } else {
+        const noCommitsMsg = `${stage} reported success but produced no new commits.`;
+        await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
+        return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
+      }
+    } else {
+      headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
     }
-    headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   }
 
   // ---- Verify fix-round commit message format (#68) ----
+  // Externally-applied commits (#349) are exempt from the prescribed-subject
+  // check: that pattern verifies fix-harness prompt compliance, and a human
+  // pushing the requested fix cannot be required to use the harness's subject.
+  // The exemption only applies once commitGateMode is "external", i.e. the
+  // commit(s) were confirmed already on the remote (#349 review-1 finding 1) —
+  // otherwise the normal fix gate runs so an unpushed leftover commit still
+  // blocks. The external variant keeps the range-level safety scan; the
+  // OpenSpec, lockfile, format/test, and consistency gates below still apply
+  // unchanged.
   if (headBefore) {
-    const commitCheck = await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
+    const commitCheck = externalAdvance && commitGateMode === "external"
+      ? await enforceExternalCommitGate(wt.path, headBefore)
+      : await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
     if (!commitCheck.ok) {
       await setBlocked(cfg, issueNumber, commitCheck.reason, stage, "needs-human");
       return { advanced: false, status: "blocked", reason: commitCheck.reason };
@@ -374,6 +517,16 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: pushFailedMsg, blockerKind: "push-failed" };
   }
 
+  if (externalAdvance) {
+    const msg =
+      `${stage}: the fix harness produced no new commits, but HEAD (${headAfter}) ` +
+      `differs from the SHA the reviewer last reviewed (${externalAdvance.reviewSha}) — the fix ` +
+      `was already applied externally and has now passed the same pre-push gates as a normal ` +
+      `fix commit. Advancing to ${externalAdvance.to}.`;
+    await transition(cfg, issueNumber, stage, externalAdvance.to, msg);
+    return { advanced: true, from: stage, to: externalAdvance.to, summary: "fix already applied externally" };
+  }
+
   if (round === 1) {
     await transition(
       cfg,
@@ -450,6 +603,22 @@ export async function enforceFixCommitGate(
     },
     deps,
   );
+}
+
+/**
+ * External-commit variant of the fix-round commit gate (#349). Commits applied
+ * outside the fix harness (a human pushing the fix the reviewer asked for) are
+ * not required to carry the harness-prescribed `fix: address review N findings`
+ * subject — that check verifies prompt compliance, not code quality. The empty
+ * config still runs verifyHarnessCommits' range-level safety scan (node_modules
+ * inclusion) over reviewSha..HEAD.
+ */
+export async function enforceExternalCommitGate(
+  wtPath: string,
+  reviewSha: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(wtPath, reviewSha, {}, deps);
 }
 
 // ---- pure helpers ----
