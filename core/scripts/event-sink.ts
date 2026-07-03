@@ -48,7 +48,10 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       reject(new Error(`event sink command timed out after ${DELIVERY_TIMEOUT_MS / 1000}s`));
     }, DELIVERY_TIMEOUT_MS);
 
-    child.stderr?.on("data", (chunk: Buffer) => { stderrBuf += chunk.toString("utf8"); });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderrBuf.length >= STDERR_EXCERPT_MAX_CHARS) return;
+      stderrBuf += chunk.toString("utf8");
+    });
 
     child.on("error", (err) => {
       if (settled) return;
@@ -67,6 +70,14 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
         const stderrExcerpt = redactForLog(stderrBuf.trim()).slice(0, STDERR_EXCERPT_MAX_CHARS);
         reject(new Error(`event sink command exited ${code}${stderrExcerpt ? `: ${stderrExcerpt}` : ""}`));
       }
+    });
+
+    child.stdin?.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      reject(err);
     });
 
     child.stdin?.write(line);

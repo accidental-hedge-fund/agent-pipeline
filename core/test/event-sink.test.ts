@@ -99,6 +99,40 @@ test("buildEventSinkDeps (default deliver): sink failure messages never leak a c
   );
 });
 
+// Regression (#343 review 2, finding 1): a forwarder that exits before
+// consuming stdin can make child.stdin emit an unhandled EPIPE stream error
+// on write. Without a stdin error handler that error escapes as an uncaught
+// exception rather than the promise rejection appendEvent catches.
+test("buildEventSinkDeps (default deliver): stdin EPIPE from an early-exiting forwarder rejects instead of crashing the process", async () => {
+  const cli = makeScript(`exit 0`);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+  const oversizedLine = "x".repeat(8 * 1024 * 1024) + "\n";
+
+  let uncaught: unknown;
+  const onUncaught = (err: unknown) => { uncaught = err; };
+  process.on("uncaughtException", onUncaught);
+  try {
+    await result.eventSink!(oversizedLine).catch(() => { /* rejection is expected/acceptable */ });
+  } finally {
+    process.off("uncaughtException", onUncaught);
+  }
+  assert.equal(uncaught, undefined);
+});
+
+// Regression (#343 review 2, finding 2): stderr must be capped while reading,
+// not only after the process closes, so a verbose/broken forwarder cannot
+// force unbounded string retention before the cap is applied.
+test("buildEventSinkDeps (default deliver): stderr accumulation is capped while reading, not only at close", async () => {
+  const cli = makeScript(`for i in $(seq 1 50); do head -c 100000 /dev/zero | tr '\\0' 'e'; done 1>&2\nexit 1`);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+  await assert.rejects(
+    () => Promise.resolve(result.eventSink!("line\n")),
+    (err: Error) => err.message.includes("exited 1") && err.message.length < 300,
+  );
+});
+
 test("buildEventSinkDeps (default deliver): an unspawnable command rejects rather than hanging", async () => {
   const cfg: Pick<PipelineConfig, "event_sink"> = {
     event_sink: { command: "/no/such/executable-343", mode: "additive" },
