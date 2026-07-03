@@ -94,6 +94,15 @@ export interface AdvanceFixDeps {
    * real git subprocess is invoked.
    */
   lockfileSideEffects?: LockfileSideEffectsDeps;
+  /**
+   * Verifies that `sha` is already present on `origin/<branch>` (#349 review-1
+   * finding 1). Used to confirm an external-commit advance decision was truly
+   * applied outside the fix harness (pushed to the remote by a human) rather
+   * than being a local-only leftover commit from a prior fix-harness run that
+   * was blocked before it could push. Defaults to `isCommitOnRemote`. Tests
+   * inject a fake so no real git fetch/subprocess runs.
+   */
+  verifyCommitOnRemote?: (wtPath: string, branch: string, sha: string) => Promise<boolean>;
 }
 
 /**
@@ -140,6 +149,43 @@ export function decideExternalCommitAdvance(
     return { advance: true, to: round === 1 ? "review-2" : "pre-merge", reviewSha };
   }
   return { advance: false, reviewSha };
+}
+
+/**
+ * Whether HEAD moving past the reviewed SHA (#349) was proven to have been
+ * applied outside the fix harness, and so may skip the harness-prescribed
+ * commit-subject check (`enforceExternalCommitGate`) rather than the normal
+ * fix-round gate (`enforceFixCommitGate`).
+ *
+ * A commit already present on `origin/<branch>` cannot be the local-only
+ * leftover from a prior fix-harness run that was blocked before it pushed
+ * (#349 review-1 finding 1: that path never reaches `git push`, so an
+ * unpushed bad-subject commit staying in the worktree must NOT get the
+ * subject exemption on a later no-op fix run). Fails closed to "harness"
+ * (the stricter gate) when the remote check cannot confirm the commit is
+ * already on the remote branch.
+ */
+export function resolveFixCommitGateMode(
+  decision: ExternalCommitAdvanceDecision,
+  verifiedOnRemote: boolean,
+): "external" | "harness" {
+  return decision.advance && verifiedOnRemote ? "external" : "harness";
+}
+
+/**
+ * Default `verifyCommitOnRemote` implementation (#349 review-1 finding 1):
+ * fetches `origin/<branch>` and checks whether `sha` is already an ancestor
+ * of it. Fails closed (returns false) on any fetch/lookup error so an
+ * unverifiable commit never gets the subject-check exemption.
+ */
+export async function isCommitOnRemote(wtPath: string, branch: string, sha: string): Promise<boolean> {
+  await gitInWorktree(wtPath, ["fetch", "origin", branch], { ignoreFailure: true });
+  const check = await gitInWorktree(
+    wtPath,
+    ["merge-base", "--is-ancestor", sha, `origin/${branch}`],
+    { ignoreFailure: true },
+  );
+  return check.code === 0;
 }
 
 export async function advanceFix(
@@ -289,6 +335,12 @@ export async function advanceFix(
   // (fix already applied externally); carries the decided target stage through
   // to the final transition once the normal gates below have validated it.
   let externalAdvance: ExternalCommitAdvanceDecision & { advance: true } | null = null;
+  // Which commit-message gate to run when externalAdvance is set (#349 review-1
+  // finding 1): "external" only once verifyCommitOnRemote proves the commit(s)
+  // already reached origin outside the fix harness; otherwise "harness" keeps
+  // the subject-prescribed gate so an unpushed leftover commit from a prior
+  // blocked fix run still blocks, exactly as before #349.
+  let commitGateMode: "external" | "harness" = "harness";
 
   let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   if (headBefore && headAfter && headBefore === headAfter) {
@@ -320,6 +372,18 @@ export async function advanceFix(
         // validated exactly like a harness-authored commit before any push.
         headBefore = decision.reviewSha;
         externalAdvance = decision;
+        // #349 review-1 finding 1: confirm the commit(s) already reached the
+        // remote branch before granting the subject-check exemption below —
+        // otherwise a bad-subject commit left over from a prior blocked fix
+        // run (never pushed) would bypass the #68 prompt-compliance gate on
+        // this no-op retry.
+        const verifyOnRemote = deps.verifyCommitOnRemote ?? isCommitOnRemote;
+        const verifiedOnRemote = await verifyOnRemote(
+          wt.path,
+          branchName(issueNumber, wt.slug),
+          headAfter,
+        );
+        commitGateMode = resolveFixCommitGateMode(decision, verifiedOnRemote);
       } else {
         const noCommitsMsg = `${stage} reported success but produced no new commits.`;
         await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
@@ -334,10 +398,14 @@ export async function advanceFix(
   // Externally-applied commits (#349) are exempt from the prescribed-subject
   // check: that pattern verifies fix-harness prompt compliance, and a human
   // pushing the requested fix cannot be required to use the harness's subject.
-  // The external variant keeps the range-level safety scan; the OpenSpec,
-  // lockfile, format/test, and consistency gates below still apply unchanged.
+  // The exemption only applies once commitGateMode is "external", i.e. the
+  // commit(s) were confirmed already on the remote (#349 review-1 finding 1) —
+  // otherwise the normal fix gate runs so an unpushed leftover commit still
+  // blocks. The external variant keeps the range-level safety scan; the
+  // OpenSpec, lockfile, format/test, and consistency gates below still apply
+  // unchanged.
   if (headBefore) {
-    const commitCheck = externalAdvance
+    const commitCheck = externalAdvance && commitGateMode === "external"
       ? await enforceExternalCommitGate(wt.path, headBefore)
       : await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
     if (!commitCheck.ok) {

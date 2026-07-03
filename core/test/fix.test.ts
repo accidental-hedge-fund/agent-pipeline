@@ -4,6 +4,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   decideExternalCommitAdvance,
   enforceFixOpenspecConsistency,
@@ -13,7 +18,11 @@ import {
   extractAllReviewFindingsHistory,
   extractBlockingReviewFindings,
   filterToBlockingFindings,
+  isCommitOnRemote,
+  resolveFixCommitGateMode,
 } from "../scripts/stages/fix.ts";
+
+const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
 import { categoryMarker, directionMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
@@ -624,4 +633,77 @@ test("decideExternalCommitAdvance: actor unresolved (null) → fails closed, doe
   );
   assert.equal(decision.advance, false, "an unresolved actor must not disable the trusted-author filter");
   assert.equal(decision.reviewSha, null);
+});
+
+// ---------------------------------------------------------------------------
+// resolveFixCommitGateMode + isCommitOnRemote (#349 pre-merge review-1 finding 1):
+// the external-commit subject exemption must only apply once the commit is
+// confirmed already on the remote branch — otherwise a bad-subject commit left
+// over from a prior blocked fix run (never pushed) would bypass the #68
+// prompt-compliance gate on a later no-op retry.
+// ---------------------------------------------------------------------------
+
+test("resolveFixCommitGateMode: advance + verified on remote → external (subject exemption applies)", () => {
+  const decision = decideExternalCommitAdvance([reviewComment(1, SHA_REVIEWED)], ACTOR, 1, SHA_HEAD);
+  assert.equal(resolveFixCommitGateMode(decision, true), "external");
+});
+
+test("resolveFixCommitGateMode: advance but NOT verified on remote → harness (regression: retry bypass)", () => {
+  // Reproduces the pre-merge finding: a fix harness commit with a non-prescribed
+  // subject was committed locally, blocked before push (enforceFixCommitGate
+  // failed). A later no-op fix run sees HEAD past the reviewed SHA and would
+  // decide to advance, but the leftover commit was never pushed — it must not
+  // get the subject-check exemption.
+  const decision = decideExternalCommitAdvance([reviewComment(1, SHA_REVIEWED)], ACTOR, 1, SHA_HEAD);
+  assert.equal(decision.advance, true, "sanity: HEAD past the reviewed SHA does decide to advance");
+  assert.equal(
+    resolveFixCommitGateMode(decision, false),
+    "harness",
+    "an unverified (not-yet-pushed) commit must still go through the subject-checked gate",
+  );
+});
+
+test("resolveFixCommitGateMode: no advance → harness regardless of remote verification", () => {
+  const decision = decideExternalCommitAdvance([], ACTOR, 1, SHA_HEAD);
+  assert.equal(resolveFixCommitGateMode(decision, true), "harness");
+});
+
+async function makeRemoteAndClone(): Promise<{ remoteDir: string; cloneDir: string; cleanup: () => Promise<void> }> {
+  const root = await mkdtemp(join(tmpdir(), "fix-remote-test-"));
+  const remoteDir = join(root, "remote.git");
+  const cloneDir = join(root, "clone");
+  await execFileAsync("git", ["init", "--bare", "-b", "main", remoteDir]);
+  await execFileAsync("git", ["clone", remoteDir, cloneDir]);
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: cloneDir });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: cloneDir });
+  await execFileAsync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: cloneDir });
+  await execFileAsync("git", ["push", "origin", "main"], { cwd: cloneDir });
+  return { remoteDir, cloneDir, cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+test("isCommitOnRemote: commit pushed to origin → true (genuinely external)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "human fix"], { cwd: cloneDir });
+    await execFileAsync("git", ["push", "origin", "main"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = stdout.trim();
+    assert.equal(await isCommitOnRemote(cloneDir, "main", sha), true);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("isCommitOnRemote: local-only commit never pushed → false (leftover from a blocked run)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    // Reproduces the exact bypass scenario: a fix-harness commit that failed
+    // enforceFixCommitGate before push remains local-only in the worktree.
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "fixed stuff"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = stdout.trim();
+    assert.equal(await isCommitOnRemote(cloneDir, "main", sha), false);
+  } finally {
+    await cleanup();
+  }
 });
