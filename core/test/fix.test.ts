@@ -707,3 +707,22 @@ test("isCommitOnRemote: local-only commit never pushed → false (leftover from 
     await cleanup();
   }
 });
+
+test("isCommitOnRemote: fetch failure with stale tracking ref containing the sha → false (fails closed)", async () => {
+  // Regression for pre-merge finding 0b679c48: when `git fetch origin <branch>`
+  // fails (remote unavailable/deleted), the stale cached origin/<branch> ref —
+  // which does contain the sha — must not prove remote presence.
+  const { remoteDir, cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "human fix"], { cwd: cloneDir });
+    await execFileAsync("git", ["push", "origin", "main"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = stdout.trim();
+    // Sanity: the stale tracking ref really does contain the sha.
+    await execFileAsync("git", ["merge-base", "--is-ancestor", sha, "origin/main"], { cwd: cloneDir });
+    await rm(remoteDir, { recursive: true, force: true });
+    assert.equal(await isCommitOnRemote(cloneDir, "main", sha), false);
+  } finally {
+    await cleanup();
+  }
+});

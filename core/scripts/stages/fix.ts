@@ -179,10 +179,15 @@ export function resolveFixCommitGateMode(
  * unverifiable commit never gets the subject-check exemption.
  */
 export async function isCommitOnRemote(wtPath: string, branch: string, sha: string): Promise<boolean> {
-  await gitInWorktree(wtPath, ["fetch", "origin", branch], { ignoreFailure: true });
+  const fetch = await gitInWorktree(wtPath, ["fetch", "origin", branch], { ignoreFailure: true });
+  if (fetch.code !== 0) return false;
+  // Check against FETCH_HEAD (the tip the fetch just retrieved), not the
+  // origin/<branch> tracking ref — after a failed or partial fetch a stale
+  // cached tracking ref could otherwise prove remote presence (#349 pre-merge
+  // finding 0b679c48).
   const check = await gitInWorktree(
     wtPath,
-    ["merge-base", "--is-ancestor", sha, `origin/${branch}`],
+    ["merge-base", "--is-ancestor", sha, "FETCH_HEAD"],
     { ignoreFailure: true },
   );
   return check.code === 0;
