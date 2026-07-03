@@ -2,7 +2,7 @@
 
 import { z } from "zod";
 import yaml from "js-yaml";
-import { parseDocument, isSeq, type YAMLSeq } from "yaml";
+import { parseDocument, isMap, isSeq, type YAMLSeq } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -1565,6 +1565,50 @@ function repoMapSeq(doc: ReturnType<typeof parseDocument>, rel: RepoMapRelation)
   return node;
 }
 
+/** Find the index of `value` in a YAML sequence's plain scalar items. */
+function findSeqIndex(seq: YAMLSeq, value: string): number {
+  return seq.items.findIndex((item) => {
+    const v = item && typeof item === "object" && "value" in item ? (item as { value: unknown }).value : item;
+    return v === value;
+  });
+}
+
+/**
+ * Locate the source character range of the top-level `repo_map:` pair
+ * (key through the end of its value), so an edit can splice just that
+ * range rather than re-serializing the whole document (#367 review 1).
+ */
+function findRepoMapRange(doc: ReturnType<typeof parseDocument>): [number, number] | null {
+  if (!isMap(doc.contents)) return null;
+  type RangedNode = { range?: [number, number, number] };
+  const pair = doc.contents.items.find((p) => String((p.key as { value?: unknown } | null)?.value) === "repo_map");
+  const keyRange = (pair?.key as RangedNode | null)?.range;
+  if (!keyRange) return null;
+  const valueRange = (pair?.value as RangedNode | null)?.range;
+  return [keyRange[0], valueRange ? valueRange[2] : keyRange[2]];
+}
+
+/**
+ * Apply `mutate` to a fresh parse of `text` and splice only the resulting
+ * `repo_map:` block back into the original source, so every byte outside
+ * `repo_map` — unrelated keys, comments, and formatting — survives verbatim.
+ * Falls back to appending the rendered block when `repo_map` was absent.
+ */
+function spliceRepoMapBlock(text: string, mutate: (doc: ReturnType<typeof parseDocument>) => void): string {
+  const doc = parseDocument(text);
+  const existingRange = findRepoMapRange(doc);
+  mutate(doc);
+  const candidate = doc.toString();
+  const candidateRange = findRepoMapRange(parseDocument(candidate));
+  if (!candidateRange) return candidate;
+  const newBlock = candidate.slice(candidateRange[0], candidateRange[1]);
+  if (existingRange) {
+    return text.slice(0, existingRange[0]) + newBlock + text.slice(existingRange[1]);
+  }
+  const needsNewline = text.length > 0 && !text.endsWith("\n");
+  return text + (needsNewline ? "\n" : "") + newBlock;
+}
+
 /**
  * Add `ownerRepo` to `repo_map.<rel>` in `.github/pipeline.yml`, creating the
  * `repo_map` block (and target list) when absent. Idempotent: adding an entry
@@ -1586,9 +1630,8 @@ export function repoMapAdd(
   if (!loaded.ok) return loaded.result;
   const { gitRoot, configPath, text } = loaded;
 
-  const doc = parseDocument(text);
-  const seq = repoMapSeq(doc, rel);
-  const existing = seq.toJSON() as string[];
+  const checkDoc = parseDocument(text);
+  const existing = repoMapSeq(checkDoc, rel).toJSON() as string[];
   if (existing.includes(ownerRepo)) {
     return {
       ok: true,
@@ -1599,8 +1642,10 @@ export function repoMapAdd(
     };
   }
 
-  doc.addIn(["repo_map", rel], ownerRepo);
-  const candidate = doc.toString();
+  const candidate = spliceRepoMapBlock(text, (doc) => {
+    repoMapSeq(doc, rel);
+    doc.addIn(["repo_map", rel], ownerRepo);
+  });
 
   const readFileFn = deps.readFile ?? defaultReadFile;
   const candidateValidation = validateConfig(gitRoot, {
@@ -1666,20 +1711,18 @@ export function repoMapRemove(
     warning: `${ownerRepo} was not present in repo_map.${rel}.`,
   };
 
-  const doc = parseDocument(text);
-  if (!doc.hasIn(["repo_map", rel])) return notPresent;
-  const node = doc.getIn(["repo_map", rel], true);
-  if (!isSeq(node)) {
+  const checkDoc = parseDocument(text);
+  if (!checkDoc.hasIn(["repo_map", rel])) return notPresent;
+  const checkNode = checkDoc.getIn(["repo_map", rel], true);
+  if (!isSeq(checkNode)) {
     throw new Error(`repo_map.${rel} in the config file is not a list.`);
   }
-  const idx = node.items.findIndex((item) => {
-    const value = item && typeof item === "object" && "value" in item ? (item as { value: unknown }).value : item;
-    return value === ownerRepo;
-  });
-  if (idx === -1) return notPresent;
+  if (findSeqIndex(checkNode, ownerRepo) === -1) return notPresent;
 
-  node.items.splice(idx, 1);
-  const candidate = doc.toString();
+  const candidate = spliceRepoMapBlock(text, (doc) => {
+    const node = doc.getIn(["repo_map", rel], true) as YAMLSeq;
+    node.items.splice(findSeqIndex(node, ownerRepo), 1);
+  });
 
   const writeFileFn = deps.writeFile ?? defaultWriteFile;
   writeFileFn(configPath, candidate);

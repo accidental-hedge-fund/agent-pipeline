@@ -2156,26 +2156,41 @@ test("repoMapList: missing config file reports an error", () => {
   assert.match(result.message, /pipeline init/);
 });
 
-test("repoMap add/remove round-trip preserves unrelated keys, comments, and formatting", () => {
+test("repoMap add/remove round-trip preserves unrelated keys, comments, and formatting byte-for-byte", () => {
+  // Deliberately nonstandard formatting (uneven spacing before an inline comment,
+  // 4-space indentation, a flow-style mapping) to prove the edit is scoped to the
+  // repo_map block rather than re-serializing the whole document (#367 review 1).
   const original = `# top comment
-base_branch: staging # trailing comment
+base_branch:   staging    # trailing comment with odd spacing
 steps:
-  docs: true
+    docs: true
+flow_key: { a: 1, b: 2 }
 review_policy:
   block_threshold: high
+repo_map:
+  depends_on:
+    - acme/existing
 `;
   const repo = makeFakeRepo(original);
   const configPath = path.join(repo, ".github", "pipeline.yml");
+  const beforeRepoMap = original.slice(0, original.indexOf("repo_map:"));
 
   repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
-  repoMapRemove(repo, "acme/lib", "depends_on");
+  const afterAdd = fs.readFileSync(configPath, "utf8");
+  assert.equal(
+    afterAdd.slice(0, afterAdd.indexOf("repo_map:")),
+    beforeRepoMap,
+    "bytes preceding repo_map must be unchanged after add",
+  );
 
-  const finalText = fs.readFileSync(configPath, "utf8");
-  const originalLines = original.split("\n");
-  for (const line of originalLines) {
-    if (line.trim() === "") continue;
-    assert.ok(finalText.includes(line), `expected unrelated line to survive round-trip: ${JSON.stringify(line)}`);
-  }
+  repoMapRemove(repo, "acme/lib", "depends_on");
+  const afterRemove = fs.readFileSync(configPath, "utf8");
+  assert.equal(
+    afterRemove.slice(0, afterRemove.indexOf("repo_map:")),
+    beforeRepoMap,
+    "bytes preceding repo_map must be unchanged after remove",
+  );
+  assert.match(afterRemove, /depends_on:\s*\n\s*- acme\/existing\s*\n/);
 });
 
 test("repoMapAdd: creating repo_map from absent produces a config that still validates", async () => {
