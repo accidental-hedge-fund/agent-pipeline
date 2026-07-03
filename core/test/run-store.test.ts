@@ -306,6 +306,76 @@ test("appendEvent: worktree_removed event appears in both events.jsonl and stdou
 });
 
 // ---------------------------------------------------------------------------
+// event sink (#343) — additive/exclusive mode gating and non-fatal delivery
+// ---------------------------------------------------------------------------
+
+test("appendEvent: additive mode (default) writes locally AND delivers to the sink", async () => {
+  const { deps, readFile } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].trim(), fileLine, "sink must receive the identical line written to events.jsonl");
+});
+
+test("appendEvent: exclusive mode delivers to the sink and does NOT write events.jsonl", async () => {
+  const { deps, files, appends } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  deps.eventSinkMode = "exclusive";
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+
+  assert.equal(delivered.length, 1);
+  assert.equal(files.has(EVENTS_JSONL), false, "events.jsonl must not be created in exclusive mode");
+  assert.equal(appends.has(EVENTS_JSONL), false, "events.jsonl must not be appended to in exclusive mode");
+});
+
+test("appendEvent: sink mode is ignored when no eventSink is configured (local write proceeds)", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSinkMode = "exclusive"; // no eventSink set — must have zero effect
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.match(fileLine, /"type":"stage_start"/);
+});
+
+test("appendEvent: a throwing sink is non-fatal; in additive mode the local write still succeeds", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSink = () => { throw new Error("sink unreachable"); };
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps); // must not throw
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.match(fileLine, /"type":"stage_start"/);
+});
+
+test("appendEvent: a rejecting async sink is non-fatal and does not abort subsequent events", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSink = async () => { throw new Error("network timeout"); };
+  const e1: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  const e2: RunEvent = { schema_version: 1, type: "stage_complete", at: STARTED_AT_ISO, stage: "planning", outcome: "advanced" };
+  await appendEvent(RUN_DIR, e1, deps);
+  await appendEvent(RUN_DIR, e2, deps);
+  const lines = readFile(EVENTS_JSONL).trim().split("\n");
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /"type":"stage_start"/);
+  assert.match(lines[1], /"type":"stage_complete"/);
+});
+
+test("appendEvent: with no eventSink configured, behavior is byte-for-byte unchanged (regression)", async () => {
+  const { deps, readFile, stdoutLines } = memRunStore();
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+  const fileLine = readFile(EVENTS_JSONL);
+  assert.equal(fileLine, `${JSON.stringify(event)}\n`);
+  assert.equal(stdoutLines.length, 1);
+  assert.equal(stdoutLines[0], fileLine);
+});
+
+// ---------------------------------------------------------------------------
 // 4.3 — readEvents
 // ---------------------------------------------------------------------------
 

@@ -118,6 +118,19 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Deterministic preflight capability check settings."),
+  // Optional external event sink (#343). Opt-in; unconfigured behavior (local
+  // events.jsonl only) is unchanged. `command` names an operator-controlled
+  // forwarder that receives each event's JSON line on stdin; `mode` selects
+  // additive (local file + sink, default) vs exclusive (sink only). Also
+  // overridable via PIPELINE_EVENT_SINK_COMMAND / PIPELINE_EVENT_SINK_MODE.
+  event_sink: z
+    .object({
+      command: z.string().optional().describe("Operator-controlled forwarder command that receives each event JSON line on stdin."),
+      mode: z.enum(["additive", "exclusive"]).optional().describe("additive (default): write to the local events.jsonl AND deliver to the sink. exclusive: deliver to the sink only; events.jsonl is not written."),
+    })
+    .strict()
+    .optional()
+    .describe("Optional external event sink for run events (#343)."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -358,6 +371,23 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     repo = "";
   }
 
+  // External event sink (#343). Env vars override file config, consistent
+  // with CLI-over-file precedence used elsewhere in this loader. Absent
+  // command (from both file and env) means no active sink.
+  const envSinkMode = process.env.PIPELINE_EVENT_SINK_MODE;
+  if (envSinkMode !== undefined && envSinkMode !== "additive" && envSinkMode !== "exclusive") {
+    throw new Error(
+      `Invalid PIPELINE_EVENT_SINK_MODE: "${envSinkMode}" (must be "additive" or "exclusive").`,
+    );
+  }
+  const sinkCommand = process.env.PIPELINE_EVENT_SINK_COMMAND ?? fileConfig.event_sink?.command;
+  const eventSink = sinkCommand
+    ? {
+        command: sinkCommand,
+        mode: (envSinkMode as "additive" | "exclusive" | undefined) ?? fileConfig.event_sink?.mode ?? "additive",
+      }
+    : undefined;
+
   const merged: PipelineConfig = {
     profile_name: profile.name,
     invocation: profile.invocation,
@@ -487,6 +517,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       depends_on: fileConfig.repo_map?.depends_on ?? DEFAULT_CONFIG.repo_map.depends_on,
       depended_on_by: fileConfig.repo_map?.depended_on_by ?? DEFAULT_CONFIG.repo_map.depended_on_by,
     },
+    event_sink: eventSink,
   };
   if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
   return merged;
@@ -1235,6 +1266,15 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   instead of bypassPermissions (#21). The codex harness is already sandboxed",
         "#   via --full-auto and is unaffected. Default false -> current invocation unchanged.",
       ].join("\n"),
+    "",
+    config.event_sink !== undefined
+      ? `event_sink: # optional external event sink (#343) — deliver run events.jsonl records to an operator-controlled forwarder\n${yamlBlock(config.event_sink, 2)}`
+      : [
+        "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder",
+        '#   command: "logger -t pipeline" # forwarder command; receives each event JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged).',
+        "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)",
+        "#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.",
+      ].join("\n"),
     config.roadmap !== undefined ? `\nroadmap:\n${yamlBlock(config.roadmap, 2)}` : undefined,
     config.sweep !== undefined ? `\nsweep:\n${yamlBlock(config.sweep, 2)}` : undefined,
     config.trusted_override_actors !== undefined ? `\ntrusted_override_actors:\n${yamlBlock(config.trusted_override_actors, 2)}` : undefined,
@@ -1308,6 +1348,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     auto_merge_eligibility: config.auto_merge_eligibility,
     context_snapshot: config.context_snapshot,
     repo_map: config.repo_map,
+    event_sink: config.event_sink,
   };
 }
 
