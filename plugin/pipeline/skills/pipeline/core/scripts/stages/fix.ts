@@ -34,7 +34,7 @@ import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
-import { extractBlockingKeysMarker } from "./review.ts";
+import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import type { RunStoreDeps } from "../run-store.ts";
 import {
   computeBranchDeveloperCommits,
@@ -106,6 +106,40 @@ export interface AdvanceFixDeps {
  */
 export function fixHarnessFailureOutcome(reason: string): Outcome {
   return { advanced: false, status: "blocked", reason, blockerKind: "harness-failure" };
+}
+
+/** Decision from {@link decideExternalCommitAdvance} — either advance to the round's next stage, or fall through to the existing no-commits block. */
+export type ExternalCommitAdvanceDecision =
+  | { advance: true; to: Stage; reviewSha: string }
+  | { advance: false; reviewSha: string | null };
+
+/**
+ * #349: when a fix round's harness produces no new commit and salvage finds
+ * nothing, decide whether to advance (a human already pushed the fix the
+ * reviewer asked for) or fall through to the existing `no-commits` block.
+ *
+ * Filters `comments` to the trusted pipeline actor (when known) before
+ * extracting the reviewed SHA, mirroring the trust pattern used by the
+ * pre-merge SHA gate and the OpenSpec consistency guard — an untrusted
+ * commenter must not be able to forge a stale reviewed-SHA marker to force
+ * an advance. Fails closed (does not advance) when no trusted review SHA is
+ * extractable, or when HEAD already equals it.
+ */
+export function decideExternalCommitAdvance(
+  comments: { author: string; body: string }[],
+  actor: string | null,
+  round: 1 | 2,
+  headAfter: string,
+): ExternalCommitAdvanceDecision {
+  const commentsToSearch = typeof actor === "string"
+    ? comments.filter((c) => c.author === actor)
+    : comments;
+  const reviewShaResult = extractReviewedSha(commentsToSearch, round);
+  const reviewSha = reviewShaResult?.sha ?? null;
+  if (reviewSha && headAfter && reviewSha !== headAfter) {
+    return { advance: true, to: round === 1 ? "review-2" : "pre-merge", reviewSha };
+  }
+  return { advance: false, reviewSha };
 }
 
 export async function advanceFix(
@@ -260,6 +294,21 @@ export async function advanceFix(
       fixSalvageStageLabel(round, issueNumber),
     );
     if (!salvaged) {
+      // #349: before blocking, check whether a human already pushed the fix the
+      // reviewer asked for. When HEAD is past the SHA the reviewer last saw,
+      // treat this as "fix already applied externally" and advance instead of
+      // blocking — recovering otherwise requires a manual label-advance for
+      // work that is already done. Fail closed (block) when no trusted review
+      // SHA is extractable, or when HEAD equals it (genuinely nothing done).
+      const decision = decideExternalCommitAdvance(detail.comments, fixActor, round, headAfter);
+      if (decision.advance) {
+        const msg =
+          `${stage}: the fix harness produced no new commits, but HEAD (${headAfter}) ` +
+          `differs from the SHA the reviewer last reviewed (${decision.reviewSha}) — the fix ` +
+          `was already applied externally. Advancing to ${decision.to}.`;
+        await transition(cfg, issueNumber, stage, decision.to, msg);
+        return { advanced: true, from: stage, to: decision.to, summary: "fix already applied externally" };
+      }
       const noCommitsMsg = `${stage} reported success but produced no new commits.`;
       await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
       return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };

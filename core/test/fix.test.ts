@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  decideExternalCommitAdvance,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
   enforceOpenspecSpecDeltaValidation,
@@ -491,4 +492,92 @@ test("filterToBlockingFindings: advisory ordinal marker in reviewer body does NO
   // Blocking finding must survive — the marker in reviewer text must not affect filtering.
   assert.ok(filtered.includes(blockingWithOrdinalInBody.title), "blocking finding must survive even when body contains the ordinal marker string");
   assert.ok(!filtered.includes("advisory finding was omitted"), "no advisory omission note should appear");
+});
+
+// ---------------------------------------------------------------------------
+// decideExternalCommitAdvance (#349: advance instead of blocking when the fix
+// was already applied externally — HEAD is past the last reviewed SHA)
+// ---------------------------------------------------------------------------
+
+const SHA_REVIEWED = "1".repeat(39) + "a";
+const SHA_HEAD = "2".repeat(39) + "b";
+const ACTOR = "pipeline-bot";
+
+function reviewComment(round: 1 | 2, sha: string | null, author = ACTOR) {
+  const sentinel = sha ? `\n\n<!-- reviewed-sha: ${sha} -->` : "";
+  return {
+    author,
+    body: `## Review ${round} (${round === 1 ? "Standard" : "Adversarial"}) — needs-attention\n\nfindings${sentinel}`,
+  };
+}
+
+test("decideExternalCommitAdvance: round 1, HEAD past reviewed SHA → advances to review-2", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED)],
+    ACTOR,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, true);
+  assert.ok(decision.advance && decision.to === "review-2");
+  assert.ok(decision.advance && decision.reviewSha === SHA_REVIEWED);
+});
+
+test("decideExternalCommitAdvance: round 2, HEAD past reviewed SHA → advances to pre-merge", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(2, SHA_REVIEWED)],
+    ACTOR,
+    2,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, true);
+  assert.ok(decision.advance && decision.to === "pre-merge");
+});
+
+test("decideExternalCommitAdvance: HEAD equals reviewed SHA → does not advance (blocks as before)", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED)],
+    ACTOR,
+    1,
+    SHA_REVIEWED,
+  );
+  assert.equal(decision.advance, false);
+  assert.equal(decision.reviewSha, SHA_REVIEWED);
+});
+
+test("decideExternalCommitAdvance: no review comment at all → fails closed, does not advance", () => {
+  const decision = decideExternalCommitAdvance([], ACTOR, 1, SHA_HEAD);
+  assert.equal(decision.advance, false);
+  assert.equal(decision.reviewSha, null);
+});
+
+test("decideExternalCommitAdvance: review comment without a SHA (legacy) → fails closed, does not advance", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, null)],
+    ACTOR,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, false);
+  assert.equal(decision.reviewSha, null);
+});
+
+test("decideExternalCommitAdvance: review comment from an untrusted author is ignored → fails closed", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED, "random-commenter")],
+    ACTOR,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, false, "an untrusted author's SHA marker must not drive an advance");
+});
+
+test("decideExternalCommitAdvance: actor unresolved (null) → no author filter, still extracts SHA", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED)],
+    null,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, true);
 });
