@@ -133,6 +133,33 @@ test("buildEventSinkDeps (default deliver): stderr accumulation is capped while 
   );
 });
 
+// Pre-merge delta regression (#343): the stderr cap drops chunks once the
+// buffer is full, so a quoted secret assignment whose closing quote arrives in
+// a dropped chunk reaches redaction unterminated. The unterminated tail must
+// still be redacted — never logged raw.
+test("buildEventSinkDeps (default deliver): quoted secret split across chunks with the closing quote past the cap is still redacted", async () => {
+  const cli = makeScript(
+    [
+      `printf 'OPENAI_API_KEY="' >&2`,
+      // 250 chars of secret value: pushes the buffer past the 200-char cap
+      `printf 'leakmarker%.0s' $(seq 1 25) >&2`,
+      // closing quote in a later chunk, dropped by the cap
+      `sleep 0.2`,
+      `printf '"' >&2`,
+      `exit 1`,
+    ].join("\n"),
+  );
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+  await assert.rejects(
+    () => Promise.resolve(result.eventSink!("line\n")),
+    (err: Error) =>
+      err.message.includes("exited 1") &&
+      !err.message.includes("leakmarker") &&
+      err.message.includes("[REDACTED]"),
+  );
+});
+
 test("buildEventSinkDeps (default deliver): an unspawnable command rejects rather than hanging", async () => {
   const cfg: Pick<PipelineConfig, "event_sink"> = {
     event_sink: { command: "/no/such/executable-343", mode: "additive" },
