@@ -415,7 +415,17 @@ export async function runAdvance(
     // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
     let runDir: string | undefined;
     let terminalTee: TerminalLogTee | undefined;
-    const runStoreDeps: RunStoreDeps = { ...defaultRunStoreDeps, ...buildEventSinkDeps(cfg) };
+    const eventSinkDeps = buildEventSinkDeps(cfg);
+    const runStoreDeps: RunStoreDeps = {
+      ...defaultRunStoreDeps,
+      ...eventSinkDeps,
+      // summaryEvents (#343): in-memory accumulator so finalizeRun can enrich
+      // summary.json from events delivered this run. Only needed in exclusive
+      // sink mode, where events.jsonl is never written (see run-store.ts
+      // finalizeRun) — additive/no-sink mode keeps reading events.jsonl so a
+      // resumed run also picks up events appended by an earlier process.
+      ...(eventSinkDeps.eventSinkMode === "exclusive" ? { summaryEvents: [] } : {}),
+    };
     if (stateDir) {
       // Use the run id pinned by a detached launcher when present, so the detached
       // caller and the inner run share one `.agent-pipeline/runs/<run-id>` (#155).

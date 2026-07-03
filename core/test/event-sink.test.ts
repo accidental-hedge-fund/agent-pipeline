@@ -73,13 +73,29 @@ test("buildEventSinkDeps (default deliver): the event line is delivered to the f
   assert.equal(fs.readFileSync(captured, "utf8"), '{"type":"stage_start"}\n');
 });
 
-test("buildEventSinkDeps (default deliver): a non-zero exit rejects with the command and stderr", async () => {
+test("buildEventSinkDeps (default deliver): a non-zero exit rejects with exit code and a redacted stderr excerpt, never the raw command", async () => {
   const cli = makeScript(`echo "forwarder failed" >&2\nexit 1`);
   const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
   const result = buildEventSinkDeps(cfg);
   await assert.rejects(
     () => Promise.resolve(result.eventSink!("line\n")),
-    (err: Error) => err.message.includes("exited 1") && err.message.includes("forwarder failed"),
+    (err: Error) =>
+      err.message.includes("exited 1") &&
+      err.message.includes("forwarder failed") &&
+      !err.message.includes(cli),
+  );
+});
+
+// Regression (#343 review 1, finding 2): forwarder commands may embed their own
+// auth (e.g. curl headers, inline env assignments) — a sink failure must never
+// echo the raw command text or an unredacted secret into pipeline logs.
+test("buildEventSinkDeps (default deliver): sink failure messages never leak a command-embedded secret", async () => {
+  const cli = makeScript(`echo "calling API_KEY=super-secret-value" >&2\nexit 1`);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+  await assert.rejects(
+    () => Promise.resolve(result.eventSink!("line\n")),
+    (err: Error) => !err.message.includes("super-secret-value") && err.message.includes("[REDACTED]"),
   );
 });
 

@@ -170,6 +170,12 @@ export interface RunStoreDeps {
    *  delivery ("additive", default) or is skipped entirely ("exclusive").
    *  Ignored when eventSink is unset. */
   eventSinkMode?: "additive" | "exclusive";
+  /** Optional in-memory accumulator (#343): when set, every event appended via
+   *  appendEvent is also pushed here, regardless of eventSinkMode. finalizeRun
+   *  reads from this (when present) instead of re-reading events.jsonl, so
+   *  stage_accounting/human_intervention data still reaches summary.json in
+   *  exclusive mode, where events.jsonl is never written. */
+  summaryEvents?: RunEvent[];
 }
 
 export const defaultRunStoreDeps: RunStoreDeps = {
@@ -288,6 +294,10 @@ export async function appendEvent(
   const line = `${JSON.stringify(event)}\n`;
   const hasSink = deps.eventSink !== undefined;
   const skipLocalWrite = hasSink && deps.eventSinkMode === "exclusive";
+
+  if (deps.summaryEvents) {
+    deps.summaryEvents.push(event);
+  }
 
   if (!skipLocalWrite) {
     try {
@@ -433,20 +443,32 @@ export async function finalizeRun(
   };
   await appendEvent(runDir, completeEvent, deps);
 
-  // Collect additive event-derived records from events.jsonl to embed in
-  // summary.json. Non-fatal: if the read fails, arrays stay empty.
+  // Collect event-derived records to embed in summary.json. When the caller
+  // supplies deps.summaryEvents (#343), use that in-memory accumulator so
+  // exclusive sink mode — which never writes events.jsonl — still enriches
+  // summary.json; otherwise fall back to re-reading events.jsonl. Non-fatal:
+  // if the read fails, arrays stay empty.
   let interventions: HumanInterventionEvent[] = [];
   let accountingRecords: StageAccountingRecord[] = [];
-  try {
-    const eventsForSummary = await readEvents(runDir, deps);
-    interventions = eventsForSummary.filter(
+  if (deps.summaryEvents) {
+    interventions = deps.summaryEvents.filter(
       (e): e is HumanInterventionEvent => e.type === "human_intervention",
     );
-    accountingRecords = eventsForSummary
+    accountingRecords = deps.summaryEvents
       .filter((e): e is StageAccountingEvent => e.type === "stage_accounting")
       .map((e) => sanitizeStageAccountingRecord(e));
-  } catch {
-    // Non-fatal: missing or unreadable events.jsonl → empty arrays
+  } else {
+    try {
+      const eventsForSummary = await readEvents(runDir, deps);
+      interventions = eventsForSummary.filter(
+        (e): e is HumanInterventionEvent => e.type === "human_intervention",
+      );
+      accountingRecords = eventsForSummary
+        .filter((e): e is StageAccountingEvent => e.type === "stage_accounting")
+        .map((e) => sanitizeStageAccountingRecord(e));
+    } catch {
+      // Non-fatal: missing or unreadable events.jsonl → empty arrays
+    }
   }
 
   // Serialize bundle — same sanitization as evidence-bundle.ts writeBundle.

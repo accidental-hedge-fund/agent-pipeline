@@ -621,6 +621,43 @@ test("finalizeRun: writes accounting records in event order with actual/estimate
   assert.equal(summary.accounting.records[2].cost_usd, null);
 });
 
+// Regression (#343 review 1, finding 1): in exclusive sink mode events.jsonl is
+// never written, so finalizeRun must not lose stage_accounting/human_intervention
+// data — it must read from deps.summaryEvents (the sink-independent in-memory
+// collector) instead of re-reading the (absent) local file.
+test("finalizeRun: exclusive sink mode still embeds accounting + interventions via summaryEvents", async () => {
+  const { deps, readFile, files } = memRunStore();
+  deps.eventSink = () => {};
+  deps.eventSinkMode = "exclusive";
+  deps.summaryEvents = [];
+  const bundle = makeBundle();
+
+  await emitStageAccounting(RUN_DIR, accountingRecord({ stage: "review-1" }), deps);
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "human_intervention",
+      at: STARTED_AT_ISO,
+      kind: "human-risk-override",
+      stage: "review-1",
+      issue: ISSUE,
+      detail: "reviewer override applied",
+    },
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  assert.equal(files.has(path.join(RUN_DIR, "events.jsonl")), false, "exclusive mode must not create events.jsonl");
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.accounting.records.length, 1, "stage_accounting must still reach summary.json");
+  assert.equal(summary.accounting.records[0].stage, "review-1");
+  assert.equal(summary.interventions.length, 1, "human_intervention must still reach summary.json");
+  assert.equal(summary.interventions[0].kind, "human-risk-override");
+});
+
 // 4.7 — backward-compat regression test
 test("finalizeRun: writes legacy evidence.json with same content as summary.json", async () => {
   const { deps, readFile } = memRunStore();

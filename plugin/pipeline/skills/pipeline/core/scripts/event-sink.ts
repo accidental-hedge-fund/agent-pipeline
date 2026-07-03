@@ -9,11 +9,23 @@
 import { spawn } from "node:child_process";
 import type { PipelineConfig } from "./types.ts";
 import type { RunStoreDeps } from "./run-store.ts";
+import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 
 // Wall-clock cap for a single delivery. A hung forwarder must not stall the
 // pipeline; a slow command is the operator's responsibility, so delivery is
 // abandoned (and reported as a non-fatal failure by appendEvent) past this.
 const DELIVERY_TIMEOUT_MS = 10_000;
+
+// Sink failure messages are logged (console.warn via appendEvent) and must
+// never leak the operator's command text: forwarder commands are allowed to
+// carry their own auth (curl headers, inline env assignments), so echoing the
+// command on a transient failure would persist credentials into pipeline logs.
+// stderr is capped and redacted for the same reason before it is surfaced.
+const STDERR_EXCERPT_MAX_CHARS = 200;
+
+function redactForLog(text: string): string {
+  return sanitize(redactSecrets(text));
+}
 
 export interface EventSinkDeps {
   /** Deliver one event line to the forwarder command; resolves on a zero
@@ -33,7 +45,7 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       if (settled) return;
       settled = true;
       try { child.kill("SIGKILL"); } catch { /* already gone */ }
-      reject(new Error(`event sink command timed out after ${DELIVERY_TIMEOUT_MS / 1000}s: ${command}`));
+      reject(new Error(`event sink command timed out after ${DELIVERY_TIMEOUT_MS / 1000}s`));
     }, DELIVERY_TIMEOUT_MS);
 
     child.stderr?.on("data", (chunk: Buffer) => { stderrBuf += chunk.toString("utf8"); });
@@ -52,7 +64,8 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`event sink command "${command}" exited ${code}${stderrBuf.trim() ? `: ${stderrBuf.trim()}` : ""}`));
+        const stderrExcerpt = redactForLog(stderrBuf.trim()).slice(0, STDERR_EXCERPT_MAX_CHARS);
+        reject(new Error(`event sink command exited ${code}${stderrExcerpt ? `: ${stderrExcerpt}` : ""}`));
       }
     });
 
