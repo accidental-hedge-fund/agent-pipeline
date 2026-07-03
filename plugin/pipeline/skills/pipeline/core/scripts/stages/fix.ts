@@ -331,8 +331,15 @@ export async function advanceFix(
   }
 
   // ---- Verify fix-round commit message format (#68) ----
+  // Externally-applied commits (#349) are exempt from the prescribed-subject
+  // check: that pattern verifies fix-harness prompt compliance, and a human
+  // pushing the requested fix cannot be required to use the harness's subject.
+  // The external variant keeps the range-level safety scan; the OpenSpec,
+  // lockfile, format/test, and consistency gates below still apply unchanged.
   if (headBefore) {
-    const commitCheck = await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
+    const commitCheck = externalAdvance
+      ? await enforceExternalCommitGate(wt.path, headBefore)
+      : await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
     if (!commitCheck.ok) {
       await setBlocked(cfg, issueNumber, commitCheck.reason, stage, "needs-human");
       return { advanced: false, status: "blocked", reason: commitCheck.reason };
@@ -523,6 +530,22 @@ export async function enforceFixCommitGate(
     },
     deps,
   );
+}
+
+/**
+ * External-commit variant of the fix-round commit gate (#349). Commits applied
+ * outside the fix harness (a human pushing the fix the reviewer asked for) are
+ * not required to carry the harness-prescribed `fix: address review N findings`
+ * subject — that check verifies prompt compliance, not code quality. The empty
+ * config still runs verifyHarnessCommits' range-level safety scan (node_modules
+ * inclusion) over reviewSha..HEAD.
+ */
+export async function enforceExternalCommitGate(
+  wtPath: string,
+  reviewSha: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(wtPath, reviewSha, {}, deps);
 }
 
 // ---- pure helpers ----

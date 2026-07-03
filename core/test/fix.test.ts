@@ -8,6 +8,7 @@ import {
   decideExternalCommitAdvance,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
+  enforceExternalCommitGate,
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
   extractBlockingReviewFindings,
@@ -125,6 +126,48 @@ test("fix round 1: multiple commits — at least one matches → proceeds", asyn
     ]),
   );
   assert.equal(result.ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// External-commit gate (#349): externally-applied fixes are exempt from the
+// prescribed-subject check but still get the range-level safety scan.
+// ---------------------------------------------------------------------------
+
+function externalDeps(shaFiles: Record<string, string[]>, messages: string[] = []): VerifyDeps {
+  return {
+    gitMessages: async () => messages,
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => Object.keys(shaFiles),
+    gitDiffTreeFiles: async (_wt: string, sha: string) => shaFiles[sha] ?? [],
+  };
+}
+
+test("external gate: human commit subject (no prescribed format) → proceeds", async () => {
+  // Regression for pre-merge finding f65e88f8: a human-applied fix with an
+  // ordinary subject must not be blocked by the fix-round message pattern.
+  const result = await enforceExternalCommitGate(
+    "/wt", "reviewsha",
+    externalDeps({ abc123: ["core/scripts/stages/fix.ts"] }, ["correct the stale OpenSpec delta by hand\n"]),
+  );
+  assert.equal(result.ok, true);
+});
+
+test("external gate: commit adding node_modules → still blocked", async () => {
+  const result = await enforceExternalCommitGate(
+    "/wt", "reviewsha",
+    externalDeps({ abc123: ["node_modules/leftpad/index.js"] }),
+  );
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("node_modules"));
+});
+
+test("external gate vs fix gate: same human subject blocks the harness gate (contrast)", async () => {
+  const result = await enforceFixCommitGate(
+    1, 42, "/wt", "reviewsha",
+    msgsDeps(["correct the stale OpenSpec delta by hand\n"]),
+  );
+  assert.equal(result.ok, false);
 });
 
 // ---------------------------------------------------------------------------
