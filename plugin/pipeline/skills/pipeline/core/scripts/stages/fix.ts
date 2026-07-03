@@ -227,8 +227,11 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: "reattach failed" };
   }
 
-  // Capture HEAD before so we can detect non-commits.
-  const headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  // Capture HEAD before so we can detect non-commits. Mutable: the external-commit
+  // advance path (#349) rebases this to the reviewed SHA so the commit/openspec/
+  // format/test gates below validate the externally-applied commit(s) rather than
+  // seeing a no-op diff.
+  let headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -282,6 +285,11 @@ export async function advanceFix(
     return fixHarnessFailureOutcome(reason);
   }
 
+  // Set when the no-new-commits path (#349) decides the reviewed SHA is stale
+  // (fix already applied externally); carries the decided target stage through
+  // to the final transition once the normal gates below have validated it.
+  let externalAdvance: ExternalCommitAdvanceDecision & { advance: true } | null = null;
+
   let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   if (headBefore && headAfter && headBefore === headAfter) {
     // #131: the harness reported success without committing — salvage real
@@ -302,30 +310,24 @@ export async function advanceFix(
       // SHA is extractable, or when HEAD equals it (genuinely nothing done).
       const decision = decideExternalCommitAdvance(detail.comments, fixActor, round, headAfter);
       if (decision.advance) {
-        // #349 review-2: local HEAD moving past the reviewed SHA only proves the
-        // managed worktree advanced — it does not prove the PR branch has that
-        // commit (e.g. a prior fix run committed but failed at the later push).
-        // Push through the same failure handling as the normal fix path before
-        // advancing, so the next review stage never reads a stale remote head.
-        const externalBranch = branchName(issueNumber, wt.slug);
-        const externalPush = await gitInWorktree(wt.path, ["push", "origin", externalBranch], { ignoreFailure: true });
-        if (externalPush.code !== 0) {
-          const pushFailedMsg = `Git push failed after fix: ${externalPush.stderr.trim()}`;
-          await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
-          return { advanced: false, status: "blocked", reason: pushFailedMsg, blockerKind: "push-failed" };
-        }
-        const msg =
-          `${stage}: the fix harness produced no new commits, but HEAD (${headAfter}) ` +
-          `differs from the SHA the reviewer last reviewed (${decision.reviewSha}) — the fix ` +
-          `was already applied externally. Advancing to ${decision.to}.`;
-        await transition(cfg, issueNumber, stage, decision.to, msg);
-        return { advanced: true, from: stage, to: decision.to, summary: "fix already applied externally" };
+        // #349 review-2: HEAD moving past the reviewed SHA only proves *some*
+        // local commit exists after review — it does not prove that commit
+        // ever passed the pre-push gates (e.g. an earlier fix run committed
+        // locally, then blocked at the commit-message/openspec/format/test
+        // gate before pushing). Do NOT push directly here. Instead, rebase
+        // `headBefore` to the reviewed SHA and fall through to the normal
+        // gate sequence below, so the externally-applied commit(s) are
+        // validated exactly like a harness-authored commit before any push.
+        headBefore = decision.reviewSha;
+        externalAdvance = decision;
+      } else {
+        const noCommitsMsg = `${stage} reported success but produced no new commits.`;
+        await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
+        return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
       }
-      const noCommitsMsg = `${stage} reported success but produced no new commits.`;
-      await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
-      return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
+    } else {
+      headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
     }
-    headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   }
 
   // ---- Verify fix-round commit message format (#68) ----
@@ -433,6 +435,16 @@ export async function advanceFix(
     const pushFailedMsg = `Git push failed after fix: ${push.stderr.trim()}`;
     await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
     return { advanced: false, status: "blocked", reason: pushFailedMsg, blockerKind: "push-failed" };
+  }
+
+  if (externalAdvance) {
+    const msg =
+      `${stage}: the fix harness produced no new commits, but HEAD (${headAfter}) ` +
+      `differs from the SHA the reviewer last reviewed (${externalAdvance.reviewSha}) — the fix ` +
+      `was already applied externally and has now passed the same pre-push gates as a normal ` +
+      `fix commit. Advancing to ${externalAdvance.to}.`;
+    await transition(cfg, issueNumber, stage, externalAdvance.to, msg);
+    return { advanced: true, from: stage, to: externalAdvance.to, summary: "fix already applied externally" };
   }
 
   if (round === 1) {
