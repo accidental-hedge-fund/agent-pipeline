@@ -118,12 +118,12 @@ export type ExternalCommitAdvanceDecision =
  * nothing, decide whether to advance (a human already pushed the fix the
  * reviewer asked for) or fall through to the existing `no-commits` block.
  *
- * Filters `comments` to the trusted pipeline actor (when known) before
- * extracting the reviewed SHA, mirroring the trust pattern used by the
- * pre-merge SHA gate and the OpenSpec consistency guard — an untrusted
- * commenter must not be able to forge a stale reviewed-SHA marker to force
- * an advance. Fails closed (does not advance) when no trusted review SHA is
- * extractable, or when HEAD already equals it.
+ * Filters `comments` to the trusted pipeline actor before extracting the
+ * reviewed SHA, mirroring the trust pattern used by the pre-merge SHA gate
+ * and the OpenSpec consistency guard — an untrusted commenter must not be
+ * able to forge a stale reviewed-SHA marker to force an advance. Fails
+ * closed (does not advance) when the actor cannot be resolved (`null`), when
+ * no trusted review SHA is extractable, or when HEAD already equals it.
  */
 export function decideExternalCommitAdvance(
   comments: { author: string; body: string }[],
@@ -133,7 +133,7 @@ export function decideExternalCommitAdvance(
 ): ExternalCommitAdvanceDecision {
   const commentsToSearch = typeof actor === "string"
     ? comments.filter((c) => c.author === actor)
-    : comments;
+    : [];
   const reviewShaResult = extractReviewedSha(commentsToSearch, round);
   const reviewSha = reviewShaResult?.sha ?? null;
   if (reviewSha && headAfter && reviewSha !== headAfter) {

@@ -572,12 +572,13 @@ test("decideExternalCommitAdvance: review comment from an untrusted author is ig
   assert.equal(decision.advance, false, "an untrusted author's SHA marker must not drive an advance");
 });
 
-test("decideExternalCommitAdvance: actor unresolved (null) → no author filter, still extracts SHA", () => {
+test("decideExternalCommitAdvance: actor unresolved (null) → fails closed, does not advance", () => {
   const decision = decideExternalCommitAdvance(
     [reviewComment(1, SHA_REVIEWED)],
     null,
     1,
     SHA_HEAD,
   );
-  assert.equal(decision.advance, true);
+  assert.equal(decision.advance, false, "an unresolved actor must not disable the trusted-author filter");
+  assert.equal(decision.reviewSha, null);
 });
