@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig } from "./config.ts";
+import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -222,6 +222,8 @@ export interface CliOpts {
   risk?: string;
   /** backfill: scope the apply slice to a named capability. */
   capability?: string;
+  /** config repo-map add/remove: target relationship list (default: depends_on). */
+  rel?: string;
 }
 
 /**
@@ -294,7 +296,8 @@ export function buildCmd(): Command {
     .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     // backfill options (#327)
-    .option("--capability <name>", "backfill: scope the apply slice to a named capability");
+    .option("--capability <name>", "backfill: scope the apply slice to a named capability")
+    .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -361,15 +364,19 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "config" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      "Usage: pipeline config <schema|validate|sync> [--repo-path <path>] [--apply] [--json]\n\n" +
+      "Usage: pipeline config <schema|validate|sync|repo-map> [--repo-path <path>] [--apply] [--json]\n\n" +
       "Config maintenance commands:\n" +
-      "  schema                 print the JSON Schema for .github/pipeline.yml\n" +
-      "  validate               validate .github/pipeline.yml and print diagnostics\n" +
-      "  sync                   preview a current scaffold refresh; use --apply to write\n\n" +
+      "  schema                          print the JSON Schema for .github/pipeline.yml\n" +
+      "  validate                        validate .github/pipeline.yml and print diagnostics\n" +
+      "  sync                            preview a current scaffold refresh; use --apply to write\n" +
+      "  repo-map add <owner/repo>       add an entry to repo_map (creates the block if absent)\n" +
+      "  repo-map remove <owner/repo>    remove an entry from repo_map (no-op if absent)\n" +
+      "  repo-map list                   print current repo_map entries grouped by relationship\n\n" +
       "Options:\n" +
       "  --repo-path <path>      operate on the git root containing this path\n" +
       "  --apply                 config sync only: write the refreshed file after safe validation\n" +
-      "  --json                  validate/sync: emit machine-readable JSON\n\n" +
+      "  --json                  validate/sync: emit machine-readable JSON\n" +
+      "  --rel <relation>        repo-map add/remove: depends_on or depended_on_by (default: depends_on)\n\n" +
       "Exit code: 0 on success; non-zero for invalid config, unsafe sync, or invalid usage.\n",
     );
     process.exit(0);
@@ -1504,8 +1511,84 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
     return;
   }
 
+  if (subcmd === "repo-map") {
+    await runConfigRepoMapCommand(args.slice(1), opts);
+    return;
+  }
+
   const sub = subcmd ? `"${subcmd}"` : "(none)";
-  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate, sync`);
+  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate, sync, repo-map`);
+  process.exitCode = 2;
+}
+
+/**
+ * `pipeline config repo-map add <owner/repo> [--rel depends_on|depended_on_by]`
+ * `pipeline config repo-map remove <owner/repo> [--rel depends_on|depended_on_by]`
+ * `pipeline config repo-map list`
+ */
+async function runConfigRepoMapCommand(args: string[], opts: CliOpts): Promise<void> {
+  const action = args[0];
+  const repoPath = opts.repoPath ?? process.cwd();
+
+  if (action === "list") {
+    if (args.length > 1) {
+      console.error(`pipeline config repo-map list: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const result = repoMapList(repoPath, { profile: opts.profile });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else if (!result.ok) {
+      console.error(result.message);
+    } else if (result.entries.depends_on.length === 0 && result.entries.depended_on_by.length === 0) {
+      console.log(result.message);
+    } else {
+      console.log(`repo_map (${result.configPath}):`);
+      console.log(`  depends_on:`);
+      for (const r of result.entries.depends_on) console.log(`    - ${r}`);
+      console.log(`  depended_on_by:`);
+      for (const r of result.entries.depended_on_by) console.log(`    - ${r}`);
+    }
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
+
+  if (action === "add" || action === "remove") {
+    const ownerRepo = args[1];
+    if (!ownerRepo) {
+      console.error(`pipeline config repo-map ${action}: <owner/repo> argument is required`);
+      process.exitCode = 2;
+      return;
+    }
+    if (args.length > 2) {
+      console.error(`pipeline config repo-map ${action}: unexpected argument(s): ${args.slice(2).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const rel = opts.rel ?? "depends_on";
+    if (rel !== "depends_on" && rel !== "depended_on_by") {
+      console.error(`pipeline config repo-map ${action}: --rel must be "depends_on" or "depended_on_by", got "${rel}"`);
+      process.exitCode = 2;
+      return;
+    }
+    const result =
+      action === "add"
+        ? repoMapAdd(repoPath, ownerRepo, rel as RepoMapRelation, { profile: opts.profile })
+        : repoMapRemove(repoPath, ownerRepo, rel as RepoMapRelation, { profile: opts.profile });
+
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else {
+      console.log(result.message);
+      if (result.warning) console.warn(`warning: ${result.warning}`);
+    }
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
+
+  const sub = action ? `"${action}"` : "(none)";
+  console.error(`pipeline config repo-map: unknown subcommand ${sub}. Available: add, remove, list`);
   process.exitCode = 2;
 }
 

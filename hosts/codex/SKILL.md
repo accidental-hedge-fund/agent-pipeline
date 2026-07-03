@@ -116,6 +116,13 @@ effective configured behavior. Preview is the default and prints a diff without
 writing; `--apply` writes only after the existing file and rendered candidate
 both validate.
 
+`config repo-map <add|remove|list>` also takes no number. `add`/`remove` mutate
+only the `repo_map` block of `.github/pipeline.yml` (all other keys, comments,
+and formatting are preserved), creating the block when absent; `add` is
+idempotent and `remove` tolerates an absent entry (exit 0, warning). `--rel`
+selects `depends_on` (default) or `depended_on_by`. `list` prints current
+entries grouped by relationship kind.
+
 `doctor` takes no number either. It runs a **deterministic, model-free** preflight
 that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
 cleanliness on protected branches, configured harness availability, npm install
@@ -314,6 +321,7 @@ URL if one was opened, and the terminal state.
 - `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
 - `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
+- `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
 
 Run those synchronously without the PTY/log-polling orchestration.
