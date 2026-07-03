@@ -306,6 +306,76 @@ test("appendEvent: worktree_removed event appears in both events.jsonl and stdou
 });
 
 // ---------------------------------------------------------------------------
+// event sink (#343) — additive/exclusive mode gating and non-fatal delivery
+// ---------------------------------------------------------------------------
+
+test("appendEvent: additive mode (default) writes locally AND delivers to the sink", async () => {
+  const { deps, readFile } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].trim(), fileLine, "sink must receive the identical line written to events.jsonl");
+});
+
+test("appendEvent: exclusive mode delivers to the sink and does NOT write events.jsonl", async () => {
+  const { deps, files, appends } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  deps.eventSinkMode = "exclusive";
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+
+  assert.equal(delivered.length, 1);
+  assert.equal(files.has(EVENTS_JSONL), false, "events.jsonl must not be created in exclusive mode");
+  assert.equal(appends.has(EVENTS_JSONL), false, "events.jsonl must not be appended to in exclusive mode");
+});
+
+test("appendEvent: sink mode is ignored when no eventSink is configured (local write proceeds)", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSinkMode = "exclusive"; // no eventSink set — must have zero effect
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.match(fileLine, /"type":"stage_start"/);
+});
+
+test("appendEvent: a throwing sink is non-fatal; in additive mode the local write still succeeds", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSink = () => { throw new Error("sink unreachable"); };
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps); // must not throw
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.match(fileLine, /"type":"stage_start"/);
+});
+
+test("appendEvent: a rejecting async sink is non-fatal and does not abort subsequent events", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSink = async () => { throw new Error("network timeout"); };
+  const e1: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  const e2: RunEvent = { schema_version: 1, type: "stage_complete", at: STARTED_AT_ISO, stage: "planning", outcome: "advanced" };
+  await appendEvent(RUN_DIR, e1, deps);
+  await appendEvent(RUN_DIR, e2, deps);
+  const lines = readFile(EVENTS_JSONL).trim().split("\n");
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /"type":"stage_start"/);
+  assert.match(lines[1], /"type":"stage_complete"/);
+});
+
+test("appendEvent: with no eventSink configured, behavior is byte-for-byte unchanged (regression)", async () => {
+  const { deps, readFile, stdoutLines } = memRunStore();
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+  const fileLine = readFile(EVENTS_JSONL);
+  assert.equal(fileLine, `${JSON.stringify(event)}\n`);
+  assert.equal(stdoutLines.length, 1);
+  assert.equal(stdoutLines[0], fileLine);
+});
+
+// ---------------------------------------------------------------------------
 // 4.3 — readEvents
 // ---------------------------------------------------------------------------
 
@@ -549,6 +619,43 @@ test("finalizeRun: writes accounting records in event order with actual/estimate
   assert.equal(summary.accounting.totals.unknown_cost_count, 1);
   assert.equal(summary.accounting.records[2].cost_source, "unknown");
   assert.equal(summary.accounting.records[2].cost_usd, null);
+});
+
+// Regression (#343 review 1, finding 1): in exclusive sink mode events.jsonl is
+// never written, so finalizeRun must not lose stage_accounting/human_intervention
+// data — it must read from deps.summaryEvents (the sink-independent in-memory
+// collector) instead of re-reading the (absent) local file.
+test("finalizeRun: exclusive sink mode still embeds accounting + interventions via summaryEvents", async () => {
+  const { deps, readFile, files } = memRunStore();
+  deps.eventSink = () => {};
+  deps.eventSinkMode = "exclusive";
+  deps.summaryEvents = [];
+  const bundle = makeBundle();
+
+  await emitStageAccounting(RUN_DIR, accountingRecord({ stage: "review-1" }), deps);
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "human_intervention",
+      at: STARTED_AT_ISO,
+      kind: "human-risk-override",
+      stage: "review-1",
+      issue: ISSUE,
+      detail: "reviewer override applied",
+    },
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  assert.equal(files.has(path.join(RUN_DIR, "events.jsonl")), false, "exclusive mode must not create events.jsonl");
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.accounting.records.length, 1, "stage_accounting must still reach summary.json");
+  assert.equal(summary.accounting.records[0].stage, "review-1");
+  assert.equal(summary.interventions.length, 1, "human_intervention must still reach summary.json");
+  assert.equal(summary.interventions[0].kind, "human-risk-override");
 });
 
 // 4.7 — backward-compat regression test

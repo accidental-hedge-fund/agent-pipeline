@@ -25,6 +25,7 @@ labelled and recorded under the concrete stages that are doing it: `planning`,
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Troubleshooting](#troubleshooting)
   - [Evidence bundle](#evidence-bundle)
+  - [External event sink](#external-event-sink-optional)
   - [Machine-readable artifact conventions](#machine-readable-artifact-conventions)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
@@ -703,6 +704,9 @@ review_harness: my-reviewer          # optional: override the reviewer CLI for t
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
 # rejected at config-parse time.
 harness_sandbox: false               # opt-in: true → claude implementer uses --permission-mode default instead of bypassPermissions (see "Sandboxed harness execution")
+event_sink:                          # optional: deliver run events.jsonl records to an operator-controlled forwarder — see "External event sink"
+  command: "logger -t pipeline"      # forwarder command; receives each event's JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged)
+  mode: additive                     # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only
 ```
 
 ### Custom reviewer harness (`review_harness`)
@@ -1039,6 +1043,23 @@ $pipeline N --json-events
 ```
 
 Each event emitted to `events.jsonl` is also written to stdout. Human-readable output continues to go to `terminal.log` and the terminal unchanged.
+
+### External event sink (optional)
+
+By default every run event is written only to the local `events.jsonl` (above). For runners in ephemeral or shared environments — where the local filesystem disappears after the run — or teams with existing centralized log infrastructure (Datadog, CloudWatch, Loki, Splunk, …), the event stream destination is pluggable via an `event_sink` block in `.github/pipeline.yml`:
+
+```yaml
+event_sink:
+  command: "logger -t pipeline"   # operator-controlled forwarder; receives each event's JSON line on stdin
+  mode: additive                  # additive (default) | exclusive
+```
+
+- `command` is an arbitrary shell command the operator controls — a syslog forwarder, a small script that `curl`s an aggregator's HTTP endpoint, `vector`, etc. The pipeline does not embed a vendor-specific client; auth is whatever the command itself carries.
+- `mode: additive` (default) writes every event to the local `events.jsonl` **and** delivers the same JSON line to the sink — the safer rollout choice, since a misconfigured sink never loses events. `mode: exclusive` delivers to the sink only; `events.jsonl` is not written for that run, so `pipeline logs <run-id> --events` reports it as absent (the documented outcome of exclusive mode).
+- Both keys are also settable via environment variables — `PIPELINE_EVENT_SINK_COMMAND` and `PIPELINE_EVENT_SINK_MODE` — which win over the file config, so an ephemeral runner can activate a sink without a checked-in file.
+- Delivery is best-effort and non-fatal: an unreachable sink, a forwarder that exits non-zero, or a slow command never aborts the run or (in additive mode) affects the local write — a warning is logged and the run continues.
+- No schema change: the lines delivered to the sink are byte-identical to the ones written to `events.jsonl` — already screened by the injection denylist and secret redaction, `schema_version` unchanged.
+- When `event_sink` is unset (the default), behavior is exactly what it was before this feature existed.
 
 ### Machine-readable artifact conventions
 

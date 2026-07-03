@@ -1957,6 +1957,168 @@ test("resolveConfig: out-of-enum ci_mode value is rejected with error naming ci_
   }
 });
 
+// ---- event_sink (#343) ----
+
+test("resolveConfig: no event_sink configured → event_sink is undefined", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/es0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.event_sink, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: event_sink.command from pipeline.yml resolves with default mode 'additive'", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger -t pipeline"\n`);
+  const binDir = makeFakeGh("acme/es1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.event_sink, { command: "logger -t pipeline", mode: "additive" });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: event_sink.mode: exclusive from pipeline.yml is honored", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger -t pipeline"\n  mode: exclusive\n`);
+  const binDir = makeFakeGh("acme/es2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.event_sink, { command: "logger -t pipeline", mode: "exclusive" });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: PIPELINE_EVENT_SINK_COMMAND activates a sink with no file config", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/es3");
+  const oldPath = process.env.PATH;
+  const oldCommand = process.env.PIPELINE_EVENT_SINK_COMMAND;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_COMMAND = "vector-tap";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.event_sink, { command: "vector-tap", mode: "additive" });
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldCommand === undefined) delete process.env.PIPELINE_EVENT_SINK_COMMAND;
+    else process.env.PIPELINE_EVENT_SINK_COMMAND = oldCommand;
+  }
+});
+
+test("resolveConfig: PIPELINE_EVENT_SINK_COMMAND overrides the file's event_sink.command", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "from-file"\n`);
+  const binDir = makeFakeGh("acme/es4");
+  const oldPath = process.env.PATH;
+  const oldCommand = process.env.PIPELINE_EVENT_SINK_COMMAND;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_COMMAND = "from-env";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.event_sink?.command, "from-env");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldCommand === undefined) delete process.env.PIPELINE_EVENT_SINK_COMMAND;
+    else process.env.PIPELINE_EVENT_SINK_COMMAND = oldCommand;
+  }
+});
+
+test("resolveConfig: PIPELINE_EVENT_SINK_MODE overrides the file's event_sink.mode", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "from-file"\n  mode: additive\n`);
+  const binDir = makeFakeGh("acme/es5");
+  const oldPath = process.env.PATH;
+  const oldMode = process.env.PIPELINE_EVENT_SINK_MODE;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_MODE = "exclusive";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.event_sink?.mode, "exclusive");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldMode === undefined) delete process.env.PIPELINE_EVENT_SINK_MODE;
+    else process.env.PIPELINE_EVENT_SINK_MODE = oldMode;
+  }
+});
+
+test("resolveConfig: invalid PIPELINE_EVENT_SINK_MODE value throws", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "from-file"\n`);
+  const binDir = makeFakeGh("acme/es6");
+  const oldPath = process.env.PATH;
+  const oldMode = process.env.PIPELINE_EVENT_SINK_MODE;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_MODE = "bogus";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /PIPELINE_EVENT_SINK_MODE/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldMode === undefined) delete process.env.PIPELINE_EVENT_SINK_MODE;
+    else process.env.PIPELINE_EVENT_SINK_MODE = oldMode;
+  }
+});
+
+test("resolveConfig: event_sink.mode outside additive/exclusive is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger"\n  mode: sometimes\n`);
+  const binDir = makeFakeGh("acme/es7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("event_sink"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: event_sink unknown sub-key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger"\n  url: "https://example.com"\n`);
+  const binDir = makeFakeGh("acme/es8");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("event_sink"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("syncConfig: event_sink is preserved through sync --apply", () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger -t pipeline"\n  mode: exclusive\n`);
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, true);
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  assert.match(synced, /^event_sink:/m, "event_sink block must be present after sync");
+  assert.match(synced, /command: .*logger -t pipeline/);
+  assert.match(synced, /mode: exclusive/);
+});
+
 // ---------------------------------------------------------------------------
 // repo_map add/remove/list (#367)
 // ---------------------------------------------------------------------------

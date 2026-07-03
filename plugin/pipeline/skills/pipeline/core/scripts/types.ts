@@ -385,6 +385,16 @@ export interface PipelineConfig {
     depends_on: string[];      // owner/repo strings this repo consumes
     depended_on_by: string[];  // owner/repo strings that consume this repo
   };
+  // External event sink (#343). Opt-in; absent means run events are written
+  // only to the local .agent-pipeline/runs/<id>/events.jsonl, unchanged from
+  // today. When set, `command` is an operator-controlled forwarder that
+  // receives each event's JSON line on stdin. `mode` selects whether the local
+  // events.jsonl write still happens alongside delivery ("additive", the
+  // default) or is skipped entirely ("exclusive").
+  event_sink?: {
+    command: string;
+    mode: "additive" | "exclusive";
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
