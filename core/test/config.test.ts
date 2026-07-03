@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import { findGitRoot, syncConfig } from "../scripts/config.ts";
+import { findGitRoot, syncConfig, repoMapAdd, repoMapRemove, repoMapList, validateOwnerRepo } from "../scripts/config.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -1383,7 +1383,158 @@ test("CLI: `pipeline config sync --apply` writes refreshed config", () => {
   assert.match(synced, /^base_branch: staging/m);
 });
 
-test("CLI: `pipeline config --help` advertises sync preview/apply", () => {
+test("CLI: `pipeline config repo-map add` writes the entry and exits 0", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const binDir = makeFakeGh("acme/lib");
+  const oldPath = process.env.PATH;
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/lib", "--repo-path", repo],
+    { encoding: "utf8", env: { ...process.env, PATH: `${binDir}:${oldPath}` } },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /repo_map:/);
+  assert.match(written, /- acme\/lib/);
+});
+
+test("CLI: `pipeline config repo-map add --rel depended_on_by` targets depended_on_by", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const binDir = makeFakeGh("acme/app");
+  const oldPath = process.env.PATH;
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/app", "--rel", "depended_on_by", "--repo-path", repo],
+    { encoding: "utf8", env: { ...process.env, PATH: `${binDir}:${oldPath}` } },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /depended_on_by:\s*\n\s+- acme\/app/);
+});
+
+test("CLI: `pipeline config repo-map remove` removes the entry and exits 0", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "remove", "acme/lib", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.doesNotMatch(fs.readFileSync(configPath, "utf8"), /acme\/lib/);
+});
+
+test("CLI: `pipeline config repo-map remove` on an absent entry exits 0 with a warning", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "remove", "acme/absent", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stderr, /warning/i);
+});
+
+test("CLI: `pipeline config repo-map list` prints entries grouped by relationship", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n  depended_on_by:\n    - acme/app\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "list", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /depends_on/);
+  assert.match(result.stdout, /acme\/lib/);
+  assert.match(result.stdout, /depended_on_by/);
+  assert.match(result.stdout, /acme\/app/);
+});
+
+test("CLI: `pipeline config repo-map add` with a malformed owner/repo exits 1 and does not write", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "not-a-repo", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 1, `stdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("CLI: `pipeline config repo-map add` with an invalid --rel exits non-zero and does not write", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/lib", "--rel", "siblings", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.notEqual(result.status, 0, `stdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("CLI: `pipeline config repo-map add` on a repo with no pipeline.yml exits 1 and creates no file", () => {
+  const repo = makeFakeRepo(null);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/lib", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 1, `stdout:\n${result.stdout}`);
+  assert.match(result.stdout, /pipeline init/);
+  assert.equal(fs.existsSync(configPath), false);
+});
+
+test("CLI: `pipeline config repo-map` with an unknown subcommand lists available subcommands", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "bogus", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 2, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.match(result.stderr, /add/);
+  assert.match(result.stderr, /remove/);
+  assert.match(result.stderr, /list/);
+});
+
+test("CLI: `pipeline config bogus` unknown-subcommand message lists repo-map", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "bogus", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 2, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.match(result.stderr, /repo-map/);
+});
+
+test("CLI: `pipeline config --help` advertises sync preview/apply and repo-map", () => {
   const result = spawnSync(
     process.execPath,
     ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "--help"],
@@ -1394,6 +1545,7 @@ test("CLI: `pipeline config --help` advertises sync preview/apply", () => {
   assert.match(result.stdout, /schema/);
   assert.match(result.stdout, /validate/);
   assert.match(result.stdout, /sync/);
+  assert.match(result.stdout, /repo-map/);
   assert.match(result.stdout, /--apply/);
 });
 
@@ -1965,4 +2117,256 @@ test("syncConfig: event_sink is preserved through sync --apply", () => {
   assert.match(synced, /^event_sink:/m, "event_sink block must be present after sync");
   assert.match(synced, /command: .*logger -t pipeline/);
   assert.match(synced, /mode: exclusive/);
+});
+
+// ---------------------------------------------------------------------------
+// repo_map add/remove/list (#367)
+// ---------------------------------------------------------------------------
+
+const alwaysReachable = () => true;
+
+test("validateOwnerRepo: accepts a well-formed owner/repo string", () => {
+  assert.equal(validateOwnerRepo("acme/widget"), null);
+});
+
+test("validateOwnerRepo: rejects a string with no '/'", () => {
+  assert.match(validateOwnerRepo("acmewidget") ?? "", /owner\/repo/);
+});
+
+test("validateOwnerRepo: rejects an empty repo segment", () => {
+  assert.match(validateOwnerRepo("acme/") ?? "", /owner\/repo/);
+});
+
+test("validateOwnerRepo: rejects an empty owner segment", () => {
+  assert.match(validateOwnerRepo("/widget") ?? "", /owner\/repo/);
+});
+
+test("validateOwnerRepo: rejects whitespace in either segment", () => {
+  assert.match(validateOwnerRepo("acme /widget") ?? "", /owner\/repo/);
+});
+
+test("repoMapAdd: defaults to depends_on and creates the repo_map block when absent", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.equal(result.noop, false);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /^repo_map:/m);
+  assert.match(written, /^ {2}depends_on:\s*\n\s+- acme\/lib/m);
+});
+
+test("repoMapAdd: --rel depended_on_by targets the other list and leaves depends_on untouched", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/app", "depended_on_by", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, true);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /depends_on:\s*\n\s+- acme\/lib/);
+  assert.match(written, /depended_on_by:\s*\n\s+- acme\/app/);
+});
+
+test("repoMapAdd: re-adding an existing entry is an idempotent no-op success", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.equal(result.noop, true);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before, "no duplicate entry should be written");
+});
+
+test("repoMapAdd: rejects a malformed owner/repo with no write", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapAdd(repo, "not-a-repo", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorKind, "invalid-owner-repo");
+  assert.equal(fs.readFileSync(configPath, "utf8"), before, "invalid input must not write");
+});
+
+test("repoMapAdd: fails with exit-worthy error when .github/pipeline.yml is absent, no file created", () => {
+  const repo = makeFakeRepo(null);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorKind, "missing-config");
+  assert.match(result.message, /pipeline init/);
+  assert.equal(fs.existsSync(configPath), false, "no config file should be created");
+});
+
+test("repoMapAdd: reachability failure warns but the entry is still written", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/private", "depends_on", { checkReachable: () => false });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.match(result.warning ?? "", /acme\/private/);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /- acme\/private/);
+});
+
+// Regression proof: without the injected checkReachable seam, repoMapAdd would
+// have to shell out to the real `gh` CLI, which is unauthenticated/unavailable
+// in CI — this test proves the reachability failure path is exercised purely
+// through the injected dep, with no real network/subprocess call.
+test("repoMapAdd: reachability check never blocks the write even when it always fails", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  let calls = 0;
+  const result = repoMapAdd(repo, "acme/unreachable", "depends_on", {
+    checkReachable: () => {
+      calls++;
+      return false;
+    },
+  });
+  assert.equal(calls, 1, "reachability check must be invoked exactly once via the injected dep");
+  assert.equal(result.ok, true);
+  assert.ok(result.warning);
+});
+
+test("repoMapRemove: removes an existing entry", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n    - acme/other\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapRemove(repo, "acme/lib", "depends_on");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.doesNotMatch(written, /acme\/lib\b/);
+  assert.match(written, /acme\/other/);
+});
+
+test("repoMapRemove: removing an absent entry is a tolerant no-op with a warning", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapRemove(repo, "acme/absent", "depends_on");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.equal(result.noop, true);
+  assert.ok(result.warning);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("repoMapRemove: removing from an entirely absent repo_map block is a tolerant no-op", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapRemove(repo, "acme/absent", "depends_on");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.noop, true);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("repoMapRemove: rejects a malformed owner/repo with no write", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapRemove(repo, "bad", "depends_on");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorKind, "invalid-owner-repo");
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("repoMapList: prints entries grouped by relationship kind", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n  depended_on_by:\n    - acme/app\n");
+
+  const result = repoMapList(repo);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.entries, { depends_on: ["acme/lib"], depended_on_by: ["acme/app"] });
+});
+
+test("repoMapList: reports no entries when repo_map is absent", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+
+  const result = repoMapList(repo);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.entries, { depends_on: [], depended_on_by: [] });
+  assert.match(result.message, /no repo_map entries/i);
+});
+
+test("repoMapList: missing config file reports an error", () => {
+  const repo = makeFakeRepo(null);
+
+  const result = repoMapList(repo);
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /pipeline init/);
+});
+
+test("repoMap add/remove round-trip preserves unrelated keys, comments, and formatting byte-for-byte", () => {
+  // Deliberately nonstandard formatting (uneven spacing before an inline comment,
+  // 4-space indentation, a flow-style mapping) to prove the edit is scoped to the
+  // repo_map block rather than re-serializing the whole document (#367 review 1).
+  const original = `# top comment
+base_branch:   staging    # trailing comment with odd spacing
+steps:
+    docs: true
+flow_key: { a: 1, b: 2 }
+review_policy:
+  block_threshold: high
+repo_map:
+  depends_on:
+    - acme/existing
+`;
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const beforeRepoMap = original.slice(0, original.indexOf("repo_map:"));
+
+  repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+  const afterAdd = fs.readFileSync(configPath, "utf8");
+  assert.equal(
+    afterAdd.slice(0, afterAdd.indexOf("repo_map:")),
+    beforeRepoMap,
+    "bytes preceding repo_map must be unchanged after add",
+  );
+
+  repoMapRemove(repo, "acme/lib", "depends_on");
+  const afterRemove = fs.readFileSync(configPath, "utf8");
+  assert.equal(
+    afterRemove.slice(0, afterRemove.indexOf("repo_map:")),
+    beforeRepoMap,
+    "bytes preceding repo_map must be unchanged after remove",
+  );
+  assert.match(afterRemove, /depends_on:\s*\n\s*- acme\/existing\s*\n/);
+});
+
+test("repoMapAdd: creating repo_map from absent produces a config that still validates", async () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const binDir = makeFakeGh("acme/rm1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const result = cfgMod.repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+    assert.equal(result.ok, true);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map.depends_on, ["acme/lib"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });

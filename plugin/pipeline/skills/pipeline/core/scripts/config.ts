@@ -2,7 +2,7 @@
 
 import { z } from "zod";
 import yaml from "js-yaml";
-import { parseDocument } from "yaml";
+import { parseDocument, isMap, isSeq, type YAMLSeq } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -1479,4 +1479,337 @@ export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created:
 
 export function buildConfigTemplate(): string {
   return renderConfigTemplate({}, "init");
+}
+
+// ---------------------------------------------------------------------------
+// repo_map add/remove/list (#367): surgical Document edits that touch only the
+// repo_map block, preserving all other keys, comments, and formatting verbatim.
+// ---------------------------------------------------------------------------
+
+export type RepoMapRelation = "depends_on" | "depended_on_by";
+
+export interface RepoMapMutationDeps {
+  /** Read file contents; return null if the file does not exist. Defaults to fs.readFileSync. */
+  readFile?: (filePath: string) => string | null;
+  /** Write file contents. Defaults to fs.writeFileSync. */
+  writeFile?: (filePath: string, content: string) => void;
+  /** Find the git root above startDir; return null if none found. Defaults to the internal findGitRoot. */
+  findGitRoot?: (startDir: string) => string | null;
+  /** Best-effort GitHub reachability check for `repoMapAdd`. Returns true when reachable.
+   *  Defaults to `gh repo view <owner/repo>`. A false result never aborts the write — it
+   *  only attaches a warning to an otherwise-successful result. */
+  checkReachable?: (ownerRepo: string) => boolean;
+  /** Harnesses used for inert-model detection during post-write validation (see ValidateConfigDeps). */
+  harnesses?: { implementer: string; reviewer: string };
+  /** Profile name to load harnesses from when `harnesses` is not injected. */
+  profile?: string;
+}
+
+export interface RepoMapResult {
+  ok: boolean;
+  changed: boolean;
+  noop: boolean;
+  configPath: string;
+  message: string;
+  warning?: string;
+  errorKind?: "invalid-owner-repo" | "missing-config" | "not-git-repo" | "invalid-config";
+}
+
+export interface RepoMapListResult {
+  ok: boolean;
+  configPath: string;
+  entries: Record<RepoMapRelation, string[]>;
+  message: string;
+  errorKind?: "missing-config" | "not-git-repo";
+}
+
+const OWNER_REPO_RE = /^[^/\s]+\/[^/\s]+$/;
+
+/**
+ * Validate an `owner/repo` string against the same format the config schema enforces
+ * (exactly one '/', non-empty segments, no whitespace). Returns an error message when
+ * invalid, or null when valid.
+ */
+export function validateOwnerRepo(value: string): string | null {
+  if (!OWNER_REPO_RE.test(value)) {
+    return `Invalid owner/repo "${value}": expected exactly one "/" with non-empty owner and repo segments and no whitespace.`;
+  }
+  return null;
+}
+
+function defaultCheckReachable(ownerRepo: string): boolean {
+  try {
+    execFileSync("gh", ["repo", "view", ownerRepo, "--json", "name"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface LoadedRepoMapDoc {
+  ok: true;
+  gitRoot: string;
+  configPath: string;
+  text: string;
+}
+
+function loadRepoMapConfig(
+  repoPath: string,
+  deps: RepoMapMutationDeps,
+): LoadedRepoMapDoc | { ok: false; result: RepoMapResult } {
+  const findGitRootFn = deps.findGitRoot ?? findGitRoot;
+  const readFileFn = deps.readFile ?? defaultReadFile;
+  const resolvedStart = path.resolve(repoPath);
+  const gitRoot = findGitRootFn(resolvedStart);
+  if (!gitRoot) {
+    return {
+      ok: false,
+      result: {
+        ok: false,
+        changed: false,
+        noop: false,
+        configPath: configPathFor(resolvedStart),
+        message: `No git repository found at or above ${resolvedStart}.`,
+        errorKind: "not-git-repo",
+      },
+    };
+  }
+  const configPath = configPathFor(gitRoot);
+  const text = readFileFn(configPath);
+  if (text === null) {
+    return {
+      ok: false,
+      result: {
+        ok: false,
+        changed: false,
+        noop: false,
+        configPath,
+        message: `Config file not found: ${configPath}. Run \`pipeline init\` to create one.`,
+        errorKind: "missing-config",
+      },
+    };
+  }
+  return { ok: true, gitRoot, configPath, text };
+}
+
+/** Get (creating if absent) the `repo_map.<rel>` sequence node in `doc`. */
+function repoMapSeq(doc: ReturnType<typeof parseDocument>, rel: RepoMapRelation): YAMLSeq {
+  if (!doc.hasIn(["repo_map"])) doc.set("repo_map", doc.createNode({}));
+  if (!doc.hasIn(["repo_map", rel])) doc.setIn(["repo_map", rel], doc.createNode([]));
+  const node = doc.getIn(["repo_map", rel], true);
+  if (!isSeq(node)) {
+    throw new Error(`repo_map.${rel} in the config file is not a list.`);
+  }
+  return node;
+}
+
+/** Find the index of `value` in a YAML sequence's plain scalar items. */
+function findSeqIndex(seq: YAMLSeq, value: string): number {
+  return seq.items.findIndex((item) => {
+    const v = item && typeof item === "object" && "value" in item ? (item as { value: unknown }).value : item;
+    return v === value;
+  });
+}
+
+/**
+ * Locate the source character range of the top-level `repo_map:` pair
+ * (key through the end of its value), so an edit can splice just that
+ * range rather than re-serializing the whole document (#367 review 1).
+ */
+function findRepoMapRange(doc: ReturnType<typeof parseDocument>): [number, number] | null {
+  if (!isMap(doc.contents)) return null;
+  type RangedNode = { range?: [number, number, number] };
+  const pair = doc.contents.items.find((p) => String((p.key as { value?: unknown } | null)?.value) === "repo_map");
+  const keyRange = (pair?.key as RangedNode | null)?.range;
+  if (!keyRange) return null;
+  const valueRange = (pair?.value as RangedNode | null)?.range;
+  return [keyRange[0], valueRange ? valueRange[2] : keyRange[2]];
+}
+
+/**
+ * Apply `mutate` to a fresh parse of `text` and splice only the resulting
+ * `repo_map:` block back into the original source, so every byte outside
+ * `repo_map` — unrelated keys, comments, and formatting — survives verbatim.
+ * Falls back to appending the rendered block when `repo_map` was absent.
+ */
+function spliceRepoMapBlock(text: string, mutate: (doc: ReturnType<typeof parseDocument>) => void): string {
+  const doc = parseDocument(text);
+  const existingRange = findRepoMapRange(doc);
+  mutate(doc);
+  const candidate = doc.toString();
+  const candidateRange = findRepoMapRange(parseDocument(candidate));
+  if (!candidateRange) return candidate;
+  const newBlock = candidate.slice(candidateRange[0], candidateRange[1]);
+  if (existingRange) {
+    return text.slice(0, existingRange[0]) + newBlock + text.slice(existingRange[1]);
+  }
+  const needsNewline = text.length > 0 && !text.endsWith("\n");
+  return text + (needsNewline ? "\n" : "") + newBlock;
+}
+
+/**
+ * Add `ownerRepo` to `repo_map.<rel>` in `.github/pipeline.yml`, creating the
+ * `repo_map` block (and target list) when absent. Idempotent: adding an entry
+ * already present is a no-op success. Best-effort checks GitHub reachability
+ * after a successful write; a reachability failure warns but never aborts.
+ */
+export function repoMapAdd(
+  repoPath: string,
+  ownerRepo: string,
+  rel: RepoMapRelation,
+  deps: RepoMapMutationDeps = {},
+): RepoMapResult {
+  const formatError = validateOwnerRepo(ownerRepo);
+  if (formatError) {
+    return { ok: false, changed: false, noop: false, configPath: "", message: formatError, errorKind: "invalid-owner-repo" };
+  }
+
+  const loaded = loadRepoMapConfig(repoPath, deps);
+  if (!loaded.ok) return loaded.result;
+  const { gitRoot, configPath, text } = loaded;
+
+  const checkDoc = parseDocument(text);
+  const existing = repoMapSeq(checkDoc, rel).toJSON() as string[];
+  if (existing.includes(ownerRepo)) {
+    return {
+      ok: true,
+      changed: false,
+      noop: true,
+      configPath,
+      message: `${ownerRepo} is already present in repo_map.${rel} — no change made.`,
+    };
+  }
+
+  const candidate = spliceRepoMapBlock(text, (doc) => {
+    repoMapSeq(doc, rel);
+    doc.addIn(["repo_map", rel], ownerRepo);
+  });
+
+  const readFileFn = deps.readFile ?? defaultReadFile;
+  const candidateValidation = validateConfig(gitRoot, {
+    ...deps,
+    readFile: (p) => (path.resolve(p) === path.resolve(configPath) ? candidate : readFileFn(p)),
+  });
+  const errors = candidateValidation.diagnostics.filter((d) => d.severity === "error");
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      changed: false,
+      noop: false,
+      configPath,
+      message: `Adding ${ownerRepo} to repo_map.${rel} would produce an invalid config: ${errors.map((e) => e.message).join("; ")}`,
+      errorKind: "invalid-config",
+    };
+  }
+
+  const writeFileFn = deps.writeFile ?? defaultWriteFile;
+  writeFileFn(configPath, candidate);
+
+  const checkReachableFn = deps.checkReachable ?? defaultCheckReachable;
+  const warning = checkReachableFn(ownerRepo)
+    ? undefined
+    : `${ownerRepo} could not be reached on GitHub (no access, not found, or a transient error) — added anyway.`;
+
+  return {
+    ok: true,
+    changed: true,
+    noop: false,
+    configPath,
+    message: `Added ${ownerRepo} to repo_map.${rel}.`,
+    warning,
+  };
+}
+
+/**
+ * Remove `ownerRepo` from `repo_map.<rel>` in `.github/pipeline.yml`. Tolerant:
+ * when the entry (or the whole repo_map/list) is absent, this is a no-op success
+ * that carries a warning rather than an error.
+ */
+export function repoMapRemove(
+  repoPath: string,
+  ownerRepo: string,
+  rel: RepoMapRelation,
+  deps: RepoMapMutationDeps = {},
+): RepoMapResult {
+  const formatError = validateOwnerRepo(ownerRepo);
+  if (formatError) {
+    return { ok: false, changed: false, noop: false, configPath: "", message: formatError, errorKind: "invalid-owner-repo" };
+  }
+
+  const loaded = loadRepoMapConfig(repoPath, deps);
+  if (!loaded.ok) return loaded.result;
+  const { configPath, text } = loaded;
+
+  const notPresent: RepoMapResult = {
+    ok: true,
+    changed: false,
+    noop: true,
+    configPath,
+    message: `${ownerRepo} is not present in repo_map.${rel} — nothing to remove.`,
+    warning: `${ownerRepo} was not present in repo_map.${rel}.`,
+  };
+
+  const checkDoc = parseDocument(text);
+  if (!checkDoc.hasIn(["repo_map", rel])) return notPresent;
+  const checkNode = checkDoc.getIn(["repo_map", rel], true);
+  if (!isSeq(checkNode)) {
+    throw new Error(`repo_map.${rel} in the config file is not a list.`);
+  }
+  if (findSeqIndex(checkNode, ownerRepo) === -1) return notPresent;
+
+  const candidate = spliceRepoMapBlock(text, (doc) => {
+    const node = doc.getIn(["repo_map", rel], true) as YAMLSeq;
+    node.items.splice(findSeqIndex(node, ownerRepo), 1);
+  });
+
+  const writeFileFn = deps.writeFile ?? defaultWriteFile;
+  writeFileFn(configPath, candidate);
+
+  return {
+    ok: true,
+    changed: true,
+    noop: false,
+    configPath,
+    message: `Removed ${ownerRepo} from repo_map.${rel}.`,
+  };
+}
+
+/** List current repo_map entries grouped by relationship kind. */
+export function repoMapList(repoPath: string, deps: RepoMapMutationDeps = {}): RepoMapListResult {
+  const loaded = loadRepoMapConfig(repoPath, deps);
+  if (!loaded.ok) {
+    return {
+      ok: false,
+      configPath: loaded.result.configPath,
+      entries: { depends_on: [], depended_on_by: [] },
+      message: loaded.result.message,
+      errorKind: loaded.result.errorKind === "invalid-owner-repo" || loaded.result.errorKind === "invalid-config"
+        ? undefined
+        : loaded.result.errorKind,
+    };
+  }
+  const { configPath, text } = loaded;
+  const doc = parseDocument(text);
+
+  const readList = (rel: RepoMapRelation): string[] => {
+    if (!doc.hasIn(["repo_map", rel])) return [];
+    const node = doc.getIn(["repo_map", rel], true);
+    return isSeq(node) ? (node.toJSON() as string[]) : [];
+  };
+
+  const entries: Record<RepoMapRelation, string[]> = {
+    depends_on: readList("depends_on"),
+    depended_on_by: readList("depended_on_by"),
+  };
+  const total = entries.depends_on.length + entries.depended_on_by.length;
+
+  return {
+    ok: true,
+    configPath,
+    entries,
+    message: total === 0 ? "No repo_map entries." : `${total} repo_map entr${total === 1 ? "y" : "ies"}.`,
+  };
 }

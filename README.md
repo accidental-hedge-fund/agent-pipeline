@@ -214,6 +214,7 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:init         $pipeline:init         onboard: ensure labels + scaffold .github/pipeline.yml
 /pipeline:cleanup      $pipeline:cleanup      sweep merged-PR worktrees
 /pipeline config sync [--apply]             preview/apply a safe .github/pipeline.yml scaffold refresh
+/pipeline config repo-map <add|remove|list> add/remove/list repo_map entries in .github/pipeline.yml
 /pipeline:doctor       $pipeline:doctor       deterministic preflight check; print pass/fail summary, exit
 /pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
 /pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
@@ -1444,6 +1445,25 @@ pipeline config sync --repo-path /path/to/repo --apply
 ```
 
 The command validates the current file, renders a refreshed candidate, validates the candidate, and refuses to write if the file is missing, invalid, or the candidate would change effective config. With `--json`, it emits `{ ok, changed, applied, configPath, candidate, diff, diagnostics }`.
+
+### `pipeline config repo-map <add|remove|list>`
+
+Add, remove, or list `repo_map` entries (`depends_on` / `depended_on_by`) in `.github/pipeline.yml` without hand-editing YAML. Each command edits only the `repo_map` block — all other keys, comments, and formatting are preserved.
+
+```bash
+pipeline config repo-map add acme/lib                                  # adds to repo_map.depends_on (default)
+pipeline config repo-map add acme/app --rel depended_on_by
+pipeline config repo-map remove acme/lib
+pipeline config repo-map list
+```
+
+- `--rel` accepts `depends_on` or `depended_on_by` and defaults to `depends_on`.
+- `add` creates the `repo_map` block (and the target list) when absent, and is idempotent — re-adding an existing entry is a no-op success.
+- `remove` is a tolerant no-op (exit 0, warning) when the entry isn't present.
+- `add`/`remove` validate the `owner/repo` argument before writing (exit 1 on a malformed value) and require an existing `.github/pipeline.yml` (exit 1 with a `pipeline init` hint when missing).
+- `add` best-effort checks GitHub reachability for the added repo; a failed check warns but never blocks the write.
+- `list` prints current entries grouped by relationship kind.
+- All three accept `--repo-path <path>` and `--json`.
 
 ## Uninstall
 
