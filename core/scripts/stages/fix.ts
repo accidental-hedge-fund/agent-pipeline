@@ -302,6 +302,18 @@ export async function advanceFix(
       // SHA is extractable, or when HEAD equals it (genuinely nothing done).
       const decision = decideExternalCommitAdvance(detail.comments, fixActor, round, headAfter);
       if (decision.advance) {
+        // #349 review-2: local HEAD moving past the reviewed SHA only proves the
+        // managed worktree advanced — it does not prove the PR branch has that
+        // commit (e.g. a prior fix run committed but failed at the later push).
+        // Push through the same failure handling as the normal fix path before
+        // advancing, so the next review stage never reads a stale remote head.
+        const externalBranch = branchName(issueNumber, wt.slug);
+        const externalPush = await gitInWorktree(wt.path, ["push", "origin", externalBranch], { ignoreFailure: true });
+        if (externalPush.code !== 0) {
+          const pushFailedMsg = `Git push failed after fix: ${externalPush.stderr.trim()}`;
+          await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
+          return { advanced: false, status: "blocked", reason: pushFailedMsg, blockerKind: "push-failed" };
+        }
         const msg =
           `${stage}: the fix harness produced no new commits, but HEAD (${headAfter}) ` +
           `differs from the SHA the reviewer last reviewed (${decision.reviewSha}) — the fix ` +
