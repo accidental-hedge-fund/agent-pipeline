@@ -36,6 +36,14 @@ Single source of truth for the open backlog, now organized by **sem-ver release*
 | #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
 | #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
 
+**v1.13.0 — Fix-stage recovery + logging portability + repo-map CLI (shipped 2026-07-04, tag `v1.13.0`):**
+
+| # | What | PR |
+|---|------|-----|
+| #349 | [Pipeline] Fix stage: advance instead of blocking when fix was already applied externally (HEAD > review SHA) | #368 |
+| #343 | [Pipeline] Logging portability | #369 |
+| #367 | [Pipeline] pipeline config repo-map: CLI primitive to add/remove repo-map entries | #370 |
+
 **v1.12.4 — Pre-merge fix round: auto-apply bounded fix for correctness findings (shipped 2026-07-02, tag `v1.12.4`):**
 
 | # | What | PR |
@@ -318,6 +326,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.12.2** ✅ shipped | patch | OpenSpec spec-divergence + injectable-dep rule in prompts | #356, #360 | Shipped 2026-07-01 (tag `v1.12.2`). See **Shipped** above. |
 | **v1.12.3** ✅ shipped | patch | Fix harness commit step lock-file side-effects | #358 | Shipped 2026-07-01 (tag `v1.12.3`). See **Shipped** above for the per-PR detail. |
 | **v1.12.4** ✅ shipped | patch | Pre-merge fix round: auto-apply bounded fix for correctness findings | #359 | Shipped 2026-07-02 (tag `v1.12.4`). See **Shipped** above for the per-PR detail. |
+| **v1.13.0** | minor | Fix-stage recovery + logging portability + repo-map CLI | #349, #343, #367 | _pending_ |
 | **deferred** | minor | Graduated autonomy (forge-resistance) | #23 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open). #149 (bounded auto-loop) already shipped in v1.7.0. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
