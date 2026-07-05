@@ -20,6 +20,7 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import { formatStderrExcerpt } from "../harness.ts";
+import { expandAutoEffort } from "../stage-routing.ts";
 import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
@@ -440,7 +441,7 @@ export async function advanceReview(
     const composite = `${rec.key}\0${rec.payload_fingerprint}`;
     if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
   }
-  const reviewerModel = opts.model ?? cfg.models.review;
+  const reviewerModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
 
   if (verdict.verdict === "approve") {
     if (opts.stateDir) {
@@ -907,7 +908,10 @@ const defaultRunReview: RunReviewFn = (
 ) =>
   invokePromptHarnessReview(cfg, issueNumber, detail.title, detail.body, plan, review1Summary, priorReview2Findings, diff, round, cwd, opts);
 
-async function invokePromptHarnessReview(
+/** Exported for direct unit testing (#366) of the reviewer model/effort
+ *  resolution — the round-aware "auto" expansion for cfg.harnesses.reviewerModel/
+ *  reviewerEffort and cfg.models.review/effort.review. */
+export async function invokePromptHarnessReview(
   cfg: PipelineConfig,
   issueNumber: number,
   title: string,
@@ -933,10 +937,19 @@ async function invokePromptHarnessReview(
       makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", cfg.harnesses.reviewer, prompt),
     ).catch(() => {});
   }
-  const model = opts.model ?? cfg.models.review;
+  const model = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+  // effort.review (and a structured review_harness.effort override) are left
+  // as-authored through config resolution because they back both review
+  // rounds with different classifications — expand "auto" here, round-aware.
+  const reasoningEffort = expandAutoEffort(
+    cfg.harnesses.reviewerEffort ?? cfg.effort?.review,
+    round === 1 ? "review-1" : "review-2",
+    "claude",
+  );
   return invokeReviewer(cfg.harnesses.reviewer, cfg.harnesses.implementer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
     model,
+    reasoningEffort,
     accounting: opts.runDir
       ? {
           runDir: opts.runDir,

@@ -199,8 +199,28 @@ export interface PipelineConfig {
   // profile (repo config cannot set it). The reviewer defaults to the profile's
   // value but MAY be overridden per-repo by the `review_harness` config key
   // (#40) to an arbitrary reviewer CLI — hence `string`, not `Harness`.
-  harnesses: { implementer: Harness; reviewer: string };
+  // `reviewerModel`/`reviewerEffort` (#366) come only from the structured
+  // `review_harness: { command, model?, effort? }` form; the string shorthand
+  // leaves both unset so review routing falls back to `models.review`/`effort.review`.
+  // `reviewerModel` is fully resolved here (Adversarial-stage `auto` is model-
+  // invariant across rounds); `reviewerEffort` is left as-authored (possibly
+  // `"auto"`) because its resolution is round-aware and happens at each
+  // reviewer call site (plan-review vs. review-1 vs. review-2).
+  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerEffort?: string };
   models: { planning: string; implementing: string; review: string; fix: string; intake: string; sweep: string };
+  // Per-stage reasoning-effort overrides (#366), parallel to `models`. Each key
+  // is independently optional; an absent key means no `--effort`/`-c
+  // model_reasoning_effort` flag is emitted for that stage (the harness
+  // operator's global effort setting applies). `review` is left as-authored
+  // (possibly `"auto"`) for the same round-aware reason as `reviewerEffort`
+  // above; the rest are fully resolved by `resolveConfig()`.
+  effort: { planning?: string; implementing?: string; review?: string; fix?: string; intake?: string; sweep?: string };
+  // Plan-review's own resolved effort (#366), derived from the `effort.planning`
+  // config key but classified as Adversarial/Definitive (not Analytical/Iterative
+  // like the `planning` stage itself) — see stage-routing.ts. Always concrete;
+  // defaults to "medium" when `effort.planning` is unset, preserving the prior
+  // hardcoded plan-review cap.
+  plan_review_effort: string;
   // OpenSpec (spec-driven development) integration. "auto" activates only when
   // the target repo has an `openspec/` directory; "on"/"off" force it. When
   // `bootstrap` is true, planning runs `openspec init` on repos that lack it.
@@ -426,7 +446,15 @@ export const DEFAULT_CONFIG: Omit<
   ci_poll_interval: 30,
   ci_no_run_grace_s: 60,
   ci_mode: "github",
-  models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
+  // review defaults to claude-fable-5 (#366): it is the auto-routed choice for
+  // every Adversarial stage, so aligning the default with that routing
+  // strengthens review rigor. Only honored when the reviewer harness is claude
+  // (under --profile codex, or an explicit review_harness: claude) — under the
+  // default --profile claude the reviewer is codex and the alias is inert
+  // (warned), so this default change is a no-op there.
+  models: { planning: "sonnet", implementing: "sonnet", review: "claude-fable-5", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
+  effort: {},
+  plan_review_effort: "medium",
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },

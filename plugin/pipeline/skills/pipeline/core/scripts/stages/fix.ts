@@ -315,6 +315,7 @@ export async function advanceFix(
   const result = await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
     model,
+    reasoningEffort: cfg.effort?.fix,
     sandbox: cfg.harness_sandbox,
     accounting: opts.runDir
       ? {

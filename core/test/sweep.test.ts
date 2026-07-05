@@ -957,6 +957,38 @@ test("sweep: realSweepDeps.runHarness forwards the pinned model and lean flags t
   }
 });
 
+test("sweep: realSweepDeps.runHarness forwards reasoningEffort as --effort to claude (#366)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
+  const cli = path.join(binDir, "claude");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realSweepDeps(tmp, "test-model-xyz", "high").runHarness("SPEC-PROMPT");
+    assert.match(result.output, /--effort\nhigh/, "effort.sweep must reach claude as --effort");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("sweep: realSweepDeps.runHarness omits --effort when reasoningEffort is unset (#366)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
+  const cli = path.join(binDir, "claude");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realSweepDeps(tmp, "test-model-xyz").runHarness("SPEC-PROMPT");
+    assert.doesNotMatch(result.output, /--effort/, "no --effort flag when reasoningEffort is unset");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("sweep: realSweepDeps defaults the model to DEFAULT_CONFIG.models.sweep when unset (#220)", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));

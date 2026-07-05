@@ -1,8 +1,8 @@
 // Run a harness CLI inside a worktree directory, streaming output to the
 // console while also capturing it for return.
 //
-// claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] <prompt>
-// codex:   codex exec --full-auto -C <worktreeDir> <prompt>
+// claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] [--effort Y] <prompt>
+// codex:   codex exec --full-auto -C <worktreeDir> [-c model_reasoning_effort=Y] <prompt>
 //          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
 //          --dangerously-bypass-approvals-and-sandbox mode on externally
 //          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
@@ -71,10 +71,11 @@ export interface InvokeOptions {
    */
   lean?: boolean;
   /**
-   * When set and harness is "codex", passes `-c model_reasoning_effort=<value>`
-   * to the codex CLI so the call overrides the operator's global reasoning-effort
-   * config. Used by plan-review to cap effort at "medium" regardless of the global.
-   * Silently ignored for claude and custom reviewer CLIs.
+   * Per-stage reasoning-effort override (#366). For "codex", passes
+   * `-c model_reasoning_effort=<value>`; for "claude", passes `--effort <value>`.
+   * Both override the operator's global reasoning-effort config for this call.
+   * Silently ignored for custom reviewer CLIs (`review_harness`, #40), which
+   * accept neither flag.
    */
   reasoningEffort?: string;
   accounting?: {
@@ -115,6 +116,7 @@ export async function invoke(
       args.push("--tools", "", "--strict-mcp-config");
     }
     if (opts.model) args.push("--model", opts.model);
+    if (opts.reasoningEffort) args.push("--effort", opts.reasoningEffort);
     args.push(prompt);
   } else if (harness === "codex") {
     cmd = "codex";

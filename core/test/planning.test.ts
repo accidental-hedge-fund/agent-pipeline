@@ -594,6 +594,8 @@ const eqCfg = {
   review_timeout: 300,
   plan_review_timeout: 300,
   models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
+  effort: {},
+  plan_review_effort: "medium",
   harness_sandbox: false,
   marker_footer: "---pipeline---",
   implementation_ready_message: "Implementation ready.",
@@ -1161,10 +1163,14 @@ test("runPlanningPhases — verdict validation: empty plan-review output blocks 
 });
 
 // ---------------------------------------------------------------------------
-// Plan-review options forwarding (#278): plan_review_timeout and reasoningEffort
+// Plan-review options forwarding (#278, #366): plan_review_timeout and
+// reasoningEffort.
 //
 // runPlanningPhases must pass cfg.plan_review_timeout (not cfg.review_timeout)
-// and reasoningEffort: "medium" to invokeReviewer for the plan-review step.
+// to invokeReviewer for the plan-review step. Effort now comes from resolved
+// cfg.plan_review_effort (default "medium" when effort.planning is unset,
+// #366) rather than a hardcoded literal — the default-unset case still
+// forwards "medium" so prior behavior is preserved.
 // ---------------------------------------------------------------------------
 
 test("runPlanningPhases — plan_review_timeout forwarded to invokeReviewer (#278)", async () => {
@@ -1196,6 +1202,65 @@ test("runPlanningPhases — reasoningEffort: medium forwarded to invokeReviewer 
   assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
   const opts = capturedOpts[0] as Record<string, unknown>;
   assert.equal(opts.reasoningEffort, "medium", "reasoningEffort must be forwarded as 'medium'");
+});
+
+test("runPlanningPhases — plan-review effort sourced from cfg.plan_review_effort, not cfg.effort.planning (#366)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  // effort.planning drives the "planning" stage (Analytical/Iterative) directly,
+  // but plan-review is classified Adversarial/Definitive and reads the dedicated
+  // cfg.plan_review_effort field instead (see stage-routing.ts / config.ts).
+  const cfg = { ...eqCfg, effort: { planning: "low" }, plan_review_effort: "max" } as unknown as PipelineConfig;
+  await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.reasoningEffort, "max", "plan-review must read cfg.plan_review_effort, not cfg.effort.planning");
+});
+
+test("runPlanningPhases — structured review_harness reviewerModel/reviewerEffort override cfg.models.review/cfg.plan_review_effort (#366)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  const cfg = {
+    ...eqCfg,
+    harnesses: { ...eqCfg.harnesses, reviewerModel: "claude-fable-5", reviewerEffort: "high" },
+    plan_review_effort: "medium",
+  } as unknown as PipelineConfig;
+  await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.model, "claude-fable-5", "reviewerModel override must win over cfg.models.review");
+  assert.equal(opts.reasoningEffort, "high", "reviewerEffort override must win over cfg.plan_review_effort");
+});
+
+test("runPlanningPhases — structured review_harness reviewerEffort: 'auto' resolves round-aware to plan-review's Definitive classification (max) (#366)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  const cfg = {
+    ...eqCfg,
+    harnesses: { ...eqCfg.harnesses, reviewerEffort: "auto" },
+    plan_review_effort: "medium",
+  } as unknown as PipelineConfig;
+  await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.reasoningEffort, "max", "auto must resolve plan-review as Adversarial/Definitive");
 });
 
 // ---------------------------------------------------------------------------

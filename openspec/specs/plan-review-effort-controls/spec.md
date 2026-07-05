@@ -25,20 +25,6 @@ the field SHALL be silently ignored.
 - **THEN** the claude process SHALL NOT include any `-c model_reasoning_effort` flag
 - **AND** the claude invocation SHALL be unchanged from its prior shape
 
-### Requirement: Plan-review codex invocation SHALL cap reasoning effort to medium
-The plan-review invocation in `planning.ts` SHALL pass `reasoningEffort: "medium"` in
-its `InvokeOptions`. This cap SHALL apply regardless of the operator's global codex
-config and SHALL NOT be overridable via `pipeline.yml`.
-
-#### Scenario: plan-review invocation includes reasoning-effort cap
-- **WHEN** the pipeline reaches the plan-review step with `cfg.harnesses.reviewer === "codex"`
-- **THEN** the codex invocation SHALL include `-c model_reasoning_effort=medium` in its args
-
-#### Scenario: review-1 and review-2 invocations are unchanged
-- **WHEN** the pipeline reaches review-1 or review-2
-- **THEN** those codex invocations SHALL NOT include any `-c model_reasoning_effort` flag
-  (they are unaffected by this change)
-
 ### Requirement: Plan-review SHALL use plan_review_timeout, not review_timeout
 The plan-review `invokeReviewer` call in `planning.ts` SHALL pass
 `timeoutSec: cfg.plan_review_timeout` instead of `timeoutSec: cfg.review_timeout`.
@@ -74,4 +60,29 @@ identifies the missing section. It SHALL NOT pass the output to the plan-revisio
 - **WHEN** plan-review output is an empty string (or whitespace only)
 - **THEN** the missing-verdict-header check SHALL trigger
 - **AND** the issue SHALL be blocked at `plan-review` with an appropriate message
+
+### Requirement: Plan-review reasoning effort SHALL be sourced from resolved cfg.effort.planning
+
+The plan-review invocation in `planning.ts` SHALL pass its reasoning effort from the resolved `cfg.effort.planning` value rather than a hardcoded literal. When `effort.planning` is unset, the resolved plan-review effort SHALL default to `"medium"`, preserving prior behavior. When `effort.planning` is `"auto"`, it SHALL resolve using the plan-review classification (Adversarial/Definitive → `"max"`). The literal string `"auto"` SHALL NOT be passed to the harness.
+
+#### Scenario: plan-review effort defaults to medium when unset
+
+- **WHEN** `.github/pipeline.yml` has no `effort:` block
+- **THEN** the plan-review invocation SHALL pass `reasoningEffort: "medium"`
+
+#### Scenario: plan-review effort overridden by config
+
+- **WHEN** `.github/pipeline.yml` sets `effort: { planning: max }`
+- **THEN** the plan-review invocation SHALL pass `reasoningEffort: "max"`
+
+#### Scenario: plan-review effort auto resolves to max
+
+- **WHEN** `.github/pipeline.yml` sets `effort: { planning: auto }`
+- **THEN** the plan-review invocation SHALL pass `reasoningEffort: "max"` (Adversarial/Definitive)
+- **AND** the harness SHALL NOT receive the literal `"auto"`
+
+#### Scenario: review-1 and review-2 unaffected by plan-review effort
+
+- **WHEN** the pipeline reaches review-1 or review-2
+- **THEN** their reasoning effort SHALL be sourced from `cfg.harnesses.reviewerEffort ?? cfg.effort.review`, independent of `cfg.effort.planning`
 

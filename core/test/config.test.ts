@@ -56,7 +56,7 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude" });
+    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerEffort: undefined });
     assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
     process.env.PATH = oldPath;
@@ -1621,6 +1621,17 @@ test("resolveReleaseConfig: returns intake_model — default when unset, pipelin
   assert.equal(over.intake_model, "haiku", "models.intake in pipeline.yml must override");
 });
 
+test("resolveReleaseConfig: returns intake_effort — unset by default, pipeline.yml override when set, auto resolves (#366)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+  // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
+  const dflt = cfgMod.resolveReleaseConfig(makeFakeRepo(null));
+  assert.equal(dflt.intake_effort, undefined, "intake_effort must be unset when effort.intake is absent");
+  const over = cfgMod.resolveReleaseConfig(makeFakeRepo("effort:\n  intake: high\n"));
+  assert.equal(over.intake_effort, "high", "effort.intake in pipeline.yml must override");
+  const auto = cfgMod.resolveReleaseConfig(makeFakeRepo("effort:\n  intake: auto\n"));
+  assert.equal(auto.intake_effort, "low", "effort.intake: auto must resolve via the intake stage routing (Analytical/Ephemeral)");
+});
+
 test("resolveReleaseConfig: returns intake_timeout — default when unset, pipeline.yml override when set (#248)", async () => {
   const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
   // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
@@ -2366,6 +2377,295 @@ test("repoMapAdd: creating repo_map from absent produces a config that still val
     assert.equal(result.ok, true);
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
     assert.deepEqual(cfg.repo_map.depends_on, ["acme/lib"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// effort: block + auto sentinel + structured review_harness (#366)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: effort block accepted and resolved", async () => {
+  const repo = makeFakeRepo(`effort:\n  planning: medium\n  implementing: low\n`);
+  const binDir = makeFakeGh("acme/effort1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.effort.planning, "medium");
+    assert.equal(cfg.effort.implementing, "low");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under effort is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`effort:\n  unknown_stage: low\n`);
+  const binDir = makeFakeGh("acme/effort2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("unknown_stage"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort block absent — every stage's resolved effort is unset, plan_review_effort defaults to medium", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/effort3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.effort.planning, undefined);
+    assert.equal(cfg.effort.implementing, undefined);
+    assert.equal(cfg.effort.review, undefined);
+    assert.equal(cfg.effort.fix, undefined);
+    assert.equal(cfg.effort.intake, undefined);
+    assert.equal(cfg.effort.sweep, undefined);
+    assert.equal(cfg.plan_review_effort, "medium");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing 'auto' resolves to sonnet on the claude primary harness", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/auto1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.models.implementing, "sonnet");
+    assert.notEqual(cfg.models.implementing, "gpt-5.5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing 'auto' resolves to gpt-5.5 on the codex primary harness", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/auto2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(cfg.models.implementing, "gpt-5.5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.implementing 'auto' resolves to low regardless of harness", async () => {
+  const repo = makeFakeRepo(`effort:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/auto3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const claudeCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    const codexCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(claudeCfg.effort.implementing, "low");
+    assert.equal(codexCfg.effort.implementing, "low");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review 'auto' resolves to claude-fable-5 under both profiles (profile-independent) and never the short alias", async () => {
+  const repo = makeFakeRepo(`models:\n  review: auto\n`);
+  const binDir = makeFakeGh("acme/auto4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const claudeCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    const codexCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(claudeCfg.models.review, "claude-fable-5");
+    assert.equal(codexCfg.models.review, "claude-fable-5");
+    assert.notEqual(claudeCfg.models.review, "fable-5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.planning 'auto' splits per-stage — planning resolves medium, plan-review resolves max", async () => {
+  // The same effort.planning config key backs two differently-classified
+  // stages: planning (Analytical/Iterative) and plan-review (Adversarial/
+  // Definitive). cfg.effort.planning serves the planning stage; cfg.plan_review_effort
+  // is the dedicated derived value plan-review actually reads (#366).
+  const repo = makeFakeRepo(`effort:\n  planning: auto\n`);
+  const binDir = makeFakeGh("acme/auto5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.effort.planning, "medium", "planning stage: Analytical/Iterative");
+    assert.equal(cfg.plan_review_effort, "max", "plan-review stage: Adversarial/Definitive");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.* / effort.* never resolve to the literal string 'auto'", async () => {
+  const repo = makeFakeRepo(
+    `models:\n  planning: auto\n  implementing: auto\n  review: auto\n  fix: auto\n  intake: auto\n  sweep: auto\n` +
+      `effort:\n  planning: auto\n  implementing: auto\n  fix: auto\n  intake: auto\n  sweep: auto\n`,
+  );
+  const binDir = makeFakeGh("acme/auto6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    for (const v of Object.values(cfg.models)) assert.notEqual(v, "auto");
+    for (const v of Object.values(cfg.effort)) assert.notEqual(v, "auto");
+    assert.notEqual(cfg.plan_review_effort, "auto");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: structured review_harness sets reviewerModel/reviewerEffort; string form leaves them unset", async () => {
+  const repo = makeFakeRepo(
+    `review_harness:\n  command: claude\n  model: claude-fable-5\n  effort: high\n`,
+  );
+  const binDir = makeFakeGh("acme/rhstruct1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "claude");
+    assert.equal(cfg.harnesses.reviewerModel, "claude-fable-5");
+    assert.equal(cfg.harnesses.reviewerEffort, "high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: structured review_harness with model: auto resolves reviewerModel to claude-fable-5", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: claude\n  model: auto\n`);
+  const binDir = makeFakeGh("acme/rhstruct2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewerModel, "claude-fable-5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness (string shorthand) leaves reviewerModel/reviewerEffort unset", async () => {
+  const repo = makeFakeRepo(`review_harness: claude\n`);
+  const binDir = makeFakeGh("acme/rhstruct3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "claude");
+    assert.equal(cfg.harnesses.reviewerModel, undefined);
+    assert.equal(cfg.harnesses.reviewerEffort, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under structured review_harness is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: claude\n  temperature: 0.2\n`);
+  const binDir = makeFakeGh("acme/rhstruct4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("temperature"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.review inert-warning fires when the reviewer is a custom CLI", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\neffort:\n  review: high\n`);
+  const binDir = makeFakeGh("acme/inerteffort1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    const hit = warnings.find((w) => w.includes("effort.review"));
+    assert.ok(hit, `expected an effort.review inert warning, got: ${JSON.stringify(warnings)}`);
+    // Advisory only — the resolved value is preserved, not blanked or thrown.
+    assert.equal(cfg.effort.review, "high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.review does NOT warn when the reviewer is claude or codex (both honor per-stage effort)", async () => {
+  const repo = makeFakeRepo(`effort:\n  review: high\n`);
+  const binDir = makeFakeGh("acme/inerteffort2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo }); // codex profile → reviewer=claude
+    });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.review absent — no inert warning even with a custom reviewer CLI", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\n`);
+  const binDir = makeFakeGh("acme/inerteffort3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("DEFAULT_CONFIG.models.review regression: resolves to the full claude-fable-5 id (#366 ratified default)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/defaultreview1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(DEFAULT_CONFIG.models.review, "claude-fable-5");
+    assert.equal(cfg.models.review, "claude-fable-5");
+    assert.notEqual(cfg.models.review, "fable-5");
   } finally {
     process.env.PATH = oldPath;
   }

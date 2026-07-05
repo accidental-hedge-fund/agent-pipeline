@@ -20,7 +20,7 @@ ci_timeout: 900 # seconds to wait for CI at pre-merge
 ci_poll_interval: 30 # seconds between CI status polls
 ci_no_run_grace_s: 60 # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately
 
-models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning).
+models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts "auto" (#366).
   planning: opus # implementer harness
   implementing: sonnet # implementer harness
   review: sonnet # reviewer harness
@@ -28,7 +28,20 @@ models: # per-phase model alias — only honored when the role's harness is clau
 #   intake: sonnet # intake spec-generation — always the claude harness (never inert)
 #   sweep: sonnet # sweep spec-generation — always the claude harness (never inert)
 
+# effort: # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort (#366). Each key also accepts "auto". Absent key: no flag (operator's global setting applies). Uncomment to override.
+#   planning: medium # implementer harness — also sources plan-review's effort (Adversarial/Definitive)
+#   implementing: low # implementer harness
+#   review: high # reviewer harness — resolved round-aware (review-1 vs. review-2)
+#   fix: low # implementer harness
+#   intake: low # intake spec-generation — always the claude harness
+#   sweep: low # sweep spec-generation — always the claude harness
+
 # review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
+#   Or a structured form for independent reviewer model/effort control:
+# review_harness:
+#   command: my-reviewer
+#   model: auto # or an explicit alias
+#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)
 
 openspec:
   enabled: auto # auto | on | off

@@ -806,6 +806,28 @@ test("intake: realIntakeDeps.runHarness forwards the pinned model and lean flags
   }
 });
 
+test("intake: realIntakeDeps.runHarness forwards reasoningEffort as --effort to claude (#366)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intake-wt-"));
+  const fake = makeFakeClaudeOnPath();
+  try {
+    const result = await realIntakeDeps(tmp, "test-model-xyz", "high").runHarness("SPEC-PROMPT");
+    assert.match(result.output, /--effort\nhigh/, "effort.intake must reach claude as --effort");
+  } finally {
+    fake.restore();
+  }
+});
+
+test("intake: realIntakeDeps.runHarness omits --effort when reasoningEffort is unset (#366)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intake-wt-"));
+  const fake = makeFakeClaudeOnPath();
+  try {
+    const result = await realIntakeDeps(tmp, "test-model-xyz").runHarness("SPEC-PROMPT");
+    assert.doesNotMatch(result.output, /--effort/, "no --effort flag when reasoningEffort is unset");
+  } finally {
+    fake.restore();
+  }
+});
+
 test("intake: realIntakeDeps defaults the model to DEFAULT_CONFIG.models.intake when unset (#220)", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intake-wt-"));
   const fake = makeFakeClaudeOnPath();
