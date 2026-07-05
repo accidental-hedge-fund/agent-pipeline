@@ -2152,3 +2152,47 @@ test("shipcheck-gate (#314): unreachable executor blocks with a named stage+prov
   assert.equal(log.blocked.length, 1);
   assert.match(log.blocked[0].reason, /opencode-main/);
 });
+
+// ---------------------------------------------------------------------------
+// #314 review-2 finding af64370f: advisory is the DEFAULT shipcheck_gate mode.
+// A delegated executor's preflight/invocation failure or contract-noncompliant
+// output must block regardless of mode — advisory only governs a VALID verdict
+// whose content is advisory by configuration, never a broken/unreachable
+// provider with no fallback.
+// ---------------------------------------------------------------------------
+
+test("shipcheck-gate (#314 af64370f): unreachable executor in DEFAULT (advisory) mode still blocks — no silent advance to ready-to-deploy", async () => {
+  const log = makeCallLog();
+  let localReviewerCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => { localReviewerCalled = true; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+  const fetchImpl = (async () => {
+    throw new Error("ECONNREFUSED");
+  }) as unknown as typeof fetch;
+
+  const out = await advance(delegatedShipcheckCfg(), 42, { executorHttpDeps: { fetchImpl } }, deps);
+
+  assert.equal(localReviewerCalled, false, "no silent fallback to the local reviewer on preflight failure");
+  assert.equal(out.advanced, false, "advisory mode must not silently advance a delegated preflight failure");
+  assert.equal(log.blocked.length, 1);
+  assert.match(log.blocked[0].reason, /opencode-main/);
+});
+
+test("shipcheck-gate (#314 af64370f): delegated executor returns non-compliant output in DEFAULT (advisory) mode → blocks instead of advancing", async () => {
+  const log = makeCallLog();
+  let localReviewerCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => { localReviewerCalled = true; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+  const fetchImpl = (async () => new Response(JSON.stringify({ output: "just some prose, not a verdict" }), { status: 200 })) as unknown as typeof fetch;
+
+  const out = await advance(delegatedShipcheckCfg(), 42, { executorHttpDeps: { fetchImpl } }, deps);
+
+  assert.equal(localReviewerCalled, false, "no silent fallback to the local reviewer on a contract violation");
+  assert.equal(out.advanced, false, "advisory mode must not silently advance a delegated contract violation");
+  assert.equal(log.blocked.length, 1);
+  assert.match(log.blocked[0].reason, /opencode-main/);
+});

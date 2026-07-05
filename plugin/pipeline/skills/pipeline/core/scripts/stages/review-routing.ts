@@ -67,6 +67,7 @@ import {
   extractDiffHashFromComment,
   extractReview1Risk,
   extractReviewArtifact,
+  parseStrictVerdict,
   parseStructuredVerdict,
   REVIEW_MARKER_PREFIX_R1,
   REVIEW_MARKER_PREFIX_R2,
@@ -396,7 +397,27 @@ export async function advanceReview(
     return { advanced: false, status: "blocked", reason };
   }
 
-  const verdict = parseStructuredVerdict(result.stdout, commitSha);
+  // A delegated `stage_executors` result must satisfy the FULL verdict schema —
+  // no partial-JSON defaulting, no prose/text-verdict fallback — or it is a
+  // contract violation that blocks the run (#314 review-2 finding 9e069297).
+  // `executor_name` is only set on a `HarnessResult` produced by
+  // `invokeStageExecutor`; a local reviewer's result never carries it.
+  const isDelegatedResult = result.executor_name !== undefined;
+  const strictVerdict = isDelegatedResult ? parseStrictVerdict(result.stdout, commitSha) : undefined;
+  if (isDelegatedResult && strictVerdict === null) {
+    const providerNote = result.executor_provider ? ` (provider "${result.executor_provider}")` : "";
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Delegated executor "${result.executor_name}"${providerNote} for stage "${stage}" returned a result ` +
+        `that does not satisfy the review verdict contract (missing/invalid fields, or non-JSON/prose ` +
+        `output). No fallback — the run is blocked.`,
+      stage,
+      "harness-failure",
+    );
+    return { advanced: false, status: "blocked", reason: "external executor verdict contract violation" };
+  }
+  const verdict = strictVerdict ?? parseStructuredVerdict(result.stdout, commitSha);
   console.log(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,
   );

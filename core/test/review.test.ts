@@ -3537,12 +3537,15 @@ test("advanceReview (#314): review-1 delegated to a model-endpoint executor disp
   assert.match(rec.comments[0], /local-ollama/);
 });
 
-test("advanceReview (#314): a malformed (non-JSON-verdict) executor response is a contract violation, not a soft pass — same needs-attention+0-findings gate as a local reviewer", async (t) => {
+test("advanceReview (#314 review-2 9e069297): a malformed (non-JSON-verdict) executor response is a hard contract violation — blocks naming the stage and executor, never soft-passes through the lenient local-reviewer parse path", async (t) => {
   const { deps, rec } = makeDelegationDeps();
-  // The endpoint returns HTTP 200 with prose (not a JSON verdict) — a contract
-  // violation caught by the SAME parseStructuredVerdict fallback + zero-findings
-  // gate that guards a local reviewer's malformed output (#45), not a distinct
-  // executor-only code path.
+  // The endpoint returns HTTP 200 with prose (not a JSON verdict). A local
+  // reviewer's malformed output degrades through parseStructuredVerdict's prose/
+  // text-verdict fallback into a soft needs-attention+0-findings re-review gate
+  // (#45) — but that lenient fallback can also silently APPROVE recognizable
+  // prose like "no issues found", which would let a non-compliant executor
+  // response pass review. A delegated result must never reach that lenient
+  // path: it is validated strictly and, on any mismatch, blocks immediately.
   const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: "just some prose, not a verdict" } }] }), { status: 200 })) as unknown as typeof fetch;
 
   let outcome;
@@ -3552,7 +3555,23 @@ test("advanceReview (#314): a malformed (non-JSON-verdict) executor response is 
 
   assert.equal(outcome!.advanced, false);
   assert.equal(rec.blocked.length, 1);
-  assert.match(rec.blocked[0], /zero enumerated findings/);
+  assert.match(rec.blocked[0], /local-ollama/);
+  assert.match(rec.blocked[0], /review-1/);
+  assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
+});
+
+test("advanceReview (#314 review-2 9e069297): a delegated executor approving via partial JSON ({\"verdict\":\"approve\"} with no other fields) is a contract violation — blocks, does not silently approve", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: '{"verdict":"approve"}' } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
 });
 
 test("advanceReview (#314): unreachable executor blocks before dispatch — no silent fallback to the local reviewer", async (t) => {

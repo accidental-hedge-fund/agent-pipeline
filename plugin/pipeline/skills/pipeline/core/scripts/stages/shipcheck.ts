@@ -563,6 +563,12 @@ export async function advance(
 
   let verdict: ShipcheckVerdict | null = null;
   let parseFailure = false;
+  // Track whether this run's shipcheck-gate was delegated to a `stage_executors`
+  // assignment (#314 review-2 finding af64370f). A delegated preflight/invocation
+  // failure or contract-noncompliant result must block regardless of
+  // shipcheck_gate.mode — advisory mode is for a valid-but-advisory VERDICT, not
+  // for a misconfigured/unreachable/non-compliant executor with no fallback.
+  let delegatedExecutorLabel: string | null = null;
 
   for (let round = 1; round <= maxRounds; round++) {
     if (round > 1) {
@@ -589,6 +595,9 @@ export async function advance(
       opts.executorHttpDeps,
     );
     if (delegated) {
+      delegatedExecutorLabel = delegated.executor_provider
+        ? `${delegated.executor_name} (provider "${delegated.executor_provider}")`
+        : delegated.executor_name ?? null;
       result = { stdout: delegated.stdout, success: delegated.success, timed_out: delegated.timed_out, stderr: delegated.stderr };
     } else if (deps.invokeReviewer) {
       result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
@@ -706,21 +715,27 @@ export async function advance(
   }
   // ---- END POST-REVIEW HEAD-COHERENCE RECHECK ----
 
-  // If all rounds produced parse failures, handle per mode.
+  // If all rounds produced parse failures, handle per mode. A delegated executor's
+  // failure or contract violation blocks unconditionally — never silently
+  // advances in advisory mode (#314 review-2 finding af64370f).
   if (parseFailure && verdict && verdict.verdict === "fail" && verdict.criteria.length === 0) {
-    if (cfg.shipcheck_gate.mode === "gate") {
-      console.log(`[pipeline] #${issueNumber}: shipcheck-gate parse failure after ${maxRounds} rounds (gate mode); blocking`);
+    if (cfg.shipcheck_gate.mode === "gate" || delegatedExecutorLabel) {
+      console.log(`[pipeline] #${issueNumber}: shipcheck-gate parse failure after ${maxRounds} rounds (${delegatedExecutorLabel ? "delegated executor" : "gate mode"}); blocking`);
+      const message = delegatedExecutorLabel
+        ? `Shipcheck gate: delegated executor ${delegatedExecutorLabel} for stage "shipcheck-gate" failed to produce a contract-compliant verdict after ${maxRounds} round(s) (no silent fallback for a delegated stage). Raw output:\n\n${verdict.summary}`
+        : `Shipcheck gate: could not parse a valid verdict from the reviewer after ${maxRounds} round(s). Raw output:\n\n${verdict.summary}`;
       await setBlockedFn(
         cfg,
         issueNumber,
-        `Shipcheck gate: could not parse a valid verdict from the reviewer after ${maxRounds} round(s). Raw output:\n\n${verdict.summary}`,
+        message,
         "shipcheck-gate",
         "needs-human" as BlockerKind,
       );
       await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "parse_failure");
       return { advanced: false, status: "blocked", reason: "shipcheck parse failure after max rounds", blockerKind: "needs-human" as BlockerKind };
     }
-    // Advisory: warn and advance.
+    // Advisory: warn and advance. Only reachable for the local harness (a
+    // delegated executor is blocked above regardless of mode).
     console.warn(`[pipeline] #${issueNumber}: shipcheck-gate parse failure (advisory mode); advancing`);
     const eligibilitySuffixPf = await maybeRunEligibilityGate(cfg, issueNumber, prNumber, worktreeDir, opts, deps);
     await transitionFn(cfg, issueNumber, "shipcheck-gate", "ready-to-deploy", "Shipcheck parse failure (advisory mode); advancing.");
@@ -730,8 +745,11 @@ export async function advance(
 
   if (!verdict) {
     // Harness produced no output at all.
-    if (cfg.shipcheck_gate.mode === "gate") {
-      await setBlockedFn(cfg, issueNumber, "Shipcheck gate: reviewer harness produced no output.", "shipcheck-gate", "needs-human" as BlockerKind);
+    if (cfg.shipcheck_gate.mode === "gate" || delegatedExecutorLabel) {
+      const message = delegatedExecutorLabel
+        ? `Shipcheck gate: delegated executor ${delegatedExecutorLabel} for stage "shipcheck-gate" produced no output (no silent fallback for a delegated stage).`
+        : "Shipcheck gate: reviewer harness produced no output.";
+      await setBlockedFn(cfg, issueNumber, message, "shipcheck-gate", "needs-human" as BlockerKind);
       await recordGateResult(opts, "fail", cfg.shipcheck_gate.mode, "no_output");
       return { advanced: false, status: "blocked", reason: "shipcheck: no harness output", blockerKind: "needs-human" as BlockerKind };
     }
