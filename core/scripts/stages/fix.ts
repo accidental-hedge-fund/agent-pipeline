@@ -18,6 +18,7 @@ import {
 import { findUnacknowledgedComments } from "../issue-context-snapshot.ts";
 import { buildTrustedOverrideComments } from "../review-policy.ts";
 import { invoke } from "../harness.ts";
+import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
@@ -58,6 +59,9 @@ export interface AdvanceFixOpts {
   runDir?: string;
   /** Run-store deps carrying `stdoutWrite` for streaming events (#302). */
   runStoreDeps?: RunStoreDeps;
+  /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
+   *  supply a fake `fetchImpl` so no real network call is made. */
+  executorHttpDeps?: ExecutorHttpDeps;
 }
 
 /** Injectable seams for {@link advanceFix} — overridable in tests. */
@@ -312,7 +316,23 @@ export async function advanceFix(
     ).catch(() => {});
   }
   const model = opts.model ?? cfg.models.fix;
-  const result = await invoke(harness, wt.path, prompt, {
+  // External stage executor delegation (#314): fix-1/fix-2 are
+  // execution-environment stages — only an `agent-system` executor can be
+  // assigned here (config.ts rejects a `model-endpoint` assignment at parse
+  // time), so no model-endpoint branching is needed at this call site.
+  const delegated = await invokeStageExecutor(
+    stage as "fix-1" | "fix-2",
+    cfg,
+    prompt,
+    {
+      timeoutSec: cfg.fix_timeout,
+      accounting: opts.runDir
+        ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage, modelSlot: "fix" }
+        : undefined,
+    },
+    opts.executorHttpDeps,
+  );
+  const result = delegated ?? await invoke(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
     model,
     reasoningEffort: cfg.effort?.fix,

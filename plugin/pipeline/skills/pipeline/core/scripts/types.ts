@@ -29,6 +29,68 @@ export const HARNESS_LABEL_PREFIX = "harness:";
 export type Harness = "claude" | "codex";
 
 // ---------------------------------------------------------------------------
+// External stage executors (#314) — named executor definitions that operators
+// can assign per model-invoking stage, in place of the local claude/codex
+// harness. Single-sourced here (not re-derived per file) so the config
+// stage-eligibility gate and the runtime dispatcher can never drift.
+// ---------------------------------------------------------------------------
+
+/** The subset of STAGES that invoke a model at all (deterministic/gate-only
+ *  stages — ready, pre-merge, eval-gate, deploy_ready, etc. — are excluded). */
+export const MODEL_INVOKING_STAGES = [
+  "planning",
+  "plan-review",
+  "implementing",
+  "review-1",
+  "fix-1",
+  "review-2",
+  "fix-2",
+  "shipcheck-gate",
+] as const;
+export type ModelInvokingStage = (typeof MODEL_INVOKING_STAGES)[number];
+
+/** Prompt-contained stages: the prompt already carries (or can carry) all
+ *  context needed to reach a verdict without exploring the repo — the only
+ *  stages a `model-endpoint` executor may be assigned to. */
+export const PROMPT_CONTAINED_STAGES = ["plan-review", "review-1", "review-2"] as const;
+
+/** Execution-environment stages: need repo/tool access (read files, run
+ *  tests/build, commit). A `model-endpoint` executor assigned here is rejected
+ *  at config-parse time; only `agent-system` executors (or the local harness)
+ *  are valid. */
+export const EXECUTION_ENVIRONMENT_STAGES = [
+  "planning",
+  "implementing",
+  "fix-1",
+  "fix-2",
+  "shipcheck-gate",
+] as const;
+
+export type ExecutorType = "agent-system" | "model-endpoint";
+
+/** A full execution backend (OpenCode / HermesAgent / OpenClaw) addressed by a
+ *  provider identifier and API endpoint. Valid for any model-invoking stage. */
+export interface AgentSystemExecutorDefinition {
+  type: "agent-system";
+  provider: string;
+  endpoint: string;
+  /** Env-var name (or secret reference) resolved from the environment at
+   *  invocation time — never a literal secret value. */
+  credential?: string;
+}
+
+/** A raw OpenAI-compatible chat/completions endpoint (e.g. local Ollama).
+ *  Valid only for PROMPT_CONTAINED_STAGES. */
+export interface ModelEndpointExecutorDefinition {
+  type: "model-endpoint";
+  base_url: string;
+  model: string;
+  credential?: string;
+}
+
+export type ExecutorDefinition = AgentSystemExecutorDefinition | ModelEndpointExecutorDefinition;
+
+// ---------------------------------------------------------------------------
 // Blocker kinds (#134) — closed set of structurally-distinct failure classes.
 //
 // `setBlocked` posts the same "## Pipeline: Blocked" comment for every blocker,
@@ -415,6 +477,12 @@ export interface PipelineConfig {
     command: string;
     mode: "additive" | "exclusive";
   };
+  // External stage executors (#314). Named executor definitions ("executors:")
+  // that operators may assign per model-invoking stage ("stage_executors:").
+  // Both default to {} — a repo with neither key configured behaves exactly as
+  // today (every stage runs through the local claude/codex harness).
+  executors: Record<string, ExecutorDefinition>;
+  stage_executors: Partial<Record<ModelInvokingStage, string>>;
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -481,6 +549,8 @@ export const DEFAULT_CONFIG: Omit<
     min_confidence: 0.8,
   },
   repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
+  executors: {} as Record<string, ExecutorDefinition>,
+  stage_executors: {} as Partial<Record<ModelInvokingStage, string>>,
 };
 
 // ---------------------------------------------------------------------------
@@ -696,6 +766,13 @@ export interface ReviewRecord {
   harness?: string;
   model?: string;
   selfReview?: boolean;
+  /** External stage executor evidence (#314). `harness` above carries the
+   *  executor NAME when this round was delegated via `stage_executors:`;
+   *  `executorProvider` is the agent-system provider id or model-endpoint base
+   *  URL; `executorModel` is the model name (model-endpoint only). Both absent
+   *  for a round that ran on the local reviewer harness. */
+  executorProvider?: string;
+  executorModel?: string;
 }
 
 export type StageAccountingCostSource = "actual" | "estimated" | "unknown";
@@ -737,6 +814,13 @@ export interface StageAccountingRecord {
    *  the test-gate harness so `ci_mode: local` can verify that the current PR
    *  head matches the commit that was actually tested (#350 review-2). */
   pr_head_sha?: string | null;
+  /** External stage executor evidence (#314). `harness` carries the executor
+   *  NAME (from `stage_executors:`) when this stage was delegated;
+   *  `executor_provider` is the agent-system provider id or the model-endpoint
+   *  base URL; `executor_model` is the model name (model-endpoint only). All
+   *  absent for a stage that ran on the local claude/codex harness, unchanged. */
+  executor_provider?: string | null;
+  executor_model?: string | null;
 }
 
 export interface StageAccountingTotals {

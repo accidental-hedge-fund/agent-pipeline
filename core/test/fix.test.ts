@@ -740,7 +740,9 @@ test("advanceFix: fix-harness invoke() call forwards cfg.effort.fix as reasoning
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const modelLineIdx = src.indexOf("const model = opts.model ?? cfg.models.fix;");
   assert.ok(modelLineIdx !== -1, "expected the fix-round model resolution line to exist");
-  const invokeCallSlice = src.slice(modelLineIdx, modelLineIdx + 400);
+  // Slice must be wide enough to span the invokeStageExecutor delegation block
+  // (#314) that now sits between model resolution and the local invoke() call.
+  const invokeCallSlice = src.slice(modelLineIdx, modelLineIdx + 1100);
   assert.match(
     invokeCallSlice,
     /reasoningEffort:\s*cfg\.effort\?\.fix/,

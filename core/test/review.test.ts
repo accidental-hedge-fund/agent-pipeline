@@ -3467,3 +3467,179 @@ test("advanceReview: dry-run skips postComment and setBlocked for unacknowledged
   assert.equal(rec.comments.length, 0, "postComment must NOT be called in dry-run");
   assert.equal(rec.blocked.length, 0, "setBlocked must NOT be called in dry-run");
 });
+
+// ---------------------------------------------------------------------------
+// External stage executor delegation (#314) — exercises the REAL
+// invokePromptHarnessReview path (deps.runReview is intentionally left
+// unset), proving: dispatch via a fake HTTP fetch, the self-contained diff
+// prompt, the unchanged parseStructuredVerdict/review-policy outcome contract,
+// and that the #39 self-review fallback never applies to a `stage_executors`
+// assignment.
+// ---------------------------------------------------------------------------
+
+const DIFF_MARKER = "+const delegatedChange = 1;";
+
+function makeDelegationDeps(): { deps: AdvanceReviewDeps; rec: Recorder } {
+  const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], comments: [], prComments: [] };
+  const deps: AdvanceReviewDeps = {
+    getPrForIssue: async () => 123,
+    getPrDiff: async () => `diff --git a/x.ts b/x.ts\n${DIFF_MARKER}`,
+    getPrDetail: async () => ({ head_sha: "f".repeat(40) }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getPrDetail"]>>>,
+    getIssueDetail: async () =>
+      ({
+        number: 1, type: "issue", title: "Title", body: "Body", state: "open",
+        url: "https://example.test/1", labels: [], comments: [],
+      }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>,
+    getForIssue: async () => null,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    postPrComment: async (_cfg, _pr, body) => { rec.prComments.push(body); },
+    transition: async (_cfg, _n, _from, to) => { rec.transitions.push({ to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push(reason); },
+    getGhActor: async () => TEST_ACTOR,
+    // runReview intentionally omitted — exercises the real defaultRunReview /
+    // invokePromptHarnessReview path, including its executor-resolution branch.
+  };
+  return { deps, rec };
+}
+
+function delegationCfg(): PipelineConfig {
+  return {
+    ...cfg,
+    repo: "acme/widget",
+    stage_executors: { "review-1": "local-ollama" },
+    executors: {
+      "local-ollama": { type: "model-endpoint", base_url: "http://localhost:11434/v1", model: "llama3.1:70b" },
+    },
+  } as unknown as PipelineConfig;
+}
+
+test("advanceReview (#314): review-1 delegated to a model-endpoint executor dispatches via fetch, self-contained prompt, verdict contract unchanged", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  let capturedBody = "";
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = String((init?.body as string) ?? "");
+    return new Response(JSON.stringify({ choices: [{ message: { content: APPROVE } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, true);
+  assert.equal(outcome!.to, "review-2");
+  assert.deepEqual(rec.blocked, [], "a valid delegated verdict must not block");
+  // Self-contained prompt: the PR diff is embedded inline in the outbound request body.
+  const parsedBody = JSON.parse(capturedBody);
+  assert.match(parsedBody.messages[0].content, new RegExp(DIFF_MARKER.replace(/[+]/g, "\\+")));
+  // No self-review banner — this was a deliberate executor delegation, not a #39 fallback.
+  assert.ok(!/Same-harness self-review/.test(rec.comments[0]));
+  assert.match(rec.comments[0], /local-ollama/);
+});
+
+test("advanceReview (#314 review-2 9e069297): a malformed (non-JSON-verdict) executor response is a hard contract violation — blocks naming the stage and executor, never soft-passes through the lenient local-reviewer parse path", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  // The endpoint returns HTTP 200 with prose (not a JSON verdict). A local
+  // reviewer's malformed output degrades through parseStructuredVerdict's prose/
+  // text-verdict fallback into a soft needs-attention+0-findings re-review gate
+  // (#45) — but that lenient fallback can also silently APPROVE recognizable
+  // prose like "no issues found", which would let a non-compliant executor
+  // response pass review. A delegated result must never reach that lenient
+  // path: it is validated strictly and, on any mismatch, blocks immediately.
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: "just some prose, not a verdict" } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /local-ollama/);
+  assert.match(rec.blocked[0], /review-1/);
+  assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
+});
+
+test("advanceReview (#314 review-2 9e069297): a delegated executor approving via partial JSON ({\"verdict\":\"approve\"} with no other fields) is a contract violation — blocks, does not silently approve", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: '{"verdict":"approve"}' } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
+});
+
+test("advanceReview (#314 review-1 086b56ab): a delegated executor returning a critical finding with out-of-range confidence (-1) is a contract violation — blocks, does not demote to advisory", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  const body =
+    '{"verdict":"needs-attention","summary":"s",' +
+    '"findings":[{"severity":"critical","title":"t","body":"b","confidence":-1,"recommendation":"r"}],' +
+    '"next_steps":[]}';
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: body } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
+});
+
+test("advanceReview (#314 pre-merge 3f6365e9): a delegated executor returning approve with a critical finding is routed through the policy gate — not silently approved, transitions to fix-1", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  // A contradictory approve+critical finding: verdict says approve, but the
+  // finding is critical. parseStrictVerdict must downgrade to needs-attention
+  // so partitionFindings applies the review_policy and the critical finding
+  // routes to fix-1 rather than silently advancing through the approve branch.
+  const body =
+    '{"verdict":"approve","summary":"s",' +
+    '"findings":[{"severity":"critical","title":"dangerous bypass","body":"b","confidence":0.9,"recommendation":"r"}],' +
+    '"next_steps":[]}';
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: body } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  // The approve+findings verdict must NOT silently advance to review-2 or pre-merge.
+  // It must be downgraded to needs-attention and routed through partitionFindings,
+  // which blocks on the critical finding and transitions to fix-1 instead.
+  assert.equal(rec.blocked.length, 0, "no hard block — the finding routes through the policy gate");
+  assert.ok(
+    rec.transitions.some((tr) => tr.to === "fix-1"),
+    `expected transition to fix-1 (policy gate blocks on critical), got: ${JSON.stringify(rec.transitions)}`,
+  );
+  assert.ok(
+    !rec.transitions.some((tr) => tr.to === "review-2" || tr.to === "pre-merge"),
+    `critical finding must not silently advance past review: ${JSON.stringify(rec.transitions)}`,
+  );
+});
+
+test("advanceReview (#314): unreachable executor blocks before dispatch — no silent fallback to the local reviewer", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  let postDispatched = false;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    if (init?.method === "POST") postDispatched = true;
+    throw new Error("ECONNREFUSED");
+  }) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(postDispatched, false, "preflight failure must block before the prompt is ever POSTed");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /local-ollama/);
+  assert.match(rec.blocked[0], /review-1/);
+  assert.ok(!/Same-harness self-review/.test(JSON.stringify(rec)), "no #39 self-review fallback for a stage_executors assignment");
+});

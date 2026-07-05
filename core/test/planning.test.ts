@@ -1552,3 +1552,60 @@ test("runPlanningPhases (#352 regression): config.yaml dirty after validateArtif
   await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, openspecHooks(), deps as any);
   assert.ok(addCalled, "gitAdd must be called after validateArtifact leaves config.yaml dirty (#352 round 2)");
 });
+
+// ---------------------------------------------------------------------------
+// External stage executor delegation (#314) — plan-review delegated to a
+// model-endpoint executor bypasses doInvokeReviewer (and its #39 self-review
+// fallback) entirely; the "planning" assignment governs the plan-generation
+// (invokePlanStep) seam separately from "plan-review" (the reviewing call).
+// ---------------------------------------------------------------------------
+
+function delegatedEqCfg(): PipelineConfig {
+  return {
+    ...eqCfg,
+    stage_executors: { "plan-review": "local-ollama" },
+    executors: {
+      "local-ollama": { type: "model-endpoint", base_url: "http://localhost:11434/v1", model: "llama3.1:70b" },
+    },
+  } as unknown as PipelineConfig;
+}
+
+test("runPlanningPhases (#314): plan-review delegated to a model-endpoint executor dispatches via fetch, never calls the local reviewer, posts the executor name", async () => {
+  let localReviewerCalled = false;
+  const comments: string[] = [];
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: "## Plan Review Verdict\n\nApproved." } }] }), { status: 200 })) as unknown as typeof fetch;
+  const deps = {
+    ...eqBaseDeps(),
+    // Deliberately NOT overriding invokeReviewer here would use the real #39
+    // seam; assert it is never reached when stage_executors delegates instead.
+    invokeReviewer: async () => {
+      localReviewerCalled = true;
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+    postComment: async (_cfg: unknown, _n: unknown, body: string) => { comments.push(body); },
+  };
+
+  await runPlanningPhases(delegatedEqCfg(), 42, "Test issue", "test body", "run-42", { executorHttpDeps: { fetchImpl } }, freeformHooks(), deps as any);
+
+  assert.equal(localReviewerCalled, false, "the local reviewer harness must never be invoked when plan-review is delegated");
+  const planReviewComment = comments.find((c) => c.startsWith("## Plan Review"));
+  assert.ok(planReviewComment, "a plan-review comment must be posted");
+  assert.match(planReviewComment!, /local-ollama/);
+  assert.ok(!/Same-harness self-review/.test(planReviewComment!));
+});
+
+test("runPlanningPhases (#314): unreachable plan-review executor blocks with a named stage+provider error — no silent fallback", async () => {
+  let blocked: { reason: string; stage: string } | undefined;
+  const fetchImpl = (async () => {
+    throw new Error("ECONNREFUSED");
+  }) as unknown as typeof fetch;
+  const deps = {
+    ...eqBaseDeps(),
+    setBlocked: async (_cfg: unknown, _n: unknown, reason: string, stage: string) => { blocked = { reason, stage }; },
+  };
+
+  await runPlanningPhases(delegatedEqCfg(), 42, "Test issue", "test body", "run-42", { executorHttpDeps: { fetchImpl } }, freeformHooks(), deps as any);
+
+  assert.equal(blocked?.stage, "plan-review");
+  assert.match(blocked!.reason, /local-ollama/);
+});

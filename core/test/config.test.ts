@@ -2670,3 +2670,138 @@ test("DEFAULT_CONFIG.models.review regression: resolves to the full claude-fable
     process.env.PATH = oldPath;
   }
 });
+
+// ---------------------------------------------------------------------------
+// External stage executors (#314)
+// ---------------------------------------------------------------------------
+
+async function resolveWithConfig(content: string | null, repoSlug: string): Promise<unknown> {
+  const repo = makeFakeRepo(content);
+  const binDir = makeFakeGh(repoSlug);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    return cfgMod.resolveConfig({ repoPath: repo });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+}
+
+async function expectInvalidConfig(content: string, repoSlug: string, messagePattern: RegExp): Promise<void> {
+  const repo = makeFakeRepo(content);
+  const binDir = makeFakeGh(repoSlug);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), messagePattern);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+}
+
+test("resolveConfig: no executors/stage_executors block → parity with pre-#314 defaults", async () => {
+  const cfg = (await resolveWithConfig(null, "acme/exec-parity")) as { executors: unknown; stage_executors: unknown };
+  assert.deepEqual(cfg.executors, {});
+  assert.deepEqual(cfg.stage_executors, {});
+});
+
+test("resolveConfig: agent-system executor definition accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\n    credential: OPENCODE_API_KEY\n`,
+    "acme/exec1",
+  )) as { executors: Record<string, unknown> };
+  assert.deepEqual(cfg.executors["opencode-main"], {
+    type: "agent-system",
+    provider: "opencode",
+    endpoint: "https://opencode.internal/api",
+    credential: "OPENCODE_API_KEY",
+  });
+});
+
+test("resolveConfig: model-endpoint executor definition accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n`,
+    "acme/exec2",
+  )) as { executors: Record<string, unknown> };
+  assert.deepEqual(cfg.executors["local-ollama"], {
+    type: "model-endpoint",
+    base_url: "http://localhost:11434/v1",
+    model: "llama3.1:70b",
+  });
+});
+
+test("resolveConfig: unknown executor type is rejected, identifying the invalid type", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: some-other-thing\n`,
+    "acme/exec3",
+    /Invalid .*pipeline\.yml/,
+  );
+});
+
+test("resolveConfig: unknown key inside an executor definition is rejected (strict)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://x\n    unexpected_key: true\n`,
+    "acme/exec4",
+    /Invalid .*pipeline\.yml/,
+  );
+});
+
+test("resolveConfig: stage_executors assigning different executors to different stages in one run", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\nstage_executors:\n  planning: opencode-main\n  review-1: local-ollama\n  review-2: local-ollama\n`,
+    "acme/exec5",
+  )) as { stage_executors: Record<string, string> };
+  assert.deepEqual(cfg.stage_executors, { planning: "opencode-main", "review-1": "local-ollama", "review-2": "local-ollama" });
+});
+
+test("resolveConfig: stage_executors referencing an unknown executor name is rejected, naming the stage", async () => {
+  await expectInvalidConfig(
+    `stage_executors:\n  planning: does-not-exist\n`,
+    "acme/exec6",
+    /stage_executors\.planning.*unknown executor.*does-not-exist/s,
+  );
+});
+
+test("resolveConfig: model-endpoint assigned to review-2 (prompt-contained) is accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\nstage_executors:\n  review-2: local-ollama\n`,
+    "acme/exec7",
+  )) as { stage_executors: Record<string, string> };
+  assert.equal(cfg.stage_executors["review-2"], "local-ollama");
+});
+
+test("resolveConfig: model-endpoint assigned to implementing (execution-environment) is rejected at parse time, naming stage + executor", async () => {
+  await expectInvalidConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\nstage_executors:\n  implementing: local-ollama\n`,
+    "acme/exec8",
+    /implementing.*local-ollama/s,
+  );
+});
+
+for (const stage of ["planning", "implementing", "fix-1", "fix-2", "shipcheck-gate"]) {
+  test(`resolveConfig: model-endpoint assigned to execution-environment stage "${stage}" is rejected at parse time`, async () => {
+    await expectInvalidConfig(
+      `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: m\nstage_executors:\n  ${stage}: local-ollama\n`,
+      `acme/exec-eee-${stage}`,
+      new RegExp(`${stage}.*local-ollama`, "s"),
+    );
+  });
+}
+
+test("resolveConfig: agent-system assigned to implementing (execution-environment) is accepted, not rejected", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\nstage_executors:\n  implementing: opencode-main\n`,
+    "acme/exec9",
+  )) as { stage_executors: Record<string, string> };
+  assert.equal(cfg.stage_executors.implementing, "opencode-main");
+});
+
+test("resolveConfig: model-endpoint executor with no credential (localhost Ollama) is valid", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n`,
+    "acme/exec10",
+  )) as { executors: Record<string, { credential?: string }> };
+  assert.equal(cfg.executors["local-ollama"].credential, undefined);
+});

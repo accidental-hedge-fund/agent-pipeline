@@ -715,6 +715,20 @@ harness_sandbox: false               # opt-in: true → claude implementer uses 
 event_sink:                          # optional: deliver run events.jsonl records to an operator-controlled forwarder — see "External event sink"
   command: "logger -t pipeline"      # forwarder command; receives each event's JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged)
   mode: additive                     # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only
+executors:                           # optional: named external executor definitions — see "External stage executors"
+  opencode-main:
+    type: agent-system                # full execution backend — valid for ANY model-invoking stage
+    provider: opencode
+    endpoint: https://opencode.internal/api
+    credential: OPENCODE_API_KEY       # env-var NAME, resolved at invocation time — never the literal value
+  local-ollama:
+    type: model-endpoint              # raw OpenAI-compatible endpoint — valid ONLY for plan-review/review-1/review-2
+    base_url: http://localhost:11434/v1
+    model: llama3.1:70b
+stage_executors:                     # optional: assign an executors: name to a model-invoking stage
+  planning: opencode-main
+  review-1: local-ollama
+  review-2: local-ollama
 ```
 
 ### Custom reviewer harness (`review_harness`)
@@ -755,6 +769,35 @@ Every `models.*` and `effort.*` key (including the structured `review_harness.mo
 | **Adversarial** (plan-review, review-1, review-2) | claude-fable-5 / medium | claude-fable-5 / high | claude-fable-5 / max |
 
 A Mechanical stage's model forks by harness (`gpt-5.5` under the codex primary harness, `sonnet` under claude — `gpt-5.5` is codex-only) — every other cell resolves the same model regardless of harness, so an inert (harness-mismatched) `auto` result is reported exactly like an inert explicit alias (see "inert models.\* alias warning"). Adversarial stages always resolve `claude-fable-5` (the full model id — never the unrecognized short alias `fable-5`) regardless of `--profile`, so alternative-harness routing is profile-independent.
+
+### External stage executors (`executors:` / `stage_executors:`)
+
+`review_harness` only overrides the *reviewer* CLI. `executors:` + `stage_executors:` generalize that to **every** model-invoking stage (`planning`, `implementing`, `review-1`, `review-2`, `fix-1`, `fix-2`, `plan-review`, `shipcheck-gate` when enabled), and to two kinds of external delegate, not just a local CLI. Both keys are opt-in — a repo with neither behaves exactly as today.
+
+```yaml
+executors:
+  opencode-main:
+    type: agent-system              # full execution backend (OpenCode / HermesAgent / OpenClaw / …)
+    provider: opencode               # a plain provider identifier — the pipeline does not ship per-provider adapters
+    endpoint: https://opencode.internal/api
+    credential: OPENCODE_API_KEY     # env-var NAME resolved from the environment at invocation time — never stored or emitted
+  local-ollama:
+    type: model-endpoint             # raw OpenAI-compatible /chat/completions endpoint (e.g. local Ollama)
+    base_url: http://localhost:11434/v1
+    model: llama3.1:70b
+    # credential omitted — valid for a localhost endpoint with no auth
+
+stage_executors:
+  planning: opencode-main
+  review-1: local-ollama
+  review-2: local-ollama
+```
+
+- **`agent-system`** executors may be assigned to **any** model-invoking stage. The pipeline `POST`s `{ "stage": "<name>", "prompt": "<full prompt text>" }` to `endpoint` (adding `authorization: Bearer <resolved-credential>` when `credential` is set) and expects back `{ "output": "<text>" }`; `output` becomes that stage's harness stdout and flows through the exact same downstream contract (including `parseStructuredVerdict` + `review_policy` for review stages) as a local `claude`/`codex` invocation.
+- **`model-endpoint`** executors are restricted to the **prompt-contained** stages `plan-review`, `review-1`, `review-2` — these are the only stages whose prompt already embeds everything needed (PR diff, plan text, conventions excerpt) inline, since a raw model endpoint cannot explore the repo or run tools. Assigning a `model-endpoint` executor to `planning`, `implementing`, `fix-1`, `fix-2`, or `shipcheck-gate` is rejected **at config-parse time** — before any stage runs — with an error naming both the stage and the executor.
+- Credentials are **references** (an environment-variable name), resolved from the process environment only at invocation time. The secret value is never written to `pipeline.yml` and never appears in run evidence or accounting output — only the reference name does (or nothing, for an unauthenticated local endpoint).
+- A misconfigured, unreachable, or non-compliant executor is caught by a **preflight check before the stage runs** and blocks the item with an error naming the stage and provider. There is **no silent fallback** to the local `claude`/`codex` harness — this is a deliberate operator choice, distinct from (and takes priority over) the `review_harness` self-review fallback described above, which never applies to a `stage_executors` assignment.
+- Run evidence records which executor (and provider, and — for `model-endpoint` — model name) ran each delegated stage.
 
 ### Local CI mode (`ci_mode: local`)
 
