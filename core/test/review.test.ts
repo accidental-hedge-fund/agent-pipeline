@@ -3574,6 +3574,24 @@ test("advanceReview (#314 review-2 9e069297): a delegated executor approving via
   assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
 });
 
+test("advanceReview (#314 review-1 086b56ab): a delegated executor returning a critical finding with out-of-range confidence (-1) is a contract violation — blocks, does not demote to advisory", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  const body =
+    '{"verdict":"needs-attention","summary":"s",' +
+    '"findings":[{"severity":"critical","title":"t","body":"b","confidence":-1,"recommendation":"r"}],' +
+    '"next_steps":[]}';
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: body } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
+});
+
 test("advanceReview (#314): unreachable executor blocks before dispatch — no silent fallback to the local reviewer", async (t) => {
   const { deps, rec } = makeDelegationDeps();
   let postDispatched = false;

@@ -520,7 +520,9 @@ function validateStrictFinding(candidate: unknown): ReviewFinding | null {
   if (typeof f.severity !== "string" || !STRICT_FINDING_SEVERITIES.has(f.severity)) return null;
   if (typeof f.title !== "string") return null;
   if (typeof f.body !== "string") return null;
-  if (typeof f.confidence !== "number") return null;
+  if (typeof f.confidence !== "number" || !Number.isFinite(f.confidence) || f.confidence < 0 || f.confidence > 1) {
+    return null;
+  }
   if (typeof f.recommendation !== "string") return null;
   if (f.file !== undefined && typeof f.file !== "string") return null;
   if (f.line_start !== undefined && typeof f.line_start !== "number") return null;
