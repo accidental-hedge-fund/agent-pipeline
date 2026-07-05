@@ -707,7 +707,7 @@ async function main(): Promise<void> {
       await runIntake(
         { description: descriptionArg ?? "", release: opts.release, dryRun: opts.dryRun },
         intakeCfg,
-        realIntakeDeps(repoDir, intakeCfg.intake_model),
+        realIntakeDeps(repoDir, intakeCfg.intake_model, intakeCfg.intake_effort),
       );
     } catch (err) {
       console.error(`pipeline intake: ${(err as Error).message}`);
@@ -889,7 +889,7 @@ async function main(): Promise<void> {
         { apply: !!opts.apply, repo: opts.repo },
         { repo_dir: sweepCfg.repo_dir, repo: sweepCfg.repo, base_branch: sweepCfg.base_branch, sweep_timeout: sweepCfg.sweep_timeout },
         sweepConfig,
-        realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep),
+        realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep, sweepCfg.effort.sweep),
       );
     } catch (err) {
       console.error(`pipeline sweep: ${(err as Error).message}`);

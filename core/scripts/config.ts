@@ -700,12 +700,15 @@ export function findGitRoot(start: string): string | null {
 export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
-): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_timeout: number } {
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_effort?: string; intake_timeout: number } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
   let releaseModel: 'semver' | 'continuous' | undefined;
   // Intake always runs through the claude harness (see stages/intake.ts), so this
   // alias is never inert; default it here and let pipeline.yml's models.intake override.
   let intakeModel: string = DEFAULT_CONFIG.models.intake;
+  // effort.intake likewise always reaches the claude harness; unset by default so no
+  // --effort flag is emitted (#366 review-1 finding: previously accepted but dropped).
+  let intakeEffort: string | undefined;
   let intakeTimeout: number = DEFAULT_CONFIG.intake_timeout;
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (fs.existsSync(configPath)) {
@@ -729,6 +732,9 @@ export function resolveReleaseConfig(
       if (result.data.models?.intake) {
         intakeModel = expandAutoModel(result.data.models.intake, "intake", "claude") ?? intakeModel;
       }
+      if (result.data.effort?.intake) {
+        intakeEffort = expandAutoEffort(result.data.effort.intake, "intake", "claude");
+      }
       if (typeof result.data.intake_timeout === "number") {
         intakeTimeout = result.data.intake_timeout;
       }
@@ -740,6 +746,7 @@ export function resolveReleaseConfig(
     base_branch: baseBranchOverride ?? baseBranch,
     release_model: releaseModel,
     intake_model: intakeModel,
+    intake_effort: intakeEffort,
     intake_timeout: intakeTimeout,
   };
 }

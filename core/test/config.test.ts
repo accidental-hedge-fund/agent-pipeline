@@ -1621,6 +1621,17 @@ test("resolveReleaseConfig: returns intake_model — default when unset, pipelin
   assert.equal(over.intake_model, "haiku", "models.intake in pipeline.yml must override");
 });
 
+test("resolveReleaseConfig: returns intake_effort — unset by default, pipeline.yml override when set, auto resolves (#366)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+  // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
+  const dflt = cfgMod.resolveReleaseConfig(makeFakeRepo(null));
+  assert.equal(dflt.intake_effort, undefined, "intake_effort must be unset when effort.intake is absent");
+  const over = cfgMod.resolveReleaseConfig(makeFakeRepo("effort:\n  intake: high\n"));
+  assert.equal(over.intake_effort, "high", "effort.intake in pipeline.yml must override");
+  const auto = cfgMod.resolveReleaseConfig(makeFakeRepo("effort:\n  intake: auto\n"));
+  assert.equal(auto.intake_effort, "low", "effort.intake: auto must resolve via the intake stage routing (Analytical/Ephemeral)");
+});
+
 test("resolveReleaseConfig: returns intake_timeout — default when unset, pipeline.yml override when set (#248)", async () => {
   const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
   // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
