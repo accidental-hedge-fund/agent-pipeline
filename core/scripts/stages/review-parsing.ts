@@ -588,7 +588,12 @@ export function parseStrictVerdict(output: string, commitSha = ""): ReviewVerdic
     }
     if (!allFindingsValid) continue;
     if (!Array.isArray(o.next_steps) || !o.next_steps.every((s) => typeof s === "string")) continue;
-    return { verdict: o.verdict, summary: o.summary, findings, next_steps: o.next_steps as string[], commitSha };
+    // An `approve` verdict with enumerated findings is contradictory — downgrade to
+    // `needs-attention` so the severity/confidence policy gate runs and findings can
+    // block or advise as their severity warrants (#314 3f6365e9).
+    const effectiveVerdict =
+      o.verdict === "approve" && findings.length > 0 ? "needs-attention" : o.verdict;
+    return { verdict: effectiveVerdict, summary: o.summary, findings, next_steps: o.next_steps as string[], commitSha };
   }
   return null;
 }

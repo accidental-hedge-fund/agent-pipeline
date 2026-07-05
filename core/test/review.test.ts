@@ -3592,6 +3592,37 @@ test("advanceReview (#314 review-1 086b56ab): a delegated executor returning a c
   assert.match(rec.blocked[0], /does not satisfy the review verdict contract/);
 });
 
+test("advanceReview (#314 pre-merge 3f6365e9): a delegated executor returning approve with a critical finding is routed through the policy gate — not silently approved, transitions to fix-1", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  // A contradictory approve+critical finding: verdict says approve, but the
+  // finding is critical. parseStrictVerdict must downgrade to needs-attention
+  // so partitionFindings applies the review_policy and the critical finding
+  // routes to fix-1 rather than silently advancing through the approve branch.
+  const body =
+    '{"verdict":"approve","summary":"s",' +
+    '"findings":[{"severity":"critical","title":"dangerous bypass","body":"b","confidence":0.9,"recommendation":"r"}],' +
+    '"next_steps":[]}';
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: body } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  // The approve+findings verdict must NOT silently advance to review-2 or pre-merge.
+  // It must be downgraded to needs-attention and routed through partitionFindings,
+  // which blocks on the critical finding and transitions to fix-1 instead.
+  assert.equal(rec.blocked.length, 0, "no hard block — the finding routes through the policy gate");
+  assert.ok(
+    rec.transitions.some((tr) => tr.to === "fix-1"),
+    `expected transition to fix-1 (policy gate blocks on critical), got: ${JSON.stringify(rec.transitions)}`,
+  );
+  assert.ok(
+    !rec.transitions.some((tr) => tr.to === "review-2" || tr.to === "pre-merge"),
+    `critical finding must not silently advance past review: ${JSON.stringify(rec.transitions)}`,
+  );
+});
+
 test("advanceReview (#314): unreachable executor blocks before dispatch — no silent fallback to the local reviewer", async (t) => {
   const { deps, rec } = makeDelegationDeps();
   let postDispatched = false;
