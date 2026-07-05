@@ -32,11 +32,8 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
-<<<<<<< HEAD
 import { expandAutoEffort } from "../stage-routing.ts";
-=======
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
->>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
 import {
   branchName,
   createWorktree,
@@ -569,20 +566,11 @@ export async function runPlanningPhases(
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
     // the just-authored change files; freeform uses cfg.repo_dir.
     const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
-<<<<<<< HEAD
     const planReviewModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
     // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
     // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
     // with a structured review_harness.effort override taking precedence when set.
     const planReviewEffort = expandAutoEffort(cfg.harnesses.reviewerEffort, "plan-review", "claude") ?? cfg.plan_review_effort;
-    const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
-        timeoutSec: cfg.plan_review_timeout,
-        model: planReviewModel,
-        reasoningEffort: planReviewEffort,
-        accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
-      });
-=======
     // External stage executor delegation (#314): a `stage_executors` assignment
     // for plan-review bypasses the local reviewer harness (and its #39
     // self-review fallback) entirely — a deliberate operator choice, never
@@ -608,11 +596,10 @@ export async function runPlanningPhases(
           }
         : await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
             timeoutSec: cfg.plan_review_timeout,
-            model: opts.model ?? cfg.models.review,
-            reasoningEffort: "medium",
-            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", opts.model ?? cfg.models.review),
+            model: planReviewModel,
+            reasoningEffort: planReviewEffort,
+            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
           });
->>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
@@ -1023,20 +1010,6 @@ export function makeOpenspecPlanningHooks(
 
       const inv = deps.invoke ?? invoke;
       const planModel = opts.model ?? innerCfg.models.planning;
-<<<<<<< HEAD
-      const planResult = await inv(
-        primary,
-        wt.path,
-        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId }),
-        {
-          timeoutSec: innerCfg.implementation_timeout,
-          model: planModel,
-          reasoningEffort: innerCfg.effort?.planning,
-          sandbox: innerCfg.harness_sandbox,
-          accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
-        },
-      );
-=======
       const openspecPlanPrompt = buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId });
       // External stage executor delegation (#314) — see invokePlanStep's comment;
       // this is the OpenSpec-flow equivalent of the same "planning" call.
@@ -1060,11 +1033,11 @@ export function makeOpenspecPlanningHooks(
           {
             timeoutSec: innerCfg.implementation_timeout,
             model: planModel,
+            reasoningEffort: innerCfg.effort?.planning,
             sandbox: innerCfg.harness_sandbox,
             accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
           },
         ));
->>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
       if (!planResult.success) {
         const reason = planResult.timed_out
           ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`

@@ -268,7 +268,6 @@ review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the 
 
 When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). The `harnesses.implementer` is never overridable by repo config.
 
-<<<<<<< HEAD
 `review_harness` also accepts a structured form for independent reviewer model/effort control, each accepting `"auto"` (resolved round-aware — plan-review/review-2 as Definitive, review-1 as Iterative):
 
 ```yaml
@@ -278,7 +277,6 @@ review_harness:
   effort: auto
 ```
 
-=======
 ### External stage executors (#314)
 
 Beyond `review_harness` (which only overrides the reviewer CLI), any model-invoking
@@ -332,8 +330,6 @@ Key rules:
   `stage_executors` assignment).
 - Run evidence records which executor (and, for `model-endpoint`, which model)
   ran each delegated stage.
-
->>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
 ## Conventions & carry-forward lessons
 
 `readConventions` reads the target repo's conventions file (`conventions_md_path`, else `CLAUDE.md` on this host) and injects an excerpt into **every** stage prompt — planning, plan-review, plan-revision, implementing, both review rounds, and both fix rounds — via the `{{conventions}}` placeholder. This makes the conventions file the natural home for **carry-forward lessons**: a maintainer-curated `## Lessons / Gotchas` section (or a dedicated lessons file pointed at by `conventions_md_path`) recording recurring findings and repo-specific hazards. It is ordinary conventions text, so it rides the existing injection with **no extra config key, store, or flag** beyond the `conventions_md_path` / `CLAUDE.md` default.
