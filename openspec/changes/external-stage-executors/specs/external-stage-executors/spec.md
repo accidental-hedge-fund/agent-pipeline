@@ -33,25 +33,27 @@ pipeline SHALL behave exactly as today.
 
 ### Requirement: Per-stage executor assignment
 
-The pipeline SHALL allow each model-invoking stage — `planning`, `implementing`,
-`review-1`, `review-2`, `fix-1`, `fix-2`, `plan-review`, and `shipcheck-gate` when
-enabled — to be assigned a named executor independently. A single run SHALL be able
-to use different executors for different stages. A stage with no assigned executor
-SHALL run through the existing local-CLI harness, unchanged.
+`PartialConfigSchema` SHALL accept an optional, strict `stage_executors:` block
+keyed by exact stage name, mapping each model-invoking stage — `planning`,
+`implementing`, `review-1`, `review-2`, `fix-1`, `fix-2`, `plan-review`, and
+`shipcheck-gate` when enabled — to a named executor independently. This is
+stage-scoped, not role-scoped: there is no `role_executors:` key. A single run
+SHALL be able to use different executors for different stages. A stage with no
+assigned executor SHALL run through the existing local-CLI harness, unchanged.
 
 #### Scenario: different executors for different stages in one run
 
-- **WHEN** planning is assigned `opencode-main` and `review-1`/`review-2` are assigned `local-ollama`
+- **WHEN** `.github/pipeline.yml` sets `stage_executors: { planning: opencode-main, review-1: local-ollama, review-2: local-ollama }`
 - **THEN** the planning stage SHALL be delegated to `opencode-main` and the review rounds SHALL be delegated to `local-ollama` within the same run
 
 #### Scenario: unassigned stage uses the local harness
 
-- **WHEN** only `review-1` is assigned an executor and no executor is assigned to `implementing`
+- **WHEN** `stage_executors:` assigns only `review-1` and no executor is assigned to `implementing`
 - **THEN** `implementing` SHALL run through the profile's implementer harness exactly as today
 
 #### Scenario: agent-system executor valid for any model-invoking stage
 
-- **WHEN** an `agent-system` executor is assigned to `implementing`
+- **WHEN** `stage_executors: { implementing: opencode-main }` and `opencode-main` is an `agent-system` executor
 - **THEN** the assignment SHALL be accepted and `implementing` SHALL be delegated to that provider
 
 ### Requirement: Model-endpoint executors are restricted to prompt-contained stages
@@ -65,18 +67,18 @@ This rejection SHALL occur during configuration parsing, never mid-run.
 
 #### Scenario: model-endpoint on a review stage is allowed
 
-- **WHEN** a `model-endpoint` executor is assigned to `review-2`
+- **WHEN** `stage_executors: { review-2: local-ollama }` and `local-ollama` is a `model-endpoint` executor
 - **THEN** `resolveConfig()` SHALL accept the assignment
 
 #### Scenario: model-endpoint on an execution-environment stage is rejected at parse time
 
-- **WHEN** a `model-endpoint` executor named `local-ollama` is assigned to `implementing`
+- **WHEN** `stage_executors: { implementing: local-ollama }` and `local-ollama` is a `model-endpoint` executor
 - **THEN** `resolveConfig()` SHALL throw a parse error that names both `implementing` and `local-ollama`
 - **AND** the error SHALL be raised during configuration parsing, before any stage executes
 
 #### Scenario: agent-system on an execution-environment stage is not rejected
 
-- **WHEN** an `agent-system` executor is assigned to `implementing`
+- **WHEN** `stage_executors: { implementing: opencode-main }` and `opencode-main` is an `agent-system` executor
 - **THEN** `resolveConfig()` SHALL NOT raise the model-endpoint stage-eligibility error for that assignment
 
 ### Requirement: Endpoint executor prompts SHALL be self-contained
@@ -91,6 +93,11 @@ the repository or invoke tools.
 
 - **WHEN** `review-2` is delegated to a `model-endpoint` executor
 - **THEN** the prompt sent to the endpoint SHALL contain the PR diff (and the review context the stage needs) inline, rather than instructing the executor to read files from a worktree
+
+#### Scenario: plan-review prompt to an endpoint carries the plan and conventions inline
+
+- **WHEN** `plan-review` is delegated to a `model-endpoint` executor
+- **THEN** the prompt sent to the endpoint SHALL contain the plan text and the conventions excerpt inline, rather than instructing the executor to read files from a worktree
 
 ### Requirement: Outcome contract is enforced independently of the executor
 
@@ -157,6 +164,7 @@ to a local harness for that stage.
 
 - **WHEN** a configured executor for a stage fails preflight
 - **THEN** the pipeline SHALL NOT run the stage on `claude` or `codex` as a silent substitute; it SHALL surface the failure
+- **AND** this holds even for a review stage, where the pre-existing `review_harness` self-review fallback (#39) would otherwise apply to a missing reviewer CLI — a `stage_executors` assignment SHALL NOT route through that fallback path
 
 ### Requirement: Run evidence records the executor per stage
 

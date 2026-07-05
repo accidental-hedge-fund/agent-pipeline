@@ -277,6 +277,59 @@ review_harness:
   effort: auto
 ```
 
+### External stage executors (#314)
+
+Beyond `review_harness` (which only overrides the reviewer CLI), any model-invoking
+stage — `planning`, `implementing`, `review-1`, `review-2`, `fix-1`, `fix-2`,
+`plan-review`, and `shipcheck-gate` when enabled — can be delegated to an **external
+agent system** (OpenCode, HermesAgent, OpenClaw, or any other API-driven execution
+backend) or, for review-only stages, to a raw **model endpoint** (e.g. a local Ollama
+server). This is entirely opt-in: a repo with no `executors:`/`stage_executors:`
+block behaves exactly as today.
+
+```yaml
+executors:
+  opencode-main:
+    type: agent-system              # full execution backend — valid for ANY model-invoking stage
+    provider: opencode               # provider identifier (a plain string; not a built-in adapter)
+    endpoint: https://opencode.internal/api
+    credential: OPENCODE_API_KEY     # env-var NAME resolved at invocation time — never a literal value
+  local-ollama:
+    type: model-endpoint             # raw OpenAI-compatible chat/completions endpoint
+    base_url: http://localhost:11434/v1
+    model: llama3.1:70b
+    # no credential needed for a localhost endpoint
+
+stage_executors:
+  planning: opencode-main
+  review-1: local-ollama
+  review-2: local-ollama
+```
+
+Key rules:
+
+- **`agent-system`** executors may be assigned to any model-invoking stage. The
+  pipeline `POST`s `{ stage, prompt }` to `endpoint` (with an `authorization: Bearer
+  <credential>` header when `credential` is set) and expects `{ "output": "<text>" }`
+  back; that text flows through the exact same downstream parsing (including
+  `parseStructuredVerdict` for review stages) as a local CLI's stdout.
+- **`model-endpoint`** executors are valid **only** for the prompt-contained stages
+  `plan-review`, `review-1`, `review-2` — a raw endpoint has no repo/tool access, and
+  these are the only stages whose prompt already carries all the context needed
+  (diff, plan text, conventions excerpt) inline. Assigning one to `planning`,
+  `implementing`, `fix-1`, `fix-2`, or `shipcheck-gate` is rejected **at
+  config-parse time**, naming both the offending stage and executor — never
+  discovered mid-run.
+- Credentials are **references** (an env-var name), resolved from the environment
+  only at invocation time; the value is never written to `pipeline.yml` or emitted
+  in run evidence.
+- A misconfigured, unreachable, or non-compliant executor **blocks the item** with
+  an error naming the stage and provider — there is no silent fallback to the local
+  `claude`/`codex` harness (this is distinct from, and takes priority over, the
+  `review_harness` self-review fallback above, which never applies to a
+  `stage_executors` assignment).
+- Run evidence records which executor (and, for `model-endpoint`, which model)
+  ran each delegated stage.
 ## Conventions & carry-forward lessons
 
 `readConventions` reads the target repo's conventions file (`conventions_md_path`, else `CLAUDE.md` on this host) and injects an excerpt into **every** stage prompt — planning, plan-review, plan-revision, implementing, both review rounds, and both fix rounds — via the `{{conventions}}` placeholder. This makes the conventions file the natural home for **carry-forward lessons**: a maintainer-curated `## Lessons / Gotchas` section (or a dedicated lessons file pointed at by `conventions_md_path`) recording recurring findings and repo-specific hazards. It is ordinary conventions text, so it rides the existing injection with **no extra config key, store, or flag** beyond the `conventions_md_path` / `CLAUDE.md` default.

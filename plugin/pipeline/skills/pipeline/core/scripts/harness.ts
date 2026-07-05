@@ -46,6 +46,14 @@ export interface HarnessResult {
   duration: number; // seconds
   timed_out: boolean;
   spawn_error?: boolean; // true when the process could not be spawned at all
+  // External stage executor evidence (#314). Populated only when the result
+  // came from `executors.ts`'s dispatch path (a `stage_executors:` assignment),
+  // never for the local claude/codex/custom-reviewer-CLI branches above. Read by
+  // accounting/evidence recording so a delegated stage's executor/provider(/model)
+  // is recorded alongside the existing harness/model fields.
+  executor_name?: string;
+  executor_provider?: string; // agent-system: provider id; model-endpoint: base_url
+  executor_model?: string; // model-endpoint only
 }
 
 export interface InvokeOptions {

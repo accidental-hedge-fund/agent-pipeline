@@ -33,6 +33,7 @@ import {
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { expandAutoEffort } from "../stage-routing.ts";
+import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   branchName,
   createWorktree,
@@ -201,6 +202,9 @@ export interface AdvanceOpts {
   /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
    *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
   runStoreDeps?: RunStoreDeps;
+  /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
+   *  supply a fake `fetchImpl` so no real network call is made. */
+  executorHttpDeps?: ExecutorHttpDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,13 +571,35 @@ export async function runPlanningPhases(
     // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
     // with a structured review_harness.effort override taking precedence when set.
     const planReviewEffort = expandAutoEffort(cfg.harnesses.reviewerEffort, "plan-review", "claude") ?? cfg.plan_review_effort;
+    // External stage executor delegation (#314): a `stage_executors` assignment
+    // for plan-review bypasses the local reviewer harness (and its #39
+    // self-review fallback) entirely — a deliberate operator choice, never
+    // silently degraded.
+    const planReviewAssignment = resolveStageExecutor(cfg, "plan-review");
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
-        timeoutSec: cfg.plan_review_timeout,
-        model: planReviewModel,
-        reasoningEffort: planReviewEffort,
-        accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
-      });
+      planReviewAssignment
+        ? {
+            result: (await invokeStageExecutor(
+              "plan-review",
+              cfg,
+              reviewPrompt,
+              {
+                timeoutSec: cfg.plan_review_timeout,
+                accounting: opts.runDir
+                  ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "plan-review", modelSlot: "review" }
+                  : undefined,
+              },
+              opts.executorHttpDeps,
+            ))!,
+            effectiveReviewer: planReviewAssignment.name,
+            selfReview: false,
+          }
+        : await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
+            timeoutSec: cfg.plan_review_timeout,
+            model: planReviewModel,
+            reasoningEffort: planReviewEffort,
+            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
+          });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
@@ -984,18 +1010,34 @@ export function makeOpenspecPlanningHooks(
 
       const inv = deps.invoke ?? invoke;
       const planModel = opts.model ?? innerCfg.models.planning;
-      const planResult = await inv(
-        primary,
-        wt.path,
-        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId }),
-        {
-          timeoutSec: innerCfg.implementation_timeout,
-          model: planModel,
-          reasoningEffort: innerCfg.effort?.planning,
-          sandbox: innerCfg.harness_sandbox,
-          accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
-        },
-      );
+      const openspecPlanPrompt = buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId });
+      // External stage executor delegation (#314) — see invokePlanStep's comment;
+      // this is the OpenSpec-flow equivalent of the same "planning" call.
+      const planResult =
+        (await invokeStageExecutor(
+          "planning",
+          innerCfg,
+          openspecPlanPrompt,
+          {
+            timeoutSec: innerCfg.implementation_timeout,
+            accounting: opts.runDir
+              ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "planning", modelSlot: "planning" }
+              : undefined,
+          },
+          opts.executorHttpDeps,
+        )) ??
+        (await inv(
+          primary,
+          wt.path,
+          openspecPlanPrompt,
+          {
+            timeoutSec: innerCfg.implementation_timeout,
+            model: planModel,
+            reasoningEffort: innerCfg.effort?.planning,
+            sandbox: innerCfg.harness_sandbox,
+            accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
+          },
+        ));
       if (!planResult.success) {
         const reason = planResult.timed_out
           ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
@@ -1153,6 +1195,24 @@ export function makeOpenspecPlanningHooks(
     // Freeform does not implement this hook and falls back to invokePlanStep,
     // which uses cfg.repo_dir for non-sandboxed runs.
     async invokeRevision(primary, wt, prompt, innerCfg, opts, deps, issueNumber) {
+      // External stage executor delegation (#314) — see invokePlanStep's
+      // comment: revision is planning-role work and resolves the "planning"
+      // assignment, regardless of the "plan-review" accounting label below.
+      if (issueNumber !== undefined) {
+        const delegated = await invokeStageExecutor(
+          "planning",
+          innerCfg,
+          prompt,
+          {
+            timeoutSec: innerCfg.implementation_timeout,
+            accounting: opts.runDir
+              ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "plan-review", modelSlot: "planning" }
+              : undefined,
+          },
+          opts.executorHttpDeps,
+        );
+        if (delegated) return delegated;
+      }
       const inv = deps.invoke ?? invoke;
       return inv(primary, wt.path, prompt, {
         timeoutSec: innerCfg.implementation_timeout,
@@ -1462,6 +1522,25 @@ export async function invokeImplementer(
   deps: ImplementerInvokeDeps = {},
   accounting?: InvokeAccountingStage,
 ): Promise<HarnessResult> {
+  // External stage executor delegation (#314): "implementing" is an
+  // execution-environment stage — only an `agent-system` executor can be
+  // assigned here (config.ts rejects a `model-endpoint` assignment at parse
+  // time), so no model-endpoint branching is needed at this call site.
+  if (accounting) {
+    const delegated = await invokeStageExecutor(
+      "implementing",
+      cfg,
+      prompt,
+      {
+        timeoutSec: cfg.implementation_timeout,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: accounting.issue, stage: accounting.stage, modelSlot: "implementing" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    if (delegated) return delegated;
+  }
   const inv = deps.invoke ?? invoke;
   const model = opts.model ?? cfg.models.implementing;
   return inv(harness, wtPath, prompt, {
@@ -1503,6 +1582,27 @@ export async function invokePlanStep(
   deps: PlanStepDeps = {},
   accounting?: InvokeAccountingStage,
 ): Promise<HarnessResult> {
+  // External stage executor delegation (#314): this seam authors/revises the
+  // PLAN — implementer/planning-role work regardless of whether the call is
+  // logged under the "planning" or "plan-review" accounting stage (a revision
+  // is still planning work; the actual reviewing call is wired separately in
+  // runPlanningPhases). It therefore always resolves the "planning" assignment,
+  // never "plan-review" (that name is reserved for the reviewer call).
+  if (accounting) {
+    const delegated = await invokeStageExecutor(
+      "planning",
+      cfg,
+      prompt,
+      {
+        timeoutSec: cfg.implementation_timeout,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: accounting.issue, stage: accounting.stage, modelSlot: "planning" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    if (delegated) return delegated;
+  }
   const inv = deps.invoke ?? invoke;
   const dir = (cfg.harness_sandbox && harness === "claude") ? wtPath : cfg.repo_dir;
   const model = opts.model ?? cfg.models.planning;

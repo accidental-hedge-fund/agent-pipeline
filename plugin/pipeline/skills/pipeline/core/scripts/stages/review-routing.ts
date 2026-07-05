@@ -20,7 +20,11 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import { formatStderrExcerpt } from "../harness.ts";
+<<<<<<< HEAD
 import { expandAutoEffort } from "../stage-routing.ts";
+=======
+import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
+>>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
 import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
@@ -93,6 +97,9 @@ export interface AdvanceReviewOpts {
   runStoreDeps?: RunStoreDeps;
   /** Pre-rendered context snapshot block for prompt injection (#318). Set internally by advanceReview. */
   contextSnapshot?: string;
+  /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
+   *  supply a fake `fetchImpl` so no real network call is made. */
+  executorHttpDeps?: ExecutorHttpDeps;
 }
 
 /**
@@ -441,13 +448,21 @@ export async function advanceReview(
     const composite = `${rec.key}\0${rec.payload_fingerprint}`;
     if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
   }
+<<<<<<< HEAD
   const reviewerModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+=======
+  const reviewerModel = result.executor_model ?? (opts.model ?? cfg.models.review);
+  const executorEvidence = result.executor_name
+    ? { executorProvider: result.executor_provider, executorModel: result.executor_model }
+    : {};
+>>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
 
   if (verdict.verdict === "approve") {
     if (opts.stateDir) {
       await recordReview(opts.stateDir, issueNumber, {
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
         findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+        ...executorEvidence,
       }).catch(() => {});
     }
     if (opts.runDir) {
@@ -486,6 +501,7 @@ export async function advanceReview(
       await recordReview(opts.stateDir, issueNumber, {
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
         findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+        ...executorEvidence,
       }).catch(() => {});
     }
     if (opts.runDir) {
@@ -523,6 +539,7 @@ export async function advanceReview(
     await recordReview(opts.stateDir, issueNumber, {
       round, sha: commitSha, verdict: verdict.verdict, findingCounts,
       findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+      ...executorEvidence,
     }).catch(() => {});
   }
   if (opts.runDir) {
@@ -926,17 +943,24 @@ export async function invokePromptHarnessReview(
 ): Promise<ReviewerInvocation> {
   const specContext = openspecContextFromDiff(cfg, cwd, diffFilePaths(diff));
   const contextSnapshot = opts.contextSnapshot;
+  const stageName: "review-1" | "review-2" = round === 1 ? "review-1" : "review-2";
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext, contextSnapshot })
     : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext, contextSnapshot });
+
+  // External stage executor delegation (#314): a `stage_executors` assignment
+  // for this round bypasses the local reviewer harness (and its #39 self-review
+  // fallback) entirely — a deliberate operator choice never silently degraded.
+  const assignment = resolveStageExecutor(cfg, stageName);
   if (opts.stateDir) {
     await recordPrompt(
       opts.stateDir,
       issueNumber,
       `review-${round}`,
-      makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", cfg.harnesses.reviewer, prompt),
+      makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", assignment?.name ?? cfg.harnesses.reviewer, prompt),
     ).catch(() => {});
   }
+<<<<<<< HEAD
   const model = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
   // effort.review (and a structured review_harness.effort override) are left
   // as-authored through config resolution because they back both review
@@ -946,6 +970,28 @@ export async function invokePromptHarnessReview(
     round === 1 ? "review-1" : "review-2",
     "claude",
   );
+=======
+  const model = opts.model ?? cfg.models.review;
+  if (assignment) {
+    const result = await invokeStageExecutor(
+      stageName,
+      cfg,
+      prompt,
+      {
+        timeoutSec: cfg.review_timeout,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: `review-${round}`, modelSlot: "review" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    // `result` is non-null: `assignment` is only set when resolveStageExecutor
+    // found a `stage_executors` entry, which is exactly invokeStageExecutor's
+    // "have an assignment" precondition for returning non-null.
+    return { result: result!, effectiveReviewer: assignment.name, selfReview: false };
+  }
+
+>>>>>>> 351f7bb (feat(pipeline): external stage executors — per-stage delegation to agent-system/model-endpoint providers (#314))
   return invokeReviewer(cfg.harnesses.reviewer, cfg.harnesses.implementer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
     model,

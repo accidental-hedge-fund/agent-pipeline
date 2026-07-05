@@ -107,28 +107,21 @@ excerpt directly in the prompt (the review prompts already assemble most of this
 The prompt contract for these stages must not assume the executor can open files —
 the same assumption the current `review_harness` shim relies on.
 
-## Open question — executor assignment scope (blocks implementation)
+## Decision — executor assignment scope: stage-scoped, key `stage_executors:`
 
-The issue leaves one decision open, and it gates the concrete config surface:
+Resolved during plan-review (codex verdict, 2026-07-05T19:03:08Z — see the
+"Plan Review" comment on #314): **stage-scoped**, config key `stage_executors:`,
+keyed by the exact `Stage` string (`planning`, `plan-review`, `implementing`,
+`review-1`, `fix-1`, `review-2`, `fix-2`, `shipcheck-gate`). Rationale accepted
+from the review: the issue and this spec already require each stage to be
+assignable independently (`plan-review` may want a different executor than
+`review-1`/`review-2`, which role-scoping cannot express), and the
+`model-endpoint` stage-eligibility matrix above is inherently stage-granular —
+stage-scoped keys let the config parser express and enforce it directly, with no
+role→stage indirection to reconcile. `role_executors:` is rejected; there is no
+role-scoped alternative in this change.
 
-- **Role-scoped** (`role_executors: { implementer: opencode-main, reviewer:
-  local-ollama }`) — smaller surface, but cannot give `plan-review` a different
-  executor than `review-1`/`review-2`, and cannot split `planning` from
-  `implementing`.
-- **Stage-scoped** (`stage_executors: { planning: opencode-main, review-1:
-  local-ollama, review-2: local-ollama }`) — finer control, one key per stage,
-  larger surface; the stage-eligibility matrix above is naturally expressed here.
-
-The behavioral requirements in `specs/external-stage-executors/spec.md` are written
-to hold under **either** choice (they say "each model-invoking stage SHALL be
-assignable to a named executor", which role-scoping satisfies by mapping a role to
-its stages). The recommended default is **stage-scoped**, because the
-`model-endpoint` eligibility rule is inherently stage-granular and because
-`plan-review` and the review rounds are the same role yet may want different
-executors. Final call deferred to @comamitc. Implementation planning MUST NOT begin
-until the scope is chosen; a follow-up amendment will pin the exact key shape.
-
-Illustrative (non-normative) config once the scope is decided:
+Config surface:
 
 ```yaml
 executors:
@@ -143,12 +136,74 @@ executors:
     model: llama3.1:70b
     # no credential for a localhost endpoint
 
-# assignment — shape pending the scope decision above
 stage_executors:
   planning: opencode-main
   review-1: local-ollama
   review-2: local-ollama
 ```
+
+## External agent-system API contract
+
+Defined here (not negotiated with or discovered from the provider — providers are
+addressed by a plain identifier string, not a provider-specific adapter; an
+operator pointing `provider:` at OpenCode/HermesAgent/OpenClaw is responsible for
+fronting that system with an endpoint that speaks this contract, e.g. a thin
+shim):
+
+- **Request**: `POST <endpoint>` with JSON body `{ "stage": "<stage-name>",
+  "prompt": "<full prompt text>" }` and header `content-type: application/json`.
+  When `credential` is set, header `authorization: Bearer <resolved-value>` is
+  added. No other headers are sent.
+- **Response**: `2xx` with JSON body `{ "output": "<full stdout-equivalent
+  text>" }`. `output` becomes the harness's `stdout` and flows through the exact
+  same downstream parsing (`parseStructuredVerdict` for review stages) as a local
+  CLI's stdout. A non-2xx response, a network error, or a response that fails to
+  parse as JSON with a string `output` field is a contract violation.
+- **Timeout**: the stage's existing configured timeout (`review_timeout`,
+  `plan_review_timeout`, `implementation_timeout`, `fix_timeout`) bounds the
+  request; on expiry the pipeline aborts the request and treats it as a timed-out
+  harness failure, exactly like a local CLI timeout.
+- **model-endpoint contract**: standard OpenAI-compatible
+  `POST <base_url>/chat/completions` with `{ "model": "<model>", "messages":
+  [{ "role": "user", "content": "<prompt>" }] }`; response
+  `choices[0].message.content` becomes `stdout`. Same auth-header and timeout
+  rules as above.
+
+## Preflight — two phases, not one
+
+Plan-review correctly flagged that "non-compliant result" cannot be proven before
+a real invocation. Preflight is split:
+
+- **Before the stage runs** (`preflightExecutor`): configuration completeness,
+  credential-env-var presence (if `credential` is declared, the named env var
+  must be set and non-empty), and endpoint reachability (a bounded HTTP probe).
+  Failure here blocks the item before any prompt is sent — named stage + provider,
+  no fallback.
+- **After invocation** (unchanged, existing machinery): the stage's normal
+  outcome-contract enforcement (`parseStructuredVerdict` + review-policy for
+  review stages) runs on whatever the executor returned. A schema-non-compliant
+  result is a contract violation handled by that existing path, not a new
+  preflight phase — there is no dry-run/contract-probe mode to invoke.
+
+## No fallback for `stage_executors` (distinct from the legacy `review_harness` self-review fallback)
+
+The existing `review_harness` self-review fallback (#39, `self-review.ts`) applies
+only when the reviewer CLI cannot be spawned (`spawn_error`) and predates
+`stage_executors`. A `stage_executors` assignment is the operator's deliberate,
+explicit choice; the executor dispatch path (`executors.ts`) never sets
+`spawn_error`, and stage call sites route a `stage_executors`-assigned stage
+directly to the executor dispatcher instead of through `invokeReviewer` — so the
+self-review fallback structurally cannot trigger for an externally-delegated
+stage. A preflight or invocation failure blocks the item with a named error
+instead.
+
+## Dependency seam for HTTP calls
+
+`executors.ts` takes an injectable `{ fetchImpl?: typeof fetch }` deps bag
+(defaulting to the global `fetch`), mirroring the repo's `Deps`-parameter
+convention (`gh`/harness/worktree fakes). Unit tests inject a fake `fetchImpl`
+that never performs real network I/O, including a "fetch throws/rejects" case
+proving the unreachable-provider path fails without a live network dependency.
 
 ## Risks / Trade-offs
 

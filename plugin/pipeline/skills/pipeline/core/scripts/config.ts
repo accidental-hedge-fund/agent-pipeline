@@ -6,7 +6,14 @@ import { parseDocument, isMap, isSeq, type YAMLSeq } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DEFAULT_CONFIG, STAGES, type Harness, type PipelineConfig } from "./types.ts";
+import {
+  DEFAULT_CONFIG,
+  STAGES,
+  MODEL_INVOKING_STAGES,
+  EXECUTION_ENVIRONMENT_STAGES,
+  type Harness,
+  type PipelineConfig,
+} from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 import { expandAutoEffort, expandAutoModel } from "./stage-routing.ts";
 
@@ -40,6 +47,36 @@ function flattenIssues(issues: readonly z.core.$ZodIssue[], basePath: (string | 
   }
   return out;
 }
+
+// External stage executors (#314). `agent-system` = a full execution backend
+// (OpenCode/HermesAgent/OpenClaw) addressed by provider id + endpoint, valid for
+// any model-invoking stage. `model-endpoint` = a raw OpenAI-compatible
+// chat/completions endpoint (e.g. local Ollama), valid only for prompt-contained
+// stages — enforced by `validateStageExecutorAssignments` below, not by this
+// schema (the eligibility rule depends on which stage a name is assigned to,
+// which this per-definition schema cannot see).
+const AgentSystemExecutorSchema = z
+  .object({
+    type: z.literal("agent-system"),
+    provider: z.string().describe("Provider identifier (e.g. 'opencode', 'hermesagent', 'openclaw')."),
+    endpoint: z.string().describe("API endpoint URL that speaks the pipeline's executor contract."),
+    credential: z.string().optional().describe("Env-var name (or secret reference) resolved at invocation time — never a literal secret value."),
+  })
+  .strict();
+
+const ModelEndpointExecutorSchema = z
+  .object({
+    type: z.literal("model-endpoint"),
+    base_url: z.string().describe("Base URL of an OpenAI-compatible chat/completions endpoint (e.g. http://localhost:11434/v1)."),
+    model: z.string().describe("Model name passed in the chat/completions request."),
+    credential: z.string().optional().describe("Env-var name (or secret reference) resolved at invocation time — never a literal secret value."),
+  })
+  .strict();
+
+const ExecutorDefinitionSchema = z.discriminatedUnion("type", [
+  AgentSystemExecutorSchema,
+  ModelEndpointExecutorSchema,
+]);
 
 const PartialConfigSchema = z.object({
   repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value)."),
@@ -341,9 +378,53 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Cross-repo dependency map: declares inter-repo relationships for planning context and roadmap cross-repo dependency annotations (#312)."),
+  // External stage executors (#314). Opt-in; both keys absent means every
+  // model-invoking stage runs through the local claude/codex harness exactly as
+  // today. `executors:` declares named provider/endpoint definitions;
+  // `stage_executors:` assigns a defined name to a specific stage. The
+  // model-endpoint-vs-execution-environment eligibility rule is enforced by
+  // `validateStageExecutorAssignments` at parse time (not expressible in this
+  // structural schema, since it depends on the *combination* of the two blocks).
+  executors: z
+    .record(z.string(), ExecutorDefinitionSchema)
+    .optional()
+    .describe("Named executor definitions (agent-system or model-endpoint) that stage_executors can reference by name."),
+  stage_executors: z
+    .partialRecord(z.enum(MODEL_INVOKING_STAGES), z.string())
+    .optional()
+    .describe("Assigns a named executor (from executors:) to a model-invoking stage, delegating that stage's execution to it instead of the local harness."),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
+
+const EXECUTION_ENVIRONMENT_STAGE_SET = new Set<string>(EXECUTION_ENVIRONMENT_STAGES);
+
+/**
+ * Enforce the model-endpoint / execution-environment stage-eligibility matrix
+ * (#314) at config-parse time, never mid-run: every `stage_executors:` name
+ * must exist in `executors:`, and a `model-endpoint`-type executor may only be
+ * assigned to a prompt-contained stage. Throws a single Error naming the
+ * offending stage + executor on the first violation found; a no-op when either
+ * block is absent (parity with pre-#314 configs).
+ */
+function validateStageExecutorAssignments(fileConfig: PartialConfig): void {
+  if (!fileConfig.stage_executors) return;
+  for (const [stage, name] of Object.entries(fileConfig.stage_executors)) {
+    const definition = fileConfig.executors?.[name];
+    if (!definition) {
+      throw new Error(
+        `stage_executors.${stage} references unknown executor "${name}" — add it under executors:`,
+      );
+    }
+    if (definition.type === "model-endpoint" && EXECUTION_ENVIRONMENT_STAGE_SET.has(stage)) {
+      throw new Error(
+        `stage "${stage}" cannot be assigned model-endpoint executor "${name}" — model-endpoint ` +
+          `executors are only valid for prompt-contained stages (plan-review, review-1, review-2); ` +
+          `"${stage}" requires repo/tool access and needs an agent-system executor or the local harness`,
+      );
+    }
+  }
+}
 
 export interface ResolveOptions {
   repoPath?: string;        // path to the target repo's working tree
@@ -404,6 +485,19 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         }
       } else {
         fileConfig = result.data;
+        try {
+          validateStageExecutorAssignments(fileConfig);
+        } catch (err) {
+          const message = (err as Error).message;
+          if (opts.tolerateInvalidConfig) {
+            if (!opts.quiet) {
+              console.warn(`[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${message}`);
+            }
+            fileConfig = { ...fileConfig, executors: undefined, stage_executors: undefined };
+          } else {
+            throw new Error(`Invalid ${configPath}: ${message}`);
+          }
+        }
       }
     }
   }
@@ -613,6 +707,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       depended_on_by: fileConfig.repo_map?.depended_on_by ?? DEFAULT_CONFIG.repo_map.depended_on_by,
     },
     event_sink: eventSink,
+    executors: fileConfig.executors ?? DEFAULT_CONFIG.executors,
+    stage_executors: fileConfig.stage_executors ?? DEFAULT_CONFIG.stage_executors,
   };
   if (!opts.quiet) {
     warnInertModelAliases(fileConfig.models, merged.harnesses);
@@ -1156,6 +1252,19 @@ export function validateConfig(
     }
   }
 
+  // 7. Stage-executor eligibility (#314) — same rule resolveConfig() throws on;
+  // surfaced here as a diagnostic instead so `pipeline config validate`/`sync`
+  // never throw.
+  try {
+    validateStageExecutorAssignments(fileConfig);
+  } catch (err) {
+    diagnostics.push({
+      severity: "error",
+      path: "stage_executors",
+      message: (err as Error).message,
+    });
+  }
+
   const hasError = diagnostics.some((d) => d.severity === "error");
   return { valid: !hasError, diagnostics };
 }
@@ -1479,6 +1588,28 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   depends_on: [] # owner/repo strings this repo consumes (e.g. - acme/shared-lib)",
         "#   depended_on_by: [] # owner/repo strings that consume this repo (e.g. - acme/consumer-app)",
       ].join("\n"),
+    config.executors !== undefined ? `\nexecutors:\n${yamlBlock(config.executors, 2)}` : undefined,
+    config.stage_executors !== undefined ? `\nstage_executors:\n${yamlBlock(config.stage_executors, 2)}` : undefined,
+    config.executors === undefined && config.stage_executors === undefined
+      ? [
+        "",
+        "# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint",
+        "#   opencode-main:",
+        "#     type: agent-system # full execution backend (OpenCode/HermesAgent/OpenClaw), valid for any model-invoking stage",
+        "#     provider: opencode",
+        "#     endpoint: https://opencode.internal/api",
+        "#     credential: OPENCODE_API_KEY # env-var NAME resolved at invocation time — never a literal secret value",
+        "#   local-ollama:",
+        "#     type: model-endpoint # raw OpenAI-compatible chat/completions endpoint; valid ONLY for plan-review/review-1/review-2",
+        "#     base_url: http://localhost:11434/v1",
+        "#     model: llama3.1:70b",
+        "# stage_executors: # assign a name from executors: to a model-invoking stage; unassigned stages use the local claude/codex harness unchanged",
+        "#   planning: opencode-main",
+        "#   review-1: local-ollama",
+        "#   review-2: local-ollama",
+        "#   Known model-invoking stages: planning, plan-review, implementing, review-1, fix-1, review-2, fix-2, shipcheck-gate",
+      ].join("\n")
+      : undefined,
   ].filter((line): line is string => line !== undefined);
 
   return `${parts.join("\n")}\n`;
@@ -1532,6 +1663,8 @@ function normalizeForSync(config: PartialConfig): unknown {
     context_snapshot: config.context_snapshot,
     repo_map: config.repo_map,
     event_sink: config.event_sink,
+    executors: config.executors,
+    stage_executors: config.stage_executors,
   };
 }
 

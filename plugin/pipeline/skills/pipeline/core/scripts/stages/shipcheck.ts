@@ -28,6 +28,7 @@ import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInW
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle, patchBundleIdentity as defaultPatchBundleIdentity } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
+import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import { substitute } from "../prompts/index.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
@@ -252,6 +253,9 @@ export interface AdvanceShipcheckOpts {
   runDir?: string;
   /** Run-store deps carrying `stdoutWrite` for streaming events. */
   runStoreDeps?: RunStoreDeps;
+  /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
+   *  supply a fake `fetchImpl` so no real network call is made. */
+  executorHttpDeps?: ExecutorHttpDeps;
 }
 
 function eventTimestamp(): string {
@@ -568,7 +572,25 @@ export async function advance(
     }
 
     let result: { stdout: string; success: boolean; timed_out?: boolean; stderr?: string };
-    if (deps.invokeReviewer) {
+    // External stage executor delegation (#314): shipcheck-gate is an
+    // execution-environment stage — only an `agent-system` executor can be
+    // assigned here (config.ts rejects a `model-endpoint` assignment at parse
+    // time), so no model-endpoint branching is needed at this call site.
+    const delegated = await invokeStageExecutor(
+      "shipcheck-gate",
+      cfg,
+      prompt,
+      {
+        timeoutSec,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "shipcheck-gate", modelSlot: "review" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    if (delegated) {
+      result = { stdout: delegated.stdout, success: delegated.success, timed_out: delegated.timed_out, stderr: delegated.stderr };
+    } else if (deps.invokeReviewer) {
       result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
     } else {
       const model = cfg.models.review;

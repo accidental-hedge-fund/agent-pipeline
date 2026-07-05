@@ -3467,3 +3467,111 @@ test("advanceReview: dry-run skips postComment and setBlocked for unacknowledged
   assert.equal(rec.comments.length, 0, "postComment must NOT be called in dry-run");
   assert.equal(rec.blocked.length, 0, "setBlocked must NOT be called in dry-run");
 });
+
+// ---------------------------------------------------------------------------
+// External stage executor delegation (#314) — exercises the REAL
+// invokePromptHarnessReview path (deps.runReview is intentionally left
+// unset), proving: dispatch via a fake HTTP fetch, the self-contained diff
+// prompt, the unchanged parseStructuredVerdict/review-policy outcome contract,
+// and that the #39 self-review fallback never applies to a `stage_executors`
+// assignment.
+// ---------------------------------------------------------------------------
+
+const DIFF_MARKER = "+const delegatedChange = 1;";
+
+function makeDelegationDeps(): { deps: AdvanceReviewDeps; rec: Recorder } {
+  const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], comments: [], prComments: [] };
+  const deps: AdvanceReviewDeps = {
+    getPrForIssue: async () => 123,
+    getPrDiff: async () => `diff --git a/x.ts b/x.ts\n${DIFF_MARKER}`,
+    getPrDetail: async () => ({ head_sha: "f".repeat(40) }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getPrDetail"]>>>,
+    getIssueDetail: async () =>
+      ({
+        number: 1, type: "issue", title: "Title", body: "Body", state: "open",
+        url: "https://example.test/1", labels: [], comments: [],
+      }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>,
+    getForIssue: async () => null,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    postPrComment: async (_cfg, _pr, body) => { rec.prComments.push(body); },
+    transition: async (_cfg, _n, _from, to) => { rec.transitions.push({ to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push(reason); },
+    getGhActor: async () => TEST_ACTOR,
+    // runReview intentionally omitted — exercises the real defaultRunReview /
+    // invokePromptHarnessReview path, including its executor-resolution branch.
+  };
+  return { deps, rec };
+}
+
+function delegationCfg(): PipelineConfig {
+  return {
+    ...cfg,
+    repo: "acme/widget",
+    stage_executors: { "review-1": "local-ollama" },
+    executors: {
+      "local-ollama": { type: "model-endpoint", base_url: "http://localhost:11434/v1", model: "llama3.1:70b" },
+    },
+  } as unknown as PipelineConfig;
+}
+
+test("advanceReview (#314): review-1 delegated to a model-endpoint executor dispatches via fetch, self-contained prompt, verdict contract unchanged", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  let capturedBody = "";
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = String((init?.body as string) ?? "");
+    return new Response(JSON.stringify({ choices: [{ message: { content: APPROVE } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, true);
+  assert.equal(outcome!.to, "review-2");
+  assert.deepEqual(rec.blocked, [], "a valid delegated verdict must not block");
+  // Self-contained prompt: the PR diff is embedded inline in the outbound request body.
+  const parsedBody = JSON.parse(capturedBody);
+  assert.match(parsedBody.messages[0].content, new RegExp(DIFF_MARKER.replace(/[+]/g, "\\+")));
+  // No self-review banner — this was a deliberate executor delegation, not a #39 fallback.
+  assert.ok(!/Same-harness self-review/.test(rec.comments[0]));
+  assert.match(rec.comments[0], /local-ollama/);
+});
+
+test("advanceReview (#314): a malformed (non-JSON-verdict) executor response is a contract violation, not a soft pass — same needs-attention+0-findings gate as a local reviewer", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  // The endpoint returns HTTP 200 with prose (not a JSON verdict) — a contract
+  // violation caught by the SAME parseStructuredVerdict fallback + zero-findings
+  // gate that guards a local reviewer's malformed output (#45), not a distinct
+  // executor-only code path.
+  const fetchImpl = (async () => new Response(JSON.stringify({ choices: [{ message: { content: "just some prose, not a verdict" } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /zero enumerated findings/);
+});
+
+test("advanceReview (#314): unreachable executor blocks before dispatch — no silent fallback to the local reviewer", async (t) => {
+  const { deps, rec } = makeDelegationDeps();
+  let postDispatched = false;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    if (init?.method === "POST") postDispatched = true;
+    throw new Error("ECONNREFUSED");
+  }) as unknown as typeof fetch;
+
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(delegationCfg(), 1, 1, { executorHttpDeps: { fetchImpl } }, 0, deps);
+  });
+
+  assert.equal(outcome!.advanced, false);
+  assert.equal(postDispatched, false, "preflight failure must block before the prompt is ever POSTed");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /local-ollama/);
+  assert.match(rec.blocked[0], /review-1/);
+  assert.ok(!/Same-harness self-review/.test(JSON.stringify(rec)), "no #39 self-review fallback for a stage_executors assignment");
+});

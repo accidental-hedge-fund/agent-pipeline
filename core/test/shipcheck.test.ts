@@ -2094,3 +2094,61 @@ test("shipcheck-gate #317 review-3-F2: orphaned first marker + subsequent valid 
   assert.equal(log.blocked.length, 0);
   assert.ok(!log.transitions.some((t) => t.to === "pre-merge"), "must NOT transition to pre-merge again");
 });
+
+// ---------------------------------------------------------------------------
+// External stage executor delegation (#314) — shipcheck-gate delegated to an
+// agent-system executor bypasses the local reviewer/deps.invokeReviewer seam
+// entirely.
+// ---------------------------------------------------------------------------
+
+function delegatedShipcheckCfg(overrides: Partial<PipelineConfig["shipcheck_gate"]> = {}): PipelineConfig {
+  const base = baseCfg(overrides);
+  return {
+    ...base,
+    stage_executors: { "shipcheck-gate": "opencode-main" },
+    executors: {
+      "opencode-main": { type: "agent-system", provider: "opencode", endpoint: "https://opencode.internal/api" },
+    },
+  } as unknown as PipelineConfig;
+}
+
+test("shipcheck-gate (#314): delegated to an agent-system executor dispatches via fetch, never calls deps.invokeReviewer", async () => {
+  const log = makeCallLog();
+  let localReviewerCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => { localReviewerCalled = true; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+  let capturedBody: Record<string, unknown> = {};
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = JSON.parse((init?.body as string) ?? "{}");
+    return new Response(JSON.stringify({ output: fencedJson(PASS_VERDICT) }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const out = await advance(delegatedShipcheckCfg(), 42, { executorHttpDeps: { fetchImpl } }, deps);
+
+  assert.equal(localReviewerCalled, false, "deps.invokeReviewer must never be called when shipcheck-gate is delegated");
+  assert.equal(capturedBody.stage, "shipcheck-gate");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "ready-to-deploy");
+  assert.equal(log.blocked.length, 0);
+});
+
+test("shipcheck-gate (#314): unreachable executor blocks with a named stage+provider error — no silent fallback", async () => {
+  const log = makeCallLog();
+  let localReviewerCalled = false;
+  const deps: ShipcheckDeps = {
+    ...makeDeps(log, ""),
+    invokeReviewer: async () => { localReviewerCalled = true; return { stdout: fencedJson(PASS_VERDICT), success: true }; },
+  };
+  const fetchImpl = (async () => {
+    throw new Error("ECONNREFUSED");
+  }) as unknown as typeof fetch;
+
+  const out = await advance(delegatedShipcheckCfg({ mode: "gate" }), 42, { executorHttpDeps: { fetchImpl } }, deps);
+
+  assert.equal(localReviewerCalled, false, "no silent fallback to the local reviewer on preflight failure");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.match(log.blocked[0].reason, /opencode-main/);
+});
