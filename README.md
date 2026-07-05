@@ -649,13 +649,20 @@ ci_timeout: 900
 ci_mode: github                    # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait (see "ci_mode: local" below)
 intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
 sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
-models:                            # per-phase model alias — only the claude harness honors these
+models:                            # per-phase model alias — only the claude harness honors these. Each key also accepts "auto" (see "Auto model/effort routing").
   planning: sonnet                 # planning / implementing / fix → implementer harness
   implementing: sonnet
-  review: opus                     # review → reviewer harness
+  review: claude-fable-5           # review → reviewer harness (default)
   fix: sonnet
   intake: sonnet                   # intake spec-generation (always the claude harness; set "haiku" for max speed)
   sweep: sonnet                    # sweep spec-generation (always the claude harness)
+effort:                            # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort. Absent key: no flag (operator's global setting applies). Each key also accepts "auto".
+  planning: medium                 # implementer harness — also sources plan-review's effort (classified separately, see below)
+  implementing: low
+  review: high                     # reviewer harness — resolved round-aware (review-1 vs. review-2)
+  fix: low
+  intake: low                      # always the claude harness
+  sweep: low                       # always the claude harness
 conventions_md_path: CLAUDE.md     # excerpt embedded in prompts
 domain_name: my-service
 domain_description: a payments service
@@ -702,7 +709,8 @@ doctor:                              # deterministic preflight capability check 
 review_harness: my-reviewer          # optional: override the reviewer CLI for the review step — see "Custom reviewer harness" (default: the profile's reviewer)
 # The implementer harness is owned by the install profile and cannot be set here.
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
-# rejected at config-parse time.
+# rejected at config-parse time. `review_harness` also accepts a structured form
+# for independent reviewer model/effort control — see "Custom reviewer harness".
 harness_sandbox: false               # opt-in: true → claude implementer uses --permission-mode default instead of bypassPermissions (see "Sandboxed harness execution")
 event_sink:                          # optional: deliver run events.jsonl records to an operator-controlled forwarder — see "External event sink"
   command: "logger -t pipeline"      # forwarder command; receives each event's JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged)
@@ -724,6 +732,29 @@ When set, every review round (plan-review, review-1, review-2) invokes `my-revie
 - **Be an installed/authenticated CLI** — no API key is introduced; like `claude`/`codex`, the reviewer brings its own auth.
 
 If the configured CLI is **not installed or not executable**, the review step fails with a specific, named reason (`reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH`) and the [same-harness fallback](#prerequisites) applies — the implementing harness reviews instead, prominently labeled. When `review_harness` is absent, the profile's reviewer is used unchanged.
+
+`review_harness` also accepts a structured form to control the reviewer's model and reasoning effort independently of `models.review`/`effort.review`:
+
+```yaml
+review_harness:
+  command: claude
+  model: auto           # or an explicit alias, e.g. claude-fable-5
+  effort: auto           # or an explicit level, e.g. high
+```
+
+`model`/`effort` here take precedence over `models.review`/`effort.review` when set. `"auto"` resolves round-aware: plan-review and review-2 are classified Adversarial/Definitive (`max`), review-1 is Adversarial/Iterative (`high`) — see "Auto model/effort routing" below. The bare string shorthand (`review_harness: my-reviewer`) is unchanged and leaves the reviewer's model/effort sourced from `models.review`/`effort.review`.
+
+### Auto model/effort routing (`auto`)
+
+Every `models.*` and `effort.*` key (including the structured `review_harness.model`/`effort`) accepts the sentinel `"auto"` instead of an explicit value. `auto` is resolved at config-load time from a fixed routing table keyed on each stage's task nature and output permanence — no stage ever sees the literal string `"auto"`.
+
+| nature \ permanence | Ephemeral | Iterative | Definitive |
+|---|---|---|---|
+| **Mechanical** (implementing, fix) | gpt-5.5 / low | gpt-5.5 / low | sonnet / medium |
+| **Analytical** (planning, intake, sweep) | sonnet / low | opus / medium | claude-fable-5 / high |
+| **Adversarial** (plan-review, review-1, review-2) | claude-fable-5 / medium | claude-fable-5 / high | claude-fable-5 / max |
+
+A Mechanical stage's model forks by harness (`gpt-5.5` under the codex primary harness, `sonnet` under claude — `gpt-5.5` is codex-only) — every other cell resolves the same model regardless of harness, so an inert (harness-mismatched) `auto` result is reported exactly like an inert explicit alias (see "inert models.\* alias warning"). Adversarial stages always resolve `claude-fable-5` (the full model id — never the unrecognized short alias `fable-5`) regardless of `--profile`, so alternative-harness routing is profile-independent.
 
 ### Local CI mode (`ci_mode: local`)
 

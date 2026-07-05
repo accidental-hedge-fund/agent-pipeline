@@ -6,9 +6,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   decideExternalCommitAdvance,
   enforceFixOpenspecConsistency,
@@ -725,4 +726,24 @@ test("isCommitOnRemote: fetch failure with stale tracking ref containing the sha
   } finally {
     await cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Effort threading (#366) — advanceFix's fix-harness invoke call has no
+// injectable seam (unlike models.fix, this is pre-existing test debt shared by
+// this change's reasoningEffort addition), so this pins the source wiring
+// directly: the same invoke() call that resolves `model` from cfg.models.fix
+// must resolve `reasoningEffort` from cfg.effort.fix.
+// ---------------------------------------------------------------------------
+
+test("advanceFix: fix-harness invoke() call forwards cfg.effort.fix as reasoningEffort (#366)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const modelLineIdx = src.indexOf("const model = opts.model ?? cfg.models.fix;");
+  assert.ok(modelLineIdx !== -1, "expected the fix-round model resolution line to exist");
+  const invokeCallSlice = src.slice(modelLineIdx, modelLineIdx + 400);
+  assert.match(
+    invokeCallSlice,
+    /reasoningEffort:\s*cfg\.effort\?\.fix/,
+    "the invoke() call immediately following model resolution must forward cfg.effort?.fix as reasoningEffort",
+  );
 });

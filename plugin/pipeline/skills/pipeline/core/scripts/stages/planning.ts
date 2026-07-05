@@ -32,6 +32,7 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
+import { expandAutoEffort } from "../stage-routing.ts";
 import {
   branchName,
   createWorktree,
@@ -561,12 +562,17 @@ export async function runPlanningPhases(
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
     // the just-authored change files; freeform uses cfg.repo_dir.
     const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
+    const planReviewModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+    // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
+    // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
+    // with a structured review_harness.effort override taking precedence when set.
+    const planReviewEffort = expandAutoEffort(cfg.harnesses.reviewerEffort, "plan-review", "claude") ?? cfg.plan_review_effort;
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
       await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
         timeoutSec: cfg.plan_review_timeout,
-        model: opts.model ?? cfg.models.review,
-        reasoningEffort: "medium",
-        accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", opts.model ?? cfg.models.review),
+        model: planReviewModel,
+        reasoningEffort: planReviewEffort,
+        accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
       });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
@@ -985,6 +991,7 @@ export function makeOpenspecPlanningHooks(
         {
           timeoutSec: innerCfg.implementation_timeout,
           model: planModel,
+          reasoningEffort: innerCfg.effort?.planning,
           sandbox: innerCfg.harness_sandbox,
           accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
         },
@@ -1150,6 +1157,7 @@ export function makeOpenspecPlanningHooks(
       return inv(primary, wt.path, prompt, {
         timeoutSec: innerCfg.implementation_timeout,
         model: opts.model ?? innerCfg.models.planning,
+        reasoningEffort: innerCfg.effort?.planning,
         sandbox: innerCfg.harness_sandbox,
         accounting: issueNumber === undefined
           ? undefined
@@ -1459,6 +1467,7 @@ export async function invokeImplementer(
   return inv(harness, wtPath, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model,
+    reasoningEffort: cfg.effort?.implementing,
     sandbox: cfg.harness_sandbox,
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
@@ -1500,6 +1509,7 @@ export async function invokePlanStep(
   return inv(harness, dir, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model,
+    reasoningEffort: cfg.effort?.planning,
     sandbox: cfg.harness_sandbox,
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "planning", model)

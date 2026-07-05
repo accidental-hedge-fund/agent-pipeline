@@ -345,11 +345,12 @@ test("invoke(): a timed-out harness kills its grandchild — proves invoke() thr
 });
 
 // ---------------------------------------------------------------------------
-// reasoningEffort (#278) — codex plan-review reasoning-effort cap
+// reasoningEffort (#278, #366) — per-stage reasoning-effort override
 //
 // invoke("codex", ..., { reasoningEffort: "medium" }) must include
-// -c model_reasoning_effort=medium in the codex args; omitting reasoningEffort
-// must leave the args unchanged; and the claude harness must never include the flag.
+// -c model_reasoning_effort=medium in the codex args; invoke("claude", ...)
+// must include --effort medium instead (#366); omitting reasoningEffort must
+// leave the args unchanged for both harnesses.
 // ---------------------------------------------------------------------------
 
 test("invoke(): codex with reasoningEffort:'medium' includes -c model_reasoning_effort=medium in args (#278)", async () => {
@@ -383,7 +384,7 @@ test("invoke(): codex WITHOUT reasoningEffort has no -c model_reasoning_effort f
   }
 });
 
-test("invoke(): claude with reasoningEffort:'medium' does NOT include -c model_reasoning_effort flag (#278)", async () => {
+test("invoke(): claude with reasoningEffort:'medium' does NOT include the codex -c model_reasoning_effort flag (#278)", async () => {
   const cli = makeScript("claude", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
@@ -393,6 +394,45 @@ test("invoke(): claude with reasoningEffort:'medium' does NOT include -c model_r
   } finally {
     process.env.PATH = oldPath;
   }
+});
+
+test("invoke(): claude with reasoningEffort:'high' includes --effort high in args (#366)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "high" });
+    const lines = result.stdout.split("\n");
+    const effortIdx = lines.indexOf("--effort");
+    assert.ok(effortIdx !== -1, "--effort flag must be present in claude args");
+    assert.equal(lines[effortIdx + 1], "high", "--effort value must be 'high'");
+    const args = result.stdout.replace(/\n$/, "").split("\n");
+    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must remain the trailing positional");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): claude WITHOUT reasoningEffort has no --effort flag (#366)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", { stream: false });
+    assert.doesNotMatch(result.stdout, /--effort/, "no --effort flag when reasoningEffort is absent");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): a custom reviewer CLI ignores reasoningEffort — no --effort/-c flag emitted (#40, #366)", async () => {
+  const cli = makeScript("my-reviewer", `printf '%s\\n' "$@"`);
+  const result = await invoke(cli, tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "high" });
+  assert.doesNotMatch(result.stdout, /--effort/, "custom CLI must not receive --effort");
+  assert.doesNotMatch(result.stdout, /model_reasoning_effort/, "custom CLI must not receive -c model_reasoning_effort");
+  const args = result.stdout.replace(/\n$/, "").split("\n");
+  assert.equal(args.length, 1, "custom CLI receives only the prompt as a single positional arg");
+  assert.equal(args[0], "PROMPT-MARKER");
 });
 
 test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace period (#260)", async () => {

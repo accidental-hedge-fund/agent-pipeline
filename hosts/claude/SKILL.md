@@ -248,8 +248,13 @@ ci_poll_interval: 30
 models:                          # only the claude harness honors these; a key
   planning: sonnet               # whose role runs on codex is ignored and a
   implementing: sonnet           # config warning is printed (planning/implementing/fix
-  review: opus                   # → implementer, review → reviewer)
+  review: claude-fable-5         # → implementer, review → reviewer). Each key also accepts "auto".
   fix: sonnet
+effort:                          # per-phase reasoning effort — codex via -c model_reasoning_effort,
+  planning: medium               # claude via --effort. Absent key: no flag. Each key also accepts "auto".
+  implementing: low              # planning also sources plan-review's effort (classified separately).
+  review: high                   # review is resolved round-aware (review-1 vs. review-2).
+  fix: low
 conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library
@@ -262,6 +267,15 @@ review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the 
 ```
 
 When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). The `harnesses.implementer` is never overridable by repo config.
+
+`review_harness` also accepts a structured form for independent reviewer model/effort control, each accepting `"auto"` (resolved round-aware — plan-review/review-2 as Definitive, review-1 as Iterative):
+
+```yaml
+review_harness:
+  command: claude
+  model: auto
+  effort: auto
+```
 
 ## Conventions & carry-forward lessons
 
