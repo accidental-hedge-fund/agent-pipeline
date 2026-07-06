@@ -411,7 +411,16 @@ function combineOutput(res: { stdout: string; stderr: string }): string {
   return parts.join("\n").trim() || "(no output captured)";
 }
 
-function truncate(s: string, cap: number): string {
+// Head+tail elision (#373): eval harnesses print setup/per-case noise first and
+// the pass/fail summary last, so a head-only slice(0, cap) shows boilerplate and
+// drops the one part that tells the operator what regressed. Keep a head fragment
+// (command/setup context) and a tail fragment (summary), with the middle elided.
+export function truncate(s: string, cap: number): string {
   if (s.length <= cap) return s;
-  return s.slice(0, cap) + "\n\n[…output truncated]";
+  const headLen = Math.floor(cap / 3);
+  const tailLen = cap - headLen;
+  const dropped = s.length - cap;
+  const head = s.slice(0, headLen);
+  const tail = s.slice(s.length - tailLen);
+  return `${head}\n\n[… ${dropped} characters truncated …]\n\n${tail}`;
 }
