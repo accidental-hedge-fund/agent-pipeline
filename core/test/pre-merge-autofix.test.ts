@@ -79,9 +79,16 @@ function makeDeps(opts: {
 }): { deps: ShaGateDeps; rec: Rec } {
   const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
 
+  // The authoritative post-fix head the auto-fix seam carries back (#371) —
+  // must match what `getPrDetail` below reports post-fix so the post-approval
+  // HEAD re-validation guard doesn't spuriously fire in these tests.
+  const postFixHeadSha = opts.reReviewPrHead ?? SHA_AFTER_FIX;
+
   const autoFix: AttemptPreMergeAutoFixFn = async () => {
     rec.autoFixCalls++;
-    return opts.autoFixResult;
+    return opts.autoFixResult === "fix-committed"
+      ? { status: "fix-committed", headSha: postFixHeadSha }
+      : { status: "error" };
   };
 
   let deltaCallCount = 0;
@@ -500,7 +507,11 @@ test("performPreMergeAutoFix finding-1: dirty post-harness worktree → rollback
     makeSucceedInvoke(),
   );
 
-  assert.equal(result, "error", "dirty post-harness worktree must return error, not fix-committed");
+  assert.deepEqual(
+    result,
+    { status: "error" },
+    "dirty post-harness worktree must return error, not fix-committed",
+  );
   // Verify rollback was called (reset --hard sha1)
   const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
   assert.ok(resetCall, "git reset --hard must be called to roll back the dirty worktree");
@@ -523,6 +534,8 @@ test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committ
     { code: 0, stdout: "" },
     // commit --amend -m ... (amend succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (postFixHead, read after the amend — #371)
+    { code: 0, stdout: "sha3" },
     // push origin <branch> (push succeeds)
     { code: 0, stdout: "" },
   ]);
@@ -538,7 +551,11 @@ test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committ
     makeSucceedInvoke(),
   );
 
-  assert.equal(result, "fix-committed", "clean commit path must return fix-committed");
+  assert.deepEqual(
+    result,
+    { status: "fix-committed", headSha: "sha3" },
+    "clean commit path must return fix-committed with the post-amend local head",
+  );
   const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
   assert.equal(resetCall, undefined, "clean path must NOT call reset --hard");
 });
@@ -569,7 +586,7 @@ test("performPreMergeAutoFix finding-3: reattach detached worktree fails → ret
     },
   );
 
-  assert.equal(result, "error", "failed reattach must return error");
+  assert.deepEqual(result, { status: "error" }, "failed reattach must return error");
   assert.equal(invokeCalled, false, "harness must NOT be invoked when reattach fails");
 });
 
@@ -600,7 +617,10 @@ test("pre-merge auto-fix finding-4: getPrCommits throws → fail closed, no auto
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
     getGhActor: async () => TEST_ACTOR,
-    attemptPreMergeAutoFix: async () => { rec.autoFixCalls++; return "fix-committed"; },
+    attemptPreMergeAutoFix: async () => {
+      rec.autoFixCalls++;
+      return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+    },
   };
 
   let out: any;
@@ -665,7 +685,10 @@ test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings �
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
     getGhActor: async () => TEST_ACTOR,
-    attemptPreMergeAutoFix: async () => { rec.autoFixCalls++; return "fix-committed"; },
+    attemptPreMergeAutoFix: async () => {
+      rec.autoFixCalls++;
+      return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+    },
   };
 
   let out: any;
@@ -723,7 +746,11 @@ test("performPreMergeAutoFix R2-F4: post-harness git status exits non-zero (empt
     makeSucceedInvoke(),
   );
 
-  assert.equal(result, "error", "non-zero git-status exit must return error even when stdout is empty");
+  assert.deepEqual(
+    result,
+    { status: "error" },
+    "non-zero git-status exit must return error even when stdout is empty",
+  );
   const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
   assert.ok(resetCall, "git reset --hard must be called to roll back when status exits non-zero");
 });
@@ -771,7 +798,7 @@ test("pre-merge auto-fix R2-F1: getCommitDeltaDiff fails post-fix → full re-re
     setBlocked: async () => {},
     getForIssue: async () => null,
     getGhActor: async () => TEST_ACTOR,
-    attemptPreMergeAutoFix: async () => "fix-committed",
+    attemptPreMergeAutoFix: async () => ({ status: "fix-committed", headSha: SHA_AFTER_FIX }),
   };
 
   let out: any;
@@ -847,7 +874,7 @@ test("pre-merge auto-fix R2-F3: fix prompt scoped to blocking findings only, not
     attemptPreMergeAutoFix: async (_blocking, _title, findingsText) => {
       capturedFindingsText = findingsText;
       rec3.autoFixCalls++;
-      return "fix-committed";
+      return { status: "fix-committed", headSha: SHA_AFTER_FIX };
     },
   };
 
@@ -868,3 +895,128 @@ test("pre-merge auto-fix R2-F3: fix prompt scoped to blocking findings only, not
     "fix prompt must NOT include the advisory (non-blocking) finding title",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #371: the post-auto-fix re-review must evaluate the diff INCLUDING the
+// auto-fix commit, anchored to the authoritative post-fix head carried back
+// from `attemptPreMergeAutoFix` — not a GitHub-API PR-head read, which can
+// still return the pre-fix head immediately after the push.
+// ---------------------------------------------------------------------------
+
+test(
+  "pre-merge auto-fix #371: re-review evaluates the post-fix diff and anchors reviewed-sha to the auto-fix commit SHA",
+  async (t) => {
+    const PRE_FIX_DELTA_DIFF = "diff --git a/foo.ts b/foo.ts\n+const bug = true;";
+    const POST_FIX_DELTA_DIFF = "diff --git a/foo.ts b/foo.ts\n+const bug = false; // fixed";
+
+    const receivedDeltaDiffs: string[] = [];
+    const comments: string[] = [];
+    let autoFixCalls = 0;
+    // Flips true once the second (re-review) delta-review invocation begins —
+    // modeling that a whole review round-trip's worth of real time has elapsed
+    // by then, so a GitHub-API PR-head read has settled. Before that point
+    // (i.e. immediately after the auto-fix push) the read is still racy and
+    // returns the pre-fix head, reproducing the observed bug window.
+    let secondReviewStarted = false;
+
+    const commits = [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+      { oid: SHA_HEAD, messageHeadline: "fix: address review 2 findings (#371)" },
+    ];
+
+    const runDeltaReview: RunDeltaReviewFn = async (_cfg, _issue, _detail, deltaDiff) => {
+      receivedDeltaDiffs.push(deltaDiff);
+      if (receivedDeltaDiffs.length === 1) {
+        return {
+          verdict: "needs-attention",
+          findings: [blockingFinding("correctness")],
+          summary: "initial: blocking correctness finding",
+        } as DeltaReviewResult;
+      }
+      secondReviewStarted = true;
+      if (deltaDiff === POST_FIX_DELTA_DIFF) {
+        return { verdict: "approve", findings: [], summary: "post-fix: resolved" } as DeltaReviewResult;
+      }
+      // Regression scenario: the re-review received the pre-fix diff again
+      // (byte-identical to the first review) → the finding recurs.
+      return {
+        verdict: "needs-attention",
+        findings: [blockingFinding("correctness")],
+        summary: "re-review saw the pre-fix diff again",
+      } as DeltaReviewResult;
+    };
+
+    const deps: ShaGateDeps = {
+      getIssueDetail: async () =>
+        ({
+          title: "Test issue",
+          body: "Body",
+          comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+        }) as any,
+      getPrDetail: async () => ({
+        head_sha: secondReviewStarted ? SHA_AFTER_FIX : SHA_HEAD,
+      }) as any,
+      getPrCommits: async () => commits as any,
+      getPrDiff: async () => NEW_DIFF,
+      getCommitDeltaDiff: async (_cfg, _pr, _base, headSha) => {
+        if (headSha === SHA_HEAD) return PRE_FIX_DELTA_DIFF;
+        if (headSha === SHA_AFTER_FIX) return POST_FIX_DELTA_DIFF;
+        throw new Error(`unexpected delta-diff head ${headSha}`);
+      },
+      runDeltaReview,
+      postComment: async (_cfg, _n, body) => { comments.push(body); },
+      transition: async () => {},
+      setBlocked: async () => {},
+      getForIssue: async () => null,
+      getGhActor: async () => TEST_ACTOR,
+      attemptPreMergeAutoFix: async () => {
+        autoFixCalls++;
+        return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+      },
+    };
+
+    let out: any;
+    await quiet(t, async () => {
+      out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+    });
+
+    assert.equal(out, null, "post-fix diff no longer exhibits the finding → pre-merge proceeds");
+    assert.equal(autoFixCalls, 1, "auto-fix seam called exactly once");
+    assert.equal(receivedDeltaDiffs.length, 2, "initial delta review + one re-review");
+    assert.notEqual(
+      receivedDeltaDiffs[0],
+      receivedDeltaDiffs[1],
+      "the re-review must receive a diff distinct from the first review's diff",
+    );
+    assert.equal(
+      receivedDeltaDiffs[1],
+      POST_FIX_DELTA_DIFF,
+      "the re-review must evaluate the post-fix diff (reviewed-sha...auto-fix-commit-sha), " +
+        "not the pre-fix diff a stale GitHub-API PR-head read would produce",
+    );
+    assert.equal(comments.length, 2, "initial + re-review delta comments both posted");
+    assert.match(
+      comments[1]!,
+      new RegExp(`reviewed-sha: ${SHA_AFTER_FIX}`),
+      "re-review comment's reviewed-sha must equal the post-fix head (auto-fix commit SHA)",
+    );
+    assert.ok(
+      !comments[1]!.includes(`reviewed-sha: ${SHA_HEAD}`),
+      "re-review comment must NOT anchor reviewed-sha to the pre-fix head",
+    );
+
+    // Bite check (#371 task 3.2): these assertions only hold because
+    // `enforceReviewShaGate` uses the auto-fix result's authoritative `headSha`
+    // directly for `newPrHead`. `getPrDetail` above is deliberately stubbed to
+    // return the STALE pre-fix head (`SHA_HEAD`) for any call made before the
+    // second review invocation begins — exactly the window in which a
+    // regressed implementation (re-deriving `newPrHead` from
+    // `getPrDetailFn(cfg, prNumber)` right after the auto-fix, as the pre-#371
+    // code did) would read it. Under that regression, `newPrHead` resolves to
+    // `SHA_HEAD`, the re-review diff becomes `getCommitDeltaDiff(reviewed.sha,
+    // SHA_HEAD)` — byte-identical to the first review's diff — the stub above
+    // receives the pre-fix diff and re-emits the blocking finding, and every
+    // assertion above (`out === null`, distinct diffs, the post-fix
+    // reviewed-sha) fails instead.
+  },
+);

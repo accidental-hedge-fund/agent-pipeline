@@ -90,11 +90,18 @@ export const PRE_MERGE_AUTOFIX_PREFIX = "fix: pre-merge auto-fix";
 /**
  * Result of a pre-merge bounded auto-fix attempt (#359).
  * "fix-committed" — harness committed a fix and pushed it to the PR head.
- *                   Caller should re-run the delta review exactly once.
+ *                   Caller should re-run the delta review exactly once,
+ *                   evaluated against `headSha` — the authoritative post-fix
+ *                   commit SHA read from local git state (#371). Callers MUST
+ *                   NOT re-derive the post-fix head from a GitHub-API PR-head
+ *                   read, which can still return the pre-fix head in the
+ *                   window immediately after the push.
  * "error"         — harness failure, dirty worktree, push failure, or no
  *                   commit produced. Worktree rolled back to pre-fix HEAD.
  */
-export type PreMergeAutoFixResult = "fix-committed" | "error";
+export type PreMergeAutoFixResult =
+  | { status: "fix-committed"; headSha: string }
+  | { status: "error" };
 
 /**
  * Injectable seam for the bounded pre-merge auto-fix attempt (#359).
@@ -167,7 +174,7 @@ export async function performPreMergeAutoFix(
   invokeFn: InvokeFn,
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
-  if (!harness) return "error";
+  if (!harness) return { status: "error" };
 
   const headBefore = (
     await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
@@ -177,13 +184,13 @@ export async function performPreMergeAutoFix(
   // (#235). Rollback uses `git reset --hard`; running that over pre-existing dirty
   // work would irreversibly discard it.
   const preStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return "error";
+  if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return { status: "error" };
 
   // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
   // made in a detached worktree don't move the branch ref, so the later push
   // would silently leave the PR branch unchanged while returning success.
   const reattach = await reattachIfDetached(wt, issueNumber, gitFn);
-  if (!reattach.ok) return "error";
+  if (!reattach.ok) return { status: "error" };
 
   const prompt = buildFixPrompt({
     cfg,
@@ -205,7 +212,7 @@ export async function performPreMergeAutoFix(
       await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
       await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
     }
-    return "error";
+    return { status: "error" };
   }
 
   const headAfter = (
@@ -225,7 +232,7 @@ export async function performPreMergeAutoFix(
       await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
       await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
     }
-    return "error";
+    return { status: "error" };
   }
 
   // Harness committed cleanly; amend to set the canonical subject so the
@@ -242,7 +249,20 @@ export async function performPreMergeAutoFix(
   if (amendRes.code !== 0) {
     await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
     await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    return "error";
+    return { status: "error" };
+  }
+
+  // Capture the authoritative post-fix head from local git state (#371) — the
+  // amend rewrote the commit SHA, so this is the SHA the caller's re-review must
+  // evaluate. Read here (not re-derived from a GitHub-API PR-head read after the
+  // push), since that API read can still lag and return the pre-fix head.
+  const postFixHead = (
+    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  if (!postFixHead) {
+    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    return { status: "error" };
   }
 
   // Push the fix commit to the PR head.
@@ -252,10 +272,10 @@ export async function performPreMergeAutoFix(
     // Rollback: push failed, remove the local commit so the next attempt is clean.
     await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
     await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    return "error";
+    return { status: "error" };
   }
 
-  return "fix-committed";
+  return { status: "fix-committed", headSha: postFixHead };
 }
 
 /**
@@ -467,7 +487,7 @@ export async function advance(
     (cfg.harnesses?.implementer
       ? async (blockingFindings, issueTitle, findingsText) => {
           const wt = await getForIssueForAutoFix(cfg, issueNumber);
-          if (!wt) return "error";
+          if (!wt) return { status: "error" };
           return performPreMergeAutoFix(
             cfg,
             issueNumber,
@@ -924,12 +944,17 @@ export interface ShaGateDeps {
   /**
    * Fetches the diff between two commits on the PR for the delta review (#228).
    * Injectable seam; real implementation uses `git diff baseSha...headSha`.
+   * Optional `worktreePath` (#371): the source directory to diff from. Defaults
+   * to `cfg.repo_dir`, which is not fetched mid-run and can lack a commit object
+   * pushed earlier in this same run (e.g. the pre-merge auto-fix commit) — pass
+   * the issue worktree path, which authored that commit, to guarantee it's present.
    */
   getCommitDeltaDiff?: (
     cfg: PipelineConfig,
     prNumber: number,
     baseSha: string,
     headSha: string,
+    worktreePath?: string,
   ) => Promise<string>;
   /** Runs the pre-merge delta review (#228) and returns the parsed verdict. */
   runDeltaReview?: RunDeltaReviewFn;
@@ -1251,19 +1276,24 @@ export async function enforceReviewShaGate(
         return null;
       }
 
+      // Resolve worktree and spec context for the delta reviewer (Finding 3): the
+      // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
+      // can inspect PR-branch files, and must receive OpenSpec context for any
+      // change dirs touched by the unreviewed commits. Resolved before the diff
+      // call (#371) so the delta diff itself also reads from the worktree — the
+      // source that authored any commit pushed earlier in this same run (e.g. a
+      // pre-merge auto-fix commit); `cfg.repo_dir` is not fetched mid-run and can
+      // lack that object immediately after the push.
+      const deltaWt = await getForIssueFn(cfg, issueNumber);
+      const deltaWorktreePath = deltaWt?.path ?? cfg.repo_dir;
+
       // Diff changed: run a focused adversarial delta review of only the unreviewed
       // commits instead of routing back to a full review-2 round. The delta review
       // does NOT count against the max_adversarial_rounds ceiling.
       const deltaDiff = reviewed.sha
-        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head)
+        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head, deltaWorktreePath)
         : currentDiff; // reviewed SHA missing → review the full diff as the delta
 
-      // Resolve worktree and spec context for the delta reviewer (Finding 3): the
-      // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
-      // can inspect PR-branch files, and must receive OpenSpec context for any
-      // change dirs touched by the unreviewed commits.
-      const deltaWt = await getForIssueFn(cfg, issueNumber);
-      const deltaWorktreePath = deltaWt?.path ?? cfg.repo_dir;
       const deltaSpecContext = deltaWt
         ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
         : "";
@@ -1377,17 +1407,25 @@ export async function enforceReviewShaGate(
           const fixRes = await attemptAutoFixFn(
             partition.blocking, detail.title, blockingOnlyBody,
           );
-          if (fixRes === "fix-committed") {
+          if (fixRes.status === "fix-committed") {
             // Re-run the delta review exactly once (does NOT consume a review-2
             // ceiling slot, consistent with the delta-review budget rule, #359).
-            const newPrHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+            // Anchor to the auto-fix's authoritative post-fix head from local git
+            // state (#371) — NOT a GitHub-API PR-head read, which can still return
+            // the pre-fix head in the window immediately after the push and would
+            // silently re-review the pre-fix diff (byte-identical to the first
+            // review), re-emitting the finding the auto-fix just resolved.
+            const newPrHead = fixRes.headSha;
             // Do NOT fall back to the pre-fix `currentDiff` if the post-fix diff
             // cannot be obtained (#359 R2 F1): a fallback would let the reviewer
             // approve a stale diff while recording `newPrHead` as reviewed. Let
             // the exception propagate to the outer catch, which routes to the
-            // conservative full re-review without recording the new head.
+            // conservative full re-review without recording the new head. Diff
+            // from `deltaWorktreePath` (#371) — the worktree that authored the
+            // auto-fix commit — since `cfg.repo_dir` is not fetched mid-run and
+            // may not yet contain that commit object.
             const reReviewDiff = reviewed.sha
-              ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, newPrHead)
+              ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, newPrHead, deltaWorktreePath)
               : currentDiff;
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
@@ -1450,7 +1488,7 @@ export async function enforceReviewShaGate(
             }
             // Re-review still blocks or returned unparseable output: fall through to block below.
           }
-          // fixRes === "error": fall through to block below.
+          // fixRes.status === "error": fall through to block below.
         }
         // Prior auto-fix attempt detected: fall through to block below.
       }
@@ -1514,9 +1552,11 @@ async function defaultGetCommitDeltaDiff(
   _prNumber: number,
   baseSha: string,
   headSha: string,
+  worktreePath?: string,
 ): Promise<string> {
   const label = `${baseSha.slice(0, 7)}...${headSha.slice(0, 7)}`;
-  const result = await gitInWorktree(cfg.repo_dir, ["diff", `${baseSha}...${headSha}`], {
+  const cwd = worktreePath ?? cfg.repo_dir;
+  const result = await gitInWorktree(cwd, ["diff", `${baseSha}...${headSha}`], {
     ignoreFailure: true,
   });
   if (result.code !== 0) {
