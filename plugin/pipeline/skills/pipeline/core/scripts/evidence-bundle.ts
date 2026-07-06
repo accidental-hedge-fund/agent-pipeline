@@ -23,6 +23,7 @@ import {
   type PromptRecord,
   type RecoveryRecord,
   type ReviewRecord,
+  type StageAccountingRecord,
   type StageRecord,
   type StageUpdate,
 } from "./types.ts";
@@ -416,8 +417,7 @@ export function stageDurationMs(enteredAt: string | null, exitedAt: string | nul
   return ms;
 }
 
-function formatDuration(enteredAt: string | null, exitedAt: string | null): string {
-  const ms = stageDurationMs(enteredAt, exitedAt);
+function formatDurationMs(ms: number | null): string {
   if (ms === null) return "—";
   const totalSec = Math.round(ms / 1000);
   if (totalSec < 60) return `${totalSec}s`;
@@ -426,18 +426,55 @@ function formatDuration(enteredAt: string | null, exitedAt: string | null): stri
   return `${min}m${String(sec).padStart(2, "0")}s`;
 }
 
+function formatDuration(enteredAt: string | null, exitedAt: string | null): string {
+  return formatDurationMs(stageDurationMs(enteredAt, exitedAt));
+}
+
+/** Sum of `StageAccountingRecord.duration_ms` (harness invocation wall-clock
+ *  time — never token/cost/prompt fields) that fall inside a stage row's
+ *  `enteredAt`→`exitedAt` window, matched by stage name. Time-windowed rather
+ *  than name-only matching so a stage name re-entered within one run (e.g.
+ *  `review-1` revisited after a fix round, per `recordStage`'s "last open"
+ *  semantics) attributes each visit's harness invocations to its own row
+ *  instead of summing them onto every row that shares the name (#377).
+ *  Returns null when no accounting record falls in the window. */
+function harnessDurationMs(stage: StageRecord, records: StageAccountingRecord[]): number | null {
+  const start = stage.enteredAt ? Date.parse(stage.enteredAt) : NaN;
+  if (!Number.isFinite(start)) return null;
+  const end = stage.exitedAt ? Date.parse(stage.exitedAt) : Infinity;
+  let total = 0;
+  let found = false;
+  for (const r of records) {
+    if (r.stage !== stage.stage) continue;
+    const startedMs = Date.parse(r.started_at);
+    if (!Number.isFinite(startedMs) || startedMs < start || startedMs > end) continue;
+    total += r.duration_ms;
+    found = true;
+  }
+  return found ? total : null;
+}
+
 /** Render a Markdown table with one row per recorded stage: stage name, its
- *  `enteredAt`→`exitedAt` timestamps, duration (via `formatDuration`), and
- *  outcome. Pure — reads only stage/timing/outcome fields, so the finalization
- *  comment's no-accounting-payload contract holds by construction (#377). */
+ *  `enteredAt`→`exitedAt` timestamps, wall-clock stage duration (via
+ *  `formatDuration`), harness invocation duration (summed from
+ *  `bundle.accounting.records[].duration_ms`, via `harnessDurationMs`), and
+ *  outcome. Reads only stage/timing/outcome fields plus the `duration_ms` and
+ *  `stage`/`started_at` correlation fields of accounting records — never
+ *  `commands`, `prompts`, `reviews`, or the cost/token/usage fields of
+ *  `accounting` — so the finalization comment's no-accounting-payload
+ *  contract holds by construction (#377). */
 export function formatStageTimingTableMarkdown(bundle: EvidenceBundle): string {
-  const lines = ["| Stage | Entered → Exited | Duration | Outcome |", "| --- | --- | --- | --- |"];
+  const accountingRecords = bundle.accounting?.records ?? [];
+  const lines = [
+    "| Stage | Entered → Exited | Duration | Harness Duration | Outcome |",
+    "| --- | --- | --- | --- | --- |",
+  ];
   if (bundle.stages.length === 0) {
-    lines.push("| _(no stages recorded)_ |  |  |  |");
+    lines.push("| _(no stages recorded)_ |  |  |  |  |");
   } else {
     for (const s of bundle.stages) {
       lines.push(
-        `| ${s.stage} | ${s.enteredAt ?? "—"} → ${s.exitedAt ?? "—"} | ${formatDuration(s.enteredAt, s.exitedAt)} | ${s.outcome ?? "in-progress"} |`,
+        `| ${s.stage} | ${s.enteredAt ?? "—"} → ${s.exitedAt ?? "—"} | ${formatDuration(s.enteredAt, s.exitedAt)} | ${formatDurationMs(harnessDurationMs(s, accountingRecords))} | ${s.outcome ?? "in-progress"} |`,
       );
     }
   }
@@ -450,8 +487,9 @@ export function formatStageTimingTableMarkdown(bundle: EvidenceBundle): string {
  *  already-known local path/hint strings, so it renders with no filesystem
  *  access: a reviewer on a different machine sees the identical run id,
  *  timings, and outcome (#377). Reads only identity and stage/timing/outcome
- *  fields — never `commands`, `prompts`, `reviews`, or `accounting` — preserving
- *  the no-accounting-payload contract. */
+ *  fields, plus harness invocation durations via `formatStageTimingTableMarkdown`
+ *  — never `commands`, `prompts`, `reviews`, or the cost/token/usage fields of
+ *  `accounting` — preserving the no-accounting-payload contract. */
 export function formatEvidenceCommentBody(
   bundle: EvidenceBundle,
   localBundlePath: string,

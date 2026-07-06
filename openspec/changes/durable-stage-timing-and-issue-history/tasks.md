@@ -14,6 +14,13 @@
 - [x] 1.4 Unit test: rendered Markdown has one row per stage, correct duration formatting, a
       visible run-id field, and contains no command/prompt/token/cost text. Prove the table
       renders fully from the bundle alone (no filesystem reads).
+- [x] 1.5 Add a harness-invocation-duration column to `formatStageTimingTableMarkdown`,
+      summing each stage's `StageAccountingRecord.duration_ms` (matched by stage name and the
+      record's `started_at` falling inside that row's `enteredAt`→`exitedAt` window, so a
+      stage name re-entered within one run is not double-counted across rows) — never the
+      record's cost/token/model fields. `finalizeRun()` in `run-store.ts` mutates the passed
+      bundle's `accounting` field so this data reaches `notifyBundlePath` via the same object
+      reference, with no second events.jsonl read.
 
 ## 2. Issue-level append-only history (issue-evidence-history)
 

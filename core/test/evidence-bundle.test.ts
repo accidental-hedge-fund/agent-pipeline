@@ -26,6 +26,7 @@ import {
 } from "../scripts/evidence-bundle.ts";
 import { EVIDENCE_SCHEMA_VERSION, type CommandRecord, type EvidenceBundle } from "../scripts/types.ts";
 import { redactSecrets, sanitize } from "../scripts/artifact-sanitize.ts";
+import { buildStageAccountingRecord } from "../scripts/accounting.ts";
 
 const STATE = "/tmp/test-evidence-state";
 const ISSUE = 147;
@@ -512,10 +513,99 @@ function timingBundle(): EvidenceBundle {
   };
 }
 
-test("formatStageTimingTableMarkdown: one row per stage with duration and outcome", () => {
+test("formatStageTimingTableMarkdown: one row per stage with duration, harness duration, and outcome", () => {
   const out = formatStageTimingTableMarkdown(timingBundle());
-  assert.match(out, /\| planning \| 2026-07-06T20:00:00Z → 2026-07-06T20:04:15Z \| 4m15s \| advanced \|/);
-  assert.match(out, /\| review-1 \| 2026-07-06T20:05:00Z → — \| — \| in-progress \|/);
+  assert.match(out, /\| planning \| 2026-07-06T20:00:00Z → 2026-07-06T20:04:15Z \| 4m15s \| — \| advanced \|/);
+  assert.match(out, /\| review-1 \| 2026-07-06T20:05:00Z → — \| — \| — \| in-progress \|/);
+});
+
+test("formatStageTimingTableMarkdown: harness duration column sums accounting records inside the stage's window", () => {
+  const bundle = timingBundle();
+  bundle.accounting = {
+    records: [
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "planning",
+        harness: "claude",
+        startedAt: "2026-07-06T20:00:10Z",
+        endedAt: "2026-07-06T20:01:00Z",
+        durationMs: 50_000,
+        outcome: "success",
+      }),
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "planning",
+        harness: "claude",
+        startedAt: "2026-07-06T20:01:05Z",
+        endedAt: "2026-07-06T20:01:15Z",
+        durationMs: 10_000,
+        outcome: "success",
+      }),
+    ],
+    totals: { record_count: 2, actual_cost_usd: 0, estimated_cost_usd: 0, unknown_cost_count: 2 },
+  };
+  const out = formatStageTimingTableMarkdown(bundle);
+  assert.match(out, /\| planning \| 2026-07-06T20:00:00Z → 2026-07-06T20:04:15Z \| 4m15s \| 1m00s \| advanced \|/);
+});
+
+// Regression: `recordStage`'s "last open" semantics allow the same stage name to
+// be re-entered within one run (e.g. review-1 → fix-1 → review-1). The harness
+// duration column must attribute each visit's accounting records to its own row
+// by enteredAt/exitedAt window, not sum them onto every row sharing the name.
+test("formatStageTimingTableMarkdown: does not double-count harness duration across repeated stage-name rows", () => {
+  const bundle = timingBundle();
+  bundle.stages = [
+    {
+      stage: "review-1",
+      enteredAt: "2026-07-06T20:00:00Z",
+      exitedAt: "2026-07-06T20:01:00Z",
+      outcome: "blocked",
+      commits: [],
+      commands: [],
+      prompts: [],
+    },
+    {
+      stage: "review-1",
+      enteredAt: "2026-07-06T20:10:00Z",
+      exitedAt: "2026-07-06T20:11:00Z",
+      outcome: "advanced",
+      commits: [],
+      commands: [],
+      prompts: [],
+    },
+  ];
+  bundle.accounting = {
+    records: [
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "review-1",
+        harness: "claude",
+        startedAt: "2026-07-06T20:00:10Z",
+        endedAt: "2026-07-06T20:00:40Z",
+        durationMs: 30_000,
+        outcome: "success",
+      }),
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "review-1",
+        harness: "claude",
+        startedAt: "2026-07-06T20:10:10Z",
+        endedAt: "2026-07-06T20:10:50Z",
+        durationMs: 40_000,
+        outcome: "success",
+      }),
+    ],
+    totals: { record_count: 2, actual_cost_usd: 0, estimated_cost_usd: 0, unknown_cost_count: 2 },
+  };
+  const out = formatStageTimingTableMarkdown(bundle);
+  const rows = out.split("\n").filter((l) => l.startsWith("| review-1"));
+  assert.equal(rows.length, 2);
+  assert.match(rows[0], /\| 30s \| blocked \|/);
+  assert.match(rows[1], /\| 40s \| advanced \|/);
 });
 
 test("formatStageTimingTableMarkdown: contains no command/prompt/token/cost text", () => {
@@ -547,6 +637,32 @@ test("formatEvidenceCommentBody: contains no accounting payloads (tokens, cost, 
   assert.doesNotMatch(out, /secret plan/);
   assert.doesNotMatch(out, /1\.23/);
   assert.doesNotMatch(out, /token/i);
+});
+
+test("formatEvidenceCommentBody: harness duration column surfaces duration only, never the record's cost/token/model fields", () => {
+  const bundle = timingBundle();
+  bundle.accounting = {
+    records: [
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "planning",
+        harness: "claude",
+        model: "sonnet-super-secret-slug",
+        startedAt: "2026-07-06T20:00:10Z",
+        endedAt: "2026-07-06T20:01:00Z",
+        durationMs: 50_000,
+        outcome: "success",
+        usage: { input_tokens: 999, output_tokens: 111, cost_usd: 42.5 },
+      }),
+    ],
+    totals: { record_count: 1, actual_cost_usd: 42.5, estimated_cost_usd: 0, unknown_cost_count: 0 },
+  };
+  const out = formatEvidenceCommentBody(bundle, "/tmp/state/377/evidence.json", "pipeline 377 --summary");
+  assert.match(out, /\| planning \| .* \| 50s \| advanced \|/);
+  assert.doesNotMatch(out, /42\.5/);
+  assert.doesNotMatch(out, /999/);
+  assert.doesNotMatch(out, /sonnet-super-secret-slug/);
 });
 
 // ---------------------------------------------------------------------------

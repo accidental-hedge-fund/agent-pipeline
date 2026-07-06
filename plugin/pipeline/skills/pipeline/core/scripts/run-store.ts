@@ -530,12 +530,16 @@ export async function finalizeRun(
   // to the run directory by a single stable identifier (the bundle's runId field
   // uses the commit-trailer format 155/..., which differs from the dir name 155-...).
   const fileRunId = path.basename(runDir);
+  // Mutate the caller's bundle (not just the summary.json copy) so the harness
+  // invocation durations reach `notifyBundlePath`, called right after
+  // `finalizeRun` resolves with this same object reference, without a second
+  // events.jsonl read (#377).
+  bundle.accounting = accountingSummary(accountingRecords);
   const summaryWithVersion = {
     ...bundle,
     schema_version: RUN_SCHEMA_VERSION,
     run_id: fileRunId,
     interventions,
-    accounting: accountingSummary(accountingRecords),
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
