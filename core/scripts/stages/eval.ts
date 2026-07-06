@@ -250,7 +250,18 @@ async function evalFixCommitPendingReview(
 ): Promise<boolean> {
   try {
     const prNumber = await deps.getPrForIssue(cfg, issueNumber);
+    // A determinate "no PR" answer (not a lookup error — those throw into the
+    // fail-closed catch) means there is no PR branch to carry an eval-fix
+    // commit: fix rounds only run at eval-gate, which follows pre-merge, which
+    // requires a PR — and a fix commit pushed THIS invocation is covered
+    // unconditionally by `fixCommitLandedThisInvocation` (key 1469c9cd), not
+    // by this durable re-derivation.
     if (!prNumber) return false;
+    const commits = await deps.getPrCommits(cfg, prNumber);
+    const pattern = evalFixCommitPattern(issueNumber);
+    // No eval-fix commit anywhere in the PR: nothing to gate against,
+    // regardless of review state.
+    if (!commits.some((c) => pattern.test(c.messageHeadline))) return false;
     // Trust-filter to the authenticated actor's own comments, mirroring the
     // pre-merge review-SHA gate (#16) — an untrusted commenter must not be
     // able to forge a stale reviewed-SHA marker.
@@ -258,13 +269,14 @@ async function evalFixCommitPendingReview(
     const detail = await deps.getIssueDetail(cfg, issueNumber);
     const trusted = actor ? detail.comments.filter((c) => c.author === actor) : [];
     const reviewed = extractReviewedSha(trusted);
-    if (!reviewed) return false; // no review has ever run for this issue — nothing to gate against
-    const commits = await deps.getPrCommits(cfg, prNumber);
+    // An eval-fix commit exists but no trusted review state can be
+    // established: treat as pending (fail closed, key 1469c9cd) — never let
+    // missing/untrusted review state silently bypass review of a fix commit.
+    if (!reviewed) return true;
     const reviewedIdx = reviewed.sha ? commits.findIndex((c) => c.oid === reviewed.sha) : -1;
     // reviewedIdx === -1 (unverifiable comment, or reviewed SHA absent from
     // history) conservatively falls back to scanning every commit.
     const landedSince = reviewedIdx !== -1 ? commits.slice(reviewedIdx + 1) : commits;
-    const pattern = evalFixCommitPattern(issueNumber);
     return landedSince.some((c) => pattern.test(c.messageHeadline));
   } catch {
     return true;
@@ -516,6 +528,12 @@ export async function advanceEval(
 
   let lastResult: EvalRunResult | null = null;
   let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
+  // Unconditional same-invocation pending-review signal (#372 pre-merge delta
+  // review, key 1469c9cd): a fix commit we just pushed MUST route back through
+  // pre-merge even if every GitHub lookup in the durable re-derivation fails
+  // or lags. The durable check below complements this across
+  // crash/interruption boundaries; this flag guarantees the common case.
+  let fixCommitLandedThisInvocation = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remainingSec = Math.max(0, (stageDeadlineMs - Date.now()) / 1000);
@@ -601,6 +619,7 @@ export async function advanceEval(
       fixRoundBlocked = { reason: fixResult.reason, blockerKind: fixResult.blockerKind };
       break;
     }
+    fixCommitLandedThisInvocation = true;
     stageDeadlineMs = Date.now() + timeoutSec * 1000;
   }
 
@@ -640,19 +659,24 @@ export async function advanceEval(
     console.log(`[pipeline] #${issueNumber}: eval-gate passed in ${result.durationSec.toFixed(1)}s`);
 
     // A pass reached after an eval-fix commit landed is a developer commit
-    // that hasn't cleared review yet. Re-derive this purely from GitHub PR
-    // state (rather than an in-memory "ran a fix round this invocation" flag,
-    // which is lost across a crash/interruption or a later resumed
-    // invocation — #372 review-2 finding 1) and route back through pre-merge
-    // so its existing review-SHA gate (#16) decides whether a fresh review
-    // round is required before the item can reach eval-gate — and
-    // ready-to-deploy — again.
-    const pendingReview = await evalFixCommitPendingReview(cfg, issueNumber, {
-      getGhActor: getGhActorFn,
-      getIssueDetail: getIssueDetailFn,
-      getPrForIssue: getPrForIssueFn,
-      getPrCommits: getPrCommitsFn,
-    });
+    // that hasn't cleared review yet: the just-pushed flag covers this
+    // invocation unconditionally, and the durable GitHub-PR-state
+    // re-derivation covers crash/interruption and resumed invocations
+    // (#372 review-2 finding 1; pre-merge delta review key 1469c9cd). Route
+    // back through pre-merge so its existing review-SHA gate (#16) decides
+    // whether a fresh review round is required before the item can reach
+    // eval-gate — and ready-to-deploy — again. Gate mode only: fix rounds
+    // never run in advisory mode, whose passes advance to the next stage
+    // unchanged per the issue spec (key 816dc89f).
+    const pendingReview =
+      cfg.eval_gate.mode === "gate" &&
+      (fixCommitLandedThisInvocation ||
+        (await evalFixCommitPendingReview(cfg, issueNumber, {
+          getGhActor: getGhActorFn,
+          getIssueDetail: getIssueDetailFn,
+          getPrForIssue: getPrForIssueFn,
+          getPrCommits: getPrCommitsFn,
+        })));
     if (pendingReview) {
       await transitionFn(
         cfg,

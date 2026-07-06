@@ -342,6 +342,85 @@ test("eval-gate: first-attempt pass with an unreviewed eval-fix commit already o
   assert.equal(log.blocked.length, 0);
 });
 
+// #372 pre-merge delta review, key 1469c9cd (part a): a fix commit pushed in
+// THIS invocation must route to pre-merge unconditionally — even when every
+// GitHub lookup in the durable re-derivation yields nothing (no PR, no actor,
+// no comments). The pre-fix behavior advanced directly because the durable
+// check returned false on the no-PR path before considering the just-pushed
+// fix commit.
+test("eval-gate: same-invocation eval-fix push + durable lookups yield nothing → still routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  // makeDeps defaults: getPrForIssue → null, getGhActor → null, no comments.
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => {
+    runCalled++;
+    return runCalled === 1 ? failResult("attempt 1 failed") : passResult("attempt 2 passed");
+  };
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(runCalled, 2, "fix round ran between the two eval runs");
+  assert.equal(out.advanced, true);
+  assert.equal(
+    (out as { to: string }).to,
+    "pre-merge",
+    "a just-pushed eval-fix commit must route to pre-merge even when GitHub state is unreadable",
+  );
+});
+
+// #372 pre-merge delta review, key 1469c9cd (part b): an eval-fix commit
+// present on the PR with NO trusted reviewed-SHA comment (e.g. the actor
+// lookup fails, or review comments are missing) must be treated as pending
+// review — the pre-fix behavior returned false ("no review has ever run —
+// nothing to gate against") and advanced the unreviewed fix commit.
+test("eval-gate: eval-fix commit on PR + no trusted reviewed-SHA state → treated as pending, routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+
+  const deps = makeDeps(log, [passResult("attempt 1 passed")]);
+  deps.getPrForIssue = async () => 900;
+  deps.getGhActor = async () => null; // no trusted actor → no trusted comments
+  deps.getPrCommits = async () => [
+    { oid: "a".repeat(40), messageHeadline: "feat: implement thing" },
+    { oid: "b".repeat(40), messageHeadline: "fix: resolve eval-gate failures (#46)" },
+  ];
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(
+    (out as { to: string }).to,
+    "pre-merge",
+    "an eval-fix commit with unverifiable review state must fail closed to pre-merge",
+  );
+});
+
+// #372 pre-merge delta review, key 816dc89f: advisory-mode passes advance to
+// the configured next stage unchanged — the pending-review routing is a
+// gate-mode concern (fix rounds never run in advisory mode). The pre-fix
+// behavior rerouted an advisory pass to pre-merge when an old eval-fix
+// commit was detected on the PR.
+test("eval-gate: advisory-mode pass with an old eval-fix commit on the PR → advances to next stage, not pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+
+  const deps = makeDeps(log, [passResult("attempt 1 passed")]);
+  Object.assign(deps, pendingReviewFixDeps(46));
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(
+    (out as { to: string }).to,
+    "ready-to-deploy",
+    "advisory passes must advance directly regardless of eval-fix history (spec: advisory behavior unchanged)",
+  );
+});
+
 // Regression test for Finding 1: advisory mode must advance even when retries are exhausted.
 // Previously the code blocked unconditionally when maxAttempts > 1, violating the advisory contract.
 test("eval-gate: retries exhausted + advisory mode → advances to ready-to-deploy (never blocks)", async () => {
