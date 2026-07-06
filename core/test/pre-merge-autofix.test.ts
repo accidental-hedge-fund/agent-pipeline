@@ -1033,6 +1033,7 @@ test(
     const comments: string[] = [];
     let autoFixCalls = 0;
     let deltaReviewCalls = 0;
+    let lsRemoteCalls = 0;
 
     const commits = [
       { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
@@ -1062,7 +1063,7 @@ test(
       // models a GitHub-API read that is still stale at the FINAL
       // revalidation call following the approving re-review, not just during
       // the re-review invocation itself (the gap the review-2 finding flagged).
-      getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+      getPrDetail: async () => ({ head_sha: SHA_HEAD, head_ref: "pipeline/16-test" }) as any,
       getPrCommits: async () => commits as any,
       getPrDiff: async () => NEW_DIFF,
       getCommitDeltaDiff: async () => NEW_DIFF,
@@ -1075,6 +1076,12 @@ test(
       attemptPreMergeAutoFix: async () => {
         autoFixCalls++;
         return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+      },
+      // The live remote ref confirms the auto-fix head — the API read really
+      // was mere staleness (#371 delta review, key 8ad8b7f0).
+      getRemoteHead: async () => {
+        lsRemoteCalls++;
+        return SHA_AFTER_FIX;
       },
     };
 
@@ -1091,6 +1098,10 @@ test(
     );
     assert.equal(autoFixCalls, 1, "auto-fix seam called exactly once");
     assert.equal(deltaReviewCalls, 2, "initial delta review + one re-review");
+    assert.equal(
+      lsRemoteCalls, 1,
+      "the pre-fix-echo read must be confirmed against the live remote ref, not trusted outright",
+    );
 
     // Bite check: WITHOUT the fix, `postFixHead !== newPrHead` alone would
     // throw here (SHA_HEAD !== SHA_AFTER_FIX), routing to the conservative
@@ -1102,3 +1113,86 @@ test(
     );
   },
 );
+
+// ---------------------------------------------------------------------------
+// #371 pre-merge delta review (key 8ad8b7f0): a stale GitHub-API read that
+// echoes the pre-fix head is NOT proof of harmless staleness — the same read
+// can mask a genuinely newer concurrent push landing during the post-fix
+// re-review. The guard must confirm the auto-fix head via the live remote ref
+// and fail closed to the SHA gate when it cannot.
+// ---------------------------------------------------------------------------
+
+for (const [label, remoteHead] of [
+  ["a concurrent push landed during the re-review", "4444444444444444444444444444444444444444"],
+  ["the remote ref cannot be read", null],
+] as const) {
+  test(
+    `pre-merge auto-fix #371 delta review 8ad8b7f0: pre-fix-echo API read + ${label} → re-enter SHA gate, not advance`,
+    async (t) => {
+      const comments: string[] = [];
+      let deltaReviewCalls = 0;
+      let transitions: string[] = [];
+
+      const commits = [
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+        { oid: SHA_HEAD, messageHeadline: "fix: address review 2 findings (#371)" },
+      ];
+
+      const runDeltaReview: RunDeltaReviewFn = async () => {
+        deltaReviewCalls++;
+        if (deltaReviewCalls === 1) {
+          return {
+            verdict: "needs-attention",
+            findings: [blockingFinding("correctness")],
+            summary: "initial: blocking correctness finding",
+          } as DeltaReviewResult;
+        }
+        return { verdict: "approve", findings: [], summary: "post-fix: resolved" } as DeltaReviewResult;
+      };
+
+      const deps: ShaGateDeps = {
+        getIssueDetail: async () =>
+          ({
+            title: "Test issue",
+            body: "Body",
+            comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+          }) as any,
+        // API read echoes the known pre-fix head throughout.
+        getPrDetail: async () => ({ head_sha: SHA_HEAD, head_ref: "pipeline/16-test" }) as any,
+        getPrCommits: async () => commits as any,
+        getPrDiff: async () => NEW_DIFF,
+        getCommitDeltaDiff: async () => NEW_DIFF,
+        runDeltaReview,
+        postComment: async (_cfg, _n, body) => { comments.push(body); },
+        transition: async (_cfg, _n, from, to) => { transitions.push(`${from}->${to}`); },
+        setBlocked: async () => {},
+        getForIssue: async () => null,
+        getGhActor: async () => TEST_ACTOR,
+        attemptPreMergeAutoFix: async () =>
+          ({ status: "fix-committed", headSha: SHA_AFTER_FIX }) as any,
+        // The live remote ref does NOT confirm the auto-fix head: either a
+        // third SHA (concurrent push) or unreadable. Both must fail closed.
+        getRemoteHead: async () => remoteHead,
+      };
+
+      let out: any;
+      await quiet(t, async () => {
+        out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+      });
+
+      // Bite check: WITHOUT the fix, the pre-fix-echo read was accepted as
+      // harmless staleness and the gate returned null (advance) — letting an
+      // unreviewed concurrent commit through pre-merge.
+      assert.notEqual(
+        out, null,
+        "an unconfirmed pre-fix-echo PR-head read must not advance pre-merge",
+      );
+      assert.equal(out.advanced, true, "fail-closed path bounces to the review stage");
+      assert.equal(out.to, "review-2", "re-enters the recorded review round");
+      assert.ok(
+        transitions.includes("pre-merge->review-2"),
+        "must transition back to review-2 via the SHA gate's conservative path",
+      );
+    },
+  );
+}

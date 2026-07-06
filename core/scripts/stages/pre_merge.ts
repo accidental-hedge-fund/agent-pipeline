@@ -978,6 +978,27 @@ export interface ShaGateDeps {
    * a real harness, git, or network.
    */
   attemptPreMergeAutoFix?: AttemptPreMergeAutoFixFn;
+  /**
+   * Authoritative remote-ref read for the post-fix head revalidation (#371
+   * pre-merge delta review, key 8ad8b7f0). Returns the SHA `refs/heads/<branch>`
+   * currently points at on origin, or null when the ref cannot be read. Used
+   * only when the GitHub-API PR-head read still echoes the known pre-fix head
+   * after an approving post-fix re-review — that read is indistinguishable
+   * from a stale read masking a genuinely newer concurrent push, so the guard
+   * must consult `git ls-remote` (which reads the live ref, not a cached API
+   * view) before proceeding. Production default: `defaultGetRemoteHead`.
+   */
+  getRemoteHead?: (cwd: string, branch: string) => Promise<string | null>;
+}
+
+/** `git ls-remote origin refs/heads/<branch>` from `cwd`; null on any failure. */
+async function defaultGetRemoteHead(cwd: string, branch: string): Promise<string | null> {
+  const res = await gitInWorktree(
+    cwd, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true },
+  );
+  if (res.code !== 0) return null;
+  const sha = res.stdout.trim().split(/\s+/)[0] ?? "";
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
 /**
@@ -1000,6 +1021,7 @@ export async function enforceReviewShaGate(
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const getCommitDeltaDiffFn = deps.getCommitDeltaDiff ?? defaultGetCommitDeltaDiff;
   const runDeltaReviewFn = deps.runDeltaReview ?? defaultRunDeltaReview;
+  const getRemoteHeadFn = deps.getRemoteHead ?? defaultGetRemoteHead;
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
@@ -1486,15 +1508,33 @@ export async function enforceReviewShaGate(
               // confirmed was pushed (performPreMergeAutoFix only returns
               // "fix-committed" after `git push` succeeds); the GitHub API's
               // PR-head field can still echo the pre-fix `head` for a short
-              // window after that push lands. Treat a read that matches the
-              // known pre-fix head as that staleness, not a new push — only a
-              // THIRD, different SHA indicates a genuinely newer concurrent push.
-              const postFixHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
-              if (postFixHead !== newPrHead && postFixHead !== head) {
-                throw new Error(
-                  `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
-                  `during pre-merge auto-fix re-review; re-entering SHA gate`,
+              // window after that push lands. A THIRD, different SHA indicates
+              // a genuinely newer concurrent push. A read matching the pre-fix
+              // `head`, however, is NOT proof of mere staleness (#371 delta
+              // review, key 8ad8b7f0): the same stale read can mask a
+              // concurrent push that landed during the re-review. Disambiguate
+              // via the live remote ref (`git ls-remote`), and fail closed to
+              // the SHA gate when it does not confirm the auto-fix head.
+              const postFixPr = await getPrDetailFn(cfg, prNumber);
+              const postFixHead = postFixPr.head_sha;
+              if (postFixHead !== newPrHead) {
+                if (postFixHead !== head) {
+                  throw new Error(
+                    `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
+                    `during pre-merge auto-fix re-review; re-entering SHA gate`,
+                  );
+                }
+                const remoteHead = await getRemoteHeadFn(
+                  deltaWorktreePath, postFixPr.head_ref,
                 );
+                if (remoteHead !== newPrHead) {
+                  throw new Error(
+                    `GitHub API still reports pre-fix head ${head.slice(0, 7)} and ` +
+                    `ls-remote reports ${remoteHead ? remoteHead.slice(0, 7) : "(unreadable)"} ` +
+                    `— cannot confirm auto-fix head ${newPrHead.slice(0, 7)} is the current ` +
+                    `PR head; re-entering SHA gate`,
+                  );
+                }
               }
               console.log(
                 `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
