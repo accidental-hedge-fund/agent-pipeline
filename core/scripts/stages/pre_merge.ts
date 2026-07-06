@@ -1417,16 +1417,23 @@ export async function enforceReviewShaGate(
             // review), re-emitting the finding the auto-fix just resolved.
             const newPrHead = fixRes.headSha;
             // Do NOT fall back to the pre-fix `currentDiff` if the post-fix diff
-            // cannot be obtained (#359 R2 F1): a fallback would let the reviewer
-            // approve a stale diff while recording `newPrHead` as reviewed. Let
-            // the exception propagate to the outer catch, which routes to the
-            // conservative full re-review without recording the new head. Diff
-            // from `deltaWorktreePath` (#371) — the worktree that authored the
-            // auto-fix commit — since `cfg.repo_dir` is not fetched mid-run and
-            // may not yet contain that commit object.
-            const reReviewDiff = reviewed.sha
-              ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, newPrHead, deltaWorktreePath)
-              : currentDiff;
+            // cannot be obtained (#359 R2 F1), including when `reviewed.sha` itself
+            // is missing (#371 review 1 finding 1): a fallback would let the
+            // reviewer approve a stale diff while recording `newPrHead` as
+            // reviewed. Let the exception propagate to the outer catch, which
+            // routes to the conservative full re-review without recording the new
+            // head. Diff from `deltaWorktreePath` (#371) — the worktree that
+            // authored the auto-fix commit — since `cfg.repo_dir` is not fetched
+            // mid-run and may not yet contain that commit object.
+            if (!reviewed.sha) {
+              throw new Error(
+                "no reviewed-sha recorded to diff the auto-fix commit " +
+                  `${newPrHead.slice(0, 7)} against; cannot anchor post-fix re-review`,
+              );
+            }
+            const reReviewDiff = await getCommitDeltaDiffFn(
+              cfg, prNumber, reviewed.sha, newPrHead, deltaWorktreePath,
+            );
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
               deps.runDir ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps } : undefined,
