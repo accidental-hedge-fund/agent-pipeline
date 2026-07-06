@@ -12,6 +12,7 @@ import { advanceEval, truncate, type EvalDeps, type EvalRunResult } from "../scr
 import { readBundle } from "../scripts/evidence-bundle.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
+import type { HarnessResult } from "../scripts/harness.ts";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -20,7 +21,7 @@ import type { RunStoreDeps } from "../scripts/run-store.ts";
 interface CallLog {
   transitions: Array<{ from: string; to: string }>;
   silentTransitions: Array<{ from: string; to: string }>;
-  blocked: Array<{ reason: string }>;
+  blocked: Array<{ reason: string; kind?: string }>;
   comments: string[];
 }
 
@@ -91,8 +92,69 @@ function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; 
     getForIssue: async () => worktree,
     transition: async (_c, _n, from, to) => { log.transitions.push({ from, to }); },
     silentTransition: async (_c, _n, from, to) => { log.silentTransitions.push({ from, to }); },
-    setBlocked: async (_c, _n, reason) => { log.blocked.push({ reason }); },
+    setBlocked: async (_c, _n, reason, _stage, kind) => { log.blocked.push({ reason, kind }); },
     postComment: async (_c, _n, body) => { log.comments.push(body); },
+    // No PR / no review history by default (#372 review-2 finding 1): a pass
+    // never routes to pre-merge unless a test explicitly wires up a matching
+    // eval-fix commit via `pendingReviewFixDeps`.
+    getGhActor: async () => null,
+    getIssueDetail: async () => ({ comments: [] }),
+    getPrForIssue: async () => null,
+    getPrCommits: async () => [],
+  };
+}
+
+/**
+ * Deps simulating an unreviewed eval-fix commit sitting on the PR: a trusted
+ * review comment recorded `reviewedSha`, and a later commit matching the
+ * prescribed eval-fix message for `issueNumber` landed after it. Used to
+ * exercise the durable (GitHub-state-derived) pending-review routing without
+ * relying on an in-memory flag (#372 review-2 finding 1).
+ */
+function pendingReviewFixDeps(issueNumber: number): Pick<EvalDeps, "getGhActor" | "getIssueDetail" | "getPrForIssue" | "getPrCommits"> {
+  const reviewedSha = "a".repeat(40);
+  return {
+    getGhActor: async () => "pipeline-bot",
+    getIssueDetail: async () => ({
+      comments: [
+        { author: "pipeline-bot", body: `## Review 2 — approve\n\n<!-- reviewed-sha: ${reviewedSha} -->` },
+      ],
+    }),
+    getPrForIssue: async () => 900,
+    getPrCommits: async () => [
+      { oid: reviewedSha, messageHeadline: "feat: implement thing" },
+      { oid: "b".repeat(40), messageHeadline: `fix: resolve eval-gate failures (#${issueNumber})` },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Eval-fix round fixtures (#372): a "clean" set of fix-round deps simulates a
+// harness invocation that commits a well-formed fix and pushes successfully,
+// so gate-mode multi-attempt tests can exercise the fix loop without spawning
+// any real harness/git/network.
+// ---------------------------------------------------------------------------
+
+function okInvoke(): HarnessResult {
+  return { success: true, stdout: "", stderr: "", exit_code: 0, duration: 1, timed_out: false };
+}
+
+/** Deps for an eval-fix round that always succeeds: HEAD advances on every
+ *  invoke call (simulating a harness commit), the worktree is clean, and the
+ *  commit format / push checks pass. */
+function cleanFixDeps(): Pick<
+  EvalDeps,
+  "invoke" | "gitHead" | "gitDirty" | "gitPush" | "gitCommitMessages" | "verifyEvalFix" | "salvage"
+> {
+  let head = 0;
+  return {
+    invoke: async () => okInvoke(),
+    gitHead: async () => `head-${head++}`,
+    gitDirty: async () => false,
+    gitPush: async () => ({ code: 0, stderr: "" }),
+    gitCommitMessages: async () => [],
+    verifyEvalFix: async () => ({ ok: true }),
+    salvage: async () => true,
   };
 }
 
@@ -151,10 +213,34 @@ test("eval-gate: exit 0 + gate mode → transitions to ready-to-deploy", async (
   assert.ok(log.comments[0].includes("PASS"), "comment must say PASS");
 });
 
+// #372 review-2 finding 1: the durable pending-review derivation must fail
+// closed (route to pre-merge) rather than silently advancing when GitHub
+// state can't be read — proving it does not just pass because the real
+// `getPrCommits`/`getGhActor` happen to be reachable (no lingering reliance
+// on local gh auth being active).
+test("eval-gate: exit 0 + gate mode + PR commit lookup fails → fails closed, routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+  const deps = makeDeps(log, [passResult("evals: 10/10 passed")]);
+  deps.getPrForIssue = async () => 900;
+  deps.getGhActor = async () => "pipeline-bot";
+  deps.getIssueDetail = async () => ({
+    comments: [{ author: "pipeline-bot", body: `## Review 2 — approve\n\n<!-- reviewed-sha: ${"a".repeat(40)} -->` }],
+  });
+  deps.getPrCommits = async () => { throw new Error("network error: gh not authenticated"); };
+
+  const out = await advanceEval(cfg, 43, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "pre-merge", "an unverifiable review state must fail closed to pre-merge, not advance directly");
+});
+
 test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
   const deps = makeDeps(log, [failResult("3 evals failed")]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 44, {}, deps);
 
@@ -164,6 +250,7 @@ test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition
   assert.equal(log.transitions.length, 0);
   assert.equal(log.comments.length, 1);
   assert.ok(log.comments[0].includes("FAIL"), "comment must say FAIL");
+  assert.equal(invokeCalled, 0, "max_attempts: 1 must perform no fix round — first failure blocks");
 });
 
 test("eval-gate: non-zero exit + advisory mode → comment posted, transitions to ready-to-deploy", async () => {
@@ -197,12 +284,78 @@ test("eval-gate: non-zero exit + advisory mode → comment posted, transitions t
   assert.equal(accounting.cost_usd, null);
 });
 
-test("eval-gate: retry on transient fail — first attempt fails, second passes → pass outcome", async () => {
+// #372: a gate-mode retry is now preceded by a fix round rather than a plain
+// re-run of the same command.
+// Review 1 finding 1 (#372): a pass reached after a pushed eval-fix commit
+// must route back through pre-merge for review, not straight to the next
+// stage — the fix commit is a developer commit the review-SHA gate hasn't
+// seen yet. This regression test fails against the pre-fix behavior, which
+// advanced directly to ready-to-deploy.
+test("eval-gate: gate-mode fail with budget remaining → fix round invoked → re-run passes → routes to pre-merge for review", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+  let invokeCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  Object.assign(deps, pendingReviewFixDeps(46));
+  deps.runEval = async () => {
+    runCalled++;
+    return runCalled === 1 ? failResult("attempt 1 failed") : passResult("attempt 2 passed");
+  };
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(runCalled, 2, "must run the eval command twice");
+  assert.equal(invokeCalled, 1, "must invoke the fix harness exactly once between the two eval runs");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "pre-merge", "an eval-fix commit must clear pre-merge review before ready-to-deploy");
+  assert.equal(log.blocked.length, 0);
+  assert.ok(log.comments[0].includes("PASS"));
+});
+
+// Regression test for #372 review-2 finding 1: an in-memory "fix round ran
+// this invocation" flag is lost across a crash/interruption between a
+// fix-round push and the transition call, or a later invocation resuming at
+// eval-gate. This test simulates exactly that: NO fix round runs in this
+// invocation (first-attempt pass, invoke never called), but a prior
+// invocation already pushed an unreviewed eval-fix commit onto the PR. The
+// pass must still route to pre-merge for review, not advance directly — the
+// pre-fix (in-memory-flag) behavior would incorrectly advance straight to
+// ready-to-deploy here since `fixCommitLanded` would be false.
+test("eval-gate: first-attempt pass with an unreviewed eval-fix commit already on the PR (from a prior invocation) → routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let invokeCalled = 0;
+
+  const deps = makeDeps(log, [passResult("attempt 1 passed")]);
+  Object.assign(deps, pendingReviewFixDeps(46));
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(invokeCalled, 0, "no fix round should run in this invocation");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "pre-merge", "an unreviewed eval-fix commit from a prior invocation must still route to pre-merge");
+  assert.equal(log.blocked.length, 0);
+});
+
+// #372 pre-merge delta review, key 1469c9cd (part a): a fix commit pushed in
+// THIS invocation must route to pre-merge unconditionally — even when every
+// GitHub lookup in the durable re-derivation yields nothing (no PR, no actor,
+// no comments). The pre-fix behavior advanced directly because the durable
+// check returned false on the no-PR path before considering the just-pushed
+// fix commit.
+test("eval-gate: same-invocation eval-fix push + durable lookups yield nothing → still routes to pre-merge", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
   let runCalled = 0;
 
+  // makeDeps defaults: getPrForIssue → null, getGhActor → null, no comments.
   const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
   deps.runEval = async () => {
     runCalled++;
     return runCalled === 1 ? failResult("attempt 1 failed") : passResult("attempt 2 passed");
@@ -210,11 +363,62 @@ test("eval-gate: retry on transient fail — first attempt fails, second passes 
 
   const out = await advanceEval(cfg, 46, {}, deps);
 
-  assert.equal(runCalled, 2, "must attempt twice");
+  assert.equal(runCalled, 2, "fix round ran between the two eval runs");
   assert.equal(out.advanced, true);
-  assert.equal((out as { to: string }).to, "ready-to-deploy");
-  assert.equal(log.blocked.length, 0);
-  assert.ok(log.comments[0].includes("PASS"));
+  assert.equal(
+    (out as { to: string }).to,
+    "pre-merge",
+    "a just-pushed eval-fix commit must route to pre-merge even when GitHub state is unreadable",
+  );
+});
+
+// #372 pre-merge delta review, key 1469c9cd (part b): an eval-fix commit
+// present on the PR with NO trusted reviewed-SHA comment (e.g. the actor
+// lookup fails, or review comments are missing) must be treated as pending
+// review — the pre-fix behavior returned false ("no review has ever run —
+// nothing to gate against") and advanced the unreviewed fix commit.
+test("eval-gate: eval-fix commit on PR + no trusted reviewed-SHA state → treated as pending, routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+
+  const deps = makeDeps(log, [passResult("attempt 1 passed")]);
+  deps.getPrForIssue = async () => 900;
+  deps.getGhActor = async () => null; // no trusted actor → no trusted comments
+  deps.getPrCommits = async () => [
+    { oid: "a".repeat(40), messageHeadline: "feat: implement thing" },
+    { oid: "b".repeat(40), messageHeadline: "fix: resolve eval-gate failures (#46)" },
+  ];
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(
+    (out as { to: string }).to,
+    "pre-merge",
+    "an eval-fix commit with unverifiable review state must fail closed to pre-merge",
+  );
+});
+
+// #372 pre-merge delta review, key 816dc89f: advisory-mode passes advance to
+// the configured next stage unchanged — the pending-review routing is a
+// gate-mode concern (fix rounds never run in advisory mode). The pre-fix
+// behavior rerouted an advisory pass to pre-merge when an old eval-fix
+// commit was detected on the PR.
+test("eval-gate: advisory-mode pass with an old eval-fix commit on the PR → advances to next stage, not pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+
+  const deps = makeDeps(log, [passResult("attempt 1 passed")]);
+  Object.assign(deps, pendingReviewFixDeps(46));
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(
+    (out as { to: string }).to,
+    "ready-to-deploy",
+    "advisory passes must advance directly regardless of eval-fix history (spec: advisory behavior unchanged)",
+  );
 });
 
 // Regression test for Finding 1: advisory mode must advance even when retries are exhausted.
@@ -249,32 +453,152 @@ test("eval-gate: retries exhausted + advisory mode + default max_attempts → ad
   assert.equal(log.blocked.length, 0);
 });
 
-test("eval-gate: retries exhausted + gate mode → setBlocked", async () => {
+test("eval-gate: gate-mode fail → fix rounds exhausted (max_attempts reached) → setBlocked with final output", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 3 });
   let runCalled = 0;
+  let invokeCalled = 0;
 
   const deps = makeDeps(log, []);
-  deps.runEval = async () => { runCalled++; return failResult("always fails"); };
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult(`always fails (run ${runCalled})`); };
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 48, {}, deps);
 
   assert.equal(runCalled, 3, "must attempt max_attempts times");
+  assert.equal(invokeCalled, 2, "must perform exactly max_attempts - 1 fix rounds");
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "eval-gate-failed");
+  assert.ok(log.blocked[0].reason.includes("always fails (run 3)"), "block reason must surface the final eval output");
 });
 
-test("eval-gate: timeout in gate mode → blocked", async () => {
+// ---------------------------------------------------------------------------
+// Eval-fix round failure paths (#372): a failed fix round blocks the item and
+// never re-runs the eval command (no partial push).
+// ---------------------------------------------------------------------------
+
+test("eval-gate: eval-fix round → harness error → blocks (harness-failure), eval NOT re-run", async () => {
   const log = makeCallLog();
-  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => ({
+    success: false, stdout: "", stderr: "boom", exit_code: 1, duration: 3, timed_out: false,
+  });
+
+  const out = await advanceEval(cfg, 700, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+});
+
+test("eval-gate: eval-fix round → harness produces no new commit → blocks (harness-failure), eval NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitHead = async () => "same-sha"; // HEAD never advances: no harness commit
+  deps.gitDirty = async () => false; // and nothing left uncommitted to salvage
+  deps.salvage = async () => false;
+
+  const out = await advanceEval(cfg, 701, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.ok(log.blocked[0].reason.includes("no new commits"));
+});
+
+test("eval-gate: eval-fix round → worktree left dirty after fix → blocks (harness-failure), eval NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitDirty = async () => true; // fix committed but left leftover uncommitted changes
+
+  const out = await advanceEval(cfg, 702, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.ok(log.blocked[0].reason.includes("uncommitted"));
+});
+
+test("eval-gate: eval-fix round → push fails → blocks (push-failed), eval NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitPush = async () => ({ code: 1, stderr: "remote rejected" });
+
+  const out = await advanceEval(cfg, 703, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "push-failed");
+  assert.ok(log.blocked[0].reason.includes("remote rejected"));
+});
+
+// ---------------------------------------------------------------------------
+// Eval-fix prompt context (#372): the prompt names the failed gate, the
+// configured command, and includes the bounded eval output.
+// ---------------------------------------------------------------------------
+
+test("eval-gate: eval-fix prompt embeds the gate name, command, and bounded output", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2, command: "pnpm run evals:ci" });
+  let capturedPrompt = "";
+
+  const deps = makeDeps(log, [failResult("assertion X failed"), passResult()]);
+  Object.assign(deps, cleanFixDeps());
+  deps.invoke = async (_harness, _wtPath, prompt) => {
+    capturedPrompt = prompt;
+    return okInvoke();
+  };
+
+  await advanceEval(cfg, 704, {}, deps);
+
+  assert.ok(capturedPrompt.includes("eval-gate"), "prompt must identify the failed gate");
+  assert.ok(capturedPrompt.includes("pnpm run evals:ci"), "prompt must include the configured command");
+  assert.ok(capturedPrompt.includes("assertion X failed"), "prompt must include the eval output");
+});
+
+test("eval-gate: timeout in gate mode → blocked, no fix round even with budget remaining", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
   const deps = makeDeps(log, [timeoutResult()]);
   const appended: string[] = [];
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 49, { runDir: "/runs/49", runStoreDeps: appendOnlyRunStore(appended) }, deps);
 
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1, "timeout must block in gate mode");
   assert.ok(log.comments[0].includes("FAIL"), "timeout comment must say FAIL");
+  assert.equal(invokeCalled, 0, "a timeout must never route to a fix round");
   const accounting = appendedEvents(appended).find((event) => event.type === "stage_accounting");
   assert.equal(accounting?.outcome, "timeout");
   assert.equal(accounting?.blocker_kind, "harness-failure");
@@ -283,8 +607,10 @@ test("eval-gate: timeout in gate mode → blocked", async () => {
 // Regression test for Finding 1: timeouts must ALWAYS block, even in advisory mode.
 test("eval-gate: timeout in advisory mode → always blocks (tooling failure, not harness failure)", async () => {
   const log = makeCallLog();
-  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 2 });
   const deps = makeDeps(log, [timeoutResult()]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 491, {}, deps);
 
@@ -292,13 +618,31 @@ test("eval-gate: timeout in advisory mode → always blocks (tooling failure, no
   assert.equal((out as { status: string }).status, "blocked");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0, "must not advance on timeout");
+  assert.equal(invokeCalled, 0, "a timeout must never route to a fix round");
+});
+
+test("eval-gate: spawn error in gate mode → blocked, no fix round even with budget remaining", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  const deps = makeDeps(log, [spawnErrorResult()]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
+
+  const out = await advanceEval(cfg, 4921, {}, deps);
+
+  assert.equal(out.advanced, false, "spawn error must block in gate mode");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.equal(invokeCalled, 0, "a spawn error must never route to a fix round");
 });
 
 // Regression test for Finding 1: spawn/runner errors must ALWAYS block, even in advisory mode.
 test("eval-gate: spawn error in advisory mode → always blocks (tooling failure)", async () => {
   const log = makeCallLog();
-  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 2 });
   const deps = makeDeps(log, [spawnErrorResult()]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 492, {}, deps);
 
@@ -306,19 +650,23 @@ test("eval-gate: spawn error in advisory mode → always blocks (tooling failure
   assert.equal((out as { status: string }).status, "blocked");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0, "must not advance on spawn error");
+  assert.equal(invokeCalled, 0, "a spawn error must never route to a fix round");
 });
 
 // Regression test for Finding 1: ordinary eval failure in advisory mode still advances.
-test("eval-gate: ordinary harness failure in advisory mode → still advances", async () => {
+test("eval-gate: ordinary harness failure in advisory mode → still advances, no fix round", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
   const deps = makeDeps(log, [failResult("2 evals failed")]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 493, {}, deps);
 
   assert.equal(out.advanced, true, "ordinary eval failure in advisory mode must advance");
   assert.equal(log.blocked.length, 0);
   assert.equal(log.transitions.length, 1);
+  assert.equal(invokeCalled, 0, "advisory mode must never invoke a fix round");
 });
 
 test("eval-gate: no worktree → blocked", async () => {
@@ -388,6 +736,7 @@ test("eval-gate: each retry attempt recorded separately in evidence bundle (find
     const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 3 });
     let attempt = 0;
     const deps = makeDeps(log, []);
+    Object.assign(deps, cleanFixDeps());
     deps.runEval = async () => {
       attempt++;
       return attempt < 3 ? failResult(`attempt ${attempt} failed`) : passResult("attempt 3 passed");

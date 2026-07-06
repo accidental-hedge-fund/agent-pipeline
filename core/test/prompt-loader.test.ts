@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   _testing,
+  buildEvalFixPrompt,
   buildFixPrompt,
   buildImplementingPrompt,
   buildPlanningOpenspecPrompt,
@@ -751,6 +752,68 @@ test("test_fix prompt: large failure output is truncated", () => {
   assert.match(out, /diff truncated at 16KB/);
 });
 
+test("eval_fix prompt: embeds the target repo's conventions (#108, #372)", () => {
+  const marker = "RUN-npm-run-ci-BEFORE-DONE-eval-9c2b";
+  const out = buildEvalFixPrompt({
+    cfg: configWithConventions(marker),
+    issueNumber: 15,
+    command: "pnpm evals",
+    attempt: 1,
+    maxAttempts: 2,
+    output: "fail",
+    pipelineRunId: "r",
+  });
+  assert.match(out, new RegExp(marker), "eval-fix prompt is missing the injected conventions content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("eval_fix prompt: renders the readConventions stub (no throw) when no conventions file (#108, #372)", () => {
+  const out = buildEvalFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 5,
+    command: "pnpm evals",
+    attempt: 1,
+    maxAttempts: 2,
+    output: "fail",
+    pipelineRunId: "r",
+  });
+  assert.match(out, /no conventions file found/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("eval_fix prompt: identifies the eval gate, command, attempt counter, and output (#372)", () => {
+  const out = buildEvalFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "pnpm run evals:ci",
+    attempt: 2,
+    maxAttempts: 3,
+    output: "EVAL-FAIL-OUTPUT-XYZ",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /#15/);
+  assert.match(out, /eval-gate/i);
+  assert.match(out, /pnpm run evals:ci/);
+  assert.match(out, /attempt 2 of 3/);
+  assert.match(out, /EVAL-FAIL-OUTPUT-XYZ/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("eval_fix prompt: instructs the trailers with substituted issue + run id (#20, #372)", () => {
+  const out = buildEvalFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "pnpm evals",
+    attempt: 1,
+    maxAttempts: 1,
+    output: "fail",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #15/);
+  assert.match(out, /Pipeline-Run: 15\/2026-06-08T14:32:00Z/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("review prompt: large diff is truncated", () => {
   const big = "x".repeat(60_000);
   const out = buildReviewStandardPrompt({
@@ -986,6 +1049,7 @@ function buildAllStagePrompts(cfg: PipelineConfig): void {
   buildReviewAdversarialPrompt({ cfg, issueNumber: 19, title: "t", body: "b", diff: "d" });
   buildFixPrompt({ cfg, issueNumber: 19, title: "t", reviewFindings: "f", fixRound: 1, pipelineRunId: "19/x" });
   buildTestFixPrompt({ cfg, issueNumber: 19, command: "npm test", attempt: 1, maxAttempts: 3, output: "o", pipelineRunId: "19/x" });
+  buildEvalFixPrompt({ cfg, issueNumber: 19, command: "pnpm evals", attempt: 1, maxAttempts: 2, output: "o", pipelineRunId: "19/x" });
 }
 
 test("lessons convention (#19): planning prompt embeds the conventions/lessons content via the default CLAUDE.md path (no config key)", () => {

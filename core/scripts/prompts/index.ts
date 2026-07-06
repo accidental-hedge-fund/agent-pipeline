@@ -398,6 +398,36 @@ export function buildTestFixPrompt(a: BuildTestFixArgs): string {
   });
 }
 
+export interface BuildEvalFixArgs {
+  /** Used to embed the target repo's conventions via {@link readConventions} (#108),
+   *  mirroring {@link buildTestFixPrompt} so the eval-fix editing round is
+   *  convention-aware explicitly rather than via best-effort host auto-load. */
+  cfg: PipelineConfig;
+  issueNumber: number;
+  /** The configured `eval_gate.command` string. */
+  command: string;
+  attempt: number;
+  maxAttempts: number;
+  /** Combined stdout+stderr from the failed eval run. Callers pass an already
+   *  tail-biased-truncated excerpt (see eval.ts's `truncate`) so the pass/fail
+   *  summary at the end of the output survives elision. */
+  output: string;
+  /** Pipeline run identifier for the commit traceability trailers (#20). */
+  pipelineRunId: string;
+}
+
+export function buildEvalFixPrompt(a: BuildEvalFixArgs): string {
+  return substitute(loadTemplate("eval_fix"), {
+    conventions: readConventions(a.cfg),
+    issue_number: String(a.issueNumber),
+    command: a.command,
+    attempt: String(a.attempt),
+    max_attempts: String(a.maxAttempts),
+    eval_output: a.output,
+    pipeline_run_id: a.pipelineRunId,
+  });
+}
+
 function contextSnapshotSection(rendered?: string): string {
   if (!rendered || !rendered.trim()) return '';
   // Leading \n\n provides separation from the preceding content; templates place
