@@ -12,6 +12,7 @@ import { advanceEval, truncate, type EvalDeps, type EvalRunResult } from "../scr
 import { readBundle } from "../scripts/evidence-bundle.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
+import type { HarnessResult } from "../scripts/harness.ts";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -20,7 +21,7 @@ import type { RunStoreDeps } from "../scripts/run-store.ts";
 interface CallLog {
   transitions: Array<{ from: string; to: string }>;
   silentTransitions: Array<{ from: string; to: string }>;
-  blocked: Array<{ reason: string }>;
+  blocked: Array<{ reason: string; kind?: string }>;
   comments: string[];
 }
 
@@ -91,8 +92,38 @@ function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; 
     getForIssue: async () => worktree,
     transition: async (_c, _n, from, to) => { log.transitions.push({ from, to }); },
     silentTransition: async (_c, _n, from, to) => { log.silentTransitions.push({ from, to }); },
-    setBlocked: async (_c, _n, reason) => { log.blocked.push({ reason }); },
+    setBlocked: async (_c, _n, reason, _stage, kind) => { log.blocked.push({ reason, kind }); },
     postComment: async (_c, _n, body) => { log.comments.push(body); },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Eval-fix round fixtures (#372): a "clean" set of fix-round deps simulates a
+// harness invocation that commits a well-formed fix and pushes successfully,
+// so gate-mode multi-attempt tests can exercise the fix loop without spawning
+// any real harness/git/network.
+// ---------------------------------------------------------------------------
+
+function okInvoke(): HarnessResult {
+  return { success: true, stdout: "", stderr: "", exit_code: 0, duration: 1, timed_out: false };
+}
+
+/** Deps for an eval-fix round that always succeeds: HEAD advances on every
+ *  invoke call (simulating a harness commit), the worktree is clean, and the
+ *  commit format / push checks pass. */
+function cleanFixDeps(): Pick<
+  EvalDeps,
+  "invoke" | "gitHead" | "gitDirty" | "gitPush" | "gitCommitMessages" | "verifyEvalFix" | "salvage"
+> {
+  let head = 0;
+  return {
+    invoke: async () => okInvoke(),
+    gitHead: async () => `head-${head++}`,
+    gitDirty: async () => false,
+    gitPush: async () => ({ code: 0, stderr: "" }),
+    gitCommitMessages: async () => [],
+    verifyEvalFix: async () => ({ ok: true }),
+    salvage: async () => true,
   };
 }
 
@@ -155,6 +186,8 @@ test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
   const deps = makeDeps(log, [failResult("3 evals failed")]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 44, {}, deps);
 
@@ -164,6 +197,7 @@ test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition
   assert.equal(log.transitions.length, 0);
   assert.equal(log.comments.length, 1);
   assert.ok(log.comments[0].includes("FAIL"), "comment must say FAIL");
+  assert.equal(invokeCalled, 0, "max_attempts: 1 must perform no fix round — first failure blocks");
 });
 
 test("eval-gate: non-zero exit + advisory mode → comment posted, transitions to ready-to-deploy", async () => {
@@ -197,20 +231,26 @@ test("eval-gate: non-zero exit + advisory mode → comment posted, transitions t
   assert.equal(accounting.cost_usd, null);
 });
 
-test("eval-gate: retry on transient fail — first attempt fails, second passes → pass outcome", async () => {
+// #372: a gate-mode retry is now preceded by a fix round rather than a plain
+// re-run of the same command.
+test("eval-gate: gate-mode fail with budget remaining → fix round invoked → re-run passes → advances", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
   let runCalled = 0;
+  let invokeCalled = 0;
 
   const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
   deps.runEval = async () => {
     runCalled++;
     return runCalled === 1 ? failResult("attempt 1 failed") : passResult("attempt 2 passed");
   };
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 46, {}, deps);
 
-  assert.equal(runCalled, 2, "must attempt twice");
+  assert.equal(runCalled, 2, "must run the eval command twice");
+  assert.equal(invokeCalled, 1, "must invoke the fix harness exactly once between the two eval runs");
   assert.equal(out.advanced, true);
   assert.equal((out as { to: string }).to, "ready-to-deploy");
   assert.equal(log.blocked.length, 0);
@@ -249,32 +289,152 @@ test("eval-gate: retries exhausted + advisory mode + default max_attempts → ad
   assert.equal(log.blocked.length, 0);
 });
 
-test("eval-gate: retries exhausted + gate mode → setBlocked", async () => {
+test("eval-gate: gate-mode fail → fix rounds exhausted (max_attempts reached) → setBlocked with final output", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 3 });
   let runCalled = 0;
+  let invokeCalled = 0;
 
   const deps = makeDeps(log, []);
-  deps.runEval = async () => { runCalled++; return failResult("always fails"); };
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult(`always fails (run ${runCalled})`); };
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 48, {}, deps);
 
   assert.equal(runCalled, 3, "must attempt max_attempts times");
+  assert.equal(invokeCalled, 2, "must perform exactly max_attempts - 1 fix rounds");
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "eval-gate-failed");
+  assert.ok(log.blocked[0].reason.includes("always fails (run 3)"), "block reason must surface the final eval output");
 });
 
-test("eval-gate: timeout in gate mode → blocked", async () => {
+// ---------------------------------------------------------------------------
+// Eval-fix round failure paths (#372): a failed fix round blocks the item and
+// never re-runs the eval command (no partial push).
+// ---------------------------------------------------------------------------
+
+test("eval-gate: eval-fix round → harness error → blocks (harness-failure), eval NOT re-run", async () => {
   const log = makeCallLog();
-  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => ({
+    success: false, stdout: "", stderr: "boom", exit_code: 1, duration: 3, timed_out: false,
+  });
+
+  const out = await advanceEval(cfg, 700, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+});
+
+test("eval-gate: eval-fix round → harness produces no new commit → blocks (harness-failure), eval NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitHead = async () => "same-sha"; // HEAD never advances: no harness commit
+  deps.gitDirty = async () => false; // and nothing left uncommitted to salvage
+  deps.salvage = async () => false;
+
+  const out = await advanceEval(cfg, 701, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.ok(log.blocked[0].reason.includes("no new commits"));
+});
+
+test("eval-gate: eval-fix round → worktree left dirty after fix → blocks (harness-failure), eval NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitDirty = async () => true; // fix committed but left leftover uncommitted changes
+
+  const out = await advanceEval(cfg, 702, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.ok(log.blocked[0].reason.includes("uncommitted"));
+});
+
+test("eval-gate: eval-fix round → push fails → blocks (push-failed), eval NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => { runCalled++; return failResult("evals failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitPush = async () => ({ code: 1, stderr: "remote rejected" });
+
+  const out = await advanceEval(cfg, 703, {}, deps);
+
+  assert.equal(runCalled, 1, "the eval command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "push-failed");
+  assert.ok(log.blocked[0].reason.includes("remote rejected"));
+});
+
+// ---------------------------------------------------------------------------
+// Eval-fix prompt context (#372): the prompt names the failed gate, the
+// configured command, and includes the bounded eval output.
+// ---------------------------------------------------------------------------
+
+test("eval-gate: eval-fix prompt embeds the gate name, command, and bounded output", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2, command: "pnpm run evals:ci" });
+  let capturedPrompt = "";
+
+  const deps = makeDeps(log, [failResult("assertion X failed"), passResult()]);
+  Object.assign(deps, cleanFixDeps());
+  deps.invoke = async (_harness, _wtPath, prompt) => {
+    capturedPrompt = prompt;
+    return okInvoke();
+  };
+
+  await advanceEval(cfg, 704, {}, deps);
+
+  assert.ok(capturedPrompt.includes("eval-gate"), "prompt must identify the failed gate");
+  assert.ok(capturedPrompt.includes("pnpm run evals:ci"), "prompt must include the configured command");
+  assert.ok(capturedPrompt.includes("assertion X failed"), "prompt must include the eval output");
+});
+
+test("eval-gate: timeout in gate mode → blocked, no fix round even with budget remaining", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
   const deps = makeDeps(log, [timeoutResult()]);
   const appended: string[] = [];
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 49, { runDir: "/runs/49", runStoreDeps: appendOnlyRunStore(appended) }, deps);
 
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1, "timeout must block in gate mode");
   assert.ok(log.comments[0].includes("FAIL"), "timeout comment must say FAIL");
+  assert.equal(invokeCalled, 0, "a timeout must never route to a fix round");
   const accounting = appendedEvents(appended).find((event) => event.type === "stage_accounting");
   assert.equal(accounting?.outcome, "timeout");
   assert.equal(accounting?.blocker_kind, "harness-failure");
@@ -283,8 +443,10 @@ test("eval-gate: timeout in gate mode → blocked", async () => {
 // Regression test for Finding 1: timeouts must ALWAYS block, even in advisory mode.
 test("eval-gate: timeout in advisory mode → always blocks (tooling failure, not harness failure)", async () => {
   const log = makeCallLog();
-  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 2 });
   const deps = makeDeps(log, [timeoutResult()]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 491, {}, deps);
 
@@ -292,13 +454,31 @@ test("eval-gate: timeout in advisory mode → always blocks (tooling failure, no
   assert.equal((out as { status: string }).status, "blocked");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0, "must not advance on timeout");
+  assert.equal(invokeCalled, 0, "a timeout must never route to a fix round");
+});
+
+test("eval-gate: spawn error in gate mode → blocked, no fix round even with budget remaining", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  const deps = makeDeps(log, [spawnErrorResult()]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
+
+  const out = await advanceEval(cfg, 4921, {}, deps);
+
+  assert.equal(out.advanced, false, "spawn error must block in gate mode");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.equal(invokeCalled, 0, "a spawn error must never route to a fix round");
 });
 
 // Regression test for Finding 1: spawn/runner errors must ALWAYS block, even in advisory mode.
 test("eval-gate: spawn error in advisory mode → always blocks (tooling failure)", async () => {
   const log = makeCallLog();
-  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
+  const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 2 });
   const deps = makeDeps(log, [spawnErrorResult()]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 492, {}, deps);
 
@@ -306,19 +486,23 @@ test("eval-gate: spawn error in advisory mode → always blocks (tooling failure
   assert.equal((out as { status: string }).status, "blocked");
   assert.equal(log.blocked.length, 1);
   assert.equal(log.transitions.length, 0, "must not advance on spawn error");
+  assert.equal(invokeCalled, 0, "a spawn error must never route to a fix round");
 });
 
 // Regression test for Finding 1: ordinary eval failure in advisory mode still advances.
-test("eval-gate: ordinary harness failure in advisory mode → still advances", async () => {
+test("eval-gate: ordinary harness failure in advisory mode → still advances, no fix round", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "advisory", max_attempts: 1 });
   const deps = makeDeps(log, [failResult("2 evals failed")]);
+  let invokeCalled = 0;
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
 
   const out = await advanceEval(cfg, 493, {}, deps);
 
   assert.equal(out.advanced, true, "ordinary eval failure in advisory mode must advance");
   assert.equal(log.blocked.length, 0);
   assert.equal(log.transitions.length, 1);
+  assert.equal(invokeCalled, 0, "advisory mode must never invoke a fix round");
 });
 
 test("eval-gate: no worktree → blocked", async () => {
@@ -388,6 +572,7 @@ test("eval-gate: each retry attempt recorded separately in evidence bundle (find
     const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 3 });
     let attempt = 0;
     const deps = makeDeps(log, []);
+    Object.assign(deps, cleanFixDeps());
     deps.runEval = async () => {
       attempt++;
       return attempt < 3 ? failResult(`attempt ${attempt} failed`) : passResult("attempt 3 passed");

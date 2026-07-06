@@ -685,9 +685,9 @@ test_gate:                           # run the repo's own tests/build before ope
 eval_gate:                           # run the repo's eval harness after pre-merge, before ready-to-deploy
   enabled: false                     # default: false; set true to enable (one-time declaration per repo)
   command: "pnpm evals"              # shell command to run; supports pipes, env vars, &&, etc.
-  mode: gate                         # gate (default): block on fail | advisory: record result and always advance
-  timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
-  max_attempts: 2                    # total attempts before giving up (1 = no retry)
+  mode: gate                         # gate (default): fail routes to a fix round, blocks once attempts are exhausted | advisory: record result and always advance
+  timeout: 300                       # hard stage-level budget in seconds per eval run
+  max_attempts: 2                    # total eval runs (1 = no retry/fix round); gate mode: fix rounds = max_attempts - 1
 shipcheck_gate:                      # reviewer-owned acceptance rubric after eval-gate, before ready-to-deploy (#148)
   enabled: false                     # default: false; set true to enable
   mode: advisory                     # advisory (default): record without blocking | gate: block on fail verdict
@@ -1190,11 +1190,12 @@ The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused fo
 
 When `eval_gate.enabled` (default **off**), the target repo's eval harness runs **after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode, elapsed, output excerpt) is always recorded as an issue comment.
 
-- **`mode: gate`** (default) — a non-zero exit **blocks** the item.
-- **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted.
-- A failing run is retried up to `max_attempts` (default 2; `1` = no retry), short-circuiting on the first pass.
-- `timeout` (default 300) is a **hard stage-level budget in seconds, shared across all attempts**, so total wall-time never exceeds it.
-- **Tooling failures always block, regardless of mode** — if the command times out or can't be spawned the item is blocked even in advisory mode.
+- **`mode: gate`** (default) — an ordinary (non-tooling) failure routes to a bounded fix round: the implementer harness is invoked with the eval output (gate name, command, bounded stdout/stderr) as context, commits and pushes a fix, and the eval command re-runs against the updated code. Only once `max_attempts` is exhausted does the item **block**, with the final eval output surfaced.
+- **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted. Advisory failures are retried as a plain re-run (no fix round) up to `max_attempts`.
+- `max_attempts` (default 2; `1` = no retry) bounds the total number of eval runs. In gate mode each run after the first is preceded by exactly one fix round, so the fix-round budget is `max_attempts - 1` — there is no separate fix-round config key.
+- `timeout` (default 300) is a **hard stage-level budget in seconds per eval run**; a successful fix round resets it for the next attempt, since fix-harness time is bounded separately by `fix_timeout`.
+- **Tooling failures always block immediately, regardless of mode, and never route to a fix round** — if the command times out or can't be spawned the item is blocked even in advisory mode or with fix-round budget remaining.
+- A fix round that fails (harness error, no new commit, a dirty worktree, or a failed push) blocks the item the same way a test-gate fix round does — it never pushes a partial fix, and the eval command is not re-run.
 
 When disabled (the default), pre-merge advances straight to `ready-to-deploy` and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
 

@@ -290,7 +290,7 @@ export async function dispatch(
       // cfg.ci_timeout.
       return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "eval-gate":
-      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir, runDir, runStoreDeps });
+      return evalStage.advanceEval(cfg, issueNumber, { dryRun, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir, runDir, runStoreDeps });
     case "ready-to-deploy":
