@@ -69,13 +69,17 @@ NOT be re-run until a fix commit has been verified and pushed.
 
 ### Requirement: An eval-fix commit SHALL be routed back through pre-merge review before advancing
 
-The eval gate SHALL, when the eval command passes after a fix round pushed a commit in the current
-invocation, transition the issue to `pre-merge` instead of advancing directly to the configured next
-stage — the pushed commit is a developer commit the pipeline's review process has not yet seen.
-Pre-merge's existing review-SHA gate (#16) SHALL then determine, from the new commit, whether a
-fresh review round is required before the issue can reach `eval-gate` again and ultimately
-`ready-to-deploy`. A pass that was NOT preceded by a fix round in the current invocation SHALL
-continue to advance directly, unaffected.
+The eval gate SHALL, when the eval command passes while an eval-fix commit sits on the PR that has
+not yet cleared pre-merge review, transition the issue to `pre-merge` instead of advancing directly
+to the configured next stage — the pushed commit is a developer commit the pipeline's review process
+has not yet seen. This SHALL be determined durably from GitHub PR state (the last reviewed SHA
+recorded on a trusted review comment, and whether a commit matching the prescribed eval-fix message
+format landed since that SHA) rather than from an in-memory flag scoped to a single invocation, so a
+fix commit pushed in an earlier invocation that was interrupted before this stage's transition call
+still routes to pre-merge on a later pass. Pre-merge's existing review-SHA gate (#16) SHALL then
+determine, from the new commit, whether a fresh review round is required before the issue can reach
+`eval-gate` again and ultimately `ready-to-deploy`. A pass with no such unreviewed eval-fix commit on
+the PR SHALL continue to advance directly, unaffected.
 
 #### Scenario: fix-round pass routes to pre-merge, not directly to the next stage
 
@@ -86,8 +90,17 @@ continue to advance directly, unaffected.
 #### Scenario: first-attempt pass with no fix round advances directly
 
 - **WHEN** the eval command exits 0 on the first attempt (no fix round invoked in this run)
+- **AND** no eval-fix commit has landed on the PR since the last reviewed SHA
 - **THEN** the stage SHALL transition to the configured next stage exactly as it did before this
   capability existed
+
+#### Scenario: a pass following an eval-fix commit pushed in an earlier, interrupted invocation still routes to pre-merge
+
+- **WHEN** an eval-fix commit was pushed in a prior invocation that was interrupted before the
+  `pre-merge` transition ran
+- **AND** a later invocation's eval pass follows, with no fix round in that later invocation
+- **THEN** the stage SHALL still transition to `pre-merge`, derived from GitHub PR state rather than
+  the (absent) in-memory flag of the later invocation
 
 ---
 

@@ -92,14 +92,27 @@ has not yet seen. Review round 1 (#372) flagged the original "a human owns the m
 as insufficient given the repo's review-rigor contract: an unreviewed code change should not reach
 `ready-to-deploy` even though a human still clicks merge.
 
-Resolution: when the re-run eval command passes after a fix round pushed a commit, the stage
-transitions the issue to `pre-merge` instead of advancing directly. Pre-merge's existing review-SHA
-gate (#16) already detects a developer commit landing after a reviewed verdict and routes it through
-a delta review (or full review round); reusing it here needs no new gate logic. Once that gate
-clears, pre-merge's own next-stage routing sends the issue back to `eval-gate` (still enabled), which
-now passes on its first attempt (no fix round) and advances normally. A pass with no preceding fix
-round in the current invocation is unaffected and advances directly, exactly as before this
-resolution.
+Resolution: when the eval command passes while an eval-fix commit sits on the PR that hasn't cleared
+pre-merge review, the stage transitions the issue to `pre-merge` instead of advancing directly.
+Pre-merge's existing review-SHA gate (#16) already detects a developer commit landing after a
+reviewed verdict and routes it through a delta review (or full review round); reusing it here needs
+no new gate logic. Once that gate clears, pre-merge's own next-stage routing sends the issue back to
+`eval-gate` (still enabled), which now passes on its first attempt (no fix round) and advances
+normally. A pass with no unreviewed eval-fix commit on the PR is unaffected and advances directly,
+exactly as before this resolution.
+
+Review round 2 (#372) flagged the original implementation: an in-memory "a fix round pushed a commit
+in this invocation" boolean is lost if the process is interrupted between the push and the
+`transition` call, or if a later invocation resumes at `eval-gate` after such an interruption — a
+subsequent pass would then see no in-memory flag set and advance directly, bypassing review of the
+still-unreviewed fix commit. The routing decision is instead re-derived, on every pass, purely from
+GitHub PR state: the last reviewed SHA recorded on a trusted review comment (`extractReviewedSha`,
+the same helper the pre-merge gate itself uses), and whether any commit landed since that SHA matches
+the prescribed eval-fix commit message pattern. This is the same durable-derivation pattern
+pre-merge's own bounded auto-fix check already uses (re-deriving "did an auto-fix already land?" from
+`getPrCommits` on every invocation rather than an in-memory or persisted flag) and needs no new
+persisted state. The check fails closed (treats the commit as still needing review) on any GitHub
+lookup error, so an unverifiable state never silently bypasses review.
 
 ## Timeouts
 

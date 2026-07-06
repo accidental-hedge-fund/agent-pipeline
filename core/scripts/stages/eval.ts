@@ -24,6 +24,10 @@ import {
   gitInWorktree,
 } from "../worktree.ts";
 import {
+  getGhActor as defaultGetGhActor,
+  getIssueDetail as defaultGetIssueDetail,
+  getPrCommits as defaultGetPrCommits,
+  getPrForIssue as defaultGetPrForIssue,
   postComment as defaultPostComment,
   setBlocked as defaultSetBlocked,
   silentTransition as defaultSilentTransition,
@@ -31,6 +35,7 @@ import {
 } from "../gh.ts";
 import { invoke as defaultInvoke, runCapped, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { buildEvalFixPrompt } from "../prompts/index.ts";
+import { extractReviewedSha } from "./review-parsing.ts";
 import {
   verifyHarnessCommits,
   type VerifyDeps,
@@ -143,6 +148,23 @@ export interface EvalDeps {
   ) => Promise<boolean>;
   /** Verify the eval-fix commit message format. Injectable for tests. */
   verifyEvalFix?: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
+  /** Authenticated gh actor login, used to trust-filter review comments when
+   *  deriving whether an eval-fix commit still needs review (#372 review-2
+   *  finding 1). */
+  getGhActor?: () => Promise<string | null>;
+  /** Issue comments, used to extract the last reviewed SHA. */
+  getIssueDetail?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<{ comments: { author: string; body: string }[] }>;
+  /** Resolve the open PR for this issue, to read its commit history. */
+  getPrForIssue?: (cfg: PipelineConfig, issueNumber: number) => Promise<number | null>;
+  /** PR commits (oldest-first), used to detect an eval-fix commit landed since
+   *  the last reviewed SHA. */
+  getPrCommits?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+  ) => Promise<{ oid: string; messageHeadline: string }[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +191,16 @@ export function evalFixSalvageStageLabel(issueNumber: number): string {
 }
 
 /**
+ * Commit message pattern for a prescribed eval-fix commit. Shared by
+ * {@link enforceEvalFixCommitFormat} (verifies the just-pushed commit) and
+ * {@link evalFixCommitPendingReview} (durably detects an eval-fix commit that
+ * landed in a prior invocation and hasn't cleared review yet).
+ */
+function evalFixCommitPattern(issueNumber: number): RegExp {
+  return new RegExp(`fix:\\s+resolve eval-gate failures \\(#${issueNumber}\\)`, "i");
+}
+
+/**
  * Verifies that at least one commit in `headBefore..HEAD` matches the expected
  * eval-fix commit message format. Exported so tests can exercise the gate
  * without mocking the full `advanceEval` call chain.
@@ -184,12 +216,59 @@ export async function enforceEvalFixCommitFormat(
     headBefore,
     {
       messagePattern: {
-        pattern: new RegExp(`fix:\\s+resolve eval-gate failures \\(#${issueNumber}\\)`, "i"),
+        pattern: evalFixCommitPattern(issueNumber),
         description: "Eval-fix commit message does not match prescribed format",
       },
     },
     deps,
   );
+}
+
+/**
+ * Durable replacement for an in-memory "a fix round ran this invocation" flag
+ * (#372 review-2 finding 1): re-derives, purely from GitHub PR state, whether
+ * an eval-fix commit has landed since the last reviewed SHA and so still
+ * needs to clear pre-merge review before this pass may advance directly.
+ *
+ * This survives a crash/interruption between a fix-round push and this
+ * stage's `transition` call, and a later invocation that resumes at
+ * eval-gate after such an interruption — cases where a purely in-process
+ * flag would reset to false and let an unreviewed fix commit slip through.
+ *
+ * Fails closed (returns `true` — route to pre-merge) on any lookup error, so
+ * an unverifiable state never silently bypasses review.
+ */
+async function evalFixCommitPendingReview(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: {
+    getGhActor: () => Promise<string | null>;
+    getIssueDetail: (cfg: PipelineConfig, issueNumber: number) => Promise<{ comments: { author: string; body: string }[] }>;
+    getPrForIssue: (cfg: PipelineConfig, issueNumber: number) => Promise<number | null>;
+    getPrCommits: (cfg: PipelineConfig, prNumber: number) => Promise<{ oid: string; messageHeadline: string }[]>;
+  },
+): Promise<boolean> {
+  try {
+    const prNumber = await deps.getPrForIssue(cfg, issueNumber);
+    if (!prNumber) return false;
+    // Trust-filter to the authenticated actor's own comments, mirroring the
+    // pre-merge review-SHA gate (#16) — an untrusted commenter must not be
+    // able to forge a stale reviewed-SHA marker.
+    const actor = await deps.getGhActor();
+    const detail = await deps.getIssueDetail(cfg, issueNumber);
+    const trusted = actor ? detail.comments.filter((c) => c.author === actor) : [];
+    const reviewed = extractReviewedSha(trusted);
+    if (!reviewed) return false; // no review has ever run for this issue — nothing to gate against
+    const commits = await deps.getPrCommits(cfg, prNumber);
+    const reviewedIdx = reviewed.sha ? commits.findIndex((c) => c.oid === reviewed.sha) : -1;
+    // reviewedIdx === -1 (unverifiable comment, or reviewed SHA absent from
+    // history) conservatively falls back to scanning every commit.
+    const landedSince = reviewedIdx !== -1 ? commits.slice(reviewedIdx + 1) : commits;
+    const pattern = evalFixCommitPattern(issueNumber);
+    return landedSince.some((c) => pattern.test(c.messageHeadline));
+  } catch {
+    return true;
+  }
 }
 
 interface EvalFixRoundDeps {
@@ -376,6 +455,10 @@ export async function advanceEval(
   const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
   const verifyEvalFixFn =
     deps.verifyEvalFix ?? ((wtPath: string, headBefore: string) => enforceEvalFixCommitFormat(issueNumber, wtPath, headBefore));
+  const getGhActorFn = deps.getGhActor ?? defaultGetGhActor;
+  const getIssueDetailFn = deps.getIssueDetail ?? defaultGetIssueDetail;
+  const getPrForIssueFn = deps.getPrForIssue ?? defaultGetPrForIssue;
+  const getPrCommitsFn = deps.getPrCommits ?? defaultGetPrCommits;
   const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   // Dry-run: no GitHub writes, no command execution. Must come before any
@@ -433,11 +516,6 @@ export async function advanceEval(
 
   let lastResult: EvalRunResult | null = null;
   let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
-  // True once an eval-fix round has pushed a commit in this invocation. A pass
-  // reached after that point is a developer commit the review-SHA gate hasn't
-  // seen yet, so it must route back through pre-merge instead of advancing
-  // directly (#372 review finding 1).
-  let fixCommitLanded = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remainingSec = Math.max(0, (stageDeadlineMs - Date.now()) / 1000);
@@ -523,7 +601,6 @@ export async function advanceEval(
       fixRoundBlocked = { reason: fixResult.reason, blockerKind: fixResult.blockerKind };
       break;
     }
-    fixCommitLanded = true;
     stageDeadlineMs = Date.now() + timeoutSec * 1000;
   }
 
@@ -562,12 +639,21 @@ export async function advanceEval(
   if (result.passed) {
     console.log(`[pipeline] #${issueNumber}: eval-gate passed in ${result.durationSec.toFixed(1)}s`);
 
-    // A pass reached only after an eval-fix commit landed is a developer
-    // commit that hasn't cleared review yet. Route back through pre-merge so
-    // its existing review-SHA gate (#16) decides whether a fresh review round
-    // is required before the item can reach eval-gate — and ready-to-deploy —
-    // again, instead of bypassing review entirely (#372 review finding 1).
-    if (fixCommitLanded) {
+    // A pass reached after an eval-fix commit landed is a developer commit
+    // that hasn't cleared review yet. Re-derive this purely from GitHub PR
+    // state (rather than an in-memory "ran a fix round this invocation" flag,
+    // which is lost across a crash/interruption or a later resumed
+    // invocation — #372 review-2 finding 1) and route back through pre-merge
+    // so its existing review-SHA gate (#16) decides whether a fresh review
+    // round is required before the item can reach eval-gate — and
+    // ready-to-deploy — again.
+    const pendingReview = await evalFixCommitPendingReview(cfg, issueNumber, {
+      getGhActor: getGhActorFn,
+      getIssueDetail: getIssueDetailFn,
+      getPrForIssue: getPrForIssueFn,
+      getPrCommits: getPrCommitsFn,
+    });
+    if (pendingReview) {
       await transitionFn(
         cfg,
         issueNumber,

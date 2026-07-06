@@ -94,6 +94,37 @@ function makeDeps(log: CallLog, results: RunResult[], worktree: { path: string; 
     silentTransition: async (_c, _n, from, to) => { log.silentTransitions.push({ from, to }); },
     setBlocked: async (_c, _n, reason, _stage, kind) => { log.blocked.push({ reason, kind }); },
     postComment: async (_c, _n, body) => { log.comments.push(body); },
+    // No PR / no review history by default (#372 review-2 finding 1): a pass
+    // never routes to pre-merge unless a test explicitly wires up a matching
+    // eval-fix commit via `pendingReviewFixDeps`.
+    getGhActor: async () => null,
+    getIssueDetail: async () => ({ comments: [] }),
+    getPrForIssue: async () => null,
+    getPrCommits: async () => [],
+  };
+}
+
+/**
+ * Deps simulating an unreviewed eval-fix commit sitting on the PR: a trusted
+ * review comment recorded `reviewedSha`, and a later commit matching the
+ * prescribed eval-fix message for `issueNumber` landed after it. Used to
+ * exercise the durable (GitHub-state-derived) pending-review routing without
+ * relying on an in-memory flag (#372 review-2 finding 1).
+ */
+function pendingReviewFixDeps(issueNumber: number): Pick<EvalDeps, "getGhActor" | "getIssueDetail" | "getPrForIssue" | "getPrCommits"> {
+  const reviewedSha = "a".repeat(40);
+  return {
+    getGhActor: async () => "pipeline-bot",
+    getIssueDetail: async () => ({
+      comments: [
+        { author: "pipeline-bot", body: `## Review 2 — approve\n\n<!-- reviewed-sha: ${reviewedSha} -->` },
+      ],
+    }),
+    getPrForIssue: async () => 900,
+    getPrCommits: async () => [
+      { oid: reviewedSha, messageHeadline: "feat: implement thing" },
+      { oid: "b".repeat(40), messageHeadline: `fix: resolve eval-gate failures (#${issueNumber})` },
+    ],
   };
 }
 
@@ -182,6 +213,28 @@ test("eval-gate: exit 0 + gate mode → transitions to ready-to-deploy", async (
   assert.ok(log.comments[0].includes("PASS"), "comment must say PASS");
 });
 
+// #372 review-2 finding 1: the durable pending-review derivation must fail
+// closed (route to pre-merge) rather than silently advancing when GitHub
+// state can't be read — proving it does not just pass because the real
+// `getPrCommits`/`getGhActor` happen to be reachable (no lingering reliance
+// on local gh auth being active).
+test("eval-gate: exit 0 + gate mode + PR commit lookup fails → fails closed, routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+  const deps = makeDeps(log, [passResult("evals: 10/10 passed")]);
+  deps.getPrForIssue = async () => 900;
+  deps.getGhActor = async () => "pipeline-bot";
+  deps.getIssueDetail = async () => ({
+    comments: [{ author: "pipeline-bot", body: `## Review 2 — approve\n\n<!-- reviewed-sha: ${"a".repeat(40)} -->` }],
+  });
+  deps.getPrCommits = async () => { throw new Error("network error: gh not authenticated"); };
+
+  const out = await advanceEval(cfg, 43, {}, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "pre-merge", "an unverifiable review state must fail closed to pre-merge, not advance directly");
+});
+
 test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
@@ -246,6 +299,7 @@ test("eval-gate: gate-mode fail with budget remaining → fix round invoked → 
 
   const deps = makeDeps(log, []);
   Object.assign(deps, cleanFixDeps());
+  Object.assign(deps, pendingReviewFixDeps(46));
   deps.runEval = async () => {
     runCalled++;
     return runCalled === 1 ? failResult("attempt 1 failed") : passResult("attempt 2 passed");
@@ -260,6 +314,32 @@ test("eval-gate: gate-mode fail with budget remaining → fix round invoked → 
   assert.equal((out as { to: string }).to, "pre-merge", "an eval-fix commit must clear pre-merge review before ready-to-deploy");
   assert.equal(log.blocked.length, 0);
   assert.ok(log.comments[0].includes("PASS"));
+});
+
+// Regression test for #372 review-2 finding 1: an in-memory "fix round ran
+// this invocation" flag is lost across a crash/interruption between a
+// fix-round push and the transition call, or a later invocation resuming at
+// eval-gate. This test simulates exactly that: NO fix round runs in this
+// invocation (first-attempt pass, invoke never called), but a prior
+// invocation already pushed an unreviewed eval-fix commit onto the PR. The
+// pass must still route to pre-merge for review, not advance directly — the
+// pre-fix (in-memory-flag) behavior would incorrectly advance straight to
+// ready-to-deploy here since `fixCommitLanded` would be false.
+test("eval-gate: first-attempt pass with an unreviewed eval-fix commit already on the PR (from a prior invocation) → routes to pre-merge", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let invokeCalled = 0;
+
+  const deps = makeDeps(log, [passResult("attempt 1 passed")]);
+  Object.assign(deps, pendingReviewFixDeps(46));
+  deps.invoke = async () => { invokeCalled++; return okInvoke(); };
+
+  const out = await advanceEval(cfg, 46, {}, deps);
+
+  assert.equal(invokeCalled, 0, "no fix round should run in this invocation");
+  assert.equal(out.advanced, true);
+  assert.equal((out as { to: string }).to, "pre-merge", "an unreviewed eval-fix commit from a prior invocation must still route to pre-merge");
+  assert.equal(log.blocked.length, 0);
 });
 
 // Regression test for Finding 1: advisory mode must advance even when retries are exhausted.

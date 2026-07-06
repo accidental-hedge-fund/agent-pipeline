@@ -42,6 +42,10 @@
   command re-ran.
 - [x] 4.10 (#372 review 1, finding 1) A pass with no preceding fix round in the current invocation
   still advances directly to the configured next stage, unaffected by 4.1's routing change.
+- [x] 4.11 (#372 review 2, finding 1) A pass with no fix round in the current invocation, but an
+  unreviewed eval-fix commit already on the PR from an earlier, interrupted invocation, still routes
+  to `pre-merge` — proving the routing decision is derived from durable GitHub PR state, not an
+  in-memory flag. A GitHub lookup failure during that derivation fails closed to `pre-merge`.
 - [x] 4.2 Gate-mode fail → fix rounds exhausted (`max_attempts` reached) → `setBlocked`
   (`eval-gate-failed`) with the final eval output surfaced.
 - [x] 4.3 Advisory-mode fail → advances, harness seam NOT called (no fix round).

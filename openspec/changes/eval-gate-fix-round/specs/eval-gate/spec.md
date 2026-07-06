@@ -6,16 +6,19 @@ The `eval_gate.mode` config key SHALL control blocking behavior. In `gate` mode 
 SHALL, on an ordinary non-zero exit (not a timeout, not a spawn/runner error), first route the
 failure through the `eval-gate-fix-round` loop when fix attempts remain; it SHALL call `setBlocked`
 and SHALL NOT advance only after the `eval_gate.max_attempts` budget is exhausted (or immediately
-when `eval_gate.max_attempts` is `1`). When a fix round has pushed a commit before an eval pass in
-the current invocation, the stage SHALL transition to `pre-merge` instead of advancing directly (see
-the `eval-gate-fix-round` capability's review-gate requirement). In `advisory` mode the stage SHALL
+when `eval_gate.max_attempts` is `1`). When an eval pass follows an eval-fix commit that has not yet
+cleared pre-merge review — determined durably from GitHub PR state rather than from any single
+invocation's in-memory history, so it also catches a fix commit pushed in an earlier, interrupted
+invocation — the stage SHALL transition to `pre-merge` instead of advancing directly (see the
+`eval-gate-fix-round` capability's review-gate requirement). In `advisory` mode the stage SHALL
 record the result comment and SHALL transition to the next stage (`shipcheck-gate` when opted in,
 else `ready-to-deploy`) regardless of exit code, and SHALL NOT route to a fix round.
 
-#### Scenario: gate mode + pass with no fix round — advances to the next stage
+#### Scenario: gate mode + pass with no unreviewed eval-fix commit — advances to the next stage
 
 - **WHEN** mode is `"gate"` (or absent/default)
-- **AND** the eval command exits 0 on an attempt not preceded by a fix round in this invocation
+- **AND** the eval command exits 0
+- **AND** no eval-fix commit has landed on the PR since the last reviewed SHA
 - **THEN** the stage SHALL transition to the configured next stage (`shipcheck-gate` when opted in,
   else `ready-to-deploy`)
 
