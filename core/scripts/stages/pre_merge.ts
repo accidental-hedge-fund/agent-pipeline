@@ -1507,34 +1507,35 @@ export async function enforceReviewShaGate(
               // 2). `newPrHead` is the authoritative post-fix head we already
               // confirmed was pushed (performPreMergeAutoFix only returns
               // "fix-committed" after `git push` succeeds); the GitHub API's
-              // PR-head field can still echo the pre-fix `head` for a short
-              // window after that push lands. A THIRD, different SHA indicates
-              // a genuinely newer concurrent push. A read matching the pre-fix
-              // `head`, however, is NOT proof of mere staleness (#371 delta
-              // review, key 8ad8b7f0): the same stale read can mask a
-              // concurrent push that landed during the re-review. Disambiguate
-              // via the live remote ref (`git ls-remote`), and fail closed to
-              // the SHA gate when it does not confirm the auto-fix head.
+              // PR-head field can still echo the pre-fix `head`, or even echo
+              // `newPrHead` itself, for a short window after a *further*
+              // concurrent push lands. Neither a read matching the pre-fix
+              // `head` nor one matching `newPrHead` is proof of mere staleness
+              // (#371 delta review, keys 8ad8b7f0 and 9943b2af): both can mask
+              // a concurrent push that landed during the re-review. Disambiguate
+              // via the live remote ref (`git ls-remote`) whenever the API read
+              // is consistent with either of those two known SHAs, and fail
+              // closed to the SHA gate when it does not confirm the auto-fix
+              // head. A read reporting some THIRD, different SHA is an
+              // unambiguous signal of a newer concurrent push on its own.
               const postFixPr = await getPrDetailFn(cfg, prNumber);
               const postFixHead = postFixPr.head_sha;
-              if (postFixHead !== newPrHead) {
-                if (postFixHead !== head) {
-                  throw new Error(
-                    `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
-                    `during pre-merge auto-fix re-review; re-entering SHA gate`,
-                  );
-                }
-                const remoteHead = await getRemoteHeadFn(
-                  deltaWorktreePath, postFixPr.head_ref,
+              if (postFixHead !== newPrHead && postFixHead !== head) {
+                throw new Error(
+                  `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
+                  `during pre-merge auto-fix re-review; re-entering SHA gate`,
                 );
-                if (remoteHead !== newPrHead) {
-                  throw new Error(
-                    `GitHub API still reports pre-fix head ${head.slice(0, 7)} and ` +
-                    `ls-remote reports ${remoteHead ? remoteHead.slice(0, 7) : "(unreadable)"} ` +
-                    `— cannot confirm auto-fix head ${newPrHead.slice(0, 7)} is the current ` +
-                    `PR head; re-entering SHA gate`,
-                  );
-                }
+              }
+              const remoteHead = await getRemoteHeadFn(
+                deltaWorktreePath, postFixPr.head_ref,
+              );
+              if (remoteHead !== newPrHead) {
+                throw new Error(
+                  `GitHub API reports head ${postFixHead.slice(0, 7)} and ls-remote reports ` +
+                  `${remoteHead ? remoteHead.slice(0, 7) : "(unreadable)"} — cannot confirm ` +
+                  `auto-fix head ${newPrHead.slice(0, 7)} is the current PR head; ` +
+                  `re-entering SHA gate`,
+                );
               }
               console.log(
                 `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
