@@ -29,6 +29,7 @@ import {
   bundlePath,
   createBundle,
   finalizeBundle,
+  formatEvidenceCommentBody,
   markNotified,
   patchBundleIdentity,
   recordOverride,
@@ -62,6 +63,7 @@ import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
   reviewStageSkipTarget,
+  type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
   type Stage,
@@ -204,29 +206,21 @@ export function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome
 }
 
 /**
- * Post a single comment recording the local evidence-bundle path so a maintainer
- * can find it (#147). Targets the PR when one exists, else the issue. Skipped when
- * a notification was already recorded for this run; marks the bundle notified
- * after posting. Best-effort — wrapped by the caller.
+ * Post a single self-contained finalization comment (#147, #377): a labeled run
+ * id, a per-stage timing table, and the local evidence-bundle path demoted to
+ * secondary/optional context. Targets the PR when one exists, else the issue.
+ * Skipped when a notification was already recorded for this run; marks the
+ * bundle notified after posting. Best-effort — wrapped by the caller.
  */
 async function notifyBundlePath(
   cfg: PipelineConfig,
   issueNumber: number,
   stateDir: string,
-  alreadyNotifiedAt: string | null,
+  bundle: EvidenceBundle,
 ): Promise<void> {
-  if (alreadyNotifiedAt) return;
+  if (bundle.notifiedAt) return;
   const p = bundlePath(stateDir, issueNumber);
-  const body = [
-    "## Pipeline: Evidence bundle",
-    "",
-    `Run evidence written to: \`${p}\``,
-    "",
-    `Print a human-readable summary with \`${cfg.invocation} ${issueNumber} --summary\`.`,
-    "",
-    "---",
-    "*Automated by Claude Code Pipeline Skill*",
-  ].join("\n");
+  const body = formatEvidenceCommentBody(bundle, p, `${cfg.invocation} ${issueNumber} --summary`);
   const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
   if (pr) {
     await postPrComment(cfg, pr, body);
@@ -883,7 +877,7 @@ export async function runAdvance(
           if (runDir) {
             await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
           }
-          await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
+          await notifyBundlePath(cfg, issueNumber, stateDir, finalized);
         } catch {
           /* audit-only — ignore */
         }
