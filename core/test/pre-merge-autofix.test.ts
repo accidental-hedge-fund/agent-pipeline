@@ -1020,3 +1020,85 @@ test(
     // reviewed-sha) fails instead.
   },
 );
+
+// ---------------------------------------------------------------------------
+// #371 review 2: the FINAL post-approval HEAD revalidation must not veto an
+// approving re-review when the GitHub-API PR-head read is still stale at that
+// exact call (not just during the re-review invocation itself).
+// ---------------------------------------------------------------------------
+
+test(
+  "pre-merge auto-fix #371 review 2: stale GitHub-API PR-head read at the final revalidation does not re-block a resolved auto-fix",
+  async (t) => {
+    const comments: string[] = [];
+    let autoFixCalls = 0;
+    let deltaReviewCalls = 0;
+
+    const commits = [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+      { oid: SHA_HEAD, messageHeadline: "fix: address review 2 findings (#371)" },
+    ];
+
+    const runDeltaReview: RunDeltaReviewFn = async () => {
+      deltaReviewCalls++;
+      if (deltaReviewCalls === 1) {
+        return {
+          verdict: "needs-attention",
+          findings: [blockingFinding("correctness")],
+          summary: "initial: blocking correctness finding",
+        } as DeltaReviewResult;
+      }
+      return { verdict: "approve", findings: [], summary: "post-fix: resolved" } as DeltaReviewResult;
+    };
+
+    const deps: ShaGateDeps = {
+      getIssueDetail: async () =>
+        ({
+          title: "Test issue",
+          body: "Body",
+          comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+        }) as any,
+      // Deliberately never catches up to the post-fix head (SHA_AFTER_FIX) —
+      // models a GitHub-API read that is still stale at the FINAL
+      // revalidation call following the approving re-review, not just during
+      // the re-review invocation itself (the gap the review-2 finding flagged).
+      getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+      getPrCommits: async () => commits as any,
+      getPrDiff: async () => NEW_DIFF,
+      getCommitDeltaDiff: async () => NEW_DIFF,
+      runDeltaReview,
+      postComment: async (_cfg, _n, body) => { comments.push(body); },
+      transition: async () => {},
+      setBlocked: async () => {},
+      getForIssue: async () => null,
+      getGhActor: async () => TEST_ACTOR,
+      attemptPreMergeAutoFix: async () => {
+        autoFixCalls++;
+        return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+      },
+    };
+
+    let out: any;
+    await quiet(t, async () => {
+      out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+    });
+
+    assert.equal(
+      out,
+      null,
+      "a stale GitHub-API PR-head read that still echoes the known pre-fix head must not " +
+        "veto an approving post-fix re-review",
+    );
+    assert.equal(autoFixCalls, 1, "auto-fix seam called exactly once");
+    assert.equal(deltaReviewCalls, 2, "initial delta review + one re-review");
+
+    // Bite check: WITHOUT the fix, `postFixHead !== newPrHead` alone would
+    // throw here (SHA_HEAD !== SHA_AFTER_FIX), routing to the conservative
+    // fallback (a stale-review comment + transition back to review-2) instead
+    // of returning null.
+    assert.ok(
+      !comments.some((c) => /HEAD has moved/.test(c)),
+      "must not fall back to the stale-review path on a known-stale (not genuinely new) PR-head read",
+    );
+  },
+);

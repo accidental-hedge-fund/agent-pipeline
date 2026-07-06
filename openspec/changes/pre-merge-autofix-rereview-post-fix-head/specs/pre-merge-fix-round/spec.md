@@ -52,6 +52,16 @@ object, and the re-review verdict comment SHALL record its `reviewed-sha` and
 - **AND** the re-review SHALL still be able to block on genuinely unresolved or newly
   introduced findings in the post-fix diff
 
+#### Scenario: A stale GitHub-API read at the final approval revalidation does not veto a resolved auto-fix
+
+- **WHEN** the post-fix re-review approves and the pipeline re-reads the PR head from the
+  GitHub API to confirm no push landed during the re-review, and that read still echoes the
+  known pre-fix head (the head the delta review evaluated before the auto-fix ran)
+- **THEN** the pipeline SHALL treat that read as the known GitHub-API staleness, not as
+  evidence of a newer concurrent push, and SHALL proceed
+- **AND** the pipeline SHALL still re-enter the SHA gate when that read returns a SHA that is
+  neither the pre-fix head nor the auto-fix commit SHA (a genuinely newer concurrent push)
+
 ## MODIFIED Requirements
 
 ### Requirement: The pre-merge auto-fix behavior SHALL be covered by regression tests
@@ -83,3 +93,11 @@ Each test SHALL fail (bite) if the corresponding behavior is removed.
   instead of the authoritative local post-fix head (regressing the fix)
 - **THEN** the test asserting the second review invocation receives a different diff than the
   first — anchored to the post-fix head — SHALL fail
+
+#### Scenario: final revalidation regression test bites
+
+- **WHEN** the post-approval HEAD revalidation is reverted to block on any mismatch between
+  the GitHub-API PR-head read and the auto-fix commit SHA, without tolerating the known
+  pre-fix head as staleness
+- **THEN** the test asserting a stale GitHub-API read of the pre-fix head does not veto an
+  approving post-fix re-review SHALL fail

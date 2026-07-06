@@ -35,3 +35,13 @@
 - [x] 4.1 Regenerate the `plugin/` mirror (`node scripts/build.mjs`) and commit it.
 - [x] 4.2 Run `openspec validate pre-merge-autofix-rereview-post-fix-head`.
 - [x] 4.3 Run `npm run ci` from the repo root and confirm it is green.
+
+## 5. Harden the final approval revalidation against stale GitHub-API reads (review 2)
+
+- [x] 5.1 In the post-fix re-review approval branch's HEAD revalidation, tolerate a
+      GitHub-API read that still echoes the known pre-fix head (staleness), while still
+      re-entering the SHA gate for a genuinely different (newer) SHA.
+- [x] 5.2 Add a regression test where the GitHub-API `getPrDetail` stub never advances past
+      the pre-fix head, proving the final revalidation call itself (not just the re-review
+      invocation) tolerates the stale read.
+- [x] 5.3 Prove the test bites against the pre-fix (exact-match-only) revalidation.

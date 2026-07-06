@@ -1480,9 +1480,17 @@ export async function enforceReviewShaGate(
             await postCommentFn(cfg, issueNumber, reComment);
 
             if (rePartition.blocking.length === 0 && !reIsUnparseable) {
-              // Re-validate HEAD (same guard as the normal approve path).
+              // Re-validate HEAD, but do not let a single stale GitHub-API
+              // PR-head read veto an approving post-fix re-review (#371 review
+              // 2). `newPrHead` is the authoritative post-fix head we already
+              // confirmed was pushed (performPreMergeAutoFix only returns
+              // "fix-committed" after `git push` succeeds); the GitHub API's
+              // PR-head field can still echo the pre-fix `head` for a short
+              // window after that push lands. Treat a read that matches the
+              // known pre-fix head as that staleness, not a new push — only a
+              // THIRD, different SHA indicates a genuinely newer concurrent push.
               const postFixHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
-              if (postFixHead !== newPrHead) {
+              if (postFixHead !== newPrHead && postFixHead !== head) {
                 throw new Error(
                   `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
                   `during pre-merge auto-fix re-review; re-entering SHA gate`,
