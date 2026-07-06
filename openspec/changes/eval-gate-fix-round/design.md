@@ -85,15 +85,21 @@ commit produced (after salvage), a worktree left dirty, or a failed push blocks 
 (`harness-failure` for harness/commit problems, `push-failed` for a failed push) and never pushes a
 partial fix. The eval command is only re-run after a verified, pushed fix commit.
 
-### D7 — Rigor note: the eval-fix commit lands after pre-merge review
+### D7 — The eval-fix commit routes back through pre-merge review before ready-to-deploy
 
-The eval gate runs after pre-merge, so an eval-fix commit is a developer commit that reaches
-`ready-to-deploy` without a pipeline review round (unlike a test-gate fix, which lands before review
-completes). This is acceptable under the pipeline's contract because **the pipeline never merges** —
-it stops at `ready-to-deploy` and a human owns the merge button, and that human sees the eval-fix
-commit on the PR. A future change may route the eval-fix commit back through the pre-merge delta
-re-review (as `pre-merge-fix-round` does) for parity; that is out of scope here and noted as an open
-follow-up.
+The eval gate runs after pre-merge, so a pushed eval-fix commit is a developer commit the reviewer
+has not yet seen. Review round 1 (#372) flagged the original "a human owns the merge button" framing
+as insufficient given the repo's review-rigor contract: an unreviewed code change should not reach
+`ready-to-deploy` even though a human still clicks merge.
+
+Resolution: when the re-run eval command passes after a fix round pushed a commit, the stage
+transitions the issue to `pre-merge` instead of advancing directly. Pre-merge's existing review-SHA
+gate (#16) already detects a developer commit landing after a reviewed verdict and routes it through
+a delta review (or full review round); reusing it here needs no new gate logic. Once that gate
+clears, pre-merge's own next-stage routing sends the issue back to `eval-gate` (still enabled), which
+now passes on its first attempt (no fix round) and advances normally. A pass with no preceding fix
+round in the current invocation is unaffected and advances directly, exactly as before this
+resolution.
 
 ## Timeouts
 

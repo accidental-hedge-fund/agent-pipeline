@@ -37,8 +37,11 @@
 
 ## 4. Tests (DI seams only — no real harness/git/network)
 
-- [x] 4.1 Gate-mode fail → fix round invoked → re-run passes → advances to the configured next stage;
-  assert the harness seam was called once and the eval command re-ran.
+- [x] 4.1 Gate-mode fail → fix round invoked → re-run passes → routes to `pre-merge` for review
+  (not directly to the configured next stage); assert the harness seam was called once and the eval
+  command re-ran.
+- [x] 4.10 (#372 review 1, finding 1) A pass with no preceding fix round in the current invocation
+  still advances directly to the configured next stage, unaffected by 4.1's routing change.
 - [x] 4.2 Gate-mode fail → fix rounds exhausted (`max_attempts` reached) → `setBlocked`
   (`eval-gate-failed`) with the final eval output surfaced.
 - [x] 4.3 Advisory-mode fail → advances, harness seam NOT called (no fix round).

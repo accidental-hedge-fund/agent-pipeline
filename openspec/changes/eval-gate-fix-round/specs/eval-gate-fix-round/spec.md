@@ -59,12 +59,35 @@ NOT be re-run until a fix commit has been verified and pushed.
 - **THEN** the stage SHALL re-run `eval_gate.command` in the worktree
 - **AND** SHALL evaluate the re-run result for pass/fail/tooling exactly as a first run
 
-#### Scenario: re-run eval passes — item advances normally
+#### Scenario: re-run eval passes — routes back through pre-merge for review
 
-- **WHEN** the re-run eval command exits 0
-- **THEN** the stage SHALL transition to the configured next stage (`shipcheck-gate` when opted in,
-  else `ready-to-deploy`)
-- **AND** SHALL use the same advance path as a first-try pass
+- **WHEN** the re-run eval command exits 0 after a fix round pushed a commit in this invocation
+- **THEN** the stage SHALL transition to `pre-merge` rather than advancing directly to the configured
+  next stage (see the review-gate requirement below)
+
+---
+
+### Requirement: An eval-fix commit SHALL be routed back through pre-merge review before advancing
+
+The eval gate SHALL, when the eval command passes after a fix round pushed a commit in the current
+invocation, transition the issue to `pre-merge` instead of advancing directly to the configured next
+stage — the pushed commit is a developer commit the pipeline's review process has not yet seen.
+Pre-merge's existing review-SHA gate (#16) SHALL then determine, from the new commit, whether a
+fresh review round is required before the issue can reach `eval-gate` again and ultimately
+`ready-to-deploy`. A pass that was NOT preceded by a fix round in the current invocation SHALL
+continue to advance directly, unaffected.
+
+#### Scenario: fix-round pass routes to pre-merge, not directly to the next stage
+
+- **WHEN** a fix round pushes a commit and the re-run eval command exits 0
+- **THEN** the stage SHALL transition to `pre-merge`
+- **AND** SHALL NOT transition directly to `shipcheck-gate` or `ready-to-deploy`
+
+#### Scenario: first-attempt pass with no fix round advances directly
+
+- **WHEN** the eval command exits 0 on the first attempt (no fix round invoked in this run)
+- **THEN** the stage SHALL transition to the configured next stage exactly as it did before this
+  capability existed
 
 ---
 

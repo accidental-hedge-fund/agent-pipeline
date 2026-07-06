@@ -233,7 +233,12 @@ test("eval-gate: non-zero exit + advisory mode → comment posted, transitions t
 
 // #372: a gate-mode retry is now preceded by a fix round rather than a plain
 // re-run of the same command.
-test("eval-gate: gate-mode fail with budget remaining → fix round invoked → re-run passes → advances", async () => {
+// Review 1 finding 1 (#372): a pass reached after a pushed eval-fix commit
+// must route back through pre-merge for review, not straight to the next
+// stage — the fix commit is a developer commit the review-SHA gate hasn't
+// seen yet. This regression test fails against the pre-fix behavior, which
+// advanced directly to ready-to-deploy.
+test("eval-gate: gate-mode fail with budget remaining → fix round invoked → re-run passes → routes to pre-merge for review", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
   let runCalled = 0;
@@ -252,7 +257,7 @@ test("eval-gate: gate-mode fail with budget remaining → fix round invoked → 
   assert.equal(runCalled, 2, "must run the eval command twice");
   assert.equal(invokeCalled, 1, "must invoke the fix harness exactly once between the two eval runs");
   assert.equal(out.advanced, true);
-  assert.equal((out as { to: string }).to, "ready-to-deploy");
+  assert.equal((out as { to: string }).to, "pre-merge", "an eval-fix commit must clear pre-merge review before ready-to-deploy");
   assert.equal(log.blocked.length, 0);
   assert.ok(log.comments[0].includes("PASS"));
 });

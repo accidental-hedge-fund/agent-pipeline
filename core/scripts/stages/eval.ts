@@ -12,6 +12,9 @@
 // round resets it, since fix-harness time is bounded separately by
 // `fix_timeout`. Tooling failures (timeout/spawn error) always block
 // immediately, in either mode, and never trigger a fix round.
+// A pass reached after an eval-fix commit landed routes back through
+// pre-merge (not directly to the next stage) so the existing review-SHA gate
+// decides whether the unreviewed fix commit needs a fresh review round.
 // The command is run through `sh -c` so normal shell syntax works.
 
 import * as path from "node:path";
@@ -430,6 +433,11 @@ export async function advanceEval(
 
   let lastResult: EvalRunResult | null = null;
   let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
+  // True once an eval-fix round has pushed a commit in this invocation. A pass
+  // reached after that point is a developer commit the review-SHA gate hasn't
+  // seen yet, so it must route back through pre-merge instead of advancing
+  // directly (#372 review finding 1).
+  let fixCommitLanded = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remainingSec = Math.max(0, (stageDeadlineMs - Date.now()) / 1000);
@@ -515,6 +523,7 @@ export async function advanceEval(
       fixRoundBlocked = { reason: fixResult.reason, blockerKind: fixResult.blockerKind };
       break;
     }
+    fixCommitLanded = true;
     stageDeadlineMs = Date.now() + timeoutSec * 1000;
   }
 
@@ -552,6 +561,29 @@ export async function advanceEval(
 
   if (result.passed) {
     console.log(`[pipeline] #${issueNumber}: eval-gate passed in ${result.durationSec.toFixed(1)}s`);
+
+    // A pass reached only after an eval-fix commit landed is a developer
+    // commit that hasn't cleared review yet. Route back through pre-merge so
+    // its existing review-SHA gate (#16) decides whether a fresh review round
+    // is required before the item can reach eval-gate — and ready-to-deploy —
+    // again, instead of bypassing review entirely (#372 review finding 1).
+    if (fixCommitLanded) {
+      await transitionFn(
+        cfg,
+        issueNumber,
+        "eval-gate",
+        "pre-merge",
+        `Eval gate passed in ${result.durationSec.toFixed(1)}s after an eval-fix commit. Routing back through pre-merge for review before advancing.`,
+      );
+      await recordGateResult(opts, "pass", cfg.eval_gate.mode, "fix_commit_needs_review");
+      return {
+        advanced: true,
+        from: "eval-gate",
+        to: "pre-merge",
+        summary: `eval passed after fix round in ${result.durationSec.toFixed(1)}s; routed to pre-merge for review`,
+      };
+    }
+
     const passTo = nextAfterEval(cfg);
     await transitionFn(cfg, issueNumber, "eval-gate", passTo, `Eval gate passed. Advancing to ${passTo}.`);
     await recordGateResult(opts, "pass", cfg.eval_gate.mode);
