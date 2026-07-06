@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { advanceEval, type EvalDeps, type EvalRunResult } from "../scripts/stages/eval.ts";
+import { advanceEval, truncate, type EvalDeps, type EvalRunResult } from "../scripts/stages/eval.ts";
 import { readBundle } from "../scripts/evidence-bundle.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
@@ -460,4 +460,64 @@ test("eval-gate: pass + shipcheck_gate.enabled:false → transitions to ready-to
 
   assert.equal(out.advanced, true);
   assert.equal((out as { to: string }).to, "ready-to-deploy", "must route to ready-to-deploy when shipcheck disabled");
+});
+
+// ---------------------------------------------------------------------------
+// #373: truncate() must preserve the summary tail, not just the head.
+// ---------------------------------------------------------------------------
+
+test("truncate: within-limit input returned verbatim, no marker", () => {
+  const s = "a".repeat(500);
+  assert.equal(truncate(s, 2000), s);
+});
+
+test("truncate: exactly-at-limit input returned verbatim, no marker", () => {
+  const s = "a".repeat(2000);
+  assert.equal(truncate(s, 2000), s);
+});
+
+test("truncate: over-limit input keeps a summary sentinel that only appears in the final characters", () => {
+  const sentinel = "SUMMARY: 3 failed, 97 passed";
+  const noise = "x".repeat(5000);
+  const s = `${noise}\n${sentinel}`;
+
+  const out = truncate(s, 2000);
+
+  assert.ok(out.includes(sentinel), "tail summary sentinel must survive truncation");
+});
+
+test("truncate: over-limit input contains a head fragment, an elision marker, and a tail fragment, within the source-character budget", () => {
+  const head = "$ pnpm evals\nsetting up harness...\n";
+  const middle = "x".repeat(5000);
+  const tail = "\nSUMMARY: 3 failed, 97 passed";
+  const s = `${head}${middle}${tail}`;
+
+  const out = truncate(s, 2000);
+
+  assert.ok(out.startsWith(head.slice(0, 10)), "must retain a leading head fragment");
+  assert.ok(out.includes("truncated"), "must include an elision marker noting dropped content");
+  assert.ok(out.endsWith(tail), "must retain the trailing tail fragment");
+
+  // Source characters shown (excluding the marker text) must not exceed the cap.
+  const markerMatch = out.match(/\[… (\d+) characters truncated …\]/);
+  assert.ok(markerMatch, "marker must state how many characters were dropped");
+  const dropped = Number(markerMatch![1]);
+  assert.equal(dropped, s.length - 2000);
+  const sourceCharsShown = s.length - dropped;
+  assert.ok(sourceCharsShown <= 2000, "shown source characters must not exceed the cap");
+});
+
+// Regression: proves this test bites against the pre-#373 head-only slice(0, cap).
+test("truncate: regression — a summary sentinel placed only in the final characters must not be dropped", () => {
+  const sentinel = "FINAL SCORE: 42/100";
+  const s = "noise ".repeat(1000) + sentinel;
+  assert.ok(s.length > 2000, "fixture must exceed the cap to exercise truncation");
+
+  const out = truncate(s, 2000);
+
+  assert.ok(out.includes(sentinel));
+  // The old implementation was `s.slice(0, cap) + "\n\n[…output truncated]"`, which
+  // would never include a sentinel located only in the final characters.
+  const oldBehavior = s.slice(0, 2000) + "\n\n[…output truncated]";
+  assert.ok(!oldBehavior.includes(sentinel), "sanity check: old head-only slice must not contain the tail sentinel");
 });
