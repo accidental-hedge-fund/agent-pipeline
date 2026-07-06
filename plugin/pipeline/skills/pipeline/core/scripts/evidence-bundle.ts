@@ -404,15 +404,71 @@ export async function markNotified(
 // Human-readable summary
 // ---------------------------------------------------------------------------
 
-function formatDuration(enteredAt: string | null, exitedAt: string | null): string {
-  if (!enteredAt || !exitedAt) return "—";
+/** Milliseconds between `enteredAt` and `exitedAt`, or `null` when either
+ *  timestamp is missing or the pair is invalid (unparseable, or exited before
+ *  entered). Shared by `formatDuration` (comment/summary rendering) and the
+ *  issue-history writer (numeric `durationMs`) so both draw from one source of
+ *  truth (#377). */
+export function stageDurationMs(enteredAt: string | null, exitedAt: string | null): number | null {
+  if (!enteredAt || !exitedAt) return null;
   const ms = Date.parse(exitedAt) - Date.parse(enteredAt);
-  if (!Number.isFinite(ms) || ms < 0) return "—";
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  return ms;
+}
+
+function formatDuration(enteredAt: string | null, exitedAt: string | null): string {
+  const ms = stageDurationMs(enteredAt, exitedAt);
+  if (ms === null) return "—";
   const totalSec = Math.round(ms / 1000);
   if (totalSec < 60) return `${totalSec}s`;
   const min = Math.floor(totalSec / 60);
   const sec = totalSec % 60;
   return `${min}m${String(sec).padStart(2, "0")}s`;
+}
+
+/** Render a Markdown table with one row per recorded stage: stage name, its
+ *  `enteredAt`→`exitedAt` timestamps, duration (via `formatDuration`), and
+ *  outcome. Pure — reads only stage/timing/outcome fields, so the finalization
+ *  comment's no-accounting-payload contract holds by construction (#377). */
+export function formatStageTimingTableMarkdown(bundle: EvidenceBundle): string {
+  const lines = ["| Stage | Entered → Exited | Duration | Outcome |", "| --- | --- | --- | --- |"];
+  if (bundle.stages.length === 0) {
+    lines.push("| _(no stages recorded)_ |  |  |  |");
+  } else {
+    for (const s of bundle.stages) {
+      lines.push(
+        `| ${s.stage} | ${s.enteredAt ?? "—"} → ${s.exitedAt ?? "—"} | ${formatDuration(s.enteredAt, s.exitedAt)} | ${s.outcome ?? "in-progress"} |`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+/** Compose the full finalization comment body: a labeled run-id field, the
+ *  per-stage timing table, and the local bundle path / `--summary` hint demoted
+ *  to secondary/optional context. Pure — takes the finalized bundle and the
+ *  already-known local path/hint strings, so it renders with no filesystem
+ *  access: a reviewer on a different machine sees the identical run id,
+ *  timings, and outcome (#377). Reads only identity and stage/timing/outcome
+ *  fields — never `commands`, `prompts`, `reviews`, or `accounting` — preserving
+ *  the no-accounting-payload contract. */
+export function formatEvidenceCommentBody(
+  bundle: EvidenceBundle,
+  localBundlePath: string,
+  summaryHint: string,
+): string {
+  return [
+    "## Pipeline: Evidence bundle",
+    "",
+    `**Run ID:** \`${bundle.runId || "(none)"}\``,
+    "",
+    formatStageTimingTableMarkdown(bundle),
+    "",
+    `<sub>Local bundle path (secondary/optional): \`${localBundlePath}\` — or run \`${summaryHint}\`.</sub>`,
+    "",
+    "---",
+    "*Automated by Claude Code Pipeline Skill*",
+  ].join("\n");
 }
 
 function pad(s: string, width: number): string {

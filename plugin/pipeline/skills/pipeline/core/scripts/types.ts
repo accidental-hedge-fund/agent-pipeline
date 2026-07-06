@@ -928,6 +928,41 @@ export interface EvidenceBundle {
   no_test_rationale?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Issue-level evidence history (#377) — an append-only, issue-scoped JSONL
+// artifact recording one compact timing/outcome record per finalized run, so
+// resuming a pipeline run after a fix round never erases prior rounds' history.
+// Deliberately narrower than EvidenceBundle: no commands/prompts/reviews — a
+// timing rollup, not a second full bundle.
+// ---------------------------------------------------------------------------
+
+/** Current issue-evidence-history JSONL schema version. Bump on a breaking change. */
+export const ISSUE_HISTORY_SCHEMA_VERSION = 1;
+
+/** One stage's timing/outcome slice recorded in an issue-history entry. */
+export interface IssueHistoryStageEntry {
+  stage: string;
+  enteredAt: string | null;
+  exitedAt: string | null;
+  durationMs: number | null;
+  outcome: StageOutcome | null;
+}
+
+/** One line of `.agent-pipeline/history/issue-<N>.jsonl` — a compact,
+ *  append-only record of a single finalized run for an issue. `run_id` is the
+ *  filesystem-safe run-directory basename (the same identifier `summary.json`
+ *  uses), so an entry joins back to its run directory. */
+export interface IssueHistoryEntry {
+  schema_version: number;
+  run_id: string;
+  issue: number;
+  pr: number | null;
+  branch: string | null;
+  final_state: string | null;
+  finalized_at: string | null;
+  stages: IssueHistoryStageEntry[];
+}
+
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry
  *  to upsert; the other fields are merged in when present. */
 export interface StageUpdate {

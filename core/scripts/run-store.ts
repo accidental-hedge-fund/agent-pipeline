@@ -12,8 +12,15 @@
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { EvidenceBundle, ReviewFindingRecord, StageAccountingRecord } from "./types.ts";
+import {
+  ISSUE_HISTORY_SCHEMA_VERSION,
+  type EvidenceBundle,
+  type IssueHistoryEntry,
+  type ReviewFindingRecord,
+  type StageAccountingRecord,
+} from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
+import { stageDurationMs } from "./evidence-bundle.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
@@ -39,6 +46,25 @@ export function runsDir(repoDir: string): string {
 /** Absolute path of a single run's directory. */
 export function runDirPath(repoDir: string, runId: RunId): string {
   return path.join(runsDir(repoDir), runId);
+}
+
+/** Root directory for the issue-level evidence-history artifacts (#377), a
+ *  sibling of `runs/` under `.agent-pipeline/` — durable, reboot-safe storage,
+ *  unlike the legacy `/tmp/pipeline-<repo>` state dir. */
+export function issueHistoryDir(repoDir: string): string {
+  return path.join(repoDir, ".agent-pipeline", "history");
+}
+
+/** Absolute path of the append-only per-issue evidence-history JSONL. */
+export function issueHistoryPath(repoDir: string, issue: number): string {
+  return path.join(issueHistoryDir(repoDir), `issue-${issue}.jsonl`);
+}
+
+/** Recover `repoDir` from a run directory. Inverse of
+ *  `runDirPath(repoDir, runId) === path.join(repoDir, ".agent-pipeline", "runs", runId)`:
+ *  strip the run-id, then "runs", then ".agent-pipeline". */
+function repoDirFromRunDir(runDir: string): string {
+  return path.dirname(path.dirname(path.dirname(runDir)));
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +436,34 @@ export async function emitStageAccounting(
 }
 
 // ---------------------------------------------------------------------------
+// appendIssueHistory (#377)
+// ---------------------------------------------------------------------------
+
+/** Append one compact per-run entry to the issue-level evidence history JSONL
+ *  at `.agent-pipeline/history/issue-<N>.jsonl` (create-on-first-write). Entries
+ *  are serialized through the same `sanitizeDeep` + `redactSecrets` + `sanitize`
+ *  chain used for `summary.json`, so no secret reaches the artifact. Non-fatal:
+ *  an append error is caught, logged, and never propagates — resumed pipelines
+ *  must not fail because a history write failed. */
+export async function appendIssueHistory(
+  repoDir: string,
+  issue: number,
+  entry: IssueHistoryEntry,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  try {
+    const cleanedEntry = sanitizeDeep(entry);
+    const line = sanitize(redactSecrets(`${JSON.stringify(cleanedEntry)}\n`));
+    await deps.mkdir(issueHistoryDir(repoDir), { recursive: true });
+    await deps.appendFile(issueHistoryPath(repoDir, issue), line);
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: issue history append failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // finalizeRun
 // ---------------------------------------------------------------------------
 
@@ -511,6 +565,28 @@ export async function finalizeRun(
       `[pipeline] run-store: legacy evidence.json write failed (non-fatal): ${(err as Error).message}`,
     );
   }
+
+  // Append-only issue-level evidence history (#377): one compact per-run entry,
+  // appended (never rewritten) after summary.json/evidence.json, so a re-run
+  // never erases prior rounds' timing history. appendIssueHistory is itself
+  // non-fatal on I/O error.
+  const historyEntry: IssueHistoryEntry = {
+    schema_version: ISSUE_HISTORY_SCHEMA_VERSION,
+    run_id: fileRunId,
+    issue,
+    pr: bundle.pr,
+    branch: bundle.branch,
+    final_state: bundle.finalState,
+    finalized_at: bundle.finalizedAt,
+    stages: bundle.stages.map((s) => ({
+      stage: s.stage,
+      enteredAt: s.enteredAt,
+      exitedAt: s.exitedAt,
+      durationMs: stageDurationMs(s.enteredAt, s.exitedAt),
+      outcome: s.outcome,
+    })),
+  };
+  await appendIssueHistory(repoDirFromRunDir(runDir), issue, historyEntry, deps);
 }
 
 // ---------------------------------------------------------------------------

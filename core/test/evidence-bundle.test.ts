@@ -7,6 +7,8 @@ import {
   bundlePath,
   createBundle,
   finalizeBundle,
+  formatEvidenceCommentBody,
+  formatStageTimingTableMarkdown,
   formatSummary,
   makeCommandRecord,
   makePromptRecord,
@@ -460,6 +462,91 @@ test("formatSummary: partial run (no finalState) is labeled as such", () => {
     notifiedAt: null,
   };
   assert.match(formatSummary(partial), /partial run/i);
+});
+
+// ---------------------------------------------------------------------------
+// formatStageTimingTableMarkdown / formatEvidenceCommentBody (#377)
+// ---------------------------------------------------------------------------
+
+function timingBundle(): EvidenceBundle {
+  return {
+    schema_version: 1,
+    schemaVersion: 1,
+    runId: "377/2026-07-06T20:49:37Z",
+    issue: 377,
+    pr: 456,
+    branch: "pipeline/377-x",
+    harnesses: ["claude"],
+    stages: [
+      {
+        stage: "planning",
+        enteredAt: "2026-07-06T20:00:00Z",
+        exitedAt: "2026-07-06T20:04:15Z",
+        outcome: "advanced",
+        commits: ["abc1234"],
+        commands: [
+          { cmd: "npm test", exitCode: 0, durationMs: 4210, outputExcerpt: "ok" },
+        ],
+        prompts: [{ kind: "planning", harness: "claude", hash: "deadbeef", excerpt: "secret plan" }],
+      },
+      {
+        stage: "review-1",
+        enteredAt: "2026-07-06T20:05:00Z",
+        exitedAt: null,
+        outcome: null,
+        commits: [],
+        commands: [],
+        prompts: [],
+      },
+    ],
+    reviews: [{ round: 1, sha: "abc1234def", verdict: "approve", findingCounts: { medium: 1 } }],
+    overrides: [],
+    recoveries: [],
+    finalState: "ready-to-deploy",
+    finalizedAt: "2026-07-06T20:10:00Z",
+    notifiedAt: null,
+    accounting: {
+      records: [],
+      totals: { record_count: 1, actual_cost_usd: 1.23, estimated_cost_usd: 0, unknown_cost_count: 0 },
+    },
+  };
+}
+
+test("formatStageTimingTableMarkdown: one row per stage with duration and outcome", () => {
+  const out = formatStageTimingTableMarkdown(timingBundle());
+  assert.match(out, /\| planning \| 2026-07-06T20:00:00Z → 2026-07-06T20:04:15Z \| 4m15s \| advanced \|/);
+  assert.match(out, /\| review-1 \| 2026-07-06T20:05:00Z → — \| — \| in-progress \|/);
+});
+
+test("formatStageTimingTableMarkdown: contains no command/prompt/token/cost text", () => {
+  const out = formatStageTimingTableMarkdown(timingBundle());
+  assert.doesNotMatch(out, /npm test/);
+  assert.doesNotMatch(out, /secret plan/);
+  assert.doesNotMatch(out, /1\.23/);
+  assert.doesNotMatch(out, /approve/);
+});
+
+test("formatStageTimingTableMarkdown: empty stages renders a placeholder row, not a crash", () => {
+  const out = formatStageTimingTableMarkdown({ ...timingBundle(), stages: [] });
+  assert.match(out, /no stages recorded/i);
+});
+
+test("formatEvidenceCommentBody: renders fully from the bundle alone — visible run id, full timing table, secondary path", () => {
+  const bundle = timingBundle();
+  const out = formatEvidenceCommentBody(bundle, "/tmp/state/377/evidence.json", "pipeline 377 --summary");
+  assert.match(out, /\*\*Run ID:\*\* `377\/2026-07-06T20:49:37Z`/);
+  assert.match(out, /\| planning \|/);
+  assert.match(out, /\| review-1 \|/);
+  assert.match(out, /\/tmp\/state\/377\/evidence\.json/);
+  assert.match(out, /pipeline 377 --summary/);
+});
+
+test("formatEvidenceCommentBody: contains no accounting payloads (tokens, cost, prompts, commands)", () => {
+  const out = formatEvidenceCommentBody(timingBundle(), "/tmp/state/377/evidence.json", "pipeline 377 --summary");
+  assert.doesNotMatch(out, /npm test/);
+  assert.doesNotMatch(out, /secret plan/);
+  assert.doesNotMatch(out, /1\.23/);
+  assert.doesNotMatch(out, /token/i);
 });
 
 // ---------------------------------------------------------------------------
