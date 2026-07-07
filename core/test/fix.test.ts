@@ -20,7 +20,9 @@ import {
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
   extractBlockingReviewFindings,
+  filterOverridesAfterReview,
   filterToBlockingFindings,
+  findTriggeringReviewComment,
   isCommitOnRemote,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
@@ -946,6 +948,86 @@ test("computeEffectiveBlockingSet: all findings dispositioned (mixed override + 
   );
   assert.equal(result.effectiveKeys.size, 0);
   assert.equal(result.dispositions.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// findTriggeringReviewComment / filterOverridesAfterReview — override timing
+// guard (#391 review-1 finding bbc7d244): only overrides recorded AFTER the
+// triggering review comment may disposition its findings.
+// ---------------------------------------------------------------------------
+
+test("findTriggeringReviewComment: returns the latest matching review comment with its createdAt", () => {
+  const comments = [
+    { author: "codex", body: "unrelated comment", createdAt: "2026-06-01T00:00:00Z" },
+    { author: "codex", body: twoFindingReview(), createdAt: "2026-07-01T12:00:00Z" },
+  ];
+  const m = findTriggeringReviewComment(comments, 1);
+  assert.ok(m, "expected the review-1 comment to be found");
+  assert.equal(m!.createdAt, "2026-07-01T12:00:00Z");
+});
+
+test("findTriggeringReviewComment: null when no review-N comment matches", () => {
+  const comments = [{ author: "codex", body: "nothing here", createdAt: "2026-07-01T00:00:00Z" }];
+  assert.equal(findTriggeringReviewComment(comments, 1), null);
+});
+
+test("filterOverridesAfterReview: drops comments at/before the triggering review, keeps ones strictly after", () => {
+  const trusted = [
+    { author: "codex", body: "before", createdAt: "2026-06-30T00:00:00Z" },
+    { author: "codex", body: "same instant", createdAt: "2026-07-01T00:00:00Z" },
+    { author: "codex", body: "after", createdAt: "2026-07-02T00:00:00Z" },
+  ];
+  const filtered = filterOverridesAfterReview(trusted, { createdAt: "2026-07-01T00:00:00Z" });
+  assert.deepEqual(filtered.map((c) => c.body), ["after"]);
+});
+
+test("filterOverridesAfterReview: no triggering comment → returns []", () => {
+  const trusted = [{ author: "codex", body: "x", createdAt: "2026-07-01T00:00:00Z" }];
+  assert.deepEqual(filterOverridesAfterReview(trusted, null), []);
+});
+
+test("computeEffectiveBlockingSet + filterOverridesAfterReview: a stale override predating the review does NOT subtract its finding; one recorded after it does", () => {
+  const reviewCreatedAt = "2026-07-01T12:00:00Z";
+  const summaries = parseFindingSummaries(twoFindingReview());
+
+  const staleOverride = [
+    {
+      body: overrideComment({ key: keyA, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-06-01T00:00:00Z" }),
+      createdAt: "2026-06-01T00:00:00Z",
+    },
+  ];
+
+  // Sanity: without the after-review filter (the pre-fix behavior), this exact
+  // stale override incorrectly subtracts keyA even though it predates the
+  // triggering review — this is the bug the fix guards against.
+  const staleUnfiltered = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, extractOverrides(staleOverride), [], new Map(), null,
+  );
+  assert.deepEqual([...staleUnfiltered.effectiveKeys].sort(), [keyB]);
+
+  const staleFiltered = filterOverridesAfterReview(staleOverride, { createdAt: reviewCreatedAt });
+  const staleResult = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, extractOverrides(staleFiltered), [], new Map(), null,
+  );
+  assert.deepEqual(
+    [...staleResult.effectiveKeys].sort(), [keyA, keyB].sort(),
+    "an override predating the triggering review must not subtract its finding",
+  );
+
+  const freshOverride = [
+    {
+      body: overrideComment({ key: keyA, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-07-02T00:00:00Z" }),
+      createdAt: "2026-07-02T00:00:00Z",
+    },
+  ];
+  const freshFiltered = filterOverridesAfterReview(freshOverride, { createdAt: reviewCreatedAt });
+  const freshResult = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, extractOverrides(freshFiltered), [], new Map(), null,
+  );
+  assert.deepEqual(
+    [...freshResult.effectiveKeys].sort(), [keyB],
+    "an override recorded after the triggering review must subtract its finding",
+  );
 });
 
 // ---------------------------------------------------------------------------

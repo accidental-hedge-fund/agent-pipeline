@@ -260,14 +260,20 @@ export async function advanceFix(
   // `override-auto-resume` gap). `effectiveBlockingKeys` stays null when the
   // triggering review has no blocking-keys marker at all (legacy comment) —
   // fail safe: no pre-filter, no skip-advance carve-out, existing behavior.
-  const reviewBody = extractReviewFindings(detail.comments, round);
+  const triggeringReviewComment = findTriggeringReviewComment(detail.comments, round);
+  const reviewBody = triggeringReviewComment?.body ?? "";
   const triggeringBlockingKeys = extractBlockingKeysMarker(reviewBody);
   let overriddenKeys = new Set<string>();
   let effectiveBlockingKeys: Set<string> | null = null;
   let overridePreFilterNotes: string[] = [];
   if (triggeringBlockingKeys && triggeringBlockingKeys.size > 0) {
-    const overrides = extractOverrides(trustedForAck);
-    const scopes = extractScopedOverrides(trustedForAck);
+    // #391 review-1 finding bbc7d244: only key/scope overrides recorded AFTER
+    // the triggering review comment may disposition its findings — one
+    // predating the review must not silently suppress a finding the review
+    // still marked blocking.
+    const trustedAfterReview = filterOverridesAfterReview(trustedForAck, triggeringReviewComment);
+    const overrides = extractOverrides(trustedAfterReview);
+    const scopes = extractScopedOverrides(trustedAfterReview);
     const nonReproducing = extractNonReproducingDispositions(trustedForAck);
     const reviewedShaAtEntry = extractReviewedSha(trustedForAck, round)?.sha ?? null;
     const summaries = parseFindingSummaries(reviewBody);
@@ -744,13 +750,19 @@ export async function enforceExternalCommitGate(
 
 // ---- pure helpers ----
 
-export function extractReviewFindings(
-  comments: { body: string }[],
+/**
+ * Locate the triggering review-{round} comment, preserving its `createdAt` (#391
+ * review-1 finding bbc7d244) so callers can filter override/scope comments to
+ * those recorded after it. Shared by {@link extractReviewFindings} (which only
+ * needs the body) so the match predicate has a single implementation.
+ */
+export function findTriggeringReviewComment(
+  comments: { author: string; body: string; createdAt: string }[],
   round: 1 | 2,
-): string {
+): { author: string; body: string; createdAt: string } | null {
   const marker = `## Review ${round}`;
-  const m = findLatestCommentMatching(
-    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+  return findLatestCommentMatching(
+    comments,
     (b) =>
       b.startsWith(marker) &&
       (b.includes("needs-attention") ||
@@ -758,7 +770,34 @@ export function extractReviewFindings(
         b.toUpperCase().includes("REQUEST_CHANGES") ||
         b.toUpperCase().includes("REQUEST CHANGES")),
   );
+}
+
+export function extractReviewFindings(
+  comments: { body: string }[],
+  round: 1 | 2,
+): string {
+  const m = findTriggeringReviewComment(
+    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+    round,
+  );
   return m?.body ?? "";
+}
+
+/**
+ * Filter trusted override/scope comments to those created strictly after the
+ * triggering review comment (#391 review-1 finding bbc7d244). Without this, an
+ * override recorded before the review — or a stale one from a prior round —
+ * could silently subtract a finding the triggering review still marked
+ * blocking. Comments are ISO-8601 timestamped, so lexicographic string
+ * comparison sorts identically to chronological order. Returns `[]` when there
+ * is no triggering review comment to anchor against.
+ */
+export function filterOverridesAfterReview<T extends { createdAt: string }>(
+  comments: T[],
+  triggeringReviewComment: { createdAt: string } | null,
+): T[] {
+  if (!triggeringReviewComment) return [];
+  return comments.filter((c) => c.createdAt > triggeringReviewComment.createdAt);
 }
 
 /**
