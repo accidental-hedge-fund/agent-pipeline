@@ -1,6 +1,6 @@
 {
   "name": "pipeline",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "description": "Self-contained Codex pipeline skill — advances issues through a label-driven state machine to ready-to-deploy",
   "private": true,
   "type": "module",
