@@ -1142,6 +1142,11 @@ export interface OverridePreFilterResult {
  * (#391 review-2 finding 53b23912) rather than one overwriting another. A
  * stale disposition (superseded SHA or mismatched fingerprint) does not apply,
  * and the finding is evaluated afresh.
+ *
+ * A blocking key with no matching summary (parseFindingSummaries could not
+ * recover it) fails closed: it stays effective as a synthetic
+ * fingerprint-null identity unless a key-level override applies (#391
+ * review-3 finding d548d3d0).
  */
 export function computeEffectiveBlockingSet(
   blockingKeys: Set<string>,
@@ -1153,8 +1158,10 @@ export function computeEffectiveBlockingSet(
 ): OverridePreFilterResult {
   const dispositions: OverridePreFilterDisposition[] = [];
   const effectiveSummaries: FindingSummary[] = [];
+  const matchedKeys = new Set<string>();
   for (const s of summaries) {
     if (!blockingKeys.has(s.key)) continue;
+    matchedKeys.add(s.key);
 
     const scope = scopes.find((sc) =>
       matchFindingScope({ category: s.category ?? undefined, file: s.file ?? undefined }, sc),
@@ -1189,6 +1196,24 @@ export function computeEffectiveBlockingSet(
     }
 
     effectiveSummaries.push(s);
+  }
+  // A marker key that parseFindingSummaries could not map back to a rendered
+  // finding (schema/version skew, malformed comment) must still block — the
+  // previous Set<key>-based implementation failed closed here, and losing the
+  // key silently would reopen that dead-end (#391 review-3 finding d548d3d0).
+  // A key-level override still applies (it matches by key alone, no
+  // category/file/fingerprint needed); a scope or non-reproducing disposition
+  // cannot, since both require signals this unmatched key doesn't have. The
+  // synthetic identity carries fingerprint: null, which — per the existing
+  // fail-closed convention above — can never be covered by a does-not-
+  // reproduce declaration.
+  for (const key of blockingKeys) {
+    if (matchedKeys.has(key)) continue;
+    if (overrides.has(key)) {
+      dispositions.push({ key, note: `override (${overrides.get(key)})` });
+      continue;
+    }
+    effectiveSummaries.push({ key, category: null, file: null, fingerprint: null });
   }
   // Identity-level scope (#391 delta, key 5a435224): the effective scope IS
   // the surviving identities. A coarse key stays effective while ANY of its

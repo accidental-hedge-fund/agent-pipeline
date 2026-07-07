@@ -993,6 +993,52 @@ test("computeEffectiveBlockingSet: all findings dispositioned (mixed override + 
   assert.equal(result.dispositions.length, 2);
 });
 
+test("computeEffectiveBlockingSet: a marker key with no matching summary (schema/version skew) stays effective — fails closed (#391 review-3 finding d548d3d0)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const keyC = "deadbeef";
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyC]), summaries, new Map(), [], new Map(), null,
+  );
+  assert.deepEqual(
+    [...result.effectiveKeys].sort(), [keyA, keyC].sort(),
+    "the unmatched key must not silently disappear from the effective set",
+  );
+  const synthetic = result.effectiveSummaries.find((s) => s.key === keyC);
+  assert.ok(synthetic, "a synthetic identity must be carried for the unmatched key");
+  assert.equal(synthetic!.fingerprint, null);
+});
+
+test("computeEffectiveBlockingSet: a key-level override still dispositions an unmatched key", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const keyC = "deadbeef";
+  const overrides = extractOverrides([
+    { body: overrideComment({ key: keyC, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z" }) },
+  ]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyC]), summaries, overrides, [], new Map(), null,
+  );
+  assert.deepEqual([...result.effectiveKeys].sort(), [keyA]);
+  assert.ok(result.dispositions.some((d) => d.key === keyC && /override/.test(d.note)));
+});
+
+test("decideDoesNotReproduceAdvance: an unmatched marker key blocks the does-not-reproduce carve-out even when every known identity is covered", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const keyC = "deadbeef";
+  const preFilter = computeEffectiveBlockingSet(
+    new Set([keyA, keyC]), summaries, new Map(), [], new Map(), null,
+  );
+  const sha = "a".repeat(40);
+  const decision = decideDoesNotReproduceAdvance(
+    preFilter.effectiveSummaries,
+    [{ key: keyA, fingerprint: FP_A, reviewedSha: sha, justification: "j" }],
+    sha, 1,
+  );
+  assert.equal(
+    decision.advance, false,
+    "a lost identity with no fingerprint can never be covered by a declaration — must fail closed",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // findTriggeringReviewComment / filterOverridesAfterReview — override timing
 // guard (#391 review-1 finding bbc7d244): only overrides recorded AFTER the
