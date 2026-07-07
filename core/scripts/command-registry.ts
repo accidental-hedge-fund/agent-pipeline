@@ -25,6 +25,16 @@ interface CmdLike {
   getOptionValueSource(key: string): string | undefined;
 }
 
+/**
+ * Flags injected by the host layer (e.g. the wrapper's unconditional
+ * `--profile` injection) rather than chosen per-command. These are tolerated
+ * on every registered command regardless of `allowedFlags`, so a profile-free
+ * command invoked through the host wrapper is not rejected. This is the single
+ * authoritative source for that exemption — do not add `profile` to individual
+ * `allowedFlags` sets instead.
+ */
+export const UNIVERSAL_FLAGS: Set<string> = new Set(["profile"]);
+
 export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // Default/numeric path — accepts every flag so new global flags work automatically.
   advance: {
@@ -112,7 +122,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   logs: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "follow"]),
+    allowedFlags: new Set(["repoPath", "follow", "events"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,
@@ -139,7 +149,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   config: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "profile", "json", "apply"]),
+    allowedFlags: new Set(["repoPath", "profile", "json", "apply", "rel"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,
@@ -199,9 +209,40 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
-  // cleanup and remove-worktree are flag-based modes (not positional keywords),
-  // but are registered here for completeness and to enable future registry-driven
-  // dispatch of these modes.
+  // status, unblock, and override were previously flag-only modes; they are now
+  // also dispatched as positional keyword sub-commands so they can be exposed as
+  // discoverable pipeline:<command> host entries.
+  status: {
+    needsIssueNumber: true,
+    allowedFlags: new Set(["repoPath", "base", "profile", "domain", "json"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  unblock: {
+    needsIssueNumber: true,
+    allowedFlags: new Set(["repoPath", "base", "profile", "domain"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  // override re-enters the advance loop after recording the disposition, so it
+  // accepts all flags that the advance command accepts.
+  override: {
+    needsIssueNumber: true,
+    allowedFlags: "all",
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
+  // cleanup is registered both for the legacy --cleanup flag mode and as an
+  // actually-dispatched positional keyword (`pipeline cleanup`).
   cleanup: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "cleanup"]),
@@ -218,6 +259,15 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     needsGhAuth: true,
     mutatesGitHub: false,
     supportsJson: true,
+  },
+
+  backfill: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "apply", "capability"]),
+    needsConfig: true,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
   },
 };
 
@@ -243,5 +293,10 @@ export function validateFlags(entry: CommandEntry, cmd: CmdLike): string[] {
   const allowed = entry.allowedFlags;
   return cmd.options
     .map((o) => o.attributeName())
-    .filter((key) => !allowed.has(key) && cmd.getOptionValueSource(key) === "cli");
+    .filter(
+      (key) =>
+        !allowed.has(key) &&
+        !UNIVERSAL_FLAGS.has(key) &&
+        cmd.getOptionValueSource(key) === "cli",
+    );
 }

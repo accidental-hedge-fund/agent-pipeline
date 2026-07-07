@@ -509,6 +509,95 @@ export function parseStructuredVerdict(
   };
 }
 
+const STRICT_FINDING_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
+
+/** Validate a single candidate finding against the full `ReviewFinding` contract.
+ *  Required fields must have the correct type; optional fields, if present,
+ *  must also have the correct type. Returns null on any mismatch. */
+function validateStrictFinding(candidate: unknown): ReviewFinding | null {
+  if (typeof candidate !== "object" || candidate === null) return null;
+  const f = candidate as Record<string, unknown>;
+  if (typeof f.severity !== "string" || !STRICT_FINDING_SEVERITIES.has(f.severity)) return null;
+  if (typeof f.title !== "string") return null;
+  if (typeof f.body !== "string") return null;
+  if (typeof f.confidence !== "number" || !Number.isFinite(f.confidence) || f.confidence < 0 || f.confidence > 1) {
+    return null;
+  }
+  if (typeof f.recommendation !== "string") return null;
+  if (f.file !== undefined && typeof f.file !== "string") return null;
+  if (f.line_start !== undefined && typeof f.line_start !== "number") return null;
+  if (f.line_end !== undefined && typeof f.line_end !== "number") return null;
+  if (f.category !== undefined && typeof f.category !== "string") return null;
+  if (
+    f.spec_divergence_direction !== undefined &&
+    f.spec_divergence_direction !== "code-behind-spec" &&
+    f.spec_divergence_direction !== "spec-behind-code"
+  ) {
+    return null;
+  }
+  if (f.blocking !== undefined && typeof f.blocking !== "boolean") return null;
+  return {
+    severity: f.severity as ReviewFinding["severity"],
+    title: f.title,
+    body: f.body,
+    file: f.file as string | undefined,
+    line_start: f.line_start as number | undefined,
+    line_end: f.line_end as number | undefined,
+    confidence: f.confidence,
+    recommendation: f.recommendation,
+    category: f.category as string | undefined,
+    spec_divergence_direction: f.spec_divergence_direction as ReviewFinding["spec_divergence_direction"],
+    blocking: f.blocking as boolean | undefined,
+  };
+}
+
+/**
+ * Strict verdict parser for external stage executor results (#314 review-2
+ * finding 9e069297). Unlike `parseStructuredVerdict`, this performs NO
+ * partial-JSON field defaulting and NO prose/text-verdict fallback: a
+ * delegated executor's output either satisfies the full `ReviewVerdict` /
+ * `ReviewFinding` schema, or it is a contract violation — returns `null` so the
+ * caller can block the run naming the stage and executor, never silently
+ * approving recognizable prose or a partial JSON object.
+ */
+export function parseStrictVerdict(output: string, commitSha = ""): ReviewVerdict | null {
+  const fenceMatch = output.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  const candidates: string[] = [];
+  if (fenceMatch) candidates.push(fenceMatch[1]);
+  const inlineMatch = output.match(/\{[\s\S]*"verdict"[\s\S]*\}/);
+  if (inlineMatch) candidates.push(inlineMatch[0]);
+
+  for (const candidate of candidates) {
+    let data: unknown;
+    try {
+      data = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof data !== "object" || data === null) continue;
+    const o = data as Record<string, unknown>;
+    if (o.verdict !== "approve" && o.verdict !== "needs-attention") continue;
+    if (typeof o.summary !== "string") continue;
+    if (!Array.isArray(o.findings)) continue;
+    const findings: ReviewFinding[] = [];
+    let allFindingsValid = true;
+    for (const raw of o.findings) {
+      const finding = validateStrictFinding(raw);
+      if (!finding) { allFindingsValid = false; break; }
+      findings.push(finding);
+    }
+    if (!allFindingsValid) continue;
+    if (!Array.isArray(o.next_steps) || !o.next_steps.every((s) => typeof s === "string")) continue;
+    // An `approve` verdict with enumerated findings is contradictory — downgrade to
+    // `needs-attention` so the severity/confidence policy gate runs and findings can
+    // block or advise as their severity warrants (#314 3f6365e9).
+    const effectiveVerdict =
+      o.verdict === "approve" && findings.length > 0 ? "needs-attention" : o.verdict;
+    return { verdict: effectiveVerdict, summary: o.summary, findings, next_steps: o.next_steps as string[], commitSha };
+  }
+  return null;
+}
+
 export function parseTextVerdict(output: string): "approve" | "needs-attention" {
   const upper = output.toUpperCase();
   const firstLines = output.split("\n", 15).map((l) => l.trim().toUpperCase());

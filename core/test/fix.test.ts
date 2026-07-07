@@ -4,16 +4,28 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  decideExternalCommitAdvance,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
+  enforceExternalCommitGate,
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
   extractBlockingReviewFindings,
   filterToBlockingFindings,
+  isCommitOnRemote,
+  resolveFixCommitGateMode,
 } from "../scripts/stages/fix.ts";
+
+const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
-import { categoryMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
+import { categoryMarker, directionMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import type { ValidateResult } from "../scripts/openspec.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
@@ -127,6 +139,48 @@ test("fix round 1: multiple commits — at least one matches → proceeds", asyn
 });
 
 // ---------------------------------------------------------------------------
+// External-commit gate (#349): externally-applied fixes are exempt from the
+// prescribed-subject check but still get the range-level safety scan.
+// ---------------------------------------------------------------------------
+
+function externalDeps(shaFiles: Record<string, string[]>, messages: string[] = []): VerifyDeps {
+  return {
+    gitMessages: async () => messages,
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => Object.keys(shaFiles),
+    gitDiffTreeFiles: async (_wt: string, sha: string) => shaFiles[sha] ?? [],
+  };
+}
+
+test("external gate: human commit subject (no prescribed format) → proceeds", async () => {
+  // Regression for pre-merge finding f65e88f8: a human-applied fix with an
+  // ordinary subject must not be blocked by the fix-round message pattern.
+  const result = await enforceExternalCommitGate(
+    "/wt", "reviewsha",
+    externalDeps({ abc123: ["core/scripts/stages/fix.ts"] }, ["correct the stale OpenSpec delta by hand\n"]),
+  );
+  assert.equal(result.ok, true);
+});
+
+test("external gate: commit adding node_modules → still blocked", async () => {
+  const result = await enforceExternalCommitGate(
+    "/wt", "reviewsha",
+    externalDeps({ abc123: ["node_modules/leftpad/index.js"] }),
+  );
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("node_modules"));
+});
+
+test("external gate vs fix gate: same human subject blocks the harness gate (contrast)", async () => {
+  const result = await enforceFixCommitGate(
+    1, 42, "/wt", "reviewsha",
+    msgsDeps(["correct the stale OpenSpec delta by hand\n"]),
+  );
+  assert.equal(result.ok, false);
+});
+
+// ---------------------------------------------------------------------------
 // Fix round 2 (4.3 / 4.4 equivalent)
 // ---------------------------------------------------------------------------
 
@@ -236,7 +290,7 @@ test("enforceOpenspecSpecDeltaValidation: headBefore === headAfter → ok withou
 const fixCfg = { base_branch: "main", repo: "acme/x", repo_dir: "/repo" } as unknown as PipelineConfig;
 const specDivergenceReview =
   `## Review 1 — needs-attention\n\n### Findings\n\n` +
-  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+  `**1. [HIGH] spec mismatch** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}\n`;
 
 function fixConsistencyDeps(commits: FixCommit[]) {
   const blocked: Array<{ reason: string; stage: string; kind: string }> = [];
@@ -265,7 +319,7 @@ test("enforceFixOpenspecConsistency: stale delta + spec-divergence marker blocks
   assert.equal(blocked.length, 1);
   assert.equal(blocked[0].stage, "fix-1");
   assert.equal(blocked[0].kind, "openspec-stale-delta");
-  assert.match(blocked[0].reason, /stale spec delta/);
+  assert.match(blocked[0].reason, /spec-delta alignment/);
 });
 
 test("enforceFixOpenspecConsistency: spec delta updated after impl change passes", async () => {
@@ -278,6 +332,24 @@ test("enforceFixOpenspecConsistency: spec delta updated after impl change passes
 
   assert.equal(out, null);
   assert.deepEqual(blocked, []);
+});
+
+test("enforceFixOpenspecConsistency: production path calls attemptBoundedRepair for spec-behind-code (#356)", async () => {
+  // Production-path test: verify that enforceFixOpenspecConsistency wires
+  // attemptBoundedRepair to the guard and that the dep is actually called.
+  const { deps } = fixConsistencyDeps([{ sha: "a", paths: ["core/scripts/foo.ts"] }]);
+  const repairCalls: string[] = [];
+  const extDeps = {
+    ...deps,
+    attemptBoundedRepair: async (changeId: string) => {
+      repairCalls.push(changeId);
+      return "cleared" as const; // repair succeeds → advance
+    },
+  };
+
+  const out = await enforceFixOpenspecConsistency(fixCfg, 42, "fix-1", "/wt", ["c106"], extDeps as any);
+  assert.deepEqual(repairCalls, ["c106"], "enforceFixOpenspecConsistency must call attemptBoundedRepair");
+  assert.equal(out, null, "guard must return null (advance) after a successful repair");
 });
 
 // ---------------------------------------------------------------------------
@@ -473,4 +545,207 @@ test("filterToBlockingFindings: advisory ordinal marker in reviewer body does NO
   // Blocking finding must survive — the marker in reviewer text must not affect filtering.
   assert.ok(filtered.includes(blockingWithOrdinalInBody.title), "blocking finding must survive even when body contains the ordinal marker string");
   assert.ok(!filtered.includes("advisory finding was omitted"), "no advisory omission note should appear");
+});
+
+// ---------------------------------------------------------------------------
+// decideExternalCommitAdvance (#349: advance instead of blocking when the fix
+// was already applied externally — HEAD is past the last reviewed SHA)
+// ---------------------------------------------------------------------------
+
+const SHA_REVIEWED = "1".repeat(39) + "a";
+const SHA_HEAD = "2".repeat(39) + "b";
+const ACTOR = "pipeline-bot";
+
+function reviewComment(round: 1 | 2, sha: string | null, author = ACTOR) {
+  const sentinel = sha ? `\n\n<!-- reviewed-sha: ${sha} -->` : "";
+  return {
+    author,
+    body: `## Review ${round} (${round === 1 ? "Standard" : "Adversarial"}) — needs-attention\n\nfindings${sentinel}`,
+  };
+}
+
+test("decideExternalCommitAdvance: round 1, HEAD past reviewed SHA → advances to review-2", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED)],
+    ACTOR,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, true);
+  assert.ok(decision.advance && decision.to === "review-2");
+  assert.ok(decision.advance && decision.reviewSha === SHA_REVIEWED);
+});
+
+test("decideExternalCommitAdvance: round 2, HEAD past reviewed SHA → advances to pre-merge", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(2, SHA_REVIEWED)],
+    ACTOR,
+    2,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, true);
+  assert.ok(decision.advance && decision.to === "pre-merge");
+});
+
+test("decideExternalCommitAdvance: HEAD equals reviewed SHA → does not advance (blocks as before)", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED)],
+    ACTOR,
+    1,
+    SHA_REVIEWED,
+  );
+  assert.equal(decision.advance, false);
+  assert.equal(decision.reviewSha, SHA_REVIEWED);
+});
+
+test("decideExternalCommitAdvance: no review comment at all → fails closed, does not advance", () => {
+  const decision = decideExternalCommitAdvance([], ACTOR, 1, SHA_HEAD);
+  assert.equal(decision.advance, false);
+  assert.equal(decision.reviewSha, null);
+});
+
+test("decideExternalCommitAdvance: review comment without a SHA (legacy) → fails closed, does not advance", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, null)],
+    ACTOR,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, false);
+  assert.equal(decision.reviewSha, null);
+});
+
+test("decideExternalCommitAdvance: review comment from an untrusted author is ignored → fails closed", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED, "random-commenter")],
+    ACTOR,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, false, "an untrusted author's SHA marker must not drive an advance");
+});
+
+test("decideExternalCommitAdvance: actor unresolved (null) → fails closed, does not advance", () => {
+  const decision = decideExternalCommitAdvance(
+    [reviewComment(1, SHA_REVIEWED)],
+    null,
+    1,
+    SHA_HEAD,
+  );
+  assert.equal(decision.advance, false, "an unresolved actor must not disable the trusted-author filter");
+  assert.equal(decision.reviewSha, null);
+});
+
+// ---------------------------------------------------------------------------
+// resolveFixCommitGateMode + isCommitOnRemote (#349 pre-merge review-1 finding 1):
+// the external-commit subject exemption must only apply once the commit is
+// confirmed already on the remote branch — otherwise a bad-subject commit left
+// over from a prior blocked fix run (never pushed) would bypass the #68
+// prompt-compliance gate on a later no-op retry.
+// ---------------------------------------------------------------------------
+
+test("resolveFixCommitGateMode: advance + verified on remote → external (subject exemption applies)", () => {
+  const decision = decideExternalCommitAdvance([reviewComment(1, SHA_REVIEWED)], ACTOR, 1, SHA_HEAD);
+  assert.equal(resolveFixCommitGateMode(decision, true), "external");
+});
+
+test("resolveFixCommitGateMode: advance but NOT verified on remote → harness (regression: retry bypass)", () => {
+  // Reproduces the pre-merge finding: a fix harness commit with a non-prescribed
+  // subject was committed locally, blocked before push (enforceFixCommitGate
+  // failed). A later no-op fix run sees HEAD past the reviewed SHA and would
+  // decide to advance, but the leftover commit was never pushed — it must not
+  // get the subject-check exemption.
+  const decision = decideExternalCommitAdvance([reviewComment(1, SHA_REVIEWED)], ACTOR, 1, SHA_HEAD);
+  assert.equal(decision.advance, true, "sanity: HEAD past the reviewed SHA does decide to advance");
+  assert.equal(
+    resolveFixCommitGateMode(decision, false),
+    "harness",
+    "an unverified (not-yet-pushed) commit must still go through the subject-checked gate",
+  );
+});
+
+test("resolveFixCommitGateMode: no advance → harness regardless of remote verification", () => {
+  const decision = decideExternalCommitAdvance([], ACTOR, 1, SHA_HEAD);
+  assert.equal(resolveFixCommitGateMode(decision, true), "harness");
+});
+
+async function makeRemoteAndClone(): Promise<{ remoteDir: string; cloneDir: string; cleanup: () => Promise<void> }> {
+  const root = await mkdtemp(join(tmpdir(), "fix-remote-test-"));
+  const remoteDir = join(root, "remote.git");
+  const cloneDir = join(root, "clone");
+  await execFileAsync("git", ["init", "--bare", "-b", "main", remoteDir]);
+  await execFileAsync("git", ["clone", remoteDir, cloneDir]);
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: cloneDir });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: cloneDir });
+  await execFileAsync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: cloneDir });
+  await execFileAsync("git", ["push", "origin", "main"], { cwd: cloneDir });
+  return { remoteDir, cloneDir, cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+test("isCommitOnRemote: commit pushed to origin → true (genuinely external)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "human fix"], { cwd: cloneDir });
+    await execFileAsync("git", ["push", "origin", "main"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = stdout.trim();
+    assert.equal(await isCommitOnRemote(cloneDir, "main", sha), true);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("isCommitOnRemote: local-only commit never pushed → false (leftover from a blocked run)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    // Reproduces the exact bypass scenario: a fix-harness commit that failed
+    // enforceFixCommitGate before push remains local-only in the worktree.
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "fixed stuff"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = stdout.trim();
+    assert.equal(await isCommitOnRemote(cloneDir, "main", sha), false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("isCommitOnRemote: fetch failure with stale tracking ref containing the sha → false (fails closed)", async () => {
+  // Regression for pre-merge finding 0b679c48: when `git fetch origin <branch>`
+  // fails (remote unavailable/deleted), the stale cached origin/<branch> ref —
+  // which does contain the sha — must not prove remote presence.
+  const { remoteDir, cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "human fix"], { cwd: cloneDir });
+    await execFileAsync("git", ["push", "origin", "main"], { cwd: cloneDir });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const sha = stdout.trim();
+    // Sanity: the stale tracking ref really does contain the sha.
+    await execFileAsync("git", ["merge-base", "--is-ancestor", sha, "origin/main"], { cwd: cloneDir });
+    await rm(remoteDir, { recursive: true, force: true });
+    assert.equal(await isCommitOnRemote(cloneDir, "main", sha), false);
+  } finally {
+    await cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Effort threading (#366) — advanceFix's fix-harness invoke call has no
+// injectable seam (unlike models.fix, this is pre-existing test debt shared by
+// this change's reasoningEffort addition), so this pins the source wiring
+// directly: the same invoke() call that resolves `model` from cfg.models.fix
+// must resolve `reasoningEffort` from cfg.effort.fix.
+// ---------------------------------------------------------------------------
+
+test("advanceFix: fix-harness invoke() call forwards cfg.effort.fix as reasoningEffort (#366)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const modelLineIdx = src.indexOf("const model = opts.model ?? cfg.models.fix;");
+  assert.ok(modelLineIdx !== -1, "expected the fix-round model resolution line to exist");
+  // Slice must be wide enough to span the invokeStageExecutor delegation block
+  // (#314) that now sits between model resolution and the local invoke() call.
+  const invokeCallSlice = src.slice(modelLineIdx, modelLineIdx + 1100);
+  assert.match(
+    invokeCallSlice,
+    /reasoningEffort:\s*cfg\.effort\?\.fix/,
+    "the invoke() call immediately following model resolution must forward cfg.effort?.fix as reasoningEffort",
+  );
 });

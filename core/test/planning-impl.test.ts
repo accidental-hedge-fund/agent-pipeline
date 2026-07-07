@@ -104,6 +104,31 @@ test("invokeImplementer: harness_sandbox:false forwards sandbox:false to invoke 
   assert.equal(capturedSandbox, false, "sandbox:false must be forwarded (default unchanged)");
 });
 
+test("invokeImplementer: forwards cfg.effort.implementing as reasoningEffort (#366)", async () => {
+  let capturedEffort: string | undefined;
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedEffort = opts.reasoningEffort;
+      return okResult();
+    },
+  };
+  const cfg = { ...cfgWithImplementing("sonnet"), effort: { implementing: "low" } } as unknown as PipelineConfig;
+  await invokeImplementer("claude", "/wt", "p", cfg, {}, deps);
+  assert.equal(capturedEffort, "low");
+});
+
+test("invokeImplementer: effort.implementing absent → no reasoningEffort forwarded (#366)", async () => {
+  let capturedEffort: string | undefined = "unset";
+  const deps = {
+    invoke: async (_h: any, _wt: string, _p: string, opts: any): Promise<HarnessResult> => {
+      capturedEffort = opts.reasoningEffort;
+      return okResult();
+    },
+  };
+  await invokeImplementer("claude", "/wt", "p", cfgWithImplementing("sonnet"), {}, deps);
+  assert.equal(capturedEffort, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // Planning-step harness invocation — cwd confinement (#21, review-2 finding 1)
 //
@@ -171,6 +196,31 @@ test("invokePlanStep: forwards cfg.models.planning and sandbox flag to invoke op
   assert.equal(capturedOpts?.model, "haiku");
   assert.equal(capturedOpts?.sandbox, true);
   assert.equal(capturedOpts?.timeoutSec, 1200);
+});
+
+test("invokePlanStep: forwards cfg.effort.planning as reasoningEffort (#366)", async () => {
+  let capturedEffort: string | undefined;
+  const deps: PlanStepDeps = {
+    invoke: async (_h, _dir, _p, opts) => {
+      capturedEffort = opts.reasoningEffort;
+      return okResult();
+    },
+  };
+  const cfg = { ...cfgWithSandbox(true), effort: { planning: "medium" } } as unknown as PipelineConfig;
+  await invokePlanStep("claude", "/wt/issue", "p", cfg, {}, deps);
+  assert.equal(capturedEffort, "medium");
+});
+
+test("invokePlanStep: effort.planning absent → no reasoningEffort forwarded (#366)", async () => {
+  let capturedEffort: string | undefined = "unset";
+  const deps: PlanStepDeps = {
+    invoke: async (_h, _dir, _p, opts) => {
+      capturedEffort = opts.reasoningEffort;
+      return okResult();
+    },
+  };
+  await invokePlanStep("claude", "/wt/issue", "p", cfgWithSandbox(true), {}, deps);
+  assert.equal(capturedEffort, undefined);
 });
 
 test("invokePlanStep: sandbox:true with codex harness still uses cfg.repo_dir (codex unaffected by sandbox flag)", async () => {

@@ -16,6 +16,7 @@ import {
   COMMAND_REGISTRY,
   lookupCommand,
   validateFlags,
+  UNIVERSAL_FLAGS,
   type CommandEntry,
 } from "../scripts/command-registry.ts";
 import { buildCmd } from "../scripts/pipeline.ts";
@@ -26,7 +27,8 @@ import { buildCmd } from "../scripts/pipeline.ts";
 
 // These are the named keywords the dispatch block in pipeline.ts recognizes.
 const DISPATCH_KEYWORDS = [
-  "init", "doctor", "release", "intake", "sweep", "triage", "merge",
+  "init", "doctor", "status", "unblock", "override", "cleanup",
+  "release", "intake", "sweep", "triage", "merge",
   "refine-spec", "logs", "summary", "path", "config", "run", "improve",
   "scoreboard", "roadmap",
 ];
@@ -179,20 +181,109 @@ test("command-registry: every attribute name in every allowedFlags Set exists in
 // 2.8  needsIssueNumber: advance and run require an issue number; named sub-commands do not
 // ---------------------------------------------------------------------------
 
-test("command-registry: needsIssueNumber is true for advance and run", () => {
+test("command-registry: needsIssueNumber is true for advance, run, status, unblock, override", () => {
   assert.equal(COMMAND_REGISTRY.advance.needsIssueNumber, true);
   assert.equal(COMMAND_REGISTRY.run.needsIssueNumber, true);
+  assert.equal(COMMAND_REGISTRY.status.needsIssueNumber, true);
+  assert.equal(COMMAND_REGISTRY.unblock.needsIssueNumber, true);
+  assert.equal(COMMAND_REGISTRY.override.needsIssueNumber, true);
 });
 
-test("command-registry: needsIssueNumber is false for all named sub-commands", () => {
-  const namedSubCommands = Object.entries(COMMAND_REGISTRY).filter(
-    ([key]) => key !== "advance" && key !== "run",
-  );
-  for (const [key, entry] of namedSubCommands) {
+test("command-registry: needsIssueNumber is false for named sub-commands that operate without an issue", () => {
+  // Commands that act on the repo/environment, not a specific issue.
+  const issueAgnosticKeys = [
+    "init", "doctor", "cleanup", "release", "intake", "sweep",
+    "triage", "merge", "refine-spec", "logs", "summary", "path",
+    "config", "improve", "scoreboard", "roadmap",
+  ];
+  for (const key of issueAgnosticKeys) {
+    const entry = COMMAND_REGISTRY[key as keyof typeof COMMAND_REGISTRY] as CommandEntry | undefined;
+    assert.ok(entry !== undefined, `Expected COMMAND_REGISTRY to have key "${key}"`);
     assert.equal(
-      (entry as CommandEntry).needsIssueNumber,
+      entry.needsIssueNumber,
       false,
       `${key}.needsIssueNumber should be false`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// 2.9  lookupCommand: new keyword entries resolve correctly
+// ---------------------------------------------------------------------------
+
+test("command-registry: lookupCommand('status') returns status entry with needsIssueNumber:true", () => {
+  const entry = lookupCommand("status");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.status);
+  assert.equal(entry.needsIssueNumber, true);
+  assert.equal(entry.mutatesGitHub, false);
+});
+
+test("command-registry: lookupCommand('unblock') returns unblock entry with needsIssueNumber:true", () => {
+  const entry = lookupCommand("unblock");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.unblock);
+  assert.equal(entry.needsIssueNumber, true);
+  assert.equal(entry.mutatesGitHub, true);
+});
+
+test("command-registry: lookupCommand('override') returns override entry with needsIssueNumber:true", () => {
+  const entry = lookupCommand("override");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.override);
+  assert.equal(entry.needsIssueNumber, true);
+  assert.equal(entry.allowedFlags, "all");
+});
+
+test("command-registry: lookupCommand('cleanup') returns cleanup entry with needsIssueNumber:false", () => {
+  const entry = lookupCommand("cleanup");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.cleanup);
+  assert.equal(entry.needsIssueNumber, false);
+});
+
+// ---------------------------------------------------------------------------
+// 2.10  UNIVERSAL_FLAGS: host-injected --profile tolerated on every command (#383)
+// ---------------------------------------------------------------------------
+
+test("command-registry: UNIVERSAL_FLAGS contains 'profile'", () => {
+  assert.ok(
+    UNIVERSAL_FLAGS.has("profile"),
+    "UNIVERSAL_FLAGS must contain 'profile' so the host-injected flag is tolerated everywhere",
+  );
+});
+
+// Mirrors hosts/_shared/entry.template.mjs: `[...passthrough, "--profile", PROFILE]`.
+// The wrapper injects --profile into every invocation unless the caller already
+// passed one, regardless of whether the target command declares it.
+const PROFILE_FREE_COMMANDS = ["refine-spec", "scoreboard", "release"];
+
+for (const keyword of PROFILE_FREE_COMMANDS) {
+  test(`command-registry: wrapper-injected --profile is tolerated on '${keyword}' (does not reject on profile)`, () => {
+    const entry = COMMAND_REGISTRY[keyword];
+    assert.ok(entry, `expected a registry entry for "${keyword}"`);
+    assert.notEqual(
+      entry.allowedFlags,
+      "all",
+      `"${keyword}" should have an explicit allowedFlags set for this test to be meaningful`,
+    );
+    assert.equal(
+      (entry.allowedFlags as Set<string>).has("profile"),
+      false,
+      `"${keyword}" should not need to declare "profile" in allowedFlags — UNIVERSAL_FLAGS covers it`,
+    );
+    const cmd = fakeCmdWithCliFlag("profile");
+    const offending = validateFlags(entry, cmd);
+    assert.deepEqual(
+      offending,
+      [],
+      `wrapper-injected --profile must not be reported as offending for "${keyword}"`,
+    );
+  });
+}
+
+test("command-registry: a genuinely unsupported flag on a profile-free command is still rejected", () => {
+  const entry = COMMAND_REGISTRY.scoreboard;
+  const cmd = fakeCmdWithCliFlag("bogus");
+  assert.deepEqual(validateFlags(entry, cmd), ["bogus"]);
 });

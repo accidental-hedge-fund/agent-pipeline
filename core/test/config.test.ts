@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import { findGitRoot, syncConfig } from "../scripts/config.ts";
+import { findGitRoot, syncConfig, repoMapAdd, repoMapRemove, repoMapList, validateOwnerRepo } from "../scripts/config.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -56,7 +56,7 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude" });
+    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerEffort: undefined });
     assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
     process.env.PATH = oldPath;
@@ -1383,7 +1383,158 @@ test("CLI: `pipeline config sync --apply` writes refreshed config", () => {
   assert.match(synced, /^base_branch: staging/m);
 });
 
-test("CLI: `pipeline config --help` advertises sync preview/apply", () => {
+test("CLI: `pipeline config repo-map add` writes the entry and exits 0", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const binDir = makeFakeGh("acme/lib");
+  const oldPath = process.env.PATH;
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/lib", "--repo-path", repo],
+    { encoding: "utf8", env: { ...process.env, PATH: `${binDir}:${oldPath}` } },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /repo_map:/);
+  assert.match(written, /- acme\/lib/);
+});
+
+test("CLI: `pipeline config repo-map add --rel depended_on_by` targets depended_on_by", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const binDir = makeFakeGh("acme/app");
+  const oldPath = process.env.PATH;
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/app", "--rel", "depended_on_by", "--repo-path", repo],
+    { encoding: "utf8", env: { ...process.env, PATH: `${binDir}:${oldPath}` } },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /depended_on_by:\s*\n\s+- acme\/app/);
+});
+
+test("CLI: `pipeline config repo-map remove` removes the entry and exits 0", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "remove", "acme/lib", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.doesNotMatch(fs.readFileSync(configPath, "utf8"), /acme\/lib/);
+});
+
+test("CLI: `pipeline config repo-map remove` on an absent entry exits 0 with a warning", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "remove", "acme/absent", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stderr, /warning/i);
+});
+
+test("CLI: `pipeline config repo-map list` prints entries grouped by relationship", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n  depended_on_by:\n    - acme/app\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "list", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /depends_on/);
+  assert.match(result.stdout, /acme\/lib/);
+  assert.match(result.stdout, /depended_on_by/);
+  assert.match(result.stdout, /acme\/app/);
+});
+
+test("CLI: `pipeline config repo-map add` with a malformed owner/repo exits 1 and does not write", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "not-a-repo", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 1, `stdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("CLI: `pipeline config repo-map add` with an invalid --rel exits non-zero and does not write", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/lib", "--rel", "siblings", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.notEqual(result.status, 0, `stdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("CLI: `pipeline config repo-map add` on a repo with no pipeline.yml exits 1 and creates no file", () => {
+  const repo = makeFakeRepo(null);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "add", "acme/lib", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 1, `stdout:\n${result.stdout}`);
+  assert.match(result.stdout, /pipeline init/);
+  assert.equal(fs.existsSync(configPath), false);
+});
+
+test("CLI: `pipeline config repo-map` with an unknown subcommand lists available subcommands", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "repo-map", "bogus", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 2, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.match(result.stderr, /add/);
+  assert.match(result.stderr, /remove/);
+  assert.match(result.stderr, /list/);
+});
+
+test("CLI: `pipeline config bogus` unknown-subcommand message lists repo-map", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "bogus", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 2, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.match(result.stderr, /repo-map/);
+});
+
+test("CLI: `pipeline config --help` advertises sync preview/apply and repo-map", () => {
   const result = spawnSync(
     process.execPath,
     ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "--help"],
@@ -1394,6 +1545,7 @@ test("CLI: `pipeline config --help` advertises sync preview/apply", () => {
   assert.match(result.stdout, /schema/);
   assert.match(result.stdout, /validate/);
   assert.match(result.stdout, /sync/);
+  assert.match(result.stdout, /repo-map/);
   assert.match(result.stdout, /--apply/);
 });
 
@@ -1467,6 +1619,17 @@ test("resolveReleaseConfig: returns intake_model — default when unset, pipelin
   assert.equal(dflt.intake_model, DEFAULT_CONFIG.models.intake, "default intake_model must be DEFAULT_CONFIG.models.intake");
   const over = cfgMod.resolveReleaseConfig(makeFakeRepo("models:\n  intake: haiku\n"));
   assert.equal(over.intake_model, "haiku", "models.intake in pipeline.yml must override");
+});
+
+test("resolveReleaseConfig: returns intake_effort — unset by default, pipeline.yml override when set, auto resolves (#366)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+  // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.
+  const dflt = cfgMod.resolveReleaseConfig(makeFakeRepo(null));
+  assert.equal(dflt.intake_effort, undefined, "intake_effort must be unset when effort.intake is absent");
+  const over = cfgMod.resolveReleaseConfig(makeFakeRepo("effort:\n  intake: high\n"));
+  assert.equal(over.intake_effort, "high", "effort.intake in pipeline.yml must override");
+  const auto = cfgMod.resolveReleaseConfig(makeFakeRepo("effort:\n  intake: auto\n"));
+  assert.equal(auto.intake_effort, "low", "effort.intake: auto must resolve via the intake stage routing (Analytical/Ephemeral)");
 });
 
 test("resolveReleaseConfig: returns intake_timeout — default when unset, pipeline.yml override when set (#248)", async () => {
@@ -1661,4 +1824,984 @@ test("resolveConfig: plan_review_timeout: -1 is rejected (negative integer)", as
   } finally {
     process.env.PATH = oldPath;
   }
+});
+
+// ---- repo_map (#312) ----
+
+test("resolveConfig: repo_map absent → empty-list defaults", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/rm0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map.depends_on, []);
+    assert.deepEqual(cfg.repo_map.depended_on_by, []);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: valid repo_map with depends_on and depended_on_by resolves", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - acme/shared-lib\n  depended_on_by:\n    - acme/consumer-app\n`);
+  const binDir = makeFakeGh("acme/rm1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map?.depends_on, ["acme/shared-lib"]);
+    assert.deepEqual(cfg.repo_map?.depended_on_by, ["acme/consumer-app"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map with same repo in both lists is preserved", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - acme/shared\n  depended_on_by:\n    - acme/shared\n`);
+  const binDir = makeFakeGh("acme/rm2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map?.depends_on, ["acme/shared"]);
+    assert.deepEqual(cfg.repo_map?.depended_on_by, ["acme/shared"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map entry missing slash is rejected", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - notaslashrepo\n`);
+  const binDir = makeFakeGh("acme/rm3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map entry with two slashes is rejected", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  depends_on:\n    - acme/shared/extra\n`);
+  const binDir = makeFakeGh("acme/rm4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: repo_map unknown sub-key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`repo_map:\n  unknown_key: []\n`);
+  const binDir = makeFakeGh("acme/rm5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /Invalid .*pipeline\.yml/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---- ci_mode (#350) ----
+
+test("resolveConfig: ci_mode absent defaults to 'github'", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/cim0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.ci_mode, "github");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: ci_mode: local is accepted and resolved correctly", async () => {
+  const repo = makeFakeRepo(`ci_mode: local\n`);
+  const binDir = makeFakeGh("acme/cim1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.ci_mode, "local");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: out-of-enum ci_mode value is rejected with error naming ci_mode", async () => {
+  const repo = makeFakeRepo(`ci_mode: skip\n`);
+  const binDir = makeFakeGh("acme/cim2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("ci_mode"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---- event_sink (#343) ----
+
+test("resolveConfig: no event_sink configured → event_sink is undefined", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/es0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.event_sink, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: event_sink.command from pipeline.yml resolves with default mode 'additive'", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger -t pipeline"\n`);
+  const binDir = makeFakeGh("acme/es1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.event_sink, { command: "logger -t pipeline", mode: "additive" });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: event_sink.mode: exclusive from pipeline.yml is honored", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger -t pipeline"\n  mode: exclusive\n`);
+  const binDir = makeFakeGh("acme/es2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.event_sink, { command: "logger -t pipeline", mode: "exclusive" });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: PIPELINE_EVENT_SINK_COMMAND activates a sink with no file config", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/es3");
+  const oldPath = process.env.PATH;
+  const oldCommand = process.env.PIPELINE_EVENT_SINK_COMMAND;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_COMMAND = "vector-tap";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.event_sink, { command: "vector-tap", mode: "additive" });
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldCommand === undefined) delete process.env.PIPELINE_EVENT_SINK_COMMAND;
+    else process.env.PIPELINE_EVENT_SINK_COMMAND = oldCommand;
+  }
+});
+
+test("resolveConfig: PIPELINE_EVENT_SINK_COMMAND overrides the file's event_sink.command", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "from-file"\n`);
+  const binDir = makeFakeGh("acme/es4");
+  const oldPath = process.env.PATH;
+  const oldCommand = process.env.PIPELINE_EVENT_SINK_COMMAND;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_COMMAND = "from-env";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.event_sink?.command, "from-env");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldCommand === undefined) delete process.env.PIPELINE_EVENT_SINK_COMMAND;
+    else process.env.PIPELINE_EVENT_SINK_COMMAND = oldCommand;
+  }
+});
+
+test("resolveConfig: PIPELINE_EVENT_SINK_MODE overrides the file's event_sink.mode", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "from-file"\n  mode: additive\n`);
+  const binDir = makeFakeGh("acme/es5");
+  const oldPath = process.env.PATH;
+  const oldMode = process.env.PIPELINE_EVENT_SINK_MODE;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_MODE = "exclusive";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.event_sink?.mode, "exclusive");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldMode === undefined) delete process.env.PIPELINE_EVENT_SINK_MODE;
+    else process.env.PIPELINE_EVENT_SINK_MODE = oldMode;
+  }
+});
+
+test("resolveConfig: invalid PIPELINE_EVENT_SINK_MODE value throws", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "from-file"\n`);
+  const binDir = makeFakeGh("acme/es6");
+  const oldPath = process.env.PATH;
+  const oldMode = process.env.PIPELINE_EVENT_SINK_MODE;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  process.env.PIPELINE_EVENT_SINK_MODE = "bogus";
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /PIPELINE_EVENT_SINK_MODE/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldMode === undefined) delete process.env.PIPELINE_EVENT_SINK_MODE;
+    else process.env.PIPELINE_EVENT_SINK_MODE = oldMode;
+  }
+});
+
+test("resolveConfig: event_sink.mode outside additive/exclusive is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger"\n  mode: sometimes\n`);
+  const binDir = makeFakeGh("acme/es7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("event_sink"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: event_sink unknown sub-key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger"\n  url: "https://example.com"\n`);
+  const binDir = makeFakeGh("acme/es8");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("event_sink"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("syncConfig: event_sink is preserved through sync --apply", () => {
+  const repo = makeFakeRepo(`event_sink:\n  command: "logger -t pipeline"\n  mode: exclusive\n`);
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, true);
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  assert.match(synced, /^event_sink:/m, "event_sink block must be present after sync");
+  assert.match(synced, /command: .*logger -t pipeline/);
+  assert.match(synced, /mode: exclusive/);
+});
+
+// ---------------------------------------------------------------------------
+// repo_map add/remove/list (#367)
+// ---------------------------------------------------------------------------
+
+const alwaysReachable = () => true;
+
+test("validateOwnerRepo: accepts a well-formed owner/repo string", () => {
+  assert.equal(validateOwnerRepo("acme/widget"), null);
+});
+
+test("validateOwnerRepo: rejects a string with no '/'", () => {
+  assert.match(validateOwnerRepo("acmewidget") ?? "", /owner\/repo/);
+});
+
+test("validateOwnerRepo: rejects an empty repo segment", () => {
+  assert.match(validateOwnerRepo("acme/") ?? "", /owner\/repo/);
+});
+
+test("validateOwnerRepo: rejects an empty owner segment", () => {
+  assert.match(validateOwnerRepo("/widget") ?? "", /owner\/repo/);
+});
+
+test("validateOwnerRepo: rejects whitespace in either segment", () => {
+  assert.match(validateOwnerRepo("acme /widget") ?? "", /owner\/repo/);
+});
+
+test("repoMapAdd: defaults to depends_on and creates the repo_map block when absent", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.equal(result.noop, false);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /^repo_map:/m);
+  assert.match(written, /^ {2}depends_on:\s*\n\s+- acme\/lib/m);
+});
+
+test("repoMapAdd: --rel depended_on_by targets the other list and leaves depends_on untouched", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/app", "depended_on_by", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, true);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /depends_on:\s*\n\s+- acme\/lib/);
+  assert.match(written, /depended_on_by:\s*\n\s+- acme\/app/);
+});
+
+test("repoMapAdd: re-adding an existing entry is an idempotent no-op success", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.equal(result.noop, true);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before, "no duplicate entry should be written");
+});
+
+test("repoMapAdd: rejects a malformed owner/repo with no write", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapAdd(repo, "not-a-repo", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorKind, "invalid-owner-repo");
+  assert.equal(fs.readFileSync(configPath, "utf8"), before, "invalid input must not write");
+});
+
+test("repoMapAdd: fails with exit-worthy error when .github/pipeline.yml is absent, no file created", () => {
+  const repo = makeFakeRepo(null);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorKind, "missing-config");
+  assert.match(result.message, /pipeline init/);
+  assert.equal(fs.existsSync(configPath), false, "no config file should be created");
+});
+
+test("repoMapAdd: reachability failure warns but the entry is still written", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapAdd(repo, "acme/private", "depends_on", { checkReachable: () => false });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.match(result.warning ?? "", /acme\/private/);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.match(written, /- acme\/private/);
+});
+
+// Regression proof: without the injected checkReachable seam, repoMapAdd would
+// have to shell out to the real `gh` CLI, which is unauthenticated/unavailable
+// in CI — this test proves the reachability failure path is exercised purely
+// through the injected dep, with no real network/subprocess call.
+test("repoMapAdd: reachability check never blocks the write even when it always fails", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  let calls = 0;
+  const result = repoMapAdd(repo, "acme/unreachable", "depends_on", {
+    checkReachable: () => {
+      calls++;
+      return false;
+    },
+  });
+  assert.equal(calls, 1, "reachability check must be invoked exactly once via the injected dep");
+  assert.equal(result.ok, true);
+  assert.ok(result.warning);
+});
+
+test("repoMapRemove: removes an existing entry", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n    - acme/other\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = repoMapRemove(repo, "acme/lib", "depends_on");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  const written = fs.readFileSync(configPath, "utf8");
+  assert.doesNotMatch(written, /acme\/lib\b/);
+  assert.match(written, /acme\/other/);
+});
+
+test("repoMapRemove: removing an absent entry is a tolerant no-op with a warning", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapRemove(repo, "acme/absent", "depends_on");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.equal(result.noop, true);
+  assert.ok(result.warning);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("repoMapRemove: removing from an entirely absent repo_map block is a tolerant no-op", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapRemove(repo, "acme/absent", "depends_on");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.noop, true);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("repoMapRemove: rejects a malformed owner/repo with no write", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n");
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const before = fs.readFileSync(configPath, "utf8");
+
+  const result = repoMapRemove(repo, "bad", "depends_on");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorKind, "invalid-owner-repo");
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+});
+
+test("repoMapList: prints entries grouped by relationship kind", () => {
+  const repo = makeFakeRepo("repo_map:\n  depends_on:\n    - acme/lib\n  depended_on_by:\n    - acme/app\n");
+
+  const result = repoMapList(repo);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.entries, { depends_on: ["acme/lib"], depended_on_by: ["acme/app"] });
+});
+
+test("repoMapList: reports no entries when repo_map is absent", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+
+  const result = repoMapList(repo);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.entries, { depends_on: [], depended_on_by: [] });
+  assert.match(result.message, /no repo_map entries/i);
+});
+
+test("repoMapList: missing config file reports an error", () => {
+  const repo = makeFakeRepo(null);
+
+  const result = repoMapList(repo);
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /pipeline init/);
+});
+
+test("repoMap add/remove round-trip preserves unrelated keys, comments, and formatting byte-for-byte", () => {
+  // Deliberately nonstandard formatting (uneven spacing before an inline comment,
+  // 4-space indentation, a flow-style mapping) to prove the edit is scoped to the
+  // repo_map block rather than re-serializing the whole document (#367 review 1).
+  const original = `# top comment
+base_branch:   staging    # trailing comment with odd spacing
+steps:
+    docs: true
+flow_key: { a: 1, b: 2 }
+review_policy:
+  block_threshold: high
+repo_map:
+  depends_on:
+    - acme/existing
+`;
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const beforeRepoMap = original.slice(0, original.indexOf("repo_map:"));
+
+  repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+  const afterAdd = fs.readFileSync(configPath, "utf8");
+  assert.equal(
+    afterAdd.slice(0, afterAdd.indexOf("repo_map:")),
+    beforeRepoMap,
+    "bytes preceding repo_map must be unchanged after add",
+  );
+
+  repoMapRemove(repo, "acme/lib", "depends_on");
+  const afterRemove = fs.readFileSync(configPath, "utf8");
+  assert.equal(
+    afterRemove.slice(0, afterRemove.indexOf("repo_map:")),
+    beforeRepoMap,
+    "bytes preceding repo_map must be unchanged after remove",
+  );
+  assert.match(afterRemove, /depends_on:\s*\n\s*- acme\/existing\s*\n/);
+});
+
+test("repoMapAdd: creating repo_map from absent produces a config that still validates", async () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const binDir = makeFakeGh("acme/rm1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const result = cfgMod.repoMapAdd(repo, "acme/lib", "depends_on", { checkReachable: alwaysReachable });
+    assert.equal(result.ok, true);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.repo_map.depends_on, ["acme/lib"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// effort: block + auto sentinel + structured review_harness (#366)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: effort block accepted and resolved", async () => {
+  const repo = makeFakeRepo(`effort:\n  planning: medium\n  implementing: low\n`);
+  const binDir = makeFakeGh("acme/effort1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.effort.planning, "medium");
+    assert.equal(cfg.effort.implementing, "low");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under effort is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`effort:\n  unknown_stage: low\n`);
+  const binDir = makeFakeGh("acme/effort2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("unknown_stage"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort block absent — every stage's resolved effort is unset, plan_review_effort defaults to medium", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/effort3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.effort.planning, undefined);
+    assert.equal(cfg.effort.implementing, undefined);
+    assert.equal(cfg.effort.review, undefined);
+    assert.equal(cfg.effort.fix, undefined);
+    assert.equal(cfg.effort.intake, undefined);
+    assert.equal(cfg.effort.sweep, undefined);
+    assert.equal(cfg.plan_review_effort, "medium");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing 'auto' resolves to sonnet on the claude primary harness", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/auto1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.models.implementing, "sonnet");
+    assert.notEqual(cfg.models.implementing, "gpt-5.5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.implementing 'auto' resolves to gpt-5.5 on the codex primary harness", async () => {
+  const repo = makeFakeRepo(`models:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/auto2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(cfg.models.implementing, "gpt-5.5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.implementing 'auto' resolves to low regardless of harness", async () => {
+  const repo = makeFakeRepo(`effort:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/auto3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const claudeCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    const codexCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(claudeCfg.effort.implementing, "low");
+    assert.equal(codexCfg.effort.implementing, "low");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review 'auto' resolves to claude-fable-5 under both profiles (profile-independent) and never the short alias", async () => {
+  const repo = makeFakeRepo(`models:\n  review: auto\n`);
+  const binDir = makeFakeGh("acme/auto4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const claudeCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    const codexCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(claudeCfg.models.review, "claude-fable-5");
+    assert.equal(codexCfg.models.review, "claude-fable-5");
+    assert.notEqual(claudeCfg.models.review, "fable-5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.planning 'auto' splits per-stage — planning resolves medium, plan-review resolves max", async () => {
+  // The same effort.planning config key backs two differently-classified
+  // stages: planning (Analytical/Iterative) and plan-review (Adversarial/
+  // Definitive). cfg.effort.planning serves the planning stage; cfg.plan_review_effort
+  // is the dedicated derived value plan-review actually reads (#366).
+  const repo = makeFakeRepo(`effort:\n  planning: auto\n`);
+  const binDir = makeFakeGh("acme/auto5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.effort.planning, "medium", "planning stage: Analytical/Iterative");
+    assert.equal(cfg.plan_review_effort, "max", "plan-review stage: Adversarial/Definitive");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.* / effort.* never resolve to the literal string 'auto'", async () => {
+  const repo = makeFakeRepo(
+    `models:\n  planning: auto\n  implementing: auto\n  review: auto\n  fix: auto\n  intake: auto\n  sweep: auto\n` +
+      `effort:\n  planning: auto\n  implementing: auto\n  fix: auto\n  intake: auto\n  sweep: auto\n`,
+  );
+  const binDir = makeFakeGh("acme/auto6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    for (const v of Object.values(cfg.models)) assert.notEqual(v, "auto");
+    for (const v of Object.values(cfg.effort)) assert.notEqual(v, "auto");
+    assert.notEqual(cfg.plan_review_effort, "auto");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: structured review_harness sets reviewerModel/reviewerEffort; string form leaves them unset", async () => {
+  const repo = makeFakeRepo(
+    `review_harness:\n  command: claude\n  model: claude-fable-5\n  effort: high\n`,
+  );
+  const binDir = makeFakeGh("acme/rhstruct1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "claude");
+    assert.equal(cfg.harnesses.reviewerModel, "claude-fable-5");
+    assert.equal(cfg.harnesses.reviewerEffort, "high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: structured review_harness with model: auto resolves reviewerModel to claude-fable-5", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: claude\n  model: auto\n`);
+  const binDir = makeFakeGh("acme/rhstruct2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewerModel, "claude-fable-5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness (string shorthand) leaves reviewerModel/reviewerEffort unset", async () => {
+  const repo = makeFakeRepo(`review_harness: claude\n`);
+  const binDir = makeFakeGh("acme/rhstruct3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "claude");
+    assert.equal(cfg.harnesses.reviewerModel, undefined);
+    assert.equal(cfg.harnesses.reviewerEffort, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under structured review_harness is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: claude\n  temperature: 0.2\n`);
+  const binDir = makeFakeGh("acme/rhstruct4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("temperature"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.review inert-warning fires when the reviewer is a custom CLI", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\neffort:\n  review: high\n`);
+  const binDir = makeFakeGh("acme/inerteffort1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      cfg = cfgMod.resolveConfig({ repoPath: repo });
+    });
+    const hit = warnings.find((w) => w.includes("effort.review"));
+    assert.ok(hit, `expected an effort.review inert warning, got: ${JSON.stringify(warnings)}`);
+    // Advisory only — the resolved value is preserved, not blanked or thrown.
+    assert.equal(cfg.effort.review, "high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.review does NOT warn when the reviewer is claude or codex (both honor per-stage effort)", async () => {
+  const repo = makeFakeRepo(`effort:\n  review: high\n`);
+  const binDir = makeFakeGh("acme/inerteffort2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo }); // codex profile → reviewer=claude
+    });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: effort.review absent — no inert warning even with a custom reviewer CLI", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\n`);
+  const binDir = makeFakeGh("acme/inerteffort3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("DEFAULT_CONFIG.models.review regression: resolves to the full claude-fable-5 id (#366 ratified default)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/defaultreview1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(DEFAULT_CONFIG.models.review, "claude-fable-5");
+    assert.equal(cfg.models.review, "claude-fable-5");
+    assert.notEqual(cfg.models.review, "fable-5");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// External stage executors (#314)
+// ---------------------------------------------------------------------------
+
+async function resolveWithConfig(content: string | null, repoSlug: string): Promise<unknown> {
+  const repo = makeFakeRepo(content);
+  const binDir = makeFakeGh(repoSlug);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    return cfgMod.resolveConfig({ repoPath: repo });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+}
+
+async function expectInvalidConfig(content: string, repoSlug: string, messagePattern: RegExp): Promise<void> {
+  const repo = makeFakeRepo(content);
+  const binDir = makeFakeGh(repoSlug);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), messagePattern);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+}
+
+test("resolveConfig: no executors/stage_executors block → parity with pre-#314 defaults", async () => {
+  const cfg = (await resolveWithConfig(null, "acme/exec-parity")) as { executors: unknown; stage_executors: unknown };
+  assert.deepEqual(cfg.executors, {});
+  assert.deepEqual(cfg.stage_executors, {});
+});
+
+test("resolveConfig: agent-system executor definition accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\n    credential: OPENCODE_API_KEY\n`,
+    "acme/exec1",
+  )) as { executors: Record<string, unknown> };
+  assert.deepEqual(cfg.executors["opencode-main"], {
+    type: "agent-system",
+    provider: "opencode",
+    endpoint: "https://opencode.internal/api",
+    credential: "OPENCODE_API_KEY",
+  });
+});
+
+test("resolveConfig: model-endpoint executor definition accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n`,
+    "acme/exec2",
+  )) as { executors: Record<string, unknown> };
+  assert.deepEqual(cfg.executors["local-ollama"], {
+    type: "model-endpoint",
+    base_url: "http://localhost:11434/v1",
+    model: "llama3.1:70b",
+  });
+});
+
+test("resolveConfig: unknown executor type is rejected, identifying the invalid type", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: some-other-thing\n`,
+    "acme/exec3",
+    /Invalid .*pipeline\.yml/,
+  );
+});
+
+test("resolveConfig: unknown key inside an executor definition is rejected (strict)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://x\n    unexpected_key: true\n`,
+    "acme/exec4",
+    /Invalid .*pipeline\.yml/,
+  );
+});
+
+test("resolveConfig: stage_executors assigning different executors to different stages in one run", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\nstage_executors:\n  planning: opencode-main\n  review-1: local-ollama\n  review-2: local-ollama\n`,
+    "acme/exec5",
+  )) as { stage_executors: Record<string, string> };
+  assert.deepEqual(cfg.stage_executors, { planning: "opencode-main", "review-1": "local-ollama", "review-2": "local-ollama" });
+});
+
+test("resolveConfig: stage_executors referencing an unknown executor name is rejected, naming the stage", async () => {
+  await expectInvalidConfig(
+    `stage_executors:\n  planning: does-not-exist\n`,
+    "acme/exec6",
+    /stage_executors\.planning.*unknown executor.*does-not-exist/s,
+  );
+});
+
+test("resolveConfig: model-endpoint assigned to review-2 (prompt-contained) is accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\nstage_executors:\n  review-2: local-ollama\n`,
+    "acme/exec7",
+  )) as { stage_executors: Record<string, string> };
+  assert.equal(cfg.stage_executors["review-2"], "local-ollama");
+});
+
+test("resolveConfig: model-endpoint assigned to implementing (execution-environment) is rejected at parse time, naming stage + executor", async () => {
+  await expectInvalidConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\nstage_executors:\n  implementing: local-ollama\n`,
+    "acme/exec8",
+    /implementing.*local-ollama/s,
+  );
+});
+
+for (const stage of ["planning", "implementing", "fix-1", "fix-2", "shipcheck-gate"]) {
+  test(`resolveConfig: model-endpoint assigned to execution-environment stage "${stage}" is rejected at parse time`, async () => {
+    await expectInvalidConfig(
+      `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: m\nstage_executors:\n  ${stage}: local-ollama\n`,
+      `acme/exec-eee-${stage}`,
+      new RegExp(`${stage}.*local-ollama`, "s"),
+    );
+  });
+}
+
+test("resolveConfig: agent-system assigned to implementing (execution-environment) is accepted, not rejected", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\nstage_executors:\n  implementing: opencode-main\n`,
+    "acme/exec9",
+  )) as { stage_executors: Record<string, string> };
+  assert.equal(cfg.stage_executors.implementing, "opencode-main");
+});
+
+test("resolveConfig: model-endpoint executor with no credential (localhost Ollama) is valid", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n`,
+    "acme/exec10",
+  )) as { executors: Record<string, { credential?: string }> };
+  assert.equal(cfg.executors["local-ollama"].credential, undefined);
 });

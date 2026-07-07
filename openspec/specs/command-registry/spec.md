@@ -5,12 +5,13 @@ TBD - created by archiving change command-registry. Update Purpose after archive
 ## Requirements
 ### Requirement: The pipeline CLI SHALL maintain a declarative command registry
 
-The pipeline CLI SHALL maintain a `COMMAND_REGISTRY` constant in `core/scripts/command-registry.ts` mapping each recognized command keyword to a `CommandEntry` record. Each `CommandEntry` SHALL declare at minimum: `needsIssueNumber` (boolean), `allowedFlags` (a `Set<string>` of Commander option attribute names, or the sentinel `"all"` for the advance command), `mutatesGitHub` (boolean), `needsConfig` (boolean), `needsGhAuth` (boolean), and `supportsJson` (boolean). The registry SHALL be the single authoritative source for command dispatch routing and flag validation.
+The pipeline CLI SHALL maintain a `COMMAND_REGISTRY` constant in `core/scripts/command-registry.ts` mapping each recognized command keyword to a `CommandEntry` record. Each `CommandEntry` SHALL declare at minimum: `needsIssueNumber` (boolean), `allowedFlags` (a `Set<string>` of Commander option attribute names, or the sentinel `"all"` for the advance command), `mutatesGitHub` (boolean), `needsConfig` (boolean), `needsGhAuth` (boolean), and `supportsJson` (boolean). The registry SHALL be the single authoritative source for command dispatch routing and flag validation. The registry SHALL include entries for the operations promoted from mode-selecting flags to positional sub-command keywords by this change — `status`, `unblock`, `override`, and `cleanup` — and `cleanup` SHALL be dispatched as an actual positional keyword (`pipeline cleanup`), not only as the legacy `--cleanup` flag mode.
 
 #### Scenario: Every recognized command keyword has a registry entry
 
 - **WHEN** the `COMMAND_REGISTRY` is inspected
-- **THEN** it SHALL contain entries for every keyword the pipeline CLI recognizes: advance (the default/numeric case), init, doctor, release, intake, triage, merge, sweep, refine-spec, logs, summary, path, config, run, improve, scoreboard, roadmap, cleanup, remove-worktree
+- **THEN** it SHALL contain entries for every keyword the pipeline CLI recognizes: advance (the default/numeric case), init, doctor, release, intake, triage, merge, sweep, refine-spec, logs, summary, path, config, run, improve, scoreboard, roadmap, cleanup, remove-worktree, **status, unblock, and override**
+- **AND** `lookupCommand("status")`, `lookupCommand("unblock")`, `lookupCommand("override")`, and `lookupCommand("cleanup")` SHALL each return a non-null entry
 - **AND** `lookupCommand("unknown-cmd")` SHALL return `null`
 - **AND** `lookupCommand(undefined)` SHALL return the advance entry
 
@@ -19,7 +20,12 @@ The pipeline CLI SHALL maintain a `COMMAND_REGISTRY` constant in `core/scripts/c
 - **WHEN** a new sub-command is added to the pipeline CLI
 - **THEN** adding it to `COMMAND_REGISTRY` SHALL be sufficient to register it for dispatch routing and flag validation, without editing any per-command conflict list elsewhere in `pipeline.ts`
 
----
+#### Scenario: Promoted keyword entries declare correct issue-number metadata
+
+- **WHEN** the registry entries for `status`, `unblock`, and `override` are inspected
+- **THEN** each SHALL declare `needsIssueNumber: true` (these operations act on an issue/PR number, e.g. `pipeline status 42`)
+- **AND** the `cleanup` entry SHALL declare `needsIssueNumber: false` (it takes no issue number)
+- **AND** each promoted entry's handler SHALL be the same handler the corresponding legacy flag invoked, so the operation's behavior is unchanged
 
 ### Requirement: The CLI SHALL enforce allowlist-based flag validation via the registry for every registered command
 
@@ -106,4 +112,149 @@ The `command-registry.ts` module SHALL export `CommandEntry`, `COMMAND_REGISTRY`
 
 - **WHEN** a test imports `{ lookupCommand, validateFlags, COMMAND_REGISTRY }` from `./command-registry.ts`
 - **THEN** the import SHALL succeed without pulling in `commander`, `process.argv` parsing, or any CLI initialization side-effect
+
+### Requirement: Legacy mode-selecting flags SHALL still work and SHALL emit a single deprecation notice
+
+For one major version, the legacy mode-selecting flag forms — `--status`, `--summary`, `--unblock`, `--override`, `--init`, and `--cleanup` — SHALL continue to perform their existing operation unchanged AND SHALL print exactly one deprecation notice naming the replacement `pipeline:<command>` (and `pipeline <command>`) form. The notice SHALL be written to stderr so machine-readable stdout contracts (e.g. `--status --json`) are byte-for-byte unchanged, and the operation's exit code SHALL be unchanged. These flag forms are slated for removal in the next major version; this change SHALL NOT remove them. The `--doctor` preflight-gate flag is a behavior modifier (run preflight, then advance) and SHALL NOT be treated as deprecated.
+
+#### Scenario: Deprecated flag performs the operation and warns
+
+- **WHEN** the user runs `pipeline 42 --status`
+- **THEN** the read-only status of issue 42 SHALL be produced exactly as before
+- **AND** exactly one deprecation notice SHALL be printed to stderr pointing to `pipeline:status` / `pipeline status 42`
+- **AND** the process exit code SHALL be identical to the pre-change `--status` behavior
+
+#### Scenario: Deprecation notice does not corrupt machine-readable output
+
+- **WHEN** the user runs `pipeline 42 --status --json`
+- **THEN** stdout SHALL contain only the same JSON payload as before this change
+- **AND** the deprecation notice SHALL appear on stderr, not stdout
+
+#### Scenario: The preflight-gate flag is not deprecated
+
+- **WHEN** the user runs `pipeline 42 --doctor`
+- **THEN** the preflight checks SHALL run and, on success, the advance loop SHALL proceed
+- **AND** no deprecation notice SHALL be emitted for `--doctor`
+
+---
+
+### Requirement: The `run` keyword SHALL be collapsed into `--detach` at the user-facing surface
+
+The detached-launch surface SHALL be `pipeline N --detach`: the `--detach` modifier SHALL be honored on the base advance command and SHALL perform the same detached launch that `pipeline run N --detach` performs. No `pipeline:run` host command entry SHALL be created. The legacy `run` keyword SHALL be retained as an undocumented, deprecated alias (still dispatching) so the detached-launcher internals are not destabilized; it SHALL NOT appear in advertised help or documentation as a recommended surface.
+
+#### Scenario: Detached launch via the base advance command
+
+- **WHEN** the user runs `pipeline 42 --detach`
+- **THEN** the pipeline SHALL start a detached background run for issue 42, reaching the same detached-launch entry point as `pipeline run 42 --detach`
+
+#### Scenario: No `pipeline:run` host entry
+
+- **WHEN** the host command surface is enumerated
+- **THEN** there SHALL be no `pipeline:run` / `$pipeline:run` entry
+- **AND** the legacy `pipeline run 42` keyword SHALL still dispatch (undocumented) without error
+
+---
+
+### Requirement: The `--detach` dispatch SHALL guard against incompatible arguments before launching
+
+The `--detach` mode-switch SHALL perform two safety checks **before** dispatching the detached-advance launch: first, it SHALL verify that the issue number is the only positional argument (no extra tokens such as `config validate`); second, it SHALL verify that no mode-selector flag (`--status`, `--summary`, `--unblock`, `--override`) is active alongside `--detach`. Both violations SHALL cause the process to exit with code 2 and print an explanatory message to stderr; no background process SHALL be launched. These two safety checks SHALL apply uniformly whether `--detach` is invoked via the canonical `pipeline N --detach` form or via the legacy `pipeline run N --detach` alias.
+
+#### Scenario: Extra positionals with `--detach` are rejected before launch
+
+- **WHEN** the user runs `pipeline 42 config validate --detach`
+- **THEN** the process SHALL exit with code 2
+- **AND** stderr SHALL contain "unexpected argument" (case-insensitive)
+- **AND** no detached background process SHALL be launched
+
+#### Scenario: Mode-selector flag combined with `--detach` is rejected
+
+- **WHEN** the user runs `pipeline 42 --status --detach`
+- **THEN** the process SHALL exit with code 2
+- **AND** stderr SHALL contain a message naming the conflicting flag and explaining that `--detach` cannot be combined with it
+- **AND** no detached background process SHALL be launched
+
+#### Scenario: Mode-selector flag combined with `--detach` via the `run` alias is also rejected
+
+- **WHEN** the user runs `pipeline run 42 --status --detach`
+- **THEN** the process SHALL exit with code 2
+- **AND** stderr SHALL contain a message indicating that `--detach` cannot be combined with `--status`
+- **AND** no detached background process SHALL be launched
+
+---
+
+### Requirement: The `unblock` and `override` positional keywords SHALL honor the kill switch
+
+The positional `pipeline unblock <N> "<answer>"` and `pipeline override <N> "<spec>"` keyword handlers SHALL check the kill-switch state after validating their arguments and before performing any GitHub mutation. When the kill-switch file (`/tmp/pipeline-<domain>.disabled`) is present, each SHALL print an explanatory message to stderr and exit with code 0, mirroring the same guard applied in the legacy `pipeline N --unblock` / `pipeline N --override` flag paths.
+
+#### Scenario: `pipeline unblock` respects an active kill switch
+
+- **WHEN** the kill-switch file `/tmp/pipeline-<domain>.disabled` is present
+- **AND** the user runs `pipeline unblock 42 "fixed in #99"`
+- **THEN** the process SHALL exit with code 0
+- **AND** stderr SHALL contain a message indicating the kill switch is active
+- **AND** no GitHub mutation (block-clear) SHALL be performed
+
+#### Scenario: `pipeline override` respects an active kill switch
+
+- **WHEN** the kill-switch file `/tmp/pipeline-<domain>.disabled` is present
+- **AND** the user runs `pipeline override 42 "abc123: deferred #99"`
+- **THEN** the process SHALL exit with code 0
+- **AND** stderr SHALL contain a message indicating the kill switch is active
+- **AND** no GitHub mutation (disposition record) SHALL be performed
+
+### Requirement: The CLI SHALL universally tolerate the host-injected `--profile` flag on every command
+
+The CLI SHALL treat the `profile` option as universally allowed during
+per-command flag validation. Because the generated host wrapper
+(`hosts/_shared/entry.template.mjs`) unconditionally appends `--profile
+<profile>` to every core invocation, `profile` SHALL never be reported as an
+offending flag for any registered command, regardless of whether that command's
+`allowedFlags` set declares it, and regardless of whether the command consumes
+the profile value. A registered `UNIVERSAL_FLAGS` set (containing at least
+`profile`) SHALL be the single authoritative source of the flags exempted this
+way, so that the exemption is explicit and testable rather than implicit. A
+command that does not use the profile SHALL ignore the injected value and behave
+identically to an invocation without it.
+
+This tolerance SHALL NOT weaken the allowlist for any other flag: an
+explicitly-provided option that is neither in the command's `allowedFlags` nor
+in `UNIVERSAL_FLAGS` SHALL still be reported as offending and cause exit code 2.
+
+#### Scenario: Profile-free command accepts the wrapper-injected profile
+
+- **WHEN** a profile-free command (e.g. `refine-spec`, `scoreboard`, or
+  `release`) is invoked through the host wrapper, which appends `--profile
+  <profile>`
+- **THEN** the flag-validation check SHALL NOT report `profile` as an offending
+  flag
+- **AND** the CLI SHALL NOT exit with the `cannot be combined with --profile`
+  error
+- **AND** the command SHALL proceed to its normal dispatch and behave identically
+  to the same invocation without `--profile`
+
+#### Scenario: Profile tolerance does not loosen the allowlist for other flags
+
+- **WHEN** a profile-free command is invoked with an explicitly-provided option
+  that is neither in its `allowedFlags` set nor in `UNIVERSAL_FLAGS` (e.g.
+  `pipeline scoreboard --bogus`)
+- **THEN** that option SHALL be reported as offending
+- **AND** the CLI SHALL exit with code 2 naming the unsupported flag
+
+#### Scenario: UNIVERSAL_FLAGS is the single source of universal tolerance
+
+- **WHEN** the flag-validation logic is inspected
+- **THEN** the set of flags tolerated on every command SHALL be sourced from a
+  single `UNIVERSAL_FLAGS` constant
+- **AND** `UNIVERSAL_FLAGS` SHALL contain `profile`
+- **AND** the fix SHALL NOT be implemented by adding `profile` to individual
+  per-command `allowedFlags` sets nor by a wrapper-side per-command exemption
+
+#### Scenario: Wrapper-composed invocation matches direct invocation
+
+- **WHEN** the host wrapper composes its argument list as
+  `[...passthrough, "--profile", <profile>]` for a profile-free command
+- **THEN** driving that argument list through the CLI's flag-validation path
+  SHALL produce no offending flags
+- **AND** the outcome SHALL match invoking the same command directly without the
+  appended `--profile`
 

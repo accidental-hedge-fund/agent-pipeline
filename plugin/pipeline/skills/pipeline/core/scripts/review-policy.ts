@@ -238,6 +238,32 @@ export function reviewCommentFlagsSpecDivergence(reviewBody: string): boolean {
   return reviewBody.includes(categoryMarker(SPEC_DIVERGENCE_CATEGORY));
 }
 
+/**
+ * Which entity must change to resolve a spec-divergence finding (#356).
+ * "code-behind-spec" — the active spec delta already requires the behavior;
+ *   the implementation must change. Normal fix-round path.
+ * "spec-behind-code" — the accepted implementation moved past the active delta;
+ *   the spec delta must be updated before archiving.
+ */
+export type SpecDivergenceDirection = "code-behind-spec" | "spec-behind-code";
+
+/** The exact (backtick-wrapped) token rendered per spec-divergence finding,
+ * single-sourced so emit + read cannot drift (#356). */
+export function directionMarker(direction: SpecDivergenceDirection): string {
+  return `\`direction: ${direction}\``;
+}
+
+/**
+ * Extract the spec-divergence direction from a rendered review comment body.
+ * Exact-marker match only — never infers direction from reviewer prose (#356).
+ * Returns null when no direction marker is present (unclassified). Pure.
+ */
+export function extractSpecDivergenceDirection(reviewBody: string): SpecDivergenceDirection | null {
+  if (reviewBody.includes(directionMarker("spec-behind-code"))) return "spec-behind-code";
+  if (reviewBody.includes(directionMarker("code-behind-spec"))) return "code-behind-spec";
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Scoped overrides (#229)
 // ---------------------------------------------------------------------------

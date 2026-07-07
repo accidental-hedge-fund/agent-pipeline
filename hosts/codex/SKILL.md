@@ -47,25 +47,49 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 
 ## Modes
 
+The primary invocation is the advance loop; all other operations are available as
+distinct `$pipeline:<command>` entries in the skill menu.
+
 ```
 $pipeline N                              advance loop (default; up to 12 transitions)
-$pipeline N --status                     read-only; print stage, blocker, PR, last review
-$pipeline N --unblock "answer"           post answer and clear blocked label
 $pipeline N --once                       advance one stage and stop
 $pipeline N --dry-run                    log what would happen; no harness calls, no GitHub writes
 $pipeline N --domain d                   override domain name in lock/log paths
 $pipeline N --base branch                override base branch
 $pipeline N --repo-path path             target a different repo working tree
-$pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
-$pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
-$pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh (no number)
-$pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
+$pipeline N --detach                     run the advance loop in a detached background process
+
+$pipeline:status <N>                     read-only; print stage, blocker, PR, last review
+$pipeline:unblock <N> "answer"           post answer and clear blocked label
+$pipeline:override <N> "key: reason"     disposition a review finding and auto-resume the advance loop
+$pipeline:summary <N>                    print the evidence bundle for issue N (local, offline)
+$pipeline:doctor                         deterministic preflight check; print summary, exit 0/1
 $pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
-$pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
-$pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
-$pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
+$pipeline:init                           ensure labels + scaffold .github/pipeline.yml
+$pipeline:cleanup                        sweep merged-PR worktrees
+$pipeline:intake [--description "text"]  spec a rough description into a GitHub issue + ROADMAP PR
+$pipeline:triage <N> --stage ready       set pipeline:ready on issue N
+$pipeline:triage <N> --stage backlog     set pipeline:backlog on issue N
+$pipeline:sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
+$pipeline:sweep --apply                  same, with write-backs applied
+$pipeline:roadmap                        dependency-aware scored roadmap for the backlog (dry-run)
+$pipeline:roadmap --apply                same, with write-backs applied
+$pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+$pipeline:release <version>              prepare a release PR for the given version
+$pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
+$pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline --version                      print the package version, then exit (no number; -V alias)
+```
+
+**Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
+```
+$pipeline N --status        → use $pipeline:status N
+$pipeline N --summary       → use $pipeline:summary N
+$pipeline N --unblock "…"   → use $pipeline:unblock N "…"
+$pipeline N --override "…"  → use $pipeline:override N "…"
+$pipeline --init            → use $pipeline:init
+$pipeline --cleanup         → use $pipeline:cleanup
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
@@ -91,6 +115,13 @@ convenience, not a precondition.
 effective configured behavior. Preview is the default and prints a diff without
 writing; `--apply` writes only after the existing file and rendered candidate
 both validate.
+
+`config repo-map <add|remove|list>` also takes no number. `add`/`remove` mutate
+only the `repo_map` block of `.github/pipeline.yml` (all other keys, comments,
+and formatting are preserved), creating the block when absent; `add` is
+idempotent and `remove` tolerates an absent entry (exit 0, warning). `--rel`
+selects `depends_on` (default) or `depended_on_by`. `list` prints current
+entries grouped by relationship kind.
 
 `doctor` takes no number either. It runs a **deterministic, model-free** preflight
 that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
@@ -136,8 +167,13 @@ ci_poll_interval: 30
 models:                          # only the claude harness honors these; a key
   planning: sonnet               # whose role runs on codex is ignored and a
   implementing: sonnet           # config warning is printed (planning/implementing/fix
-  review: opus                   # → implementer, review → reviewer)
+  review: claude-fable-5         # → implementer, review → reviewer). Each key also accepts "auto".
   fix: sonnet
+effort:                          # per-phase reasoning effort — codex via -c model_reasoning_effort,
+  planning: medium               # claude via --effort. Absent key: no flag. Each key also accepts "auto".
+  implementing: low              # planning also sources plan-review's effort (classified separately).
+  review: high                   # review is resolved round-aware (review-1 vs. review-2).
+  fix: low
 conventions_md_path: AGENTS.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library
@@ -150,6 +186,15 @@ review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the 
 ```
 
 When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). The `harnesses.implementer` is never overridable by repo config.
+
+`review_harness` also accepts a structured form for independent reviewer model/effort control, each accepting `"auto"` (resolved round-aware — plan-review/review-2 as Definitive, review-1 as Iterative):
+
+```yaml
+review_harness:
+  command: claude
+  model: auto
+  effort: auto
+```
 
 ## Conventions & carry-forward lessons
 
@@ -203,96 +248,84 @@ Confirms target exists, has a `pipeline:*` label, isn't already at a
 terminal/blocked state. If anything looks wrong, surface it and stop —
 do not start an advance.
 
-#### b. Start the advance in a PTY session with logging
+#### b. Launch the advance through detached run-store mode
 
 ```bash
 cd <repo_dir>
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs <N> \
-  > /tmp/pipeline-<domain>-<N>.log 2>&1
+RUN_DIR=$(node ~/.codex/skills/pipeline/scripts/pipeline.mjs run <N> --detach)
+cat "$RUN_DIR/run-store.json"
 ```
 
-Run with `exec_command` using `tty: true` and a long enough yield window to
-capture the session id. Keep the session open until the pipeline exits. Do not
-leave a live pipeline session running when the Codex turn ends.
+This command returns quickly. `RUN_DIR` is a supervision wrapper under
+`~/.pipeline/runs/...`; `run-store.json` points at the canonical
+`.agent-pipeline/runs/<run-id>/` run store. Use that `run_store_run_id` for all
+log and summary commands below. Do not leave a live pipeline session running
+when the Codex turn ends.
 
-#### c. Poll stage transitions from the session or log
+#### c. Poll structured run events
 
-Poll the PTY session with `write_stdin` and summarize material `[pipeline]`
-lines to the user. If the session output is too noisy, filter the log.
-The **log path** always uses the original argument `<N>` from section b
-(the same file that was opened for writing). The **grep filter** uses the
-**resolved issue number** `<resolved-N>` — identical to `<N>` when you
-passed an issue directly; check the log for
-`[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` when you
-passed a PR:
+Follow the run-store event stream and summarize material lifecycle records to
+the user:
 
 ```bash
-tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
-  "^\[pipeline\] #<resolved-N>: "
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
 ```
 
-For example, `/pipeline 64` (issue passed directly, `<N>` = `<resolved-N>` = 64):
+`--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
+structured stream for lifecycle, gate, blocker, PR, review, accounting, and
+completion events. It is not a grep-filtered terminal log and it is not a
+separate `/tmp` transitions artifact.
+
+**Fallback — raw terminal output:** If you need the full combined output, follow
+`terminal.log` from the same run store:
+
 ```bash
-tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
 ```
 
-`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100, `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-100.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
-
-**Why the tight filter?** The test-gate stage (`npm test` / `npm run ci`)
-dumps the full unit-test suite output to the same log. The eval-gate and
-state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
-`→ ready-to-deploy` substrings (they assert on the pipeline's own log
-format). The broad alternation matched hundreds of these fixture lines in
-rapid succession, triggering the Monitor tool's auto-stop threshold and
-silencing the rest of the run.
-
-**No real signal is lost:** every stage transition — including
-`[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
-`[pipeline] #N: → ready-to-deploy` — begins with `[pipeline] #N:`.
-The PTY session finishing signals run-end independently.
+Do not create or recommend extra `/tmp/pipeline-<domain>-<N>.log` files for
+normal monitoring. If a human manually redirects output for local debugging,
+that file is scratch output, not the pipeline evidence contract.
 
 #### d. User-visible progress updates
 
-For every material `[pipeline]` line, send a concise chat update. The state
-machine has only 9 transitions max and each emits a small number of visible
-`[pipeline]` lines, so this gives enough signal without flooding the user.
+For every material event record, send a concise chat update. The state machine
+has only a bounded number of stage transitions, so this gives enough signal
+without flooding the user.
 
 Examples that should be surfaced:
-- `[pipeline] #N: starting at stage=<x>`
-- `[pipeline] #N: planning (impl=codex)`
-- `[pipeline] #N: worktree at <path>`
-- `[pipeline] #N: implementation done (Xs, harness=Y)`
-- `[pipeline] #N: PR #M created`
-- `[pipeline] #N: ready → review-1: PR #M opened`
-- `[pipeline] #N: review-1 by claude`
-- `[pipeline] #N: verdict=approve findings=0`
-- `[pipeline] #N: review-1 → review-2: standard review approved`
-- … and so on, all the way through `→ ready-to-deploy`
+- `run_start`
+- `stage_start`
+- `stage_complete`
+- `pr_created` / `pr_updated`
+- `review_verdict`
+- `gate_result`
+- `blocker_set` / `blocker_cleared`
+- `run_complete`
 
 Examples to suppress or summarize:
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
-  re-enters the gate check every `ci_poll_interval` seconds (default 30s)
-  and emits `[pipeline] #N: pre-merge gate` each time. Surface the FIRST
-  occurrence per stage entry; suppress subsequent identical lines in the
-  same polling burst. The next material event is the eventual
-  `→ ready-to-deploy` or `→ blocked` transition.
+  re-enters the gate check every `ci_poll_interval` seconds (default 30s).
+  Surface the first material stage/gate event per stage entry; suppress
+  subsequent identical polling updates in the same burst. The next material
+  event is the eventual advancing or blocked stage outcome.
 
-#### e. Finish the session
+#### e. Finish the run
 
-When the pipeline process exits, stop polling and surface the final summary
-inline by reading the tail of the log.
+When a `run_complete` event appears, or when the wrapper
+`$RUN_DIR/sentinel.json` reports completion, stop polling and surface the final
+summary.
 
 #### f. Final summary
 
-Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` (same path as
-section b — the original argument) and surface inline: starting stage →
-ending stage, transitions made, wall-clock elapsed, PR URL if one was
-opened, and the terminal state.
+Read the run-store summary and surface inline:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
+URL if one was opened, and the terminal state.
 
 ### 5. Modes that DON'T need this orchestration
 
@@ -302,6 +335,7 @@ opened, and the terminal state.
 - `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
 - `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
+- `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
 
 Run those synchronously without the PTY/log-polling orchestration.

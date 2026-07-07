@@ -2,12 +2,81 @@
 
 import { z } from "zod";
 import yaml from "js-yaml";
-import { parseDocument } from "yaml";
+import { parseDocument, isMap, isSeq, type YAMLSeq } from "yaml";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DEFAULT_CONFIG, STAGES, type Harness, type PipelineConfig } from "./types.ts";
+import {
+  DEFAULT_CONFIG,
+  STAGES,
+  MODEL_INVOKING_STAGES,
+  EXECUTION_ENVIRONMENT_STAGES,
+  type Harness,
+  type PipelineConfig,
+} from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
+import { expandAutoEffort, expandAutoModel } from "./stage-routing.ts";
+
+// A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
+// "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
+const modelOrAuto = z.union([z.string(), z.literal("auto")]);
+
+/**
+ * Flatten zod issues, unwrapping `invalid_union` issues (produced by fields
+ * that accept either a string or a structured object, e.g. `review_harness`)
+ * into their most specific nested branch. Without this, a typo'd key inside
+ * the object form (`review_harness: { command, bad_key }`) surfaces only the
+ * union's generic "Invalid input" with no key name. This recurses into the
+ * union's per-branch issues and prefers a branch that pinpoints an
+ * unrecognized key (or otherwise the most specific/longest branch) over a
+ * generic type-mismatch branch, so the real problem is reported.
+ */
+function flattenIssues(issues: readonly z.core.$ZodIssue[], basePath: (string | number)[] = []): z.core.$ZodIssue[] {
+  const out: z.core.$ZodIssue[] = [];
+  for (const issue of issues) {
+    const path = [...basePath, ...issue.path];
+    if (issue.code === "invalid_union" && Array.isArray(issue.errors)) {
+      const branches = issue.errors.map((branchIssues) => flattenIssues(branchIssues, path));
+      const preferred =
+        branches.find((b) => b.some((i) => i.code === "unrecognized_keys")) ??
+        branches.reduce((best, b) => (b.length > best.length ? b : best), branches[0] ?? []);
+      out.push(...preferred);
+    } else {
+      out.push({ ...issue, path } as z.core.$ZodIssue);
+    }
+  }
+  return out;
+}
+
+// External stage executors (#314). `agent-system` = a full execution backend
+// (OpenCode/HermesAgent/OpenClaw) addressed by provider id + endpoint, valid for
+// any model-invoking stage. `model-endpoint` = a raw OpenAI-compatible
+// chat/completions endpoint (e.g. local Ollama), valid only for prompt-contained
+// stages — enforced by `validateStageExecutorAssignments` below, not by this
+// schema (the eligibility rule depends on which stage a name is assigned to,
+// which this per-definition schema cannot see).
+const AgentSystemExecutorSchema = z
+  .object({
+    type: z.literal("agent-system"),
+    provider: z.string().describe("Provider identifier (e.g. 'opencode', 'hermesagent', 'openclaw')."),
+    endpoint: z.string().describe("API endpoint URL that speaks the pipeline's executor contract."),
+    credential: z.string().optional().describe("Env-var name (or secret reference) resolved at invocation time — never a literal secret value."),
+  })
+  .strict();
+
+const ModelEndpointExecutorSchema = z
+  .object({
+    type: z.literal("model-endpoint"),
+    base_url: z.string().describe("Base URL of an OpenAI-compatible chat/completions endpoint (e.g. http://localhost:11434/v1)."),
+    model: z.string().describe("Model name passed in the chat/completions request."),
+    credential: z.string().optional().describe("Env-var name (or secret reference) resolved at invocation time — never a literal secret value."),
+  })
+  .strict();
+
+const ExecutorDefinitionSchema = z.discriminatedUnion("type", [
+  AgentSystemExecutorSchema,
+  ModelEndpointExecutorSchema,
+]);
 
 const PartialConfigSchema = z.object({
   repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value)."),
@@ -24,21 +93,37 @@ const PartialConfigSchema = z.object({
   ci_timeout: z.number().int().positive().optional().describe("Seconds to wait for CI at pre-merge."),
   ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
   ci_no_run_grace_s: z.number().int().min(0).optional().describe("Seconds to wait before checking for zero check-runs when CI is pending. Default 60; set to 0 to check immediately."),
+  ci_mode: z.enum(["github", "local"]).optional().describe("Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait."),
   // Each alias is independently optional so a partial `models:` block (e.g.
   // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
   // and the inert-alias warning keys off which sub-keys were explicitly set.
   models: z
     .object({
-      planning: z.string().optional().describe("Model alias for the planning phase (implementer harness)."),
-      implementing: z.string().optional().describe("Model alias for the implementing phase (implementer harness)."),
-      review: z.string().optional().describe("Model alias for the review phase (reviewer harness)."),
-      fix: z.string().optional().describe("Model alias for the fix phase (implementer harness)."),
-      intake: z.string().optional().describe("Model alias for the intake spec-generation step (always the claude harness, regardless of profile — never inert)."),
-      sweep: z.string().optional().describe("Model alias for the sweep spec-generation step (always the claude harness, regardless of profile — never inert)."),
+      planning: modelOrAuto.optional().describe("Model alias for the planning phase (implementer harness), or \"auto\" to derive it from the stage's task-nature/permanence routing table."),
+      implementing: modelOrAuto.optional().describe("Model alias for the implementing phase (implementer harness), or \"auto\"."),
+      review: modelOrAuto.optional().describe("Model alias for the review phase (reviewer harness), or \"auto\"."),
+      fix: modelOrAuto.optional().describe("Model alias for the fix phase (implementer harness), or \"auto\"."),
+      intake: modelOrAuto.optional().describe("Model alias for the intake spec-generation step (always the claude harness, regardless of profile — never inert), or \"auto\"."),
+      sweep: modelOrAuto.optional().describe("Model alias for the sweep spec-generation step (always the claude harness, regardless of profile — never inert), or \"auto\"."),
     })
     .strict()
     .optional()
-    .describe("Per-phase model aliases; only honored when the role's harness is claude (codex ignores them)."),
+    .describe("Per-phase model aliases; only honored when the role's harness is claude (codex ignores them). Each key also accepts \"auto\" (#366)."),
+  // Per-stage reasoning-effort overrides (#366), parallel to `models`. Each key
+  // is independently optional; an absent key emits no effort flag so the
+  // operator's global effort setting applies. Also accepts "auto".
+  effort: z
+    .object({
+      planning: modelOrAuto.optional().describe("Reasoning effort for the planning phase (implementer harness), or \"auto\". Also sources plan-review's effort (classified separately as Adversarial/Definitive)."),
+      implementing: modelOrAuto.optional().describe("Reasoning effort for the implementing phase (implementer harness), or \"auto\"."),
+      review: modelOrAuto.optional().describe("Reasoning effort for the review phase (reviewer harness), or \"auto\". Resolved round-aware (review-1 vs. review-2)."),
+      fix: modelOrAuto.optional().describe("Reasoning effort for the fix phase (implementer harness), or \"auto\"."),
+      intake: modelOrAuto.optional().describe("Reasoning effort for the intake spec-generation step (always the claude harness), or \"auto\"."),
+      sweep: modelOrAuto.optional().describe("Reasoning effort for the sweep spec-generation step (always the claude harness), or \"auto\"."),
+    })
+    .strict()
+    .optional()
+    .describe("Per-phase reasoning-effort overrides: codex via -c model_reasoning_effort, claude via --effort (#366)."),
   openspec: z
     .object({
       enabled: z.enum(["auto", "on", "off"]).optional().describe("Whether to require OpenSpec: auto=only when openspec/ exists, on=always, off=never."),
@@ -117,6 +202,19 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Deterministic preflight capability check settings."),
+  // Optional external event sink (#343). Opt-in; unconfigured behavior (local
+  // events.jsonl only) is unchanged. `command` names an operator-controlled
+  // forwarder that receives each event's JSON line on stdin; `mode` selects
+  // additive (local file + sink, default) vs exclusive (sink only). Also
+  // overridable via PIPELINE_EVENT_SINK_COMMAND / PIPELINE_EVENT_SINK_MODE.
+  event_sink: z
+    .object({
+      command: z.string().optional().describe("Operator-controlled forwarder command that receives each event JSON line on stdin."),
+      mode: z.enum(["additive", "exclusive"]).optional().describe("additive (default): write to the local events.jsonl AND deliver to the sink. exclusive: deliver to the sink only; events.jsonl is not written."),
+    })
+    .strict()
+    .optional()
+    .describe("Optional external event sink for run events (#343)."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -124,7 +222,23 @@ const PartialConfigSchema = z.object({
   // `command`). The implementer harness remains profile-only — there is no
   // companion `implementer`/`harnesses` key, and the deleted `harnesses:` block
   // stays rejected by the strict schema.
-  review_harness: z.string().optional().describe("Override the reviewer CLI for the review step (profile default when absent)."),
+  // Structured form (#366) adds independent model/effort control for the
+  // alternative reviewer harness, alongside the original string shorthand.
+  // The string form leaves reviewerModel/reviewerEffort unset so review
+  // routing falls back to models.review/effort.review unchanged.
+  review_harness: z
+    .union([
+      z.string(),
+      z
+        .object({
+          command: z.string().describe("Reviewer CLI command (profile default when the whole review_harness key is absent)."),
+          model: modelOrAuto.optional().describe("Model override for the reviewer, or \"auto\"."),
+          effort: modelOrAuto.optional().describe("Reasoning-effort override for the reviewer, or \"auto\" (resolved round-aware: review-1 Iterative, review-2/plan-review Definitive)."),
+        })
+        .strict(),
+    ])
+    .optional()
+    .describe("Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort? } for independent reviewer model/effort control."),
   conventions_md_path: z.string().optional().describe("Repo-root-relative path to the conventions file embedded in stage prompts."),
   domain_name: z.string().optional().describe("Human-readable project name used in prompts and logs."),
   domain_description: z.string().optional().describe("Short description of this repository for prompt context."),
@@ -163,6 +277,14 @@ const PartialConfigSchema = z.object({
       hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
       pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
       release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery."),
+      release_capacity: z
+        .object({
+          effort_budget: z.number().positive().optional().describe("Per-milestone effort-points capacity budget for the semver model (XS=1 S=2 M=3 L=5 XL=8). An issue with effort_points ≥ budget is isolated into its own milestone. Default: 8."),
+          isolate_breaking: z.boolean().optional().describe("When true (default), each breaking-change issue is given its own milestone instead of sharing one with unrelated issues. Tunes capacity-aware semver milestone grouping."),
+        })
+        .strict()
+        .optional()
+        .describe("Capacity policy for the semver release model. Controls per-milestone effort budget and breaking-change isolation. Absent block uses capacity-aware defaults."),
       inventory_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during inventory phase (default: 4)."),
       depgraph_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during dependency verification (default: 4)."),
       depgraph_verify_cap: z.number().int().positive().optional().describe("Maximum candidates to source-verify; excess go to open_questions (default: 20)."),
@@ -237,9 +359,72 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Stage-aware issue context snapshot settings (#318)."),
+  // Cross-repo dependency map (#312). Declares inter-repo relationships for
+  // supplemental planning context and roadmap cross-repo dependency annotations.
+  // Declarative only: no cross-repo write, PR creation, label/status sync, or
+  // CI gating. Relationships are declared independently per repo; no reverse-edge
+  // inference is performed.
+  repo_map: z
+    .object({
+      depends_on: z
+        .array(z.string().regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/repo format (exactly one '/')"))
+        .optional()
+        .describe("Repos this repo consumes (owner/repo strings). The planning stage fetches open issues from these repos as supplemental context."),
+      depended_on_by: z
+        .array(z.string().regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/repo format (exactly one '/')"))
+        .optional()
+        .describe("Repos that consume this repo (owner/repo strings). The planning stage fetches open issues from these repos as supplemental context."),
+    })
+    .strict()
+    .optional()
+    .describe("Cross-repo dependency map: declares inter-repo relationships for planning context and roadmap cross-repo dependency annotations (#312)."),
+  // External stage executors (#314). Opt-in; both keys absent means every
+  // model-invoking stage runs through the local claude/codex harness exactly as
+  // today. `executors:` declares named provider/endpoint definitions;
+  // `stage_executors:` assigns a defined name to a specific stage. The
+  // model-endpoint-vs-execution-environment eligibility rule is enforced by
+  // `validateStageExecutorAssignments` at parse time (not expressible in this
+  // structural schema, since it depends on the *combination* of the two blocks).
+  executors: z
+    .record(z.string(), ExecutorDefinitionSchema)
+    .optional()
+    .describe("Named executor definitions (agent-system or model-endpoint) that stage_executors can reference by name."),
+  stage_executors: z
+    .partialRecord(z.enum(MODEL_INVOKING_STAGES), z.string())
+    .optional()
+    .describe("Assigns a named executor (from executors:) to a model-invoking stage, delegating that stage's execution to it instead of the local harness."),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
+
+const EXECUTION_ENVIRONMENT_STAGE_SET = new Set<string>(EXECUTION_ENVIRONMENT_STAGES);
+
+/**
+ * Enforce the model-endpoint / execution-environment stage-eligibility matrix
+ * (#314) at config-parse time, never mid-run: every `stage_executors:` name
+ * must exist in `executors:`, and a `model-endpoint`-type executor may only be
+ * assigned to a prompt-contained stage. Throws a single Error naming the
+ * offending stage + executor on the first violation found; a no-op when either
+ * block is absent (parity with pre-#314 configs).
+ */
+function validateStageExecutorAssignments(fileConfig: PartialConfig): void {
+  if (!fileConfig.stage_executors) return;
+  for (const [stage, name] of Object.entries(fileConfig.stage_executors)) {
+    const definition = fileConfig.executors?.[name];
+    if (!definition) {
+      throw new Error(
+        `stage_executors.${stage} references unknown executor "${name}" — add it under executors:`,
+      );
+    }
+    if (definition.type === "model-endpoint" && EXECUTION_ENVIRONMENT_STAGE_SET.has(stage)) {
+      throw new Error(
+        `stage "${stage}" cannot be assigned model-endpoint executor "${name}" — model-endpoint ` +
+          `executors are only valid for prompt-contained stages (plan-review, review-1, review-2); ` +
+          `"${stage}" requires repo/tool access and needs an agent-system executor or the local harness`,
+      );
+    }
+  }
+}
 
 export interface ResolveOptions {
   repoPath?: string;        // path to the target repo's working tree
@@ -287,7 +472,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     if (parsed && typeof parsed === "object") {
       const result = PartialConfigSchema.safeParse(parsed);
       if (!result.success) {
-        const errors = result.error.issues
+        const errors = flattenIssues(result.error.issues)
           .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
           .join("; ");
         if (opts.tolerateInvalidConfig) {
@@ -300,6 +485,19 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         }
       } else {
         fileConfig = result.data;
+        try {
+          validateStageExecutorAssignments(fileConfig);
+        } catch (err) {
+          const message = (err as Error).message;
+          if (opts.tolerateInvalidConfig) {
+            if (!opts.quiet) {
+              console.warn(`[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${message}`);
+            }
+            fileConfig = { ...fileConfig, executors: undefined, stage_executors: undefined };
+          } else {
+            throw new Error(`Invalid ${configPath}: ${message}`);
+          }
+        }
       }
     }
   }
@@ -330,6 +528,33 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     repo = "";
   }
 
+  // External event sink (#343). Env vars override file config, consistent
+  // with CLI-over-file precedence used elsewhere in this loader. Absent
+  // command (from both file and env) means no active sink.
+  const envSinkMode = process.env.PIPELINE_EVENT_SINK_MODE;
+  if (envSinkMode !== undefined && envSinkMode !== "additive" && envSinkMode !== "exclusive") {
+    throw new Error(
+      `Invalid PIPELINE_EVENT_SINK_MODE: "${envSinkMode}" (must be "additive" or "exclusive").`,
+    );
+  }
+  const sinkCommand = process.env.PIPELINE_EVENT_SINK_COMMAND ?? fileConfig.event_sink?.command;
+  const eventSink = sinkCommand
+    ? {
+        command: sinkCommand,
+        mode: (envSinkMode as "additive" | "exclusive" | undefined) ?? fileConfig.event_sink?.mode ?? "additive",
+      }
+    : undefined;
+
+  // review_harness (#40, #366): either a bare command string, or a structured
+  // { command, model?, effort? } form that additionally targets the reviewer's
+  // own model/effort. The string form leaves reviewerModel/reviewerEffort
+  // unset, so review-routing/plan-review fall back to models.review/effort.review.
+  const reviewHarnessCfg = fileConfig.review_harness;
+  const reviewerCommand = typeof reviewHarnessCfg === "string" ? reviewHarnessCfg : reviewHarnessCfg?.command;
+  const reviewerModelRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.model : undefined;
+  const reviewerEffortRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.effort : undefined;
+  const implementerHarness = profile.harnesses.implementer;
+
   const merged: PipelineConfig = {
     profile_name: profile.name,
     invocation: profile.invocation,
@@ -356,23 +581,46 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     ci_timeout: fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout,
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
     ci_no_run_grace_s: fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s,
+    ci_mode: fileConfig.ci_mode ?? DEFAULT_CONFIG.ci_mode,
     // Harness roles are profile-relative; the implementer can never be set by
     // repo config (the strict schema rejects a `harnesses:` key outright). The
     // reviewer defaults to the profile's value but is overridden here by the
     // optional `review_harness` key (#40) when present, so all stage code can
-    // keep reading only `cfg.harnesses.reviewer`.
+    // keep reading only `cfg.harnesses.reviewer`. reviewerModel is fully
+    // resolved (Adversarial `auto` is model-invariant across rounds);
+    // reviewerEffort is left as-authored (possibly "auto") since its
+    // resolution is round-aware and happens at each reviewer call site.
     harnesses: {
-      implementer: profile.harnesses.implementer,
-      reviewer: fileConfig.review_harness ?? profile.harnesses.reviewer,
+      implementer: implementerHarness,
+      reviewer: reviewerCommand ?? profile.harnesses.reviewer,
+      reviewerModel: expandAutoModel(reviewerModelRaw, "review-2", "claude"),
+      reviewerEffort: reviewerEffortRaw,
     },
     models: {
-      planning: fileConfig.models?.planning ?? DEFAULT_CONFIG.models.planning,
-      implementing: fileConfig.models?.implementing ?? DEFAULT_CONFIG.models.implementing,
-      review: fileConfig.models?.review ?? DEFAULT_CONFIG.models.review,
-      fix: fileConfig.models?.fix ?? DEFAULT_CONFIG.models.fix,
-      intake: fileConfig.models?.intake ?? DEFAULT_CONFIG.models.intake,
-      sweep: fileConfig.models?.sweep ?? DEFAULT_CONFIG.models.sweep,
+      planning: expandAutoModel(fileConfig.models?.planning, "planning", implementerHarness) ?? DEFAULT_CONFIG.models.planning,
+      implementing: expandAutoModel(fileConfig.models?.implementing, "implementing", implementerHarness) ?? DEFAULT_CONFIG.models.implementing,
+      review: expandAutoModel(fileConfig.models?.review, "review-2", "claude") ?? DEFAULT_CONFIG.models.review,
+      fix: expandAutoModel(fileConfig.models?.fix, "fix", implementerHarness) ?? DEFAULT_CONFIG.models.fix,
+      intake: expandAutoModel(fileConfig.models?.intake, "intake", "claude") ?? DEFAULT_CONFIG.models.intake,
+      sweep: expandAutoModel(fileConfig.models?.sweep, "sweep", "claude") ?? DEFAULT_CONFIG.models.sweep,
     },
+    // effort.review is deliberately left as-authored (possibly "auto"): it
+    // backs review-1 (Iterative) and review-2 (Definitive), which resolve
+    // "auto" differently, so round-aware expansion happens in review-routing.ts.
+    // The rest are single-stage keys, fully resolved here.
+    effort: {
+      planning: expandAutoEffort(fileConfig.effort?.planning, "planning", implementerHarness),
+      implementing: expandAutoEffort(fileConfig.effort?.implementing, "implementing", implementerHarness),
+      review: fileConfig.effort?.review,
+      fix: expandAutoEffort(fileConfig.effort?.fix, "fix", implementerHarness),
+      intake: expandAutoEffort(fileConfig.effort?.intake, "intake", "claude"),
+      sweep: expandAutoEffort(fileConfig.effort?.sweep, "sweep", "claude"),
+    },
+    // Plan-review's own resolved effort: same `effort.planning` config key as
+    // above, but classified Adversarial/Definitive (not Analytical/Iterative
+    // like the `planning` stage itself) — see stage-routing.ts. Defaults to
+    // "medium" when effort.planning is unset, preserving the prior hardcoded cap.
+    plan_review_effort: expandAutoEffort(fileConfig.effort?.planning, "plan-review", "claude") ?? DEFAULT_CONFIG.plan_review_effort,
     openspec: {
       enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
       bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
@@ -454,8 +702,18 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       allow_paths: fileConfig.auto_merge_eligibility?.allow_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.allow_paths,
       min_confidence: fileConfig.auto_merge_eligibility?.min_confidence ?? DEFAULT_CONFIG.auto_merge_eligibility.min_confidence,
     },
+    repo_map: {
+      depends_on: fileConfig.repo_map?.depends_on ?? DEFAULT_CONFIG.repo_map.depends_on,
+      depended_on_by: fileConfig.repo_map?.depended_on_by ?? DEFAULT_CONFIG.repo_map.depended_on_by,
+    },
+    event_sink: eventSink,
+    executors: fileConfig.executors ?? DEFAULT_CONFIG.executors,
+    stage_executors: fileConfig.stage_executors ?? DEFAULT_CONFIG.stage_executors,
   };
-  if (!opts.quiet) warnInertModelAliases(fileConfig.models, merged.harnesses);
+  if (!opts.quiet) {
+    warnInertModelAliases(fileConfig.models, merged.harnesses);
+    warnInertEffort(fileConfig.effort, merged.harnesses);
+  }
   return merged;
 }
 
@@ -493,6 +751,28 @@ function warnInertModelAliases(
   }
 }
 
+/**
+ * Warn (non-blocking) about `effort.review` when the effective reviewer is a
+ * custom CLI (`review_harness` set to something other than "claude" or
+ * "codex"), which honors neither `--model` nor `--effort`. Both built-in
+ * harnesses honor per-stage effort (claude via `--effort`, codex via
+ * `-c model_reasoning_effort`), so `effort.planning`/`implementing`/`fix`/
+ * `intake`/`sweep` can never be inert — only a custom reviewer CLI backing
+ * `effort.review` can be. Advisory only: no throw, and the resolved config is
+ * unchanged (the inert value is preserved in `config.effort.review`).
+ */
+function warnInertEffort(
+  fileEffort: z.infer<typeof PartialConfigSchema>["effort"],
+  harnesses: PipelineConfig["harnesses"],
+): void {
+  const value = fileEffort?.review;
+  if (value === undefined) return;
+  if (harnesses.reviewer === "claude" || harnesses.reviewer === "codex") return;
+  console.warn(
+    `[pipeline] config warning: effort.review is set to "${value}" but the reviewer is the custom CLI "${harnesses.reviewer}" — it accepts neither a --model nor an --effort flag, so per-stage effort is ignored.`,
+  );
+}
+
 export function findGitRoot(start: string): string | null {
   let dir = start;
   while (true) {
@@ -516,12 +796,15 @@ export function findGitRoot(start: string): string | null {
 export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
-): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_timeout: number } {
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_effort?: string; intake_timeout: number } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
   let releaseModel: 'semver' | 'continuous' | undefined;
   // Intake always runs through the claude harness (see stages/intake.ts), so this
   // alias is never inert; default it here and let pipeline.yml's models.intake override.
   let intakeModel: string = DEFAULT_CONFIG.models.intake;
+  // effort.intake likewise always reaches the claude harness; unset by default so no
+  // --effort flag is emitted (#366 review-1 finding: previously accepted but dropped).
+  let intakeEffort: string | undefined;
   let intakeTimeout: number = DEFAULT_CONFIG.intake_timeout;
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (fs.existsSync(configPath)) {
@@ -531,7 +814,7 @@ export function resolveReleaseConfig(
     if (parsed && typeof parsed === "object") {
       const result = PartialConfigSchema.safeParse(parsed);
       if (!result.success) {
-        const errors = result.error.issues
+        const errors = flattenIssues(result.error.issues)
           .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
           .join("; ");
         throw new Error(`Invalid ${configPath}: ${errors}`);
@@ -543,7 +826,10 @@ export function resolveReleaseConfig(
         releaseModel = result.data.roadmap.release_model;
       }
       if (result.data.models?.intake) {
-        intakeModel = result.data.models.intake;
+        intakeModel = expandAutoModel(result.data.models.intake, "intake", "claude") ?? intakeModel;
+      }
+      if (result.data.effort?.intake) {
+        intakeEffort = expandAutoEffort(result.data.effort.intake, "intake", "claude");
       }
       if (typeof result.data.intake_timeout === "number") {
         intakeTimeout = result.data.intake_timeout;
@@ -556,6 +842,7 @@ export function resolveReleaseConfig(
     base_branch: baseBranchOverride ?? baseBranch,
     release_model: releaseModel,
     intake_model: intakeModel,
+    intake_effort: intakeEffort,
     intake_timeout: intakeTimeout,
   };
 }
@@ -888,7 +1175,7 @@ export function validateConfig(
   const result = PartialConfigSchema.safeParse(parsed);
   if (!result.success) {
     const lineOf = buildLineLookup(text);
-    for (const issue of result.error.issues) {
+    for (const issue of flattenIssues(result.error.issues)) {
       if (issue.code === "unrecognized_keys") {
         // Each unknown key becomes its own diagnostic
         const parentPath = issue.path.join(".");
@@ -921,9 +1208,9 @@ export function validateConfig(
     return { valid: false, diagnostics };
   }
 
-  // 6. Inert-model alias detection
+  // 6. Inert-model / inert-effort alias detection
   const fileConfig = result.data;
-  if (fileConfig.models) {
+  {
     let harnesses = deps.harnesses;
     if (!harnesses) {
       try {
@@ -935,11 +1222,16 @@ export function validateConfig(
       }
     }
     // Apply review_harness from the file config (same override resolveConfig applies),
-    // so inert-model detection reflects the actual effective reviewer at runtime.
-    if (harnesses && fileConfig.review_harness) {
-      harnesses = { ...harnesses, reviewer: fileConfig.review_harness };
+    // so inert-alias detection reflects the actual effective reviewer at runtime.
+    // review_harness may be the string shorthand or the structured { command, ... } form.
+    const reviewerCommand =
+      typeof fileConfig.review_harness === "string"
+        ? fileConfig.review_harness
+        : fileConfig.review_harness?.command;
+    if (harnesses && reviewerCommand) {
+      harnesses = { ...harnesses, reviewer: reviewerCommand };
     }
-    if (harnesses) {
+    if (harnesses && fileConfig.models) {
       for (const { key, role } of MODEL_ALIAS_ROLES) {
         const value = fileConfig.models[key];
         if (value === undefined) continue;
@@ -951,6 +1243,26 @@ export function validateConfig(
         });
       }
     }
+    if (harnesses && fileConfig.effort?.review !== undefined && harnesses.reviewer !== "claude" && harnesses.reviewer !== "codex") {
+      diagnostics.push({
+        severity: "warning",
+        path: "effort.review",
+        message: `effort.review is set to "${fileConfig.effort.review}" but the reviewer is the custom CLI "${harnesses.reviewer}" — it accepts neither a --model nor an --effort flag, so per-stage effort is ignored at runtime.`,
+      });
+    }
+  }
+
+  // 7. Stage-executor eligibility (#314) — same rule resolveConfig() throws on;
+  // surfaced here as a diagnostic instead so `pipeline config validate`/`sync`
+  // never throw.
+  try {
+    validateStageExecutorAssignments(fileConfig);
+  } catch (err) {
+    diagnostics.push({
+      severity: "error",
+      path: "stage_executors",
+      message: (err as Error).message,
+    });
   }
 
   const hasError = diagnostics.some((d) => d.severity === "error");
@@ -1002,18 +1314,62 @@ function renderModelLines(models: PartialConfig["models"]): string {
   };
   if (!models) {
     return [
-      "# models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Uncomment to override.",
+      "# models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts \"auto\" (#366). Uncomment to override.",
       ...keys.map((key) => `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`),
     ].join("\n");
   }
   return [
-    "models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning).",
+    "models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts \"auto\".",
     ...keys.map((key) =>
       hasOwn(models, key)
         ? `  ${key}: ${yamlScalar(models[key])} # ${comments[key]}`
         : `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`,
     ),
   ].join("\n");
+}
+
+function renderEffortLines(effort: PartialConfig["effort"]): string {
+  const keys = ["planning", "implementing", "review", "fix", "intake", "sweep"] as const;
+  const comments: Record<typeof keys[number], string> = {
+    planning: "implementer harness — also sources plan-review's effort (Adversarial/Definitive)",
+    implementing: "implementer harness",
+    review: "reviewer harness — resolved round-aware (review-1 vs. review-2)",
+    fix: "implementer harness",
+    intake: "intake spec-generation — always the claude harness",
+    sweep: "sweep spec-generation — always the claude harness",
+  };
+  if (!effort) {
+    return [
+      "# effort: # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort (#366). Each key also accepts \"auto\". Absent key: no flag (operator's global setting applies). Uncomment to override.",
+      ...keys.map((key) => `#   ${key}: medium # ${comments[key]}`),
+    ].join("\n");
+  }
+  return [
+    "effort: # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort (#366). Each key also accepts \"auto\".",
+    ...keys.map((key) =>
+      hasOwn(effort, key)
+        ? `  ${key}: ${yamlScalar(effort[key])} # ${comments[key]}`
+        : `#   ${key}: medium # ${comments[key]}`,
+    ),
+  ].join("\n");
+}
+
+/** Render the `review_harness:` block for either the string shorthand or the
+ *  structured `{ command, model?, effort? }` form (#366). */
+function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]): string {
+  if (reviewHarness === undefined) {
+    return "# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)";
+  }
+  if (typeof reviewHarness === "string") {
+    return `review_harness: ${yamlScalar(reviewHarness)} # override the reviewer CLI for the review step`;
+  }
+  const lines = [
+    "review_harness: # override the reviewer CLI, and optionally its model/effort (#366)",
+    `  command: ${yamlScalar(reviewHarness.command)}`,
+  ];
+  if (reviewHarness.model !== undefined) lines.push(`  model: ${yamlScalar(reviewHarness.model)} # or "auto"`);
+  if (reviewHarness.effort !== undefined) lines.push(`  effort: ${yamlScalar(reviewHarness.effort)} # or "auto" (round-aware: review-1 Iterative, review-2/plan-review Definitive)`);
+  return lines.join("\n");
 }
 
 function renderMaybeScalar(key: string, value: unknown, comment: string): string {
@@ -1084,12 +1440,13 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `ci_timeout: ${yamlScalar(config.ci_timeout ?? d.ci_timeout)} # seconds to wait for CI at pre-merge`,
     `ci_poll_interval: ${yamlScalar(config.ci_poll_interval ?? d.ci_poll_interval)} # seconds between CI status polls`,
     `ci_no_run_grace_s: ${yamlScalar(config.ci_no_run_grace_s ?? d.ci_no_run_grace_s)} # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately`,
+    `ci_mode: ${yamlScalar(config.ci_mode ?? d.ci_mode)} # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait`,
     "",
     renderModelLines(config.models),
     "",
-    config.review_harness !== undefined
-      ? `review_harness: ${yamlScalar(config.review_harness)} # override the reviewer CLI for the review step`
-      : "# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.",
+    renderEffortLines(config.effort),
+    "",
+    renderReviewHarnessBlock(config.review_harness),
     "",
     "openspec:",
     `  enabled: ${yamlScalar(openspec.enabled)} # auto | on | off`,
@@ -1201,12 +1558,58 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   instead of bypassPermissions (#21). The codex harness is already sandboxed",
         "#   via --full-auto and is unaffected. Default false -> current invocation unchanged.",
       ].join("\n"),
+    "",
+    config.event_sink !== undefined
+      ? `event_sink: # optional external event sink (#343) — deliver run events.jsonl records to an operator-controlled forwarder\n${yamlBlock(config.event_sink, 2)}`
+      : [
+        "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder",
+        '#   command: "logger -t pipeline" # forwarder command; receives each event JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged).',
+        "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)",
+        "#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.",
+      ].join("\n"),
     config.roadmap !== undefined ? `\nroadmap:\n${yamlBlock(config.roadmap, 2)}` : undefined,
     config.sweep !== undefined ? `\nsweep:\n${yamlBlock(config.sweep, 2)}` : undefined,
     config.trusted_override_actors !== undefined ? `\ntrusted_override_actors:\n${yamlBlock(config.trusted_override_actors, 2)}` : undefined,
     config.queue !== undefined ? `\nqueue:\n${yamlBlock(config.queue, 2)}` : undefined,
     config.auto_merge_eligibility !== undefined ? `\nauto_merge_eligibility:\n${yamlBlock(config.auto_merge_eligibility, 2)}` : undefined,
     config.context_snapshot !== undefined ? `\ncontext_snapshot:\n${yamlBlock(config.context_snapshot, 2)}` : undefined,
+    config.repo_map !== undefined
+      ? [
+        "",
+        "repo_map: # cross-repo dependency map (#312) — declare inter-repo relationships for planning context",
+        `  depends_on: ${yamlInline(config.repo_map.depends_on ?? [])} # owner/repo strings this repo consumes`,
+        `  depended_on_by: ${yamlInline(config.repo_map.depended_on_by ?? [])} # owner/repo strings that consume this repo`,
+      ].join("\n")
+      : [
+        "",
+        "# repo_map: # cross-repo dependency map (#312) — uncomment to declare inter-repo relationships",
+        "#   # When set, the planning stage fetches open issues from declared repos as supplemental context.",
+        "#   # Relationships are declared independently per repo; no reverse-edge inference is performed.",
+        "#   depends_on: [] # owner/repo strings this repo consumes (e.g. - acme/shared-lib)",
+        "#   depended_on_by: [] # owner/repo strings that consume this repo (e.g. - acme/consumer-app)",
+      ].join("\n"),
+    config.executors !== undefined ? `\nexecutors:\n${yamlBlock(config.executors, 2)}` : undefined,
+    config.stage_executors !== undefined ? `\nstage_executors:\n${yamlBlock(config.stage_executors, 2)}` : undefined,
+    config.executors === undefined && config.stage_executors === undefined
+      ? [
+        "",
+        "# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint",
+        "#   opencode-main:",
+        "#     type: agent-system # full execution backend (OpenCode/HermesAgent/OpenClaw), valid for any model-invoking stage",
+        "#     provider: opencode",
+        "#     endpoint: https://opencode.internal/api",
+        "#     credential: OPENCODE_API_KEY # env-var NAME resolved at invocation time — never a literal secret value",
+        "#   local-ollama:",
+        "#     type: model-endpoint # raw OpenAI-compatible chat/completions endpoint; valid ONLY for plan-review/review-1/review-2",
+        "#     base_url: http://localhost:11434/v1",
+        "#     model: llama3.1:70b",
+        "# stage_executors: # assign a name from executors: to a model-invoking stage; unassigned stages use the local claude/codex harness unchanged",
+        "#   planning: opencode-main",
+        "#   review-1: local-ollama",
+        "#   review-2: local-ollama",
+        "#   Known model-invoking stages: planning, plan-review, implementing, review-1, fix-1, review-2, fix-2, shipcheck-gate",
+      ].join("\n")
+      : undefined,
   ].filter((line): line is string => line !== undefined);
 
   return `${parts.join("\n")}\n`;
@@ -1233,6 +1636,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     ci_timeout: config.ci_timeout ?? d.ci_timeout,
     ci_poll_interval: config.ci_poll_interval ?? d.ci_poll_interval,
     ci_no_run_grace_s: config.ci_no_run_grace_s ?? d.ci_no_run_grace_s,
+    ci_mode: config.ci_mode ?? d.ci_mode,
     models: { ...d.models, ...config.models },
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },
@@ -1257,6 +1661,10 @@ function normalizeForSync(config: PartialConfig): unknown {
     queue: config.queue,
     auto_merge_eligibility: config.auto_merge_eligibility,
     context_snapshot: config.context_snapshot,
+    repo_map: config.repo_map,
+    event_sink: config.event_sink,
+    executors: config.executors,
+    stage_executors: config.stage_executors,
   };
 }
 
@@ -1387,4 +1795,337 @@ export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created:
 
 export function buildConfigTemplate(): string {
   return renderConfigTemplate({}, "init");
+}
+
+// ---------------------------------------------------------------------------
+// repo_map add/remove/list (#367): surgical Document edits that touch only the
+// repo_map block, preserving all other keys, comments, and formatting verbatim.
+// ---------------------------------------------------------------------------
+
+export type RepoMapRelation = "depends_on" | "depended_on_by";
+
+export interface RepoMapMutationDeps {
+  /** Read file contents; return null if the file does not exist. Defaults to fs.readFileSync. */
+  readFile?: (filePath: string) => string | null;
+  /** Write file contents. Defaults to fs.writeFileSync. */
+  writeFile?: (filePath: string, content: string) => void;
+  /** Find the git root above startDir; return null if none found. Defaults to the internal findGitRoot. */
+  findGitRoot?: (startDir: string) => string | null;
+  /** Best-effort GitHub reachability check for `repoMapAdd`. Returns true when reachable.
+   *  Defaults to `gh repo view <owner/repo>`. A false result never aborts the write — it
+   *  only attaches a warning to an otherwise-successful result. */
+  checkReachable?: (ownerRepo: string) => boolean;
+  /** Harnesses used for inert-model detection during post-write validation (see ValidateConfigDeps). */
+  harnesses?: { implementer: string; reviewer: string };
+  /** Profile name to load harnesses from when `harnesses` is not injected. */
+  profile?: string;
+}
+
+export interface RepoMapResult {
+  ok: boolean;
+  changed: boolean;
+  noop: boolean;
+  configPath: string;
+  message: string;
+  warning?: string;
+  errorKind?: "invalid-owner-repo" | "missing-config" | "not-git-repo" | "invalid-config";
+}
+
+export interface RepoMapListResult {
+  ok: boolean;
+  configPath: string;
+  entries: Record<RepoMapRelation, string[]>;
+  message: string;
+  errorKind?: "missing-config" | "not-git-repo";
+}
+
+const OWNER_REPO_RE = /^[^/\s]+\/[^/\s]+$/;
+
+/**
+ * Validate an `owner/repo` string against the same format the config schema enforces
+ * (exactly one '/', non-empty segments, no whitespace). Returns an error message when
+ * invalid, or null when valid.
+ */
+export function validateOwnerRepo(value: string): string | null {
+  if (!OWNER_REPO_RE.test(value)) {
+    return `Invalid owner/repo "${value}": expected exactly one "/" with non-empty owner and repo segments and no whitespace.`;
+  }
+  return null;
+}
+
+function defaultCheckReachable(ownerRepo: string): boolean {
+  try {
+    execFileSync("gh", ["repo", "view", ownerRepo, "--json", "name"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface LoadedRepoMapDoc {
+  ok: true;
+  gitRoot: string;
+  configPath: string;
+  text: string;
+}
+
+function loadRepoMapConfig(
+  repoPath: string,
+  deps: RepoMapMutationDeps,
+): LoadedRepoMapDoc | { ok: false; result: RepoMapResult } {
+  const findGitRootFn = deps.findGitRoot ?? findGitRoot;
+  const readFileFn = deps.readFile ?? defaultReadFile;
+  const resolvedStart = path.resolve(repoPath);
+  const gitRoot = findGitRootFn(resolvedStart);
+  if (!gitRoot) {
+    return {
+      ok: false,
+      result: {
+        ok: false,
+        changed: false,
+        noop: false,
+        configPath: configPathFor(resolvedStart),
+        message: `No git repository found at or above ${resolvedStart}.`,
+        errorKind: "not-git-repo",
+      },
+    };
+  }
+  const configPath = configPathFor(gitRoot);
+  const text = readFileFn(configPath);
+  if (text === null) {
+    return {
+      ok: false,
+      result: {
+        ok: false,
+        changed: false,
+        noop: false,
+        configPath,
+        message: `Config file not found: ${configPath}. Run \`pipeline init\` to create one.`,
+        errorKind: "missing-config",
+      },
+    };
+  }
+  return { ok: true, gitRoot, configPath, text };
+}
+
+/** Get (creating if absent) the `repo_map.<rel>` sequence node in `doc`. */
+function repoMapSeq(doc: ReturnType<typeof parseDocument>, rel: RepoMapRelation): YAMLSeq {
+  if (!doc.hasIn(["repo_map"])) doc.set("repo_map", doc.createNode({}));
+  if (!doc.hasIn(["repo_map", rel])) doc.setIn(["repo_map", rel], doc.createNode([]));
+  const node = doc.getIn(["repo_map", rel], true);
+  if (!isSeq(node)) {
+    throw new Error(`repo_map.${rel} in the config file is not a list.`);
+  }
+  return node;
+}
+
+/** Find the index of `value` in a YAML sequence's plain scalar items. */
+function findSeqIndex(seq: YAMLSeq, value: string): number {
+  return seq.items.findIndex((item) => {
+    const v = item && typeof item === "object" && "value" in item ? (item as { value: unknown }).value : item;
+    return v === value;
+  });
+}
+
+/**
+ * Locate the source character range of the top-level `repo_map:` pair
+ * (key through the end of its value), so an edit can splice just that
+ * range rather than re-serializing the whole document (#367 review 1).
+ */
+function findRepoMapRange(doc: ReturnType<typeof parseDocument>): [number, number] | null {
+  if (!isMap(doc.contents)) return null;
+  type RangedNode = { range?: [number, number, number] };
+  const pair = doc.contents.items.find((p) => String((p.key as { value?: unknown } | null)?.value) === "repo_map");
+  const keyRange = (pair?.key as RangedNode | null)?.range;
+  if (!keyRange) return null;
+  const valueRange = (pair?.value as RangedNode | null)?.range;
+  return [keyRange[0], valueRange ? valueRange[2] : keyRange[2]];
+}
+
+/**
+ * Apply `mutate` to a fresh parse of `text` and splice only the resulting
+ * `repo_map:` block back into the original source, so every byte outside
+ * `repo_map` — unrelated keys, comments, and formatting — survives verbatim.
+ * Falls back to appending the rendered block when `repo_map` was absent.
+ */
+function spliceRepoMapBlock(text: string, mutate: (doc: ReturnType<typeof parseDocument>) => void): string {
+  const doc = parseDocument(text);
+  const existingRange = findRepoMapRange(doc);
+  mutate(doc);
+  const candidate = doc.toString();
+  const candidateRange = findRepoMapRange(parseDocument(candidate));
+  if (!candidateRange) return candidate;
+  const newBlock = candidate.slice(candidateRange[0], candidateRange[1]);
+  if (existingRange) {
+    return text.slice(0, existingRange[0]) + newBlock + text.slice(existingRange[1]);
+  }
+  const needsNewline = text.length > 0 && !text.endsWith("\n");
+  return text + (needsNewline ? "\n" : "") + newBlock;
+}
+
+/**
+ * Add `ownerRepo` to `repo_map.<rel>` in `.github/pipeline.yml`, creating the
+ * `repo_map` block (and target list) when absent. Idempotent: adding an entry
+ * already present is a no-op success. Best-effort checks GitHub reachability
+ * after a successful write; a reachability failure warns but never aborts.
+ */
+export function repoMapAdd(
+  repoPath: string,
+  ownerRepo: string,
+  rel: RepoMapRelation,
+  deps: RepoMapMutationDeps = {},
+): RepoMapResult {
+  const formatError = validateOwnerRepo(ownerRepo);
+  if (formatError) {
+    return { ok: false, changed: false, noop: false, configPath: "", message: formatError, errorKind: "invalid-owner-repo" };
+  }
+
+  const loaded = loadRepoMapConfig(repoPath, deps);
+  if (!loaded.ok) return loaded.result;
+  const { gitRoot, configPath, text } = loaded;
+
+  const checkDoc = parseDocument(text);
+  const existing = repoMapSeq(checkDoc, rel).toJSON() as string[];
+  if (existing.includes(ownerRepo)) {
+    return {
+      ok: true,
+      changed: false,
+      noop: true,
+      configPath,
+      message: `${ownerRepo} is already present in repo_map.${rel} — no change made.`,
+    };
+  }
+
+  const candidate = spliceRepoMapBlock(text, (doc) => {
+    repoMapSeq(doc, rel);
+    doc.addIn(["repo_map", rel], ownerRepo);
+  });
+
+  const readFileFn = deps.readFile ?? defaultReadFile;
+  const candidateValidation = validateConfig(gitRoot, {
+    ...deps,
+    readFile: (p) => (path.resolve(p) === path.resolve(configPath) ? candidate : readFileFn(p)),
+  });
+  const errors = candidateValidation.diagnostics.filter((d) => d.severity === "error");
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      changed: false,
+      noop: false,
+      configPath,
+      message: `Adding ${ownerRepo} to repo_map.${rel} would produce an invalid config: ${errors.map((e) => e.message).join("; ")}`,
+      errorKind: "invalid-config",
+    };
+  }
+
+  const writeFileFn = deps.writeFile ?? defaultWriteFile;
+  writeFileFn(configPath, candidate);
+
+  const checkReachableFn = deps.checkReachable ?? defaultCheckReachable;
+  const warning = checkReachableFn(ownerRepo)
+    ? undefined
+    : `${ownerRepo} could not be reached on GitHub (no access, not found, or a transient error) — added anyway.`;
+
+  return {
+    ok: true,
+    changed: true,
+    noop: false,
+    configPath,
+    message: `Added ${ownerRepo} to repo_map.${rel}.`,
+    warning,
+  };
+}
+
+/**
+ * Remove `ownerRepo` from `repo_map.<rel>` in `.github/pipeline.yml`. Tolerant:
+ * when the entry (or the whole repo_map/list) is absent, this is a no-op success
+ * that carries a warning rather than an error.
+ */
+export function repoMapRemove(
+  repoPath: string,
+  ownerRepo: string,
+  rel: RepoMapRelation,
+  deps: RepoMapMutationDeps = {},
+): RepoMapResult {
+  const formatError = validateOwnerRepo(ownerRepo);
+  if (formatError) {
+    return { ok: false, changed: false, noop: false, configPath: "", message: formatError, errorKind: "invalid-owner-repo" };
+  }
+
+  const loaded = loadRepoMapConfig(repoPath, deps);
+  if (!loaded.ok) return loaded.result;
+  const { configPath, text } = loaded;
+
+  const notPresent: RepoMapResult = {
+    ok: true,
+    changed: false,
+    noop: true,
+    configPath,
+    message: `${ownerRepo} is not present in repo_map.${rel} — nothing to remove.`,
+    warning: `${ownerRepo} was not present in repo_map.${rel}.`,
+  };
+
+  const checkDoc = parseDocument(text);
+  if (!checkDoc.hasIn(["repo_map", rel])) return notPresent;
+  const checkNode = checkDoc.getIn(["repo_map", rel], true);
+  if (!isSeq(checkNode)) {
+    throw new Error(`repo_map.${rel} in the config file is not a list.`);
+  }
+  if (findSeqIndex(checkNode, ownerRepo) === -1) return notPresent;
+
+  const candidate = spliceRepoMapBlock(text, (doc) => {
+    const node = doc.getIn(["repo_map", rel], true) as YAMLSeq;
+    node.items.splice(findSeqIndex(node, ownerRepo), 1);
+  });
+
+  const writeFileFn = deps.writeFile ?? defaultWriteFile;
+  writeFileFn(configPath, candidate);
+
+  return {
+    ok: true,
+    changed: true,
+    noop: false,
+    configPath,
+    message: `Removed ${ownerRepo} from repo_map.${rel}.`,
+  };
+}
+
+/** List current repo_map entries grouped by relationship kind. */
+export function repoMapList(repoPath: string, deps: RepoMapMutationDeps = {}): RepoMapListResult {
+  const loaded = loadRepoMapConfig(repoPath, deps);
+  if (!loaded.ok) {
+    return {
+      ok: false,
+      configPath: loaded.result.configPath,
+      entries: { depends_on: [], depended_on_by: [] },
+      message: loaded.result.message,
+      errorKind: loaded.result.errorKind === "invalid-owner-repo" || loaded.result.errorKind === "invalid-config"
+        ? undefined
+        : loaded.result.errorKind,
+    };
+  }
+  const { configPath, text } = loaded;
+  const doc = parseDocument(text);
+
+  const readList = (rel: RepoMapRelation): string[] => {
+    if (!doc.hasIn(["repo_map", rel])) return [];
+    const node = doc.getIn(["repo_map", rel], true);
+    return isSeq(node) ? (node.toJSON() as string[]) : [];
+  };
+
+  const entries: Record<RepoMapRelation, string[]> = {
+    depends_on: readList("depends_on"),
+    depended_on_by: readList("depended_on_by"),
+  };
+  const total = entries.depends_on.length + entries.depended_on_by.length;
+
+  return {
+    ok: true,
+    configPath,
+    entries,
+    message: total === 0 ? "No repo_map entries." : `${total} repo_map entr${total === 1 ? "y" : "ies"}.`,
+  };
 }

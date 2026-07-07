@@ -19,6 +19,25 @@
 - Preserved current implementation vocabulary: `pre-merge -> eval-gate -> shipcheck-gate -> ready-to-deploy`, with visual/E2E checks described as `eval-gate`/`shipcheck-gate` use cases rather than a current `visual-gate` label.
 - Verification passed: `git diff --check`, README lifecycle anchor check, and full `npm run ci`.
 
+# Logging Surface Consolidation
+
+- [x] Inspect the post-#334 logging implementation and documentation.
+- [x] Identify open backlog issues that could compound logging fragmentation.
+- [x] Remove tracked runtime run artifacts from `.agent-pipeline/runs/` without deleting local ignored output.
+- [x] Consolidate host/operator docs away from `/tmp` log redirection and toward the run store / `pipeline logs`.
+- [x] Replace the dedicated transitions-log surface with run-store event visibility, or remove it if redundant.
+- [x] Update tests/docs and regenerate the generated plugin mirror.
+- [x] Run focused tests, mirror check, and full `npm run ci`.
+- [x] Commit changes and open a PR against `main`.
+
+## Review Results
+
+- Focused logging/CLI tests passed: `node --test --experimental-strip-types test/run-logs.test.ts test/pipeline-cli.test.ts test/pipeline-override.test.ts`.
+- Mirror check passed: `node scripts/build.mjs --check`.
+- OpenSpec validation passed: `openspec validate --all`.
+- Whitespace check passed: `git diff --check`.
+- Full CI passed: `npm run ci`.
+
 # Config Sync Implementation Plan
 
 ## Checklist
@@ -65,3 +84,21 @@
 - [x] `npm test` from `core/`
 - [x] `node scripts/build.mjs`
 - [x] `npm run ci`
+
+# PR-Number Blocker Event Routing
+
+- [x] Inspect current unblock/override event routing and adjacent tests.
+- [x] Fix `blocker_cleared` event lookup for PR-number invocations without changing GitHub mutation semantics.
+- [x] Add regression coverage for PR-number run-store IDs.
+- [x] Regenerate the `plugin/` mirror so `build.mjs --check` passes.
+- [x] Run targeted tests, OpenSpec validation, mirror check, and full CI if feasible.
+- [x] Record review notes and final verification results.
+
+## Review Results
+
+- Focused regression tests passed: `node --test --experimental-strip-types test/pipeline-override.test.ts`.
+- Focused logging/CLI tests passed: `node --test --experimental-strip-types test/pipeline-override.test.ts test/run-logs.test.ts test/pipeline-cli.test.ts`.
+- Mirror check passed: `node scripts/build.mjs --check`.
+- OpenSpec validation passed: `npx openspec validate --all`.
+- Whitespace check passed: `git diff --check`.
+- Full CI passed: `npm run ci`.

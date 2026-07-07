@@ -29,6 +29,68 @@ export const HARNESS_LABEL_PREFIX = "harness:";
 export type Harness = "claude" | "codex";
 
 // ---------------------------------------------------------------------------
+// External stage executors (#314) — named executor definitions that operators
+// can assign per model-invoking stage, in place of the local claude/codex
+// harness. Single-sourced here (not re-derived per file) so the config
+// stage-eligibility gate and the runtime dispatcher can never drift.
+// ---------------------------------------------------------------------------
+
+/** The subset of STAGES that invoke a model at all (deterministic/gate-only
+ *  stages — ready, pre-merge, eval-gate, deploy_ready, etc. — are excluded). */
+export const MODEL_INVOKING_STAGES = [
+  "planning",
+  "plan-review",
+  "implementing",
+  "review-1",
+  "fix-1",
+  "review-2",
+  "fix-2",
+  "shipcheck-gate",
+] as const;
+export type ModelInvokingStage = (typeof MODEL_INVOKING_STAGES)[number];
+
+/** Prompt-contained stages: the prompt already carries (or can carry) all
+ *  context needed to reach a verdict without exploring the repo — the only
+ *  stages a `model-endpoint` executor may be assigned to. */
+export const PROMPT_CONTAINED_STAGES = ["plan-review", "review-1", "review-2"] as const;
+
+/** Execution-environment stages: need repo/tool access (read files, run
+ *  tests/build, commit). A `model-endpoint` executor assigned here is rejected
+ *  at config-parse time; only `agent-system` executors (or the local harness)
+ *  are valid. */
+export const EXECUTION_ENVIRONMENT_STAGES = [
+  "planning",
+  "implementing",
+  "fix-1",
+  "fix-2",
+  "shipcheck-gate",
+] as const;
+
+export type ExecutorType = "agent-system" | "model-endpoint";
+
+/** A full execution backend (OpenCode / HermesAgent / OpenClaw) addressed by a
+ *  provider identifier and API endpoint. Valid for any model-invoking stage. */
+export interface AgentSystemExecutorDefinition {
+  type: "agent-system";
+  provider: string;
+  endpoint: string;
+  /** Env-var name (or secret reference) resolved from the environment at
+   *  invocation time — never a literal secret value. */
+  credential?: string;
+}
+
+/** A raw OpenAI-compatible chat/completions endpoint (e.g. local Ollama).
+ *  Valid only for PROMPT_CONTAINED_STAGES. */
+export interface ModelEndpointExecutorDefinition {
+  type: "model-endpoint";
+  base_url: string;
+  model: string;
+  credential?: string;
+}
+
+export type ExecutorDefinition = AgentSystemExecutorDefinition | ModelEndpointExecutorDefinition;
+
+// ---------------------------------------------------------------------------
 // Blocker kinds (#134) — closed set of structurally-distinct failure classes.
 //
 // `setBlocked` posts the same "## Pipeline: Blocked" comment for every blocker,
@@ -59,6 +121,7 @@ export const BLOCKER_KINDS = [
   "eval-gate-misconfigured",
   "eval-gate-failed",
   "shipcheck-failed",
+  "head-drift",
   "worktree-setup-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
@@ -150,6 +213,10 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "comment above for the specific concerns). Address the flagged concerns in " +
     "the worktree and commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
+  "head-drift":
+    "The worktree HEAD differs from the PR head (an unpushed local fix). Push the " +
+    "local commits so the PR head includes the fix (`git push`), remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
   "worktree-setup-failed":
     "The worktree dependency install step failed (see the error above). " +
     "Fix the root cause (package manager not installed, bad lockfile, network " +
@@ -184,12 +251,38 @@ export interface PipelineConfig {
   ci_timeout: number;
   ci_poll_interval: number;
   ci_no_run_grace_s: number;
+  // Pre-merge CI verification source (#350). "github" (default) waits for GitHub
+  // Actions check-runs via `gh pr checks`. "local" relies on the current run's
+  // recorded test-gate outcome and skips the GitHub Actions wait entirely.
+  // Only enable "local" when the local gate is identical to full CI and branch
+  // protection is operator-managed.
+  ci_mode: "github" | "local";
   // Harness roles + models. The implementer is always taken from the active
   // profile (repo config cannot set it). The reviewer defaults to the profile's
   // value but MAY be overridden per-repo by the `review_harness` config key
   // (#40) to an arbitrary reviewer CLI — hence `string`, not `Harness`.
-  harnesses: { implementer: Harness; reviewer: string };
+  // `reviewerModel`/`reviewerEffort` (#366) come only from the structured
+  // `review_harness: { command, model?, effort? }` form; the string shorthand
+  // leaves both unset so review routing falls back to `models.review`/`effort.review`.
+  // `reviewerModel` is fully resolved here (Adversarial-stage `auto` is model-
+  // invariant across rounds); `reviewerEffort` is left as-authored (possibly
+  // `"auto"`) because its resolution is round-aware and happens at each
+  // reviewer call site (plan-review vs. review-1 vs. review-2).
+  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerEffort?: string };
   models: { planning: string; implementing: string; review: string; fix: string; intake: string; sweep: string };
+  // Per-stage reasoning-effort overrides (#366), parallel to `models`. Each key
+  // is independently optional; an absent key means no `--effort`/`-c
+  // model_reasoning_effort` flag is emitted for that stage (the harness
+  // operator's global effort setting applies). `review` is left as-authored
+  // (possibly `"auto"`) for the same round-aware reason as `reviewerEffort`
+  // above; the rest are fully resolved by `resolveConfig()`.
+  effort: { planning?: string; implementing?: string; review?: string; fix?: string; intake?: string; sweep?: string };
+  // Plan-review's own resolved effort (#366), derived from the `effort.planning`
+  // config key but classified as Adversarial/Definitive (not Analytical/Iterative
+  // like the `planning` stage itself) — see stage-routing.ts. Always concrete;
+  // defaults to "medium" when `effort.planning` is unset, preserving the prior
+  // hardcoded plan-review cap.
+  plan_review_effort: string;
   // OpenSpec (spec-driven development) integration. "auto" activates only when
   // the target repo has an `openspec/` directory; "on"/"off" force it. When
   // `bootstrap` is true, planning runs `openspec init` on repos that lack it.
@@ -364,6 +457,32 @@ export interface PipelineConfig {
   context_snapshot?: {
     max_chars: number;
   };
+  // Cross-repo dependency map (#312). Declares inter-repo relationships so the
+  // planning stage can surface open-issue context from related repos, and the
+  // roadmap engine can identify cross-repo sequencing hints. Declarative only —
+  // no cross-repo write, merge, PR creation, label propagation, or CI gating.
+  // Relationships are declared independently per repo; no reverse-edge inference.
+  // Resolves to { depends_on: [], depended_on_by: [] } when absent from .github/pipeline.yml.
+  repo_map: {
+    depends_on: string[];      // owner/repo strings this repo consumes
+    depended_on_by: string[];  // owner/repo strings that consume this repo
+  };
+  // External event sink (#343). Opt-in; absent means run events are written
+  // only to the local .agent-pipeline/runs/<id>/events.jsonl, unchanged from
+  // today. When set, `command` is an operator-controlled forwarder that
+  // receives each event's JSON line on stdin. `mode` selects whether the local
+  // events.jsonl write still happens alongside delivery ("additive", the
+  // default) or is skipped entirely ("exclusive").
+  event_sink?: {
+    command: string;
+    mode: "additive" | "exclusive";
+  };
+  // External stage executors (#314). Named executor definitions ("executors:")
+  // that operators may assign per model-invoking stage ("stage_executors:").
+  // Both default to {} — a repo with neither key configured behaves exactly as
+  // today (every stage runs through the local claude/codex harness).
+  executors: Record<string, ExecutorDefinition>;
+  stage_executors: Partial<Record<ModelInvokingStage, string>>;
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -394,7 +513,16 @@ export const DEFAULT_CONFIG: Omit<
   ci_timeout: 900,
   ci_poll_interval: 30,
   ci_no_run_grace_s: 60,
-  models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
+  ci_mode: "github",
+  // review defaults to claude-fable-5 (#366): it is the auto-routed choice for
+  // every Adversarial stage, so aligning the default with that routing
+  // strengthens review rigor. Only honored when the reviewer harness is claude
+  // (under --profile codex, or an explicit review_harness: claude) — under the
+  // default --profile claude the reviewer is codex and the alias is inert
+  // (warned), so this default change is a no-op there.
+  models: { planning: "sonnet", implementing: "sonnet", review: "claude-fable-5", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
+  effort: {},
+  plan_review_effort: "medium",
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
@@ -420,6 +548,9 @@ export const DEFAULT_CONFIG: Omit<
     allow_paths: [] as string[],
     min_confidence: 0.8,
   },
+  repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
+  executors: {} as Record<string, ExecutorDefinition>,
+  stage_executors: {} as Partial<Record<ModelInvokingStage, string>>,
 };
 
 // ---------------------------------------------------------------------------
@@ -509,6 +640,12 @@ export interface ReviewFinding {
   // never converges (the #106 detector failure). Gates SHOULD key on this, never
   // on keyword-matching a finding's body.
   category?: string;
+  // When category is "spec-divergence", clarifies which entity must change (#356):
+  // "code-behind-spec" — the active spec delta already requires the behavior; the
+  // implementation must change. "spec-behind-code" — the accepted implementation
+  // moved past the active delta; the spec delta must change. Absent when category is
+  // not "spec-divergence" or when the direction cannot be determined with confidence.
+  spec_divergence_direction?: "code-behind-spec" | "spec-behind-code";
   // Non-blocking marker (#236). Absent or true = classify normally by
   // severity/confidence. false = advisory regardless of severity and confidence;
   // the finding is recorded but does NOT route to a fix round.
@@ -629,6 +766,13 @@ export interface ReviewRecord {
   harness?: string;
   model?: string;
   selfReview?: boolean;
+  /** External stage executor evidence (#314). `harness` above carries the
+   *  executor NAME when this round was delegated via `stage_executors:`;
+   *  `executorProvider` is the agent-system provider id or model-endpoint base
+   *  URL; `executorModel` is the model name (model-endpoint only). Both absent
+   *  for a round that ran on the local reviewer harness. */
+  executorProvider?: string;
+  executorModel?: string;
 }
 
 export type StageAccountingCostSource = "actual" | "estimated" | "unknown";
@@ -666,6 +810,17 @@ export interface StageAccountingRecord {
   prompt_chars?: number | null;
   prompt_estimated_tokens?: number | null;
   usage?: StageAccountingUsage;
+  /** Git HEAD SHA of the worktree at the time the test gate ran. Recorded by
+   *  the test-gate harness so `ci_mode: local` can verify that the current PR
+   *  head matches the commit that was actually tested (#350 review-2). */
+  pr_head_sha?: string | null;
+  /** External stage executor evidence (#314). `harness` carries the executor
+   *  NAME (from `stage_executors:`) when this stage was delegated;
+   *  `executor_provider` is the agent-system provider id or the model-endpoint
+   *  base URL; `executor_model` is the model name (model-endpoint only). All
+   *  absent for a stage that ran on the local claude/codex harness, unchanged. */
+  executor_provider?: string | null;
+  executor_model?: string | null;
 }
 
 export interface StageAccountingTotals {
@@ -771,6 +926,41 @@ export interface EvidenceBundle {
    *  present, the eligibility gate's behavioral-change-without-tests hard-deny
    *  is suppressed. */
   no_test_rationale?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Issue-level evidence history (#377) — an append-only, issue-scoped JSONL
+// artifact recording one compact timing/outcome record per finalized run, so
+// resuming a pipeline run after a fix round never erases prior rounds' history.
+// Deliberately narrower than EvidenceBundle: no commands/prompts/reviews — a
+// timing rollup, not a second full bundle.
+// ---------------------------------------------------------------------------
+
+/** Current issue-evidence-history JSONL schema version. Bump on a breaking change. */
+export const ISSUE_HISTORY_SCHEMA_VERSION = 1;
+
+/** One stage's timing/outcome slice recorded in an issue-history entry. */
+export interface IssueHistoryStageEntry {
+  stage: string;
+  enteredAt: string | null;
+  exitedAt: string | null;
+  durationMs: number | null;
+  outcome: StageOutcome | null;
+}
+
+/** One line of `.agent-pipeline/history/issue-<N>.jsonl` — a compact,
+ *  append-only record of a single finalized run for an issue. `run_id` is the
+ *  filesystem-safe run-directory basename (the same identifier `summary.json`
+ *  uses), so an entry joins back to its run directory. */
+export interface IssueHistoryEntry {
+  schema_version: number;
+  run_id: string;
+  issue: number;
+  pr: number | null;
+  branch: string | null;
+  final_state: string | null;
+  finalized_at: string | null;
+  stages: IssueHistoryStageEntry[];
 }
 
 /** Partial stage update accepted by `recordStage` — `stage` identifies the entry

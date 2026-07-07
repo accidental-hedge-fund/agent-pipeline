@@ -41,6 +41,18 @@ export interface OpenQuestion {
   rationale?: string;
 }
 
+/** One cross-repo dependency annotation emitted when repo_map is configured. */
+export interface CrossRepoDep {
+  /** Local issue that relates to a declared repo. */
+  local_issue: IssueNumber;
+  /** The declared owner/repo that the local issue depends on or is depended on by. */
+  repo: string;
+  /** Relationship direction from the local repo's perspective. */
+  direction: "depends_on" | "depended_on_by";
+  /** Human-readable rationale for why this cross-repo relationship was identified. */
+  rationale: string;
+}
+
 export interface DepGraph {
   must_precede: DepEdge[];
   should_precede: DepEdge[];
@@ -50,6 +62,8 @@ export interface DepGraph {
   conflict_pairs: [IssueNumber, IssueNumber][];
   cycle_reports: CycleReport[];
   open_questions: OpenQuestion[];
+  /** Cross-repo dependency annotations (populated when repo_map is configured). */
+  cross_repo: CrossRepoDep[];
 }
 
 export type Tier = "enablers" | "dependency-unlock" | "high-value/low-risk" | "larger-bets" | "cleanup";
@@ -118,6 +132,10 @@ export interface MilestoneSpec {
   title: string;
   issue_numbers: IssueNumber[];
   rationale: string;
+  /** Compatibility impact driving the semver increment for this milestone. */
+  version_impact?: 'major' | 'minor' | 'patch';
+  /** Present when sparse metadata required a conservative classification. */
+  uncertainty?: string;
 }
 
 export interface NewIssueDraft {
@@ -171,6 +189,13 @@ export interface PlanJson {
   run_stats?: RunStats;
 }
 
+export interface ReleaseCapacity {
+  /** Per-milestone effort-points budget (XS=1 S=2 M=3 L=5 XL=8; default: 8). */
+  effort_budget?: number;
+  /** Give each breaking-change issue its own milestone (default: true). */
+  isolate_breaking?: boolean;
+}
+
 export interface RoadmapConfig {
   include_labels?: string[];
   exclude_labels?: string[];
@@ -178,6 +203,7 @@ export interface RoadmapConfig {
   hygiene_auto_apply?: boolean;
   pr_docs?: boolean;
   release_model?: 'semver' | 'continuous';
+  release_capacity?: ReleaseCapacity;
   inventory_concurrency?: number;
   depgraph_concurrency?: number;
   depgraph_verify_cap?: number;

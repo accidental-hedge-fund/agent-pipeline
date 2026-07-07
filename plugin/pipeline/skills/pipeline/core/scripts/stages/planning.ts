@@ -15,6 +15,7 @@ import {
   createPr,
   extractHumanPlanComments,
   getIssueDetail,
+  getOpenIssues,
   getPrForBranch,
   getPrForIssue,
   postComment,
@@ -31,6 +32,8 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
+import { expandAutoEffort } from "../stage-routing.ts";
+import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   branchName,
   createWorktree,
@@ -55,7 +58,7 @@ import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
-import { setLivePlanningMarker, clearLivePlanningMarker } from "../lock.ts";
+import { setLivePlanningMarker, clearLivePlanningMarker, isLivePlanningActive } from "../lock.ts";
 import {
   verifyHarnessCommits,
   verifyPlanRevisionOutput,
@@ -66,6 +69,71 @@ import type { Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../t
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
+
+// ---------------------------------------------------------------------------
+// OpenSpec project-config commit — exported for unit testing (#352)
+// ---------------------------------------------------------------------------
+
+/**
+ * Injectable seams for {@link commitOpenspecProjectConfig}.
+ * All three default to the real `gitInWorktree` wrappers.
+ */
+export interface CommitOpenspecConfigDeps {
+  /** `git status --porcelain -- openspec/config.yaml` — returns raw output. */
+  gitStatus?: (wtPath: string) => Promise<string>;
+  /** `git add -- openspec/config.yaml` */
+  gitAdd?: (wtPath: string) => Promise<void>;
+  /** `git commit -m <message> -- <path>` in the worktree — path is always "openspec/config.yaml". */
+  gitCommit?: (wtPath: string, message: string, path: string) => Promise<void>;
+}
+
+async function defaultConfigGitStatus(wtPath: string): Promise<string> {
+  const res = await gitInWorktree(
+    wtPath,
+    ["status", "--porcelain", "--", "openspec/config.yaml"],
+    { ignoreFailure: true },
+  );
+  return res.stdout;
+}
+
+async function defaultConfigGitAdd(wtPath: string): Promise<void> {
+  await gitInWorktree(wtPath, ["add", "--", "openspec/config.yaml"]);
+}
+
+async function defaultConfigGitCommit(wtPath: string, message: string, path: string): Promise<void> {
+  await gitInWorktree(wtPath, ["commit", "-m", message, "--", path]);
+}
+
+/**
+ * When `openspec/config.yaml` is untracked or modified after OpenSpec authoring,
+ * commit it so the test gate does not see it as a dirty file. When the file is
+ * already tracked and unmodified (or absent), this is a no-op (#352).
+ *
+ * The commit is scoped to `openspec/config.yaml` only, carries `Issue:` /
+ * `Pipeline-Run:` trailers, and is placed BEFORE `verifyHarnessCommits` so it
+ * falls inside the verified commit range and satisfies the `allowPattern:
+ * /^openspec\//` guard.
+ */
+export async function commitOpenspecProjectConfig(
+  wtPath: string,
+  issueNumber: number,
+  pipelineRunId: string,
+  deps: CommitOpenspecConfigDeps = {},
+): Promise<void> {
+  const doGitStatus = deps.gitStatus ?? defaultConfigGitStatus;
+  const doGitAdd = deps.gitAdd ?? defaultConfigGitAdd;
+  const doGitCommit = deps.gitCommit ?? defaultConfigGitCommit;
+
+  const status = (await doGitStatus(wtPath)).trim();
+  if (!status) return; // already tracked and unmodified — no-op
+
+  await doGitAdd(wtPath);
+  await doGitCommit(
+    wtPath,
+    withTrailers(`chore: track openspec/config.yaml (#${issueNumber})`, issueNumber, pipelineRunId),
+    "openspec/config.yaml",
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Worktree bootstrap (create + dependency install) — exported for unit testing
@@ -134,6 +202,9 @@ export interface AdvanceOpts {
   /** Run-store deps carrying `stdoutWrite` so events also stream to stdout under
    *  `--json-events` (#155). Undefined → events go to events.jsonl only. */
   runStoreDeps?: RunStoreDeps;
+  /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
+   *  supply a fake `fetchImpl` so no real network call is made. */
+  executorHttpDeps?: ExecutorHttpDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +230,7 @@ export interface PlanningPhaseHooks {
     pipelineRunId: string,
     deps: RunPlanningPhasesDeps,
     contextSnapshot?: string,
+    crossRepoContext?: string,
   ): Promise<
     | {
         ok: true;
@@ -249,7 +321,9 @@ export interface PlanningPhaseHooks {
 type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
   PlanStepDeps &
   ImplementerInvokeDeps &
-  ResumeFromImplementingDeps & {
+  ResumeFromImplementingDeps &
+  CrossRepoContextDeps &
+  CommitOpenspecConfigDeps & {
     getIssueDetail?: typeof getIssueDetail;
     setBlocked?: typeof setBlocked;
     transition?: typeof transition;
@@ -413,8 +487,11 @@ export async function runPlanningPhases(
 
   try {
 
-  // ---- Step 0: optional carry-forward context (last30days) ----
-  const carryForward = await gatherCarryForward(cfg, issueNumber, title, body);
+  // ---- Step 0: optional carry-forward context (last30days) + cross-repo context ----
+  const [carryForward, crossRepoContext] = await Promise.all([
+    gatherCarryForward(cfg, issueNumber, title, body),
+    gatherCrossRepoContext(cfg, issueNumber, deps),
+  ]);
 
   // ---- Worktree bootstrap: create + dependency install ----
   // NOTE: snapshot is gathered AFTER bootstrap so any human comments posted
@@ -440,7 +517,7 @@ export async function runPlanningPhases(
   const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
 
   // ---- Author the planning artifact ----
-  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot);
+  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext);
   if (!authorResult.ok) {
     await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
@@ -459,6 +536,10 @@ export async function runPlanningPhases(
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
     return { advanced: false, status: "blocked", reason: validateResult.reason };
   }
+  // #352 (round 2): openspec.validateItem inside validateArtifact can also trigger
+  // ensureDefaultConfig, leaving config.yaml dirty after the authorArtifact commit.
+  // Repeat the config-commit so no validate call leaves the file untracked.
+  await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
   // ---- Post plan comment ----
   const planComment = `## Implementation Plan\n\n${planText}${footer(cfg)}`;
@@ -485,13 +566,40 @@ export async function runPlanningPhases(
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
     // the just-authored change files; freeform uses cfg.repo_dir.
     const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
+    const planReviewModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+    // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
+    // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
+    // with a structured review_harness.effort override taking precedence when set.
+    const planReviewEffort = expandAutoEffort(cfg.harnesses.reviewerEffort, "plan-review", "claude") ?? cfg.plan_review_effort;
+    // External stage executor delegation (#314): a `stage_executors` assignment
+    // for plan-review bypasses the local reviewer harness (and its #39
+    // self-review fallback) entirely — a deliberate operator choice, never
+    // silently degraded.
+    const planReviewAssignment = resolveStageExecutor(cfg, "plan-review");
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
-      await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
-        timeoutSec: cfg.plan_review_timeout,
-        model: opts.model ?? cfg.models.review,
-        reasoningEffort: "medium",
-        accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", opts.model ?? cfg.models.review),
-      });
+      planReviewAssignment
+        ? {
+            result: (await invokeStageExecutor(
+              "plan-review",
+              cfg,
+              reviewPrompt,
+              {
+                timeoutSec: cfg.plan_review_timeout,
+                accounting: opts.runDir
+                  ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "plan-review", modelSlot: "review" }
+                  : undefined,
+              },
+              opts.executorHttpDeps,
+            ))!,
+            effectiveReviewer: planReviewAssignment.name,
+            selfReview: false,
+          }
+        : await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
+            timeoutSec: cfg.plan_review_timeout,
+            model: planReviewModel,
+            reasoningEffort: planReviewEffort,
+            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
+          });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
@@ -554,6 +662,9 @@ export async function runPlanningPhases(
     }
     revisedPlan = rv.updatedPlanText;
     specContext = rv.updatedSpecContext || specContext;
+    // #352 (round 2): revalidateArtifact calls openspec.validateItem which can also
+    // trigger ensureDefaultConfig — commit any dirty config.yaml it leaves behind.
+    await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
     if (!validateHumanFeedbackAck(revisedPlan, humanComments)) {
       const commenters = [...new Set(humanComments.map((c) => `@${c.author}`))].join(", ");
@@ -769,9 +880,9 @@ async function advanceOpenspec(
  */
 export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, body: string): PlanningPhaseHooks {
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot, crossRepoContext) {
       const primary: Harness = innerCfg.harnesses.implementer;
-      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot });
+      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext });
       let planResult: HarnessResult;
       try {
         planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "planning" });
@@ -854,7 +965,7 @@ export function makeOpenspecPlanningHooks(
   let changeId = "";
 
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext) {
       const primary: Harness = innerCfg.harnesses.implementer;
       const doGit = deps.gitInWorktree ?? gitInWorktree;
       const isInit = deps.openspecIsInitialized ?? openspec.isInitialized;
@@ -899,17 +1010,34 @@ export function makeOpenspecPlanningHooks(
 
       const inv = deps.invoke ?? invoke;
       const planModel = opts.model ?? innerCfg.models.planning;
-      const planResult = await inv(
-        primary,
-        wt.path,
-        buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, pipelineRunId }),
-        {
-          timeoutSec: innerCfg.implementation_timeout,
-          model: planModel,
-          sandbox: innerCfg.harness_sandbox,
-          accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
-        },
-      );
+      const openspecPlanPrompt = buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId });
+      // External stage executor delegation (#314) — see invokePlanStep's comment;
+      // this is the OpenSpec-flow equivalent of the same "planning" call.
+      const planResult =
+        (await invokeStageExecutor(
+          "planning",
+          innerCfg,
+          openspecPlanPrompt,
+          {
+            timeoutSec: innerCfg.implementation_timeout,
+            accounting: opts.runDir
+              ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "planning", modelSlot: "planning" }
+              : undefined,
+          },
+          opts.executorHttpDeps,
+        )) ??
+        (await inv(
+          primary,
+          wt.path,
+          openspecPlanPrompt,
+          {
+            timeoutSec: innerCfg.implementation_timeout,
+            model: planModel,
+            reasoningEffort: innerCfg.effort?.planning,
+            sandbox: innerCfg.harness_sandbox,
+            accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
+          },
+        ));
       if (!planResult.success) {
         const reason = planResult.timed_out
           ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
@@ -923,7 +1051,17 @@ export function makeOpenspecPlanningHooks(
 
       // #131: salvage authoring work the harness left uncommitted before the
       // commit-range verification below (the change folder may exist only on disk).
-      await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore);
+      // Scope to openspec/ so only intent files are staged — aligns with the
+      // path-constraint guard below and fixes the sandbox-lock contamination (#321).
+      await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore, "openspec/");
+
+      // #352: commit openspec/config.yaml when the CLI left it untracked/modified.
+      // The openspec CLI writes this file lazily (ensureDefaultConfig) on the first
+      // command invocation; the scoped salvage above only runs when HEAD did not
+      // advance, so config.yaml can be left dirty even when the harness committed
+      // its change. Commit it here — AFTER salvage, BEFORE verifyHarnessCommits —
+      // so it falls inside the verified range and satisfies allowPattern:/^openspec\//
+      await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
       // ---- Discover the change the implementer created. ----
       const after = openspec.listChangeDirs(wt.path);
@@ -945,6 +1083,8 @@ export function makeOpenspecPlanningHooks(
           issueNumber,
           pathConstraint: {
             allowPattern: /^openspec\//,
+            // tasks/ planning notes left dirty by the scoped salvage (#321) are expected
+            allowDirtyPattern: /^tasks\//,
             description:
               "OpenSpec authoring step committed files outside `openspec/` — only intent files may be committed at this stage",
           },
@@ -1055,10 +1195,29 @@ export function makeOpenspecPlanningHooks(
     // Freeform does not implement this hook and falls back to invokePlanStep,
     // which uses cfg.repo_dir for non-sandboxed runs.
     async invokeRevision(primary, wt, prompt, innerCfg, opts, deps, issueNumber) {
+      // External stage executor delegation (#314) — see invokePlanStep's
+      // comment: revision is planning-role work and resolves the "planning"
+      // assignment, regardless of the "plan-review" accounting label below.
+      if (issueNumber !== undefined) {
+        const delegated = await invokeStageExecutor(
+          "planning",
+          innerCfg,
+          prompt,
+          {
+            timeoutSec: innerCfg.implementation_timeout,
+            accounting: opts.runDir
+              ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "plan-review", modelSlot: "planning" }
+              : undefined,
+          },
+          opts.executorHttpDeps,
+        );
+        if (delegated) return delegated;
+      }
       const inv = deps.invoke ?? invoke;
       return inv(primary, wt.path, prompt, {
         timeoutSec: innerCfg.implementation_timeout,
         model: opts.model ?? innerCfg.models.planning,
+        reasoningEffort: innerCfg.effort?.planning,
         sandbox: innerCfg.harness_sandbox,
         accounting: issueNumber === undefined
           ? undefined
@@ -1240,14 +1399,21 @@ export interface DispatchResumeDeps {
   hasCommitsAhead?: typeof hasCommitsAhead;
   getIssueDetail?: typeof getIssueDetail;
   resumeFromImplementing?: typeof resumeFromImplementing;
+  /** Check if a live planning process is active for this repo+issue (repo-stable). */
+  isLivePlanningActive?: typeof isLivePlanningActive;
+  transition?: typeof transition;
+  planningAdvance?: typeof advance;
 }
 
 /**
- * Dispatch resume for the `implementing` stage: check whether the issue has an
- * existing worktree with commits ahead of the base branch. If so, run the
- * post-implementation steps (test gate → push → PR → review-1) without
- * re-planning or re-implementing. If not, return the existing "nothing to do"
- * waiting response (no regression for mid-flight runs).
+ * Dispatch resume for the `implementing` stage. Re-entry ordering:
+ *   1. Live-planning marker present → a concurrent process owns the stage;
+ *      return `waiting` naming the live owner (no worktree inspection).
+ *   2. No live owner + worktree with commits ahead of base → resume the
+ *      post-implementation steps (test gate → push → PR → review-1), #175.
+ *   3. No live owner + no commits → crash-stranded: roll back to `ready` and
+ *      restart the planning arc, identical to the `planning`/`plan-review`
+ *      recovery (#271).
  */
 export async function dispatchResume(
   cfg: PipelineConfig,
@@ -1259,19 +1425,39 @@ export async function dispatchResume(
   const commitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
   const fetchIssue = deps.getIssueDetail ?? getIssueDetail;
   const doResume = deps.resumeFromImplementing ?? resumeFromImplementing;
+  const checkLive = deps.isLivePlanningActive ?? isLivePlanningActive;
+  const trans = deps.transition ?? transition;
+  const planningAdvance = deps.planningAdvance ?? advance;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
     return { advanced: true, from: "implementing", to: "review-1", summary: "[dry-run] implementing resume" };
   }
 
-  const wt = await getWt(cfg, issueNumber);
-  if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
+  // Liveness first: a live owner may be mid-commit, so the worktree must not be
+  // inspected or acted on at all while the marker is held.
+  if (checkLive(cfg.repo, issueNumber)) {
     return {
       advanced: false,
       status: "waiting",
-      reason: "implementing is set mid-flight by the planning/plan-review handler; nothing to do at this point.",
+      reason: "implementing is owned by a live concurrent planning/implementing run — waiting for it to complete",
     };
+  }
+
+  const wt = await getWt(cfg, issueNumber);
+  if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
+    console.log(
+      `[pipeline] #${issueNumber}: recovered stranded implementing attempt — restarting from ready`,
+    );
+    await trans(cfg, issueNumber, "implementing", "ready", "recovered crashed implementing attempt — restarting");
+    return planningAdvance(cfg, issueNumber, {
+      dryRun: opts.dryRun,
+      model: opts.model,
+      pipelineRunId: opts.pipelineRunId,
+      stateDir: opts.stateDir,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+    });
   }
 
   const primary: Harness = cfg.harnesses.implementer;
@@ -1321,13 +1507,14 @@ async function salvageIfNoNewCommit(
   pipelineRunId: string,
   stageLabel: string,
   headBefore: string,
+  scope?: string,
 ): Promise<void> {
   if (!headBefore) return;
   const headAfter = (
     await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   if (headAfter && headAfter === headBefore) {
-    await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel);
+    await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, {}, scope);
   }
 }
 
@@ -1362,11 +1549,31 @@ export async function invokeImplementer(
   deps: ImplementerInvokeDeps = {},
   accounting?: InvokeAccountingStage,
 ): Promise<HarnessResult> {
+  // External stage executor delegation (#314): "implementing" is an
+  // execution-environment stage — only an `agent-system` executor can be
+  // assigned here (config.ts rejects a `model-endpoint` assignment at parse
+  // time), so no model-endpoint branching is needed at this call site.
+  if (accounting) {
+    const delegated = await invokeStageExecutor(
+      "implementing",
+      cfg,
+      prompt,
+      {
+        timeoutSec: cfg.implementation_timeout,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: accounting.issue, stage: accounting.stage, modelSlot: "implementing" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    if (delegated) return delegated;
+  }
   const inv = deps.invoke ?? invoke;
   const model = opts.model ?? cfg.models.implementing;
   return inv(harness, wtPath, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model,
+    reasoningEffort: cfg.effort?.implementing,
     sandbox: cfg.harness_sandbox,
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
@@ -1402,12 +1609,34 @@ export async function invokePlanStep(
   deps: PlanStepDeps = {},
   accounting?: InvokeAccountingStage,
 ): Promise<HarnessResult> {
+  // External stage executor delegation (#314): this seam authors/revises the
+  // PLAN — implementer/planning-role work regardless of whether the call is
+  // logged under the "planning" or "plan-review" accounting stage (a revision
+  // is still planning work; the actual reviewing call is wired separately in
+  // runPlanningPhases). It therefore always resolves the "planning" assignment,
+  // never "plan-review" (that name is reserved for the reviewer call).
+  if (accounting) {
+    const delegated = await invokeStageExecutor(
+      "planning",
+      cfg,
+      prompt,
+      {
+        timeoutSec: cfg.implementation_timeout,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: accounting.issue, stage: accounting.stage, modelSlot: "planning" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    if (delegated) return delegated;
+  }
   const inv = deps.invoke ?? invoke;
   const dir = (cfg.harness_sandbox && harness === "claude") ? wtPath : cfg.repo_dir;
   const model = opts.model ?? cfg.models.planning;
   return inv(harness, dir, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model,
+    reasoningEffort: cfg.effort?.planning,
     sandbox: cfg.harness_sandbox,
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "planning", model)
@@ -1613,6 +1842,74 @@ export async function gatherCarryForward(
   );
   console.log(`[pipeline] #${issueNumber}: last30days brief posted + carried into planning`);
   return sanitizedBrief;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-repo context (#312): open issues from declared repo_map repos
+// ---------------------------------------------------------------------------
+
+/** Injectable seam for unit-testing `gatherCrossRepoContext` without real gh calls. */
+export interface CrossRepoContextDeps {
+  getOpenIssues?: typeof getOpenIssues;
+}
+
+/**
+ * When `cfg.repo_map` declares related repos, fetch open issues from each declared
+ * repo (`depends_on` ∪ `depended_on_by`) and return a formatted context block for
+ * injection into the planning prompt. Non-blocking: an unreachable repo logs a named
+ * warning and is skipped; the run continues with whatever context was fetched.
+ *
+ * Returns "" when `repo_map` is absent/empty (no gh call is made).
+ */
+export async function gatherCrossRepoContext(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: CrossRepoContextDeps = {},
+): Promise<string> {
+  const repoMap = cfg.repo_map;
+  if (!repoMap) return "";
+  const allDeclared = [...(repoMap.depends_on ?? []), ...(repoMap.depended_on_by ?? [])];
+  if (allDeclared.length === 0) return "";
+
+  const getIssuesFn = deps.getOpenIssues ?? getOpenIssues;
+
+  // Deduplicate repos; depends_on wins over depended_on_by for same repo.
+  const repoSet = new Set<string>();
+  for (const r of (repoMap.depended_on_by ?? [])) repoSet.add(r);
+  for (const r of (repoMap.depends_on ?? [])) repoSet.add(r);
+
+  console.log(`[pipeline] #${issueNumber}: gathering cross-repo context from ${repoSet.size} declared repo(s)`);
+
+  const sections: string[] = [];
+
+  for (const repo of repoSet) {
+    let issues: Awaited<ReturnType<typeof getOpenIssues>>;
+    try {
+      issues = await getIssuesFn(repo);
+    } catch (err) {
+      console.warn(
+        `[pipeline] #${issueNumber}: repo_map: ${repo} unreachable — continuing without its cross-repo context: ${(err as Error).message}`,
+      );
+      continue;
+    }
+    if (issues.length === 0) continue;
+    const lines = issues.map((i) => {
+      // Sanitize titles and labels before prompt injection: these originate from external
+      // contributors in declared repos and must be treated as untrusted input.
+      const safeTitle = sanitizeBriefForPrompt(i.title);
+      const safeLabels = i.labels.map((l) => sanitizeBriefForPrompt(l));
+      const labelStr = safeLabels.length > 0 ? ` [${safeLabels.join(", ")}]` : "";
+      return `- #${i.number} ${safeTitle}${labelStr}`;
+    });
+    sections.push(`### ${repo}\n\n${lines.join("\n")}`);
+  }
+
+  if (sections.length === 0) return "";
+
+  const header = "## Cross-Repo Context (declared related repos — open issues only)";
+  const result = `${header}\n\n${sections.join("\n\n")}`;
+  console.log(`[pipeline] #${issueNumber}: cross-repo context gathered (${repoSet.size} repo(s))`);
+  return result;
 }
 
 /**

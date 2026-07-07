@@ -29,6 +29,7 @@ import {
   bundlePath,
   createBundle,
   finalizeBundle,
+  formatEvidenceCommentBody,
   markNotified,
   patchBundleIdentity,
   recordOverride,
@@ -48,6 +49,7 @@ import {
   type RunStoreDeps,
   type TerminalLogTee,
 } from "./run-store.ts";
+import { buildEventSinkDeps } from "./event-sink.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
@@ -61,6 +63,7 @@ import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
   reviewStageSkipTarget,
+  type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
   type Stage,
@@ -192,40 +195,32 @@ function evidenceTimestamp(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
 }
 
-function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome): void {
+export function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome, tlog: (line: string) => void): void {
   if (out.advanced) {
     const oo = out as { from: Stage; to: Stage; summary: string };
-    console.log(`[pipeline] #${issueNumber}: ${oo.from} → ${oo.to}: ${oo.summary}`);
+    tlog(`[pipeline] #${issueNumber}: ${oo.from} → ${oo.to}: ${oo.summary}`);
   } else {
     const oo = out as { status: string; reason: string };
-    console.log(`[pipeline] #${issueNumber}: at ${fromStage} — ${oo.status}: ${oo.reason}`);
+    tlog(`[pipeline] #${issueNumber}: at ${fromStage} — ${oo.status}: ${oo.reason}`);
   }
 }
 
 /**
- * Post a single comment recording the local evidence-bundle path so a maintainer
- * can find it (#147). Targets the PR when one exists, else the issue. Skipped when
- * a notification was already recorded for this run; marks the bundle notified
- * after posting. Best-effort — wrapped by the caller.
+ * Post a single self-contained finalization comment (#147, #377): a labeled run
+ * id, a per-stage timing table, and the local evidence-bundle path demoted to
+ * secondary/optional context. Targets the PR when one exists, else the issue.
+ * Skipped when a notification was already recorded for this run; marks the
+ * bundle notified after posting. Best-effort — wrapped by the caller.
  */
 async function notifyBundlePath(
   cfg: PipelineConfig,
   issueNumber: number,
   stateDir: string,
-  alreadyNotifiedAt: string | null,
+  bundle: EvidenceBundle,
 ): Promise<void> {
-  if (alreadyNotifiedAt) return;
+  if (bundle.notifiedAt) return;
   const p = bundlePath(stateDir, issueNumber);
-  const body = [
-    "## Pipeline: Evidence bundle",
-    "",
-    `Run evidence written to: \`${p}\``,
-    "",
-    `Print a human-readable summary with \`${cfg.invocation} ${issueNumber} --summary\`.`,
-    "",
-    "---",
-    "*Automated by Claude Code Pipeline Skill*",
-  ].join("\n");
+  const body = formatEvidenceCommentBody(bundle, p, `${cfg.invocation} ${issueNumber} --summary`);
   const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
   if (pr) {
     await postPrComment(cfg, pr, body);
@@ -295,7 +290,7 @@ export async function dispatch(
       // cfg.ci_timeout.
       return preMergeStage.advancePolling(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "eval-gate":
-      return evalStage.advanceEval(cfg, issueNumber, { dryRun, stateDir, runDir, runStoreDeps });
+      return evalStage.advanceEval(cfg, issueNumber, { dryRun, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "shipcheck-gate":
       return shipchecKStage.advance(cfg, issueNumber, { dryRun, stateDir, runDir, runStoreDeps });
     case "ready-to-deploy":
@@ -339,11 +334,19 @@ export async function dispatch(
       }
       return deps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     }
-    case "implementing":
-      // Re-entry: if a worktree with commits exists, resume the post-implementation
-      // steps (gate → push → PR → review-1) without re-planning or re-implementing.
-      // Falls back to "waiting" when no such worktree exists (mid-flight guard).
-      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    case "implementing": {
+      // Re-entry: gated on the same repo-stable live-planning marker as the
+      // `planning`/`plan-review` recovery (#382). Live owner → waiting; no live
+      // owner + commits ahead → resume post-implementation steps (#175); no
+      // live owner + no commits → crash-stranded, roll back to `ready` and
+      // restart planning.
+      const implDeps = recoveryDeps ?? realPlanningRecoveryDeps();
+      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps }, {
+        isLivePlanningActive: implDeps.isLivePlanningActive,
+        transition: implDeps.transition,
+        planningAdvance: implDeps.planningAdvance,
+      });
+    }
     default:
       return { advanced: false, status: "error", reason: `unknown stage ${stage}` };
   }
@@ -403,6 +406,10 @@ export async function runAdvance(
     // GitHub labels/comments stay authoritative).
     const stateDir = opts.dryRun ? undefined : runStateDir(cfg.domain);
 
+    function tlog(line: string): void {
+      console.log(line);
+    }
+
     // Run directory (#155): stable artifact directory per dispatch. Initialized
     // before the first stage so it survives a mid-run crash. Also starts the
     // terminal.log tee here so it captures all subsequent output including the
@@ -410,7 +417,17 @@ export async function runAdvance(
     // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
     let runDir: string | undefined;
     let terminalTee: TerminalLogTee | undefined;
-    const runStoreDeps: RunStoreDeps = { ...defaultRunStoreDeps };
+    const eventSinkDeps = buildEventSinkDeps(cfg);
+    const runStoreDeps: RunStoreDeps = {
+      ...defaultRunStoreDeps,
+      ...eventSinkDeps,
+      // summaryEvents (#343): in-memory accumulator so finalizeRun can enrich
+      // summary.json from events delivered this run. Only needed in exclusive
+      // sink mode, where events.jsonl is never written (see run-store.ts
+      // finalizeRun) — additive/no-sink mode keeps reading events.jsonl so a
+      // resumed run also picks up events appended by an earlier process.
+      ...(eventSinkDeps.eventSinkMode === "exclusive" ? { summaryEvents: [] } : {}),
+    };
     if (stateDir) {
       // Use the run id pinned by a detached launcher when present, so the detached
       // caller and the inner run share one `.agent-pipeline/runs/<run-id>` (#155).
@@ -441,14 +458,14 @@ export async function runAdvance(
     // that line is captured in terminal.log (the inner finally runs first).
     try {
 
-    console.log(`[pipeline] #${issueNumber}: starting at stage=${startStage}`);
+    tlog(`[pipeline] #${issueNumber}: starting at stage=${startStage}`);
 
     // One run id per dispatch (#20): generated before any stage runs and threaded
     // into every commit operation, so all commits this invocation produces — across
     // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
     const pipelineRunId = makePipelineRunId(issueNumber, runStartedAt);
     setGhRunId(pipelineRunId);
-    console.log(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
+    tlog(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
     if (stateDir) {
       let bundlePr: number | null = null;
@@ -502,7 +519,7 @@ export async function runAdvance(
       const detail = await getIssueDetail(cfg, issueNumber);
       const stage = pickStage(detail.labels);
       if (!stage) {
-        console.log(`[pipeline] #${issueNumber}: pipeline label removed; stopping.`);
+        tlog(`[pipeline] #${issueNumber}: pipeline label removed; stopping.`);
         break;
       }
       finalStage = stage;
@@ -573,7 +590,7 @@ export async function runAdvance(
         if (runDir) {
           await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
         }
-        printOutcome(issueNumber, stage, out);
+        printOutcome(issueNumber, stage, out, tlog);
         break;
       }
 
@@ -596,7 +613,7 @@ export async function runAdvance(
         if (stage === "implementing") {
           console.log(`[pipeline] #${issueNumber}: blocked at implementing — attempting auto-recovery`);
           const out = await autoRecover.tryAutoRecover(cfg, issueNumber, stateDir);
-          printOutcome(issueNumber, stage, out);
+          printOutcome(issueNumber, stage, out, tlog);
           if (out.advanced) {
             transitions++;
             lastStage = (out as { to: Stage }).to;
@@ -626,7 +643,7 @@ export async function runAdvance(
         const skipStage = evidenceStageName(stage);
         const skipEnteredAt = evidenceTimestamp();
         await transition(cfg, issueNumber, stage, to, `${stage} step disabled in this repo's config; skipping.`);
-        console.log(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
+        tlog(`[pipeline] #${issueNumber}: ${stage} → ${to} (step disabled)`);
         transitions++;
         lastStage = to;
         finalStage = to;
@@ -720,7 +737,7 @@ export async function runAdvance(
       if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: stageExitedAt, stage: auditStage, outcome: evidenceOutcome(out), commits: stageCommits }, runStoreDeps).catch(() => {});
       }
-      printOutcome(issueNumber, stage, out);
+      printOutcome(issueNumber, stage, out, tlog);
 
       if (out.advanced) {
         transitions++;
@@ -868,7 +885,7 @@ export async function runAdvance(
           if (runDir) {
             await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
           }
-          await notifyBundlePath(cfg, issueNumber, stateDir, finalized.notifiedAt);
+          await notifyBundlePath(cfg, issueNumber, stateDir, finalized);
         } catch {
           /* audit-only — ignore */
         }
@@ -881,7 +898,7 @@ export async function runAdvance(
     }
 
     const elapsed = Math.round((nowFn() - t0) / 1000);
-    console.log(
+    tlog(
       `\n[pipeline] #${issueNumber}: done — ${startStage} → ${lastStage} (${transitions} transitions, ${elapsed}s)`,
     );
 

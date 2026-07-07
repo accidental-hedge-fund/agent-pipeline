@@ -418,3 +418,150 @@ Any unknown key inside the `auto_merge_eligibility` block SHALL be rejected with
 - **WHEN** `.github/pipeline.yml` sets `auto_merge_eligibility.min_confidence: 1.5`
 - **THEN** `resolveConfig()` SHALL throw with a parse error identifying `min_confidence` as out of range
 
+### Requirement: Config SHALL accept an optional strict `repo_map` block
+
+`PartialConfigSchema` SHALL accept an optional `repo_map` block with strict validation. Its
+fields SHALL be `depends_on` (array of `owner/repo` strings, repos this repo consumes) and
+`depended_on_by` (array of `owner/repo` strings, repos that consume this repo). Both lists
+SHALL be optional and SHALL default to empty arrays in the resolved config. Each entry SHALL
+match the `owner/repo` shape (exactly one `/`, with non-empty owner and name segments); an
+entry that is not `owner/repo`-shaped SHALL cause `resolveConfig()` to throw a parse error
+identifying the offending entry. An unknown sub-key under `repo_map` SHALL be rejected by
+strict-schema validation, consistent with the other feature blocks. When the block is absent,
+`repo_map` SHALL resolve to its `DEFAULT_CONFIG` value (`{ depends_on: [], depended_on_by: [] }`)
+and behavior SHALL be unchanged.
+
+`PipelineConfig.repo_map` SHALL be a required (non-optional) field on the resolved config —
+it SHALL never be `undefined` at runtime. The `DEFAULT_CONFIG.repo_map` value SHALL be
+`{ depends_on: [], depended_on_by: [] }`. Downstream consumers (planning stage, roadmap
+engine) SHALL test for empty lists, not for `undefined`, to determine whether cross-repo
+context gathering is active.
+
+The `repo_map` block is declarative context only. It SHALL NOT enable any cross-repo write,
+merge, PR creation, label propagation, or status sync; it SHALL NOT weaken the never-auto-merge
+safety floor. Relationships are declared independently per repo — the pipeline SHALL NOT infer
+a reverse edge in another repo from a local declaration.
+
+#### Scenario: valid repo_map block resolves
+
+- **WHEN** `.github/pipeline.yml` sets:
+  ```yaml
+  repo_map:
+    depends_on:
+      - acme/shared-lib
+    depended_on_by:
+      - acme/consumer-app
+  ```
+- **THEN** `resolveConfig()` SHALL succeed
+- **AND** `config.repo_map.depends_on` SHALL equal `["acme/shared-lib"]`
+- **AND** `config.repo_map.depended_on_by` SHALL equal `["acme/consumer-app"]`
+
+#### Scenario: repo_map absent — defaults to empty lists
+
+- **WHEN** `.github/pipeline.yml` has no `repo_map` block
+- **THEN** `config.repo_map.depends_on` SHALL equal `[]`
+- **AND** `config.repo_map.depended_on_by` SHALL equal `[]`
+
+#### Scenario: unknown sub-key under repo_map rejected
+
+- **WHEN** `.github/pipeline.yml` sets an unrecognized key under `repo_map` (e.g. `consumes: [acme/x]`)
+- **THEN** `resolveConfig()` SHALL throw a parse error identifying the offending key
+
+#### Scenario: malformed owner/repo entry rejected
+
+- **WHEN** `repo_map.depends_on` contains an entry that is not `owner/repo`-shaped (e.g. `just-a-name` or `a/b/c`)
+- **THEN** `resolveConfig()` SHALL throw a parse error identifying the offending entry
+
+### Requirement: `pipeline config schema` SHALL expose the repo_map block
+
+The JSON Schema emitted by `pipeline config schema` SHALL include a `repo_map` property
+derived from `PartialConfigSchema`, whose `depends_on` and `depended_on_by` sub-properties are
+each typed as an array of strings and carry a non-empty `description`. `repo_map` SHALL be
+absent from the schema's top-level `required` array (it is optional).
+
+#### Scenario: schema includes repo_map with accurate types
+
+- **WHEN** the user runs `pipeline config schema`
+- **THEN** the emitted JSON Schema SHALL include a `repo_map` property
+- **AND** `repo_map.properties.depends_on` SHALL describe an array of strings with a non-empty `description`
+- **AND** `repo_map.properties.depended_on_by` SHALL describe an array of strings with a non-empty `description`
+- **AND** `repo_map` SHALL NOT appear in the schema's top-level `required` array
+
+### Requirement: Config SHALL accept an optional `ci_mode` key selecting the pre-merge CI verification source
+
+`PartialConfigSchema` SHALL accept an optional `ci_mode` key validated as an enum with exactly the values `github` and `local`. `PipelineConfig.ci_mode` SHALL be a required (non-optional) field on the resolved config — it SHALL never be `undefined` at runtime — and `DEFAULT_CONFIG.ci_mode` SHALL be `"github"`. An absent key SHALL resolve to `"github"`, preserving the current behavior in which the pre-merge gate waits on `gh pr checks`. A value outside the enum SHALL cause `resolveConfig()` to throw a parse error identifying `ci_mode` as the offending field, consistent with the strict-validation contract used for the other config fields. The `ci_mode` key SHALL carry a `.describe()` annotation so the JSON Schema emitted by `pipeline config schema` includes a non-empty `description` and the `github`/`local` enum for `ci_mode`.
+
+#### Scenario: ci_mode absent — defaults to github
+
+- **WHEN** `.github/pipeline.yml` does not include a `ci_mode` key
+- **THEN** `resolveConfig()` SHALL return a config with `ci_mode === "github"`
+- **AND** the pre-merge gate behavior SHALL be unchanged from prior behavior (waits on `gh pr checks`)
+
+#### Scenario: ci_mode local accepted
+
+- **WHEN** `.github/pipeline.yml` sets `ci_mode: local`
+- **THEN** `resolveConfig()` SHALL succeed and the resolved config SHALL carry `ci_mode === "local"`
+
+#### Scenario: out-of-enum ci_mode rejected
+
+- **WHEN** `.github/pipeline.yml` sets `ci_mode: skip` (a value other than `github` or `local`)
+- **THEN** `resolveConfig()` SHALL throw a parse error identifying `ci_mode` as the offending field
+
+#### Scenario: emitted JSON Schema exposes the ci_mode enum
+
+- **WHEN** the user runs `pipeline config schema`
+- **THEN** the emitted JSON Schema SHALL include a `ci_mode` property whose allowed values are exactly `github` and `local`
+- **AND** the `ci_mode` property SHALL carry a non-empty `description`
+
+### Requirement: The config SHALL accept an optional effort block parallel to models
+
+`PartialConfigSchema` SHALL accept an optional `effort:` block with the same per-stage key set as `models:` (`planning`, `implementing`, `review`, `fix`, `intake`, `sweep`). Each key SHALL be independently optional and SHALL accept either an arbitrary string or the literal `"auto"`. The block SHALL be strict: an unknown key under `effort:` SHALL be rejected at validation time. When a key is absent, `resolveConfig()` SHALL leave the resolved effort for that stage unset (no effort flag emitted).
+
+#### Scenario: effort block accepted and resolved
+
+- **WHEN** `.github/pipeline.yml` sets `effort: { planning: medium, implementing: low }`
+- **THEN** `resolveConfig()` SHALL return a `PipelineConfig` whose resolved planning effort is `"medium"` and implementing effort is `"low"`
+
+#### Scenario: unknown key under effort rejected
+
+- **WHEN** `.github/pipeline.yml` sets `effort: { unknown_stage: low }`
+- **THEN** `resolveConfig()` SHALL throw a parse error identifying `unknown_stage` as an unknown key under `effort`
+
+#### Scenario: effort block absent — no effort flags
+
+- **WHEN** `.github/pipeline.yml` has no `effort:` block
+- **THEN** every stage's resolved effort SHALL be unset and no stage invocation SHALL emit an effort flag
+
+### Requirement: models and effort keys SHALL accept the auto sentinel
+
+`PartialConfigSchema` SHALL accept the literal string `"auto"` as a valid value for every `models.*` and `effort.*` key. A key set to `"auto"` SHALL pass strict schema validation (it is not treated as an unknown/invalid value). `resolveConfig()` SHALL resolve every `"auto"` value to a concrete string before returning; the returned `PipelineConfig` SHALL contain no `"auto"` value for any model or effort consulted by stage code.
+
+#### Scenario: auto passes strict validation
+
+- **WHEN** `.github/pipeline.yml` sets `models: { review: auto }` and `effort: { review: auto }`
+- **THEN** `resolveConfig()` SHALL NOT throw and SHALL treat `auto` as a valid value
+
+#### Scenario: auto fully resolved in returned config
+
+- **WHEN** any `models.*` or `effort.*` key is `"auto"`
+- **THEN** the returned `PipelineConfig` SHALL expose a concrete resolved value for that stage, never the literal `"auto"`
+
+### Requirement: review_harness SHALL accept a structured command/model/effort form
+
+`PartialConfigSchema` SHALL accept `review_harness` as either a bare string (the existing shorthand) or a strict object `{ command, model?, effort? }`, where `model` and `effort` each accept an arbitrary string or `"auto"`. When the object form is given, `resolveConfig()` SHALL set `cfg.harnesses.reviewer` from `command`, `cfg.harnesses.reviewerModel` from `model`, and `cfg.harnesses.reviewerEffort` from `effort`. When the string shorthand is given, `reviewerModel` and `reviewerEffort` SHALL remain unset so review routing falls back to `cfg.models.review` and `cfg.effort.review` unchanged.
+
+#### Scenario: structured review_harness unpacked
+
+- **WHEN** `.github/pipeline.yml` sets `review_harness: { command: claude, model: claude-fable-5, effort: high }`
+- **THEN** `cfg.harnesses.reviewer` SHALL be `"claude"`, `cfg.harnesses.reviewerModel` SHALL be `"claude-fable-5"`, and `cfg.harnesses.reviewerEffort` SHALL be `"high"`
+
+#### Scenario: string review_harness leaves model/effort unset
+
+- **WHEN** `.github/pipeline.yml` sets `review_harness: claude`
+- **THEN** `cfg.harnesses.reviewer` SHALL be `"claude"` and both `cfg.harnesses.reviewerModel` and `cfg.harnesses.reviewerEffort` SHALL be unset
+
+#### Scenario: unknown key under structured review_harness rejected
+
+- **WHEN** `.github/pipeline.yml` sets `review_harness: { command: claude, temperature: 0.2 }`
+- **THEN** `resolveConfig()` SHALL throw a parse error identifying `temperature` as an unknown key under `review_harness`
+

@@ -191,6 +191,7 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
     case "shipcheck-failed":
       return "eval-shipcheck-failure";
     case "merge-conflict":
+    case "head-drift":
       return "merge-conflict-or-branch-drift";
     case "worktree-missing":
     case "worktree-creation-failed":

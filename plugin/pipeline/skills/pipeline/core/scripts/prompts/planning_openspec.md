@@ -6,7 +6,7 @@ You are a senior engineer authoring an OpenSpec change proposal for {{domain_nam
 
 {{body}}{{context_snapshot}}
 
-{{carry_forward_context}}
+{{carry_forward_context}}{{cross_repo_context}}
 
 ## Task
 

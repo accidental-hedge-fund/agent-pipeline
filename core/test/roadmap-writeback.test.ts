@@ -12,7 +12,7 @@ import {
   applyMilestones,
   openRoadmapPr,
 } from "../scripts/roadmap/writeback.ts";
-import type { HygieneItem, MilestoneSpec, PlanJson } from "../scripts/roadmap/types.ts";
+import type { CrossRepoDep, HygieneItem, MilestoneSpec, PlanJson } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
 
 function makePlan(overrides: Partial<PlanJson> = {}): PlanJson {
@@ -342,5 +342,72 @@ describe("openRoadmapPr - idempotency", () => {
       switchedToBranch!.startsWith("roadmap/"),
       `gitSwitchBranch should be called with the roadmap branch, got: ${switchedToBranch}`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderRoadmapMd: cross-repo section (#312)
+// ---------------------------------------------------------------------------
+
+describe("renderRoadmapMd: cross_repo", () => {
+  it("emits Cross-Repo Dependencies section when cross_repo is non-empty", () => {
+    const crossRepo: CrossRepoDep[] = [
+      { local_issue: 5, repo: "acme/shared-lib", direction: "depends_on", rationale: "local issue text references `acme/shared-lib`" },
+    ];
+    const plan = makePlan({
+      dependency_graph: {
+        must_precede: [], should_precede: [], parallel_safe: [],
+        blocked_pending_decision: [], duplicate_merge: [], conflict_pairs: [],
+        cycle_reports: [], open_questions: [], cross_repo: crossRepo,
+      },
+    });
+    const md = renderRoadmapMd(plan);
+    assert.ok(md.includes("## Cross-Repo Dependencies"), "must emit section header");
+    assert.ok(md.includes("**#5**"), "must reference local issue");
+    assert.ok(md.includes("acme/shared-lib"), "must include repo name");
+    assert.ok(md.includes("depends_on"), "must include direction");
+    assert.ok(md.includes("local issue text references"), "must include rationale");
+  });
+
+  it("omits Cross-Repo Dependencies section when cross_repo is empty", () => {
+    const plan = makePlan({
+      dependency_graph: {
+        must_precede: [], should_precede: [], parallel_safe: [],
+        blocked_pending_decision: [], duplicate_merge: [], conflict_pairs: [],
+        cycle_reports: [], open_questions: [], cross_repo: [],
+      },
+    });
+    const md = renderRoadmapMd(plan);
+    assert.ok(!md.includes("## Cross-Repo Dependencies"), "section must be absent when cross_repo is empty");
+  });
+
+  it("omits Cross-Repo Dependencies section when cross_repo is undefined (legacy plans)", () => {
+    const plan = makePlan();
+    // dependency_graph from makePlan() does not include cross_repo at all — runtime undefined.
+    const md = renderRoadmapMd(plan);
+    assert.ok(!md.includes("## Cross-Repo Dependencies"), "section must be absent when cross_repo is undefined");
+  });
+
+  it("cross_repo entries do not appear in Must Precede section", () => {
+    const crossRepo: CrossRepoDep[] = [
+      { local_issue: 7, repo: "acme/lib", direction: "depended_on_by", rationale: "test" },
+    ];
+    const plan = makePlan({
+      dependency_graph: {
+        must_precede: [], should_precede: [], parallel_safe: [],
+        blocked_pending_decision: [], duplicate_merge: [], conflict_pairs: [],
+        cycle_reports: [], open_questions: [], cross_repo: crossRepo,
+      },
+    });
+    const md = renderRoadmapMd(plan);
+    const mustPrecedeIdx = md.indexOf("## Dependency Graph");
+    const crossRepoIdx = md.indexOf("## Cross-Repo Dependencies");
+    // Cross-repo section must appear after dependency graph section (if it appears)
+    if (mustPrecedeIdx >= 0 && crossRepoIdx >= 0) {
+      assert.ok(crossRepoIdx > mustPrecedeIdx, "cross-repo section must appear after dep graph");
+    }
+    // The annotation entry must appear in the cross-repo section, not duplicate into dep graph
+    const crossRepoSection = md.slice(crossRepoIdx);
+    assert.ok(crossRepoSection.includes("acme/lib"), "repo name must appear in cross-repo section");
   });
 });

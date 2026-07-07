@@ -7,11 +7,14 @@ import * as path from "node:path";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
+  appendIssueHistory,
   emitStageAccounting,
   emitGhMetrics,
   finalizeRun,
   initRunDir,
   isValidSummaryBundle,
+  issueHistoryDir,
+  issueHistoryPath,
   latestSummaryForIssue,
   listRunIds,
   readEvents,
@@ -21,7 +24,7 @@ import {
   type RunEvent,
   type RunStoreDeps,
 } from "../scripts/run-store.ts";
-import type { EvidenceBundle } from "../scripts/types.ts";
+import type { EvidenceBundle, IssueHistoryEntry } from "../scripts/types.ts";
 import { buildStageAccountingRecord } from "../scripts/accounting.ts";
 import { GhMetricsCollector } from "../scripts/gh.ts";
 import type { GhMetricsSummary } from "../scripts/gh.ts";
@@ -306,6 +309,76 @@ test("appendEvent: worktree_removed event appears in both events.jsonl and stdou
 });
 
 // ---------------------------------------------------------------------------
+// event sink (#343) — additive/exclusive mode gating and non-fatal delivery
+// ---------------------------------------------------------------------------
+
+test("appendEvent: additive mode (default) writes locally AND delivers to the sink", async () => {
+  const { deps, readFile } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].trim(), fileLine, "sink must receive the identical line written to events.jsonl");
+});
+
+test("appendEvent: exclusive mode delivers to the sink and does NOT write events.jsonl", async () => {
+  const { deps, files, appends } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  deps.eventSinkMode = "exclusive";
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+
+  assert.equal(delivered.length, 1);
+  assert.equal(files.has(EVENTS_JSONL), false, "events.jsonl must not be created in exclusive mode");
+  assert.equal(appends.has(EVENTS_JSONL), false, "events.jsonl must not be appended to in exclusive mode");
+});
+
+test("appendEvent: sink mode is ignored when no eventSink is configured (local write proceeds)", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSinkMode = "exclusive"; // no eventSink set — must have zero effect
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.match(fileLine, /"type":"stage_start"/);
+});
+
+test("appendEvent: a throwing sink is non-fatal; in additive mode the local write still succeeds", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSink = () => { throw new Error("sink unreachable"); };
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps); // must not throw
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.match(fileLine, /"type":"stage_start"/);
+});
+
+test("appendEvent: a rejecting async sink is non-fatal and does not abort subsequent events", async () => {
+  const { deps, readFile } = memRunStore();
+  deps.eventSink = async () => { throw new Error("network timeout"); };
+  const e1: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  const e2: RunEvent = { schema_version: 1, type: "stage_complete", at: STARTED_AT_ISO, stage: "planning", outcome: "advanced" };
+  await appendEvent(RUN_DIR, e1, deps);
+  await appendEvent(RUN_DIR, e2, deps);
+  const lines = readFile(EVENTS_JSONL).trim().split("\n");
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /"type":"stage_start"/);
+  assert.match(lines[1], /"type":"stage_complete"/);
+});
+
+test("appendEvent: with no eventSink configured, behavior is byte-for-byte unchanged (regression)", async () => {
+  const { deps, readFile, stdoutLines } = memRunStore();
+  const event: RunEvent = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" };
+  await appendEvent(RUN_DIR, event, deps);
+  const fileLine = readFile(EVENTS_JSONL);
+  assert.equal(fileLine, `${JSON.stringify(event)}\n`);
+  assert.equal(stdoutLines.length, 1);
+  assert.equal(stdoutLines[0], fileLine);
+});
+
+// ---------------------------------------------------------------------------
 // 4.3 — readEvents
 // ---------------------------------------------------------------------------
 
@@ -551,6 +624,62 @@ test("finalizeRun: writes accounting records in event order with actual/estimate
   assert.equal(summary.accounting.records[2].cost_usd, null);
 });
 
+// Regression (#377 review 1, finding 1): notifyBundlePath renders the
+// finalization comment's timing table from the exact `finalized` bundle object
+// finalizeRun was called with — it does not re-read events.jsonl. So the
+// harness-invocation-duration column only works if finalizeRun mutates the
+// caller's bundle in place (not just the separate summary.json copy).
+test("finalizeRun: mutates the passed-in bundle's accounting field with the same records written to summary.json", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+  assert.equal(bundle.accounting, undefined, "bundle must start without an accounting field");
+  await emitStageAccounting(RUN_DIR, accountingRecord({ stage: "review-1" }), deps);
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(bundle.accounting?.records.length, 1);
+  assert.equal(bundle.accounting?.records[0].stage, "review-1");
+  assert.deepEqual(bundle.accounting, summary.accounting);
+});
+
+// Regression (#343 review 1, finding 1): in exclusive sink mode events.jsonl is
+// never written, so finalizeRun must not lose stage_accounting/human_intervention
+// data — it must read from deps.summaryEvents (the sink-independent in-memory
+// collector) instead of re-reading the (absent) local file.
+test("finalizeRun: exclusive sink mode still embeds accounting + interventions via summaryEvents", async () => {
+  const { deps, readFile, files } = memRunStore();
+  deps.eventSink = () => {};
+  deps.eventSinkMode = "exclusive";
+  deps.summaryEvents = [];
+  const bundle = makeBundle();
+
+  await emitStageAccounting(RUN_DIR, accountingRecord({ stage: "review-1" }), deps);
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "human_intervention",
+      at: STARTED_AT_ISO,
+      kind: "human-risk-override",
+      stage: "review-1",
+      issue: ISSUE,
+      detail: "reviewer override applied",
+    },
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  assert.equal(files.has(path.join(RUN_DIR, "events.jsonl")), false, "exclusive mode must not create events.jsonl");
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.accounting.records.length, 1, "stage_accounting must still reach summary.json");
+  assert.equal(summary.accounting.records[0].stage, "review-1");
+  assert.equal(summary.interventions.length, 1, "human_intervention must still reach summary.json");
+  assert.equal(summary.interventions[0].kind, "human-risk-override");
+});
+
 // 4.7 — backward-compat regression test
 test("finalizeRun: writes legacy evidence.json with same content as summary.json", async () => {
   const { deps, readFile } = memRunStore();
@@ -586,6 +715,165 @@ test("finalizeRun: legacy evidence.json write failure is non-fatal", async () =>
   const summaryPath = path.join(RUN_DIR, "summary.json");
   const summary = JSON.parse(readFile(summaryPath));
   assert.equal(summary.issue, ISSUE);
+});
+
+// ---------------------------------------------------------------------------
+// Issue-level append-only evidence history (#377)
+// ---------------------------------------------------------------------------
+
+test("issueHistoryDir: resolves to <repoDir>/.agent-pipeline/history", () => {
+  assert.equal(issueHistoryDir(REPO_DIR), path.join(REPO_DIR, ".agent-pipeline", "history"));
+});
+
+test("issueHistoryPath: resolves to <repoDir>/.agent-pipeline/history/issue-<N>.jsonl", () => {
+  assert.equal(
+    issueHistoryPath(REPO_DIR, ISSUE),
+    path.join(REPO_DIR, ".agent-pipeline", "history", `issue-${ISSUE}.jsonl`),
+  );
+});
+
+function makeHistoryEntry(runId: string): IssueHistoryEntry {
+  return {
+    schema_version: 1,
+    run_id: runId,
+    issue: ISSUE,
+    pr: 42,
+    branch: "pipeline/155-x",
+    final_state: "ready-to-deploy",
+    finalized_at: "2026-06-16T22:00:00Z",
+    stages: [
+      { stage: "planning", enteredAt: "2026-06-16T21:00:00Z", exitedAt: "2026-06-16T21:04:15Z", durationMs: 255000, outcome: "advanced" },
+    ],
+  };
+}
+
+test("appendIssueHistory: creates the file on first write and writes a single valid JSON line", async () => {
+  const { deps, readFile } = memRunStore();
+
+  await appendIssueHistory(REPO_DIR, ISSUE, makeHistoryEntry("155-a"), deps);
+
+  const lines = readFile(issueHistoryPath(REPO_DIR, ISSUE)).split("\n").filter(Boolean);
+  assert.equal(lines.length, 1);
+  const parsed = JSON.parse(lines[0]);
+  assert.equal(parsed.run_id, "155-a");
+  assert.equal(parsed.issue, ISSUE);
+});
+
+test("appendIssueHistory: a throwing appendFile is non-fatal (no throw)", async () => {
+  const { deps: baseDeps } = memRunStore();
+  const deps: RunStoreDeps = {
+    ...baseDeps,
+    appendFile: async () => {
+      throw new Error("disk full");
+    },
+  };
+
+  await assert.doesNotReject(appendIssueHistory(REPO_DIR, ISSUE, makeHistoryEntry("155-a"), deps));
+});
+
+const ISSUE_HISTORY_PATH = path.join(REPO_DIR, ".agent-pipeline", "history", `issue-${ISSUE}.jsonl`);
+const RUN_DIR_2 = path.join(REPO_DIR, ".agent-pipeline", "runs", `${ISSUE}-2026-06-17T09-00-00-000Z`);
+
+function makeBundleWithStages(finalState: string | null = "ready-to-deploy"): EvidenceBundle {
+  return {
+    ...makeBundle(finalState),
+    stages: [
+      {
+        stage: "planning",
+        enteredAt: "2026-06-16T21:00:00Z",
+        exitedAt: "2026-06-16T21:04:15Z",
+        outcome: "advanced",
+        commits: ["abc1234"],
+        commands: [],
+        prompts: [],
+      },
+      {
+        stage: "review-1",
+        enteredAt: "2026-06-16T21:05:00Z",
+        exitedAt: "2026-06-16T21:06:00Z",
+        outcome: "advanced",
+        commits: [],
+        commands: [],
+        prompts: [],
+      },
+    ],
+  };
+}
+
+function readHistoryLines(readFile: (p: string) => string): unknown[] {
+  return readFile(ISSUE_HISTORY_PATH)
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+test("finalizeRun: appends one issue-history entry with run id, per-stage timings, and outcome", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundleWithStages();
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const lines = readHistoryLines(readFile) as Array<Record<string, unknown>>;
+  assert.equal(lines.length, 1);
+  const entry = lines[0];
+  assert.equal(entry.run_id, `${ISSUE}-${STARTED_AT}`);
+  assert.equal(entry.issue, ISSUE);
+  assert.equal(entry.final_state, "ready-to-deploy");
+  assert.equal(entry.schema_version, 1);
+  const stages = entry.stages as Array<Record<string, unknown>>;
+  assert.equal(stages.length, 2);
+  assert.equal(stages[0].stage, "planning");
+  assert.equal(stages[0].durationMs, 255000);
+  assert.equal(stages[0].outcome, "advanced");
+});
+
+test("finalizeRun: re-run appends a second entry; the first entry is byte-identical afterward (append, not rewrite)", async () => {
+  const { deps, readFile } = memRunStore();
+
+  await finalizeRun(RUN_DIR, makeBundleWithStages(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const firstLineBefore = readFile(ISSUE_HISTORY_PATH).split("\n").filter(Boolean)[0];
+
+  await finalizeRun(RUN_DIR_2, makeBundleWithStages(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const lines = readFile(ISSUE_HISTORY_PATH).split("\n").filter(Boolean);
+  assert.equal(lines.length, 2, "re-run must append, not replace");
+  assert.equal(lines[0], firstLineBefore, "prior entry must remain byte-identical");
+  const parsed = lines.map((l) => JSON.parse(l));
+  assert.equal(parsed[0].run_id, `${ISSUE}-${STARTED_AT}`);
+  assert.equal(parsed[1].run_id, path.basename(RUN_DIR_2));
+});
+
+test("finalizeRun: N finalizes on one issue yield exactly N history entries", async () => {
+  const { deps, readFile } = memRunStore();
+  const runDirs = [RUN_DIR, RUN_DIR_2, path.join(REPO_DIR, ".agent-pipeline", "runs", `${ISSUE}-2026-06-18T09-00-00-000Z`)];
+
+  for (const dir of runDirs) {
+    await finalizeRun(dir, makeBundleWithStages(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  }
+
+  const lines = readHistoryLines(readFile);
+  assert.equal(lines.length, runDirs.length);
+});
+
+test("finalizeRun: history append failure is non-fatal — summary.json and legacy evidence.json still write", async () => {
+  const { deps: baseDeps, readFile } = memRunStore();
+  const deps: RunStoreDeps = {
+    ...baseDeps,
+    appendFile: async (p, data) => {
+      if (p.includes("history")) {
+        throw new Error("disk full");
+      }
+      await baseDeps.appendFile(p, data);
+    },
+  };
+  const bundle = makeBundleWithStages();
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps); // must not throw
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.issue, ISSUE);
+  const legacy = JSON.parse(readFile(path.join(STATE_DIR, String(ISSUE), "evidence.json")));
+  assert.equal(legacy.issue, ISSUE);
 });
 
 // ---------------------------------------------------------------------------

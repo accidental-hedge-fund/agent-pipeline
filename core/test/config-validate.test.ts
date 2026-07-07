@@ -738,3 +738,44 @@ test("validateConfig: roadmap concurrency keys absent → valid (defaults applie
   );
   assert.equal(concurrencyDiags.length, 0, "absent concurrency keys should not produce diagnostics");
 });
+
+// ---- repo_map (#312) schema observability ----
+
+test("generateConfigSchema: repo_map property exists with depends_on and depended_on_by sub-properties", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const props = schema.properties as Record<string, unknown>;
+  assert.ok(props["repo_map"], "repo_map must exist in schema");
+  const rmDef = props["repo_map"] as Record<string, unknown>;
+  assert.ok(typeof rmDef["description"] === "string" && rmDef["description"].length > 0, "repo_map must have a description");
+  // repo_map may be wrapped as anyOf (optional/nullable in zod-to-json-schema)
+  const rmProps = (rmDef["properties"] as Record<string, unknown> | undefined) ??
+    ((rmDef["anyOf"] as Array<Record<string, unknown>> | undefined)?.find((s) => s["properties"])?.["properties"] as Record<string, unknown> | undefined);
+  assert.ok(rmProps, "repo_map must have nested properties (possibly via anyOf)");
+  assert.ok(rmProps["depends_on"], "repo_map must have depends_on sub-property");
+  assert.ok(rmProps["depended_on_by"], "repo_map must have depended_on_by sub-property");
+});
+
+test("generateConfigSchema: repo_map is not in top-level required array", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const required = (schema.required ?? []) as string[];
+  assert.ok(!required.includes("repo_map"), "repo_map must not be in the required array");
+});
+
+
+test("generateConfigSchema: ci_mode has github/local enum and non-empty description (#350)", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const props = schema.properties as Record<string, unknown>;
+  assert.ok(props["ci_mode"], "ci_mode must exist in schema");
+  const def = props["ci_mode"] as Record<string, unknown>;
+  // ci_mode may be wrapped in anyOf by zod-to-json-schema for optional fields
+  const resolved = (def["anyOf"] as Array<Record<string, unknown>> | undefined)
+    ?.find((s) => Array.isArray(s["enum"])) ?? def;
+  assert.ok(
+    Array.isArray(resolved["enum"]) && resolved["enum"].includes("github") && resolved["enum"].includes("local"),
+    "ci_mode enum must include github and local",
+  );
+  assert.ok(
+    typeof def["description"] === "string" && def["description"].length > 0,
+    "ci_mode must carry a non-empty description",
+  );
+});

@@ -141,6 +141,7 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
     setBlocked: async () => {},
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
   };
 
   await quiet(t, async () => {
@@ -296,6 +297,7 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       setBlocked: async () => {},
       getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
       branchDeveloperCommits: async () => [],
+      trustedReviewAuthor: "test-actor",
     });
   });
 
@@ -326,10 +328,93 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       setBlocked: async () => {},
       getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
       branchDeveloperCommits: async () => [],
+      trustedReviewAuthor: "test-actor",
     });
   });
 
   assert.deepEqual(archiveCallsRun2, [CHANGE_ID], "archive must be called on the retry run");
   assert.equal((run2 as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.status, "waiting",
     "retry run must complete archive and return waiting");
+});
+
+// ---------------------------------------------------------------------------
+// 6. maybeArchiveOpenspec: CLI unavailable with active candidates → blocked (#308)
+// ---------------------------------------------------------------------------
+
+test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks with openspec-invalid", async (t) => {
+  // Regression for #308: when openspec archive returns { unavailable: true } and
+  // there is at least one active change candidate, the step must block rather than
+  // return null (which would silently skip the archive and ship an orphaned change dir).
+  const CHANGE_ID = "some-active-change";
+  const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
+
+  const blockedCalls: Array<{ reason: string; stage: string; label: string }> = [];
+  const archiveCalls: string[] = [];
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 }; // clean
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => true,
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { unavailable: true, success: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    setBlocked: (async (_cfg, _n, reason, stage, label) => {
+      blockedCalls.push({ reason, stage, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  let out;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+  });
+
+  assert.equal((out as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.status, "blocked",
+    "must return blocked, not null, when CLI is unavailable with active candidates");
+  assert.equal((out as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.advanced, false);
+  assert.equal(blockedCalls.length, 1, "setBlocked must be called exactly once");
+  assert.equal(blockedCalls[0].stage, "pre-merge");
+  assert.equal(blockedCalls[0].label, "openspec-invalid");
+  assert.match(blockedCalls[0].reason, /openspec/, "reason must mention openspec CLI");
+  assert.match(blockedCalls[0].reason, new RegExp(CHANGE_ID), "reason must name the change id");
+});
+
+test("maybeArchiveOpenspec: CLI unavailable with no active candidates → returns null without calling archive or setBlocked (#308 no-regression)", async () => {
+  // When there are no active candidates, the CLI is never invoked, so unavailability
+  // must not block — repos with nothing to archive are unaffected.
+  const archiveCalls: string[] = [];
+  const blockedCalls: string[] = [];
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "diff") return { stdout: "", stderr: "", code: 0 }; // no paths in diff
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    changeDirExists: () => false,
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { unavailable: true, success: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    setBlocked: async (_cfg, _n, reason) => {
+      blockedCalls.push(reason);
+    },
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    branchDeveloperCommits: async () => [],
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+
+  assert.equal(out, null, "must return null (continue) when there are no active candidates");
+  assert.deepEqual(archiveCalls, [], "openspecArchive must NOT be called when no candidates");
+  assert.deepEqual(blockedCalls, [], "setBlocked must NOT be called when no candidates");
 });

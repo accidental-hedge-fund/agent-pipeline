@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
-import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig } from "./config.ts";
+import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -155,6 +155,8 @@ export interface CliOpts {
   jsonEvents?: boolean;
   /** Follow mode for `pipeline logs <run-id> --follow` (-f). */
   follow?: boolean;
+  /** Read/follow events.jsonl instead of terminal.log in `pipeline logs`. */
+  events?: boolean;
   // `pipeline run <N> --detach` options
   detach?: boolean;
   timeout?: number;
@@ -218,6 +220,10 @@ export interface CliOpts {
   milestone?: string;
   /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
   risk?: string;
+  /** backfill: scope the apply slice to a named capability. */
+  capability?: string;
+  /** config repo-map add/remove: target relationship list (default: depends_on). */
+  rel?: string;
 }
 
 /**
@@ -234,7 +240,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -257,6 +263,7 @@ export function buildCmd(): Command {
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
     .option("-f, --follow", "follow mode for 'pipeline logs <run-id> --follow': stream new output as appended")
+    .option("--events", "logs mode: read/follow events.jsonl instead of terminal.log")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
@@ -267,9 +274,9 @@ export function buildCmd(): Command {
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap/sweep/improve/config sync: execute write-backs; default is dry-run/preview")
+    .option("--apply", "roadmap/sweep/backfill/improve/config sync: execute write-backs; default is dry-run/preview")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
-    .option("--repo <owner/repo>", "sweep: override the target GitHub repository (default: current repo from gh config)")
+    .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
@@ -287,7 +294,10 @@ export function buildCmd(): Command {
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
     .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
-    .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)");
+    .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
+    // backfill options (#327)
+    .option("--capability <name>", "backfill: scope the apply slice to a named capability")
+    .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -354,15 +364,19 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "config" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      "Usage: pipeline config <schema|validate|sync> [--repo-path <path>] [--apply] [--json]\n\n" +
+      "Usage: pipeline config <schema|validate|sync|repo-map> [--repo-path <path>] [--apply] [--json]\n\n" +
       "Config maintenance commands:\n" +
-      "  schema                 print the JSON Schema for .github/pipeline.yml\n" +
-      "  validate               validate .github/pipeline.yml and print diagnostics\n" +
-      "  sync                   preview a current scaffold refresh; use --apply to write\n\n" +
+      "  schema                          print the JSON Schema for .github/pipeline.yml\n" +
+      "  validate                        validate .github/pipeline.yml and print diagnostics\n" +
+      "  sync                            preview a current scaffold refresh; use --apply to write\n" +
+      "  repo-map add <owner/repo>       add an entry to repo_map (creates the block if absent)\n" +
+      "  repo-map remove <owner/repo>    remove an entry from repo_map (no-op if absent)\n" +
+      "  repo-map list                   print current repo_map entries grouped by relationship\n\n" +
       "Options:\n" +
       "  --repo-path <path>      operate on the git root containing this path\n" +
       "  --apply                 config sync only: write the refreshed file after safe validation\n" +
-      "  --json                  validate/sync: emit machine-readable JSON\n\n" +
+      "  --json                  validate/sync: emit machine-readable JSON\n" +
+      "  --rel <relation>        repo-map add/remove: depends_on or depended_on_by (default: depends_on)\n\n" +
       "Exit code: 0 on success; non-zero for invalid config, unsafe sync, or invalid usage.\n",
     );
     process.exit(0);
@@ -384,6 +398,8 @@ async function main(): Promise<void> {
   const isIntakeCommand = numArg === "intake";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
   const isSweepCommand = numArg === "sweep";
+  // `pipeline backfill [--apply] [--capability <name>] [--repo <owner/repo>]` — OpenSpec coverage backfill.
+  const isBackfillCommand = numArg === "backfill";
   // `pipeline triage <issue> --stage ready|backlog` — set an issue's pre-pipeline stage label.
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
@@ -405,7 +421,7 @@ async function main(): Promise<void> {
       typeof logsArg === "string" && logsArg.length > 0 && !logsArg.startsWith("-")
         ? logsArg
         : undefined;
-    await runLogs(repoDir, logsRunId, !!opts.follow);
+    await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events);
     return;
   }
 
@@ -489,9 +505,9 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
-  // `pipeline improve --json`, `pipeline scoreboard --json`, and `--remove-worktree --json` legitimately emit JSON —
-  // exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard") {
+  // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
+  // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -558,6 +574,22 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     if (opts.detach) {
+      // Guard: reject mode-selector flags before launching a detached advance,
+      // just as the `pipeline N --detach` canonical path does (lines ~591-602).
+      const runModeConflicts: Array<[string, boolean | string | undefined]> = [
+        ["--status", opts.status],
+        ["--summary", opts.summary],
+        ["--unblock", opts.unblock !== undefined],
+        ["--override", opts.override !== undefined],
+        ["--cleanup", opts.cleanup],
+        ["--init", opts.init],
+      ];
+      for (const [flag, active] of runModeConflicts) {
+        if (active) {
+          console.error(`pipeline run: --detach cannot be combined with ${flag}. These are separate modes.`);
+          process.exit(2);
+        }
+      }
       // Detach path: spawn a background wrapper and exit.
       await handleRunSubcommand(cmd.args[1] ?? "", opts);
       return;
@@ -575,6 +607,34 @@ async function main(): Promise<void> {
     numArg = runIssueArg;
   }
 
+  // `pipeline N --detach`: detach the advance loop to a background process.
+  // Equivalent to the legacy `pipeline run N --detach`; `run` is retained as an
+  // undocumented alias but `N --detach` is the canonical detached-launch surface.
+  // Guard: require exactly one positional (the issue number) and reject incompatible
+  // mode-selector flags before dispatching, so e.g. `pipeline 42 config validate --detach`
+  // or `pipeline 42 --status --detach` never accidentally start a mutating advance.
+  if (opts.detach && numArg && /^\d+$/.test(numArg)) {
+    if (cmd.args.length > 1) {
+      const extra = cmd.args.slice(1).join(", ");
+      console.error(`pipeline: unexpected argument(s): ${extra}`);
+      process.exit(2);
+    }
+    const detachModeConflicts: Array<[string, boolean | string | undefined]> = [
+      ["--status", opts.status],
+      ["--summary", opts.summary],
+      ["--unblock", opts.unblock !== undefined],
+      ["--override", opts.override !== undefined],
+    ];
+    for (const [flag, active] of detachModeConflicts) {
+      if (active) {
+        console.error(`pipeline: --detach cannot be combined with ${flag}. These are separate modes.`);
+        process.exit(2);
+      }
+    }
+    await handleRunSubcommand(numArg, opts);
+    return;
+  }
+
   // `pipeline path [--json]` — probe installed hosts and print the result.
   if (numArg === "path") {
     await handlePathSubcommand(opts);
@@ -586,13 +646,18 @@ async function main(): Promise<void> {
   // `intake [description]` legitimately have two positionals; `config`/`path`
   // already returned above. `sweep` is a bulk command with no issue number —
   // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
+  // `status <N>` takes two positionals; `unblock <N> "<answer>"` and
+  // `override <N> "<spec>"` take three.
   const maxPositionals =
     cmd.args[0] === "run" ||
     cmd.args[0] === "release" ||
     cmd.args[0] === "intake" ||
     cmd.args[0] === "triage" ||
-    cmd.args[0] === "merge"
+    cmd.args[0] === "merge" ||
+    cmd.args[0] === "status"
       ? 2
+      : cmd.args[0] === "unblock" || cmd.args[0] === "override"
+      ? 3
       : 1; // refine-spec takes only flags (no extra positionals)
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
@@ -642,7 +707,7 @@ async function main(): Promise<void> {
       await runIntake(
         { description: descriptionArg ?? "", release: opts.release, dryRun: opts.dryRun },
         intakeCfg,
-        realIntakeDeps(repoDir, intakeCfg.intake_model),
+        realIntakeDeps(repoDir, intakeCfg.intake_model, intakeCfg.intake_effort),
       );
     } catch (err) {
       console.error(`pipeline intake: ${(err as Error).message}`);
@@ -794,7 +859,7 @@ async function main(): Promise<void> {
         roadmapCfg.repo_dir,
         roadmapCfg.base_branch,
         roadmapCfg.roadmap ?? {},
-        { apply: !!opts.apply, next: opts.next, dryRun: opts.dryRun },
+        { apply: !!opts.apply, next: opts.next, dryRun: opts.dryRun, repoMap: roadmapCfg.repo_map },
         realRoadmapDeps(roadmapCfg),
       );
     } catch (err) {
@@ -824,10 +889,34 @@ async function main(): Promise<void> {
         { apply: !!opts.apply, repo: opts.repo },
         { repo_dir: sweepCfg.repo_dir, repo: sweepCfg.repo, base_branch: sweepCfg.base_branch, sweep_timeout: sweepCfg.sweep_timeout },
         sweepConfig,
-        realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep),
+        realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep, sweepCfg.effort.sweep),
       );
     } catch (err) {
       console.error(`pipeline sweep: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Early backfill dispatch — no issue number; derives repo/config from local git state.
+  // Preview by default (non-mutating); --apply opens a spec-only PR.
+  if (isBackfillCommand) {
+    let backfillCfg: import("./types.ts").PipelineConfig;
+    try {
+      backfillCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline backfill: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const { runBackfill, realBackfillDeps } = await import("./stages/backfill.ts");
+    try {
+      await runBackfill(
+        { apply: !!opts.apply, capability: opts.capability },
+        { repo_dir: backfillCfg.repo_dir, repo: backfillCfg.repo, base_branch: backfillCfg.base_branch },
+        realBackfillDeps(backfillCfg.repo_dir),
+      );
+    } catch (err) {
+      console.error(`pipeline backfill: ${(err as Error).message}`);
       process.exit(1);
     }
     return;
@@ -906,7 +995,11 @@ async function main(): Promise<void> {
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
-    const recognized = ["init", "doctor", "logs", "path", "config", "run", "release", "intake", "refine-spec", "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue"];
+    const recognized = [
+      "init", "doctor", "status", "unblock", "override", "cleanup",
+      "logs", "path", "config", "run", "release", "intake", "refine-spec",
+      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill",
+    ];
     if (!recognized.includes(numArg)) {
       console.error(
         `pipeline: unrecognized sub-command "${numArg}".\n` +
@@ -975,18 +1068,148 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  if (opts.cleanup) {
+  // Legacy `--cleanup` flag form — deprecated; use `pipeline cleanup` or
+  // `/pipeline:cleanup` instead.
+  if (opts.cleanup && isNumericOrAbsent) {
+    process.stderr.write(
+      "Deprecated: `pipeline --cleanup` is deprecated. Use `pipeline cleanup` or `/pipeline:cleanup` instead.\n",
+    );
+    await runCleanup(cfg);
+    return;
+  }
+
+  // Positional `pipeline cleanup` keyword dispatch.
+  if (numArg === "cleanup") {
     await runCleanup(cfg);
     return;
   }
 
   if (isInit) {
+    // Legacy `--init` flag form — deprecated; use `pipeline init` or `/pipeline:init` instead.
+    if (opts.init && isNumericOrAbsent) {
+      process.stderr.write(
+        "Deprecated: `pipeline --init` is deprecated. Use `pipeline init` or `/pipeline:init` instead.\n",
+      );
+    }
     await runInit(cfg);
     return;
   }
 
   if (isDoctorCommand) {
     await runDoctor(cfg, opts);
+    return;
+  }
+
+  // Positional `pipeline status <N> [--json]` keyword dispatch.
+  // Equivalent to the legacy `pipeline <N> --status [--json]`.
+  if (numArg === "status") {
+    const statusNumStr = cmd.args[1];
+    if (!statusNumStr || !/^\d+$/.test(statusNumStr)) {
+      console.error(
+        "pipeline status: an issue or PR number is required.\n" +
+          "  Usage: pipeline status <N>\n" +
+          "  Example: pipeline status 42",
+      );
+      process.exit(2);
+    }
+    const statusN = Number.parseInt(statusNumStr, 10);
+    let statusIssueNumber: number;
+    try {
+      statusIssueNumber = await resolveIssueNumber(cfg, statusN, { quiet: !!opts.json });
+    } catch (err) {
+      const e = err as Error;
+      if (opts.json) {
+        console.log(JSON.stringify({ schema_version: "1", status: "error", error: e.message }));
+        process.exitCode = 1;
+      } else {
+        console.error(`pipeline: ${e.message}`);
+        process.exit(1);
+      }
+      return;
+    }
+    await runStatus(cfg, statusIssueNumber, defaultRunStatusDeps, { json: opts.json });
+    return;
+  }
+
+  // Positional `pipeline unblock <N> "<answer>"` keyword dispatch.
+  // Equivalent to the legacy `pipeline <N> --unblock "<answer>"`.
+  if (numArg === "unblock") {
+    const unblockNumStr = cmd.args[1];
+    const unblockAnswer = cmd.args[2];
+    if (!unblockNumStr || !/^\d+$/.test(unblockNumStr)) {
+      console.error(
+        "pipeline unblock: an issue or PR number is required.\n" +
+          '  Usage: pipeline unblock <N> "<answer>"\n' +
+          '  Example: pipeline unblock 42 "The fix is in branch feat/foo"',
+      );
+      process.exit(2);
+    }
+    if (unblockAnswer === undefined) {
+      console.error(
+        "pipeline unblock: an answer string is required.\n" +
+          '  Usage: pipeline unblock <N> "<answer>"\n' +
+          '  Example: pipeline unblock 42 "The fix is in branch feat/foo"',
+      );
+      process.exit(2);
+    }
+    // Kill-switch check: same gate as the legacy `pipeline N --unblock` form.
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
+    }
+    const unblockN = Number.parseInt(unblockNumStr, 10);
+    let unblockIssueNumber: number;
+    try {
+      unblockIssueNumber = await resolveIssueNumber(cfg, unblockN);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runUnblock(cfg, unblockIssueNumber!, unblockAnswer, unblockN);
+    return;
+  }
+
+  // Positional `pipeline override <N> "<spec>"` keyword dispatch.
+  // Equivalent to the legacy `pipeline <N> --override "<spec>"`.
+  if (numArg === "override") {
+    const overrideNumStr = cmd.args[1];
+    const overrideSpec = cmd.args[2];
+    if (!overrideNumStr || !/^\d+$/.test(overrideNumStr)) {
+      console.error(
+        "pipeline override: an issue or PR number is required.\n" +
+          '  Usage: pipeline override <N> "<key>: <reason>"\n' +
+          '  Example: pipeline override 42 "abc123: deferred #99"',
+      );
+      process.exit(2);
+    }
+    if (overrideSpec === undefined) {
+      console.error(
+        "pipeline override: a spec string is required.\n" +
+          '  Usage: pipeline override <N> "<key>: <reason>"\n' +
+          '  Example: pipeline override 42 "abc123: deferred #99"',
+      );
+      process.exit(2);
+    }
+    // Kill-switch check: same gate as the legacy `pipeline N --override` form.
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
+    }
+    const overrideN = Number.parseInt(overrideNumStr, 10);
+    let overrideIssueNumber: number;
+    try {
+      overrideIssueNumber = await resolveIssueNumber(cfg, overrideN);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    await runOverride(cfg, overrideIssueNumber!, overrideSpec, opts, undefined, overrideN);
     return;
   }
 
@@ -1003,6 +1226,9 @@ async function main(): Promise<void> {
   // kill-switch check, label-ensure, or lock — and treats <number> as the issue
   // number the bundle is keyed by.
   if (opts.summary) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --summary\` is deprecated. Use \`/pipeline:summary ${number}\` instead.\n`,
+    );
     await runSummary(cfg, number, cfg.repo_dir);
     return;
   }
@@ -1014,6 +1240,9 @@ async function main(): Promise<void> {
   // for a stuck run; blocking them with a kill-switch check would prevent
   // recovery, so they also bypass it (below).
   if (opts.status) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --status\` is deprecated. Use \`pipeline status ${number}\` or \`/pipeline:status\` instead.\n`,
+    );
     let issueNumber: number;
     try {
       issueNumber = await resolveIssueNumber(cfg, number, { quiet: !!opts.json });
@@ -1060,6 +1289,9 @@ async function main(): Promise<void> {
   }
 
   if (opts.unblock !== undefined) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --unblock\` is deprecated. Use \`pipeline unblock ${number} "<answer>"\` or \`/pipeline:unblock\` instead.\n`,
+    );
     let issueNumber: number;
     try {
       issueNumber = await resolveIssueNumber(cfg, number);
@@ -1068,10 +1300,13 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runUnblock(cfg, issueNumber, opts.unblock);
+    await runUnblock(cfg, issueNumber, opts.unblock, number);
     return;
   }
   if (opts.override !== undefined) {
+    process.stderr.write(
+      `Deprecated: \`pipeline ${number} --override\` is deprecated. Use \`pipeline override ${number} "<spec>"\` or \`/pipeline:override\` instead.\n`,
+    );
     let issueNumber: number;
     try {
       issueNumber = await resolveIssueNumber(cfg, number);
@@ -1080,7 +1315,7 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    await runOverride(cfg, issueNumber, opts.override, opts);
+    await runOverride(cfg, issueNumber, opts.override, opts, undefined, number);
     return;
   }
 
@@ -1276,8 +1511,84 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
     return;
   }
 
+  if (subcmd === "repo-map") {
+    await runConfigRepoMapCommand(args.slice(1), opts);
+    return;
+  }
+
   const sub = subcmd ? `"${subcmd}"` : "(none)";
-  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate, sync`);
+  console.error(`pipeline config: unknown subcommand ${sub}. Available: schema, validate, sync, repo-map`);
+  process.exitCode = 2;
+}
+
+/**
+ * `pipeline config repo-map add <owner/repo> [--rel depends_on|depended_on_by]`
+ * `pipeline config repo-map remove <owner/repo> [--rel depends_on|depended_on_by]`
+ * `pipeline config repo-map list`
+ */
+async function runConfigRepoMapCommand(args: string[], opts: CliOpts): Promise<void> {
+  const action = args[0];
+  const repoPath = opts.repoPath ?? process.cwd();
+
+  if (action === "list") {
+    if (args.length > 1) {
+      console.error(`pipeline config repo-map list: unexpected argument(s): ${args.slice(1).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const result = repoMapList(repoPath, { profile: opts.profile });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else if (!result.ok) {
+      console.error(result.message);
+    } else if (result.entries.depends_on.length === 0 && result.entries.depended_on_by.length === 0) {
+      console.log(result.message);
+    } else {
+      console.log(`repo_map (${result.configPath}):`);
+      console.log(`  depends_on:`);
+      for (const r of result.entries.depends_on) console.log(`    - ${r}`);
+      console.log(`  depended_on_by:`);
+      for (const r of result.entries.depended_on_by) console.log(`    - ${r}`);
+    }
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
+
+  if (action === "add" || action === "remove") {
+    const ownerRepo = args[1];
+    if (!ownerRepo) {
+      console.error(`pipeline config repo-map ${action}: <owner/repo> argument is required`);
+      process.exitCode = 2;
+      return;
+    }
+    if (args.length > 2) {
+      console.error(`pipeline config repo-map ${action}: unexpected argument(s): ${args.slice(2).join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const rel = opts.rel ?? "depends_on";
+    if (rel !== "depends_on" && rel !== "depended_on_by") {
+      console.error(`pipeline config repo-map ${action}: --rel must be "depends_on" or "depended_on_by", got "${rel}"`);
+      process.exitCode = 2;
+      return;
+    }
+    const result =
+      action === "add"
+        ? repoMapAdd(repoPath, ownerRepo, rel as RepoMapRelation, { profile: opts.profile })
+        : repoMapRemove(repoPath, ownerRepo, rel as RepoMapRelation, { profile: opts.profile });
+
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    } else {
+      console.log(result.message);
+      if (result.warning) console.warn(`warning: ${result.warning}`);
+    }
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
+
+  const sub = action ? `"${action}"` : "(none)";
+  console.error(`pipeline config repo-map: unknown subcommand ${sub}. Available: add, remove, list`);
   process.exitCode = 2;
 }
 
@@ -1690,6 +2001,7 @@ export async function runLogs(
   repoDir: string,
   runId: string | undefined,
   follow: boolean,
+  events = false,
 ): Promise<void> {
   // No run-id: list available runs, most recent first, then exit 0.
   if (runId === undefined) {
@@ -1703,7 +2015,8 @@ export async function runLogs(
   }
 
   const dir = runDirPath(repoDir, runId);
-  const logFile = path.join(dir, "terminal.log");
+  const fileName = events ? "events.jsonl" : "terminal.log";
+  const logFile = path.join(dir, fileName);
 
   // Check that the run directory exists.
   try {
@@ -1715,13 +2028,13 @@ export async function runLogs(
   }
 
   if (!follow) {
-    // Print terminal.log and exit.
+    // Print the selected run-store log and exit.
     let content: string;
     try {
       content = await defaultRunStoreDeps.readFile(logFile);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        console.error(`pipeline logs: terminal.log not yet written for run '${runId}'`);
+        console.error(`pipeline logs: ${fileName} not yet written for run '${runId}'`);
         process.exitCode = 1;
         return;
       }
@@ -1732,7 +2045,7 @@ export async function runLogs(
   }
 
   // --follow: tail -f, independent of the original pipeline process. Resolve when
-  // the tail child exits or errors — including the case where terminal.log does
+  // the tail child exits or errors — including the case where the selected log does
   // not exist yet — so a failed follow exits non-zero and releases the caller
   // instead of awaiting an unresolvable promise forever (#155).
   await new Promise<void>((resolve) => {
@@ -1896,20 +2209,60 @@ export async function handlePathSubcommand(
 // Unblock mode
 // ---------------------------------------------------------------------------
 
-/** Append a blocker_cleared event to the most recent run directory for issueNumber.
+async function runJsonIssue(repoDir: string, runId: string, deps: RunStoreDeps): Promise<number | null> {
+  try {
+    const raw = await deps.readFile(path.join(runDirPath(repoDir, runId), "run.json"));
+    const parsed = JSON.parse(raw) as { issue?: unknown };
+    return typeof parsed.issue === "number" && Number.isFinite(parsed.issue) ? parsed.issue : null;
+  } catch {
+    return null;
+  }
+}
+
+async function findBlockerClearedRunId(
+  repoDir: string,
+  issueNumber: number,
+  originalNumber: number | undefined = issueNumber,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<string | null> {
+  const allIds = await listRunIds(repoDir, deps).catch(() => [] as string[]);
+  const prefixNumbers = [originalNumber, issueNumber].filter(
+    (n, idx, arr): n is number =>
+      typeof n === "number" && Number.isFinite(n) && n > 0 && arr.indexOf(n) === idx,
+  );
+  for (const n of prefixNumbers) {
+    const id = allIds.find((runId) => runId.startsWith(`${n}-`));
+    if (id) return id;
+  }
+  for (const id of allIds) {
+    if (await runJsonIssue(repoDir, id, deps) === issueNumber) return id;
+  }
+  return null;
+}
+
+/** Append a blocker_cleared event to the most relevant run directory.
  *  Best-effort: silently skips if no run directory is found. */
-async function appendBlockerCleared(repoDir: string, issueNumber: number): Promise<void> {
-  const allIds = await listRunIds(repoDir).catch(() => [] as string[]);
-  const id = allIds.find((runId) => runId.startsWith(`${issueNumber}-`));
+async function appendBlockerCleared(
+  repoDir: string,
+  issueNumber: number,
+  originalNumber: number | undefined = issueNumber,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  const id = await findBlockerClearedRunId(repoDir, issueNumber, originalNumber, deps);
   if (!id) return;
   await appendEvent(
     runDirPath(repoDir, id),
     { schema_version: RUN_SCHEMA_VERSION, type: "blocker_cleared", at: evidenceTimestamp() },
-    defaultRunStoreDeps,
+    deps,
   ).catch(() => {});
 }
 
-async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: string): Promise<void> {
+async function runUnblock(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  answer: string,
+  originalNumber: number = issueNumber,
+): Promise<void> {
   const detail = await getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
@@ -1931,8 +2284,9 @@ async function runUnblock(cfg: PipelineConfig, issueNumber: number, answer: stri
   ].join("\n");
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
-  await appendBlockerCleared(cfg.repo_dir, issueNumber);
-  console.log(`[pipeline] #${issueNumber}: unblocked at ${stage}`);
+  await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
+  const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
+  console.log(unblockLine);
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,6 +2318,7 @@ export async function runOverride(
   spec: string,
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
+  originalNumber: number = issueNumber,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2014,7 +2369,7 @@ export async function runOverride(
   // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
     await deps.clearBlocked(cfg, issueNumber);
-    await appendBlockerCleared(cfg.repo_dir, issueNumber);
+    await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
   }
   console.log(`[pipeline] #${issueNumber}: ${overrideLogMsg}`);
 
@@ -2067,7 +2422,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 // ---------------------------------------------------------------------------
 
 // dispatch and realPlanningRecoveryDeps are imported from pipeline-run.ts above.
-export const _internals = { dispatch, runInit, isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue, realPlanningRecoveryDeps };
+export const _internals = {
+  dispatch,
+  runInit,
+  isAutoLoopRecoverable,
+  isAutoLoopEligible,
+  canAutoLoopContinue,
+  realPlanningRecoveryDeps,
+  appendBlockerCleared,
+  findBlockerClearedRunId,
+};
 
 // Suppress unused import warnings for test-only helpers.
 void addLabel;

@@ -64,6 +64,7 @@ flowchart LR
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Troubleshooting](#troubleshooting)
   - [Evidence bundle](#evidence-bundle)
+  - [External event sink](#external-event-sink-optional)
   - [Machine-readable artifact conventions](#machine-readable-artifact-conventions)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
@@ -231,55 +232,73 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 
 ## Usage
 
+Each operation is available as its own discoverable `/pipeline:<command>` (Claude Code)
+or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
+
 ```text
 /pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
-/pipeline N --status   $pipeline N --status   read-only: stage, blocker, PR, last review
-/pipeline N --status --json                   machine-readable JSON status envelope (stable contract)
-/pipeline N --summary  $pipeline N --summary  print the run's evidence bundle (local, offline) and exit
-/pipeline summary <run-id>                    print the evidence bundle for an exact run (domain-independent)
-/pipeline N --unblock "<answer>"              post answer + clear the blocked label
-$pipeline N --unblock "<answer>"              (same for Codex)
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
-/pipeline --cleanup    $pipeline --cleanup    sweep merged-PR worktrees, then exit (no number)
+/pipeline N --detach                          run the advance loop in a detached background process
+
+/pipeline:status N     $pipeline:status N     read-only: stage, blocker, PR, last review
+/pipeline:status N --json                     machine-readable JSON status envelope (stable contract)
+/pipeline:unblock N "<answer>"                post answer + clear the blocked label
+/pipeline:override N "<key>: <reason>"        disposition a review finding and auto-resume the advance loop
+/pipeline:summary N    $pipeline:summary N    print the run's evidence bundle for issue N (local, offline)
+/pipeline summary <run-id>                    print the evidence bundle for an exact run (domain-independent)
 /pipeline N --remove-worktree               remove issue N's on-disk worktree + local branch (bypasses kill switch)
 /pipeline N --remove-worktree --force       same, discarding uncommitted changes with a warning
 /pipeline N --remove-worktree --json        machine-readable JSON result (stable contract)
-/pipeline --init       $pipeline --init       onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline:init         $pipeline:init         onboard: ensure labels + scaffold .github/pipeline.yml
+/pipeline:cleanup      $pipeline:cleanup      sweep merged-PR worktrees
 /pipeline config sync [--apply]             preview/apply a safe .github/pipeline.yml scaffold refresh
-/pipeline doctor       $pipeline doctor       deterministic preflight check; print pass/fail summary, exit (no number)
+/pipeline config repo-map <add|remove|list> add/remove/list repo_map entries in .github/pipeline.yml
+/pipeline:doctor       $pipeline:doctor       deterministic preflight check; print pass/fail summary, exit
 /pipeline doctor --json                       machine-readable JSON doctor envelope (stable contract)
 /pipeline doctor --is-ok                      silent exit-0/1 polling gate; no output
 /pipeline N --doctor   $pipeline N --doctor   run the preflight before advancing; abort the run on any failure
-/pipeline intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR (no number)
-/pipeline intake "<text>" --release v1.6.0    same, pinning the target release slot
-/pipeline intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
-/pipeline refine-spec --title "<t>" --body "<b>"  refine an existing issue's spec preview; non-mutating JSON output (no number)
+/pipeline:intake --description "<text>"       spec a rough idea into a GitHub issue + propose a ROADMAP.md PR
+/pipeline:intake "<text>" --release v1.6.0    same, pinning the target release slot
+/pipeline:intake --description "<text>" --dry-run   print the proposed issue + roadmap diff without writing anything
+/pipeline refine-spec --title "<t>" --body "<b>"  refine an existing issue's spec preview; non-mutating JSON output
 /pipeline refine-spec --help                  probe for contract availability; exits 0 on supported installs
-/pipeline triage <N> --stage ready            set pipeline:ready on issue N; remove any other pipeline:* stage label
-/pipeline triage <N> --stage backlog          set pipeline:backlog on issue N; idempotent, no model call
-/pipeline sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
-/pipeline sweep --apply                       same, updating issue bodies and opening a ROADMAP reconciliation PR
-/pipeline sweep --apply --repo other/repo     sweep a different repository
-/pipeline roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run; no number)
-/pipeline roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
-/pipeline roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
-/pipeline merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
-/pipeline improve                             read run artifacts; print dry-run cluster report (no number; read-only)
+/pipeline:triage N --stage ready              set pipeline:ready on issue N; remove any other pipeline:* stage label
+/pipeline:triage N --stage backlog            set pipeline:backlog on issue N; idempotent, no model call
+/pipeline:sweep                               batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
+/pipeline:sweep --apply                       same, updating issue bodies and opening a ROADMAP reconciliation PR
+/pipeline:sweep --apply --repo other/repo     sweep a different repository
+/pipeline:roadmap                             analyze the open backlog → dependency-aware scored roadmap (dry-run)
+/pipeline:roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
+/pipeline:roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
+/pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
+/pipeline:release <version>                   prepare a release PR for the given version
+/pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
+/pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
 /pipeline improve --top 10 --since 2026-06-01 --json  limit scope + emit JSON array of clusters
 /pipeline scoreboard                          read run artifacts; print factory throughput/cost/reliability metrics
 /pipeline scoreboard --days 14 --json         emit one JSON scoreboard object for the last 14 days
 /pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
-/pipeline queue                               batch factory: dispatch all pipeline:ready issues up to limits (no number)
+/pipeline queue                               batch factory: dispatch all pipeline:ready issues up to limits
 /pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
 /pipeline queue --label team:backend --milestone v2.0 --risk medium
 /pipeline --version    $pipeline --version    print the package version, then exit (no number; -V alias)
 ```
 
+**Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
+```
+/pipeline N --status      → /pipeline:status N
+/pipeline N --summary     → /pipeline:summary N
+/pipeline N --unblock "…" → /pipeline:unblock N "…"
+/pipeline N --override "…"→ /pipeline:override N "…"
+/pipeline --init          → /pipeline:init
+/pipeline --cleanup       → /pipeline:cleanup
+```
+
 The number is auto-detected as an issue or PR. PRs resolve to their linked closing issue; PRs with no `Closes #N` are refused. Items must carry a `pipeline:*` label (opt-in) — add `pipeline:ready` to start.
 
-`--cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
+`/pipeline:cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
 
 ## Intake sub-command
 
@@ -395,6 +414,58 @@ sweep:
     - Out of scope
 ```
 
+## Backfill sub-command
+
+`pipeline backfill` is a safe maintenance flow for adding OpenSpec coverage to repositories whose accepted behavior predates OpenSpec adoption. It previews which legacy behaviors are already covered, which are missing, which conflict with existing specs, and which are too uncertain to codify without human judgment. Without `--apply` it is fully **non-mutating**.
+
+```bash
+# Preview: analyze the repo and print a four-group coverage report (no writes):
+/pipeline backfill
+
+# Apply: author an OpenSpec change for missing-coverage behaviors and open a spec-only PR:
+/pipeline backfill --apply
+
+# Scope the apply slice to a named capability:
+/pipeline backfill --apply --capability auth
+
+# Target a different repository:
+/pipeline backfill --repo owner/other-repo
+```
+
+**What it does:**
+
+1. **Reads living specs (deterministic):** scans `openspec/specs/` for existing requirements. A partially-populated workspace is NOT treated as complete — coverage is computed from living-spec content, never from `openspec/` presence alone.
+2. **Behavior analysis (single model call):** invokes the claude harness once to enumerate candidate accepted behaviors from the evidence corpus (tests, docs, code, git history), draft each as a requirement with provenance, and grade evidence as `sufficient`, `conflicting`, or `uncertain`.
+3. **Classifies into four groups (deterministic):**
+   - **already-covered** — behavior maps to a living requirement; not proposed again.
+   - **missing-coverage** — sufficient evidence, no existing requirement; eligible for backfill.
+   - **conflicting-evidence** — contradicts a living requirement or evidence sources disagree; surfaced for human decision, NOT codified.
+   - **uncertain-evidence** — evidence too weak to justify codifying; surfaced for human decision, NOT codified.
+4. **Apply path (--apply only):** authors an OpenSpec change with additive `## ADDED Requirements` deltas for the `missing-coverage` slice, validates with `openspec validate`, creates a branch, and opens a spec-only PR targeting the default branch. Never commits directly to the default branch; never merges.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--apply` | Apply: author a spec-only PR for the missing-coverage slice. Default is preview-only (no writes). |
+| `--capability <name>` | Scope the apply slice to behaviors whose description contains `<name>`. |
+| `--repo <owner/repo>` | Override the target repository. Default: current repo from config. |
+
+**Non-mutating preview guarantee:** without `--apply`, the handler makes no write to the filesystem, no GitHub issue create/edit, no branch creation, and no PR creation. The output explicitly states "No specs, issues, branches, or PRs were changed."
+
+**Spec-only guarantee:** the apply path asserts the authored diff touches only paths under `openspec/` and aborts before opening any PR if a non-`openspec/` path would change.
+
+**Idempotency:** re-running backfill after a slice has landed recognizes previously-accepted requirements as `already-covered` and behaviors already proposed in an open backfill PR as already-proposed. Neither is duplicated.
+
+**Operator guidance:**
+
+- *When to use backfill:* use it when adopting OpenSpec in a repo with years of existing behavior, or when a partial `openspec/` workspace covers only recent changes and you want future pipeline runs checked against the full product contract.
+- *How to review provenance:* each candidate in the report includes a provenance reference (test name, doc section, code path, or commit). Verify the reference is real before approving the backfill PR — provenance is what distinguishes established behavior from an accidental implementation detail.
+- *How partial adoption is handled:* backfill computes coverage from living-spec content, not from the presence of an `openspec/` directory. A repo with 3 living requirements and 20 legacy behaviors will still show 17 candidates.
+- *Why low-confidence behavior is not auto-codified:* `conflicting-evidence` and `uncertain-evidence` candidates require human judgment. Codifying a behavior that contradicts a living requirement or lacks concrete evidence would introduce a spec that is immediately wrong. These groups are surfaced for manual review, not silently committed.
+
+The pipeline never merges — the spec-backfill PR requires a human to review and merge.
+
 ## Roadmap sub-command
 
 `pipeline roadmap` generates a dependency-aware scored roadmap from the open backlog and writes `plan.json` + `roadmap.md` to `.agent-pipeline/roadmap/<repo>/`. Without `--apply` it only previews.
@@ -410,7 +481,23 @@ roadmap:
   depgraph_concurrency: 4        # max concurrent harness calls during dep verification (default: 4)
   depgraph_verify_cap: 20        # max dep candidates to source-verify; excess go to open_questions (default: 20)
   release_model: semver          # semver (default) | continuous
+  release_capacity:              # capacity policy for the semver release model (#347)
+    effort_budget: 8             # per-milestone effort-points budget (XS=1 S=2 M=3 L=5 XL=8; default: 8)
+    isolate_breaking: true       # give each breaking-change issue its own milestone (default: true)
 ```
+
+**Semver release model — capacity-aware milestone grouping (#347):**
+
+When `release_model` is `semver` (the default), generated milestones are determined by *release substance* rather than a fixed issue count:
+
+| Signal | Effect |
+|--------|--------|
+| `breaking-change` / `semver:major` label, or `breaking change`/`migration` in text | Classified as **major** impact → bumps major version (`v{M+1}.0.0`), isolated into own milestone |
+| `chore` / `bug` / `maintenance` / `refactor` / `docs` label, or `cleanup` tier | Classified as **patch** impact → bumps patch version (`v{M}.{N}.{P+1}`) |
+| `feature` / `enhancement` / `semver:minor` label | Classified as **minor** impact → bumps minor version (`v{M}.{N+1}.0`) |
+| No impact-bearing signal (sparse metadata) | Conservative default: **minor** + uncertainty recorded in `plan.json` |
+
+Issues accumulate into a milestone until adding the next would exceed `effort_budget` (effort points: XS=1 S=2 M=3 L=5 XL=8). A breaking-change issue (when `isolate_breaking: true`) or an oversized issue (effort ≥ budget) is always placed alone. The `continuous` model is unaffected by these rules.
 
 ## Triage sub-command
 
@@ -598,15 +685,23 @@ base_branch: main
 worktree_root: .worktrees
 review_timeout: 1200
 ci_timeout: 900
+ci_mode: github                    # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait (see "ci_mode: local" below)
 intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
 sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
-models:                            # per-phase model alias — only the claude harness honors these
+models:                            # per-phase model alias — only the claude harness honors these. Each key also accepts "auto" (see "Auto model/effort routing").
   planning: sonnet                 # planning / implementing / fix → implementer harness
   implementing: sonnet
-  review: opus                     # review → reviewer harness
+  review: claude-fable-5           # review → reviewer harness (default)
   fix: sonnet
   intake: sonnet                   # intake spec-generation (always the claude harness; set "haiku" for max speed)
   sweep: sonnet                    # sweep spec-generation (always the claude harness)
+effort:                            # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort. Absent key: no flag (operator's global setting applies). Each key also accepts "auto".
+  planning: medium                 # implementer harness — also sources plan-review's effort (classified separately, see below)
+  implementing: low
+  review: high                     # reviewer harness — resolved round-aware (review-1 vs. review-2)
+  fix: low
+  intake: low                      # always the claude harness
+  sweep: low                       # always the claude harness
 conventions_md_path: CLAUDE.md     # excerpt embedded in prompts
 domain_name: my-service
 domain_description: a payments service
@@ -629,9 +724,9 @@ test_gate:                           # run the repo's own tests/build before ope
 eval_gate:                           # run the repo's eval harness after pre-merge, before ready-to-deploy
   enabled: false                     # default: false; set true to enable (one-time declaration per repo)
   command: "pnpm evals"              # shell command to run; supports pipes, env vars, &&, etc.
-  mode: gate                         # gate (default): block on fail | advisory: record result and always advance
-  timeout: 300                       # hard stage-level budget in seconds (all attempts share this budget)
-  max_attempts: 2                    # total attempts before giving up (1 = no retry)
+  mode: gate                         # gate (default): fail routes to a fix round, blocks once attempts are exhausted | advisory: record result and always advance
+  timeout: 300                       # hard stage-level budget in seconds per eval run
+  max_attempts: 2                    # total eval runs (1 = no retry/fix round); gate mode: fix rounds = max_attempts - 1
 shipcheck_gate:                      # reviewer-owned acceptance rubric after eval-gate, before ready-to-deploy (#148)
   enabled: false                     # default: false; set true to enable
   mode: advisory                     # advisory (default): record without blocking | gate: block on fail verdict
@@ -653,8 +748,26 @@ doctor:                              # deterministic preflight capability check 
 review_harness: my-reviewer          # optional: override the reviewer CLI for the review step — see "Custom reviewer harness" (default: the profile's reviewer)
 # The implementer harness is owned by the install profile and cannot be set here.
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
-# rejected at config-parse time.
+# rejected at config-parse time. `review_harness` also accepts a structured form
+# for independent reviewer model/effort control — see "Custom reviewer harness".
 harness_sandbox: false               # opt-in: true → claude implementer uses --permission-mode default instead of bypassPermissions (see "Sandboxed harness execution")
+event_sink:                          # optional: deliver run events.jsonl records to an operator-controlled forwarder — see "External event sink"
+  command: "logger -t pipeline"      # forwarder command; receives each event's JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged)
+  mode: additive                     # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only
+executors:                           # optional: named external executor definitions — see "External stage executors"
+  opencode-main:
+    type: agent-system                # full execution backend — valid for ANY model-invoking stage
+    provider: opencode
+    endpoint: https://opencode.internal/api
+    credential: OPENCODE_API_KEY       # env-var NAME, resolved at invocation time — never the literal value
+  local-ollama:
+    type: model-endpoint              # raw OpenAI-compatible endpoint — valid ONLY for plan-review/review-1/review-2
+    base_url: http://localhost:11434/v1
+    model: llama3.1:70b
+stage_executors:                     # optional: assign an executors: name to a model-invoking stage
+  planning: opencode-main
+  review-1: local-ollama
+  review-2: local-ollama
 ```
 
 ### Custom reviewer harness (`review_harness`)
@@ -672,6 +785,77 @@ When set, every review round (plan-review, review-1, review-2) invokes `my-revie
 - **Be an installed/authenticated CLI** — no API key is introduced; like `claude`/`codex`, the reviewer brings its own auth.
 
 If the configured CLI is **not installed or not executable**, the review step fails with a specific, named reason (`reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH`) and the [same-harness fallback](#prerequisites) applies — the implementing harness reviews instead, prominently labeled. When `review_harness` is absent, the profile's reviewer is used unchanged.
+
+`review_harness` also accepts a structured form to control the reviewer's model and reasoning effort independently of `models.review`/`effort.review`:
+
+```yaml
+review_harness:
+  command: claude
+  model: auto           # or an explicit alias, e.g. claude-fable-5
+  effort: auto           # or an explicit level, e.g. high
+```
+
+`model`/`effort` here take precedence over `models.review`/`effort.review` when set. `"auto"` resolves round-aware: plan-review and review-2 are classified Adversarial/Definitive (`max`), review-1 is Adversarial/Iterative (`high`) — see "Auto model/effort routing" below. The bare string shorthand (`review_harness: my-reviewer`) is unchanged and leaves the reviewer's model/effort sourced from `models.review`/`effort.review`.
+
+### Auto model/effort routing (`auto`)
+
+Every `models.*` and `effort.*` key (including the structured `review_harness.model`/`effort`) accepts the sentinel `"auto"` instead of an explicit value. `auto` is resolved at config-load time from a fixed routing table keyed on each stage's task nature and output permanence — no stage ever sees the literal string `"auto"`.
+
+| nature \ permanence | Ephemeral | Iterative | Definitive |
+|---|---|---|---|
+| **Mechanical** (implementing, fix) | gpt-5.5 / low | gpt-5.5 / low | sonnet / medium |
+| **Analytical** (planning, intake, sweep) | sonnet / low | opus / medium | claude-fable-5 / high |
+| **Adversarial** (plan-review, review-1, review-2) | claude-fable-5 / medium | claude-fable-5 / high | claude-fable-5 / max |
+
+A Mechanical stage's model forks by harness (`gpt-5.5` under the codex primary harness, `sonnet` under claude — `gpt-5.5` is codex-only) — every other cell resolves the same model regardless of harness, so an inert (harness-mismatched) `auto` result is reported exactly like an inert explicit alias (see "inert models.\* alias warning"). Adversarial stages always resolve `claude-fable-5` (the full model id — never the unrecognized short alias `fable-5`) regardless of `--profile`, so alternative-harness routing is profile-independent.
+
+### External stage executors (`executors:` / `stage_executors:`)
+
+`review_harness` only overrides the *reviewer* CLI. `executors:` + `stage_executors:` generalize that to **every** model-invoking stage (`planning`, `implementing`, `review-1`, `review-2`, `fix-1`, `fix-2`, `plan-review`, `shipcheck-gate` when enabled), and to two kinds of external delegate, not just a local CLI. Both keys are opt-in — a repo with neither behaves exactly as today.
+
+```yaml
+executors:
+  opencode-main:
+    type: agent-system              # full execution backend (OpenCode / HermesAgent / OpenClaw / …)
+    provider: opencode               # a plain provider identifier — the pipeline does not ship per-provider adapters
+    endpoint: https://opencode.internal/api
+    credential: OPENCODE_API_KEY     # env-var NAME resolved from the environment at invocation time — never stored or emitted
+  local-ollama:
+    type: model-endpoint             # raw OpenAI-compatible /chat/completions endpoint (e.g. local Ollama)
+    base_url: http://localhost:11434/v1
+    model: llama3.1:70b
+    # credential omitted — valid for a localhost endpoint with no auth
+
+stage_executors:
+  planning: opencode-main
+  review-1: local-ollama
+  review-2: local-ollama
+```
+
+- **`agent-system`** executors may be assigned to **any** model-invoking stage. The pipeline `POST`s `{ "stage": "<name>", "prompt": "<full prompt text>" }` to `endpoint` (adding `authorization: Bearer <resolved-credential>` when `credential` is set) and expects back `{ "output": "<text>" }`; `output` becomes that stage's harness stdout and flows through the exact same downstream contract (including `parseStructuredVerdict` + `review_policy` for review stages) as a local `claude`/`codex` invocation.
+- **`model-endpoint`** executors are restricted to the **prompt-contained** stages `plan-review`, `review-1`, `review-2` — these are the only stages whose prompt already embeds everything needed (PR diff, plan text, conventions excerpt) inline, since a raw model endpoint cannot explore the repo or run tools. Assigning a `model-endpoint` executor to `planning`, `implementing`, `fix-1`, `fix-2`, or `shipcheck-gate` is rejected **at config-parse time** — before any stage runs — with an error naming both the stage and the executor.
+- Credentials are **references** (an environment-variable name), resolved from the process environment only at invocation time. The secret value is never written to `pipeline.yml` and never appears in run evidence or accounting output — only the reference name does (or nothing, for an unauthenticated local endpoint).
+- A misconfigured, unreachable, or non-compliant executor is caught by a **preflight check before the stage runs** and blocks the item with an error naming the stage and provider. There is **no silent fallback** to the local `claude`/`codex` harness — this is a deliberate operator choice, distinct from (and takes priority over) the `review_harness` self-review fallback described above, which never applies to a `stage_executors` assignment.
+- Run evidence records which executor (and provider, and — for `model-endpoint` — model name) ran each delegated stage.
+
+### Local CI mode (`ci_mode: local`)
+
+By default (`ci_mode: github`) the pre-merge gate polls `gh pr checks` and waits for GitHub Actions to pass before advancing. For repos where the local gate (`npm run ci`, `pnpm test`, etc.) is **identical** to what Actions runs, this is a redundant second run of the same command. Set `ci_mode: local` to skip the GitHub Actions wait and rely on the current pipeline run's local test-gate result instead:
+
+```yaml
+ci_mode: local   # default: github
+```
+
+**When `ci_mode: local`:**
+- The pre-merge gate reads the current run's test-gate outcome from the run store instead of polling `gh pr checks`.
+- If the test gate passed in this run, pre-merge advances to the mergeability and OpenSpec-validation steps (those still run in both modes).
+- If the test gate failed, or if no test-gate result is recorded for this run (gate skipped, disabled, or log unreadable), the gate blocks with a clear message rather than silently skipping verification — it never advances with zero verification.
+
+**Operator responsibility:** only enable `ci_mode: local` when:
+- The local gate (`test_gate.command` or auto-detected) runs the same checks as GitHub Actions.
+- Branch protection rules are set appropriately for your team — the pipeline stops at `pipeline:ready-to-deploy` regardless of `ci_mode`; a human still merges the PR.
+
+For repos with matrix builds, environment-specific secrets, or CI steps that differ from the local command, stay on `ci_mode: github` (the default).
 
 ## Preflight (doctor)
 
@@ -747,7 +931,15 @@ harness_sandbox: true   # claude implementer uses --permission-mode default (san
 
 When `harness_sandbox` is `true`, the claude harness is invoked with `--permission-mode default` instead of `bypassPermissions`. All other flags are unchanged. The codex harness is already workspace-sandboxed via `--full-auto` and is unaffected by this setting in both modes.
 
-**Default** (`harness_sandbox: false` or absent): the invocation is byte-identical to the pre-change behaviour — `--permission-mode bypassPermissions`. No change to existing repos unless you opt in.
+On runners where Codex's bubblewrap/user-namespace sandbox cannot start because the host is already externally sandboxed, set this runner-local environment variable:
+
+```bash
+PIPELINE_CODEX_NO_SANDBOX=1
+```
+
+With that explicit operator opt-in, the codex harness uses Codex's automation no-sandbox mode (`codex exec --dangerously-bypass-approvals-and-sandbox`) instead of `--full-auto`. Use it only when the surrounding worker/supervisor already provides the required isolation.
+
+**Default** (`harness_sandbox: false` or absent, and no `PIPELINE_CODEX_NO_SANDBOX=1`): the invocation is byte-identical to the pre-change behaviour — `--permission-mode bypassPermissions` for claude and `--full-auto` for codex. No change to existing repos unless you opt in.
 
 ## Test/build gate (optional, default on)
 
@@ -797,10 +989,12 @@ Two tiers, so you can verify the right amount before pushing and let CI run less
 | Command | What it runs | When |
 |---------|--------------|------|
 | `npm run ci:fast` | core unit tests + `plugin/` mirror check | **default, per commit** — the quick local gate (~16s) |
-| `npm run ci` | clean install + core tests + mirror check + install-smoke + launcher-smoke | **before opening a PR / cutting a release** — the exact gate GitHub Actions runs |
+| `npm run ci` | clean install + core tests + mirror check + install-smoke + launcher-smoke + `openspec validate --all` (if `openspec/` present) | **before opening a PR / cutting a release** — the exact gate GitHub Actions runs |
 | `cd core && node --test --experimental-strip-types test/<file>.test.ts` | a single test file | **targeted** — iterating on one area |
 
 `ci:fast` catches the vast majority of failures (logic regressions and a stale `plugin/` mirror) without the packaging install/launcher smoke-tests, which rarely break from a normal `core/` change and are reserved for the full gate. `ci` is the CI-equivalent: the GitHub Actions workflow runs this identical script, so a green `npm run ci` locally means a green CI run. Run `ci:fast` while iterating; run `ci` once before you push a PR.
+
+The full `ci` gate also runs `openspec validate --all` when an `openspec/` directory is present at the repo root. A structurally invalid living spec or active change fails `npm run ci` and therefore blocks the PR in GitHub Actions. The step is a no-op when no `openspec/` directory exists, so non-OpenSpec repos and the install smoke test are unaffected.
 
 > CI runs the full gate on **every** commit (including the pipeline's OpenSpec-archive commits — the pre-merge gate depends on it) and cancels superseded runs automatically, so the cheapest way to save Actions minutes is to catch failures with `ci:fast` locally before pushing.
 
@@ -912,9 +1106,11 @@ Every run writes a **run directory** under `.agent-pipeline/runs/<run-id>/` in t
 
 The `run_id` field in `summary.json` matches the directory name so the two can be joined by a single stable identifier.
 
-It is a **write-only audit supplement**, not a second state machine: GitHub labels and comments remain the authoritative state, and deleting or corrupting the bundle has zero effect on a run. When a run finalizes, the pipeline posts a single comment on the PR (or issue) recording the local bundle path so a maintainer can find it.
+It is a **write-only audit supplement**, not a second state machine: GitHub labels and comments remain the authoritative state, and deleting or corrupting the bundle has zero effect on a run. When a run finalizes, the pipeline posts a single, self-contained comment on the PR (or issue): a labeled **Run ID** field, a Markdown table with one row per recorded stage (stage name, `enteredAt`→`exitedAt`, duration, outcome), and the local bundle path plus the `--summary` hint demoted to secondary/optional context. The run id, timing table, and outcome are complete from the comment body alone — nothing in the table depends on local filesystem access, so it reads correctly from a different machine than the one that ran the pipeline. As before, the comment contains no accounting payloads (token counts, cost values, prompts, responses, transcripts).
 
 **Legacy path.** For backward compatibility, `summary.json` content is also written to `<stateDir>/<issue>/evidence.json` (typically `/tmp/pipeline-<domain>/<issue>/evidence.json`) so existing consumers experience no breakage.
+
+**Issue-level evidence history.** Because `evidence.json` is overwritten on every run and the per-run `summary.json` files require enumerating `.agent-pipeline/runs/` by hand, the pipeline also maintains an append-only history artifact at `.agent-pipeline/history/issue-<N>.jsonl` (one compact JSON entry per line, created on first write). At finalization — after `summary.json` and the legacy `evidence.json` are written — one entry is appended for the run being finalized: `run_id`, `issue`, `pr`, `branch`, `final_state`, `finalized_at`, and a `stages[]` array of `{ stage, enteredAt, exitedAt, durationMs, outcome }`. Appending never reads, rewrites, or truncates prior lines, so an issue with N finalized runs (e.g. resumed after a fix round) has exactly N entries, each with its own run id and timings. Like every other run artifact, the write is non-fatal — a failure is logged and never fails the run.
 
 Print a human-readable summary of a run at any time — this reads the local file only, so it works offline:
 
@@ -941,9 +1137,19 @@ $pipeline logs <run-id>
 # stream new output as it is written (like tail -f)
 $pipeline logs <run-id> --follow
 
+# print structured events.jsonl for a run
+$pipeline logs <run-id> --events
+
+# follow structured lifecycle/event records without parsing terminal output
+$pipeline logs <run-id> --events --follow
+
 # list available run-ids (most recent first)
 $pipeline logs
 ```
+
+Use `--events` for stage/lifecycle monitoring. It reads the canonical run-store
+`events.jsonl`; no separate transitions log or grep-filtered terminal output is
+required.
 
 Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):
 
@@ -952,6 +1158,23 @@ $pipeline N --json-events
 ```
 
 Each event emitted to `events.jsonl` is also written to stdout. Human-readable output continues to go to `terminal.log` and the terminal unchanged.
+
+### External event sink (optional)
+
+By default every run event is written only to the local `events.jsonl` (above). For runners in ephemeral or shared environments — where the local filesystem disappears after the run — or teams with existing centralized log infrastructure (Datadog, CloudWatch, Loki, Splunk, …), the event stream destination is pluggable via an `event_sink` block in `.github/pipeline.yml`:
+
+```yaml
+event_sink:
+  command: "logger -t pipeline"   # operator-controlled forwarder; receives each event's JSON line on stdin
+  mode: additive                  # additive (default) | exclusive
+```
+
+- `command` is an arbitrary shell command the operator controls — a syslog forwarder, a small script that `curl`s an aggregator's HTTP endpoint, `vector`, etc. The pipeline does not embed a vendor-specific client; auth is whatever the command itself carries.
+- `mode: additive` (default) writes every event to the local `events.jsonl` **and** delivers the same JSON line to the sink — the safer rollout choice, since a misconfigured sink never loses events. `mode: exclusive` delivers to the sink only; `events.jsonl` is not written for that run, so `pipeline logs <run-id> --events` reports it as absent (the documented outcome of exclusive mode).
+- Both keys are also settable via environment variables — `PIPELINE_EVENT_SINK_COMMAND` and `PIPELINE_EVENT_SINK_MODE` — which win over the file config, so an ephemeral runner can activate a sink without a checked-in file.
+- Delivery is best-effort and non-fatal: an unreachable sink, a forwarder that exits non-zero, or a slow command never aborts the run or (in additive mode) affects the local write — a warning is logged and the run continues.
+- No schema change: the lines delivered to the sink are byte-identical to the ones written to `events.jsonl` — already screened by the injection denylist and secret redaction, `schema_version` unchanged.
+- When `event_sink` is unset (the default), behavior is exactly what it was before this feature existed.
 
 ### Machine-readable artifact conventions
 
@@ -1006,11 +1229,12 @@ The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused fo
 
 When `eval_gate.enabled` (default **off**), the target repo's eval harness runs **after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode, elapsed, output excerpt) is always recorded as an issue comment.
 
-- **`mode: gate`** (default) — a non-zero exit **blocks** the item.
-- **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted.
-- A failing run is retried up to `max_attempts` (default 2; `1` = no retry), short-circuiting on the first pass.
-- `timeout` (default 300) is a **hard stage-level budget in seconds, shared across all attempts**, so total wall-time never exceeds it.
-- **Tooling failures always block, regardless of mode** — if the command times out or can't be spawned the item is blocked even in advisory mode.
+- **`mode: gate`** (default) — an ordinary (non-tooling) failure routes to a bounded fix round: the implementer harness is invoked with the eval output (gate name, command, bounded stdout/stderr) as context, commits and pushes a fix, and the eval command re-runs against the updated code. Only once `max_attempts` is exhausted does the item **block**, with the final eval output surfaced.
+- **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted. Advisory failures are retried as a plain re-run (no fix round) up to `max_attempts`.
+- `max_attempts` (default 2; `1` = no retry) bounds the total number of eval runs. In gate mode each run after the first is preceded by exactly one fix round, so the fix-round budget is `max_attempts - 1` — there is no separate fix-round config key.
+- `timeout` (default 300) is a **hard stage-level budget in seconds per eval run**; a successful fix round resets it for the next attempt, since fix-harness time is bounded separately by `fix_timeout`.
+- **Tooling failures always block immediately, regardless of mode, and never route to a fix round** — if the command times out or can't be spawned the item is blocked even in advisory mode or with fix-round budget remaining.
+- A fix round that fails (harness error, no new commit, a dirty worktree, or a failed push) blocks the item the same way a test-gate fix round does — it never pushes a partial fix, and the eval command is not re-run.
 
 When disabled (the default), pre-merge advances straight to `ready-to-deploy` and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
 
@@ -1078,7 +1302,7 @@ If a target repo uses [OpenSpec](https://openspec.dev/) (it has an `openspec/` d
 - **Fix-round consistency** — if a structured review finding is tagged `category: spec-divergence` and fix commits move implementation files after the latest spec-delta update, the fix round blocks before pushing until `openspec/changes/<id>/specs/**` is updated.
 - **Finalize (pre-merge)** — folds the change into the living specs (`openspec archive`, committed to the PR), then runs `openspec validate --all` and refuses `pipeline:ready-to-deploy` if anything is structurally invalid.
 
-It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to require OpenSpec everywhere or `off` to disable. By default the pipeline only uses OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have **planning run `openspec init`** on repos that lack an `openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing the pre-merge gate is skipped (non-blocking) and planning blocks with an install hint. No `openspec/` dir (and no bootstrap) means no behavior change.
+It's **auto-detected** by default (`openspec.enabled: auto`); set it to `on` to require OpenSpec everywhere or `off` to disable. By default the pipeline only uses OpenSpec on repos that already have it; set `openspec.bootstrap: true` to have **planning run `openspec init`** on repos that lack an `openspec/` workspace. The `openspec` CLI must be on PATH — if it's missing and there is an active change to archive, the pre-merge gate blocks with `openspec-invalid` (with an install hint); repos with no active change to archive are unaffected. Planning also blocks with an install hint when the CLI is missing. No `openspec/` dir (and no bootstrap) means no behavior change.
 
 ### last30days context
 
@@ -1213,9 +1437,10 @@ same `.agent-pipeline/runs/<run-id>/` run store a foreground run uses — the
 launch logs `structured run artifacts at <repo>/.agent-pipeline/runs/<run-id>/`.
 That directory's **`events.jsonl` and `terminal.log` are the Pipeline Desk
 contract** (not `pipeline.log`): render the stage timeline from `events.jsonl`
-with zero prose parsing, and follow live output with
+with zero prose parsing, follow structured events with
+`pipeline logs <run-id> --events --follow`, and follow live raw output with
 `pipeline logs <run-id> --follow`. Pass `--json-events` to also stream the event
-lines to the detached run's stdout (captured in `pipeline.log`).
+lines to the detached run's stdout (captured in the wrapper `pipeline.log`).
 
 ### Poll for completion — `sentinel.json`
 
@@ -1336,6 +1561,25 @@ pipeline config sync --repo-path /path/to/repo --apply
 ```
 
 The command validates the current file, renders a refreshed candidate, validates the candidate, and refuses to write if the file is missing, invalid, or the candidate would change effective config. With `--json`, it emits `{ ok, changed, applied, configPath, candidate, diff, diagnostics }`.
+
+### `pipeline config repo-map <add|remove|list>`
+
+Add, remove, or list `repo_map` entries (`depends_on` / `depended_on_by`) in `.github/pipeline.yml` without hand-editing YAML. Each command edits only the `repo_map` block — all other keys, comments, and formatting are preserved.
+
+```bash
+pipeline config repo-map add acme/lib                                  # adds to repo_map.depends_on (default)
+pipeline config repo-map add acme/app --rel depended_on_by
+pipeline config repo-map remove acme/lib
+pipeline config repo-map list
+```
+
+- `--rel` accepts `depends_on` or `depended_on_by` and defaults to `depends_on`.
+- `add` creates the `repo_map` block (and the target list) when absent, and is idempotent — re-adding an existing entry is a no-op success.
+- `remove` is a tolerant no-op (exit 0, warning) when the entry isn't present.
+- `add`/`remove` validate the `owner/repo` argument before writing (exit 1 on a malformed value) and require an existing `.github/pipeline.yml` (exit 1 with a `pipeline init` hint when missing).
+- `add` best-effort checks GitHub reachability for the added repo; a failed check warns but never blocks the write.
+- `list` prints current entries grouped by relationship kind.
+- All three accept `--repo-path <path>` and `--json`.
 
 ## Uninstall
 

@@ -231,6 +231,181 @@ test("pipeline-cli 5.8g: 'logs --dry-run' → logs entry, validateFlags returns 
   assert.deepEqual(roundTrip(["logs", "--dry-run"]), ["dryRun"]);
 });
 
+test("pipeline-cli: logs --events --follow is valid", () => {
+  assert.deepEqual(roundTrip(["logs", "42-2026-06-16T00-00-00Z", "--events", "--follow"]), []);
+});
+
 test("pipeline-cli 5.8h: 'summary run-123 --dry-run' → summary entry, validateFlags returns ['dryRun']", () => {
   assert.deepEqual(roundTrip(["summary", "run-123", "--dry-run"]), ["dryRun"]);
+});
+
+// ---------------------------------------------------------------------------
+// 7.1  New positional keywords: status, unblock, override, cleanup
+// ---------------------------------------------------------------------------
+
+test("pipeline-cli 7.1a: 'status 42' → numArg=status, args[1]=42, routes to status entry", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "status", "42"]);
+  assert.equal(cmd.args[0], "status");
+  assert.equal(cmd.args[1], "42");
+  const entry = lookupCommand("status");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.status);
+});
+
+test("pipeline-cli 7.1b: 'unblock 42 <answer>' → numArg=unblock, args[1]=42, args[2]=answer", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "unblock", "42", "the answer"]);
+  assert.equal(cmd.args[0], "unblock");
+  assert.equal(cmd.args[1], "42");
+  assert.equal(cmd.args[2], "the answer");
+  const entry = lookupCommand("unblock");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.unblock);
+});
+
+test("pipeline-cli 7.1c: 'override 42 <key>: <reason>' → numArg=override, args[1]=42, args[2]=disposition", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "override", "42", "perf: not in scope"]);
+  assert.equal(cmd.args[0], "override");
+  assert.equal(cmd.args[1], "42");
+  assert.equal(cmd.args[2], "perf: not in scope");
+  const entry = lookupCommand("override");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.override);
+  assert.equal(entry.allowedFlags, "all");
+});
+
+test("pipeline-cli 7.1d: 'cleanup' → numArg=cleanup, routes to cleanup entry", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "cleanup"]);
+  assert.equal(cmd.args[0], "cleanup");
+  const entry = lookupCommand("cleanup");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.cleanup);
+});
+
+test("pipeline-cli 7.1e: advance loop unaffected — '42' still routes to advance entry", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42"]);
+  assert.equal(cmd.args[0], "42");
+  const entry = lookupCommand(cmd.args[0]);
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.advance);
+});
+
+// ---------------------------------------------------------------------------
+// 7.3  Deprecated flag-form compatibility
+//      Each legacy flag form is still accepted by the CLI parser and resolves
+//      to the advance entry (allowedFlags:"all"), so validateFlags returns [].
+//      The stderr deprecation notice and actual handler execution are behavioral
+//      concerns verified by integration/smoke tests.
+// ---------------------------------------------------------------------------
+
+test("pipeline-cli 7.3a: '42 --status' is accepted → advance entry, validateFlags []", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42", "--status"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.status, true);
+  assert.equal(cmd.args[0], "42");
+  const entry = lookupCommand(cmd.args[0]);
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.advance);
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("pipeline-cli 7.3b: '42 --status --json' preserves json flag (stdout contract unchanged)", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42", "--status", "--json"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.status, true);
+  assert.equal(opts.json, true);
+  assert.equal(cmd.args[0], "42");
+  // Both flags land on advance entry and pass validation
+  const entry = lookupCommand(cmd.args[0]);
+  assert.ok(entry !== null);
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("pipeline-cli 7.3c: '42 --unblock <answer>' is accepted → advance entry, validateFlags []", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42", "--unblock", "the unblock answer"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.unblock, "the unblock answer");
+  const entry = lookupCommand(cmd.args[0]);
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.advance);
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("pipeline-cli 7.3d: '42 --override <spec>' is accepted → advance entry, validateFlags []", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42", "--override", "key: reason"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.override, "key: reason");
+  const entry = lookupCommand(cmd.args[0]);
+  assert.ok(entry !== null);
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("pipeline-cli 7.3e: '42 --summary' is accepted → advance entry, validateFlags []", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42", "--summary"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.summary, true);
+  const entry = lookupCommand(cmd.args[0]);
+  assert.ok(entry !== null);
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("pipeline-cli 7.3f: '--init' is accepted → init entry via roundTrip, validateFlags []", () => {
+  assert.deepEqual(roundTrip(["--init"]), []);
+});
+
+test("pipeline-cli 7.3g: '--cleanup' is accepted → cleanup entry via roundTrip, validateFlags []", () => {
+  assert.deepEqual(roundTrip(["--cleanup"]), []);
+});
+
+test("pipeline-cli 7.3h: 'doctor' keyword resolves directly — no deprecated shim needed", () => {
+  // 'doctor' is dispatched as a positional keyword; --doctor is a separate advance-gate flag
+  // (run preflight before advancing). The keyword form is NOT deprecated.
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "doctor"]);
+  assert.equal(cmd.args[0], "doctor");
+  const entry = lookupCommand("doctor");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.doctor);
+  // --doctor (the advance-gate flag) is a separate concern and not deprecated
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.doctor, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// 7.4  Detach routing: 'pipeline N --detach' is equivalent to 'pipeline run N --detach'
+// ---------------------------------------------------------------------------
+
+test("pipeline-cli 7.4a: 'N --detach' → opts.detach=true and numArg is numeric (routes via detach path)", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "42", "--detach"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.detach, true);
+  assert.ok(/^\d+$/.test(cmd.args[0]), "numArg should be numeric");
+  assert.equal(cmd.args[0], "42");
+});
+
+test("pipeline-cli 7.4b: 'run N --detach' → opts.detach=true and numArg='run', args[1]=N", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "run", "42", "--detach"]);
+  const opts = cmd.opts<CliOpts>();
+  assert.equal(opts.detach, true);
+  assert.equal(cmd.args[0], "run");
+  assert.equal(cmd.args[1], "42");
+});
+
+test("pipeline-cli 7.4c: 'run' keyword maps to run entry (allowedFlags:all), not advance", () => {
+  const entry = lookupCommand("run");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.run);
+  assert.equal(entry.allowedFlags, "all");
+  assert.notEqual(entry, COMMAND_REGISTRY.advance);
 });

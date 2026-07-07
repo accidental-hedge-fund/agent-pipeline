@@ -1,8 +1,11 @@
 // Run a harness CLI inside a worktree directory, streaming output to the
 // console while also capturing it for return.
 //
-// claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] <prompt>
-// codex:   codex exec --full-auto -C <worktreeDir> <prompt>
+// claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] [--effort Y] <prompt>
+// codex:   codex exec --full-auto -C <worktreeDir> [-c model_reasoning_effort=Y] <prompt>
+//          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
+//          --dangerously-bypass-approvals-and-sandbox mode on externally
+//          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
 // custom:  <name> <prompt>   (#40 — a user-configured reviewer CLI)
 //
 // The two built-in harnesses keep their exact invocation shapes. Any other
@@ -43,6 +46,14 @@ export interface HarnessResult {
   duration: number; // seconds
   timed_out: boolean;
   spawn_error?: boolean; // true when the process could not be spawned at all
+  // External stage executor evidence (#314). Populated only when the result
+  // came from `executors.ts`'s dispatch path (a `stage_executors:` assignment),
+  // never for the local claude/codex/custom-reviewer-CLI branches above. Read by
+  // accounting/evidence recording so a delegated stage's executor/provider(/model)
+  // is recorded alongside the existing harness/model fields.
+  executor_name?: string;
+  executor_provider?: string; // agent-system: provider id; model-endpoint: base_url
+  executor_model?: string; // model-endpoint only
 }
 
 export interface InvokeOptions {
@@ -68,10 +79,11 @@ export interface InvokeOptions {
    */
   lean?: boolean;
   /**
-   * When set and harness is "codex", passes `-c model_reasoning_effort=<value>`
-   * to the codex CLI so the call overrides the operator's global reasoning-effort
-   * config. Used by plan-review to cap effort at "medium" regardless of the global.
-   * Silently ignored for claude and custom reviewer CLIs.
+   * Per-stage reasoning-effort override (#366). For "codex", passes
+   * `-c model_reasoning_effort=<value>`; for "claude", passes `--effort <value>`.
+   * Both override the operator's global reasoning-effort config for this call.
+   * Silently ignored for custom reviewer CLIs (`review_harness`, #40), which
+   * accept neither flag.
    */
   reasoningEffort?: string;
   accounting?: {
@@ -112,10 +124,17 @@ export async function invoke(
       args.push("--tools", "", "--strict-mcp-config");
     }
     if (opts.model) args.push("--model", opts.model);
+    if (opts.reasoningEffort) args.push("--effort", opts.reasoningEffort);
     args.push(prompt);
   } else if (harness === "codex") {
     cmd = "codex";
-    args = ["exec", "--full-auto", "-C", worktreeDir];
+    const noSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
+    args = [
+      "exec",
+      noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto",
+      "-C",
+      worktreeDir,
+    ];
     if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort=${opts.reasoningEffort}`);
     args.push(prompt);
   } else {

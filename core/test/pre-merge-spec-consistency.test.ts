@@ -14,7 +14,7 @@ import {
   type FixCommit,
   type SpecConsistencyDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { SPEC_DIVERGENCE_CATEGORY, categoryMarker } from "../scripts/review-policy.ts";
+import { SPEC_DIVERGENCE_CATEGORY, categoryMarker, directionMarker } from "../scripts/review-policy.ts";
 import { DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -28,7 +28,12 @@ const spec = (sha: string): FixCommit => ({ sha, paths: [`openspec/changes/${ID}
 // carries no marker.
 const findingLine = (extra: string) =>
   `## Review 2 (Adversarial) — needs-attention\n\n### Findings\n\n**1. [HIGH] x** \`override-key: abc12345\`${extra}\n`;
-const reviewWithMarker = findingLine(` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}`);
+// The blocking case: category + spec-behind-code direction (#356).
+const reviewWithMarker = findingLine(
+  ` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}`,
+);
+// Unclassified category marker only — no direction marker.
+const reviewWithCategoryOnly = findingLine(` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}`);
 const reviewProseOnly =
   `## Review 2 (Adversarial) — needs-attention\n\n### Findings\n\n` +
   `**1. [HIGH] the code diverges from the spec and is inconsistent with the requirement** \`override-key: abc12345\`\n`;
@@ -68,12 +73,20 @@ function guardDeps(commits: FixCommit[], reviewBody: string | null): {
   return { deps, blocked };
 }
 
-test("guard: stale + finding tagged category:spec-divergence → blocked", async () => {
+test("guard: stale + spec-divergence finding with spec-behind-code direction → blocked", async () => {
   const { deps, blocked } = guardDeps([impl("a")], reviewWithMarker);
   const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
   assert.ok(out && !out.advanced && out.status === "blocked");
   assert.equal(blocked.length, 1);
-  assert.match(blocked[0], /stale spec delta/);
+  assert.match(blocked[0], /spec-delta alignment/);
+});
+
+// Disambiguation (#356): unclassified spec-divergence marker (no direction) must NOT block.
+test("guard: stale + spec-divergence finding with no direction marker → NOT blocked (disambiguation)", async () => {
+  const { deps, blocked } = guardDeps([impl("a")], reviewWithCategoryOnly);
+  const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
+  assert.equal(out, null, "unclassified spec-divergence must NOT drive the stale-delta block");
+  assert.deepEqual(blocked, []);
 });
 
 test("guard: stale but divergence only in PROSE (no marker) → NOT blocked — the gate ignores prose", async () => {
@@ -97,10 +110,10 @@ test("guard: no developer commits → not blocked", async () => {
 // review comment, including pre-merge delta reviews. If the latest comment is a delta
 // review carrying `category: spec-divergence` and the prior full Review 2 does NOT
 // carry the marker, the guard must still block (not fall through to the old comment).
-test("guard: latest delta review has spec-divergence marker but older Review 2 does not → blocked (#228)", async () => {
+test("guard: latest delta review has spec-divergence marker (spec-behind-code) but older Review 2 does not → blocked (#228)", async () => {
   const deltaReviewWithMarker =
     `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention (commit abc1234)\n\n` +
-    `### Findings\n\n**1. [HIGH] spec divergence** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)}\n`;
+    `### Findings\n\n**1. [HIGH] spec divergence** \`override-key: abc12345\` ${categoryMarker(SPEC_DIVERGENCE_CATEGORY)} ${directionMarker("spec-behind-code")}\n`;
   const olderReview2WithoutMarker = findingLine(""); // no spec-divergence category
 
   const blocked: string[] = [];
@@ -118,9 +131,9 @@ test("guard: latest delta review has spec-divergence marker but older Review 2 d
   };
   const out = await enforceSpecConsistencyGuard(cfg, 1, "/wt", [ID], deps);
   assert.ok(out && !out.advanced && out.status === "blocked",
-    "should block because the latest (delta) review has category:spec-divergence");
+    "should block because the latest (delta) review has spec-behind-code direction");
   assert.equal(blocked.length, 1);
-  assert.match(blocked[0], /stale spec delta/);
+  assert.match(blocked[0], /spec-delta alignment/);
 });
 
 // ---- computeBranchDeveloperCommits: auto-format commits visible to stale-spec guard (#182 review-2 finding 3) ----
@@ -134,10 +147,20 @@ test("guard: latest delta review has spec-divergence marker but older Review 2 d
 
 test("computeBranchDeveloperCommits (via guard): auto-format commit changing impl files IS visible to stale-spec guard", async () => {
   const blocked: string[] = [];
+  // The review body must include a reviewed-sha matching what fakeGit returns for
+  // rev-parse HEAD so the guard sees positive evidence the marker is current (#356).
+  const HEAD_SHA = "aabbccddeeff11223344556677889900aabbccdd";
+  const reviewBodyWithSha = [
+    reviewWithMarker.trimEnd(),
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
   // Build a fake log: one auto-format commit that touches an implementation file.
   // gitInWorktree is called for: "diff --name-only" (candidates), "log" (commits), and
   // "diff --name-only sha^..sha" (per-commit paths). We discriminate by the args.
   const fakeGit = (async (_wt: string, args: string[]) => {
+    // 0. rev-parse HEAD for the SHA correlation check (#356 finding 2)
+    if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
     // 1. diff for candidates (three-dot form: origin/main...HEAD)
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
       return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
@@ -162,12 +185,13 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
     changeDirExists: () => true,
     // No branchDeveloperCommits override → uses computeBranchDeveloperCommits default
     getIssueDetail: (async () => ({
-      comments: [{ author: "r", body: reviewWithMarker, createdAt: "t" }],
+      comments: [{ author: "r", body: reviewBodyWithSha, createdAt: "t" }],
     })) as AdvancePreMergeDeps["getIssueDetail"],
     setBlocked: (async (_c, _n, reason: string) => {
       blocked.push(reason);
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "r", // match the author set on review comments above (#356 finding 1)
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -175,7 +199,7 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
   assert.ok(out && !out.advanced && out.status === "blocked",
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.equal(blocked.length, 1);
-  assert.match(blocked[0], /stale spec delta/);
+  assert.match(blocked[0], /spec-delta alignment/);
 });
 
 // ---- maybeArchiveOpenspec: archive commit failure blocks and prevents push (#255) ----
@@ -223,6 +247,7 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
       blocked.push(reason);
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async () => { archived = true; return { success: true, unavailable: false, output: "" }; }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -266,6 +291,7 @@ test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ �
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -310,6 +336,7 @@ test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollb
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -395,6 +422,7 @@ test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty 
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
   };
 
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
@@ -409,19 +437,29 @@ test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty 
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
 
 test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, archive never called", async () => {
+  // The review body includes a reviewed-sha matching the mocked HEAD so the guard
+  // has positive evidence the marker is current before blocking (#356 finding 2).
+  const HEAD_SHA = "1122334455667788990011223344556677889900";
+  const reviewBodyWithSha = [
+    reviewWithMarker.trimEnd(),
+    "",
+    `<!-- reviewed-sha: ${HEAD_SHA} -->`,
+  ].join("\n");
   const archiveCalls: string[] = [];
   const blocked: string[] = [];
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
-    gitInWorktree: (async (_p: string, args: string[]) =>
-      args[0] === "diff" && args.includes("--name-only")
-        ? { stdout: `openspec/changes/${ID}/specs/cap/spec.md\ncore/scripts/foo.ts`, stderr: "", code: 0 }
-        : { stdout: "", stderr: "", code: 0 }) as AdvancePreMergeDeps["gitInWorktree"],
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
+      if (args[0] === "diff" && args.includes("--name-only"))
+        return { stdout: `openspec/changes/${ID}/specs/cap/spec.md\ncore/scripts/foo.ts`, stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [impl("a")],
     getIssueDetail: (async () => ({
-      comments: [{ author: "r", body: reviewWithMarker, createdAt: "t" }],
+      comments: [{ author: "r", body: reviewBodyWithSha, createdAt: "t" }],
     })) as AdvancePreMergeDeps["getIssueDetail"],
     setBlocked: (async (_c, _n, reason: string) => {
       blocked.push(reason);
@@ -430,6 +468,7 @@ test("maybeArchiveOpenspec: stale delta + spec-divergence marker → blocked, ar
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "r", // match the author set on review comments above (#356 finding 1)
   };
   const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
   assert.ok(out && !out.advanced && out.status === "blocked");

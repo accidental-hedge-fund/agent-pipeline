@@ -45,41 +45,59 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 
 ## Modes
 
+The primary invocation is the advance loop; all other operations are available as
+distinct `pipeline:<command>` entries in the skill/command menu.
+
 ```
 /pipeline N                              advance loop (default; up to 12 transitions)
-/pipeline N --status                     read-only — print stage, blocker, PR, last review
-/pipeline N --unblock "<answer>"         post answer + clear blocked label
 /pipeline N --once                       advance one stage and stop
 /pipeline N --dry-run                    log what would happen; no harness calls, no GitHub writes
 /pipeline N --domain <d>                 override domain name in lock/log paths
 /pipeline N --base <branch>              override base branch
 /pipeline N --repo-path <path>           target a different repo working tree
-/pipeline --cleanup                      sweep merged-PR worktrees, then exit (no number)
-/pipeline --init                         ensure labels + scaffold .github/pipeline.yml, then exit (no number)
-/pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh (no number)
-/pipeline doctor                         deterministic preflight check; print summary, exit 0/1 (no number)
+/pipeline N --detach                     run the advance loop in a detached background process
+
+/pipeline:status <N>                     read-only — print stage, blocker, PR, last review
+/pipeline:unblock <N> "<answer>"         post answer + clear blocked label
+/pipeline:override <N> "<key>: <reason>" disposition a review finding and auto-resume the advance loop
+/pipeline:summary <N>                    print the run's evidence bundle for issue N (local, offline)
+/pipeline:doctor                         deterministic preflight check; print summary, exit 0/1
 /pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
-/pipeline intake --description "<text>"  spec a rough description into a GitHub issue + ROADMAP PR (no number)
-/pipeline intake "<text>" --release v1.6.0  same, pinning the target release slot
-/pipeline intake --description "<text>" --dry-run  preview only; no writes
-/pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output (no number)
-/pipeline refine-spec --help             probe for contract availability; exits 0 on supported installs
-/pipeline triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
-/pipeline triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
-/pipeline sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run; no number)
-/pipeline sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
-/pipeline sweep --apply --repo other/r   sweep a different repository
-/pipeline roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run; no number)
-/pipeline roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
-/pipeline roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
-/pipeline merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
-/pipeline N --summary                    print the run's evidence bundle (local, offline); prefers run dir over /tmp
+/pipeline:init                           ensure labels + scaffold .github/pipeline.yml
+/pipeline:cleanup                        sweep merged-PR worktrees
+/pipeline:intake [--description "<text>"]  spec a rough description into a GitHub issue + ROADMAP PR
+/pipeline:intake --description "<text>" --dry-run  preview only; no writes
+/pipeline:triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
+/pipeline:triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
+/pipeline:sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
+/pipeline:sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
+/pipeline:sweep --apply --repo other/r   sweep a different repository
+/pipeline backfill                       preview OpenSpec coverage for legacy behavior (non-mutating)
+/pipeline backfill --apply               author a spec-only PR for missing-coverage behaviors
+/pipeline backfill --apply --capability auth  scope the apply slice to a named capability
+/pipeline:roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run)
+/pipeline:roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
+/pipeline:roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
+/pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+/pipeline:release <version>              prepare a release PR for the given version
+/pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
-/pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits (no number)
-/pipeline queue --max-issues 5 --concurrency 2 --budget-dollars 2.00
-/pipeline queue --label team:backend --milestone v2.0 --risk medium
+/pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh
+/pipeline config repo-map <add|remove|list>  add/remove/list repo_map entries in .github/pipeline.yml
+/pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output
+/pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
 /pipeline --version                      print the package version, then exit (no number; -V alias)
+```
+
+**Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
+```
+/pipeline N --status        → use /pipeline:status N
+/pipeline N --summary       → use /pipeline:summary N
+/pipeline N --unblock "…"   → use /pipeline:unblock N "…"
+/pipeline N --override "…"  → use /pipeline:override N "…"
+/pipeline --init            → use /pipeline:init
+/pipeline --cleanup         → use /pipeline:cleanup
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
@@ -105,6 +123,13 @@ convenience, not a precondition.
 effective configured behavior. Preview is the default and prints a diff without
 writing; `--apply` writes only after the existing file and rendered candidate
 both validate.
+
+`config repo-map <add|remove|list>` also takes no number. `add`/`remove` mutate
+only the `repo_map` block of `.github/pipeline.yml` (all other keys, comments,
+and formatting are preserved), creating the block when absent; `add` is
+idempotent and `remove` tolerates an absent entry (exit 0, warning). `--rel`
+selects `depends_on` (default) or `depended_on_by`. `list` prints current
+entries grouped by relationship kind.
 
 `doctor` takes no number either. It runs a **deterministic, model-free** preflight
 that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
@@ -174,6 +199,23 @@ in place; the ROADMAP reconciliation is delivered as a branch + PR for human
 review (never committed directly to the default branch). Re-running sweep is
 idempotent — already-specced issues are recognized as sufficient and skipped.
 
+`backfill` is a safe maintenance flow for adding OpenSpec coverage to repositories
+whose accepted behavior predates OpenSpec adoption. It classifies legacy behaviors
+into four groups and optionally opens a spec-only PR for the missing-coverage slice:
+
+```bash
+/pipeline backfill                        # preview: four-group coverage report (no writes)
+/pipeline backfill --apply                # apply: open a spec-only PR for missing behaviors
+/pipeline backfill --apply --capability auth  # scope the slice to a named capability
+```
+
+Default is non-mutating preview. With `--apply`: authors an OpenSpec change with
+additive requirement deltas, validates with `openspec validate`, and opens a
+spec-only PR. Never commits directly to the default branch; never merges.
+The diff is asserted to touch only paths under `openspec/` before the PR is created.
+Re-running after a slice lands is idempotent — applied requirements are recognized
+as already-covered and not duplicated.
+
 ## Setup (zero install after first run)
 
 The skill is a Node 24+ TypeScript codebase under
@@ -206,8 +248,13 @@ ci_poll_interval: 30
 models:                          # only the claude harness honors these; a key
   planning: sonnet               # whose role runs on codex is ignored and a
   implementing: sonnet           # config warning is printed (planning/implementing/fix
-  review: opus                   # → implementer, review → reviewer)
+  review: claude-fable-5         # → implementer, review → reviewer). Each key also accepts "auto".
   fix: sonnet
+effort:                          # per-phase reasoning effort — codex via -c model_reasoning_effort,
+  planning: medium               # claude via --effort. Absent key: no flag. Each key also accepts "auto".
+  implementing: low              # planning also sources plan-review's effort (classified separately).
+  review: high                   # review is resolved round-aware (review-1 vs. review-2).
+  fix: low
 conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library
@@ -221,6 +268,68 @@ review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the 
 
 When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). The `harnesses.implementer` is never overridable by repo config.
 
+`review_harness` also accepts a structured form for independent reviewer model/effort control, each accepting `"auto"` (resolved round-aware — plan-review/review-2 as Definitive, review-1 as Iterative):
+
+```yaml
+review_harness:
+  command: claude
+  model: auto
+  effort: auto
+```
+
+### External stage executors (#314)
+
+Beyond `review_harness` (which only overrides the reviewer CLI), any model-invoking
+stage — `planning`, `implementing`, `review-1`, `review-2`, `fix-1`, `fix-2`,
+`plan-review`, and `shipcheck-gate` when enabled — can be delegated to an **external
+agent system** (OpenCode, HermesAgent, OpenClaw, or any other API-driven execution
+backend) or, for review-only stages, to a raw **model endpoint** (e.g. a local Ollama
+server). This is entirely opt-in: a repo with no `executors:`/`stage_executors:`
+block behaves exactly as today.
+
+```yaml
+executors:
+  opencode-main:
+    type: agent-system              # full execution backend — valid for ANY model-invoking stage
+    provider: opencode               # provider identifier (a plain string; not a built-in adapter)
+    endpoint: https://opencode.internal/api
+    credential: OPENCODE_API_KEY     # env-var NAME resolved at invocation time — never a literal value
+  local-ollama:
+    type: model-endpoint             # raw OpenAI-compatible chat/completions endpoint
+    base_url: http://localhost:11434/v1
+    model: llama3.1:70b
+    # no credential needed for a localhost endpoint
+
+stage_executors:
+  planning: opencode-main
+  review-1: local-ollama
+  review-2: local-ollama
+```
+
+Key rules:
+
+- **`agent-system`** executors may be assigned to any model-invoking stage. The
+  pipeline `POST`s `{ stage, prompt }` to `endpoint` (with an `authorization: Bearer
+  <credential>` header when `credential` is set) and expects `{ "output": "<text>" }`
+  back; that text flows through the exact same downstream parsing (including
+  `parseStructuredVerdict` for review stages) as a local CLI's stdout.
+- **`model-endpoint`** executors are valid **only** for the prompt-contained stages
+  `plan-review`, `review-1`, `review-2` — a raw endpoint has no repo/tool access, and
+  these are the only stages whose prompt already carries all the context needed
+  (diff, plan text, conventions excerpt) inline. Assigning one to `planning`,
+  `implementing`, `fix-1`, `fix-2`, or `shipcheck-gate` is rejected **at
+  config-parse time**, naming both the offending stage and executor — never
+  discovered mid-run.
+- Credentials are **references** (an env-var name), resolved from the environment
+  only at invocation time; the value is never written to `pipeline.yml` or emitted
+  in run evidence.
+- A misconfigured, unreachable, or non-compliant executor **blocks the item** with
+  an error naming the stage and provider — there is no silent fallback to the local
+  `claude`/`codex` harness (this is distinct from, and takes priority over, the
+  `review_harness` self-review fallback above, which never applies to a
+  `stage_executors` assignment).
+- Run evidence records which executor (and, for `model-endpoint`, which model)
+  ran each delegated stage.
 ## Conventions & carry-forward lessons
 
 `readConventions` reads the target repo's conventions file (`conventions_md_path`, else `CLAUDE.md` on this host) and injects an excerpt into **every** stage prompt — planning, plan-review, plan-revision, implementing, both review rounds, and both fix rounds — via the `{{conventions}}` placeholder. This makes the conventions file the natural home for **carry-forward lessons**: a maintainer-curated `## Lessons / Gotchas` section (or a dedicated lessons file pointed at by `conventions_md_path`) recording recurring findings and repo-specific hazards. It is ordinary conventions text, so it rides the existing injection with **no extra config key, store, or flag** beyond the `conventions_md_path` / `CLAUDE.md` default.
@@ -273,108 +382,94 @@ Confirms target exists, has a `pipeline:*` label, isn't already at a
 terminal/blocked state. If anything looks wrong, surface it and stop —
 do not start an advance.
 
-#### b. Background the advance with logging
+#### b. Launch the advance through detached run-store mode
 
 ```bash
 cd <repo_dir>
-node ~/.claude/skills/pipeline/scripts/pipeline.mjs <N> \
-  > /tmp/pipeline-<domain>-<N>.log 2>&1
+RUN_DIR=$(node ~/.claude/skills/pipeline/scripts/pipeline.mjs run <N> --detach)
+cat "$RUN_DIR/run-store.json"
 ```
 
-Run with `run_in_background: true`. The bash tool returns the task ID
-immediately; the pipeline runs detached.
+This command returns quickly. `RUN_DIR` is a supervision wrapper under
+`~/.pipeline/runs/...`; `run-store.json` points at the canonical
+`.agent-pipeline/runs/<run-id>/` run store. Use that `run_store_run_id` for all
+log and summary commands below.
 
-#### c. Stream stage transitions via Monitor
+#### c. Stream structured run events via Monitor
 
-Arm a persistent Monitor. The **log path** always uses the original argument
-`<N>` from section b (the same file that was opened for writing). The
-**grep filter** uses the **resolved issue number** `<resolved-N>` — identical
-to `<N>` when you passed an issue directly; look for the line
-`[pipeline] #<N> is a PR → resolved to issue #<resolved-N>` near the top of
-the log when you passed a PR:
+Arm a persistent Monitor on the run-store event stream:
 
 ```bash
-tail -f /tmp/pipeline-<domain>-<N>.log | grep -E --line-buffered \
-  "^\[pipeline\] #<resolved-N>: "
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
 ```
 
-For example, `/pipeline 64` (issue passed directly, `<N>` = `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-64.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
-
-`/pipeline 100` where PR 100 resolves to issue 64 (`<N>` = 100, `<resolved-N>` = 64):
-```bash
-tail -f /tmp/pipeline-<domain>-100.log | grep -E --line-buffered \
-  "^\[pipeline\] #64: "
-```
+`--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
+structured stream for lifecycle, gate, blocker, PR, review, accounting, and
+completion events. It is not a grep-filtered terminal log and it is not a
+separate `/tmp` transitions artifact.
 
 Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if
 needed). Each emitted line lands in Claude's notification stream.
 
-**Why the tight filter?** The test-gate stage (`npm test` / `npm run ci`)
-dumps the full unit-test suite output to the same log. The eval-gate and
-state-machine test fixtures reproduce exact `[pipeline] #<other-N>:` and
-`→ ready-to-deploy` substrings (they assert on the pipeline's own log
-format). The broad alternation matched hundreds of these fixture lines in
-rapid succession, triggering the Monitor tool's auto-stop threshold and
-silencing the rest of the run.
+**Fallback — raw terminal output:** If you need the full combined output
+(harness prose, CI stdout, stage output), follow `terminal.log` from the same
+run store:
 
-**No real signal is lost:** every stage transition — including
-`[pipeline] #N: done`, `[pipeline] #N: at <stage> — blocked: …`, and
-`[pipeline] #N: → ready-to-deploy` — begins with `[pipeline] #N:`.
-Process exit (run-end) is independently signalled by the background bash
-task completing, not by log content.
+```bash
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
+```
 
-#### d. Push notification on every `[pipeline]` event
+Do not create or recommend extra `/tmp/pipeline-<domain>-<N>.log` files for
+normal monitoring. If a human manually redirects output for local debugging,
+that file is scratch output, not the pipeline evidence contract.
+
+#### d. Push notification on material event records
 
 For every material Monitor event (see suppression list below), call
 `PushNotification` with a short one-line message. The state machine has
-only 9 transitions max and each emits ≤2 visible `[pipeline]` lines, so
-this caps at ~12–18 pushes per full run — coarse enough to not be spammy,
+only a bounded number of stage transitions, so
+this caps at a small number of pushes per full run — coarse enough to not be spammy,
 fine enough that the user never wonders "is anything happening?" between
 major arrows.
 
 Examples that DO push:
-- `[pipeline] #N: starting at stage=<x>`
-- `[pipeline] #N: planning (impl=claude)`
-- `[pipeline] #N: worktree at <path>`
-- `[pipeline] #N: implementation done (Xs, harness=Y)`
-- `[pipeline] #N: PR #M created`
-- `[pipeline] #N: ready → review-1: PR #M opened`
-- `[pipeline] #N: review-1 by codex`
-- `[pipeline] #N: verdict=approve findings=0`
-- `[pipeline] #N: review-1 → review-2: standard review approved`
-- … and so on, all the way through `→ ready-to-deploy`
+- `run_start`
+- `stage_start`
+- `stage_complete`
+- `pr_created` / `pr_updated`
+- `review_verdict`
+- `gate_result`
+- `blocker_set` / `blocker_cleared`
+- `run_complete`
 
 Examples that do NOT push:
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
-  re-enters the gate check every `ci_poll_interval` seconds (default 30s)
-  and emits `[pipeline] #N: pre-merge gate` each time. Push the FIRST
-  occurrence per stage entry; suppress subsequent identical lines in the
-  same polling burst. The next material event is the eventual
-  `→ ready-to-deploy` or `→ blocked` transition — don't bury it under
-  30 spam pushes.
+  re-enters the gate check every `ci_poll_interval` seconds (default 30s).
+  Push the first material stage/gate event per stage entry; suppress
+  subsequent identical polling updates in the same burst. The next material
+  event is the eventual advancing or blocked stage outcome.
 
 The "err toward not sending" guidance in the PushNotification docs is
 about ambient noise — but `/pipeline N` is a foreground operation the
 user explicitly invoked, not background ambient state. They asked for
 this push stream; deliver it.
 
-#### e. Stop the Monitor when the background bash completes
+#### e. Stop the Monitor when the run completes
 
-The harness fires a separate `task-notification` for the background
-bash with `<status>completed</status>` when pipeline.ts exits. On that
-event, call `TaskStop` with the Monitor's task_id and surface the
-final summary inline by reading the tail of the log.
+Stop the Monitor when a `run_complete` event appears, or when the wrapper
+`$RUN_DIR/sentinel.json` reports completion. Then surface the final summary.
 
 #### f. Final summary
 
-Read the last 30 lines of `/tmp/pipeline-<domain>-<N>.log` (same path as
-section b — the original argument) and surface inline: starting stage →
-ending stage, transitions made, wall-clock elapsed, PR URL if one was
-opened. Also send one final PushNotification with the terminal state.
+Read the run-store summary and surface inline:
+
+```bash
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
+URL if one was opened, and the terminal state. Also send one final
+PushNotification with the terminal state.
 
 ### 5. Modes that DON'T need this orchestration
 
@@ -384,6 +479,7 @@ opened. Also send one final PushNotification with the terminal state.
 - `--cleanup` — sweeps merged-PR worktrees, prints a summary, completes in seconds
 - `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
+- `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
 
 Run those synchronously, no Monitor, no background, no Push.

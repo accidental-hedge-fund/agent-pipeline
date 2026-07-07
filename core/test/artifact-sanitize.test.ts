@@ -154,6 +154,29 @@ test("redactSecrets: single-quoted env assignment is redacted", () => {
   assert.ok(result.includes("OPENAI_API_KEY="), "var name must be preserved");
 });
 
+// Pre-merge delta regression (#343): a capped/truncated excerpt can cut off the
+// closing quote of a quoted secret assignment; the unterminated tail must still
+// be redacted rather than logged raw.
+test("redactSecrets: unterminated double-quoted secret assignment (truncated input) is redacted", () => {
+  const text = 'forwarder: OPENAI_API_KEY="supersecretvalue-cut-off-by-cap';
+  const result = redactSecrets(text);
+  assert.ok(!result.includes("supersecretvalue"), "truncated quoted value must not survive");
+  assert.ok(result.includes("OPENAI_API_KEY=[REDACTED]"), "redaction marker must be present");
+});
+
+test("redactSecrets: unterminated single-quoted secret assignment (truncated input) is redacted", () => {
+  const text = "forwarder: MY_TOKEN='supersecretvalue-cut-off-by-cap";
+  const result = redactSecrets(text);
+  assert.ok(!result.includes("supersecretvalue"), "truncated quoted value must not survive");
+  assert.ok(result.includes("MY_TOKEN=[REDACTED]"), "redaction marker must be present");
+});
+
+test("redactSecrets: unterminated quoted non-secret assignment is left unchanged", () => {
+  const text = 'log: NODE_OPTIONS="--max-old-space';
+  const result = redactSecrets(text);
+  assert.equal(result, text, "non-secret unterminated assignments must not be touched");
+});
+
 test("redactSecrets: double-quoted value matches storePreflightResult eval-command remediation pattern", () => {
   // storePreflightResult serializes the PreflightResult via JSON.stringify then redactSecrets.
   // The eval-command check embeds eval_gate.command in its remediation string, so a configured

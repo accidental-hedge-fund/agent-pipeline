@@ -7,6 +7,8 @@ import {
   bundlePath,
   createBundle,
   finalizeBundle,
+  formatEvidenceCommentBody,
+  formatStageTimingTableMarkdown,
   formatSummary,
   makeCommandRecord,
   makePromptRecord,
@@ -24,6 +26,7 @@ import {
 } from "../scripts/evidence-bundle.ts";
 import { EVIDENCE_SCHEMA_VERSION, type CommandRecord, type EvidenceBundle } from "../scripts/types.ts";
 import { redactSecrets, sanitize } from "../scripts/artifact-sanitize.ts";
+import { buildStageAccountingRecord } from "../scripts/accounting.ts";
 
 const STATE = "/tmp/test-evidence-state";
 const ISSUE = 147;
@@ -460,6 +463,206 @@ test("formatSummary: partial run (no finalState) is labeled as such", () => {
     notifiedAt: null,
   };
   assert.match(formatSummary(partial), /partial run/i);
+});
+
+// ---------------------------------------------------------------------------
+// formatStageTimingTableMarkdown / formatEvidenceCommentBody (#377)
+// ---------------------------------------------------------------------------
+
+function timingBundle(): EvidenceBundle {
+  return {
+    schema_version: 1,
+    schemaVersion: 1,
+    runId: "377/2026-07-06T20:49:37Z",
+    issue: 377,
+    pr: 456,
+    branch: "pipeline/377-x",
+    harnesses: ["claude"],
+    stages: [
+      {
+        stage: "planning",
+        enteredAt: "2026-07-06T20:00:00Z",
+        exitedAt: "2026-07-06T20:04:15Z",
+        outcome: "advanced",
+        commits: ["abc1234"],
+        commands: [
+          { cmd: "npm test", exitCode: 0, durationMs: 4210, outputExcerpt: "ok" },
+        ],
+        prompts: [{ kind: "planning", harness: "claude", hash: "deadbeef", excerpt: "secret plan" }],
+      },
+      {
+        stage: "review-1",
+        enteredAt: "2026-07-06T20:05:00Z",
+        exitedAt: null,
+        outcome: null,
+        commits: [],
+        commands: [],
+        prompts: [],
+      },
+    ],
+    reviews: [{ round: 1, sha: "abc1234def", verdict: "approve", findingCounts: { medium: 1 } }],
+    overrides: [],
+    recoveries: [],
+    finalState: "ready-to-deploy",
+    finalizedAt: "2026-07-06T20:10:00Z",
+    notifiedAt: null,
+    accounting: {
+      records: [],
+      totals: { record_count: 1, actual_cost_usd: 1.23, estimated_cost_usd: 0, unknown_cost_count: 0 },
+    },
+  };
+}
+
+test("formatStageTimingTableMarkdown: one row per stage with duration, harness duration, and outcome", () => {
+  const out = formatStageTimingTableMarkdown(timingBundle());
+  assert.match(out, /\| planning \| 2026-07-06T20:00:00Z → 2026-07-06T20:04:15Z \| 4m15s \| — \| advanced \|/);
+  assert.match(out, /\| review-1 \| 2026-07-06T20:05:00Z → — \| — \| — \| in-progress \|/);
+});
+
+test("formatStageTimingTableMarkdown: harness duration column sums accounting records inside the stage's window", () => {
+  const bundle = timingBundle();
+  bundle.accounting = {
+    records: [
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "planning",
+        harness: "claude",
+        startedAt: "2026-07-06T20:00:10Z",
+        endedAt: "2026-07-06T20:01:00Z",
+        durationMs: 50_000,
+        outcome: "success",
+      }),
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "planning",
+        harness: "claude",
+        startedAt: "2026-07-06T20:01:05Z",
+        endedAt: "2026-07-06T20:01:15Z",
+        durationMs: 10_000,
+        outcome: "success",
+      }),
+    ],
+    totals: { record_count: 2, actual_cost_usd: 0, estimated_cost_usd: 0, unknown_cost_count: 2 },
+  };
+  const out = formatStageTimingTableMarkdown(bundle);
+  assert.match(out, /\| planning \| 2026-07-06T20:00:00Z → 2026-07-06T20:04:15Z \| 4m15s \| 1m00s \| advanced \|/);
+});
+
+// Regression: `recordStage`'s "last open" semantics allow the same stage name to
+// be re-entered within one run (e.g. review-1 → fix-1 → review-1). The harness
+// duration column must attribute each visit's accounting records to its own row
+// by enteredAt/exitedAt window, not sum them onto every row sharing the name.
+test("formatStageTimingTableMarkdown: does not double-count harness duration across repeated stage-name rows", () => {
+  const bundle = timingBundle();
+  bundle.stages = [
+    {
+      stage: "review-1",
+      enteredAt: "2026-07-06T20:00:00Z",
+      exitedAt: "2026-07-06T20:01:00Z",
+      outcome: "blocked",
+      commits: [],
+      commands: [],
+      prompts: [],
+    },
+    {
+      stage: "review-1",
+      enteredAt: "2026-07-06T20:10:00Z",
+      exitedAt: "2026-07-06T20:11:00Z",
+      outcome: "advanced",
+      commits: [],
+      commands: [],
+      prompts: [],
+    },
+  ];
+  bundle.accounting = {
+    records: [
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "review-1",
+        harness: "claude",
+        startedAt: "2026-07-06T20:00:10Z",
+        endedAt: "2026-07-06T20:00:40Z",
+        durationMs: 30_000,
+        outcome: "success",
+      }),
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "review-1",
+        harness: "claude",
+        startedAt: "2026-07-06T20:10:10Z",
+        endedAt: "2026-07-06T20:10:50Z",
+        durationMs: 40_000,
+        outcome: "success",
+      }),
+    ],
+    totals: { record_count: 2, actual_cost_usd: 0, estimated_cost_usd: 0, unknown_cost_count: 2 },
+  };
+  const out = formatStageTimingTableMarkdown(bundle);
+  const rows = out.split("\n").filter((l) => l.startsWith("| review-1"));
+  assert.equal(rows.length, 2);
+  assert.match(rows[0], /\| 30s \| blocked \|/);
+  assert.match(rows[1], /\| 40s \| advanced \|/);
+});
+
+test("formatStageTimingTableMarkdown: contains no command/prompt/token/cost text", () => {
+  const out = formatStageTimingTableMarkdown(timingBundle());
+  assert.doesNotMatch(out, /npm test/);
+  assert.doesNotMatch(out, /secret plan/);
+  assert.doesNotMatch(out, /1\.23/);
+  assert.doesNotMatch(out, /approve/);
+});
+
+test("formatStageTimingTableMarkdown: empty stages renders a placeholder row, not a crash", () => {
+  const out = formatStageTimingTableMarkdown({ ...timingBundle(), stages: [] });
+  assert.match(out, /no stages recorded/i);
+});
+
+test("formatEvidenceCommentBody: renders fully from the bundle alone — visible run id, full timing table, secondary path", () => {
+  const bundle = timingBundle();
+  const out = formatEvidenceCommentBody(bundle, "/tmp/state/377/evidence.json", "pipeline 377 --summary");
+  assert.match(out, /\*\*Run ID:\*\* `377\/2026-07-06T20:49:37Z`/);
+  assert.match(out, /\| planning \|/);
+  assert.match(out, /\| review-1 \|/);
+  assert.match(out, /\/tmp\/state\/377\/evidence\.json/);
+  assert.match(out, /pipeline 377 --summary/);
+});
+
+test("formatEvidenceCommentBody: contains no accounting payloads (tokens, cost, prompts, commands)", () => {
+  const out = formatEvidenceCommentBody(timingBundle(), "/tmp/state/377/evidence.json", "pipeline 377 --summary");
+  assert.doesNotMatch(out, /npm test/);
+  assert.doesNotMatch(out, /secret plan/);
+  assert.doesNotMatch(out, /1\.23/);
+  assert.doesNotMatch(out, /token/i);
+});
+
+test("formatEvidenceCommentBody: harness duration column surfaces duration only, never the record's cost/token/model fields", () => {
+  const bundle = timingBundle();
+  bundle.accounting = {
+    records: [
+      buildStageAccountingRecord({
+        runId: "r",
+        issue: 377,
+        stage: "planning",
+        harness: "claude",
+        model: "sonnet-super-secret-slug",
+        startedAt: "2026-07-06T20:00:10Z",
+        endedAt: "2026-07-06T20:01:00Z",
+        durationMs: 50_000,
+        outcome: "success",
+        usage: { input_tokens: 999, output_tokens: 111, cost_usd: 42.5 },
+      }),
+    ],
+    totals: { record_count: 1, actual_cost_usd: 42.5, estimated_cost_usd: 0, unknown_cost_count: 0 },
+  };
+  const out = formatEvidenceCommentBody(bundle, "/tmp/state/377/evidence.json", "pipeline 377 --summary");
+  assert.match(out, /\| planning \| .* \| 50s \| advanced \|/);
+  assert.doesNotMatch(out, /42\.5/);
+  assert.doesNotMatch(out, /999/);
+  assert.doesNotMatch(out, /sonnet-super-secret-slug/);
 });
 
 // ---------------------------------------------------------------------------

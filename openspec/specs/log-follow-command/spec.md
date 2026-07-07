@@ -48,3 +48,21 @@ When `pipeline logs` is invoked with no `<run-id>` argument, the CLI SHALL list 
 - **THEN** the command SHALL print a message indicating no runs are available
 - **AND** SHALL exit with code 0
 
+---
+
+### Requirement: pipeline logs can read or follow structured run events
+The CLI SHALL support `pipeline logs <run-id> --events [--follow | -f]`. When `--events` is present, the command SHALL use the run directory's `events.jsonl` instead of `terminal.log`, so operators and agent harnesses can monitor lifecycle events without parsing raw combined terminal output or relying on a separate `/tmp` transitions file.
+
+#### Scenario: logs --events prints current event lines
+- **WHEN** `pipeline logs <run-id> --events` is invoked without `--follow`
+- **THEN** the full current contents of `.agent-pipeline/runs/<run-id>/events.jsonl` SHALL be printed to stdout
+- **AND** `terminal.log` SHALL NOT be read for that invocation
+
+#### Scenario: logs --events --follow tails event lines
+- **WHEN** `pipeline logs <run-id> --events --follow` is invoked while the run is in progress
+- **THEN** new JSON event lines appended to `events.jsonl` SHALL appear on stdout as they are written
+- **AND** the command SHALL NOT require any `/tmp/pipeline-<domain>-<N>.transitions.log` file
+
+#### Scenario: missing events file reports the selected file name
+- **WHEN** `pipeline logs <run-id> --events` is invoked before `events.jsonl` exists
+- **THEN** the command SHALL exit non-zero with a diagnostic naming `events.jsonl`

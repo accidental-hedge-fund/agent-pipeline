@@ -363,6 +363,7 @@ export async function buildDepgraph(
     conflict_pairs: [],
     cycle_reports: [],
     open_questions: [],
+    cross_repo: [],
   };
 
   if (items.length === 0) {

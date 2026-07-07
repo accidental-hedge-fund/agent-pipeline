@@ -37,6 +37,9 @@ export interface BuildStageAccountingRecordInput {
   estimatedCostUsd?: number | null;
   promptChars?: number | null;
   promptEstimatedTokens?: number | null;
+  prHeadSha?: string | null;
+  executorProvider?: string | null;
+  executorModel?: string | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -142,6 +145,9 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(finiteNonNegative(input.promptChars) !== null ? { prompt_chars: nonNegativeInteger(input.promptChars) } : {}),
     ...(finiteNonNegative(input.promptEstimatedTokens) !== null ? { prompt_estimated_tokens: nonNegativeInteger(input.promptEstimatedTokens) } : {}),
     ...(usage.usage ? { usage: usage.usage } : {}),
+    ...(typeof input.prHeadSha === "string" && input.prHeadSha ? { pr_head_sha: input.prHeadSha } : {}),
+    ...(cleanOptionalString(input.executorProvider ?? null) !== null ? { executor_provider: cleanOptionalString(input.executorProvider ?? null) } : {}),
+    ...(cleanOptionalString(input.executorModel ?? null) !== null ? { executor_model: cleanOptionalString(input.executorModel ?? null) } : {}),
   };
   return sanitizeStageAccountingRecord(record);
 }
@@ -176,6 +182,11 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (promptEstimatedTokens !== null) cleaned.prompt_estimated_tokens = nonNegativeInteger(promptEstimatedTokens);
   const usage = sanitizeUsage(record.usage);
   if (usage) cleaned.usage = usage;
+  if (typeof record.pr_head_sha === "string" && record.pr_head_sha) cleaned.pr_head_sha = record.pr_head_sha;
+  const executorProvider = cleanOptionalString(record.executor_provider ?? null);
+  if (executorProvider !== null) cleaned.executor_provider = executorProvider;
+  const executorModel = cleanOptionalString(record.executor_model ?? null);
+  if (executorModel !== null) cleaned.executor_model = executorModel;
   return cleaned;
 }
 

@@ -52,6 +52,14 @@ export function redactSecrets(text: string): string {
     /\b([A-Z][A-Z0-9_]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'`,;)\\]+)/g,
     (full, name) => (SECRET_NAME_RE.test(name) ? `${name}=[REDACTED]` : full),
   );
+  // A truncated input (e.g. a capped stderr excerpt) can cut off the closing
+  // quote of a quoted assignment, so the pattern above never matches and the
+  // raw value prefix would survive. An unterminated quoted secret assignment
+  // running to end-of-input is inherently a secret value — redact it whole.
+  result = result.replace(
+    /\b([A-Z][A-Z0-9_]*)\s*=\s*(?:"[^"]*|'[^']*)$/,
+    (full, name) => (SECRET_NAME_RE.test(name) ? `${name}=[REDACTED]` : full),
+  );
   return result;
 }
 

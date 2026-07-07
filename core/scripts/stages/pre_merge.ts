@@ -27,7 +27,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
+import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   computeDiffHash,
@@ -50,12 +50,16 @@ import {
   partitionFindings,
 } from "../review-policy.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
-import { buildDeltaReviewPrompt } from "../prompts/index.ts";
+import { buildDeltaReviewPrompt, buildFixPrompt } from "../prompts/index.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import * as openspec from "../openspec.ts";
 import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
+  performBoundedSpecRepair,
+  type InvokeFn,
+  type SpecConsistencyDeps,
+  type ValidateFn,
 } from "../openspec-consistency.ts";
 export {
   enforceSpecConsistencyGuard,
@@ -63,13 +67,54 @@ export {
   type FixCommit,
   type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
+import { invoke } from "../harness.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
-import type { RunStoreDeps } from "../run-store.ts";
+import { readEvents } from "../run-store.ts";
+import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
+import { runTestGate } from "../testgate.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
+
+/**
+ * Commit-subject prefix for the pre-merge bounded auto-fix round (#359).
+ * Every auto-fix commit starts with this prefix so the one-attempt bound can
+ * detect a prior attempt after a process restart by scanning PR commit subjects.
+ * MUST NOT match `isPipelineInternalCommit` — auto-fix commits are developer
+ * commits and must invalidate the review-SHA gate so the re-review runs.
+ */
+export const PRE_MERGE_AUTOFIX_PREFIX = "fix: pre-merge auto-fix";
+
+/**
+ * Result of a pre-merge bounded auto-fix attempt (#359).
+ * "fix-committed" — harness committed a fix and pushed it to the PR head.
+ *                   Caller should re-run the delta review exactly once,
+ *                   evaluated against `headSha` — the authoritative post-fix
+ *                   commit SHA read from local git state (#371). Callers MUST
+ *                   NOT re-derive the post-fix head from a GitHub-API PR-head
+ *                   read, which can still return the pre-fix head in the
+ *                   window immediately after the push.
+ * "error"         — harness failure, dirty worktree, push failure, or no
+ *                   commit produced. Worktree rolled back to pre-fix HEAD.
+ */
+export type PreMergeAutoFixResult =
+  | { status: "fix-committed"; headSha: string }
+  | { status: "error" };
+
+/**
+ * Injectable seam for the bounded pre-merge auto-fix attempt (#359).
+ * Parameters: the blocking ReviewFinding objects, the issue title (for the
+ * fix prompt), and the delta review comment body (as reviewFindings text).
+ * Called by `enforceReviewShaGate` only when (a) all blocking findings pass
+ * `allBlockingAutoFixable` and (b) no prior auto-fix commit is present.
+ */
+export type AttemptPreMergeAutoFixFn = (
+  blockingFindings: ReviewFinding[],
+  issueTitle: string,
+  reviewComment: string,
+) => Promise<PreMergeAutoFixResult>;
 
 /**
  * True when a commit was authored by the pipeline itself in pre-merge (an
@@ -84,6 +129,153 @@ const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
   return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+}
+
+/**
+ * True iff a blocking finding's category is in the auto-fix allowlist
+ * `{ correctness, missing-dep }`. Absent/empty/unknown category → false
+ * (fail-closed: auto-fix only on positive signal). (#359)
+ */
+export function isAutoFixableFinding(f: ReviewFinding): boolean {
+  const cat = (f.category ?? "").toLowerCase().trim();
+  return cat === "correctness" || cat === "missing-dep";
+}
+
+/**
+ * True iff the blocking findings array is non-empty and every element
+ * passes `isAutoFixableFinding`. Empty array → false (no findings to fix).
+ * (#359)
+ */
+export function allBlockingAutoFixable(blocking: ReviewFinding[]): boolean {
+  return blocking.length > 0 && blocking.every(isAutoFixableFinding);
+}
+
+/**
+ * Perform one bounded pre-merge auto-fix attempt (#359).
+ *
+ * Invokes the implementer harness with the surgical-fix prompt (`buildFixPrompt`),
+ * amends the resulting commit to carry the `PRE_MERGE_AUTOFIX_PREFIX` subject
+ * (the durable crash-safe one-attempt marker), and pushes to the PR head.
+ *
+ * Pre-conditions: worktree must be clean (fail closed otherwise).
+ * On any failure (harness error, no commit produced, push error): rolls the
+ * worktree back to the pre-fix HEAD over a clean tree and returns "error".
+ * The surgical-fix discipline (#235) — minimal diff, destructive-operation guard,
+ * pre-commit self-check — applies via `buildFixPrompt` unchanged.
+ */
+export async function performPreMergeAutoFix(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  pipelineRunId: string,
+  findingsText: string,
+  issueTitle: string,
+  wt: { path: string; slug: string },
+  gitFn: typeof gitInWorktree,
+  invokeFn: InvokeFn,
+): Promise<PreMergeAutoFixResult> {
+  const harness = cfg.harnesses?.implementer;
+  if (!harness) return { status: "error" };
+
+  const headBefore = (
+    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+
+  // Pre-fix cleanliness check: a dirty worktree before the attempt fails closed
+  // (#235). Rollback uses `git reset --hard`; running that over pre-existing dirty
+  // work would irreversibly discard it.
+  const preStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return { status: "error" };
+
+  // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
+  // made in a detached worktree don't move the branch ref, so the later push
+  // would silently leave the PR branch unchanged while returning success.
+  const reattach = await reattachIfDetached(wt, issueNumber, gitFn);
+  if (!reattach.ok) return { status: "error" };
+
+  const prompt = buildFixPrompt({
+    cfg,
+    issueNumber,
+    title: issueTitle,
+    reviewFindings: findingsText,
+    fixRound: 1,
+    pipelineRunId,
+  });
+
+  const result = await invokeFn(harness, wt.path, prompt, {
+    timeoutSec: cfg.fix_timeout,
+    model: cfg.models?.fix ?? null,
+    sandbox: cfg.harness_sandbox,
+  });
+
+  if (!result.success) {
+    if (headBefore) {
+      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    }
+    return { status: "error" };
+  }
+
+  const headAfter = (
+    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
+  const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
+  const hasNewCommit = headAfter && headBefore && headAfter !== headBefore;
+
+  // Spec (#359): a dirty post-harness worktree (uncommitted changes remaining) or
+  // no new commit is a failure — roll back. The harness MUST commit cleanly; a dirty
+  // state indicates the harness exited early or its pre-commit self-check withheld the
+  // commit, and we must not push a partial or self-check-rejected fix.
+  if (hasUncommitted || !hasNewCommit) {
+    if (headBefore) {
+      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    }
+    return { status: "error" };
+  }
+
+  // Harness committed cleanly; amend to set the canonical subject so the
+  // one-attempt bound can detect this commit by subject prefix.
+  const autoFixMsg = withTrailers(
+    `${PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
+    issueNumber,
+    pipelineRunId,
+  );
+
+  const amendRes = await gitFn(
+    wt.path, ["commit", "--amend", "-m", autoFixMsg], { ignoreFailure: true },
+  );
+  if (amendRes.code !== 0) {
+    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    return { status: "error" };
+  }
+
+  // Capture the authoritative post-fix head from local git state (#371) — the
+  // amend rewrote the commit SHA, so this is the SHA the caller's re-review must
+  // evaluate. Read here (not re-derived from a GitHub-API PR-head read after the
+  // push), since that API read can still lag and return the pre-fix head.
+  const postFixHead = (
+    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  if (!postFixHead) {
+    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    return { status: "error" };
+  }
+
+  // Push the fix commit to the PR head.
+  const branch = branchName(issueNumber, wt.slug);
+  const pushRes = await gitFn(wt.path, ["push", "origin", branch], { ignoreFailure: true });
+  if (pushRes.code !== 0) {
+    // Rollback: push failed, remove the local commit so the next attempt is clean.
+    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+    return { status: "error" };
+  }
+
+  return { status: "fix-committed", headSha: postFixHead };
 }
 
 /**
@@ -149,6 +341,35 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
+  /**
+   * Injectable bounded spec-delta repair attempt (#356). When provided, the
+   * spec-divergence consistency guard calls this for a `spec-behind-code`
+   * direction instead of blocking immediately. Production default: uses the
+   * implementer harness to update only the active change's spec files.
+   * Tests inject a mock to verify the dep is wired without a real harness.
+   */
+  attemptBoundedRepair?: SpecConsistencyDeps["attemptBoundedRepair"];
+  /**
+   * Injectable harness invoker for the internal bounded-repair closure (#356).
+   * Defaults to `invoke` from harness.ts. Tests inject this to exercise the
+   * production-path repair closure (when `attemptBoundedRepair` is not provided
+   * and `cfg.harnesses.implementer` is set) without spawning a real harness.
+   */
+  invokeFn?: InvokeFn;
+  /**
+   * Injectable OpenSpec change validator for the internal bounded-repair closure
+   * (#356). Defaults to `openspec.validateItem`. Tests inject this alongside
+   * `invokeFn` to exercise the production-path repair closure end-to-end.
+   */
+  openspecValidateItem?: ValidateFn;
+  /**
+   * GitHub login of the pipeline actor used to filter review comments to
+   * trusted-authored entries before extracting spec-divergence signals (#356
+   * finding 1). When absent, `maybeArchiveOpenspec` resolves it via `getGhActor()`
+   * at runtime. Tests inject a literal string (matching the review-comment author
+   * they set up) to avoid a real GitHub API call.
+   */
+  trustedReviewAuthor?: string | null;
   // Seams for the no-run recovery path (#281).
   getHeadCheckRunCount?: typeof getHeadCheckRunCount;
   /** Counts only successful (conclusion=success) check-runs for a SHA.
@@ -165,6 +386,47 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   /** Sleep for the given ms. Injectable for tests to avoid real waits in
    *  `advancePolling` unit tests; defaults to setTimeout-based sleep. */
   sleepMs?: (ms: number) => Promise<void>;
+  /** Read events from the run-store JSONL log. Injected for tests; defaults to
+   *  `readEvents` from run-store.ts. Used by the `ci_mode: local` gate (#350). */
+  readRunEvents?: typeof readEvents;
+  /** Run the local test gate inline. Injected for tests; defaults to `runTestGate`
+   *  from testgate.ts. Used by the `ci_mode: local` gate when the cached result is
+   *  absent or stale (#350). */
+  runTestGate?: typeof runTestGate;
+  /** Read the HEAD SHA of a worktree by path. Injected for tests; defaults to
+   *  `git rev-parse HEAD` in the worktree. Used by the `ci_mode: local` inline gate
+   *  to verify the tested commit matches the remote PR head (#350). */
+  getWorktreeHead?: (worktreePath: string) => Promise<string>;
+}
+
+/**
+ * Read the most-recent `stage_accounting` event with `harness === "test-gate"`
+ * from the run's event log. Returns the outcome and the worktree HEAD SHA that
+ * was recorded at test time (pr_head_sha, if present). Returns `null` when no
+ * test-gate event exists (run dir absent, log unreadable, or gate never ran).
+ * Used by the `ci_mode: local` pre-merge CI gate (#350).
+ */
+async function latestTestGateOutcome(
+  runDir: string | undefined,
+  readRunEventsFn: typeof readEvents,
+): Promise<{ outcome: "success" | "failure"; prHeadSha: string | null } | null> {
+  if (!runDir) return null;
+  let events: Awaited<ReturnType<typeof readEvents>>;
+  try {
+    events = await readRunEventsFn(runDir);
+  } catch {
+    return null;
+  }
+  const testGateEvents = events.filter(
+    (e): e is StageAccountingEvent =>
+      e.type === "stage_accounting" && (e as StageAccountingEvent).harness === "test-gate",
+  );
+  if (testGateEvents.length === 0) return null;
+  const last = testGateEvents[testGateEvents.length - 1]!;
+  return {
+    outcome: last.outcome === "success" ? "success" : "failure",
+    prHeadSha: last.pr_head_sha ?? null,
+  };
 }
 
 export async function advance(
@@ -213,11 +475,42 @@ export async function advance(
   // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
   // back to the review round before doing any pre-merge work; pipeline-internal
   // commits (openspec archive) do not invalidate the verdict.
+
+  // Wire the bounded pre-merge auto-fix dep (#359): when the implementer harness
+  // is configured and no seam is injected by the caller, build a production closure
+  // that invokes `performPreMergeAutoFix` (fix + amend + push) for the gate to call.
+  const gitFnForAutoFix = deps.gitInWorktree ?? gitInWorktree;
+  const invokeFnForAutoFix = deps.invokeFn ?? invoke;
+  const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
+  const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
+    deps.attemptPreMergeAutoFix ??
+    (cfg.harnesses?.implementer
+      ? async (blockingFindings, issueTitle, findingsText) => {
+          const wt = await getForIssueForAutoFix(cfg, issueNumber);
+          if (!wt) return { status: "error" };
+          return performPreMergeAutoFix(
+            cfg,
+            issueNumber,
+            pipelineRunId,
+            findingsText,
+            issueTitle,
+            wt,
+            gitFnForAutoFix,
+            invokeFnForAutoFix,
+          );
+        }
+      : undefined);
+
   const shaGate = await enforceReviewShaGate(
     cfg,
     issueNumber,
     prNumber,
-    { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+    {
+      ...deps,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+      attemptPreMergeAutoFix: preAutoFixFn,
+    },
   );
   if (shaGate) return shaGate;
 
@@ -260,87 +553,225 @@ export async function advance(
   }
 
   // ---- Step 1: CI ----
-  let checks;
-  try {
-    checks = await getPrChecksFn(cfg, prNumber);
-  } catch (err) {
-    const e = err as Error;
-    return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
-  }
+  // localTestedSha is set by the local-mode branch and re-checked after the
+  // mergeability refetch to catch pushes that arrive during Step 2. It stays
+  // null in github mode (unused).
+  let localTestedSha: string | null = null;
 
-  const agg = parseChecksAggregate(checks);
+  if ((cfg.ci_mode ?? "github") === "local") {
+    // Local mode (#350): verify CI using the current run's recorded test-gate outcome
+    // instead of polling GitHub Actions check-runs. The conflict pre-check, mergeability
+    // gate, and OpenSpec-validation gate are unaffected and still run below.
+    const readRunEventsFn = deps.readRunEvents ?? readEvents;
+    const runTestGateFn = deps.runTestGate ?? runTestGate;
+    const tgResult = await latestTestGateOutcome(opts.runDir, readRunEventsFn);
 
-  // Record CI check result evidence; skip when still pending (no result yet).
-  if (opts.stateDir && !agg.pending) {
-    const ciSummary = agg.failed.length > 0
-      ? agg.failed.map((c) => `${c.name}: ${c.bucket}`).join(", ")
-      : `all ${checks.length} check(s) passed`;
-    await recordCommand(
-      opts.stateDir,
-      issueNumber,
-      "pre-merge",
-      makeCommandRecord(`gh pr checks #${prNumber}`, agg.failed.length > 0 ? 1 : 0, 0, ciSummary),
-    ).catch(() => {});
-  }
+    const isAbsent = tgResult === null;
+    // Only treat as stale when the result is a success: a failure blocks regardless
+    // of which commit was tested (the developer must fix the tests). A successful
+    // result from an old commit needs re-validation against the current PR head.
+    const isStale = tgResult !== null &&
+      tgResult.outcome === "success" &&
+      (!tgResult.prHeadSha || prDetail.head_sha !== tgResult.prHeadSha);
 
-  if (agg.pending) {
-    // No-run recovery (#281): when GitHub Actions never fires a run for the head
-    // SHA (e.g. after an archive-only commit), `getPrChecks` returns a stale
-    // pending state indefinitely. After the grace window, query the check-runs API
-    // directly. Zero runs → enter recovery rather than polling out ci_timeout.
-    // Only active when a polling context is present (advancePolling session).
-    const ctx = opts.pollingCtx;
-    if (ctx) {
-      const headSha = prDetail.head_sha;
-      if (ctx.ciGateEnteredAt === undefined) ctx.ciGateEnteredAt = nowMsFn();
-      const elapsed = nowMsFn() - ctx.ciGateEnteredAt;
-      if (elapsed >= (cfg.ci_no_run_grace_s ?? 60) * 1000) {
-        let runCount: number;
-        try {
-          runCount = await getHeadCheckRunCountFn(cfg, headSha);
-        } catch {
-          runCount = -1; // API failure → treat as "runs exist" (conservative-open)
-        }
-        if (runCount === 0) {
-          return handleZeroRunRecovery(cfg, issueNumber, prNumber, headSha, ctx,
-            setBlockedFn, closePrFn, reopenPrFn, getSuccessfulCheckRunCountFn, getDiffFilePathsFn);
-        }
-      }
-    }
-    return { advanced: false, status: "waiting", reason: "CI still running" };
-  }
-
-  if (agg.failed.length > 0) {
-    const wt = await getForIssueFn(cfg, issueNumber);
-    const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
-    if (!alreadyRebased && wt) {
-      const ok = await tryRebaseAndPushFn(cfg, issueNumber);
-      if (opts.stateDir) {
-        await recordCommand(
-          opts.stateDir,
+    if (isAbsent || isStale) {
+      // No usable cached result (first entry to pre-merge, or PR head moved after
+      // an OpenSpec archive commit or rebase). Run the test gate inline against the
+      // current worktree so recovery is deterministic rather than a re-run dead-end.
+      const localWt = await getForIssueFn(cfg, issueNumber);
+      if (!localWt) {
+        await setBlockedFn(
+          cfg,
           issueNumber,
+          "ci_mode: local — no worktree found for this issue; cannot run the local test gate " +
+            "from pre-merge. Ensure the pipeline created a worktree, or switch to ci_mode: github.",
           "pre-merge",
-          makeCommandRecord(
-            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
-            ok ? 0 : 1,
-            0,
-            ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
-          ),
-        ).catch(() => {});
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — no worktree for inline gate" };
       }
-      if (ok) {
-        markRebaseAttemptedFn(wt.path);
-        return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+      const inlineResult = await runTestGateFn(
+        cfg,
+        issueNumber,
+        localWt.path,
+        {},
+        pipelineRunId,
+        "pre-merge",
+        opts.stateDir,
+        opts.runDir,
+      );
+      if (inlineResult.skipped) {
+        // Fail-closed: skipped means the test gate is disabled or no command was detected.
+        // ci_mode: local must not advance without a verified local exit-0 result.
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the inline local test gate was skipped (test_gate is disabled or no " +
+            "test command was detected). ci_mode: local requires a verified local exit-0 result. " +
+            "Enable test_gate with a test command, or switch to ci_mode: github.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate skipped (fail-closed)" };
       }
+      if (!inlineResult.passed) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the inline local test gate (run from pre-merge) failed. " +
+            "Fix the failing tests, push a new commit, and re-run the pipeline.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate failed" };
+      }
+      if ((inlineResult.attempts ?? 0) > 0) {
+        // The test gate invoked the implementer harness (test-and-fix mode) and may
+        // have created commits. Those commits exist only in the local worktree and are
+        // not on the remote PR head. Certifying the remote PR head would advance an
+        // untested commit. Block: push the fix commits and re-run the pipeline.
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the inline test gate invoked the implementer harness to fix " +
+            `failing tests (${inlineResult.attempts} attempt(s)). ` +
+            "Any fix commits exist only in the local worktree. " +
+            "Push the fix commits to the PR branch, then re-run the pipeline so the full " +
+            "review → pre-merge path covers the updated code.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline gate created fix commits; push required" };
+      }
+      // Verify the actual worktree HEAD matches the remote PR head. A prior inline
+      // gate run may have created fix commits (attempts > 0) and blocked; if the user
+      // retries without pushing, those commits remain in the worktree. A subsequent
+      // run passes with attempts === 0 (no new harness calls needed) but tests the
+      // ahead worktree, not the remote PR head. (#350 pre-merge finding)
+      const gitFnForHead = deps.gitInWorktree ?? gitInWorktree;
+      const getWorktreeHeadFn = deps.getWorktreeHead ??
+        ((wt: string) => gitFnForHead(wt, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()));
+      const worktreeHead = await getWorktreeHeadFn(localWt.path);
+      if (worktreeHead !== prDetail.head_sha) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the local worktree is ahead of the remote PR head " +
+            `(worktree HEAD ${worktreeHead.slice(0, 7)}, PR head ${prDetail.head_sha.slice(0, 7)}). ` +
+            "Push the worktree commits to the PR branch, then re-run the pipeline.",
+          "pre-merge",
+          "needs-human",
+        );
+        return { advanced: false, status: "blocked", reason: "ci_mode: local — worktree ahead of PR head; push required" };
+      }
+      localTestedSha = prDetail.head_sha;
+    } else if (tgResult.outcome !== "success") {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        "ci_mode: local is set but the most recent local test-gate result is a failure. " +
+          "Fix the failing tests, push a new commit to re-run the test gate, then re-run the pipeline.",
+        "pre-merge",
+        "needs-human",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "ci_mode: local — local test gate failed",
+      };
+    } else {
+      localTestedSha = tgResult.prHeadSha!;
     }
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
-      "pre-merge",
-      "needs-human",
+
+    console.log(
+      `[pipeline] #${issueNumber}: ci_mode: local — local test gate passed; skipping GitHub Actions wait`,
     );
-    return { advanced: false, status: "blocked", reason: "CI failed" };
+    // Local test gate passed: fall through to Step 2 (mergeability) and Step 2.5 (OpenSpec).
+    // Do NOT return early — the downstream gates must still run.
+  } else {
+    // github mode (default): poll GitHub Actions check-runs.
+    let checks;
+    try {
+      checks = await getPrChecksFn(cfg, prNumber);
+    } catch (err) {
+      const e = err as Error;
+      return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
+    }
+
+    const agg = parseChecksAggregate(checks);
+
+    // Record CI check result evidence; skip when still pending (no result yet).
+    if (opts.stateDir && !agg.pending) {
+      const ciSummary = agg.failed.length > 0
+        ? agg.failed.map((c) => `${c.name}: ${c.bucket}`).join(", ")
+        : `all ${checks.length} check(s) passed`;
+      await recordCommand(
+        opts.stateDir,
+        issueNumber,
+        "pre-merge",
+        makeCommandRecord(`gh pr checks #${prNumber}`, agg.failed.length > 0 ? 1 : 0, 0, ciSummary),
+      ).catch(() => {});
+    }
+
+    if (agg.pending) {
+      // No-run recovery (#281): when GitHub Actions never fires a run for the head
+      // SHA (e.g. after an archive-only commit), `getPrChecks` returns a stale
+      // pending state indefinitely. After the grace window, query the check-runs API
+      // directly. Zero runs → enter recovery rather than polling out ci_timeout.
+      // Only active when a polling context is present (advancePolling session).
+      const ctx = opts.pollingCtx;
+      if (ctx) {
+        const headSha = prDetail.head_sha;
+        if (ctx.ciGateEnteredAt === undefined) ctx.ciGateEnteredAt = nowMsFn();
+        const elapsed = nowMsFn() - ctx.ciGateEnteredAt;
+        if (elapsed >= (cfg.ci_no_run_grace_s ?? 60) * 1000) {
+          let runCount: number;
+          try {
+            runCount = await getHeadCheckRunCountFn(cfg, headSha);
+          } catch {
+            runCount = -1; // API failure → treat as "runs exist" (conservative-open)
+          }
+          if (runCount === 0) {
+            return handleZeroRunRecovery(cfg, issueNumber, prNumber, headSha, ctx,
+              setBlockedFn, closePrFn, reopenPrFn, getSuccessfulCheckRunCountFn, getDiffFilePathsFn);
+          }
+        }
+      }
+      return { advanced: false, status: "waiting", reason: "CI still running" };
+    }
+
+    if (agg.failed.length > 0) {
+      const wt = await getForIssueFn(cfg, issueNumber);
+      const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
+      if (!alreadyRebased && wt) {
+        const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+        if (opts.stateDir) {
+          await recordCommand(
+            opts.stateDir,
+            issueNumber,
+            "pre-merge",
+            makeCommandRecord(
+              `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+              ok ? 0 : 1,
+              0,
+              ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
+            ),
+          ).catch(() => {});
+        }
+        if (ok) {
+          markRebaseAttemptedFn(wt.path);
+          return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+        }
+      }
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `CI checks failed:\n${agg.failed.map((c) => `- ${c.name}: ${c.bucket}`).join("\n")}`,
+        "pre-merge",
+        "needs-human",
+      );
+      return { advanced: false, status: "blocked", reason: "CI failed" };
+    }
   }
 
   // ---- Step 2: mergeability ----
@@ -355,6 +786,24 @@ export async function advance(
   // the next poll with a misleading "merge conflict — manual rebase needed"
   // reason for a PR that never had a real code conflict.
   const freshPrDetail = await getPrDetailFn(cfg, prNumber);
+
+  // Final SHA re-check for ci_mode: local: a developer push that arrives
+  // between the test-gate completion and this mergeability refetch would
+  // produce a freshPrDetail.head_sha that differs from the SHA we actually
+  // tested. Re-verify so we never certify an untested commit. (#350 pre-merge fix)
+  if (localTestedSha !== null && freshPrDetail.head_sha !== localTestedSha) {
+    const testedAt = localTestedSha.slice(0, 7);
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      "ci_mode: local — PR head moved after the local test gate ran " +
+        `(tested ${testedAt}, current head ${freshPrDetail.head_sha.slice(0, 7)}). ` +
+        "Re-run the pipeline to run the local test gate against the current head.",
+      "pre-merge",
+      "needs-human",
+    );
+    return { advanced: false, status: "blocked", reason: "ci_mode: local — PR head moved after SHA re-check" };
+  }
   const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
   const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
   if (isFreshConflict) {
@@ -495,12 +944,17 @@ export interface ShaGateDeps {
   /**
    * Fetches the diff between two commits on the PR for the delta review (#228).
    * Injectable seam; real implementation uses `git diff baseSha...headSha`.
+   * Optional `worktreePath` (#371): the source directory to diff from. Defaults
+   * to `cfg.repo_dir`, which is not fetched mid-run and can lack a commit object
+   * pushed earlier in this same run (e.g. the pre-merge auto-fix commit) — pass
+   * the issue worktree path, which authored that commit, to guarantee it's present.
    */
   getCommitDeltaDiff?: (
     cfg: PipelineConfig,
     prNumber: number,
     baseSha: string,
     headSha: string,
+    worktreePath?: string,
   ) => Promise<string>;
   /** Runs the pre-merge delta review (#228) and returns the parsed verdict. */
   runDeltaReview?: RunDeltaReviewFn;
@@ -514,6 +968,37 @@ export interface ShaGateDeps {
   getGhActor?: () => Promise<string | null>;
   runDir?: string;
   runStoreDeps?: RunStoreDeps;
+  /**
+   * Injectable seam for the bounded pre-merge auto-fix round (#359).
+   * When provided, called when (a) all blocking delta-review findings pass
+   * `allBlockingAutoFixable` and (b) no prior auto-fix commit is present in
+   * the branch since the reviewed SHA. Production default: wired in
+   * `advance()` as a closure over the implementer harness and worktree.
+   * Tests inject this directly to exercise the blocking-branch routing without
+   * a real harness, git, or network.
+   */
+  attemptPreMergeAutoFix?: AttemptPreMergeAutoFixFn;
+  /**
+   * Authoritative remote-ref read for the post-fix head revalidation (#371
+   * pre-merge delta review, key 8ad8b7f0). Returns the SHA `refs/heads/<branch>`
+   * currently points at on origin, or null when the ref cannot be read. Used
+   * only when the GitHub-API PR-head read still echoes the known pre-fix head
+   * after an approving post-fix re-review — that read is indistinguishable
+   * from a stale read masking a genuinely newer concurrent push, so the guard
+   * must consult `git ls-remote` (which reads the live ref, not a cached API
+   * view) before proceeding. Production default: `defaultGetRemoteHead`.
+   */
+  getRemoteHead?: (cwd: string, branch: string) => Promise<string | null>;
+}
+
+/** `git ls-remote origin refs/heads/<branch>` from `cwd`; null on any failure. */
+async function defaultGetRemoteHead(cwd: string, branch: string): Promise<string | null> {
+  const res = await gitInWorktree(
+    cwd, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true },
+  );
+  if (res.code !== 0) return null;
+  const sha = res.stdout.trim().split(/\s+/)[0] ?? "";
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
 /**
@@ -536,6 +1021,7 @@ export async function enforceReviewShaGate(
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const getCommitDeltaDiffFn = deps.getCommitDeltaDiff ?? defaultGetCommitDeltaDiff;
   const runDeltaReviewFn = deps.runDeltaReview ?? defaultRunDeltaReview;
+  const getRemoteHeadFn = deps.getRemoteHead ?? defaultGetRemoteHead;
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
@@ -812,19 +1298,24 @@ export async function enforceReviewShaGate(
         return null;
       }
 
+      // Resolve worktree and spec context for the delta reviewer (Finding 3): the
+      // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
+      // can inspect PR-branch files, and must receive OpenSpec context for any
+      // change dirs touched by the unreviewed commits. Resolved before the diff
+      // call (#371) so the delta diff itself also reads from the worktree — the
+      // source that authored any commit pushed earlier in this same run (e.g. a
+      // pre-merge auto-fix commit); `cfg.repo_dir` is not fetched mid-run and can
+      // lack that object immediately after the push.
+      const deltaWt = await getForIssueFn(cfg, issueNumber);
+      const deltaWorktreePath = deltaWt?.path ?? cfg.repo_dir;
+
       // Diff changed: run a focused adversarial delta review of only the unreviewed
       // commits instead of routing back to a full review-2 round. The delta review
       // does NOT count against the max_adversarial_rounds ceiling.
       const deltaDiff = reviewed.sha
-        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head)
+        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head, deltaWorktreePath)
         : currentDiff; // reviewed SHA missing → review the full diff as the delta
 
-      // Resolve worktree and spec context for the delta reviewer (Finding 3): the
-      // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
-      // can inspect PR-branch files, and must receive OpenSpec context for any
-      // change dirs touched by the unreviewed commits.
-      const deltaWt = await getForIssueFn(cfg, issueNumber);
-      const deltaWorktreePath = deltaWt?.path ?? cfg.repo_dir;
       const deltaSpecContext = deltaWt
         ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
         : "";
@@ -902,7 +1393,164 @@ export async function enforceReviewShaGate(
         return null;
       }
 
-      // Delta review found blocking findings: block pre-merge without routing to review-2.
+      // Delta review found blocking findings. Attempt one bounded auto-fix
+      // before blocking when all findings are in the category allowlist (#359).
+      const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
+      if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
+        // One-attempt bound (crash-safe): detect a prior auto-fix commit by
+        // scanning PR commits since the reviewed SHA for the PREFIX subject.
+        let priorAutoFix = false;
+        try {
+          const prCommits = await getPrCommitsFn(cfg, prNumber);
+          const revIdx = reviewed.sha
+            ? prCommits.findIndex((c) => c.oid === reviewed.sha)
+            : -1;
+          const since = revIdx !== -1 ? prCommits.slice(revIdx + 1) : prCommits;
+          priorAutoFix = since.some((c) =>
+            c.messageHeadline.startsWith(PRE_MERGE_AUTOFIX_PREFIX),
+          );
+        } catch {
+          // Cannot determine prior attempt — fail closed (#359): skipping the
+          // auto-fix is safer than risking a second attempt when the durable
+          // marker cannot be read (crash-safe at-most-one requirement).
+          priorAutoFix = true;
+        }
+
+        if (!priorAutoFix) {
+          // Scope the fix prompt to blocking findings only — not the full delta
+          // comment which may include advisory/non-blocking findings (#359 R2 F3).
+          const blockingOnlyBody = formatDeltaReviewComment(
+            cfg,
+            { ...deltaCommentVerdict, findings: partition.blocking },
+            `pre-merge delta review by ${deltaReviewerLabel}`,
+            blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
+            newHash,
+          );
+          const fixRes = await attemptAutoFixFn(
+            partition.blocking, detail.title, blockingOnlyBody,
+          );
+          if (fixRes.status === "fix-committed") {
+            // Re-run the delta review exactly once (does NOT consume a review-2
+            // ceiling slot, consistent with the delta-review budget rule, #359).
+            // Anchor to the auto-fix's authoritative post-fix head from local git
+            // state (#371) — NOT a GitHub-API PR-head read, which can still return
+            // the pre-fix head in the window immediately after the push and would
+            // silently re-review the pre-fix diff (byte-identical to the first
+            // review), re-emitting the finding the auto-fix just resolved.
+            const newPrHead = fixRes.headSha;
+            // Do NOT fall back to the pre-fix `currentDiff` if the post-fix diff
+            // cannot be obtained (#359 R2 F1), including when `reviewed.sha` itself
+            // is missing (#371 review 1 finding 1): a fallback would let the
+            // reviewer approve a stale diff while recording `newPrHead` as
+            // reviewed. Let the exception propagate to the outer catch, which
+            // routes to the conservative full re-review without recording the new
+            // head. Diff from `deltaWorktreePath` (#371) — the worktree that
+            // authored the auto-fix commit — since `cfg.repo_dir` is not fetched
+            // mid-run and may not yet contain that commit object.
+            if (!reviewed.sha) {
+              throw new Error(
+                "no reviewed-sha recorded to diff the auto-fix commit " +
+                  `${newPrHead.slice(0, 7)} against; cannot anchor post-fix re-review`,
+              );
+            }
+            const reReviewDiff = await getCommitDeltaDiffFn(
+              cfg, prNumber, reviewed.sha, newPrHead, deltaWorktreePath,
+            );
+            const reResult = await runDeltaReviewFn(
+              cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
+              deps.runDir ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps } : undefined,
+            );
+            const rePartition = partitionFindings(
+              reResult.findings, cfg.review_policy, overrides, scopes,
+            );
+            // Mirror the initial delta review guard (#228): needs-attention with zero
+            // findings is likely unparseable reviewer output — block conservatively.
+            // Detect BEFORE formatting/posting the comment so we do not write a
+            // clean reviewed-sha artifact for unparseable output (#359 R2 F2).
+            const reIsUnparseable =
+              reResult.verdict === "needs-attention" && reResult.findings.length === 0;
+            // Post the re-review delta comment with updated sentinels.
+            // Use the post-fix diff hash (reReviewDiff), not the pre-fix currentDiff (#359 R2 F1).
+            // Suppress commitSha for unparseable output so the reuse path cannot
+            // treat the artifact as a clean approval (#359 R2 F2).
+            const reNewHash = computeDiffHash(reReviewDiff);
+            const reBlockingKeys = new Set(rePartition.blocking.map((f) => findingKey(f)));
+            const reEffective = reResult.effectiveReviewer ?? cfg.harnesses.reviewer;
+            const reSelfReview = reResult.selfReview ?? false;
+            const reLabel = reSelfReview ? `${reEffective} (self-review)` : reEffective;
+            const reCommentBody = formatDeltaReviewComment(
+              cfg,
+              {
+                verdict: reResult.verdict,
+                summary: reResult.summary,
+                findings: reResult.findings,
+                next_steps: [],
+                commitSha: reIsUnparseable ? undefined : newPrHead,
+              },
+              `pre-merge delta review by ${reLabel}`,
+              reBlockingKeys.size > 0 ? reBlockingKeys : undefined,
+              reNewHash,
+            );
+            const reComment = reSelfReview
+              ? (() => {
+                  const nl = reCommentBody.indexOf("\n");
+                  return nl >= 0
+                    ? `${reCommentBody.slice(0, nl)}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}${reCommentBody.slice(nl)}`
+                    : `${reCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}`;
+                })()
+              : reCommentBody;
+            await postCommentFn(cfg, issueNumber, reComment);
+
+            if (rePartition.blocking.length === 0 && !reIsUnparseable) {
+              // Re-validate HEAD, but do not let a single stale GitHub-API
+              // PR-head read veto an approving post-fix re-review (#371 review
+              // 2). `newPrHead` is the authoritative post-fix head we already
+              // confirmed was pushed (performPreMergeAutoFix only returns
+              // "fix-committed" after `git push` succeeds); the GitHub API's
+              // PR-head field can still echo the pre-fix `head`, or even echo
+              // `newPrHead` itself, for a short window after a *further*
+              // concurrent push lands. Neither a read matching the pre-fix
+              // `head` nor one matching `newPrHead` is proof of mere staleness
+              // (#371 delta review, keys 8ad8b7f0 and 9943b2af): both can mask
+              // a concurrent push that landed during the re-review. Disambiguate
+              // via the live remote ref (`git ls-remote`) whenever the API read
+              // is consistent with either of those two known SHAs, and fail
+              // closed to the SHA gate when it does not confirm the auto-fix
+              // head. A read reporting some THIRD, different SHA is an
+              // unambiguous signal of a newer concurrent push on its own.
+              const postFixPr = await getPrDetailFn(cfg, prNumber);
+              const postFixHead = postFixPr.head_sha;
+              if (postFixHead !== newPrHead && postFixHead !== head) {
+                throw new Error(
+                  `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
+                  `during pre-merge auto-fix re-review; re-entering SHA gate`,
+                );
+              }
+              const remoteHead = await getRemoteHeadFn(
+                deltaWorktreePath, postFixPr.head_ref,
+              );
+              if (remoteHead !== newPrHead) {
+                throw new Error(
+                  `GitHub API reports head ${postFixHead.slice(0, 7)} and ls-remote reports ` +
+                  `${remoteHead ? remoteHead.slice(0, 7) : "(unreadable)"} — cannot confirm ` +
+                  `auto-fix head ${newPrHead.slice(0, 7)} is the current PR head; ` +
+                  `re-entering SHA gate`,
+                );
+              }
+              console.log(
+                `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
+              );
+              return null;
+            }
+            // Re-review still blocks or returned unparseable output: fall through to block below.
+          }
+          // fixRes.status === "error": fall through to block below.
+        }
+        // Prior auto-fix attempt detected: fall through to block below.
+      }
+
+      // Non-auto-fixable category, no seam, or fix round exhausted:
+      // block pre-merge without routing to review-2.
       await setBlockedFn(
         cfg,
         issueNumber,
@@ -960,9 +1608,11 @@ async function defaultGetCommitDeltaDiff(
   _prNumber: number,
   baseSha: string,
   headSha: string,
+  worktreePath?: string,
 ): Promise<string> {
   const label = `${baseSha.slice(0, 7)}...${headSha.slice(0, 7)}`;
-  const result = await gitInWorktree(cfg.repo_dir, ["diff", `${baseSha}...${headSha}`], {
+  const cwd = worktreePath ?? cfg.repo_dir;
+  const result = await gitInWorktree(cwd, ["diff", `${baseSha}...${headSha}`], {
     ignoreFailure: true,
   });
   if (result.code !== 0) {
@@ -1135,10 +1785,60 @@ export async function maybeArchiveOpenspec(
   // AND a review finding is tagged `category: spec-divergence`, archiving would
   // fold a stale delta into the living specs (silent corruption) and re-review
   // would keep re-anchoring on the wrong delta. Block and surface it instead.
+  //
+  // Wire the bounded repair dep (#356): when direction is `spec-behind-code` the
+  // guard calls this once before blocking. Only created when the harness is
+  // configured; tests inject deps.attemptBoundedRepair directly.
+  let repairAttempted = false;
+  const attemptRepairFn: SpecConsistencyDeps["attemptBoundedRepair"] =
+    deps.attemptBoundedRepair ??
+    (cfg.harnesses?.implementer
+      ? async (changeId, issNo, runId) => {
+          if (repairAttempted) return "already-attempted";
+          repairAttempted = true;
+          return performBoundedSpecRepair(
+            cfg,
+            changeId,
+            issNo,
+            runId,
+            wt.path,
+            gitFn,
+            branchDeveloperCommitsFn,
+            deps.invokeFn ?? invoke,
+            deps.openspecValidateItem ?? openspec.validateItem,
+          );
+        }
+      : undefined);
+  const getHeadShaFn = async (p: string): Promise<string | null> => {
+    const r = await gitFn(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    return r.stdout.trim() || null;
+  };
+  // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
+  // When the dep is provided (including null), use it directly so tests avoid a real network call.
+  // In production (dep absent), fail closed: null from getGhActor() means auth is degraded,
+  // and proceeding without the filter would allow untrusted commenters to forge review markers.
+  let trustedReviewAuthor: string | null;
+  if ("trustedReviewAuthor" in deps) {
+    trustedReviewAuthor = deps.trustedReviewAuthor ?? null;
+  } else {
+    const getGhActorFn = deps.getGhActor ?? getGhActor;
+    trustedReviewAuthor = await getGhActorFn();
+    if (trustedReviewAuthor === null) {
+      const reason =
+        "cannot resolve the pipeline actor identity (gh auth may be degraded) — " +
+        "trusted review-comment filtering requires a known actor; check `gh auth status`";
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+      return { advanced: false, status: "blocked", reason, blockerKind: "needs-human" };
+    }
+  }
   const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
     branchDeveloperCommits: branchDeveloperCommitsFn,
     getIssueDetail: getIssueDetailFn,
     setBlocked: setBlockedFn,
+    pipelineRunId,
+    attemptBoundedRepair: attemptRepairFn,
+    getHeadSha: getHeadShaFn,
+    trustedReviewAuthor,
   });
   if (guard) return guard;
 
@@ -1178,10 +1878,14 @@ export async function maybeArchiveOpenspec(
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
     if (res.unavailable) {
-      console.log(
-        `[pipeline] #${issueNumber}: openspec CLI unavailable; skipping archive (non-blocking)`,
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `openspec CLI unavailable — cannot archive change '${id}'. Install the openspec CLI and re-run.`,
+        "pre-merge",
+        "openspec-invalid",
       );
-      return null;
+      return { advanced: false, status: "blocked", reason: `openspec CLI unavailable (${id})` };
     }
     if (!res.success) {
       await setBlockedFn(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge", "openspec-invalid");

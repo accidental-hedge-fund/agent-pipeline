@@ -1,26 +1,50 @@
-// Eval-gate stage (#12): run the repo's eval harness after pre-merge, before
-// ready-to-deploy. Disabled repos skip immediately with a log line.
+// Eval-gate stage (#12, #372): run the repo's eval harness after pre-merge,
+// before ready-to-deploy. Disabled repos skip immediately with a log line.
 //
 // Exit code determines pass/fail — the pipeline never interprets scores.
-// Gate mode (default) blocks on fail; advisory mode records the result and
-// always advances, even after retries are exhausted.
-// The configured `timeout` is a hard stage-level budget: each attempt receives
-// only the remaining budget, so total wall-time never exceeds `timeout` seconds.
+// Gate mode (default): an ordinary (non-tooling) failure with attempts
+// remaining routes to a bounded eval-fix round (implementer harness invoked
+// with the eval output as context, commit verified and pushed, eval re-run)
+// before blocking once `max_attempts` is exhausted. Advisory mode records the
+// result and always advances, retrying the same command (no fix round) until
+// attempts are exhausted.
+// The configured `timeout` is a hard per-attempt budget: a successful fix
+// round resets it, since fix-harness time is bounded separately by
+// `fix_timeout`. Tooling failures (timeout/spawn error) always block
+// immediately, in either mode, and never trigger a fix round.
+// A pass reached after an eval-fix commit landed routes back through
+// pre-merge (not directly to the next stage) so the existing review-SHA gate
+// decides whether the unreviewed fix commit needs a fresh review round.
 // The command is run through `sh -c` so normal shell syntax works.
 
 import * as path from "node:path";
 import {
+  branchName,
   getOnDiskForIssue as defaultGetForIssue,
+  gitInWorktree,
 } from "../worktree.ts";
 import {
+  getGhActor as defaultGetGhActor,
+  getIssueDetail as defaultGetIssueDetail,
+  getPrCommits as defaultGetPrCommits,
+  getPrForIssue as defaultGetPrForIssue,
   postComment as defaultPostComment,
   setBlocked as defaultSetBlocked,
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
-import { runCapped } from "../harness.ts";
-import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
-import type { BlockerKind, Outcome, PipelineConfig, Stage } from "../types.ts";
+import { invoke as defaultInvoke, runCapped, type HarnessResult, type InvokeOptions } from "../harness.ts";
+import { buildEvalFixPrompt } from "../prompts/index.ts";
+import { extractReviewedSha } from "./review-parsing.ts";
+import {
+  verifyHarnessCommits,
+  type VerifyDeps,
+  type VerifyResult,
+} from "../verify-harness-commits.ts";
+import { makePipelineRunId, validateCommitTrailers } from "../traceability.ts";
+import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { makeCommandRecord, makePromptRecord, recordCommand, recordPrompt } from "../evidence-bundle.ts";
+import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { buildStageAccountingRecord } from "../accounting.ts";
 import { emitStageAccounting } from "../run-store.ts";
@@ -41,6 +65,10 @@ export interface AdvanceEvalOpts {
   runDir?: string;
   /** Run-store deps carrying `stdoutWrite` for streaming events (#302). */
   runStoreDeps?: RunStoreDeps;
+  /** Dispatch-wide run id for the eval-fix commit traceability trailers (#20, #372).
+   *  Defaults to a fresh id so direct/unit-test callers that don't thread it still
+   *  produce valid trailers. */
+  pipelineRunId?: string;
 }
 
 export interface EvalRunResult {
@@ -52,6 +80,14 @@ export interface EvalRunResult {
   /** True when the process could not be spawned at all (missing binary, permission error, etc.). */
   spawnError: boolean;
 }
+
+/** Signature of the harness `invoke` — injectable so the eval-fix loop is unit-testable. */
+export type InvokeFn = (
+  harness: Harness,
+  worktreeDir: string,
+  prompt: string,
+  opts?: InvokeOptions,
+) => Promise<HarnessResult>;
 
 // Injectable seams — default to real implementations in prod; replaced in unit tests.
 export interface EvalDeps {
@@ -90,6 +126,297 @@ export interface EvalDeps {
     issueNumber: number,
     body: string,
   ) => Promise<void>;
+  /** Implementer harness invoker for the eval-fix round (#372). Defaults to `invoke`
+   *  from harness.ts. Injectable so the fix loop is unit-testable with no real harness. */
+  invoke?: InvokeFn;
+  /** Current HEAD SHA in the worktree. */
+  gitHead?: (cwd: string) => Promise<string>;
+  /** Whether the worktree has uncommitted changes. */
+  gitDirty?: (cwd: string) => Promise<boolean>;
+  /** `git push origin <branch>` after an eval-fix commit. */
+  gitPush?: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
+  /** Full commit messages for commits reachable from HEAD but not `baseRef`, used
+   *  to validate the eval-fix commit(s) carry the required traceability trailers. */
+  gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
+  /** Salvage uncommitted eval-fix work into a commit (#131). Returns true when a
+   *  salvage commit was created. */
+  salvage?: (
+    wtPath: string,
+    issueNumber: number,
+    pipelineRunId: string,
+    stageLabel: string,
+  ) => Promise<boolean>;
+  /** Verify the eval-fix commit message format. Injectable for tests. */
+  verifyEvalFix?: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
+  /** Authenticated gh actor login, used to trust-filter review comments when
+   *  deriving whether an eval-fix commit still needs review (#372 review-2
+   *  finding 1). */
+  getGhActor?: () => Promise<string | null>;
+  /** Issue comments, used to extract the last reviewed SHA. */
+  getIssueDetail?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<{ comments: { author: string; body: string }[] }>;
+  /** Resolve the open PR for this issue, to read its commit history. */
+  getPrForIssue?: (cfg: PipelineConfig, issueNumber: number) => Promise<number | null>;
+  /** PR commits (oldest-first), used to detect an eval-fix commit landed since
+   *  the last reviewed SHA. */
+  getPrCommits?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+  ) => Promise<{ oid: string; messageHeadline: string }[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Eval-fix round (#372): a gate-mode ordinary failure with attempts remaining
+// invokes the implementer harness with the eval output as context, verifies
+// and pushes the resulting commit, then lets the caller re-run the eval.
+// Mirrors the fix/test-gate failure contract (harness error / no commit /
+// dirty worktree / push failure all block; never a partial push).
+// ---------------------------------------------------------------------------
+
+/** Cap on the eval output injected into the eval-fix prompt. Uses the stage's
+ *  tail-biased `truncate` (below) so the pass/fail summary survives elision. */
+const MAX_FIX_PROMPT_OUTPUT = 16_000;
+
+/**
+ * Stage label for a salvaged eval-fix commit. Includes the prescribed eval-fix
+ * commit subject so the salvage commit body satisfies
+ * `enforceEvalFixCommitFormat`'s message pattern and the loop proceeds to
+ * re-run the eval command. Exported so tests can pin the label against the
+ * gate's actual pattern.
+ */
+export function evalFixSalvageStageLabel(issueNumber: number): string {
+  return `eval-fix (prescribed commit: "fix: resolve eval-gate failures (#${issueNumber})")`;
+}
+
+/**
+ * Commit message pattern for a prescribed eval-fix commit. Shared by
+ * {@link enforceEvalFixCommitFormat} (verifies the just-pushed commit) and
+ * {@link evalFixCommitPendingReview} (durably detects an eval-fix commit that
+ * landed in a prior invocation and hasn't cleared review yet).
+ */
+function evalFixCommitPattern(issueNumber: number): RegExp {
+  return new RegExp(`fix:\\s+resolve eval-gate failures \\(#${issueNumber}\\)`, "i");
+}
+
+/**
+ * Verifies that at least one commit in `headBefore..HEAD` matches the expected
+ * eval-fix commit message format. Exported so tests can exercise the gate
+ * without mocking the full `advanceEval` call chain.
+ */
+export async function enforceEvalFixCommitFormat(
+  issueNumber: number,
+  wtPath: string,
+  headBefore: string,
+  deps: VerifyDeps = {},
+): Promise<VerifyResult> {
+  return verifyHarnessCommits(
+    wtPath,
+    headBefore,
+    {
+      messagePattern: {
+        pattern: evalFixCommitPattern(issueNumber),
+        description: "Eval-fix commit message does not match prescribed format",
+      },
+    },
+    deps,
+  );
+}
+
+/**
+ * Durable replacement for an in-memory "a fix round ran this invocation" flag
+ * (#372 review-2 finding 1): re-derives, purely from GitHub PR state, whether
+ * an eval-fix commit has landed since the last reviewed SHA and so still
+ * needs to clear pre-merge review before this pass may advance directly.
+ *
+ * This survives a crash/interruption between a fix-round push and this
+ * stage's `transition` call, and a later invocation that resumes at
+ * eval-gate after such an interruption — cases where a purely in-process
+ * flag would reset to false and let an unreviewed fix commit slip through.
+ *
+ * Fails closed (returns `true` — route to pre-merge) on any lookup error, so
+ * an unverifiable state never silently bypasses review.
+ */
+async function evalFixCommitPendingReview(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: {
+    getGhActor: () => Promise<string | null>;
+    getIssueDetail: (cfg: PipelineConfig, issueNumber: number) => Promise<{ comments: { author: string; body: string }[] }>;
+    getPrForIssue: (cfg: PipelineConfig, issueNumber: number) => Promise<number | null>;
+    getPrCommits: (cfg: PipelineConfig, prNumber: number) => Promise<{ oid: string; messageHeadline: string }[]>;
+  },
+): Promise<boolean> {
+  try {
+    const prNumber = await deps.getPrForIssue(cfg, issueNumber);
+    // A determinate "no PR" answer (not a lookup error — those throw into the
+    // fail-closed catch) means there is no PR branch to carry an eval-fix
+    // commit: fix rounds only run at eval-gate, which follows pre-merge, which
+    // requires a PR — and a fix commit pushed THIS invocation is covered
+    // unconditionally by `fixCommitLandedThisInvocation` (key 1469c9cd), not
+    // by this durable re-derivation.
+    if (!prNumber) return false;
+    const commits = await deps.getPrCommits(cfg, prNumber);
+    const pattern = evalFixCommitPattern(issueNumber);
+    // No eval-fix commit anywhere in the PR: nothing to gate against,
+    // regardless of review state.
+    if (!commits.some((c) => pattern.test(c.messageHeadline))) return false;
+    // Trust-filter to the authenticated actor's own comments, mirroring the
+    // pre-merge review-SHA gate (#16) — an untrusted commenter must not be
+    // able to forge a stale reviewed-SHA marker.
+    const actor = await deps.getGhActor();
+    const detail = await deps.getIssueDetail(cfg, issueNumber);
+    const trusted = actor ? detail.comments.filter((c) => c.author === actor) : [];
+    const reviewed = extractReviewedSha(trusted);
+    // An eval-fix commit exists but no trusted review state can be
+    // established: treat as pending (fail closed, key 1469c9cd) — never let
+    // missing/untrusted review state silently bypass review of a fix commit.
+    if (!reviewed) return true;
+    const reviewedIdx = reviewed.sha ? commits.findIndex((c) => c.oid === reviewed.sha) : -1;
+    // reviewedIdx === -1 (unverifiable comment, or reviewed SHA absent from
+    // history) conservatively falls back to scanning every commit.
+    const landedSince = reviewedIdx !== -1 ? commits.slice(reviewedIdx + 1) : commits;
+    return landedSince.some((c) => pattern.test(c.messageHeadline));
+  } catch {
+    return true;
+  }
+}
+
+interface EvalFixRoundDeps {
+  invoke: InvokeFn;
+  gitHead: (cwd: string) => Promise<string>;
+  gitDirty: (cwd: string) => Promise<boolean>;
+  gitPush: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
+  gitCommitMessages: (cwd: string, baseRef: string) => Promise<string[]>;
+  salvage: (wtPath: string, issueNumber: number, pipelineRunId: string, stageLabel: string) => Promise<boolean>;
+  verifyEvalFix: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
+}
+
+type EvalFixRoundResult =
+  | { ok: true }
+  | { ok: false; reason: string; blockerKind: "harness-failure" | "push-failed" };
+
+/**
+ * Run a single eval-fix round: invoke the implementer harness with the eval
+ * output as context, then verify + push the resulting commit. Returns
+ * `{ ok: true }` only once a verified fix commit has been pushed — the caller
+ * re-runs the eval command in that case. Never pushes a partial fix: a harness
+ * error, no new commit (after salvage), a dirty worktree, or a failed push all
+ * return `ok: false` and the caller blocks without re-running the eval.
+ */
+async function runEvalFixRound(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  wtPath: string,
+  slug: string,
+  attempt: number,
+  maxAttempts: number,
+  evalOutput: string,
+  pipelineRunId: string,
+  opts: AdvanceEvalOpts,
+  deps: EvalFixRoundDeps,
+): Promise<EvalFixRoundResult> {
+  const harness = cfg.harnesses.implementer;
+  console.log(
+    `[pipeline] #${issueNumber}: eval-gate failed; fix round ${attempt}/${maxAttempts - 1} (${harness})`,
+  );
+
+  const excerpt = truncate(evalOutput, MAX_FIX_PROMPT_OUTPUT);
+  const prompt = buildEvalFixPrompt({
+    cfg,
+    issueNumber,
+    command: cfg.eval_gate.command,
+    attempt,
+    maxAttempts,
+    output: excerpt,
+    pipelineRunId,
+  });
+  if (opts.stateDir) {
+    await recordPrompt(
+      opts.stateDir,
+      issueNumber,
+      "eval-gate",
+      makePromptRecord(`eval-fix-${attempt}`, harness, prompt),
+    ).catch(() => {});
+  }
+
+  const headBefore = await deps.gitHead(wtPath);
+  const fixModel = cfg.models.fix;
+  const fixRes = await deps.invoke(harness, wtPath, prompt, {
+    timeoutSec: cfg.fix_timeout,
+    model: fixModel,
+    sandbox: cfg.harness_sandbox,
+    accounting: opts.runDir
+      ? {
+          runDir: opts.runDir,
+          runStoreDeps: opts.runStoreDeps,
+          issue: issueNumber,
+          stage: "eval-gate",
+          modelSlot: "fix",
+          model: fixModel,
+        }
+      : undefined,
+  });
+
+  if (!fixRes.success) {
+    const reason = fixRes.timed_out
+      ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on eval-gate fix round ${attempt}.`
+      : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on eval-gate fix round ${attempt}.`;
+    return { ok: false, reason, blockerKind: "harness-failure" };
+  }
+
+  // #131: the harness may have done the work without committing — salvage real
+  // uncommitted changes into a commit instead of discarding it.
+  let headAfter = await deps.gitHead(wtPath);
+  if (headBefore && headAfter && headBefore === headAfter) {
+    const salvaged = await deps.salvage(wtPath, issueNumber, pipelineRunId, evalFixSalvageStageLabel(issueNumber));
+    if (!salvaged) {
+      return {
+        ok: false,
+        reason: `eval-gate fix round ${attempt} reported success but produced no new commits.`,
+        blockerKind: "harness-failure",
+      };
+    }
+    headAfter = await deps.gitHead(wtPath);
+  }
+
+  // Require a clean worktree after the fix round regardless of whether HEAD
+  // advanced — an eval re-run must not certify uncommitted state.
+  if (await deps.gitDirty(wtPath)) {
+    return {
+      ok: false,
+      reason:
+        `eval-gate fix round ${attempt} left uncommitted changes in the working tree. ` +
+        "Eval results can't be trusted — stage and commit the fix before re-running.",
+      blockerKind: "harness-failure",
+    };
+  }
+
+  if (headBefore) {
+    const commitCheck = await deps.verifyEvalFix(wtPath, headBefore);
+    if (!commitCheck.ok) {
+      return { ok: false, reason: commitCheck.reason, blockerKind: "harness-failure" };
+    }
+
+    const newMessages = await deps.gitCommitMessages(wtPath, headBefore);
+    const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
+    if (trailerErr) {
+      return { ok: false, reason: trailerErr, blockerKind: "harness-failure" };
+    }
+  }
+
+  const branch = branchName(issueNumber, slug);
+  const push = await deps.gitPush(wtPath, branch);
+  if (push.code !== 0) {
+    return {
+      ok: false,
+      reason: `Git push failed after eval-gate fix: ${push.stderr.trim()}`,
+      blockerKind: "push-failed",
+    };
+  }
+
+  return { ok: true };
 }
 
 function eventTimestamp(): string {
@@ -132,6 +459,19 @@ export async function advanceEval(
   const postCommentFn = deps.postComment ?? defaultPostComment;
   const getForIssueFn = deps.getForIssue ?? defaultGetForIssue;
   const runFn = deps.runEval ?? defaultRunEval;
+  const invokeFn = deps.invoke ?? defaultInvoke;
+  const gitHeadFn = deps.gitHead ?? defaultGitHead;
+  const gitDirtyFn = deps.gitDirty ?? defaultGitDirty;
+  const gitPushFn = deps.gitPush ?? defaultGitPush;
+  const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
+  const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
+  const verifyEvalFixFn =
+    deps.verifyEvalFix ?? ((wtPath: string, headBefore: string) => enforceEvalFixCommitFormat(issueNumber, wtPath, headBefore));
+  const getGhActorFn = deps.getGhActor ?? defaultGetGhActor;
+  const getIssueDetailFn = deps.getIssueDetail ?? defaultGetIssueDetail;
+  const getPrForIssueFn = deps.getPrForIssue ?? defaultGetPrForIssue;
+  const getPrCommitsFn = deps.getPrCommits ?? defaultGetPrCommits;
+  const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   // Dry-run: no GitHub writes, no command execution. Must come before any
   // transition/setBlocked/postComment call so --dry-run is truly read-only.
@@ -182,9 +522,18 @@ export async function advanceEval(
   const maxAttempts = cfg.eval_gate.max_attempts;
   const timeoutSec = cfg.eval_gate.timeout;
   // Hard stage-level deadline — each attempt gets only the remaining budget.
-  const stageDeadlineMs = Date.now() + timeoutSec * 1000;
+  // Reset after a successful eval-fix round (#372): fix-round time is bounded
+  // separately by fix_timeout and must not eat into the eval run's own budget.
+  let stageDeadlineMs = Date.now() + timeoutSec * 1000;
 
   let lastResult: EvalRunResult | null = null;
+  let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
+  // Unconditional same-invocation pending-review signal (#372 pre-merge delta
+  // review, key 1469c9cd): a fix commit we just pushed MUST route back through
+  // pre-merge even if every GitHub lookup in the durable re-derivation fails
+  // or lags. The durable check below complements this across
+  // crash/interruption boundaries; this flag guarantees the common case.
+  let fixCommitLandedThisInvocation = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remainingSec = Math.max(0, (stageDeadlineMs - Date.now()) / 1000);
@@ -235,6 +584,62 @@ export async function advanceEval(
     await recordEvalAccounting(opts, issueNumber, cfg.eval_gate.command, lastResult, startedAt, endedAt);
 
     if (lastResult.passed) break;
+    // Tooling failures (timeout/spawn error) never route to a fix round, in
+    // either mode — they mean the harness itself couldn't run.
+    if (lastResult.timedOut || lastResult.spawnError) break;
+    // Advisory mode keeps the existing plain-retry cushion (no fix round):
+    // out of scope per #372, unchanged.
+    if (cfg.eval_gate.mode !== "gate") continue;
+    // Gate mode with no attempts remaining: fall through to the terminal block.
+    if (attempt >= maxAttempts) break;
+
+    // Gate-mode ordinary failure with an attempt remaining: route to a fix
+    // round instead of blocking, then re-run the eval against the fixed code.
+    const fixResult = await runEvalFixRound(
+      cfg,
+      issueNumber,
+      wt.path,
+      wt.slug,
+      attempt,
+      maxAttempts,
+      lastResult.output,
+      pipelineRunId,
+      opts,
+      {
+        invoke: invokeFn,
+        gitHead: gitHeadFn,
+        gitDirty: gitDirtyFn,
+        gitPush: gitPushFn,
+        gitCommitMessages: gitCommitMessagesFn,
+        salvage: salvageFn,
+        verifyEvalFix: verifyEvalFixFn,
+      },
+    );
+    if (!fixResult.ok) {
+      fixRoundBlocked = { reason: fixResult.reason, blockerKind: fixResult.blockerKind };
+      break;
+    }
+    fixCommitLandedThisInvocation = true;
+    stageDeadlineMs = Date.now() + timeoutSec * 1000;
+  }
+
+  if (fixRoundBlocked) {
+    console.log(`[pipeline] #${issueNumber}: eval-gate fix round failed; blocking`);
+    // Branch on literal kind strings (rather than passing the variable through)
+    // so the static "every setBlocked call passes an explicit BlockerKind" guard
+    // (blocked-recipes.test.ts) can verify each call site by source inspection.
+    if (fixRoundBlocked.blockerKind === "push-failed") {
+      await setBlockedFn(cfg, issueNumber, fixRoundBlocked.reason, "eval-gate", "push-failed");
+    } else {
+      await setBlockedFn(cfg, issueNumber, fixRoundBlocked.reason, "eval-gate", "harness-failure");
+    }
+    await recordGateResult(opts, "fail", cfg.eval_gate.mode, "fix_round_failed");
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: fixRoundBlocked.reason,
+      blockerKind: fixRoundBlocked.blockerKind,
+    };
   }
 
   const result = lastResult!;
@@ -252,6 +657,43 @@ export async function advanceEval(
 
   if (result.passed) {
     console.log(`[pipeline] #${issueNumber}: eval-gate passed in ${result.durationSec.toFixed(1)}s`);
+
+    // A pass reached after an eval-fix commit landed is a developer commit
+    // that hasn't cleared review yet: the just-pushed flag covers this
+    // invocation unconditionally, and the durable GitHub-PR-state
+    // re-derivation covers crash/interruption and resumed invocations
+    // (#372 review-2 finding 1; pre-merge delta review key 1469c9cd). Route
+    // back through pre-merge so its existing review-SHA gate (#16) decides
+    // whether a fresh review round is required before the item can reach
+    // eval-gate — and ready-to-deploy — again. Gate mode only: fix rounds
+    // never run in advisory mode, whose passes advance to the next stage
+    // unchanged per the issue spec (key 816dc89f).
+    const pendingReview =
+      cfg.eval_gate.mode === "gate" &&
+      (fixCommitLandedThisInvocation ||
+        (await evalFixCommitPendingReview(cfg, issueNumber, {
+          getGhActor: getGhActorFn,
+          getIssueDetail: getIssueDetailFn,
+          getPrForIssue: getPrForIssueFn,
+          getPrCommits: getPrCommitsFn,
+        })));
+    if (pendingReview) {
+      await transitionFn(
+        cfg,
+        issueNumber,
+        "eval-gate",
+        "pre-merge",
+        `Eval gate passed in ${result.durationSec.toFixed(1)}s after an eval-fix commit. Routing back through pre-merge for review before advancing.`,
+      );
+      await recordGateResult(opts, "pass", cfg.eval_gate.mode, "fix_commit_needs_review");
+      return {
+        advanced: true,
+        from: "eval-gate",
+        to: "pre-merge",
+        summary: `eval passed after fix round in ${result.durationSec.toFixed(1)}s; routed to pre-merge for review`,
+      };
+    }
+
     const passTo = nextAfterEval(cfg);
     await transitionFn(cfg, issueNumber, "eval-gate", passTo, `Eval gate passed. Advancing to ${passTo}.`);
     await recordGateResult(opts, "pass", cfg.eval_gate.mode);
@@ -403,6 +845,38 @@ async function defaultRunEval(
 }
 
 // ---------------------------------------------------------------------------
+// Default git implementations for the eval-fix round (injectable for tests).
+// ---------------------------------------------------------------------------
+
+async function defaultGitHead(cwd: string): Promise<string> {
+  const res = await gitInWorktree(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  return res.stdout.trim();
+}
+
+async function defaultGitDirty(cwd: string): Promise<boolean> {
+  const res = await gitInWorktree(cwd, ["status", "--porcelain"], { ignoreFailure: true });
+  return res.stdout.trim().length > 0;
+}
+
+async function defaultGitPush(cwd: string, branch: string): Promise<{ code: number; stderr: string }> {
+  const res = await gitInWorktree(cwd, ["push", "origin", branch], { ignoreFailure: true });
+  return { code: res.code, stderr: res.stderr };
+}
+
+/** Return the full commit messages for commits reachable from HEAD but not from
+ *  `baseRef`. Uses NUL-delimited output to safely handle multi-line messages.
+ *  Returns [] when there are no new commits or when git is unavailable. */
+async function defaultGitCommitMessages(cwd: string, baseRef: string): Promise<string[]> {
+  const res = await gitInWorktree(
+    cwd,
+    ["log", `--format=%x00%B`, `${baseRef}..HEAD`],
+    { ignoreFailure: true },
+  );
+  if (!res.stdout.trim()) return [];
+  return res.stdout.split("\x00").map((s) => s.trim()).filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
@@ -411,7 +885,16 @@ function combineOutput(res: { stdout: string; stderr: string }): string {
   return parts.join("\n").trim() || "(no output captured)";
 }
 
-function truncate(s: string, cap: number): string {
+// Head+tail elision (#373): eval harnesses print setup/per-case noise first and
+// the pass/fail summary last, so a head-only slice(0, cap) shows boilerplate and
+// drops the one part that tells the operator what regressed. Keep a head fragment
+// (command/setup context) and a tail fragment (summary), with the middle elided.
+export function truncate(s: string, cap: number): string {
   if (s.length <= cap) return s;
-  return s.slice(0, cap) + "\n\n[…output truncated]";
+  const headLen = Math.floor(cap / 3);
+  const tailLen = cap - headLen;
+  const dropped = s.length - cap;
+  const head = s.slice(0, headLen);
+  const tail = s.slice(s.length - tailLen);
+  return `${head}\n\n[… ${dropped} characters truncated …]\n\n${tail}`;
 }
