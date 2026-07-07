@@ -210,6 +210,26 @@ export interface ForwardStream {
   off(event: "error", listener: (err: Error) => void): unknown;
 }
 
+// Destinations that already carry a permanent 'error' guard (#384 delta
+// review round 2, key 0415ec38). A forwarded write's async EPIPE can land
+// after this call's own settle() has removed its per-call diagnostic
+// listener — Node throws on an 'error' event with zero listeners, which
+// would crash the pipeline even though the command already exited 0. This
+// permanent, once-per-destination listener absorbs any such late error so a
+// stray unhandled event can never surface, independent of exactly when the
+// per-call listener is attached or removed.
+const permanentlyForwardGuarded = new WeakSet<ForwardStream>();
+function ensurePermanentForwardGuard(dest: ForwardStream): void {
+  if (permanentlyForwardGuarded.has(dest)) return;
+  permanentlyForwardGuarded.add(dest);
+  dest.on("error", () => {
+    // Intentionally a no-op: this call's own listener (added below) already
+    // records the diagnostic for any error that lands while it is active.
+    // This permanent listener exists solely so the stream is never left
+    // with zero 'error' listeners.
+  });
+}
+
 export async function runCapped(
   cmd: string,
   args: string[],
@@ -267,6 +287,8 @@ export async function runCapped(
         `[harness ${label}] stream-forward error (diagnostic; command outcome unaffected): ${err.message}`;
     };
     if (stream) {
+      ensurePermanentForwardGuard(fwd.stdout);
+      ensurePermanentForwardGuard(fwd.stderr);
       fwd.stdout.on("error", onForwardError);
       fwd.stderr.on("error", onForwardError);
     }

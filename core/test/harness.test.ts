@@ -555,3 +555,47 @@ for (const [shape, makeForwardStdout] of [
     );
   });
 }
+
+// ---------------------------------------------------------------------------
+// late forward-stream error (#384 delta review round 2, key 0415ec38) — the
+// sink's async EPIPE can arrive AFTER the child has already closed and
+// runCapped has settled, by which point the per-call diagnostic listener
+// added above has already been detached. Before the fix, this ordering left
+// the destination stream with zero 'error' listeners: emitting 'error' with
+// no listener throws synchronously inside the emit() call below, which
+// would surface as an uncaught exception and crash the whole test process —
+// exactly the pipeline crash the finding describes, on a command that
+// already exited 0.
+// ---------------------------------------------------------------------------
+
+test("runCapped: a forward-stream error arriving after settle is absorbed, not an unhandled crash (#384 0415ec38)", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  const forwardTo = {
+    stdout: Object.assign(new EventEmitter(), { write: () => true }),
+    stderr: Object.assign(new EventEmitter(), { write: () => true }),
+  };
+
+  setImmediate(() => {
+    fakeChild.stdout.emit("data", Buffer.from("tests: 10/10 passed\n"));
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, true, "test", { spawnFn, forwardTo });
+
+  assert.equal(result.success, true, "a passing command must still resolve successfully");
+  assert.equal(result.exit_code, 0, "gate outcome derives solely from the command exit code");
+
+  // The command has already settled and this call's own listener is gone —
+  // emitting now reproduces the exact late-arrival race. If this throws, the
+  // fix regressed: the destination is left with no 'error' listener.
+  assert.doesNotThrow(
+    () => forwardTo.stdout.emit("error", new Error("EPIPE (simulated, late)")),
+    "a forward error landing after settle must not be an unhandled 'error' event",
+  );
+});
