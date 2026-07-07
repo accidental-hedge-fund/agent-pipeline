@@ -152,6 +152,16 @@ export interface GhMetricsSummaryEvent extends RunEventBase {
 export interface StageAccountingEvent extends RunEventBase, StageAccountingRecord {
   type: "stage_accounting";
 }
+/** Recorded at the instant a `runCapped` wall-clock cap fires (#398) — before,
+ *  and independent of, the harness invocation's promise resolving — so a
+ *  supervisor tailing events.jsonl can detect a wedged harness without process
+ *  introspection. Additive: does not change `schema_version` or the meaning of
+ *  `stage_start`/`stage_complete` stage-timeline filters, which exclude it. */
+export interface HarnessTimeoutEvent extends RunEventBase {
+  type: "harness_timeout";
+  stage: string;
+  timeout_sec: number;
+}
 
 export type { HumanInterventionEvent };
 
@@ -170,6 +180,7 @@ export type RunEvent =
   | BlockerClearedEvent
   | GhMetricsSummaryEvent
   | StageAccountingEvent
+  | HarnessTimeoutEvent
   | HumanInterventionEvent;
 
 // ---------------------------------------------------------------------------
@@ -713,6 +724,43 @@ export async function latestSummaryForIssue(
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// latestRunEventsSummaryForIssue — for the `possibly_wedged` status flag (#398)
+// ---------------------------------------------------------------------------
+
+export interface RunEventsSummary {
+  /** True when events.jsonl contains a `run_complete` event. */
+  finalized: boolean;
+  /** The newest event's type/timestamp, or null when events.jsonl is empty. */
+  lastEvent: { type: string; at: string } | null;
+}
+
+/** Return a finalized/last-event summary of the most-recent run's events.jsonl
+ *  for the given issue, or null when no run directory exists for it. Unlike
+ *  `latestSummaryForIssue`, this reads events.jsonl directly rather than
+ *  summary.json, so a run that has not reached `finalizeRun` yet (including a
+ *  wedged one) can still be inspected. Non-fatal: an unreadable events.jsonl is
+ *  treated as absent. */
+export async function latestRunEventsSummaryForIssue(
+  repoDir: string,
+  issueNumber: number,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<RunEventsSummary | null> {
+  const allIds = await listRunIds(repoDir, deps);
+  const prefix = `${issueNumber}-`;
+  const matchId = allIds.find((rid) => rid.startsWith(prefix));
+  if (!matchId) return null;
+  try {
+    const events = await readEvents(runDirPath(repoDir, matchId), deps);
+    if (events.length === 0) return { finalized: false, lastEvent: null };
+    const finalized = events.some((e) => e.type === "run_complete");
+    const last = events[events.length - 1];
+    return { finalized, lastEvent: { type: last.type, at: last.at } };
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

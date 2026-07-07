@@ -19,10 +19,23 @@
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
-import { emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
+import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness } from "./types.ts";
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
+
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/** Run-store context for recording a `harness_timeout` event at cap-fire time
+ *  (#398). Optional: bare `runCapped` callers (`testgate.ts`, `eval.ts`) pass
+ *  none, and no event is recorded for them. */
+export interface HarnessTimeoutEventContext {
+  runDir: string;
+  runStoreDeps?: RunStoreDeps;
+  stage: string;
+}
 
 /**
  * Format a bounded CLI stderr excerpt for inclusion in a blocked-item message.
@@ -151,7 +164,16 @@ export async function invoke(
   }
 
   const startedAt = new Date();
-  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness, { killProcessGroup: true });
+  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness, {
+    killProcessGroup: true,
+    timeoutEvent: opts.accounting
+      ? {
+          runDir: opts.accounting.runDir,
+          runStoreDeps: opts.accounting.runStoreDeps,
+          stage: opts.accounting.stage,
+        }
+      : undefined,
+  });
   const endedAt = new Date();
   if (opts.accounting) {
     const model = opts.accounting.model ?? opts.model ?? null;
@@ -240,6 +262,15 @@ export async function runCapped(
   opts: {
     killProcessGroup?: boolean;
     killGraceSec?: number;
+    // Hard secondary deadline (#398), seconds after the SIGKILL point at which
+    // runCapped force-resolves `timed_out: true` unconditionally, even if the
+    // child's streams never emit `close` and the process-group kill fails.
+    // Injectable so tests use a short value; production keeps the 30 s default.
+    hardDeadlineSec?: number;
+    // Run-store context (#398): when present, a `harness_timeout` event is
+    // recorded at the moment the wall-clock cap fires. Absent for bare
+    // runCapped callers, which record nothing (unchanged behavior).
+    timeoutEvent?: HarnessTimeoutEventContext;
     // Injectable spawn seam (#384): lets tests simulate a capture stream that
     // errors mid-run without a real OS-level pipe fault. Defaults to the real
     // node:child_process spawn.
@@ -257,6 +288,7 @@ export async function runCapped(
     // Grace period (seconds) between SIGTERM and SIGKILL on timeout. Configurable
     // so tests can use a short value without waiting the full 5 s default.
     const killGraceSec = opts.killGraceSec ?? 5;
+    const hardDeadlineSec = opts.hardDeadlineSec ?? 30;
     const spawnImpl = opts.spawnFn ?? spawn;
     const child = spawnImpl(cmd, args, {
       cwd,
@@ -357,6 +389,45 @@ export async function runCapped(
     const timer = setTimeout(() => {
       timedOut = true;
       killGroup("SIGTERM");
+
+      // Record the timeout to the run store at the instant the cap fires — before,
+      // and independent of, this promise resolving — so a supervisor tailing
+      // events.jsonl can detect a wedge without process introspection (#398).
+      // Best-effort and inert when the invocation carries no run-store context.
+      if (opts.timeoutEvent) {
+        const { runDir, runStoreDeps, stage } = opts.timeoutEvent;
+        appendEvent(
+          runDir,
+          {
+            schema_version: RUN_SCHEMA_VERSION,
+            type: "harness_timeout",
+            at: nowIso(),
+            stage,
+            timeout_sec: timeoutSec,
+          },
+          runStoreDeps,
+        ).catch(() => {});
+      }
+
+      // Hard secondary deadline (#398): a sibling failsafe armed the moment the cap
+      // fires — not nested inside the SIGKILL escalation chain below — so runCapped
+      // concludes even if a detached grandchild survives SIGKILL and keeps the
+      // inherited stdio pipes open (in which case child.stdout/stderr never emit
+      // `close`). settle()'s single-resolution guard makes this a no-op once the
+      // escalation chain below has already settled, which is the common case, so
+      // clean timeouts see no added latency.
+      setTimeout(() => {
+        const duration = (Date.now() - start) / 1000;
+        settle({
+          success: false,
+          stdout: stdoutBuf,
+          stderr: stderrBuf,
+          exit_code: lastExitCode ?? -1,
+          duration,
+          timed_out: true,
+        });
+      }, (killGraceSec + hardDeadlineSec) * 1000);
+
       // After the grace period, force-kill any remaining group members and only then
       // resolve — so all descendants are absent from the OS process table before
       // runCapped returns, even if a grandchild ignored SIGTERM.

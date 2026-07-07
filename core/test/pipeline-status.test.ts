@@ -399,7 +399,7 @@ test("runStatus --json: schema_version is \"1\"", async () => {
 test("runStatus --json: all minimum fields are present", async () => {
   const parsed = await captureStatusJson("review-1", 42) as Record<string, unknown>;
   for (const field of ["schema_version", "status", "issue", "stage", "pr", "branch", "worktree",
-    "last_event", "review_summary", "next_action", "config"]) {
+    "last_event", "review_summary", "next_action", "config", "possibly_wedged"]) {
     assert.ok(field in parsed, `missing field: ${field}`);
   }
 });
@@ -489,6 +489,95 @@ test("runStatus --json: getLabelEvents failure is encoded as status:error envelo
   assert.equal(parsed.schema_version, "1");
   assert.equal(parsed.status, "error");
   assert.match(parsed.error, /rate limit/);
+});
+
+// ---------------------------------------------------------------------------
+// #398: runStatus --json — possibly_wedged wiring through getLatestRunEvents
+// ---------------------------------------------------------------------------
+
+// A CFG with realistic stage timeouts (mirrors config.ts's DEFAULT_CONFIG) so the
+// largest-timeout threshold is a real number rather than NaN from the file-level
+// CFG fixture (which only carries repo/domain).
+const CFG_WITH_TIMEOUTS = {
+  ...CFG,
+  implementation_timeout: 2400,
+  review_timeout: 1500,
+  plan_review_timeout: 300,
+  fix_timeout: 2400,
+  ci_timeout: 900,
+  test_gate: { timeout: 300 },
+  eval_gate: { timeout: 300 },
+} as PipelineConfig;
+
+test("runStatus --json: possibly_wedged is populated when the latest run is unfinalized and stale", async () => {
+  const staleAt = new Date(Date.now() - 3_000_000).toISOString(); // 50 min ago > 2400s + margin
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLatestRunEvents: async () => ({
+      finalized: false,
+      lastEvent: { type: "harness_timeout", at: staleAt },
+    }),
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG_WITH_TIMEOUTS, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(lines[0]) as {
+    possibly_wedged: { last_event_type: string; last_event_age_ms: number; threshold_ms: number } | null;
+  };
+  assert.ok(parsed.possibly_wedged !== null, "expected possibly_wedged to be populated for a stale unfinalized run");
+  assert.equal(parsed.possibly_wedged.last_event_type, "harness_timeout");
+});
+
+test("runStatus --json: possibly_wedged is null when the latest run is finalized, even if old", async () => {
+  const staleAt = new Date(Date.now() - 3_000_000).toISOString();
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLatestRunEvents: async () => ({
+      finalized: true,
+      lastEvent: { type: "run_complete", at: staleAt },
+    }),
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG_WITH_TIMEOUTS, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(lines[0]) as { possibly_wedged: unknown };
+  assert.equal(parsed.possibly_wedged, null);
+});
+
+test("runStatus --json: possibly_wedged is null when the latest run's last event is recent", async () => {
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLatestRunEvents: async () => ({
+      finalized: false,
+      lastEvent: { type: "stage_start", at: new Date().toISOString() },
+    }),
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG_WITH_TIMEOUTS, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(lines[0]) as { possibly_wedged: unknown };
+  assert.equal(parsed.possibly_wedged, null);
 });
 
 test("runStatus --json: prose output (State:, Stage:, etc.) is NOT emitted", async () => {
