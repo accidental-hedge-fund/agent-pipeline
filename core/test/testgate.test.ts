@@ -12,12 +12,14 @@ import {
   runTestGate,
   runTests,
   shellSplit,
+  testGateBlockReason,
   type ParsedCommand,
   type RunTestsResult,
   type TestGateDeps,
 } from "../scripts/testgate.ts";
 import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { defaultRunStoreDeps } from "../scripts/run-store.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures + helpers
@@ -245,6 +247,7 @@ test("shellSplit: empty/whitespace-only string throws", () => {
 test("runTests: passing command → passed true", async () => {
   const res = await runTests(tmpRoot, { cmd: "node", args: ["-e", "process.exit(0)"] }, 30);
   assert.equal(res.passed, true);
+  assert.equal(res.toolingError, false);
 });
 
 test("runTests: failing command → passed false with output", async () => {
@@ -255,6 +258,14 @@ test("runTests: failing command → passed false with output", async () => {
   );
   assert.equal(res.passed, false);
   assert.match(res.output, /boom/);
+  // A cleanly-observed non-zero exit is a genuine test failure, not tooling (#384).
+  assert.equal(res.toolingError, false);
+});
+
+test("runTests (#384): command that cannot be spawned at all → toolingError true", async () => {
+  const res = await runTests(tmpRoot, { cmd: "/no/such/executable-testgate-384", args: [] }, 30);
+  assert.equal(res.passed, false);
+  assert.equal(res.toolingError, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -439,6 +450,140 @@ test("gate: fail then fix then pass → attempts 1", async () => {
   assert.equal(invoked, 1);
 });
 
+// ---------------------------------------------------------------------------
+// Tooling-failure retry (#384): a run whose output capture ends abnormally
+// (no clean exit code observed — a spawn/capture error, e.g. an event-sink
+// write failure corrupting the captured stream) is retried directly, never
+// charged as a fix attempt, and — if retries are exhausted — blocks with a
+// reason distinct from the ordinary test-failure wording.
+// ---------------------------------------------------------------------------
+
+test("gate (#384): event-sink write failure during a passing run does not fail the gate", async () => {
+  // Simulates the reported bug: a run-store event-sink delivery write fails
+  // while the test command itself exits 0. The gate outcome must depend only
+  // on the command's exit code — recording/telemetry failures are non-fatal
+  // and never surface as a blockReason.
+  const fakeRunStoreDeps = {
+    ...defaultRunStoreDeps,
+    eventSink: async () => {
+      throw new Error("EPIPE: event sink socket write failed");
+    },
+    eventSinkMode: "additive" as const,
+  };
+  const stateDir = fs.mkdtempSync(path.join(tmpRoot, "state-"));
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  let invoked = 0;
+  const out = await runTestGate(
+    cfgWith({}),
+    384,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => passResult,
+      invoke: async () => {
+        invoked++;
+        return okInvoke();
+      },
+      ...cleanGitDeps(),
+    },
+    undefined,
+    "test-gate",
+    stateDir,
+    runDir,
+    fakeRunStoreDeps,
+  );
+  assert.equal(out.passed, true);
+  assert.equal(out.blockReason, undefined);
+  assert.equal(invoked, 0);
+});
+
+test("gate (#384): abnormal capture termination is retried, not charged as a fix attempt", async () => {
+  // runTests reports a tooling error (no clean exit observed) once, then a
+  // clean pass. The gate must retry the command directly — never invoke the
+  // fix harness, and never charge a fix attempt.
+  let calls = 0;
+  let invoked = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      calls++;
+      return calls === 1
+        ? { passed: false, output: "spawn error", durationSec: 1, toolingError: true }
+        : passResult;
+    },
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 0);
+  assert.equal(invoked, 0, "fix harness must never be invoked for a tooling-error retry");
+  assert.equal(calls, 2);
+});
+
+test("gate (#384): tooling retries exhausted → blocked with a distinct tooling-failure reason", async () => {
+  let invoked = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => ({
+      passed: false,
+      output: "capture died before exit was observed",
+      durationSec: 1,
+      toolingError: true,
+    }),
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(invoked, 0, "fix harness must never be invoked for a tooling failure");
+  assert.equal(out.toolingFailure, true);
+  assert.match(out.blockReason ?? "", /tooling failure/i);
+  assert.doesNotMatch(out.blockReason ?? "", /failed after \d+ fix attempt/i);
+});
+
+test("gate (#384): a cleanly-observed non-zero exit still enters the fix loop (no regression)", async () => {
+  // toolingError: false (the default) on an ordinary failing result must still
+  // charge a fix attempt exactly as before this change.
+  let n = 0;
+  let invoked = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => (n++ === 0 ? failResult : passResult),
+    invoke: async () => {
+      invoked++;
+      return okInvoke();
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, true);
+  assert.equal(out.attempts, 1);
+  assert.equal(invoked, 1);
+});
+
+test("gate (#384, bites): testGateBlockReason keeps the tooling-failure and test-failure wordings distinct", () => {
+  const toolingGate = {
+    skipped: false as const,
+    passed: false,
+    attempts: 0,
+    blockReason: "Test/build gate tooling failure: capture died before exit was observed.",
+    toolingFailure: true,
+  };
+  const testFailGate = {
+    skipped: false as const,
+    passed: false,
+    attempts: 2,
+    blockReason: "FAIL: 1 test failed",
+  };
+  assert.doesNotMatch(testGateBlockReason(toolingGate), /failed after \d+ fix attempt/i);
+  assert.match(testGateBlockReason(testFailGate), /failed after 2 fix attempt/i);
+});
+
 test("gate: max_attempts 2, both post-fix fail → blocked with reason", async () => {
   let invoked = 0;
   const out = await runTestGate(cfgWith({ max_attempts: 2 }), 1, "/wt", {
@@ -617,8 +762,41 @@ test("gate: huge failure output is truncated in blockReason", async () => {
     ...cleanGitDeps(),
   });
   assert.equal(out.passed, false);
-  assert.match(out.blockReason ?? "", /output truncated/);
+  assert.match(out.blockReason ?? "", /characters truncated/);
   assert.ok((out.blockReason ?? "").length < huge.length);
+});
+
+test("gate (#384): over-cap failure output is tail-biased — the trailing summary survives", async () => {
+  // The pass/fail summary a test runner prints is at the END of the output;
+  // a head-only truncate would cut it off. Assert the tail summary text and
+  // the middle-elision marker both survive, and the head/tail source
+  // characters shown don't exceed the cap.
+  const head = "a".repeat(7000);
+  const middle = "b".repeat(50_000);
+  const tail = "SUMMARY: 1 failed, 42 passed";
+  const huge = `${head}${middle}\n${tail}`;
+  const out = await runTestGate(cfgWith({ max_attempts: 1 }), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => ({ passed: false, output: huge, durationSec: 1 }),
+    invoke: async () => okInvoke(),
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, false);
+  assert.match(out.blockReason ?? "", /characters truncated/);
+  assert.match(out.blockReason ?? "", /SUMMARY: 1 failed, 42 passed/);
+});
+
+test("gate (#384): at-or-under-cap failure output is verbatim (no elision marker)", async () => {
+  const small = "FAIL: 1 test failed\nSUMMARY: 1 failed, 1 passed";
+  const out = await runTestGate(cfgWith({ max_attempts: 1 }), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => ({ passed: false, output: small, durationSec: 1 }),
+    invoke: async () => okInvoke(),
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, false);
+  assert.ok(!(out.blockReason ?? "").includes("characters truncated"));
+  assert.match(out.blockReason ?? "", /SUMMARY: 1 failed, 1 passed/);
 });
 
 test("gate (regression / #48, CI parity): explicit CI command fails on second step → gate blocks", async () => {

@@ -160,6 +160,37 @@ test("buildEventSinkDeps (default deliver): quoted secret split across chunks wi
   );
 });
 
+// #384: a synchronous throw from the underlying stream write (e.g. the
+// low-level socket write rejecting an EPIPE inline rather than emitting the
+// stream's 'error' event) must resolve through the same rejection path and
+// clean up the child process immediately — never leave a dangling delivery
+// timer or an un-killed forwarder process waiting on the 10s timeout.
+test("buildEventSinkDeps (default deliver): a synchronous throw from the stdin write settles the delivery promise (no uncaught exception)", async () => {
+  const net = await import("node:net");
+  const cli = makeScript(`cat > /dev/null`);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+
+  const origWrite = net.Socket.prototype.write;
+  net.Socket.prototype.write = function () {
+    throw new Error("synthetic synchronous write failure");
+  };
+
+  let uncaught: unknown;
+  const onUncaught = (err: unknown) => { uncaught = err; };
+  process.on("uncaughtException", onUncaught);
+  try {
+    await assert.rejects(
+      () => Promise.resolve(result.eventSink!("line\n")),
+      /synthetic synchronous write failure/,
+    );
+  } finally {
+    net.Socket.prototype.write = origWrite;
+    process.off("uncaughtException", onUncaught);
+  }
+  assert.equal(uncaught, undefined);
+});
+
 test("buildEventSinkDeps (default deliver): an unspawnable command rejects rather than hanging", async () => {
   const cfg: Pick<PipelineConfig, "event_sink"> = {
     event_sink: { command: "/no/such/executable-343", mode: "additive" },

@@ -80,8 +80,20 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       reject(err);
     });
 
-    child.stdin?.write(line);
-    child.stdin?.end();
+    // A synchronous throw from the underlying stream write (e.g. an EPIPE
+    // detected inline rather than via the 'error' event above) must resolve
+    // through the same rejection path — never escape uncaught and take down
+    // whatever else the process is doing concurrently (#384).
+    try {
+      child.stdin?.write(line);
+      child.stdin?.end();
+    } catch (err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
   });
 }
 

@@ -37,6 +37,11 @@ export interface RunTestsResult {
   passed: boolean;
   output: string;
   durationSec: number;
+  /** True when the command's output capture ended abnormally — a spawn/capture
+   *  error (no clean process exit code was ever observed) rather than a
+   *  cleanly-observed exit (zero or non-zero) (#384). Drives the gate's bounded
+   *  tooling-failure retry instead of charging a fix attempt. */
+  toolingError: boolean;
 }
 
 export interface TestGateResult {
@@ -48,6 +53,11 @@ export interface TestGateResult {
   attempts?: number;
   /** Captured failure output / reason, set only when `passed` is false. */
   blockReason?: string;
+  /** True when `blockReason` reports a tooling/capture failure (bounded
+   *  tooling retries exhausted without ever observing a clean exit) rather
+   *  than a genuine test/build failure (#384). Consumed by
+   *  `testGateBlockReason` to pick the matching wording. */
+  toolingFailure?: boolean;
 }
 
 /** Signature of the harness `invoke` — injectable so the loop is unit-testable. */
@@ -136,6 +146,12 @@ export async function enforceTestFixCommitFormat(
 }
 
 const MAX_BLOCK_OUTPUT = 8000;
+
+// Bounded retries for a test-command run whose output capture ends abnormally
+// (no clean exit code observed — a spawn/capture error) before invoking the
+// fix harness. Small and internal: this is a plumbing-transient safety net,
+// not an operator-configurable knob (#384).
+const MAX_TOOLING_RETRIES = 2;
 
 // ---------------------------------------------------------------------------
 // The bounded generate→test→fix loop.
@@ -257,8 +273,11 @@ export async function runTestGate(
           durationMs: res.durationSec * 1000,
           commandCount: 1,
           subprocessCount: 1,
-          outcome: res.passed ? "success" : "failure",
-          blockerKind: res.passed ? null : "test-gate-exhausted",
+          outcome: res.passed ? "success" : res.toolingError ? "spawn_error" : "failure",
+          // Mirrors eval.ts's recordEvalAccounting distinction (#372): a tooling
+          // error (no clean exit observed) is a harness/capture-plumbing problem,
+          // not the "fix attempts exhausted" test-gate class (#384).
+          blockerKind: res.passed ? null : res.toolingError ? "harness-failure" : "test-gate-exhausted",
           prHeadSha,
         }),
         runStoreDeps,
@@ -267,11 +286,33 @@ export async function runTestGate(
     return res;
   };
 
+  // Bounded retry for a run whose output capture ended abnormally (no clean
+  // exit code observed — a spawn/capture error) rather than a genuine test
+  // failure. Retries the command directly, without invoking the fix harness
+  // and without touching the `max_attempts` fix budget (#384).
+  const runWithToolingRetries = async (): Promise<{
+    result: RunTestsResult;
+    toolingExhausted: boolean;
+  }> => {
+    let result = await runAndRecord();
+    let retries = 0;
+    while (result.toolingError && retries < MAX_TOOLING_RETRIES) {
+      retries++;
+      console.log(
+        `[pipeline] #${issueNumber}: test gate output capture ended abnormally ` +
+          `(no clean exit observed); retrying the command (${retries}/${MAX_TOOLING_RETRIES}) ` +
+          "instead of invoking the fix harness",
+      );
+      result = await runAndRecord();
+    }
+    return { result, toolingExhausted: result.toolingError };
+  };
+
   // Require a clean worktree before the first trusted test run. If uncommitted
   // changes exist, what's tested diverges from what's committed, so the gate
   // result can't be trusted.
   if (await gitDirtyFn(wtPath)) {
-    const porcelainOut = truncate((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
+    const porcelainOut = truncateHead((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
     const pathSuffix = porcelainOut ? `\n\nUncommitted paths:\n${porcelainOut}` : "";
     return {
       skipped: false,
@@ -284,13 +325,26 @@ export async function runTestGate(
     };
   }
 
-  let { passed, output } = await runAndRecord();
+  const initialRun = await runWithToolingRetries();
+  if (initialRun.toolingExhausted) {
+    console.log(
+      `[pipeline] #${issueNumber}: test gate tooling failure persisted after ${MAX_TOOLING_RETRIES} retries; blocking`,
+    );
+    return {
+      skipped: false,
+      passed: false,
+      attempts: 0,
+      blockReason: toolingFailureBlockReason(initialRun.result.output),
+      toolingFailure: true,
+    };
+  }
+  let { passed, output } = initialRun.result;
   if (passed) {
     // A passing run can still generate uncommitted artifacts (tsbuildinfo,
     // snapshots, lock-file updates). If it does, the committed state diverges
     // from what was tested — block so artifacts are committed and the gate reruns.
     if (await gitDirtyFn(wtPath)) {
-      const porcelainOut = truncate((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
+      const porcelainOut = truncateHead((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
       const pathSuffix = porcelainOut ? `\n\nUncommitted paths:\n${porcelainOut}` : "";
       return {
         skipped: false,
@@ -393,7 +447,20 @@ export async function runTestGate(
       }
     }
 
-    ({ passed, output } = await runAndRecord());
+    const retryRun = await runWithToolingRetries();
+    if (retryRun.toolingExhausted) {
+      console.log(
+        `[pipeline] #${issueNumber}: test gate tooling failure persisted after ${MAX_TOOLING_RETRIES} retries; blocking`,
+      );
+      return {
+        skipped: false,
+        passed: false,
+        attempts: attempt,
+        blockReason: toolingFailureBlockReason(retryRun.result.output),
+        toolingFailure: true,
+      };
+    }
+    ({ passed, output } = retryRun.result);
     if (passed) {
       if (await gitDirtyFn(wtPath)) {
         return {
@@ -415,13 +482,35 @@ export async function runTestGate(
     skipped: false,
     passed: false,
     attempts: cfg.test_gate.max_attempts,
-    blockReason: truncate(output, MAX_BLOCK_OUTPUT),
+    blockReason: truncateTail(output, MAX_BLOCK_OUTPUT),
   };
 }
 
+/** Captured-output failure excerpt for a bounded tooling-retry exhaustion —
+ *  distinct from `testGateBlockReason`'s "failed after N fix attempt(s)"
+ *  test-failure wording, so an operator/recovery harness can tell a capture
+ *  plumbing transient from a real regression (#384). */
+function toolingFailureBlockReason(output: string): string {
+  return (
+    "Test/build gate tooling failure: the test command's output capture terminated " +
+    `abnormally (no clean process exit observed) after ${MAX_TOOLING_RETRIES} retries. ` +
+    "This indicates a capture/spawn problem in the pipeline's own tooling, not a genuine " +
+    "test failure.\n\n" +
+    "```\n" +
+    truncateTail(output, MAX_BLOCK_OUTPUT) +
+    "\n```"
+  );
+}
+
 /** Format a gate failure into a markdown blocker comment body. Generic across
- *  the planning (pre-PR) and fix (pre-advance) seams. */
+ *  the planning (pre-PR) and fix (pre-advance) seams. A tooling-failure block
+ *  (#384) is already a fully-formed, self-describing message — returned as-is
+ *  rather than wrapped in the ordinary test-failure wording, so the two stay
+ *  distinguishable. */
 export function testGateBlockReason(gate: TestGateResult): string {
+  if (gate.toolingFailure) {
+    return gate.blockReason ?? "(no output captured)";
+  }
   return (
     `Test/build gate failed after ${gate.attempts ?? 0} fix attempt(s); ` +
     "the repo's own test/build command is still failing, so the item was not advanced.\n\n" +
@@ -461,7 +550,10 @@ export async function runTests(
   if (res.timed_out) {
     output = `${output}\n\n[test gate timed out after ${timeoutSec}s]`;
   }
-  return { passed: res.success, output, durationSec: res.duration };
+  // A timeout is a distinct, already-handled failure mode (the command ran,
+  // just too long) — only a genuine spawn/capture error (no clean exit code
+  // ever observed) is a tooling error (#384).
+  return { passed: res.success, output, durationSec: res.duration, toolingError: !!res.spawn_error };
 }
 
 // ---------------------------------------------------------------------------
@@ -630,9 +722,27 @@ function combineOutput(res: HarnessResult): string {
   return parts.join("\n").trim() || "(no output captured)";
 }
 
-function truncate(s: string, cap: number): string {
+/** Head-only truncation, used only for the dirty-worktree porcelain path
+ *  listing (#352) — an ordered file list where the head is the useful part.
+ *  Left unchanged by #384; the captured-command-output excerpt below uses the
+ *  tail-biased `truncateTail` instead. */
+function truncateHead(s: string, cap: number): string {
   if (s.length <= cap) return s;
   return s.slice(0, cap) + "\n\n[…output truncated]";
+}
+
+// Head+tail elision (#384), mirroring eval.ts's tail-biased truncate (#373): a
+// test runner prints setup/per-test noise first and the pass/fail summary
+// last, so a head-only slice cuts off the one part that tells the operator
+// what failed. Keep a head fragment and a tail fragment, eliding the middle.
+function truncateTail(s: string, cap: number): string {
+  if (s.length <= cap) return s;
+  const headLen = Math.floor(cap / 3);
+  const tailLen = cap - headLen;
+  const dropped = s.length - cap;
+  const head = s.slice(0, headLen);
+  const tail = s.slice(s.length - tailLen);
+  return `${head}\n\n[… ${dropped} characters truncated …]\n\n${tail}`;
 }
 
 async function defaultGitHead(cwd: string): Promise<string> {
