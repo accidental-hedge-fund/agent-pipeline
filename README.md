@@ -6,6 +6,8 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 ## Lifecycle
 
+![agent-pipeline state machine — ready → deploy-ready, no human writes the code](docs/assets/state-machine.png)
+
 `ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and never presses merge.
 
 ```mermaid
