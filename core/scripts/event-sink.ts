@@ -72,6 +72,11 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       }
     });
 
+    // Covers the *asynchronous* EPIPE case (an early-exiting forwarder: the
+    // write is accepted, then the stream emits 'error' on a later tick) —
+    // regression-tested by "stdin EPIPE from an early-exiting forwarder..."
+    // in event-sink.test.ts, which fails with an uncaught EPIPE if this
+    // handler is removed.
     child.stdin?.on("error", (err) => {
       if (settled) return;
       settled = true;
