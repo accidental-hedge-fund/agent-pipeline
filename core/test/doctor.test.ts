@@ -516,6 +516,89 @@ test("check install:version-coherence — fails with reinstall remediation when 
   assert.match(r.remediation!, /reinstall/i);
 });
 
+// ---------------------------------------------------------------------------
+// install:version-freshness check (#385)
+// ---------------------------------------------------------------------------
+
+/** Fake a `gh release view --repo <upstream> --json tagName` response. */
+function releaseDeps(tagName: string | null, o: FakeOverrides = {}): DoctorDeps {
+  return fakeDeps({
+    exec: (f, a) => {
+      if (f === "gh" && a[0] === "release") {
+        return tagName === null
+          ? { ok: false, stdout: "", stderr: "gh: could not resolve to a Repository" }
+          : { ok: true, stdout: JSON.stringify({ tagName }), stderr: "" };
+      }
+      return o.exec ? o.exec(f, a) : { ok: true, stdout: "", stderr: "" };
+    },
+    ...o,
+  });
+}
+
+test("check install:version-freshness — queries the fixed upstream repo, never config.repo", async () => {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const cfg = makeConfig({ repo: "acme/widget" });
+  await getCheck(cfg, "install:version-freshness").run(
+    releaseDeps("v1.0.0", { onCall: (f, a) => calls.push({ file: f, args: a }) }),
+  );
+  const releaseCall = calls.find((c) => c.file === "gh" && c.args[0] === "release");
+  assert.ok(releaseCall, "expected a `gh release view` call");
+  assert.ok(releaseCall!.args.includes("accidental-hedge-fund/agent-pipeline"));
+  assert.ok(!releaseCall!.args.includes("acme/widget"), "must never query config.repo");
+});
+
+test("check install:version-freshness — behind the latest release → warn naming both versions and the update command", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "1.0.0").run(releaseDeps("v1.1.0"));
+  assert.equal(r.status, "warn");
+  assert.match(r.detail, /1\.0\.0/);
+  assert.match(r.detail, /1\.1\.0/);
+  assert.match(r.remediation!, /npx github:accidental-hedge-fund\/agent-pipeline update/);
+});
+
+test("check install:version-freshness — equal to the latest release → pass", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "1.1.0").run(releaseDeps("v1.1.0"));
+  assert.equal(r.status, "pass");
+});
+
+test("check install:version-freshness — ahead of the latest release (unreleased dev build) → pass, not warn", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "1.2.0").run(releaseDeps("v1.1.0"));
+  assert.equal(r.status, "pass");
+});
+
+test("check install:version-freshness — gh release view fails (offline) → skip, never warn/fail", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "1.0.0").run(releaseDeps(null));
+  assert.equal(r.status, "skip");
+  assert.match(r.detail, /skipped \(offline\)/);
+});
+
+test("check install:version-freshness — unparseable gh output → skip", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "1.0.0").run(
+    fakeDeps({ exec: () => ({ ok: true, stdout: "not json {{{", stderr: "" }) }),
+  );
+  assert.equal(r.status, "skip");
+  assert.match(r.detail, /skipped \(offline\)/);
+});
+
+test("check install:version-freshness — JSON without tagName → skip", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "1.0.0").run(
+    fakeDeps({ exec: () => ({ ok: true, stdout: "{}", stderr: "" }) }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check install:version-freshness — empty running version → skip (nothing to compare)", async () => {
+  const r = await getCheck(makeConfig(), "install:version-freshness", "").run(releaseDeps("v1.1.0"));
+  assert.equal(r.status, "skip");
+});
+
+test("runPreflight — a stale install (warn) does not set ok:false and does not block collect-all", async () => {
+  const cfg = makeConfig();
+  const result = await runPreflight(cfg, releaseDeps("v9.9.9"), {}, "1.0.0");
+  assert.equal(result.ok, true, "a warn-only result must keep ok:true");
+  const fresh = result.checks.find((c) => c.id === "install:version-freshness");
+  assert.equal(fresh?.status, "warn");
+});
+
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json
 // is unreadable at startup, loadVersion() in pipeline.ts returns "" rather than throwing
 // at module load. This test proves runPreflight still executes (does not crash) and that
@@ -639,7 +722,7 @@ test("formatDoctorSummary — lists each check and surfaces remediation on failu
     ],
   };
   const out = formatDoctorSummary(result);
-  assert.match(out, /1 passed, 1 failed, 1 skipped/);
+  assert.match(out, /1 passed, 1 failed, 0 warned, 1 skipped/);
   assert.match(out, /cli:gh/);
   assert.match(out, /github-auth/);
   assert.match(out, /Run `gh auth login`\./, "remediation text must appear for the failing check");
@@ -655,6 +738,29 @@ test("formatDoctorSummary — all-pass renders Result: PASS", () => {
     checks: [{ id: "cli:gh", description: "gh", status: "pass", detail: "ok" }],
   };
   assert.match(formatDoctorSummary(result), /Result: PASS/);
+});
+
+test("formatDoctorSummary — a warn-only result renders Result: PASS with the warning and its remediation", () => {
+  const result: PreflightResult = {
+    schema_version: 1,
+    ok: true,
+    ranAt: "2026-06-14T12:00:00.000Z",
+    checks: [
+      { id: "cli:gh", description: "gh", status: "pass", detail: "`gh` is available" },
+      {
+        id: "install:version-freshness",
+        description: "freshness",
+        status: "warn",
+        detail: "installed engine v1.0.0 is behind the latest release v1.1.0",
+        remediation: "Run `npx github:accidental-hedge-fund/agent-pipeline update` to refresh the installed skill to v1.1.0.",
+      },
+    ],
+  };
+  const out = formatDoctorSummary(result);
+  assert.match(out, /1 passed, 0 failed, 1 warned, 0 skipped/);
+  assert.match(out, /! install:version-freshness/);
+  assert.match(out, /npx github:accidental-hedge-fund\/agent-pipeline update/, "remediation must appear for a warn");
+  assert.match(out, /Result: PASS/, "a warn never flips the overall result to FAIL");
 });
 
 // ---------------------------------------------------------------------------
@@ -713,6 +819,22 @@ function failingResult(): PreflightResult {
     ok: false,
     ranAt: "t",
     checks: [{ id: "cli:gh", description: "gh", status: "fail", detail: "missing", remediation: "install gh" }],
+  };
+}
+function warnResult(): PreflightResult {
+  return {
+    schema_version: 1,
+    ok: true,
+    ranAt: "t",
+    checks: [
+      {
+        id: "install:version-freshness",
+        description: "freshness",
+        status: "warn",
+        detail: "installed engine v1.0.0 is behind the latest release v1.1.0",
+        remediation: "Run `npx github:accidental-hedge-fund/agent-pipeline update` to refresh the installed skill to v1.1.0.",
+      },
+    ],
   };
 }
 
@@ -809,6 +931,20 @@ test("runStartPreflightGate — passing preflight returns proceed:true (planning
     if (gate.proceed) planningCalls++;
   });
   assert.equal(planningCalls, 1);
+});
+
+// #385: a stale install (warn) must print but never abort a run-start preflight.
+test("runStartPreflightGate — a warn-only preflight prints the warning and still proceeds", async () => {
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => warnResult(),
+    storePreflightResult: async () => {},
+  };
+  const cfg = makeConfig({ doctor: { runOnStart: true, failFast: false } });
+  const out = await captureConsole(async () => {
+    const gate = await runStartPreflightGate(cfg, {} as CliOpts, deps);
+    assert.equal(gate.proceed, true, "a warn must not abort the run");
+  });
+  assert.match(out, /install:version-freshness/);
 });
 
 // 6.9 — disabled: no preflight runs, advance proceeds unchanged
@@ -944,6 +1080,42 @@ test("formatDoctorJson: skipped check is ok:true (skips are not failures)", () =
     checks: [{ id: "eval-command", description: "eval", status: "skip", detail: "not configured" }],
   };
   assert.equal(formatDoctorJson(result).checks[0].ok, true);
+});
+
+test("formatDoctorJson: a warn with no failure → status \"warnings\", warn check ok:true with non-empty fix", () => {
+  const result: PreflightResult = {
+    ok: true,
+    ranAt: "t",
+    checks: [
+      { id: "cli:gh", description: "gh", status: "pass", detail: "`gh` is available" },
+      {
+        id: "install:version-freshness",
+        description: "freshness",
+        status: "warn",
+        detail: "installed engine v1.0.0 is behind the latest release v1.1.0",
+        remediation: "Run `npx github:accidental-hedge-fund/agent-pipeline update` to refresh the installed skill to v1.1.0.",
+      },
+    ],
+  };
+  const env = formatDoctorJson(result);
+  assert.equal(env.status, "warnings");
+  const warned = env.checks.find((c) => c.name === "install:version-freshness");
+  assert.ok(warned, "warning check must appear in output");
+  assert.equal(warned!.status, "warn");
+  assert.equal(warned!.ok, true, "a warn is not a failure — ok stays true");
+  assert.ok(warned!.fix.length > 0, "fix must be non-empty for a warn");
+});
+
+test("formatDoctorJson: a fail dominates a co-occurring warn → status \"error\"", () => {
+  const result: PreflightResult = {
+    ok: false,
+    ranAt: "t",
+    checks: [
+      { id: "install:version-freshness", description: "freshness", status: "warn", detail: "behind", remediation: "update" },
+      { id: "github-auth", description: "auth", status: "fail", detail: "no auth", remediation: "Run `gh auth login`." },
+    ],
+  };
+  assert.equal(formatDoctorJson(result).status, "error");
 });
 
 // ---------------------------------------------------------------------------

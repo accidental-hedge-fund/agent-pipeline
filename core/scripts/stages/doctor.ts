@@ -45,13 +45,13 @@ export interface DoctorDeps {
   readTextFile(p: string): Promise<string | null>;
 }
 
-export type CheckStatus = "pass" | "fail" | "skip";
+export type CheckStatus = "pass" | "fail" | "skip" | "warn";
 
 export interface CheckResult {
   status: CheckStatus;
   /** One-line description of what was checked and what was found. */
   detail: string;
-  /** Actionable remediation text — required when status is "fail". */
+  /** Actionable remediation text — required when status is "fail" or "warn". */
   remediation?: string;
 }
 
@@ -132,6 +132,13 @@ const fail = (detail: string, remediation: string): CheckResult => ({
   detail,
   remediation,
 });
+/** Non-blocking: reported loudly but never sets `PreflightResult.ok` false and
+ *  never aborts a run-start preflight — a stale/degraded-but-working install. */
+const warn = (detail: string, remediation: string): CheckResult => ({
+  status: "warn",
+  detail,
+  remediation,
+});
 
 // ---------------------------------------------------------------------------
 // Check definitions
@@ -140,6 +147,32 @@ const fail = (detail: string, remediation: string): CheckResult => ({
 /** Protected branches the pipeline must not have dirty (it branches worktrees from them). */
 function protectedBranches(config: PipelineConfig): Set<string> {
   return new Set([config.base_branch, "main", "master", "staging"]);
+}
+
+/** The engine's own source/release repo — fixed, and distinct from `config.repo`
+ *  (the target repo the pipeline operates on). Mirrors the constant used by
+ *  scripts/build.mjs, scripts/install.mjs, and scripts/postinstall.mjs. */
+const UPSTREAM_REPO = "accidental-hedge-fund/agent-pipeline";
+
+/** Strip a leading "v"/"V" so a release tag ("v1.14.0") and the running
+ *  VERSION constant ("1.14.0") compare on the same footing. */
+function normalizeVersionTag(v: string): string {
+  return v.trim().replace(/^[vV]/, "");
+}
+
+/** Compare two dotted-numeric version strings segment by segment. Non-numeric
+ *  or missing segments parse to 0, so a genuinely ambiguous tag never reads
+ *  as "behind" — ambiguity biases toward pass, never a false-positive warn. */
+function compareVersionSegments(a: string, b: string): number {
+  const as = normalizeVersionTag(a).split(".");
+  const bs = normalizeVersionTag(b).split(".");
+  const len = Math.max(as.length, bs.length);
+  for (let i = 0; i < len; i++) {
+    const an = Number.parseInt(as[i] ?? "0", 10) || 0;
+    const bn = Number.parseInt(bs[i] ?? "0", 10) || 0;
+    if (an !== bn) return an - bn;
+  }
+  return 0;
 }
 
 /** Build the ordered list of preflight checks for the given resolved config.
@@ -312,6 +345,44 @@ export function buildPreflightChecks(
     },
   });
 
+  // 6b. Install version freshness (#385) — the installed engine can be internally
+  //     coherent (running code and its package.json agree) yet still be an old
+  //     *release*. Compares the running VERSION against the latest published
+  //     GitHub release tag of the engine's own upstream repo (never config.repo).
+  //     Report-only: never mutates the install, never blocks (warn, not fail),
+  //     and degrades to a silent skip when the release lookup is unavailable.
+  checks.push({
+    id: "install:version-freshness",
+    description: "Installed engine version is up to date with the latest agent-pipeline release",
+    run: async (deps) => {
+      if (!version) {
+        return skip("no running version available to compare — skipped (offline)");
+      }
+      const res = await deps.exec("gh", ["release", "view", "--repo", UPSTREAM_REPO, "--json", "tagName"]);
+      if (!res.ok || !res.stdout.trim()) {
+        return skip("could not reach the latest agent-pipeline release — skipped (offline)");
+      }
+      let parsed: { tagName?: string };
+      try {
+        parsed = JSON.parse(res.stdout) as { tagName?: string };
+      } catch {
+        return skip("release lookup returned unparseable output — skipped (offline)");
+      }
+      if (!parsed.tagName) {
+        return skip("release lookup returned no tagName — skipped (offline)");
+      }
+      const latest = normalizeVersionTag(parsed.tagName);
+      const installed = normalizeVersionTag(version);
+      if (compareVersionSegments(installed, latest) < 0) {
+        return warn(
+          `installed engine v${installed} is behind the latest release v${latest}`,
+          `Run \`npx github:${UPSTREAM_REPO} update\` to refresh the installed skill to v${latest}.`,
+        );
+      }
+      return pass(`installed engine v${installed} is up to date with the latest release v${latest}`);
+    },
+  });
+
   // 7. Package install state — only meaningful for npm-ci repos (those with a
   //    package-lock.json at the repo root). Heuristic: node_modules must exist
   //    and not be older than the lock file. `npm ci` is the fix either way.
@@ -463,22 +534,24 @@ export async function runPreflight(
 // Human-readable summary
 // ---------------------------------------------------------------------------
 
-const SYMBOL: Record<CheckStatus, string> = { pass: "✓", fail: "✗", skip: "–" };
+const SYMBOL: Record<CheckStatus, string> = { pass: "✓", fail: "✗", warn: "!", skip: "–" };
 
-/** Render a per-check pass/fail/skip summary with remediation text on failures. */
+/** Render a per-check pass/fail/warn/skip summary with remediation text on
+ *  failures and warnings. */
 export function formatDoctorSummary(result: PreflightResult): string {
   const passed = result.checks.filter((c) => c.status === "pass").length;
   const failed = result.checks.filter((c) => c.status === "fail").length;
+  const warned = result.checks.filter((c) => c.status === "warn").length;
   const skipped = result.checks.filter((c) => c.status === "skip").length;
 
   const lines: string[] = [];
   lines.push(
-    `Pipeline doctor — ${result.checks.length} checks (${passed} passed, ${failed} failed, ${skipped} skipped)`,
+    `Pipeline doctor — ${result.checks.length} checks (${passed} passed, ${failed} failed, ${warned} warned, ${skipped} skipped)`,
   );
   lines.push("");
   for (const c of result.checks) {
     lines.push(`  ${SYMBOL[c.status]} ${c.id} — ${c.detail}`);
-    if (c.status === "fail" && c.remediation) {
+    if ((c.status === "fail" || c.status === "warn") && c.remediation) {
       lines.push(`      → ${c.remediation}`);
     }
   }
@@ -493,6 +566,7 @@ export function formatDoctorSummary(result: PreflightResult): string {
 
 export interface DoctorJsonCheck {
   name: string;
+  status: CheckStatus;
   ok: boolean;
   reason: string;
   fix: string;
@@ -505,16 +579,22 @@ export interface DoctorJsonEnvelope {
 }
 
 /** Map a PreflightResult to the stable JSON envelope for `pipeline doctor --json`.
- *  Reuses the same runPreflight result as the prose path — no duplicate check logic. */
+ *  Reuses the same runPreflight result as the prose path — no duplicate check logic.
+ *  Top-level `status` is `"error"` when any check fails (a fail dominates a
+ *  co-occurring warn), `"warnings"` when at least one check warns and none fail,
+ *  else `"ok"`. */
 export function formatDoctorJson(result: PreflightResult): DoctorJsonEnvelope {
+  const hasFail = result.checks.some((c) => c.status === "fail");
+  const hasWarn = result.checks.some((c) => c.status === "warn");
   return {
     schema_version: "1",
-    status: result.ok ? "ok" : "error",
+    status: hasFail ? "error" : hasWarn ? "warnings" : "ok",
     checks: result.checks.map((c) => ({
       name: c.id,
+      status: c.status,
       ok: c.status !== "fail",
       reason: c.detail,
-      fix: c.status === "fail" ? (c.remediation ?? "") : "",
+      fix: c.status === "fail" || c.status === "warn" ? (c.remediation ?? "") : "",
     })),
   };
 }

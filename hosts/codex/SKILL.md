@@ -126,13 +126,17 @@ entries grouped by relationship kind.
 `doctor` takes no number either. It runs a **deterministic, model-free** preflight
 that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
 cleanliness on protected branches, configured harness availability, npm install
-freshness, and — when configured — the `openspec` CLI and the eval command's
-binary. It prints a per-check pass/fail summary with one-line remediation on each
-failure and exits `0`/`1`. Opt in to run it at the start of a real run with
-`doctor.runOnStart: true` or `--doctor`: a failing preflight aborts **before
-planning**, so no tokens are spent. `--fail-fast` (or `doctor.failFast: true`)
-stops at the first failure. The latest result is stored under `/tmp` and surfaced
-by `--status`.
+freshness, whether the installed engine version is behind the latest
+agent-pipeline release, and — when configured — the `openspec` CLI and the eval
+command's binary. It prints a per-check pass/fail/warn summary with one-line
+remediation on each failure or warning and exits `0` (all pass or warn) / `1`
+(any fail). A stale install (`install:version-freshness`) only **warns** — it
+never fails the preflight; run `npx github:accidental-hedge-fund/agent-pipeline
+update` to refresh it. Opt in to run the preflight at the start of a real run
+with `doctor.runOnStart: true` or `--doctor`: a failing check aborts **before
+planning**, so no tokens are spent, while a warning prints but does not abort.
+`--fail-fast` (or `doctor.failFast: true`) stops at the first failure. The
+latest result is stored under `/tmp` and surfaced by `--status`.
 
 ## Setup (zero install after first run)
 
