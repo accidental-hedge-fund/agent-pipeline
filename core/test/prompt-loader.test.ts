@@ -1452,6 +1452,34 @@ test("fix prompt: rendered prompt contains no unfilled {{placeholder}} on either
   assert.doesNotMatch(buildSampleFixPrompt(), /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders on the freeform path");
 });
 
+// #391: does-not-reproduce drift test — bites when the sanctioned outcome is
+// removed from fix.md, and asserts the rendered prompt embeds the reviewed SHA
+// (no unfilled placeholder either with or without a supplied reviewedSha).
+test("fix prompt: does-not-reproduce outcome names the sentinel shape and the reviewed SHA (#391)", () => {
+  const sha = "c".repeat(40);
+  const out = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 391,
+    title: "No-op dead-end recovery",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "391/r",
+    reviewedSha: sha,
+  });
+  assert.match(out, /does not reproduce/i, "fix prompt must name the does-not-reproduce outcome");
+  assert.match(
+    out,
+    /pipeline-does-not-reproduce/,
+    "fix prompt must instruct the harness to emit the pipeline-does-not-reproduce sentinel",
+  );
+  assert.ok(out.includes(sha), "fix prompt must embed the exact reviewed SHA the declaration must match");
+  assert.match(out, /override-key/, "fix prompt must tell the harness to use the finding's override-key");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is supplied");
+
+  const withoutSha = buildSampleFixPrompt();
+  assert.doesNotMatch(withoutSha, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is omitted");
+});
+
 test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {
   // Regression for the round-5 finding: a budget loop that appends later compact
   // sections first could consume the budget and leave a large early cap-crossing

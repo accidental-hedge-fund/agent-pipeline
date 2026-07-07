@@ -346,8 +346,13 @@ export function findingPayloadFingerprint(f: ReviewFinding): string {
  * - file: `normalizeFile(finding.file)` equals the scope value OR begins with
  *   `scopeValue + "/"` (directory-boundary-aware prefix, #229).
  *   A finding without a file does NOT match.
+ *
+ * Accepts `Pick<ReviewFinding, "category" | "file">` (not the full type) so
+ * callers that only have a partial finding reconstructed from rendered review
+ * text (e.g. the fix-stage override pre-filter, #391) can reuse this single
+ * identity implementation instead of re-deriving the match rule.
  */
-function matchFindingScope(f: ReviewFinding, s: ScopedOverride): boolean {
+export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s: ScopedOverride): boolean {
   if (s.type === "category") {
     const cat = (f.category ?? "").toLowerCase().trim();
     return cat !== "" && cat === s.value;
@@ -643,6 +648,73 @@ export function scopedOverrideComment(args: {
     "",
     `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${safeReason} -->`,
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Non-reproducing disposition (#391) — SHA-anchored, machine-authored, weaker
+// than an operator override. Recorded when the fix harness declares a blocking
+// finding does not reproduce at the reviewed SHA (see fix.ts's does-not-reproduce
+// declaration parsing) so a later fix/review re-entry at the SAME SHA does not
+// reproduce the "reported success but produced no new commits" dead-end.
+// ---------------------------------------------------------------------------
+
+const NON_REPRODUCING_HEADING = "## Pipeline: Finding does not reproduce";
+const NON_REPRODUCING_RE = /^<!-- pipeline-non-reproducing: ([0-9a-f]{8}) ([0-9a-fA-F]{40}) -->$/m;
+
+/**
+ * The audited non-reproducing disposition comment (#391). Distinct heading and
+ * sentinel from `overrideComment` — this disposition is machine-authored and
+ * SHA-anchored, never an unconditional human clearance.
+ */
+export function nonReproducingDispositionComment(args: {
+  key: string;
+  reviewedSha: string;
+  stage: string;
+  justification: string;
+  timestamp: string;
+  footer?: string;
+}): string {
+  const { key, reviewedSha, stage, justification, timestamp, footer } = args;
+  return [
+    NON_REPRODUCING_HEADING,
+    "",
+    `**Finding**: \`${key}\``,
+    `**Reviewed SHA**: \`${reviewedSha}\``,
+    `**Stage**: ${stage}`,
+    `**Recorded at**: ${timestamp}`,
+    "",
+    "### Justification (fix harness)",
+    justification,
+    "",
+    "This disposition is machine-authored and SHA-anchored: it is consulted only " +
+      "while the reviewed SHA is unchanged. A new commit re-opens the finding for review.",
+    "",
+    (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
+    "",
+    `<!-- pipeline-non-reproducing: ${key} ${reviewedSha} -->`,
+  ].join("\n");
+}
+
+/**
+ * Collect active non-reproducing dispositions from trusted-author comments as
+ * key → reviewed SHA (the SHA the disposition is anchored to). A later
+ * disposition for the same key wins. Callers MUST pre-filter `comments` to
+ * trusted authors (e.g. via `buildTrustedOverrideComments`) before calling —
+ * mirrors the trust model of `extractOverrides`.
+ *
+ * Security invariants (parallel to extractOverrides):
+ * 1. Only comments with the `## Pipeline: Finding does not reproduce` heading are processed.
+ * 2. Only the last non-empty line is parsed as the machine sentinel.
+ */
+export function extractNonReproducingDispositions(comments: { body: string }[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const c of comments) {
+    if (!c.body.startsWith(NON_REPRODUCING_HEADING)) continue;
+    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    const m = NON_REPRODUCING_RE.exec(lastLine);
+    if (m) map.set(m[1], m[2]);
+  }
+  return map;
 }
 
 /**

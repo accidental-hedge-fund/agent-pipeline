@@ -49,6 +49,18 @@ This self-check is a targeted scan of your own changes against the findings you 
 
 Any code path you add or modify that calls an external CLI or API (`gh`, `git`, network, auth) MUST go through an injectable dep — never call the module-level function directly when a seam already exists on the `Deps` type. If no seam exists, add one. Tests that only pass because local auth is active are NOT passing tests — they will fail in CI. Every new or modified test must cover the unauthenticated/no-network path and prove it fails without the injected fake.
 
+## Does-Not-Reproduce Outcome (if applicable)
+
+If an assigned blocking finding does NOT reproduce at the reviewed SHA `{{reviewed_sha}}` — for example it is a tooling artifact, a false positive, or the condition it describes does not exist in the code — do NOT silently skip it, and do NOT commit a no-op change to work around it. Instead, declare it using the finding's `override-key` (shown above each finding) by emitting exactly one line per non-reproducing finding, formatted precisely as:
+
+    <!-- pipeline-does-not-reproduce: <override-key> {{reviewed_sha}} | <one-line justification> -->
+
+Rules for this declaration:
+- The reviewed SHA in the declaration MUST be exactly `{{reviewed_sha}}` — a declaration against any other SHA is ignored.
+- The justification MUST be a single line (no line breaks) explaining why the finding does not reproduce.
+- Emit one declaration per non-reproducing finding. You may still commit fixes for the other assigned findings in the same round.
+- This is a distinct, sanctioned outcome from silently making no change — the pipeline recognizes a valid declaration and does NOT treat it as a failed fix round.
+
 ## Review Findings
 
 {{review_findings}}

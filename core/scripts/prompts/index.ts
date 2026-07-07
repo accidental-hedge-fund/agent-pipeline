@@ -353,6 +353,13 @@ export interface BuildFixArgs {
   pipelineRunId: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
+  /**
+   * The worktree HEAD this fix round is evaluating — the reviewed SHA the
+   * harness must exactly match in a does-not-reproduce declaration (#391).
+   * Optional: falls back to a descriptive placeholder in tests that don't
+   * exercise the declaration instruction.
+   */
+  reviewedSha?: string;
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
@@ -367,6 +374,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     pipeline_run_id: a.pipelineRunId,
     spec_context: specContextSection(a.specContext),
     spec_revision_instruction: fixSpecRevisionInstruction(a.specContext),
+    reviewed_sha: a.reviewedSha ?? "(unknown — no reviewed SHA supplied)",
   });
 }
 
