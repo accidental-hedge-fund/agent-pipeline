@@ -25,6 +25,16 @@ interface CmdLike {
   getOptionValueSource(key: string): string | undefined;
 }
 
+/**
+ * Flags injected by the host layer (e.g. the wrapper's unconditional
+ * `--profile` injection) rather than chosen per-command. These are tolerated
+ * on every registered command regardless of `allowedFlags`, so a profile-free
+ * command invoked through the host wrapper is not rejected. This is the single
+ * authoritative source for that exemption — do not add `profile` to individual
+ * `allowedFlags` sets instead.
+ */
+export const UNIVERSAL_FLAGS: Set<string> = new Set(["profile"]);
+
 export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // Default/numeric path — accepts every flag so new global flags work automatically.
   advance: {
@@ -283,5 +293,10 @@ export function validateFlags(entry: CommandEntry, cmd: CmdLike): string[] {
   const allowed = entry.allowedFlags;
   return cmd.options
     .map((o) => o.attributeName())
-    .filter((key) => !allowed.has(key) && cmd.getOptionValueSource(key) === "cli");
+    .filter(
+      (key) =>
+        !allowed.has(key) &&
+        !UNIVERSAL_FLAGS.has(key) &&
+        cmd.getOptionValueSource(key) === "cli",
+    );
 }
