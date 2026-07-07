@@ -16,6 +16,7 @@ import {
   COMMAND_REGISTRY,
   lookupCommand,
   validateFlags,
+  UNIVERSAL_FLAGS,
   type CommandEntry,
 } from "../scripts/command-registry.ts";
 import { buildCmd } from "../scripts/pipeline.ts";
@@ -239,4 +240,50 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.ok(entry !== null);
   assert.equal(entry, COMMAND_REGISTRY.cleanup);
   assert.equal(entry.needsIssueNumber, false);
+});
+
+// ---------------------------------------------------------------------------
+// 2.10  UNIVERSAL_FLAGS: host-injected --profile tolerated on every command (#383)
+// ---------------------------------------------------------------------------
+
+test("command-registry: UNIVERSAL_FLAGS contains 'profile'", () => {
+  assert.ok(
+    UNIVERSAL_FLAGS.has("profile"),
+    "UNIVERSAL_FLAGS must contain 'profile' so the host-injected flag is tolerated everywhere",
+  );
+});
+
+// Mirrors hosts/_shared/entry.template.mjs: `[...passthrough, "--profile", PROFILE]`.
+// The wrapper injects --profile into every invocation unless the caller already
+// passed one, regardless of whether the target command declares it.
+const PROFILE_FREE_COMMANDS = ["refine-spec", "scoreboard", "release"];
+
+for (const keyword of PROFILE_FREE_COMMANDS) {
+  test(`command-registry: wrapper-injected --profile is tolerated on '${keyword}' (does not reject on profile)`, () => {
+    const entry = COMMAND_REGISTRY[keyword];
+    assert.ok(entry, `expected a registry entry for "${keyword}"`);
+    assert.notEqual(
+      entry.allowedFlags,
+      "all",
+      `"${keyword}" should have an explicit allowedFlags set for this test to be meaningful`,
+    );
+    assert.equal(
+      (entry.allowedFlags as Set<string>).has("profile"),
+      false,
+      `"${keyword}" should not need to declare "profile" in allowedFlags — UNIVERSAL_FLAGS covers it`,
+    );
+    const cmd = fakeCmdWithCliFlag("profile");
+    const offending = validateFlags(entry, cmd);
+    assert.deepEqual(
+      offending,
+      [],
+      `wrapper-injected --profile must not be reported as offending for "${keyword}"`,
+    );
+  });
+}
+
+test("command-registry: a genuinely unsupported flag on a profile-free command is still rejected", () => {
+  const entry = COMMAND_REGISTRY.scoreboard;
+  const cmd = fakeCmdWithCliFlag("bogus");
+  assert.deepEqual(validateFlags(entry, cmd), ["bogus"]);
 });
