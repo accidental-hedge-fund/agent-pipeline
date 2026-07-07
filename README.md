@@ -10,34 +10,6 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 `ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and never presses merge.
 
-```mermaid
-flowchart LR
-    backlog(["backlog<br/>triage queue"]) --> ready(["ready<br/>entry"])
-    ready --> planning["planning<br/>agent worktree + plan"]
-    planning --> planReview["plan-review<br/>human gate"]
-    planReview --> implementing["implementing<br/>agent + test gates"]
-
-    subgraph boundedLoop["bounded loop: severity-gated, recurrence-guarded, capped rounds"]
-        implementing --> review1["review-1<br/>standard reviewer"]
-        review1 -->|blocking findings| fix1["fix-1<br/>surgical diff"]
-        fix1 --> review2["review-2<br/>adversarial reviewer"]
-        review1 -->|approved / advisory only| review2
-        review2 -->|blocking findings| fix2["fix-2<br/>final fix if needed"]
-        fix2 --> preMerge["pre-merge<br/>CI + conflicts + archive"]
-        review2 -->|approved / advisory only| preMerge
-    end
-
-    preMerge --> evalGate["eval-gate<br/>optional suite"]
-    evalGate --> shipcheckGate["shipcheck-gate<br/>reviewer rubric"]
-    shipcheckGate --> readyToDeploy(["ready-to-deploy<br/>terminal stop"])
-
-    review1 -. round ceiling / recurrence .-> manualStop(["blocked / needs-human<br/>manual off-ramp"])
-    review2 -. round ceiling / recurrence .-> manualStop
-    preMerge -. unrecoverable gate .-> manualStop
-    evalGate -. gate failure .-> manualStop
-    shipcheckGate -. gate failure .-> manualStop
-```
-
 | Band | What happens |
 | --- | --- |
 | Spec before code | `planning` writes the implementation plan/spec, and `plan-review` is the human sign-off before implementation starts. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
