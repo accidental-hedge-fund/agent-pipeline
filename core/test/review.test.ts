@@ -37,7 +37,7 @@ import {
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
-import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
+import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -538,6 +538,7 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
 
 const NA_ZERO = '{"verdict":"needs-attention","summary":"vague","findings":[],"next_steps":[]}';
 const APPROVE = '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}';
+const NA_WITH_FINDING_OBJ = { severity: "high", title: "bug", body: "b", confidence: 0.8, recommendation: "fix it" };
 const NA_WITH_FINDING =
   '{"verdict":"needs-attention","summary":"one issue","findings":' +
   '[{"severity":"high","title":"bug","body":"b","confidence":0.8,"recommendation":"fix it"}],' +
@@ -792,6 +793,7 @@ test("advanceReview (#391 review-2 finding 7b965502): a SHA-anchored non-reprodu
         body: nonReproducingDispositionComment({
           key,
           reviewedSha: sha,
+          fingerprint: findingPayloadFingerprint(NA_WITH_FINDING_OBJ),
           stage: "fix-2",
           justification: "tooling artifact, does not reproduce",
           timestamp: "2026-01-01T00:00:00Z",
@@ -829,6 +831,7 @@ test("advanceReview (#391): a non-reproducing disposition anchored to a stale SH
         body: nonReproducingDispositionComment({
           key,
           reviewedSha: staleSha,
+          fingerprint: findingPayloadFingerprint(NA_WITH_FINDING_OBJ),
           stage: "fix-2",
           justification: "tooling artifact, does not reproduce",
           timestamp: "2026-01-01T00:00:00Z",

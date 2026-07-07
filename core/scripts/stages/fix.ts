@@ -21,6 +21,7 @@ import {
   extractNonReproducingDispositions,
   extractOverrides,
   extractScopedOverrides,
+  findingPayloadFingerprint,
   matchFindingScope,
   nonReproducingDispositionComment,
   type ScopedOverride,
@@ -506,13 +507,20 @@ export async function advanceFix(
         const dnrDecision = decideDoesNotReproduceAdvance(invokedBlockingKeys, declarations, headAfter, round);
         if (dnrDecision.advance) {
           const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          // Recompute the finding payload fingerprint from the same triggering
+          // review body used to derive invokedBlockingKeys, so the disposition
+          // records a full-payload signature (#391 review-1 finding 5805b17e),
+          // not just the coarse key.
+          const declSummaries = parseFindingSummaries(reviewBody);
           for (const decl of dnrDecision.covered.values()) {
+            const fingerprint = declSummaries.find((s) => s.key === decl.key)?.fingerprint ?? "";
             await postComment(
               cfg,
               issueNumber,
               nonReproducingDispositionComment({
                 key: decl.key,
                 reviewedSha: decl.reviewedSha,
+                fingerprint,
                 stage,
                 justification: decl.justification,
                 timestamp,
@@ -851,6 +859,9 @@ const PK_MARKER = "\n<!-- pipeline-blocking-keys:";
 const OVERRIDE_KEY_RE = /`override-key: ([0-9a-f]{8})`/;
 const CATEGORY_MARKER_RE = /`category: ([^`]+)`/;
 const LOCATION_LINE_RE = /^Location: `(.+)`$/m;
+// Mirrors formatReviewComment's heading render: `**N. [SEV] title**...`.
+const TITLE_LINE_RE = /^\*\*\d+\.\s*\[[A-Z]+\]\s*(.+?)\*\*/;
+const RECOMMENDATION_LINE_RE = /^\*\*Recommendation\*\*: (.+)$/;
 
 interface SplitFindingsSection {
   beforeFindings: string;
@@ -1029,19 +1040,58 @@ export function extractBlockingReviewFindings(
 
 /** Minimal per-finding identity fields recoverable from rendered review-comment
  *  text: the finding's stable key (`override-key`), and — when present — its
- *  category marker and location file, used for scope-override matching. */
+ *  category marker and location file, used for scope-override matching. The
+ *  `fingerprint` field mirrors `findingPayloadFingerprint` (#391 review-1
+ *  finding 5805b17e) — reconstructed from the block's title/body/recommendation/
+ *  line range — so a non-reproducing disposition can be matched on full payload,
+ *  not just the coarse `key`. */
 export interface FindingSummary {
   key: string;
   category: string | null;
   file: string | null;
+  fingerprint: string;
 }
 
 /**
- * Recover `{ key, category, file }` for every finding block in a rendered
- * review comment body (#391). Findings without an `override-key` token are
- * skipped (cannot be identified). Used to match blocking findings against
- * active overrides/dispositions without re-deriving `findingKey` from scratch —
- * the key is already embedded verbatim by `formatReviewComment`.
+ * Recover `{ title, body, recommendation, lineStart, lineEnd }` for a single
+ * finding block, mirroring formatReviewComment's exact render order (heading,
+ * optional Location line, body, optional Recommendation line) so the fields
+ * feed back into `findingPayloadFingerprint` identically to how the live
+ * `ReviewFinding` would (#391 review-1 finding 5805b17e).
+ */
+function parseFindingBlockPayload(block: string): {
+  title: string;
+  body: string;
+  recommendation: string | undefined;
+  lineStart: number | undefined;
+  lineEnd: number | undefined;
+} {
+  const lines = block.split("\n");
+  const title = TITLE_LINE_RE.exec(lines[0] ?? "")?.[1] ?? "";
+  let idx = 1;
+  let lineStart: number | undefined;
+  let lineEnd: number | undefined;
+  const locMatch = lines[idx] ? LOCATION_LINE_RE.exec(lines[idx]) : null;
+  if (locMatch) {
+    const rangeMatch = locMatch[1].match(/^(.*):(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      lineStart = Number(rangeMatch[2]);
+      lineEnd = Number(rangeMatch[3]);
+    }
+    idx++;
+  }
+  const recIdx = lines.findIndex((l, i) => i >= idx && RECOMMENDATION_LINE_RE.test(l));
+  const bodyLines = recIdx === -1 ? lines.slice(idx) : lines.slice(idx, recIdx);
+  const recommendation = recIdx === -1 ? undefined : RECOMMENDATION_LINE_RE.exec(lines[recIdx])?.[1];
+  return { title, body: bodyLines.join("\n").trim(), recommendation, lineStart, lineEnd };
+}
+
+/**
+ * Recover `{ key, category, file, fingerprint }` for every finding block in a
+ * rendered review comment body (#391). Findings without an `override-key`
+ * token are skipped (cannot be identified). Used to match blocking findings
+ * against active overrides/dispositions without re-deriving `findingKey` from
+ * scratch — the key is already embedded verbatim by `formatReviewComment`.
  */
 export function parseFindingSummaries(body: string): FindingSummary[] {
   const split = splitFindingsSection(body);
@@ -1059,7 +1109,15 @@ export function parseFindingSummaries(body: string): FindingSummary[] {
       const rangeMatch = locText.match(/^(.*):(\d+)-(\d+)$/);
       file = (rangeMatch ? rangeMatch[1] : locText) || null;
     }
-    summaries.push({ key, category, file });
+    const payload = parseFindingBlockPayload(block);
+    const fingerprint = findingPayloadFingerprint({
+      title: payload.title,
+      body: payload.body,
+      recommendation: payload.recommendation,
+      line_start: payload.lineStart,
+      line_end: payload.lineEnd,
+    });
+    summaries.push({ key, category, file, fingerprint });
   }
   return summaries;
 }
@@ -1088,7 +1146,10 @@ export interface OverridePreFilterResult {
  *
  * A non-reproducing disposition only dispositions a finding when
  * `reviewedShaAtEntry` is non-null and equals the SHA the disposition was
- * recorded against — a stale disposition (recorded at a since-superseded SHA)
+ * recorded against, AND the disposition's recorded payload fingerprint equals
+ * the summary's `fingerprint` (#391 review-1 finding 5805b17e) — the coarse
+ * `key` alone cannot distinguish a different finding in the same bucket at the
+ * same SHA. A stale disposition (superseded SHA or mismatched fingerprint)
  * does not apply, and the finding is evaluated afresh.
  */
 export function computeEffectiveBlockingSet(
@@ -1096,7 +1157,7 @@ export function computeEffectiveBlockingSet(
   summaries: FindingSummary[],
   overrides: Map<string, string>,
   scopes: ScopedOverride[],
-  nonReproducing: Map<string, string>,
+  nonReproducing: Map<string, { sha: string; fingerprint: string }>,
   reviewedShaAtEntry: string | null,
 ): OverridePreFilterResult {
   const effectiveKeys = new Set(blockingKeys);
@@ -1122,8 +1183,11 @@ export function computeEffectiveBlockingSet(
       continue;
     }
 
-    const nonReproSha = nonReproducing.get(s.key);
-    if (reviewedShaAtEntry && nonReproSha === reviewedShaAtEntry) {
+    const nonRepro = nonReproducing.get(s.key);
+    if (
+      reviewedShaAtEntry && nonRepro && nonRepro.sha === reviewedShaAtEntry &&
+      nonRepro.fingerprint === s.fingerprint
+    ) {
       effectiveKeys.delete(s.key);
       dispositions.push({
         key: s.key,

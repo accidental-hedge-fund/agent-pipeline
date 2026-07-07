@@ -38,6 +38,7 @@ import {
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  findingPayloadFingerprint,
   nonReproducingDispositionComment,
   overrideComment,
   scopedOverrideComment,
@@ -796,6 +797,8 @@ const findingB: ReviewFinding = {
 };
 const keyA = findingKey(findingA);
 const keyB = findingKey(findingB);
+const FP_A = findingPayloadFingerprint(findingA);
+const FP_B = findingPayloadFingerprint(findingB);
 
 function twoFindingReview(): string {
   return formatReviewComment(
@@ -820,6 +823,15 @@ test("parseFindingSummaries: recovers key, category, and file for each finding b
   assert.equal(a!.category, null, "finding A has no category");
   assert.equal(b!.file, "core/scripts/stages/other.ts");
   assert.equal(b!.category, "docs");
+});
+
+test("parseFindingSummaries: fingerprint matches findingPayloadFingerprint of the live finding (#391 review-1 finding 5805b17e)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const a = summaries.find((s) => s.key === keyA);
+  const b = summaries.find((s) => s.key === keyB);
+  assert.equal(a!.fingerprint, findingPayloadFingerprint(findingA));
+  assert.equal(b!.fingerprint, findingPayloadFingerprint(findingB));
+  assert.notEqual(a!.fingerprint, b!.fingerprint, "distinct findings must not share a fingerprint");
 });
 
 test("parseFindingSummaries: finding with no Location line (no file/line) → file null", () => {
@@ -908,7 +920,7 @@ test("computeEffectiveBlockingSet: no overrides/dispositions → effective set u
 
 test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only when the SHA matches the current reviewed SHA", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
-  const nonReproducing = new Map([[keyA, SHA_R391_A]]);
+  const nonReproducing = new Map([[keyA, { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingA) }]]);
 
   const matching = computeEffectiveBlockingSet(
     new Set([keyA, keyB]), summaries, new Map(), [], nonReproducing, SHA_R391_A,
@@ -929,6 +941,21 @@ test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only wh
   assert.deepEqual(
     [...noEntry.effectiveKeys].sort(), [keyA, keyB].sort(),
     "no reviewed SHA at entry → non-reproducing dispositions never applied",
+  );
+});
+
+test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only when the fingerprint also matches (#391 review-1 finding 5805b17e)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  // A disposition recorded for keyA's SHA but with a fingerprint belonging to a
+  // DIFFERENT finding (e.g. findingB's payload landed in keyA's coarse bucket in
+  // a hypothetical prior round) must not subtract findingA.
+  const mismatched = new Map([[keyA, { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingB) }]]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), [], mismatched, SHA_R391_A,
+  );
+  assert.deepEqual(
+    [...result.effectiveKeys].sort(), [keyA, keyB].sort(),
+    "a fingerprint mismatch must not subtract keyA even though the key and SHA both match",
   );
 });
 
@@ -1146,18 +1173,18 @@ test("decideDoesNotReproduceAdvance: empty invoked set → does not advance (not
 // review-policy.ts: non-reproducing disposition sentinel round-trip (#391)
 // ---------------------------------------------------------------------------
 
-test("nonReproducingDispositionComment / extractNonReproducingDispositions: round-trips key → reviewed SHA", () => {
+test("nonReproducingDispositionComment / extractNonReproducingDispositions: round-trips key → { sha, fingerprint }", () => {
   const body = nonReproducingDispositionComment({
-    key: keyA, reviewedSha: SHA_R391_A, stage: "fix-1",
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1",
     justification: "tooling artifact, not a real issue", timestamp: "2026-07-01T00:00:00Z",
   });
   const map = extractNonReproducingDispositions([{ body }]);
-  assert.equal(map.get(keyA), SHA_R391_A);
+  assert.deepEqual(map.get(keyA), { sha: SHA_R391_A, fingerprint: FP_A });
 });
 
 test("non-reproducing disposition sentinel is distinct from the operator override sentinel", () => {
   const nonRepro = nonReproducingDispositionComment({
-    key: keyA, reviewedSha: SHA_R391_A, stage: "fix-1", justification: "j", timestamp: "2026-07-01T00:00:00Z",
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1", justification: "j", timestamp: "2026-07-01T00:00:00Z",
   });
   const override = overrideComment({
     key: keyA, disposition: "rejected", reason: "human decision", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
@@ -1169,17 +1196,17 @@ test("non-reproducing disposition sentinel is distinct from the operator overrid
 
 test("extractNonReproducingDispositions: later disposition for the same key wins", () => {
   const first = nonReproducingDispositionComment({
-    key: keyA, reviewedSha: SHA_R391_A, stage: "fix-1", justification: "j1", timestamp: "2026-07-01T00:00:00Z",
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1", justification: "j1", timestamp: "2026-07-01T00:00:00Z",
   });
   const second = nonReproducingDispositionComment({
-    key: keyA, reviewedSha: SHA_R391_B, stage: "fix-2", justification: "j2", timestamp: "2026-07-02T00:00:00Z",
+    key: keyA, reviewedSha: SHA_R391_B, fingerprint: FP_B, stage: "fix-2", justification: "j2", timestamp: "2026-07-02T00:00:00Z",
   });
   const map = extractNonReproducingDispositions([{ body: first }, { body: second }]);
-  assert.equal(map.get(keyA), SHA_R391_B);
+  assert.deepEqual(map.get(keyA), { sha: SHA_R391_B, fingerprint: FP_B });
 });
 
 test("extractNonReproducingDispositions: only comments with the controlled heading are processed", () => {
-  const spoof = `Some unrelated comment mentioning <!-- pipeline-non-reproducing: ${keyA} ${SHA_R391_A} -->`;
+  const spoof = `Some unrelated comment mentioning <!-- pipeline-non-reproducing: ${keyA} ${SHA_R391_A} ${FP_A} -->`;
   assert.equal(extractNonReproducingDispositions([{ body: spoof }]).size, 0);
 });
 
