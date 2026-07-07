@@ -4,18 +4,29 @@
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
-```text
-backlog → ready → planning → plan-review → implementing
-              → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
-```
+## Lifecycle
 
-`ready` is the queue/opt-in entry point. Once a run starts, long-running work is
-labelled and recorded under the concrete stages that are doing it: `planning`,
-`plan-review`, and `implementing`.
+![agent-pipeline state machine — ready → deploy-ready, no human writes the code](docs/assets/state-machine.png)
+
+`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and never presses merge.
+
+| Band | What happens |
+| --- | --- |
+| Spec before code | `planning` writes the implementation plan/spec, and `plan-review` is the human sign-off before implementation starts. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
+| Structured review | Reviewers emit findings with severity, confidence, and file/line context. The same review input should lead to the same advance/block decision, not a model coin flip. |
+| Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
+| Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
+| Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `eval-gate` can run a repo-defined suite such as Playwright or visual checks. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
+| Human merge | `ready-to-deploy` is terminal for the autonomous loop. A human owns the merge button. |
+
+| Naive AI loop | agent-pipeline lifecycle |
+| --- | --- |
+| `prompt -> code -> merge` | `plan -> build -> review/fix -> gated stop` |
+| Unreviewed, unbounded, opaque | Reviewed, bounded, audited, human-gated |
 
 ## Contents
 
+- [Lifecycle](#lifecycle)
 - [Prerequisites](#prerequisites)
 - [Quickstart](#quickstart)
 - [Install](#install)
