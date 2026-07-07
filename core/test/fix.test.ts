@@ -1150,7 +1150,7 @@ test("decideDoesNotReproduceAdvance: round 1, all invoked findings validly decla
     { key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j1" },
     { key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j2" },
   ];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA, keyB]), summaries, decls, SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => [keyA, keyB].includes(x.key)), decls, SHA_R391_A, 1);
   assert.equal(decision.advance, true);
   assert.ok(decision.advance && decision.to === "review-2");
   assert.ok(decision.advance && decision.covered.size === 2);
@@ -1159,7 +1159,7 @@ test("decideDoesNotReproduceAdvance: round 1, all invoked findings validly decla
 test("decideDoesNotReproduceAdvance: round 2, all invoked findings validly declared → advances to pre-merge", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
   const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j1" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), summaries, decls, SHA_R391_A, 2);
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A, 2);
   assert.equal(decision.advance, true);
   assert.ok(decision.advance && decision.to === "pre-merge");
 });
@@ -1167,7 +1167,7 @@ test("decideDoesNotReproduceAdvance: round 2, all invoked findings validly decla
 test("decideDoesNotReproduceAdvance: declaration key outside the invoked set is ignored → does not advance", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
   const decls = [{ key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), summaries, decls, SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A, 1);
   assert.equal(decision.advance, false);
   assert.ok(!decision.advance && decision.missing.has(keyA));
 });
@@ -1175,7 +1175,7 @@ test("decideDoesNotReproduceAdvance: declaration key outside the invoked set is 
 test("decideDoesNotReproduceAdvance: declaration SHA not equal to current HEAD is ignored → does not advance", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
   const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_B, justification: "j" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), summaries, decls, SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A, 1);
   assert.equal(decision.advance, false);
   assert.ok(!decision.advance && decision.missing.has(keyA));
 });
@@ -1183,13 +1183,13 @@ test("decideDoesNotReproduceAdvance: declaration SHA not equal to current HEAD i
 test("decideDoesNotReproduceAdvance: partial coverage → does not advance (fail closed)", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
   const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA, keyB]), summaries, decls, SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => [keyA, keyB].includes(x.key)), decls, SHA_R391_A, 1);
   assert.equal(decision.advance, false);
   assert.ok(!decision.advance && decision.missing.size === 1 && decision.missing.has(keyB));
 });
 
 test("decideDoesNotReproduceAdvance: empty invoked set → does not advance (nothing to cover)", () => {
-  const decision = decideDoesNotReproduceAdvance(new Set(), [], [], SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance([], [], SHA_R391_A, 1);
   assert.equal(decision.advance, false);
 });
 
@@ -1220,7 +1220,7 @@ test("decideDoesNotReproduceAdvance: a key shared by two distinct findings requi
 
   // Only collideA's fingerprint declared → collideB still uncovered.
   const partial = decideDoesNotReproduceAdvance(
-    new Set([sharedKey]), summaries,
+    summaries,
     [{ key: sharedKey, fingerprint: fpA, reviewedSha: sha, justification: "j" }],
     sha, 1,
   );
@@ -1228,7 +1228,7 @@ test("decideDoesNotReproduceAdvance: a key shared by two distinct findings requi
 
   // Both fingerprints declared → fully covered, advances.
   const full = decideDoesNotReproduceAdvance(
-    new Set([sharedKey]), summaries,
+    summaries,
     [
       { key: sharedKey, fingerprint: fpA, reviewedSha: sha, justification: "j" },
       { key: sharedKey, fingerprint: fpB, reviewedSha: sha, justification: "j" },
@@ -1305,7 +1305,7 @@ test("advanceFix source pin: the all-dispositioned skip-advance return precedes 
 
 test("advanceFix source pin: the does-not-reproduce carve-out is checked before the no-commits block", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedBlockingKeys,");
+  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedIdentities,");
   const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
   assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
   assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
@@ -1433,5 +1433,84 @@ test("filterUnambiguousDeclarations: drops a declaration whose unique summary ha
   ];
   const decl = { key: "aaaabbbb", fingerprint: "0123456789abcdef", reviewedSha: "a".repeat(40), justification: "j" };
   assert.deepEqual(filterUnambiguousDeclarations([decl], summaries), []);
+});
+
+// #391 pre-merge delta, key 5a435224: when one of two colliding-key findings
+// already has a matching non-reproducing disposition, the effective scope
+// must carry ONLY the remaining identity — the advance decision then requires
+// a declaration for that identity alone. The pre-fix key-set rebuild pulled
+// the dispositioned sibling back into the required set, so a correct
+// declaration for the remaining finding still failed closed (the dead-end
+// this issue exists to remove).
+test("identity scope end-to-end: dispositioned colliding sibling stays out of the required set → remaining declaration advances", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  assert.equal(sharedKey, findingKey(collideB), "precondition: colliding keys");
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const fpA = findingPayloadFingerprint(collideA);
+  const fpB = findingPayloadFingerprint(collideB);
+  const sha = "a".repeat(40);
+
+  // Prior fix round dispositioned collideA at this SHA.
+  const preFilter = computeEffectiveBlockingSet(
+    new Set([sharedKey]), summaries, new Map(), [],
+    new Map([[sharedKey, [{ sha, fingerprint: fpA }]]]), sha,
+  );
+  assert.equal(preFilter.effectiveSummaries.length, 1, "only the undispositioned sibling remains in scope");
+  assert.equal(preFilter.effectiveSummaries[0].fingerprint, fpB);
+  assert.ok(preFilter.effectiveKeys.has(sharedKey), "the key stays effective while a sibling is actionable");
+
+  // The harness declares ONLY the remaining finding non-reproducing → advance.
+  const decision = decideDoesNotReproduceAdvance(
+    preFilter.effectiveSummaries,
+    [{ key: sharedKey, fingerprint: fpB, reviewedSha: sha, justification: "j" }],
+    sha, 1,
+  );
+  assert.equal(
+    decision.advance, true,
+    "a declaration covering exactly the post-disposition scope must advance — the dispositioned sibling is not required again",
+  );
+});
+
+test("computeEffectiveBlockingSet: all colliding identities dispositioned → key clears entirely", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const sha = "a".repeat(40);
+  const preFilter = computeEffectiveBlockingSet(
+    new Set([sharedKey]), summaries, new Map(), [],
+    new Map([[sharedKey, [
+      { sha, fingerprint: findingPayloadFingerprint(collideA) },
+      { sha, fingerprint: findingPayloadFingerprint(collideB) },
+    ]]]), sha,
+  );
+  assert.equal(preFilter.effectiveSummaries.length, 0);
+  assert.equal(preFilter.effectiveKeys.size, 0, "no actionable identity → key clears → skip-advance path applies");
 });
 

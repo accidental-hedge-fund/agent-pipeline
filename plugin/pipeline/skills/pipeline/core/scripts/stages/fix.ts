@@ -266,6 +266,7 @@ export async function advanceFix(
   const triggeringBlockingKeys = extractBlockingKeysMarker(reviewBody);
   let overriddenKeys = new Set<string>();
   let effectiveBlockingKeys: Set<string> | null = null;
+  let effectiveIdentities: FindingSummary[] | null = null;
   let overridePreFilterNotes: string[] = [];
   if (triggeringBlockingKeys && triggeringBlockingKeys.size > 0) {
     // #391 review-1 finding bbc7d244: only key/scope overrides recorded AFTER
@@ -287,6 +288,7 @@ export async function advanceFix(
       reviewedShaAtEntry,
     );
     effectiveBlockingKeys = preFilter.effectiveKeys;
+    effectiveIdentities = preFilter.effectiveSummaries;
     overriddenKeys = new Set(
       [...triggeringBlockingKeys].filter((k) => !preFilter.effectiveKeys.has(k)),
     );
@@ -340,6 +342,12 @@ export async function advanceFix(
   // when the triggering review carried no blocking-keys marker (legacy
   // comment): fail closed, no does-not-reproduce carve-out is possible.
   const invokedBlockingKeys = effectiveBlockingKeys ?? new Set<string>();
+  // The fingerprint-qualified counterpart of `invokedBlockingKeys` (#391
+  // delta, key 5a435224): the exact identities the fix round is scoped to,
+  // AFTER overrides and non-reproducing dispositions are removed. Empty for
+  // legacy comments with no blocking-keys marker — the does-not-reproduce
+  // carve-out then requires nothing and refuses (fail closed), as before.
+  const invokedIdentities = effectiveIdentities ?? [];
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would invoke ${harness} to fix findings`);
@@ -516,8 +524,7 @@ export async function advanceFix(
         const declSummaries = parseFindingSummaries(reviewBody);
         const unambiguous = filterUnambiguousDeclarations(declarations, declSummaries);
         const dnrDecision = decideDoesNotReproduceAdvance(
-          invokedBlockingKeys,
-          declSummaries,
+          invokedIdentities,
           unambiguous,
           headAfter,
           round,
@@ -1105,9 +1112,14 @@ export interface OverridePreFilterDisposition {
 }
 
 export interface OverridePreFilterResult {
-  /** The triggering blocking keys minus any dispositioned by an override or a
-   *  SHA-matching non-reproducing disposition. */
+  /** The triggering blocking keys minus any whose every identity is
+   *  dispositioned by an override or a SHA-matching non-reproducing
+   *  disposition. Derived from `effectiveSummaries` (#391 delta, 5a435224). */
   effectiveKeys: Set<string>;
+  /** The fingerprint-qualified identities that remain actionable — the
+   *  authoritative fix-round scope. Prefer this over `effectiveKeys` wherever
+   *  identities matter (the does-not-reproduce advance decision). */
+  effectiveSummaries: FindingSummary[];
   /** Human-readable audit lines, one per dispositioned key, in finding order. */
   dispositions: OverridePreFilterDisposition[];
 }
@@ -1139,8 +1151,8 @@ export function computeEffectiveBlockingSet(
   nonReproducing: Map<string, { sha: string; fingerprint: string }[]>,
   reviewedShaAtEntry: string | null,
 ): OverridePreFilterResult {
-  const effectiveKeys = new Set(blockingKeys);
   const dispositions: OverridePreFilterDisposition[] = [];
+  const effectiveSummaries: FindingSummary[] = [];
   for (const s of summaries) {
     if (!blockingKeys.has(s.key)) continue;
 
@@ -1148,7 +1160,6 @@ export function computeEffectiveBlockingSet(
       matchFindingScope({ category: s.category ?? undefined, file: s.file ?? undefined }, sc),
     );
     if (scope) {
-      effectiveKeys.delete(s.key);
       dispositions.push({
         key: s.key,
         note: `scope override \`${scope.type}:${scope.value}\` (${scope.disposition}): ${scope.reason}`,
@@ -1157,7 +1168,6 @@ export function computeEffectiveBlockingSet(
     }
 
     if (overrides.has(s.key)) {
-      effectiveKeys.delete(s.key);
       dispositions.push({ key: s.key, note: `override (${overrides.get(s.key)})` });
       continue;
     }
@@ -1171,14 +1181,24 @@ export function computeEffectiveBlockingSet(
         )
       : undefined;
     if (nonRepro) {
-      effectiveKeys.delete(s.key);
       dispositions.push({
         key: s.key,
         note: `declared non-reproducing at ${reviewedShaAtEntry.slice(0, 7)} by a prior fix round`,
       });
+      continue;
     }
+
+    effectiveSummaries.push(s);
   }
-  return { effectiveKeys, dispositions };
+  // Identity-level scope (#391 delta, key 5a435224): the effective scope IS
+  // the surviving identities. A coarse key stays effective while ANY of its
+  // colliding identities remains actionable, and clears only when every one
+  // is dispositioned — a Set<key> alone cannot express the partial case
+  // (one dispositioned sibling, one actionable), which previously either
+  // dropped the actionable sibling from scope or pulled the dispositioned
+  // one back into the required set.
+  const effectiveKeys = new Set(effectiveSummaries.map((s) => s.key));
+  return { effectiveKeys, effectiveSummaries, dispositions };
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,13 +1287,16 @@ export function filterUnambiguousDeclarations(
  * not advance.
  */
 export function decideDoesNotReproduceAdvance(
-  invokedBlockingKeys: Set<string>,
-  summaries: FindingSummary[],
+  invokedIdentities: FindingSummary[],
   declarations: DoesNotReproduceDeclaration[],
   currentHead: string,
   round: 1 | 2,
 ): DoesNotReproduceDecision {
-  const required = summaries.filter((s) => invokedBlockingKeys.has(s.key));
+  // The required set IS the caller's post-disposition invoked identities
+  // (#391 delta, key 5a435224) — never rebuilt from coarse keys, which pulled
+  // an already-dispositioned colliding sibling back into the requirement and
+  // recreated the no-op dead-end this carve-out exists to prevent.
+  const required = invokedIdentities;
   const covered = new Map<string, DoesNotReproduceDeclaration>();
   const missing = new Set<string>();
   for (const s of required) {
@@ -1288,7 +1311,7 @@ export function decideDoesNotReproduceAdvance(
       missing.add(s.key);
     }
   }
-  if (invokedBlockingKeys.size > 0 && required.length > 0 && missing.size === 0) {
+  if (required.length > 0 && missing.size === 0) {
     return { advance: true, to: round === 1 ? "review-2" : "pre-merge", covered };
   }
   return { advance: false, missing };
