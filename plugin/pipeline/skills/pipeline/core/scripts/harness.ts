@@ -202,6 +202,14 @@ function harnessOutcome(result: HarnessResult): string {
   return "failure";
 }
 
+/** Minimal shape of a stream-forward destination (#384, key 84c9859e) —
+ *  satisfied by `process.stdout`/`process.stderr` and by test fakes. */
+export interface ForwardStream {
+  write(text: string): unknown;
+  on(event: "error", listener: (err: Error) => void): unknown;
+  off(event: "error", listener: (err: Error) => void): unknown;
+}
+
 export async function runCapped(
   cmd: string,
   args: string[],
@@ -216,6 +224,11 @@ export async function runCapped(
     // errors mid-run without a real OS-level pipe fault. Defaults to the real
     // node:child_process spawn.
     spawnFn?: typeof spawn;
+    // Injectable forward-destination seam (#384 delta review, key 84c9859e):
+    // lets tests simulate the DOWNSTREAM side of the pipe — our own
+    // stdout/stderr (terminal-log tee, event-sink socket) — failing while the
+    // child command itself succeeds. Defaults to the real process streams.
+    forwardTo?: { stdout: ForwardStream; stderr: ForwardStream };
   } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
@@ -237,12 +250,51 @@ export async function runCapped(
     let lastExitCode: number | null = null;
     let settled = false;
 
+    // Downstream forward failures — OUR stdout/stderr breaking (terminal-log
+    // tee, event-sink socket), not the child's streams — are diagnostics,
+    // never test results: the gate outcome derives solely from the command
+    // exit code (#384 delta review, key 84c9859e). On the first failure stop
+    // forwarding (capture continues unaffected) and carry a one-line note in
+    // the result's stderr. Both delivery shapes are covered: a synchronous
+    // throw from write() and an asynchronous 'error' event on the stream.
+    const fwd = opts.forwardTo ?? { stdout: process.stdout, stderr: process.stderr };
+    let forwardBroken = false;
+    let forwardNote = "";
+    const onForwardError = (err: Error) => {
+      if (forwardBroken) return;
+      forwardBroken = true;
+      forwardNote =
+        `[harness ${label}] stream-forward error (diagnostic; command outcome unaffected): ${err.message}`;
+    };
+    if (stream) {
+      fwd.stdout.on("error", onForwardError);
+      fwd.stderr.on("error", onForwardError);
+    }
+    const safeForward = (dest: ForwardStream, text: string) => {
+      if (forwardBroken) return;
+      try {
+        dest.write(text);
+      } catch (err) {
+        onForwardError(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
     const settle = (result: HarnessResult) => {
       if (settled) return;
       settled = true;
       if (killProcessGroup) {
         process.removeListener("SIGINT", sigintHandler);
         process.removeListener("SIGTERM", sigtermHandler);
+      }
+      if (stream) {
+        fwd.stdout.off("error", onForwardError);
+        fwd.stderr.off("error", onForwardError);
+      }
+      if (forwardNote) {
+        result = {
+          ...result,
+          stderr: result.stderr ? `${result.stderr}\n${forwardNote}` : forwardNote,
+        };
       }
       resolvePromise(result);
     };
@@ -308,7 +360,7 @@ export async function runCapped(
         stdoutBuf += text;
         if (stdoutBuf.length > MAX_OUTPUT) stdoutBuf = stdoutBuf.slice(0, MAX_OUTPUT);
       }
-      if (stream) process.stdout.write(text);
+      if (stream) safeForward(fwd.stdout, text);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
@@ -316,7 +368,7 @@ export async function runCapped(
         stderrBuf += text;
         if (stderrBuf.length > MAX_OUTPUT) stderrBuf = stderrBuf.slice(0, MAX_OUTPUT);
       }
-      if (stream) process.stderr.write(text);
+      if (stream) safeForward(fwd.stderr, text);
     });
 
     // A capture stream erroring mid-run (e.g. the pipe breaking before the

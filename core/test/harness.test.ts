@@ -493,3 +493,65 @@ test("runCapped: a capture stream erroring mid-run resolves with capture_error, 
   assert.equal(result.success, false);
   assert.equal(result.spawn_error ?? false, false, "a capture-stream error is distinct from a spawn error");
 });
+
+// ---------------------------------------------------------------------------
+// forward-stream error (#384 delta review, key 84c9859e) — the DOWNSTREAM
+// side of the pipe (our own stdout/stderr: terminal-log tee, event-sink
+// socket) failing while the child command succeeds. Distinct from the
+// capture-stream case above: the child's streams are healthy, so the gate
+// result must stay tied to the command exit code — a sink write failure is a
+// diagnostic, never a failed attempt. Covers both delivery shapes: a
+// synchronous throw from write() and an asynchronous 'error' event.
+// ---------------------------------------------------------------------------
+
+for (const [shape, makeForwardStdout] of [
+  [
+    "write() throws synchronously",
+    () =>
+      Object.assign(new EventEmitter(), {
+        write: () => { throw new Error("EPIPE (simulated sink fault)"); },
+      }),
+  ],
+  [
+    "stream emits an asynchronous 'error'",
+    () => {
+      const s = Object.assign(new EventEmitter(), { write: () => true });
+      setImmediate(() => s.emit("error", new Error("EPIPE (simulated sink fault)")));
+      return s;
+    },
+  ],
+] as const) {
+  test(`runCapped: forward-stream failure (${shape}) with a passing command → success, exit 0, diagnostic only (#384 84c9859e)`, async () => {
+    const fakeChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      pid: 999999,
+      kill: () => true,
+    });
+    const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+    const forwardTo = {
+      stdout: makeForwardStdout() as never,
+      stderr: Object.assign(new EventEmitter(), { write: () => true }) as never,
+    };
+
+    setImmediate(() => {
+      fakeChild.stdout.emit("data", Buffer.from("tests: 10/10 passed\n"));
+      // Give the async 'error' shape a tick to deliver before the clean exit.
+      setImmediate(() => {
+        fakeChild.stdout.emit("data", Buffer.from("done\n"));
+        fakeChild.emit("close", 0);
+      });
+    });
+
+    const result = await runCapped("unused", [], tmpRoot, 30, true, "test", { spawnFn, forwardTo });
+
+    assert.equal(result.success, true, "a sink write failure must not convert a passing command into a failure");
+    assert.equal(result.exit_code, 0, "gate outcome derives solely from the command exit code");
+    assert.equal(result.capture_error ?? false, false, "sink faults are not capture errors — the child streams were healthy");
+    assert.ok(result.stdout.includes("tests: 10/10 passed"), "capture continues after the forward path breaks");
+    assert.ok(
+      result.stderr.includes("stream-forward error (diagnostic"),
+      "the sink fault is recorded as a diagnostic note",
+    );
+  });
+}
