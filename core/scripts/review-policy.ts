@@ -397,26 +397,28 @@ export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s
  * Scoped overrides bypass this guard by design (#229): a scope is explicitly
  * intended to match more than one finding.
  *
- * SHA-anchored non-reproducing disposition (#391): a finding whose key has a
- * recorded {@link extractNonReproducingDispositions} entry is treated like a
- * key override — same ambiguity guard — but ONLY when both `reviewedSha` (the
- * SHA this verdict was produced against) equals the disposition's recorded SHA
- * AND the finding's {@link findingPayloadFingerprint} equals the disposition's
- * recorded fingerprint (#391 review-1 finding 5805b17e). `findingKey` is
- * intentionally coarse (file + severity + 5-line band), so a key+SHA match
+ * SHA-anchored non-reproducing disposition (#391): a finding whose key has one
+ * or more recorded {@link extractNonReproducingDispositions} entries is
+ * treated like a key override — same ambiguity guard — but ONLY when at least
+ * one of those entries has both a `sha` equal to `reviewedSha` (the SHA this
+ * verdict was produced against) AND a `fingerprint` equal to the finding's
+ * {@link findingPayloadFingerprint} (#391 review-1 finding 5805b17e). `findingKey`
+ * is intentionally coarse (file + severity + 5-line band), so a key+SHA match
  * alone is not enough to prove it is the SAME finding — the fingerprint
  * requirement rules out a different finding that happens to land in the same
- * coarse bucket at the same SHA. A disposition recorded against a since-
- * superseded SHA, or whose fingerprint no longer matches, does not apply, so
- * the finding is evaluated afresh. Callers MUST pre-filter the source comments
- * to trusted authors before calling, mirroring the trust model of `overrides`.
+ * coarse bucket at the same SHA, and multiple dispositions are kept per key
+ * (#391 review-2 finding 53b23912) so a colliding finding's disposition is
+ * never lost. A disposition recorded against a since-superseded SHA, or whose
+ * fingerprint no longer matches, does not apply, so the finding is evaluated
+ * afresh. Callers MUST pre-filter the source comments to trusted authors
+ * before calling, mirroring the trust model of `overrides`.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
   policy: ReviewPolicy,
   overrides: Map<string, string> = new Map(),
   scopes: ScopedOverride[] = [],
-  nonReproducing: Map<string, { sha: string; fingerprint: string }> = new Map(),
+  nonReproducing: Map<string, { sha: string; fingerprint: string }[]> = new Map(),
   reviewedSha: string | null = null,
 ): PartitionResult {
   const threshold = severityRank(policy.block_threshold);
@@ -479,12 +481,12 @@ export function partitionFindings(
     // current fingerprint (#391 review-1 finding 5805b17e) — the coarse key
     // alone cannot distinguish a different finding that lands in the same
     // file/severity/line-band bucket at the same SHA.
-    const nonRepro = nonReproducing.get(key);
-    if (
-      reviewedSha && nonRepro && nonRepro.sha === reviewedSha &&
-      nonRepro.fingerprint === findingPayloadFingerprint(f) &&
-      isBlockingCandidate && !isAmbiguous
-    ) {
+    const nonRepro = reviewedSha
+      ? nonReproducing.get(key)?.find(
+          (d) => d.sha === reviewedSha && d.fingerprint === findingPayloadFingerprint(f),
+        )
+      : undefined;
+    if (nonRepro && isBlockingCandidate && !isAmbiguous) {
       result.overridden.push({
         kind: "key",
         finding: f,
@@ -747,9 +749,13 @@ export function nonReproducingDispositionComment(args: {
 
 /**
  * Collect active non-reproducing dispositions from trusted-author comments as
- * key → `{ sha, fingerprint }` (the SHA and payload fingerprint the disposition
- * is anchored to). A later disposition for the same key wins. Callers MUST
- * pre-filter `comments` to trusted authors (e.g. via
+ * key → `{ sha, fingerprint }[]` (every disposition recorded under that coarse
+ * key, each anchored to the SHA and payload fingerprint it was declared
+ * against). The coarse key (file + severity + 5-line band) can collide across
+ * distinct findings, so multiple dispositions per key are preserved rather
+ * than the later one overwriting the earlier — a consumer must match on both
+ * SHA and fingerprint (#391 review-2 finding 53b23912), not key alone. Callers
+ * MUST pre-filter `comments` to trusted authors (e.g. via
  * `buildTrustedOverrideComments`) before calling — mirrors the trust model of
  * `extractOverrides`.
  *
@@ -759,13 +765,17 @@ export function nonReproducingDispositionComment(args: {
  */
 export function extractNonReproducingDispositions(
   comments: { body: string }[],
-): Map<string, { sha: string; fingerprint: string }> {
-  const map = new Map<string, { sha: string; fingerprint: string }>();
+): Map<string, { sha: string; fingerprint: string }[]> {
+  const map = new Map<string, { sha: string; fingerprint: string }[]>();
   for (const c of comments) {
     if (!c.body.startsWith(NON_REPRODUCING_HEADING)) continue;
     const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
     const m = NON_REPRODUCING_RE.exec(lastLine);
-    if (m) map.set(m[1], { sha: m[2], fingerprint: m[3] });
+    if (!m) continue;
+    const entry = { sha: m[2], fingerprint: m[3] };
+    const existing = map.get(m[1]);
+    if (existing) existing.push(entry);
+    else map.set(m[1], [entry]);
   }
   return map;
 }

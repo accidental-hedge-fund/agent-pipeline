@@ -920,7 +920,7 @@ test("computeEffectiveBlockingSet: no overrides/dispositions → effective set u
 
 test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only when the SHA matches the current reviewed SHA", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
-  const nonReproducing = new Map([[keyA, { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingA) }]]);
+  const nonReproducing = new Map([[keyA, [{ sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingA) }]]]);
 
   const matching = computeEffectiveBlockingSet(
     new Set([keyA, keyB]), summaries, new Map(), [], nonReproducing, SHA_R391_A,
@@ -949,7 +949,7 @@ test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only wh
   // A disposition recorded for keyA's SHA but with a fingerprint belonging to a
   // DIFFERENT finding (e.g. findingB's payload landed in keyA's coarse bucket in
   // a hypothetical prior round) must not subtract findingA.
-  const mismatched = new Map([[keyA, { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingB) }]]);
+  const mismatched = new Map([[keyA, [{ sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingB) }]]]);
   const result = computeEffectiveBlockingSet(
     new Set([keyA, keyB]), summaries, new Map(), [], mismatched, SHA_R391_A,
   );
@@ -957,6 +957,21 @@ test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only wh
     [...result.effectiveKeys].sort(), [keyA, keyB].sort(),
     "a fingerprint mismatch must not subtract keyA even though the key and SHA both match",
   );
+});
+
+test("computeEffectiveBlockingSet: multiple dispositions under the same coarse key each still apply to their own finding (#391 review-2 finding 53b23912)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  // keyA and keyB are distinct here, but both dispositions are stored under a
+  // single coarse key to simulate a collision — the array must preserve both
+  // rather than the later entry overwriting the earlier one.
+  const collided = new Map([[keyA, [
+    { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingA) },
+    { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingB) },
+  ]]]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA]), summaries, new Map(), [], collided, SHA_R391_A,
+  );
+  assert.deepEqual([...result.effectiveKeys], [], "findingA's own disposition must still be found in the array");
 });
 
 test("computeEffectiveBlockingSet: all findings dispositioned (mixed override + scope) → empty effective set", () => {
@@ -1173,13 +1188,13 @@ test("decideDoesNotReproduceAdvance: empty invoked set → does not advance (not
 // review-policy.ts: non-reproducing disposition sentinel round-trip (#391)
 // ---------------------------------------------------------------------------
 
-test("nonReproducingDispositionComment / extractNonReproducingDispositions: round-trips key → { sha, fingerprint }", () => {
+test("nonReproducingDispositionComment / extractNonReproducingDispositions: round-trips key → [{ sha, fingerprint }]", () => {
   const body = nonReproducingDispositionComment({
     key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1",
     justification: "tooling artifact, not a real issue", timestamp: "2026-07-01T00:00:00Z",
   });
   const map = extractNonReproducingDispositions([{ body }]);
-  assert.deepEqual(map.get(keyA), { sha: SHA_R391_A, fingerprint: FP_A });
+  assert.deepEqual(map.get(keyA), [{ sha: SHA_R391_A, fingerprint: FP_A }]);
 });
 
 test("non-reproducing disposition sentinel is distinct from the operator override sentinel", () => {
@@ -1194,7 +1209,7 @@ test("non-reproducing disposition sentinel is distinct from the operator overrid
   assert.equal(extractNonReproducingDispositions([{ body: override }]).size, 0);
 });
 
-test("extractNonReproducingDispositions: later disposition for the same key wins", () => {
+test("extractNonReproducingDispositions: multiple dispositions for the same coarse key are all preserved, not overwritten (#391 review-2 finding 53b23912)", () => {
   const first = nonReproducingDispositionComment({
     key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1", justification: "j1", timestamp: "2026-07-01T00:00:00Z",
   });
@@ -1202,7 +1217,10 @@ test("extractNonReproducingDispositions: later disposition for the same key wins
     key: keyA, reviewedSha: SHA_R391_B, fingerprint: FP_B, stage: "fix-2", justification: "j2", timestamp: "2026-07-02T00:00:00Z",
   });
   const map = extractNonReproducingDispositions([{ body: first }, { body: second }]);
-  assert.deepEqual(map.get(keyA), { sha: SHA_R391_B, fingerprint: FP_B });
+  assert.deepEqual(map.get(keyA), [
+    { sha: SHA_R391_A, fingerprint: FP_A },
+    { sha: SHA_R391_B, fingerprint: FP_B },
+  ]);
 });
 
 test("extractNonReproducingDispositions: only comments with the controlled heading are processed", () => {

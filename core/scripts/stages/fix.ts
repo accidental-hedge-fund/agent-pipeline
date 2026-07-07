@@ -1145,19 +1145,21 @@ export interface OverridePreFilterResult {
  * never a re-implementation.
  *
  * A non-reproducing disposition only dispositions a finding when
- * `reviewedShaAtEntry` is non-null and equals the SHA the disposition was
- * recorded against, AND the disposition's recorded payload fingerprint equals
- * the summary's `fingerprint` (#391 review-1 finding 5805b17e) — the coarse
- * `key` alone cannot distinguish a different finding in the same bucket at the
- * same SHA. A stale disposition (superseded SHA or mismatched fingerprint)
- * does not apply, and the finding is evaluated afresh.
+ * `reviewedShaAtEntry` is non-null and at least one of the key's recorded
+ * dispositions has both a `sha` equal to `reviewedShaAtEntry` AND a
+ * `fingerprint` equal to the summary's `fingerprint` (#391 review-1 finding
+ * 5805b17e) — the coarse `key` alone cannot distinguish a different finding in
+ * the same bucket at the same SHA, so multiple dispositions are kept per key
+ * (#391 review-2 finding 53b23912) rather than one overwriting another. A
+ * stale disposition (superseded SHA or mismatched fingerprint) does not apply,
+ * and the finding is evaluated afresh.
  */
 export function computeEffectiveBlockingSet(
   blockingKeys: Set<string>,
   summaries: FindingSummary[],
   overrides: Map<string, string>,
   scopes: ScopedOverride[],
-  nonReproducing: Map<string, { sha: string; fingerprint: string }>,
+  nonReproducing: Map<string, { sha: string; fingerprint: string }[]>,
   reviewedShaAtEntry: string | null,
 ): OverridePreFilterResult {
   const effectiveKeys = new Set(blockingKeys);
@@ -1183,11 +1185,12 @@ export function computeEffectiveBlockingSet(
       continue;
     }
 
-    const nonRepro = nonReproducing.get(s.key);
-    if (
-      reviewedShaAtEntry && nonRepro && nonRepro.sha === reviewedShaAtEntry &&
-      nonRepro.fingerprint === s.fingerprint
-    ) {
+    const nonRepro = reviewedShaAtEntry
+      ? nonReproducing.get(s.key)?.find(
+          (d) => d.sha === reviewedShaAtEntry && d.fingerprint === s.fingerprint,
+        )
+      : undefined;
+    if (nonRepro) {
       effectiveKeys.delete(s.key);
       dispositions.push({
         key: s.key,
