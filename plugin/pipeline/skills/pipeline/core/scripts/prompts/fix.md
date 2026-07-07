@@ -51,11 +51,12 @@ Any code path you add or modify that calls an external CLI or API (`gh`, `git`, 
 
 ## Does-Not-Reproduce Outcome (if applicable)
 
-If an assigned blocking finding does NOT reproduce at the reviewed SHA `{{reviewed_sha}}` — for example it is a tooling artifact, a false positive, or the condition it describes does not exist in the code — do NOT silently skip it, and do NOT commit a no-op change to work around it. Instead, declare it using the finding's `override-key` (shown above each finding) by emitting exactly one line per non-reproducing finding, formatted precisely as:
+If an assigned blocking finding does NOT reproduce at the reviewed SHA `{{reviewed_sha}}` — for example it is a tooling artifact, a false positive, or the condition it describes does not exist in the code — do NOT silently skip it, and do NOT commit a no-op change to work around it. Instead, declare it using the finding's `override-key` AND its `finding-fingerprint` (both shown above each finding — the fingerprint is the hidden `<!-- finding-fingerprint: ... -->` marker) by emitting exactly one line per non-reproducing finding, formatted precisely as:
 
-    <!-- pipeline-does-not-reproduce: <override-key> {{reviewed_sha}} | <one-line justification> -->
+    <!-- pipeline-does-not-reproduce: <override-key> <finding-fingerprint> {{reviewed_sha}} | <one-line justification> -->
 
 Rules for this declaration:
+- The `finding-fingerprint` MUST be copied verbatim from the marker shown directly above the finding you are declaring non-reproducing — never guessed or reused from a different finding. The same `override-key` can be shared by more than one finding in this review; the fingerprint is what identifies which one you mean.
 - The reviewed SHA in the declaration MUST be exactly `{{reviewed_sha}}` — a declaration against any other SHA is ignored.
 - The justification MUST be a single line (no line breaks) explaining why the finding does not reproduce.
 - Emit one declaration per non-reproducing finding. You may still commit fixes for the other assigned findings in the same round.

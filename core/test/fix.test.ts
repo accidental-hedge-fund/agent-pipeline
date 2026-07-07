@@ -1106,27 +1106,30 @@ test("extractBlockingReviewFindings: overriddenKeys param excludes the dispositi
 // ---------------------------------------------------------------------------
 
 test("parseDoesNotReproduceDeclarations: parses a single well-formed declaration", () => {
-  const stdout = `Some harness prose.\n<!-- pipeline-does-not-reproduce: ${keyA} ${SHA_R391_A} | this is a tooling artifact -->\nmore prose`;
+  const stdout = `Some harness prose.\n<!-- pipeline-does-not-reproduce: ${keyA} ${FP_A} ${SHA_R391_A} | this is a tooling artifact -->\nmore prose`;
   const decls = parseDoesNotReproduceDeclarations(stdout);
   assert.equal(decls.length, 1);
-  assert.deepEqual(decls[0], { key: keyA, reviewedSha: SHA_R391_A, justification: "this is a tooling artifact" });
+  assert.deepEqual(decls[0], {
+    key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "this is a tooling artifact",
+  });
 });
 
 test("parseDoesNotReproduceDeclarations: parses multiple declarations", () => {
   const stdout = [
-    `<!-- pipeline-does-not-reproduce: ${keyA} ${SHA_R391_A} | reason one -->`,
-    `<!-- pipeline-does-not-reproduce: ${keyB} ${SHA_R391_A} | reason two -->`,
+    `<!-- pipeline-does-not-reproduce: ${keyA} ${FP_A} ${SHA_R391_A} | reason one -->`,
+    `<!-- pipeline-does-not-reproduce: ${keyB} ${FP_B} ${SHA_R391_A} | reason two -->`,
   ].join("\n");
   const decls = parseDoesNotReproduceDeclarations(stdout);
   assert.equal(decls.length, 2);
   assert.deepEqual(decls.map((d) => d.key).sort(), [keyA, keyB].sort());
 });
 
-test("parseDoesNotReproduceDeclarations: malformed lines (bad key/sha length, missing pipe) are ignored", () => {
+test("parseDoesNotReproduceDeclarations: malformed lines (bad key/sha/fingerprint length, missing pipe) are ignored", () => {
   const stdout = [
-    "<!-- pipeline-does-not-reproduce: shortkey " + SHA_R391_A + " | reason -->",
-    "<!-- pipeline-does-not-reproduce: " + keyA + " tooshortsha | reason -->",
-    "<!-- pipeline-does-not-reproduce: " + keyA + " " + SHA_R391_A + " no pipe here -->",
+    "<!-- pipeline-does-not-reproduce: shortkey " + FP_A + " " + SHA_R391_A + " | reason -->",
+    "<!-- pipeline-does-not-reproduce: " + keyA + " tooshortfp " + SHA_R391_A + " | reason -->",
+    "<!-- pipeline-does-not-reproduce: " + keyA + " " + FP_A + " tooshortsha | reason -->",
+    "<!-- pipeline-does-not-reproduce: " + keyA + " " + FP_A + " " + SHA_R391_A + " no pipe here -->",
     "plain prose mentioning pipeline-does-not-reproduce without the sentinel shape",
   ].join("\n");
   assert.deepEqual(parseDoesNotReproduceDeclarations(stdout), []);
@@ -1142,47 +1145,98 @@ test("parseDoesNotReproduceDeclarations: empty/absent → []", () => {
 // ---------------------------------------------------------------------------
 
 test("decideDoesNotReproduceAdvance: round 1, all invoked findings validly declared → advances to review-2", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
   const decls = [
-    { key: keyA, reviewedSha: SHA_R391_A, justification: "j1" },
-    { key: keyB, reviewedSha: SHA_R391_A, justification: "j2" },
+    { key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j1" },
+    { key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j2" },
   ];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA, keyB]), decls, SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance(new Set([keyA, keyB]), summaries, decls, SHA_R391_A, 1);
   assert.equal(decision.advance, true);
   assert.ok(decision.advance && decision.to === "review-2");
   assert.ok(decision.advance && decision.covered.size === 2);
 });
 
 test("decideDoesNotReproduceAdvance: round 2, all invoked findings validly declared → advances to pre-merge", () => {
-  const decls = [{ key: keyA, reviewedSha: SHA_R391_A, justification: "j1" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), decls, SHA_R391_A, 2);
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j1" }];
+  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), summaries, decls, SHA_R391_A, 2);
   assert.equal(decision.advance, true);
   assert.ok(decision.advance && decision.to === "pre-merge");
 });
 
 test("decideDoesNotReproduceAdvance: declaration key outside the invoked set is ignored → does not advance", () => {
-  const decls = [{ key: keyB, reviewedSha: SHA_R391_A, justification: "j" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), decls, SHA_R391_A, 1);
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j" }];
+  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), summaries, decls, SHA_R391_A, 1);
   assert.equal(decision.advance, false);
   assert.ok(!decision.advance && decision.missing.has(keyA));
 });
 
 test("decideDoesNotReproduceAdvance: declaration SHA not equal to current HEAD is ignored → does not advance", () => {
-  const decls = [{ key: keyA, reviewedSha: SHA_R391_B, justification: "j" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), decls, SHA_R391_A, 1);
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_B, justification: "j" }];
+  const decision = decideDoesNotReproduceAdvance(new Set([keyA]), summaries, decls, SHA_R391_A, 1);
   assert.equal(decision.advance, false);
   assert.ok(!decision.advance && decision.missing.has(keyA));
 });
 
 test("decideDoesNotReproduceAdvance: partial coverage → does not advance (fail closed)", () => {
-  const decls = [{ key: keyA, reviewedSha: SHA_R391_A, justification: "j" }];
-  const decision = decideDoesNotReproduceAdvance(new Set([keyA, keyB]), decls, SHA_R391_A, 1);
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j" }];
+  const decision = decideDoesNotReproduceAdvance(new Set([keyA, keyB]), summaries, decls, SHA_R391_A, 1);
   assert.equal(decision.advance, false);
   assert.ok(!decision.advance && decision.missing.size === 1 && decision.missing.has(keyB));
 });
 
 test("decideDoesNotReproduceAdvance: empty invoked set → does not advance (nothing to cover)", () => {
-  const decision = decideDoesNotReproduceAdvance(new Set(), [], SHA_R391_A, 1);
+  const decision = decideDoesNotReproduceAdvance(new Set(), [], [], SHA_R391_A, 1);
   assert.equal(decision.advance, false);
+});
+
+// #391 pre-merge delta, key bb8d0a35: a key shared by two distinct rendered
+// findings requires a declaration for EACH finding's fingerprint — one
+// declaration alone leaves the other finding uncovered and fails closed.
+test("decideDoesNotReproduceAdvance: a key shared by two distinct findings requires both fingerprints declared", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  assert.equal(sharedKey, findingKey(collideB), "precondition: colliding keys");
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const fpA = findingPayloadFingerprint(collideA);
+  const fpB = findingPayloadFingerprint(collideB);
+  const sha = "a".repeat(40);
+
+  // Only collideA's fingerprint declared → collideB still uncovered.
+  const partial = decideDoesNotReproduceAdvance(
+    new Set([sharedKey]), summaries,
+    [{ key: sharedKey, fingerprint: fpA, reviewedSha: sha, justification: "j" }],
+    sha, 1,
+  );
+  assert.equal(partial.advance, false, "one covered finding under a shared key must not advance the other");
+
+  // Both fingerprints declared → fully covered, advances.
+  const full = decideDoesNotReproduceAdvance(
+    new Set([sharedKey]), summaries,
+    [
+      { key: sharedKey, fingerprint: fpA, reviewedSha: sha, justification: "j" },
+      { key: sharedKey, fingerprint: fpB, reviewedSha: sha, justification: "j" },
+    ],
+    sha, 1,
+  );
+  assert.equal(full.advance, true, "declaring both distinct findings under the shared key must advance");
+  assert.ok(full.advance && full.covered.size === 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -1251,7 +1305,7 @@ test("advanceFix source pin: the all-dispositioned skip-advance return precedes 
 
 test("advanceFix source pin: the does-not-reproduce carve-out is checked before the no-commits block", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(invokedBlockingKeys, unambiguous, headAfter, round)");
+  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedBlockingKeys,");
   const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
   assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
   assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
@@ -1327,11 +1381,11 @@ test("parseFindingSummaries: comment without the finding-fingerprint marker → 
   assert.equal(summary!.fingerprint, null);
 });
 
-// 0fb96f45: a declaration on a key that TWO rendered findings share cannot be
-// tied to a unique fingerprint — it must be dropped so the advance decision
-// leaves the key uncovered (fail closed), instead of recording the first
-// matching finding's fingerprint. Bites the `.find(key)` record path.
-test("filterUnambiguousDeclarations: drops a declaration whose key matches multiple rendered findings", () => {
+// bb8d0a35: a declaration on a key that TWO rendered findings share is no
+// longer dropped outright — its verbatim fingerprint disambiguates which of
+// the two findings it means, so it is kept and the OTHER finding under the
+// same key stays independently uncovered.
+test("filterUnambiguousDeclarations: a verbatim fingerprint disambiguates a key shared by two rendered findings", () => {
   const collideA: ReviewFinding = {
     severity: "high", title: "can starve", file: "x.ts", line_start: 46,
     body: "A", confidence: 0.9, recommendation: "ra",
@@ -1349,20 +1403,26 @@ test("filterUnambiguousDeclarations: drops a declaration whose key matches multi
     new Set([sharedKey]),
   );
   const summaries = parseFindingSummaries(body);
-  const decl = { key: sharedKey, reviewedSha: "a".repeat(40), justification: "j" };
+  const declA = {
+    key: sharedKey, fingerprint: findingPayloadFingerprint(collideA),
+    reviewedSha: "a".repeat(40), justification: "j",
+  };
   assert.deepEqual(
-    filterUnambiguousDeclarations([decl], summaries),
-    [],
-    "an ambiguous-key declaration must be dropped, leaving its key uncovered",
+    filterUnambiguousDeclarations([declA], summaries),
+    [declA],
+    "a declaration whose fingerprint matches one of the colliding findings must be kept",
   );
-  // And the advance decision then refuses coverage for that key:
-  const decision = decideDoesNotReproduceAdvance(new Set([sharedKey]), [], "a".repeat(40), 1);
-  assert.equal(decision.advance, false, "uncovered key → no advance (fail closed)");
+});
+
+test("filterUnambiguousDeclarations: drops a declaration whose fingerprint matches no rendered finding under that key (malformed/hallucinated identity)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decl = { key: keyA, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j" };
+  assert.deepEqual(filterUnambiguousDeclarations([decl], summaries), []);
 });
 
 test("filterUnambiguousDeclarations: keeps a declaration with a unique key and a verbatim fingerprint", () => {
   const summaries = parseFindingSummaries(twoFindingReview());
-  const decl = { key: keyA, reviewedSha: SHA_R391_A, justification: "j" };
+  const decl = { key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j" };
   const kept = filterUnambiguousDeclarations([decl], summaries);
   assert.equal(kept.length, 1);
 });
@@ -1371,7 +1431,7 @@ test("filterUnambiguousDeclarations: drops a declaration whose unique summary ha
   const summaries: Parameters<typeof filterUnambiguousDeclarations>[1] = [
     { key: "aaaabbbb", category: null, file: "x.ts", fingerprint: null },
   ];
-  const decl = { key: "aaaabbbb", reviewedSha: "a".repeat(40), justification: "j" };
+  const decl = { key: "aaaabbbb", fingerprint: "0123456789abcdef", reviewedSha: "a".repeat(40), justification: "j" };
   assert.deepEqual(filterUnambiguousDeclarations([decl], summaries), []);
 });
 

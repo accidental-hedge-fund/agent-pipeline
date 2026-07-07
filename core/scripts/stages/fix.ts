@@ -504,29 +504,34 @@ export async function advanceFix(
         // silent failure. Fails closed: an empty invoked set, or any invoked
         // finding left uncovered, falls through to the existing block below.
         const declarations = parseDoesNotReproduceDeclarations(result.stdout ?? "");
-        // A declaration references a finding by its coarse key, which the
-        // reviewer may have minted for MULTIPLE distinct findings in this
-        // review (#391 delta, key 0fb96f45). A declaration that cannot be
-        // tied to exactly one rendered finding — unique key match with a
-        // verbatim render-time fingerprint — is dropped BEFORE the advance
-        // decision, so its key stays uncovered and the round fails closed to
-        // the block below instead of recording a wrong-fingerprint
-        // disposition.
+        // A declaration references a finding by (key, fingerprint) — the
+        // fingerprint, copied verbatim from the `finding-fingerprint` marker
+        // shown above the finding in the fix prompt, ties it to exactly one
+        // rendered finding even when the coarse key was minted for MULTIPLE
+        // distinct findings in this review (#391 pre-merge delta, key
+        // bb8d0a35). A declaration whose identity matches no rendered finding
+        // is dropped BEFORE the advance decision, so that finding stays
+        // uncovered and the round fails closed to the block below instead of
+        // recording a wrong disposition.
         const declSummaries = parseFindingSummaries(reviewBody);
         const unambiguous = filterUnambiguousDeclarations(declarations, declSummaries);
-        const dnrDecision = decideDoesNotReproduceAdvance(invokedBlockingKeys, unambiguous, headAfter, round);
+        const dnrDecision = decideDoesNotReproduceAdvance(
+          invokedBlockingKeys,
+          declSummaries,
+          unambiguous,
+          headAfter,
+          round,
+        );
         if (dnrDecision.advance) {
           const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
           for (const decl of dnrDecision.covered.values()) {
-            // Unique by construction of `unambiguous` above.
-            const fingerprint = declSummaries.find((s) => s.key === decl.key)!.fingerprint!;
             await postComment(
               cfg,
               issueNumber,
               nonReproducingDispositionComment({
                 key: decl.key,
                 reviewedSha: decl.reviewedSha,
-                fingerprint,
+                fingerprint: decl.fingerprint,
                 stage,
                 justification: decl.justification,
                 timestamp,
@@ -1182,15 +1187,22 @@ export function computeEffectiveBlockingSet(
 
 export interface DoesNotReproduceDeclaration {
   key: string;
+  /** Verbatim render-time finding fingerprint (#391 pre-merge delta, key
+   *  bb8d0a35) — disambiguates which rendered finding this declaration means
+   *  when its coarse key was minted for more than one finding in the review. */
+  fingerprint: string;
   reviewedSha: string;
   justification: string;
 }
 
 // Anchored full-line + global; mirrors the `pipeline-override-scope` sentinel's
 // "disposition | reason" delimiter convention so justification text (which may
-// contain arbitrary punctuation) cannot break the fixed-field parse.
+// contain arbitrary punctuation) cannot break the fixed-field parse. The
+// fingerprint group mirrors FINDING_FINGERPRINT_RE's 16-hex-char shape — the
+// harness copies it verbatim from the `<!-- finding-fingerprint: ... -->`
+// marker shown above the finding it is declaring non-reproducing.
 const DOES_NOT_REPRODUCE_RE =
-  /^<!-- pipeline-does-not-reproduce: ([0-9a-f]{8}) ([0-9a-fA-F]{40}) \| (.+?) -->$/gm;
+  /^<!-- pipeline-does-not-reproduce: ([0-9a-f]{8}) ([0-9a-f]{16}) ([0-9a-fA-F]{40}) \| (.+?) -->$/gm;
 
 /**
  * Parse does-not-reproduce declarations from raw fix-harness stdout (#391).
@@ -1203,7 +1215,7 @@ export function parseDoesNotReproduceDeclarations(stdout: string): DoesNotReprod
   DOES_NOT_REPRODUCE_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = DOES_NOT_REPRODUCE_RE.exec(stdout)) !== null) {
-    out.push({ key: m[1], reviewedSha: m[2], justification: m[3].trim() });
+    out.push({ key: m[1], fingerprint: m[2], reviewedSha: m[3], justification: m[4].trim() });
   }
   DOES_NOT_REPRODUCE_RE.lastIndex = 0;
   return out;
@@ -1218,49 +1230,65 @@ export type DoesNotReproduceDecision =
 
 
 /**
- * Drop does-not-reproduce declarations that cannot be tied to exactly one
- * rendered finding (#391 delta, key 0fb96f45): `findingKey` is coarse, so a
- * single review can mint the same key for multiple distinct findings, and a
- * key-only declaration is then ambiguous — recording it would persist the
- * FIRST matching finding's fingerprint for whichever finding the harness
- * meant. A declaration also drops when its unique summary carries no verbatim
- * render-time fingerprint (pre-marker comment). Dropped declarations leave
- * their keys uncovered, so `decideDoesNotReproduceAdvance` refuses the
- * advance and the round fails closed to the no-commits block.
+ * Drop does-not-reproduce declarations whose (key, fingerprint) identity does
+ * not match any rendered finding (#391 pre-merge delta, key bb8d0a35): a
+ * verbatim fingerprint — copied by the harness from the `finding-fingerprint`
+ * marker shown above the finding it declares — ties a declaration to exactly
+ * one rendered finding even when `findingKey` (coarse) was minted for more
+ * than one distinct finding in the review. Only a malformed or unmatched
+ * identity (fingerprint absent from any summary sharing the key, or the
+ * summary predates the fingerprint marker) is dropped; a genuinely ambiguous
+ * key no longer forces a drop once the fingerprint disambiguates it. Dropped
+ * declarations leave their finding uncovered, so `decideDoesNotReproduceAdvance`
+ * refuses the advance and the round fails closed to the no-commits block.
  */
 export function filterUnambiguousDeclarations(
   declarations: DoesNotReproduceDeclaration[],
   summaries: FindingSummary[],
 ): DoesNotReproduceDeclaration[] {
-  return declarations.filter((decl) => {
-    const matches = summaries.filter((s) => s.key === decl.key);
-    return matches.length === 1 && matches[0].fingerprint !== null;
-  });
+  return declarations.filter((decl) =>
+    summaries.some((s) => s.key === decl.key && s.fingerprint !== null && s.fingerprint === decl.fingerprint),
+  );
 }
 
 /**
- * #391: on a fix round's no-commit path, decide whether every INVOKED blocking
- * finding (the keys actually rendered into the fix prompt this round) is
- * covered by a valid does-not-reproduce declaration. A declaration is valid
- * only when its key belongs to the invoked set AND its reviewed SHA equals
- * `currentHead` (the tree the harness actually saw) — an out-of-scope key or a
- * stale SHA is ignored. Fails closed: an empty invoked set, or any invoked
- * finding left uncovered, does not advance.
+ * #391: on a fix round's no-commit path, decide whether every rendered
+ * finding whose key belongs to the invoked blocking set (the keys actually
+ * rendered into the fix prompt this round) is covered by a valid
+ * does-not-reproduce declaration. Coverage is decided per rendered finding —
+ * identified by (key, fingerprint), not by the coarse key alone (#391
+ * pre-merge delta, key bb8d0a35) — so a key shared by several distinct
+ * findings requires one declaration per finding, not one for the whole key. A
+ * declaration is valid only when its (key, fingerprint) matches a rendered
+ * finding AND its reviewed SHA equals `currentHead` (the tree the harness
+ * actually saw); a finding with no verbatim fingerprint (pre-marker comment)
+ * can never be covered. Fails closed: an empty invoked set, no rendered
+ * findings for the invoked keys, or any invoked finding left uncovered, does
+ * not advance.
  */
 export function decideDoesNotReproduceAdvance(
   invokedBlockingKeys: Set<string>,
+  summaries: FindingSummary[],
   declarations: DoesNotReproduceDeclaration[],
   currentHead: string,
   round: 1 | 2,
 ): DoesNotReproduceDecision {
+  const required = summaries.filter((s) => invokedBlockingKeys.has(s.key));
   const covered = new Map<string, DoesNotReproduceDeclaration>();
-  for (const d of declarations) {
-    if (!invokedBlockingKeys.has(d.key)) continue;
-    if (!currentHead || d.reviewedSha !== currentHead) continue;
-    covered.set(d.key, d);
+  const missing = new Set<string>();
+  for (const s of required) {
+    const decl = s.fingerprint !== null
+      ? declarations.find(
+          (d) => d.key === s.key && d.fingerprint === s.fingerprint && !!currentHead && d.reviewedSha === currentHead,
+        )
+      : undefined;
+    if (decl) {
+      covered.set(`${s.key}:${s.fingerprint}`, decl);
+    } else {
+      missing.add(s.key);
+    }
   }
-  const missing = new Set([...invokedBlockingKeys].filter((k) => !covered.has(k)));
-  if (invokedBlockingKeys.size > 0 && missing.size === 0) {
+  if (invokedBlockingKeys.size > 0 && required.length > 0 && missing.size === 0) {
     return { advance: true, to: round === 1 ? "review-2" : "pre-merge", covered };
   }
   return { advance: false, missing };
