@@ -504,16 +504,22 @@ export async function advanceFix(
         // silent failure. Fails closed: an empty invoked set, or any invoked
         // finding left uncovered, falls through to the existing block below.
         const declarations = parseDoesNotReproduceDeclarations(result.stdout ?? "");
-        const dnrDecision = decideDoesNotReproduceAdvance(invokedBlockingKeys, declarations, headAfter, round);
+        // A declaration references a finding by its coarse key, which the
+        // reviewer may have minted for MULTIPLE distinct findings in this
+        // review (#391 delta, key 0fb96f45). A declaration that cannot be
+        // tied to exactly one rendered finding — unique key match with a
+        // verbatim render-time fingerprint — is dropped BEFORE the advance
+        // decision, so its key stays uncovered and the round fails closed to
+        // the block below instead of recording a wrong-fingerprint
+        // disposition.
+        const declSummaries = parseFindingSummaries(reviewBody);
+        const unambiguous = filterUnambiguousDeclarations(declarations, declSummaries);
+        const dnrDecision = decideDoesNotReproduceAdvance(invokedBlockingKeys, unambiguous, headAfter, round);
         if (dnrDecision.advance) {
           const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-          // Recompute the finding payload fingerprint from the same triggering
-          // review body used to derive invokedBlockingKeys, so the disposition
-          // records a full-payload signature (#391 review-1 finding 5805b17e),
-          // not just the coarse key.
-          const declSummaries = parseFindingSummaries(reviewBody);
           for (const decl of dnrDecision.covered.values()) {
-            const fingerprint = declSummaries.find((s) => s.key === decl.key)?.fingerprint ?? "";
+            // Unique by construction of `unambiguous` above.
+            const fingerprint = declSummaries.find((s) => s.key === decl.key)!.fingerprint!;
             await postComment(
               cfg,
               issueNumber,
@@ -860,8 +866,8 @@ const OVERRIDE_KEY_RE = /`override-key: ([0-9a-f]{8})`/;
 const CATEGORY_MARKER_RE = /`category: ([^`]+)`/;
 const LOCATION_LINE_RE = /^Location: `(.+)`$/m;
 // Mirrors formatReviewComment's heading render: `**N. [SEV] title**...`.
-const TITLE_LINE_RE = /^\*\*\d+\.\s*\[[A-Z]+\]\s*(.+?)\*\*/;
-const RECOMMENDATION_LINE_RE = /^\*\*Recommendation\*\*: (.+)$/;
+/** Verbatim per-finding payload fingerprint emitted by review rendering (#391). */
+const FINDING_FINGERPRINT_RE = /^<!-- finding-fingerprint: ([0-9a-f]{16}) -->$/m;
 
 interface SplitFindingsSection {
   beforeFindings: string;
@@ -1049,41 +1055,9 @@ export interface FindingSummary {
   key: string;
   category: string | null;
   file: string | null;
-  fingerprint: string;
-}
-
-/**
- * Recover `{ title, body, recommendation, lineStart, lineEnd }` for a single
- * finding block, mirroring formatReviewComment's exact render order (heading,
- * optional Location line, body, optional Recommendation line) so the fields
- * feed back into `findingPayloadFingerprint` identically to how the live
- * `ReviewFinding` would (#391 review-1 finding 5805b17e).
- */
-function parseFindingBlockPayload(block: string): {
-  title: string;
-  body: string;
-  recommendation: string | undefined;
-  lineStart: number | undefined;
-  lineEnd: number | undefined;
-} {
-  const lines = block.split("\n");
-  const title = TITLE_LINE_RE.exec(lines[0] ?? "")?.[1] ?? "";
-  let idx = 1;
-  let lineStart: number | undefined;
-  let lineEnd: number | undefined;
-  const locMatch = lines[idx] ? LOCATION_LINE_RE.exec(lines[idx]) : null;
-  if (locMatch) {
-    const rangeMatch = locMatch[1].match(/^(.*):(\d+)-(\d+)$/);
-    if (rangeMatch) {
-      lineStart = Number(rangeMatch[2]);
-      lineEnd = Number(rangeMatch[3]);
-    }
-    idx++;
-  }
-  const recIdx = lines.findIndex((l, i) => i >= idx && RECOMMENDATION_LINE_RE.test(l));
-  const bodyLines = recIdx === -1 ? lines.slice(idx) : lines.slice(idx, recIdx);
-  const recommendation = recIdx === -1 ? undefined : RECOMMENDATION_LINE_RE.exec(lines[recIdx])?.[1];
-  return { title, body: bodyLines.join("\n").trim(), recommendation, lineStart, lineEnd };
+  /** Verbatim render-time payload fingerprint, or null when the comment
+   *  predates the finding-fingerprint marker (fail closed: never matches). */
+  fingerprint: string | null;
 }
 
 /**
@@ -1109,14 +1083,12 @@ export function parseFindingSummaries(body: string): FindingSummary[] {
       const rangeMatch = locText.match(/^(.*):(\d+)-(\d+)$/);
       file = (rangeMatch ? rangeMatch[1] : locText) || null;
     }
-    const payload = parseFindingBlockPayload(block);
-    const fingerprint = findingPayloadFingerprint({
-      title: payload.title,
-      body: payload.body,
-      recommendation: payload.recommendation,
-      line_start: payload.lineStart,
-      line_end: payload.lineEnd,
-    });
+    // Verbatim machine-readable fingerprint emitted at render time (#391
+    // delta, key b827b914) — never reconstructed from the lossy markdown,
+    // which truncated multi-line recommendations. Absent on comments rendered
+    // before the marker shipped: fingerprint null → never matches any
+    // disposition (fail closed).
+    const fingerprint = block.match(FINDING_FINGERPRINT_RE)?.[1] ?? null;
     summaries.push({ key, category, file, fingerprint });
   }
   return summaries;
@@ -1185,7 +1157,10 @@ export function computeEffectiveBlockingSet(
       continue;
     }
 
-    const nonRepro = reviewedShaAtEntry
+    // s.fingerprint === null (comment predates the render-time marker) never
+    // matches — an identity we cannot verify verbatim fails closed (#391
+    // delta, key b827b914).
+    const nonRepro = reviewedShaAtEntry && s.fingerprint !== null
       ? nonReproducing.get(s.key)?.find(
           (d) => d.sha === reviewedShaAtEntry && d.fingerprint === s.fingerprint,
         )
@@ -1240,6 +1215,28 @@ export function parseDoesNotReproduceDeclarations(stdout: string): DoesNotReprod
 export type DoesNotReproduceDecision =
   | { advance: true; to: Stage; covered: Map<string, DoesNotReproduceDeclaration> }
   | { advance: false; missing: Set<string> };
+
+
+/**
+ * Drop does-not-reproduce declarations that cannot be tied to exactly one
+ * rendered finding (#391 delta, key 0fb96f45): `findingKey` is coarse, so a
+ * single review can mint the same key for multiple distinct findings, and a
+ * key-only declaration is then ambiguous — recording it would persist the
+ * FIRST matching finding's fingerprint for whichever finding the harness
+ * meant. A declaration also drops when its unique summary carries no verbatim
+ * render-time fingerprint (pre-marker comment). Dropped declarations leave
+ * their keys uncovered, so `decideDoesNotReproduceAdvance` refuses the
+ * advance and the round fails closed to the no-commits block.
+ */
+export function filterUnambiguousDeclarations(
+  declarations: DoesNotReproduceDeclaration[],
+  summaries: FindingSummary[],
+): DoesNotReproduceDeclaration[] {
+  return declarations.filter((decl) => {
+    const matches = summaries.filter((s) => s.key === decl.key);
+    return matches.length === 1 && matches[0].fingerprint !== null;
+  });
+}
 
 /**
  * #391: on a fix round's no-commit path, decide whether every INVOKED blocking

@@ -20,6 +20,7 @@ import {
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
   extractBlockingReviewFindings,
+  filterUnambiguousDeclarations,
   filterOverridesAfterReview,
   filterToBlockingFindings,
   findTriggeringReviewComment,
@@ -1250,7 +1251,7 @@ test("advanceFix source pin: the all-dispositioned skip-advance return precedes 
 
 test("advanceFix source pin: the does-not-reproduce carve-out is checked before the no-commits block", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(invokedBlockingKeys, declarations, headAfter, round)");
+  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(invokedBlockingKeys, unambiguous, headAfter, round)");
   const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
   assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
   assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
@@ -1281,3 +1282,96 @@ test("advanceFix source pin: the all-dispositioned skip-advance path honors dry-
       "so a dry-run of the all-dispositioned path never posts the transition comment or moves the stage label",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #391 pre-merge delta, keys 0fb96f45 + b827b914: verbatim render-time
+// fingerprints and ambiguity-refusing declaration filtering.
+// ---------------------------------------------------------------------------
+
+// b827b914: the fingerprint travels with the rendered finding — a multi-line
+// recommendation (which the old markdown reconstruction truncated at the first
+// line) round-trips exactly. Bites the reconstruction approach.
+test("parseFindingSummaries: multi-line recommendation round-trips the exact structured fingerprint via the render-time marker", () => {
+  const multiline: ReviewFinding = {
+    severity: "high",
+    title: "Multi-line rec finding",
+    file: "core/scripts/stages/fix.ts",
+    line_start: 10,
+    body: "Body.",
+    confidence: 0.9,
+    recommendation: "First line of the recommendation.\nSecond line with the crucial detail.",
+  };
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [multiline], next_steps: [] },
+    1, "codex",
+    new Set([findingKey(multiline)]),
+  );
+  const summary = parseFindingSummaries(body).find((s) => s.key === findingKey(multiline));
+  assert.ok(summary, "finding must be recovered");
+  assert.equal(
+    summary!.fingerprint,
+    findingPayloadFingerprint(multiline),
+    "the parsed fingerprint must be the exact render-time value, immune to markdown lossiness",
+  );
+});
+
+test("parseFindingSummaries: comment without the finding-fingerprint marker → fingerprint null (fail closed)", () => {
+  // A realistic pre-marker comment: current rendering minus the marker lines.
+  const body = twoFindingReview()
+    .split("\n")
+    .filter((l) => !l.startsWith("<!-- finding-fingerprint:"))
+    .join("\n");
+  const summary = parseFindingSummaries(body).find((s) => s.key === keyA);
+  assert.ok(summary, "finding must still be recovered from a pre-marker comment");
+  assert.equal(summary!.fingerprint, null);
+});
+
+// 0fb96f45: a declaration on a key that TWO rendered findings share cannot be
+// tied to a unique fingerprint — it must be dropped so the advance decision
+// leaves the key uncovered (fail closed), instead of recording the first
+// matching finding's fingerprint. Bites the `.find(key)` record path.
+test("filterUnambiguousDeclarations: drops a declaration whose key matches multiple rendered findings", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  assert.equal(sharedKey, findingKey(collideB), "precondition: colliding keys");
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const decl = { key: sharedKey, reviewedSha: "a".repeat(40), justification: "j" };
+  assert.deepEqual(
+    filterUnambiguousDeclarations([decl], summaries),
+    [],
+    "an ambiguous-key declaration must be dropped, leaving its key uncovered",
+  );
+  // And the advance decision then refuses coverage for that key:
+  const decision = decideDoesNotReproduceAdvance(new Set([sharedKey]), [], "a".repeat(40), 1);
+  assert.equal(decision.advance, false, "uncovered key → no advance (fail closed)");
+});
+
+test("filterUnambiguousDeclarations: keeps a declaration with a unique key and a verbatim fingerprint", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decl = { key: keyA, reviewedSha: SHA_R391_A, justification: "j" };
+  const kept = filterUnambiguousDeclarations([decl], summaries);
+  assert.equal(kept.length, 1);
+});
+
+test("filterUnambiguousDeclarations: drops a declaration whose unique summary has no fingerprint marker", () => {
+  const summaries: Parameters<typeof filterUnambiguousDeclarations>[1] = [
+    { key: "aaaabbbb", category: null, file: "x.ts", fingerprint: null },
+  ];
+  const decl = { key: "aaaabbbb", reviewedSha: "a".repeat(40), justification: "j" };
+  assert.deepEqual(filterUnambiguousDeclarations([decl], summaries), []);
+});
+
