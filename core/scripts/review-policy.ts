@@ -389,12 +389,23 @@ export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s
  * and correctly withhold the override so a real blocker cannot advance under it.
  * Scoped overrides bypass this guard by design (#229): a scope is explicitly
  * intended to match more than one finding.
+ *
+ * SHA-anchored non-reproducing disposition (#391): a finding whose key has a
+ * recorded {@link extractNonReproducingDispositions} entry is treated like a
+ * key override — same ambiguity guard — but ONLY when `reviewedSha` (the SHA
+ * this verdict was produced against) equals the disposition's recorded SHA. A
+ * disposition recorded against a since-superseded SHA does not apply, so a
+ * finding re-emerging after a new commit is evaluated afresh. Callers MUST
+ * pre-filter the source comments to trusted authors before calling, mirroring
+ * the trust model of `overrides`.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
   policy: ReviewPolicy,
   overrides: Map<string, string> = new Map(),
   scopes: ScopedOverride[] = [],
+  nonReproducing: Map<string, string> = new Map(),
+  reviewedSha: string | null = null,
 ): PartitionResult {
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
@@ -447,6 +458,23 @@ export function partitionFindings(
 
     if (overrides.has(key) && isBlockingCandidate && !isAmbiguous) {
       result.overridden.push({ kind: "key", finding: f, key, disposition: overrides.get(key)! });
+      continue;
+    }
+
+    // 2b. SHA-anchored non-reproducing disposition (#391): only consulted when
+    // the disposition's recorded SHA matches the SHA this verdict was produced
+    // against — a stale disposition from a superseded SHA does not apply.
+    const nonReproSha = nonReproducing.get(key);
+    if (
+      reviewedSha && nonReproSha === reviewedSha &&
+      isBlockingCandidate && !isAmbiguous
+    ) {
+      result.overridden.push({
+        kind: "key",
+        finding: f,
+        key,
+        disposition: `declared non-reproducing at ${reviewedSha.slice(0, 7)} by a prior fix round`,
+      });
       continue;
     }
 

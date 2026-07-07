@@ -299,6 +299,16 @@ export async function advanceFix(
     // Every triggering blocking finding is already dispositioned — nothing left
     // to fix. Skip the harness entirely and advance directly (#391).
     const next: Stage = round === 1 ? "review-2" : "pre-merge";
+    if (opts.dryRun) {
+      // #391 review-2 finding 9c0750f9: this bypass must honor dry-run exactly
+      // like the harness-invocation path below — a dry-run must never post the
+      // transition comment or move the issue's stage label.
+      console.log(
+        `[pipeline] #${issueNumber}: [dry-run] would advance ${stage} → ${next} ` +
+          `(all ${triggeringBlockingKeys.size} blocking finding(s) already dispositioned)`,
+      );
+      return { advanced: true, from: stage, to: next, summary: "[dry-run] all blocking findings dispositioned" };
+    }
     const msg = [
       `All ${triggeringBlockingKeys.size} blocking finding(s) from the triggering review are ` +
         `already dispositioned by an active override or non-reproducing disposition — nothing ` +

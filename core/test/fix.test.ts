@@ -1211,3 +1211,28 @@ test("advanceFix source pin: the does-not-reproduce carve-out is checked before 
   assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
   assert.ok(dnrIdx < noCommitsIdx, "the does-not-reproduce carve-out must be evaluated before the no-commits block");
 });
+
+test("advanceFix source pin: the all-dispositioned skip-advance path honors dry-run before transitioning (#391 review-2 finding 9c0750f9)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const skipAdvanceBlockIdx = src.indexOf(
+    "Every triggering blocking finding is already dispositioned — nothing left",
+  );
+  const dryRunCheckIdx = src.indexOf("if (opts.dryRun) {", skipAdvanceBlockIdx);
+  const dryRunReturnIdx = src.indexOf(
+    'summary: "[dry-run] all blocking findings dispositioned"',
+    skipAdvanceBlockIdx,
+  );
+  const transitionCallIdx = src.indexOf(
+    "await transition(cfg, issueNumber, stage, next, msg);",
+    skipAdvanceBlockIdx,
+  );
+  assert.ok(skipAdvanceBlockIdx !== -1, "expected the all-dispositioned skip-advance block to exist");
+  assert.ok(dryRunCheckIdx !== -1, "expected a dry-run check inside the all-dispositioned block");
+  assert.ok(dryRunReturnIdx !== -1, "expected a non-mutating dry-run return inside the all-dispositioned block");
+  assert.ok(transitionCallIdx !== -1, "expected the all-dispositioned block's transition() call to exist");
+  assert.ok(
+    dryRunCheckIdx < transitionCallIdx && dryRunReturnIdx < transitionCallIdx,
+    "the dry-run guard and its non-mutating return must precede the transition() call, " +
+      "so a dry-run of the all-dispositioned path never posts the transition comment or moves the stage label",
+  );
+});
