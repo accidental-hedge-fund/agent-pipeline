@@ -202,6 +202,19 @@ Confirm what's installed at any time with `pipeline --version` (or `/pipeline --
 
 > The plugin marketplace path above always tracks the **latest** published version and is not a way to pin an older release — use the `#<tag>` form for that.
 
+### Updating an npx/clone install
+
+For the `npx github:…` or clone-and-run install paths (not the plugin marketplace, which updates via `/plugin marketplace update`), refresh an existing install in place with the `update` verb — an idempotent alias for `install` that re-stages and atomically swaps the skill directory:
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline update            # both hosts
+npx github:accidental-hedge-fund/agent-pipeline update --host claude
+# or from a clone:
+node scripts/install.mjs update --host claude
+```
+
+Running it twice in a row is a net no-op — safe to re-run whenever `pipeline doctor` reports the `install:version-freshness` check is behind the latest release (see [Preflight (doctor)](#preflight-doctor)).
+
 ## Usage
 
 Each operation is available as its own discoverable `/pipeline:<command>` (Claude Code)
@@ -831,14 +844,14 @@ For repos with matrix builds, environment-specific secrets, or CI steps that dif
 
 ## Preflight (doctor)
 
-`pipeline doctor` runs a fast, **deterministic, model-free** capability check and prints a per-check pass/fail summary — a "this repo is runnable" signal before any autonomous work begins. It exits `0` when everything passes and `1` when any check fails, so it drops cleanly into CI or an onboarding script. It invokes no language model and consumes no tokens.
+`pipeline doctor` runs a fast, **deterministic, model-free** capability check and prints a per-check pass/fail/warn summary — a "this repo is runnable" signal before any autonomous work begins. It exits `0` when every check passes or only warns, and `1` when any check fails, so it drops cleanly into CI or an onboarding script. It invokes no language model and consumes no tokens.
 
 ```bash
 /pipeline doctor    # Claude Code primary
 $pipeline doctor    # Codex primary
 ```
 
-The checks (each emits one sentence of remediation text on failure):
+The checks (each emits one sentence of remediation text on failure or warning):
 
 | Check | Passes when | Skipped when |
 | --- | --- | --- |
@@ -847,9 +860,13 @@ The checks (each emits one sentence of remediation text on failure):
 | `repo-access` | `gh repo view <repo>` succeeds | — |
 | `worktree-clean` | the checkout has no uncommitted changes **while on a protected branch** (`main`/`master`/`staging`/`base_branch`); feature branches always pass | — |
 | `harness:<bin>` | each configured harness (`claude`/`codex`) is on `PATH` | — |
+| `install:version-coherence` | the running engine version matches `core/package.json` at the install root | — |
+| `install:version-freshness` | the installed engine version is `>=` the latest agent-pipeline release tag (**warns**, never fails, when behind — see below) | the latest release is unreachable (offline / `gh` failure / unparseable output) |
 | `package-install` | `node_modules` exists and is not older than `package-lock.json` | the repo root has no `package-lock.json` |
 | `openspec-cli` | the `openspec` CLI is on `PATH` | OpenSpec is not active (`openspec.enabled: off`, or `auto` with no `openspec/` dir) |
 | `eval-command` | the configured eval command's binary resolves on `PATH` | the eval gate is off or has no `command` |
+
+**Stale-install warning (#385).** `install:version-freshness` compares the installed engine against the latest `accidental-hedge-fund/agent-pipeline` GitHub release tag. A behind install reports `warn` — loud but **non-blocking**: it never fails the preflight, never sets a non-zero exit code, and never aborts a `--doctor` / `doctor.runOnStart` run. The remediation names the [update command](#updating-an-npxclone-install). The check only reports; it never updates anything itself.
 
 **Run-start gating (opt-in).** Set `doctor.runOnStart: true` in `.github/pipeline.yml`, or pass `--doctor` on a normal run, to run the preflight **before planning**. A failing preflight prints the summary and aborts with a non-zero exit **before any planning, implementation, or review tokens are spent**. With neither set, a run is completely unaffected — no checks execute. `--fail-fast` (or `doctor.failFast: true`) stops at the first failing check instead of collecting all failures.
 
@@ -857,7 +874,7 @@ The latest result is stored under `/tmp/pipeline-<domain>-doctor-result.json`; `
 
 **Machine-readable output (#154).** Two flags expose the doctor result as a stable JSON contract for tooling (e.g. Pipeline Desk):
 
-- `pipeline doctor --json` — emits a single unfenced JSON object with `schema_version`, `status` (`"ok"` or `"error"`), and a `checks` array where each entry is `{name, ok, reason, fix}`. Exit code mirrors the prose path (0 = all pass, 1 = any fail). Human output is suppressed.
+- `pipeline doctor --json` — emits a single unfenced JSON object with `schema_version`, top-level `status` (`"ok"`, `"warnings"` when ≥1 check warns and none fail, or `"error"` when any check fails — a fail dominates a co-occurring warn), and a `checks` array where each entry is `{name, status, ok, reason, fix}` (`status` is `"pass"|"warn"|"fail"|"skip"`; `ok` is retained for backward compatibility and equals `status !== "fail"`). Exit code mirrors the prose path (0 = all pass/warn, 1 = any fail). Human output is suppressed.
 - `pipeline doctor --is-ok` — runs all checks, emits **zero bytes of output**, and exits 0 (all pass) or 1 (any fail). Use for cheap polling. Mutually exclusive with `--json`.
 
 Similarly, `pipeline N --status --json` emits a single unfenced JSON object describing the issue's pipeline state (`schema_version`, `status`, `issue`, `stage`, `pr`, `branch`, `worktree`, `last_event`, `review_summary`, `next_action`, `config`). The human `--status` output is unchanged when `--json` is absent.

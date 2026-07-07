@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Replicates the "Install smoke test" step from .github/workflows/ci.yml.
 // Creates an isolated CLAUDE_CONFIG_DIR in a temp directory, installs the
-// pipeline shim into it, verifies the shim runs (--help exits 0), then
+// pipeline shim into it, verifies the shim runs (--help exits 0), exercises
+// the documented `update` verb (#385: the install:version-freshness doctor
+// check's remediation) twice to prove it is idempotent in place, then
 // uninstalls. Cleans up even on failure.
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -31,6 +33,13 @@ try {
   const env = { CLAUDE_CONFIG_DIR: configDir };
 
   run([installScript, "install", "--host", "claude"], env);
+  run([shimScript, "--help"], env);
+  // `update` refreshes the installed skill in place; running it twice must be
+  // a net no-op (no error, shim still runs) — the documented remediation for
+  // a stale install:version-freshness warning.
+  run([installScript, "update", "--host", "claude"], env);
+  run([shimScript, "--help"], env);
+  run([installScript, "update", "--host", "claude"], env);
   run([shimScript, "--help"], env);
   run([installScript, "uninstall", "--host", "claude"], env);
 } finally {
