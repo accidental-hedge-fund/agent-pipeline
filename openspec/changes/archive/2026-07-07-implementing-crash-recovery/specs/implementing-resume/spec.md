@@ -1,8 +1,5 @@
-# implementing-resume Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change implementing-resume. Update Purpose after archive.
-## Requirements
 ### Requirement: implementing stage is resumable when commits exist in the worktree
 
 When the orchestrator dispatches stage `implementing` at the start of a run (re-entry, not mid-flight), it SHALL first consult the repo-stable live-planning marker for the issue. If a live process owns the marker, the dispatcher SHALL return a `waiting` outcome whose reason names the live concurrent owner. Otherwise it SHALL check whether an existing worktree for the issue has commits ahead of the base branch. If so, it SHALL resume the post-implementation steps — test gate → push → open-or-find PR → transition `implementing → review-1` — without re-planning or re-implementing. If no live process owns the marker AND no worktree with commits exists, the issue is crash-stranded and the dispatcher SHALL restart the planning arc from `ready` (see the crash-stranded recovery requirement) rather than returning `waiting`.
@@ -39,22 +36,7 @@ The liveness check SHALL run before the commits-ahead check so that a live cross
 - **AND** the test gate fails again on the resume attempt
 - **THEN** the pipeline SHALL call `setBlocked` with kind `test-gate-exhausted` and SHALL NOT open a PR or transition the stage
 
-### Requirement: PR is created exactly once across the initial run and any resume runs
-
-When the pipeline resumes at `implementing`, it SHALL attempt to find an existing PR for the issue before creating a new one. If a PR already exists, it SHALL use the existing PR number and SHALL NOT attempt to create a duplicate. The transition comment (`implementing → review-1`) SHALL reference the PR number whether the PR was created in the current run or found from a prior partial run.
-
-#### Scenario: PR already exists — reused on resume
-
-- **WHEN** the resume path runs
-- **AND** `getPrForIssue(cfg, issueNumber)` returns a PR number
-- **THEN** the pipeline SHALL use that PR number for the transition comment
-- **AND** SHALL NOT call `createPr()`
-
-#### Scenario: no existing PR — created during resume
-
-- **WHEN** the resume path runs
-- **AND** `getPrForIssue(cfg, issueNumber)` returns null
-- **THEN** the pipeline SHALL call `createPr()` and use the returned PR number for the transition comment
+## ADDED Requirements
 
 ### Requirement: crash-stranded implementing stage SHALL restart from ready
 
@@ -85,4 +67,3 @@ Because the live-planning marker is set at the start of `planningStage.advance()
 - **WHEN** the `implementing` dispatch runs
 - **THEN** it SHALL evaluate the live-planning marker before inspecting the worktree for commits ahead of base
 - **AND** a live owner SHALL short-circuit to `waiting` without any worktree inspection, rollback, or restart
-

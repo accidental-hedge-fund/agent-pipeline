@@ -77,12 +77,19 @@ test("dispatchResume: worktree exists + commits ahead → calls resumeFromImplem
 });
 
 // ---------------------------------------------------------------------------
-// 3.2: dispatch path — no worktree → waiting (no regression for mid-flight)
+// 3.2: dispatch path — live owner → waiting, no worktree inspection (#382)
+//
+// Before #382 a no-commits worktree always returned "waiting" (an ambiguous
+// no-op). Now that only happens when a live process genuinely owns the stage;
+// an absent/dead marker with no commits is crash-stranded recovery (covered in
+// implementing-crash-recovery.test.ts), not waiting.
 // ---------------------------------------------------------------------------
 
-test("dispatchResume: no worktree → returns waiting (no regression)", async () => {
+test("dispatchResume: live owner + no worktree → returns waiting without inspecting worktree", async () => {
+  let getForIssueCalled = false;
   const deps: DispatchResumeDeps = {
-    getForIssue: async () => null,
+    isLivePlanningActive: () => true,
+    getForIssue: async () => { getForIssueCalled = true; return null; },
     hasCommitsAhead: async () => false,
   };
 
@@ -91,11 +98,14 @@ test("dispatchResume: no worktree → returns waiting (no regression)", async ()
   if (!result.advanced) {
     assert.equal(result.status, "waiting");
   }
+  assert.ok(!getForIssueCalled, "live owner must short-circuit before the worktree is inspected");
 });
 
-test("dispatchResume: worktree exists but no commits ahead → returns waiting", async () => {
+test("dispatchResume: live owner + worktree with no commits ahead → returns waiting without inspecting worktree", async () => {
+  let getForIssueCalled = false;
   const deps: DispatchResumeDeps = {
-    getForIssue: async () => makeWt(),
+    isLivePlanningActive: () => true,
+    getForIssue: async () => { getForIssueCalled = true; return makeWt(); },
     hasCommitsAhead: async () => false,
   };
 
@@ -104,6 +114,7 @@ test("dispatchResume: worktree exists but no commits ahead → returns waiting",
   if (!result.advanced) {
     assert.equal(result.status, "waiting");
   }
+  assert.ok(!getForIssueCalled, "live owner must short-circuit before the worktree is inspected");
 });
 
 // ---------------------------------------------------------------------------

@@ -334,11 +334,19 @@ export async function dispatch(
       }
       return deps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     }
-    case "implementing":
-      // Re-entry: if a worktree with commits exists, resume the post-implementation
-      // steps (gate → push → PR → review-1) without re-planning or re-implementing.
-      // Falls back to "waiting" when no such worktree exists (mid-flight guard).
-      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+    case "implementing": {
+      // Re-entry: gated on the same repo-stable live-planning marker as the
+      // `planning`/`plan-review` recovery (#382). Live owner → waiting; no live
+      // owner + commits ahead → resume post-implementation steps (#175); no
+      // live owner + no commits → crash-stranded, roll back to `ready` and
+      // restart planning.
+      const implDeps = recoveryDeps ?? realPlanningRecoveryDeps();
+      return planningStage.dispatchResume(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps }, {
+        isLivePlanningActive: implDeps.isLivePlanningActive,
+        transition: implDeps.transition,
+        planningAdvance: implDeps.planningAdvance,
+      });
+    }
     default:
       return { advanced: false, status: "error", reason: `unknown stage ${stage}` };
   }

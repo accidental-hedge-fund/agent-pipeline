@@ -58,7 +58,7 @@ import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
-import { setLivePlanningMarker, clearLivePlanningMarker } from "../lock.ts";
+import { setLivePlanningMarker, clearLivePlanningMarker, isLivePlanningActive } from "../lock.ts";
 import {
   verifyHarnessCommits,
   verifyPlanRevisionOutput,
@@ -1399,14 +1399,21 @@ export interface DispatchResumeDeps {
   hasCommitsAhead?: typeof hasCommitsAhead;
   getIssueDetail?: typeof getIssueDetail;
   resumeFromImplementing?: typeof resumeFromImplementing;
+  /** Check if a live planning process is active for this repo+issue (repo-stable). */
+  isLivePlanningActive?: typeof isLivePlanningActive;
+  transition?: typeof transition;
+  planningAdvance?: typeof advance;
 }
 
 /**
- * Dispatch resume for the `implementing` stage: check whether the issue has an
- * existing worktree with commits ahead of the base branch. If so, run the
- * post-implementation steps (test gate → push → PR → review-1) without
- * re-planning or re-implementing. If not, return the existing "nothing to do"
- * waiting response (no regression for mid-flight runs).
+ * Dispatch resume for the `implementing` stage. Re-entry ordering:
+ *   1. Live-planning marker present → a concurrent process owns the stage;
+ *      return `waiting` naming the live owner (no worktree inspection).
+ *   2. No live owner + worktree with commits ahead of base → resume the
+ *      post-implementation steps (test gate → push → PR → review-1), #175.
+ *   3. No live owner + no commits → crash-stranded: roll back to `ready` and
+ *      restart the planning arc, identical to the `planning`/`plan-review`
+ *      recovery (#271).
  */
 export async function dispatchResume(
   cfg: PipelineConfig,
@@ -1418,19 +1425,39 @@ export async function dispatchResume(
   const commitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
   const fetchIssue = deps.getIssueDetail ?? getIssueDetail;
   const doResume = deps.resumeFromImplementing ?? resumeFromImplementing;
+  const checkLive = deps.isLivePlanningActive ?? isLivePlanningActive;
+  const trans = deps.transition ?? transition;
+  const planningAdvance = deps.planningAdvance ?? advance;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
     return { advanced: true, from: "implementing", to: "review-1", summary: "[dry-run] implementing resume" };
   }
 
-  const wt = await getWt(cfg, issueNumber);
-  if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
+  // Liveness first: a live owner may be mid-commit, so the worktree must not be
+  // inspected or acted on at all while the marker is held.
+  if (checkLive(cfg.repo, issueNumber)) {
     return {
       advanced: false,
       status: "waiting",
-      reason: "implementing is set mid-flight by the planning/plan-review handler; nothing to do at this point.",
+      reason: "implementing is owned by a live concurrent planning/implementing run — waiting for it to complete",
     };
+  }
+
+  const wt = await getWt(cfg, issueNumber);
+  if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
+    console.log(
+      `[pipeline] #${issueNumber}: recovered stranded implementing attempt — restarting from ready`,
+    );
+    await trans(cfg, issueNumber, "implementing", "ready", "recovered crashed implementing attempt — restarting");
+    return planningAdvance(cfg, issueNumber, {
+      dryRun: opts.dryRun,
+      model: opts.model,
+      pipelineRunId: opts.pipelineRunId,
+      stateDir: opts.stateDir,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+    });
   }
 
   const primary: Harness = cfg.harnesses.implementer;
