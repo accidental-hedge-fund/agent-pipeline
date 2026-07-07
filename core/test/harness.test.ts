@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { EventEmitter } from "node:events";
 import { invoke, runCapped, formatStderrExcerpt } from "../scripts/harness.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
@@ -463,4 +464,32 @@ test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace p
     (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
     "SIGTERM-ignoring grandchild must be dead after SIGKILL grace period",
   );
+});
+
+// ---------------------------------------------------------------------------
+// capture-stream error (#384) — the output-capture pipe breaking mid-run
+// (e.g. an EPIPE) before a clean process exit is ever observed. Uses an
+// injected spawn to simulate the stream fault deterministically: real OS-level
+// pipe faults are not reproducible portably, but the real runCapped
+// event-wiring/settle logic under test is unchanged and unfaked.
+// ---------------------------------------------------------------------------
+
+test("runCapped: a capture stream erroring mid-run resolves with capture_error, not a hang or a throw (#384)", async () => {
+  // A minimal ChildProcess-shaped fake — only the spawn() OS boundary is faked,
+  // so the assertions below exercise runCapped's real event-wiring/settle logic.
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  setImmediate(() => fakeChild.stdout.emit("error", new Error("EPIPE (simulated)")));
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(result.capture_error, true);
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error ?? false, false, "a capture-stream error is distinct from a spawn error");
 });

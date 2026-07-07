@@ -46,6 +46,10 @@ export interface HarnessResult {
   duration: number; // seconds
   timed_out: boolean;
   spawn_error?: boolean; // true when the process could not be spawned at all
+  // True when the output-capture stream (stdout/stderr) errored before a clean
+  // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
+  // Distinct from spawn_error: the process itself started successfully.
+  capture_error?: boolean;
   // External stage executor evidence (#314). Populated only when the result
   // came from `executors.ts`'s dispatch path (a `stage_executors:` assignment),
   // never for the local claude/codex/custom-reviewer-CLI branches above. Read by
@@ -205,7 +209,14 @@ export async function runCapped(
   timeoutSec: number,
   stream: boolean,
   label: string,
-  opts: { killProcessGroup?: boolean; killGraceSec?: number } = {},
+  opts: {
+    killProcessGroup?: boolean;
+    killGraceSec?: number;
+    // Injectable spawn seam (#384): lets tests simulate a capture stream that
+    // errors mid-run without a real OS-level pipe fault. Defaults to the real
+    // node:child_process spawn.
+    spawnFn?: typeof spawn;
+  } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
   return new Promise<HarnessResult>((resolvePromise) => {
@@ -213,7 +224,8 @@ export async function runCapped(
     // Grace period (seconds) between SIGTERM and SIGKILL on timeout. Configurable
     // so tests can use a short value without waiting the full 5 s default.
     const killGraceSec = opts.killGraceSec ?? 5;
-    const child = spawn(cmd, args, {
+    const spawnImpl = opts.spawnFn ?? spawn;
+    const child = spawnImpl(cmd, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       // detached creates a new process group so we can kill all descendants on timeout
@@ -306,6 +318,28 @@ export async function runCapped(
       }
       if (stream) process.stderr.write(text);
     });
+
+    // A capture stream erroring mid-run (e.g. the pipe breaking before the
+    // process exit is observed) is a tooling failure, not a genuine test
+    // result — without this handler an unhandled stream 'error' would throw
+    // and crash the pipeline process itself (#384).
+    const onCaptureError = (err: Error) => {
+      if (settled) return;
+      clearTimeout(timer);
+      killGroup("SIGTERM");
+      const duration = (Date.now() - start) / 1000;
+      settle({
+        success: false,
+        stdout: stdoutBuf,
+        stderr: `[harness ${label}] output-capture error: ${err.message}\n${stderrBuf}`,
+        exit_code: -1,
+        duration,
+        timed_out: false,
+        capture_error: true,
+      });
+    };
+    child.stdout?.on("error", onCaptureError);
+    child.stderr?.on("error", onCaptureError);
 
     child.on("error", (err) => {
       clearTimeout(timer);

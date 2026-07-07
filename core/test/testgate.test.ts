@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { EventEmitter } from "node:events";
 import {
   detectTestCommand,
   enforceTestFixCommitFormat,
@@ -264,6 +265,26 @@ test("runTests: failing command → passed false with output", async () => {
 
 test("runTests (#384): command that cannot be spawned at all → toolingError true", async () => {
   const res = await runTests(tmpRoot, { cmd: "/no/such/executable-testgate-384", args: [] }, 30);
+  assert.equal(res.passed, false);
+  assert.equal(res.toolingError, true);
+});
+
+test("runTests (#384): capture stream breaks mid-run (no spawn_error) → toolingError true via the real runCapped path", async () => {
+  // Reproduces the reviewer's exact concern: a broken capture pipe with
+  // spawn_error false must still set toolingError. Only the spawn() OS
+  // boundary is faked — runTests and runCapped's real logic run unmodified,
+  // so this proves the actual code path rather than a hand-built RunTestsResult.
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  setImmediate(() => fakeChild.stdout.emit("error", new Error("EPIPE (simulated)")));
+
+  const res = await runTests(tmpRoot, { cmd: "unused", args: [] }, 30, false, spawnFn);
+
   assert.equal(res.passed, false);
   assert.equal(res.toolingError, true);
 });

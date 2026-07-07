@@ -7,6 +7,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { spawn } from "node:child_process";
 import {
   invoke as defaultInvoke,
   runCapped,
@@ -536,6 +537,9 @@ export async function runTests(
   command: ParsedCommand,
   timeoutSec: number,
   killProcessGroup = false,
+  // Injectable spawn seam (#384), forwarded to runCapped — lets tests exercise
+  // this real code path with a simulated capture-stream failure.
+  spawnFn?: typeof spawn,
 ): Promise<RunTestsResult> {
   const res = await runCapped(
     command.cmd,
@@ -544,16 +548,22 @@ export async function runTests(
     timeoutSec,
     true,
     `test-gate:${command.cmd}`,
-    { killProcessGroup },
+    { killProcessGroup, spawnFn },
   );
   let output = combineOutput(res);
   if (res.timed_out) {
     output = `${output}\n\n[test gate timed out after ${timeoutSec}s]`;
   }
   // A timeout is a distinct, already-handled failure mode (the command ran,
-  // just too long) — only a genuine spawn/capture error (no clean exit code
-  // ever observed) is a tooling error (#384).
-  return { passed: res.success, output, durationSec: res.duration, toolingError: !!res.spawn_error };
+  // just too long) — a genuine spawn error (couldn't start at all) or a
+  // capture-stream error (pipe broke before a clean exit was observed) are
+  // both tooling errors (#384), not test failures.
+  return {
+    passed: res.success,
+    output,
+    durationSec: res.duration,
+    toolingError: !!(res.spawn_error || res.capture_error),
+  };
 }
 
 // ---------------------------------------------------------------------------
