@@ -46,6 +46,10 @@ export interface HarnessResult {
   duration: number; // seconds
   timed_out: boolean;
   spawn_error?: boolean; // true when the process could not be spawned at all
+  // True when the output-capture stream (stdout/stderr) errored before a clean
+  // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
+  // Distinct from spawn_error: the process itself started successfully.
+  capture_error?: boolean;
   // External stage executor evidence (#314). Populated only when the result
   // came from `executors.ts`'s dispatch path (a `stage_executors:` assignment),
   // never for the local claude/codex/custom-reviewer-CLI branches above. Read by
@@ -198,6 +202,34 @@ function harnessOutcome(result: HarnessResult): string {
   return "failure";
 }
 
+/** Minimal shape of a stream-forward destination (#384, key 84c9859e) —
+ *  satisfied by `process.stdout`/`process.stderr` and by test fakes. */
+export interface ForwardStream {
+  write(text: string): unknown;
+  on(event: "error", listener: (err: Error) => void): unknown;
+  off(event: "error", listener: (err: Error) => void): unknown;
+}
+
+// Destinations that already carry a permanent 'error' guard (#384 delta
+// review round 2, key 0415ec38). A forwarded write's async EPIPE can land
+// after this call's own settle() has removed its per-call diagnostic
+// listener — Node throws on an 'error' event with zero listeners, which
+// would crash the pipeline even though the command already exited 0. This
+// permanent, once-per-destination listener absorbs any such late error so a
+// stray unhandled event can never surface, independent of exactly when the
+// per-call listener is attached or removed.
+const permanentlyForwardGuarded = new WeakSet<ForwardStream>();
+function ensurePermanentForwardGuard(dest: ForwardStream): void {
+  if (permanentlyForwardGuarded.has(dest)) return;
+  permanentlyForwardGuarded.add(dest);
+  dest.on("error", () => {
+    // Intentionally a no-op: this call's own listener (added below) already
+    // records the diagnostic for any error that lands while it is active.
+    // This permanent listener exists solely so the stream is never left
+    // with zero 'error' listeners.
+  });
+}
+
 export async function runCapped(
   cmd: string,
   args: string[],
@@ -205,7 +237,19 @@ export async function runCapped(
   timeoutSec: number,
   stream: boolean,
   label: string,
-  opts: { killProcessGroup?: boolean; killGraceSec?: number } = {},
+  opts: {
+    killProcessGroup?: boolean;
+    killGraceSec?: number;
+    // Injectable spawn seam (#384): lets tests simulate a capture stream that
+    // errors mid-run without a real OS-level pipe fault. Defaults to the real
+    // node:child_process spawn.
+    spawnFn?: typeof spawn;
+    // Injectable forward-destination seam (#384 delta review, key 84c9859e):
+    // lets tests simulate the DOWNSTREAM side of the pipe — our own
+    // stdout/stderr (terminal-log tee, event-sink socket) — failing while the
+    // child command itself succeeds. Defaults to the real process streams.
+    forwardTo?: { stdout: ForwardStream; stderr: ForwardStream };
+  } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
   return new Promise<HarnessResult>((resolvePromise) => {
@@ -213,7 +257,8 @@ export async function runCapped(
     // Grace period (seconds) between SIGTERM and SIGKILL on timeout. Configurable
     // so tests can use a short value without waiting the full 5 s default.
     const killGraceSec = opts.killGraceSec ?? 5;
-    const child = spawn(cmd, args, {
+    const spawnImpl = opts.spawnFn ?? spawn;
+    const child = spawnImpl(cmd, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       // detached creates a new process group so we can kill all descendants on timeout
@@ -225,12 +270,53 @@ export async function runCapped(
     let lastExitCode: number | null = null;
     let settled = false;
 
+    // Downstream forward failures — OUR stdout/stderr breaking (terminal-log
+    // tee, event-sink socket), not the child's streams — are diagnostics,
+    // never test results: the gate outcome derives solely from the command
+    // exit code (#384 delta review, key 84c9859e). On the first failure stop
+    // forwarding (capture continues unaffected) and carry a one-line note in
+    // the result's stderr. Both delivery shapes are covered: a synchronous
+    // throw from write() and an asynchronous 'error' event on the stream.
+    const fwd = opts.forwardTo ?? { stdout: process.stdout, stderr: process.stderr };
+    let forwardBroken = false;
+    let forwardNote = "";
+    const onForwardError = (err: Error) => {
+      if (forwardBroken) return;
+      forwardBroken = true;
+      forwardNote =
+        `[harness ${label}] stream-forward error (diagnostic; command outcome unaffected): ${err.message}`;
+    };
+    if (stream) {
+      ensurePermanentForwardGuard(fwd.stdout);
+      ensurePermanentForwardGuard(fwd.stderr);
+      fwd.stdout.on("error", onForwardError);
+      fwd.stderr.on("error", onForwardError);
+    }
+    const safeForward = (dest: ForwardStream, text: string) => {
+      if (forwardBroken) return;
+      try {
+        dest.write(text);
+      } catch (err) {
+        onForwardError(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
     const settle = (result: HarnessResult) => {
       if (settled) return;
       settled = true;
       if (killProcessGroup) {
         process.removeListener("SIGINT", sigintHandler);
         process.removeListener("SIGTERM", sigtermHandler);
+      }
+      if (stream) {
+        fwd.stdout.off("error", onForwardError);
+        fwd.stderr.off("error", onForwardError);
+      }
+      if (forwardNote) {
+        result = {
+          ...result,
+          stderr: result.stderr ? `${result.stderr}\n${forwardNote}` : forwardNote,
+        };
       }
       resolvePromise(result);
     };
@@ -296,7 +382,7 @@ export async function runCapped(
         stdoutBuf += text;
         if (stdoutBuf.length > MAX_OUTPUT) stdoutBuf = stdoutBuf.slice(0, MAX_OUTPUT);
       }
-      if (stream) process.stdout.write(text);
+      if (stream) safeForward(fwd.stdout, text);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
@@ -304,8 +390,30 @@ export async function runCapped(
         stderrBuf += text;
         if (stderrBuf.length > MAX_OUTPUT) stderrBuf = stderrBuf.slice(0, MAX_OUTPUT);
       }
-      if (stream) process.stderr.write(text);
+      if (stream) safeForward(fwd.stderr, text);
     });
+
+    // A capture stream erroring mid-run (e.g. the pipe breaking before the
+    // process exit is observed) is a tooling failure, not a genuine test
+    // result — without this handler an unhandled stream 'error' would throw
+    // and crash the pipeline process itself (#384).
+    const onCaptureError = (err: Error) => {
+      if (settled) return;
+      clearTimeout(timer);
+      killGroup("SIGTERM");
+      const duration = (Date.now() - start) / 1000;
+      settle({
+        success: false,
+        stdout: stdoutBuf,
+        stderr: `[harness ${label}] output-capture error: ${err.message}\n${stderrBuf}`,
+        exit_code: -1,
+        duration,
+        timed_out: false,
+        capture_error: true,
+      });
+    };
+    child.stdout?.on("error", onCaptureError);
+    child.stderr?.on("error", onCaptureError);
 
     child.on("error", (err) => {
       clearTimeout(timer);

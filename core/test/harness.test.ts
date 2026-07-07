@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { EventEmitter } from "node:events";
 import { invoke, runCapped, formatStderrExcerpt } from "../scripts/harness.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
@@ -462,5 +463,139 @@ test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace p
     () => process.kill(grandchildPid, 0),
     (err: unknown) => (err as NodeJS.ErrnoException).code === "ESRCH",
     "SIGTERM-ignoring grandchild must be dead after SIGKILL grace period",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// capture-stream error (#384) — the output-capture pipe breaking mid-run
+// (e.g. an EPIPE) before a clean process exit is ever observed. Uses an
+// injected spawn to simulate the stream fault deterministically: real OS-level
+// pipe faults are not reproducible portably, but the real runCapped
+// event-wiring/settle logic under test is unchanged and unfaked.
+// ---------------------------------------------------------------------------
+
+test("runCapped: a capture stream erroring mid-run resolves with capture_error, not a hang or a throw (#384)", async () => {
+  // A minimal ChildProcess-shaped fake — only the spawn() OS boundary is faked,
+  // so the assertions below exercise runCapped's real event-wiring/settle logic.
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  setImmediate(() => fakeChild.stdout.emit("error", new Error("EPIPE (simulated)")));
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(result.capture_error, true);
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error ?? false, false, "a capture-stream error is distinct from a spawn error");
+});
+
+// ---------------------------------------------------------------------------
+// forward-stream error (#384 delta review, key 84c9859e) — the DOWNSTREAM
+// side of the pipe (our own stdout/stderr: terminal-log tee, event-sink
+// socket) failing while the child command succeeds. Distinct from the
+// capture-stream case above: the child's streams are healthy, so the gate
+// result must stay tied to the command exit code — a sink write failure is a
+// diagnostic, never a failed attempt. Covers both delivery shapes: a
+// synchronous throw from write() and an asynchronous 'error' event.
+// ---------------------------------------------------------------------------
+
+for (const [shape, makeForwardStdout] of [
+  [
+    "write() throws synchronously",
+    () =>
+      Object.assign(new EventEmitter(), {
+        write: () => { throw new Error("EPIPE (simulated sink fault)"); },
+      }),
+  ],
+  [
+    "stream emits an asynchronous 'error'",
+    () => {
+      const s = Object.assign(new EventEmitter(), { write: () => true });
+      setImmediate(() => s.emit("error", new Error("EPIPE (simulated sink fault)")));
+      return s;
+    },
+  ],
+] as const) {
+  test(`runCapped: forward-stream failure (${shape}) with a passing command → success, exit 0, diagnostic only (#384 84c9859e)`, async () => {
+    const fakeChild = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      pid: 999999,
+      kill: () => true,
+    });
+    const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+    const forwardTo = {
+      stdout: makeForwardStdout() as never,
+      stderr: Object.assign(new EventEmitter(), { write: () => true }) as never,
+    };
+
+    setImmediate(() => {
+      fakeChild.stdout.emit("data", Buffer.from("tests: 10/10 passed\n"));
+      // Give the async 'error' shape a tick to deliver before the clean exit.
+      setImmediate(() => {
+        fakeChild.stdout.emit("data", Buffer.from("done\n"));
+        fakeChild.emit("close", 0);
+      });
+    });
+
+    const result = await runCapped("unused", [], tmpRoot, 30, true, "test", { spawnFn, forwardTo });
+
+    assert.equal(result.success, true, "a sink write failure must not convert a passing command into a failure");
+    assert.equal(result.exit_code, 0, "gate outcome derives solely from the command exit code");
+    assert.equal(result.capture_error ?? false, false, "sink faults are not capture errors — the child streams were healthy");
+    assert.ok(result.stdout.includes("tests: 10/10 passed"), "capture continues after the forward path breaks");
+    assert.ok(
+      result.stderr.includes("stream-forward error (diagnostic"),
+      "the sink fault is recorded as a diagnostic note",
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// late forward-stream error (#384 delta review round 2, key 0415ec38) — the
+// sink's async EPIPE can arrive AFTER the child has already closed and
+// runCapped has settled, by which point the per-call diagnostic listener
+// added above has already been detached. Before the fix, this ordering left
+// the destination stream with zero 'error' listeners: emitting 'error' with
+// no listener throws synchronously inside the emit() call below, which
+// would surface as an uncaught exception and crash the whole test process —
+// exactly the pipeline crash the finding describes, on a command that
+// already exited 0.
+// ---------------------------------------------------------------------------
+
+test("runCapped: a forward-stream error arriving after settle is absorbed, not an unhandled crash (#384 0415ec38)", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  const forwardTo = {
+    stdout: Object.assign(new EventEmitter(), { write: () => true }),
+    stderr: Object.assign(new EventEmitter(), { write: () => true }),
+  };
+
+  setImmediate(() => {
+    fakeChild.stdout.emit("data", Buffer.from("tests: 10/10 passed\n"));
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, true, "test", { spawnFn, forwardTo });
+
+  assert.equal(result.success, true, "a passing command must still resolve successfully");
+  assert.equal(result.exit_code, 0, "gate outcome derives solely from the command exit code");
+
+  // The command has already settled and this call's own listener is gone —
+  // emitting now reproduces the exact late-arrival race. If this throws, the
+  // fix regressed: the destination is left with no 'error' listener.
+  assert.doesNotThrow(
+    () => forwardTo.stdout.emit("error", new Error("EPIPE (simulated, late)")),
+    "a forward error landing after settle must not be an unhandled 'error' event",
   );
 });
