@@ -303,7 +303,7 @@ const anyCfg = cfg([{ command: "fmt", auto_fix: true }]) as unknown as PipelineC
 // Build injected gate deps from per-round scripted results.
 function convergeDeps(
   fmt: Array<{ status: "ok"; committed: boolean } | { status: "blocked"; reason: string }>,
-  test: Array<{ skipped?: boolean; passed?: boolean; attempts?: number; blockReason?: string }>,
+  test: Array<{ skipped?: boolean; passed?: boolean; attempts?: number; blockReason?: string; buildFailure?: boolean }>,
 ): { deps: FormatTestGateDeps; fmtCalls: () => number; testCalls: () => number } {
   let fi = 0;
   let ti = 0;
@@ -312,7 +312,10 @@ function convergeDeps(
       runFormatGate: (async () => fmt[Math.min(fi++, fmt.length - 1)]) as FormatTestGateDeps["runFormatGate"],
       runTestGate: (async () => {
         const r = test[Math.min(ti++, test.length - 1)];
-        return { skipped: r.skipped ?? false, passed: r.passed ?? true, attempts: r.attempts ?? 0, blockReason: r.blockReason };
+        return {
+          skipped: r.skipped ?? false, passed: r.passed ?? true, attempts: r.attempts ?? 0,
+          blockReason: r.blockReason, buildFailure: r.buildFailure,
+        };
       }) as FormatTestGateDeps["runTestGate"],
     },
     fmtCalls: () => fi,
@@ -374,4 +377,78 @@ test("runFormatAndTestGates: non-convergence at the round cap → blocked (sourc
   assert.equal(res.ok, false);
   assert.equal(res.ok === false && res.source, "noconverge");
   assert.ok(c.fmtCalls() <= 3 && c.testCalls() <= 3, "iterations are bounded (no infinite loop)");
+});
+
+// ---------------------------------------------------------------------------
+// Regression: format-gate auto-fix commits must also fold declared build
+// artifacts, not just the round's initial commit (#387 review-2 finding 1).
+// Bites: without the foldBuildArtifacts call in the loop, a formatter commit
+// that edits source ships with stale generated artifacts.
+// ---------------------------------------------------------------------------
+
+test("runFormatAndTestGates (#387 review-2 finding 1, bites): a format-gate auto-fix commit triggers the build fold before the test gate re-runs", async () => {
+  const c = convergeDeps(
+    [{ status: "ok", committed: true }, { status: "ok", committed: false }],
+    [{ passed: true, attempts: 0 }, { passed: true, attempts: 0 }],
+  );
+  const calls: string[] = [];
+  const deps: FormatTestGateDeps = {
+    ...c.deps,
+    foldBuildArtifacts: async (wtPath) => { calls.push(wtPath); return { ok: true }; },
+  };
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, deps);
+  assert.equal(res.ok, true);
+  assert.deepEqual(calls, ["/wt"], "the build fold must run exactly once, after the format-gate commit");
+});
+
+test("runFormatAndTestGates: no format-gate commit → build fold is never attempted", async () => {
+  const c = convergeDeps([{ status: "ok", committed: false }], [{ passed: true, attempts: 0 }]);
+  let foldCalls = 0;
+  const deps: FormatTestGateDeps = {
+    ...c.deps,
+    foldBuildArtifacts: async () => { foldCalls++; return { ok: true }; },
+  };
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, deps);
+  assert.equal(res.ok, true);
+  assert.equal(foldCalls, 0);
+});
+
+test("runFormatAndTestGates: no foldBuildArtifacts hook supplied → format-gate commit path is unaffected (undeclared build_command, or a non-fix caller like the implementing stage, stays inert)", async () => {
+  const c = convergeDeps(
+    [{ status: "ok", committed: true }, { status: "ok", committed: false }],
+    [{ passed: true, attempts: 0 }, { passed: true, attempts: 0 }],
+  );
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, true);
+});
+
+test("runFormatAndTestGates (#387 review-2 finding 1, bites): build fold failure after a format-gate commit blocks with source=build, distinct from source=format/test", async () => {
+  const c = convergeDeps([{ status: "ok", committed: true }], [{ passed: true, attempts: 0 }]);
+  const deps: FormatTestGateDeps = {
+    ...c.deps,
+    foldBuildArtifacts: async () => ({ ok: false, reason: "Declared build_command 'npm run build' failed" }),
+  };
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, deps);
+  assert.equal(res.ok, false);
+  assert.equal(res.ok === false && res.source, "build");
+  assert.equal(res.ok === false && res.reason, "Declared build_command 'npm run build' failed");
+  assert.equal(c.testCalls(), 0, "the test gate must not re-run against a stale-artifact commit");
+});
+
+// ---------------------------------------------------------------------------
+// Regression: propagate a build failure surfaced from the auto-fix (test-gate
+// fix-loop) attempt into source=build, not source=test (#387 review-2
+// next-step 2). Bites: without gate.buildFailure routing, this maps to
+// source=test → the caller reports blockerKind test-gate-exhausted instead of
+// build-failed.
+// ---------------------------------------------------------------------------
+
+test("runFormatAndTestGates (#387 review-2, bites): a test-gate result flagged buildFailure maps to source=build, not source=test", async () => {
+  const c = convergeDeps(
+    [{ status: "ok", committed: false }],
+    [{ passed: false, attempts: 1, blockReason: "Declared build_command 'npm run build' failed", buildFailure: true }],
+  );
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, false);
+  assert.equal(res.ok === false && res.source, "build");
 });

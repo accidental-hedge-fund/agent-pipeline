@@ -185,6 +185,7 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
     case "test-gate-exhausted":
     case "no-commits":
     case "push-failed":
+    case "build-failed":
       return "test-build-failure";
     case "eval-gate-failed":
     case "eval-gate-misconfigured":

@@ -116,14 +116,25 @@ export async function runFormatGate(
 export type FormatTestGateResult =
   | { ok: true; gate: TestGateResult }
   // `source` identifies why it blocked so the caller can pass the matching
-  // literal BlockerKind: "test" → test-gate-exhausted; "format" (a format/lint
-  // failure) and "noconverge" (gates still mutating at the round cap) →
-  // needs-human.
-  | { ok: false; reason: string; source: "format" | "test" | "noconverge" };
+  // literal BlockerKind: "test" → test-gate-exhausted; "build" (#387: a
+  // declared build_command failed while rebuilding artifacts) → build-failed;
+  // "format" (a format/lint failure) and "noconverge" (gates still mutating at
+  // the round cap) → needs-human.
+  | { ok: false; reason: string; source: "format" | "test" | "noconverge" | "build" };
 
 export interface FormatTestGateDeps {
   runFormatGate?: typeof runFormatGate;
   runTestGate?: typeof runTestGate;
+  /**
+   * Build-artifact rebuild-and-fold (#387), run after a format-gate auto-fix
+   * commit and before the test gate re-runs, so a formatter-created commit's
+   * generated artifacts stay fresh too — not just the round's initial commit.
+   * Absent (the default) is a no-op: only the fix stage supplies this (gated
+   * on a declared `build_command`), so other `runFormatAndTestGates` callers
+   * (e.g. the `implementing` stage) are unaffected, per #387's non-goal of
+   * scoping build behavior to fix/auto-fix commits.
+   */
+  foldBuildArtifacts?: (wtPath: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 /** Maximum format↔test iterations before proceeding with whatever passed last. */
@@ -164,9 +175,20 @@ export async function runFormatAndTestGates(
       return { ok: false, reason: fmtResult.reason, source: "format" };
     }
 
+    // #387 review-2 finding 1: a format-gate auto-fix commit can modify source
+    // after the round's initial build-artifact fold already ran, leaving
+    // generated artifacts stale. Fold again here, before the test gate
+    // re-runs, so a formatter-created commit's artifacts stay fresh too.
+    if (fmtResult.committed && deps.foldBuildArtifacts) {
+      const buildFold = await deps.foldBuildArtifacts(wtPath);
+      if (!buildFold.ok) {
+        return { ok: false, reason: buildFold.reason, source: "build" };
+      }
+    }
+
     gate = await test(cfg, issueNumber, wtPath, {}, pipelineRunId, stage, stateDir, runDir, runStoreDeps);
     if (!gate.skipped && !gate.passed) {
-      return { ok: false, reason: testGateBlockReason(gate), source: "test" };
+      return { ok: false, reason: testGateBlockReason(gate), source: gate.buildFailure ? "build" : "test" };
     }
 
     // Converged: the format gate committed nothing this round AND the test gate's

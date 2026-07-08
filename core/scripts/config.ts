@@ -245,6 +245,10 @@ const PartialConfigSchema = z.object({
   // Worktree bootstrap: dependency install step (#174). Non-empty string →
   // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
   setup_command: z.string().optional().describe("Shell command to run in the worktree after creation, before the test gate."),
+  // Repo build command run after fix/auto-fix edits (#387). Mirrors setup_command:
+  // a bare shell string, run via `bash -c`. Absent → inert, no build runs, no
+  // default/guessed command, no auto-detection.
+  build_command: z.string().optional().describe("Repo build command run after fix/auto-fix edits; its output is folded into the round commit so committed generated artifacts stay fresh."),
   // Format/lint normalization gate (#182). Each entry runs after implementing
   // and fix-round harnesses exit. auto_fix: true commits changes and re-runs;
   // auto_fix: false blocks on non-zero exit without committing.
@@ -679,6 +683,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     domain_name: fileConfig.domain_name,
     domain_description: fileConfig.domain_description,
     setup_command: fileConfig.setup_command,
+    build_command: fileConfig.build_command,
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
     trusted_override_actors: fileConfig.trusted_override_actors,
@@ -1537,6 +1542,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         '#     setup_command: "pnpm install && pnpm run build:types"   # multi-step setup',
       ].join("\n"),
     "",
+    config.build_command !== undefined
+      ? `build_command: ${yamlScalar(config.build_command)} # shell command run after fix/auto-fix edits; its output is folded into the round commit`
+      : [
+        '# build_command: "npm run build" # repo build command run after fix/auto-fix edits (#387)',
+        "#   When declared, fix and auto-fix rounds run it after committing source edits and fold any",
+        "#   resulting generated-artifact changes (dist/, a plugin manifest, …) into the round commit,",
+        "#   so committed artifacts stay fresh and a CI artifact-drift check never fails on drift the",
+        "#   round itself introduced. Absent (default): no build runs, no auto-detection, no fallback.",
+      ].join("\n"),
+    "",
     renderOptionalArray("format_gate", config.format_gate, [
       "# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)",
       "#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;",
@@ -1647,6 +1662,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     review_policy: { ...d.review_policy, ...config.review_policy },
     doctor: { ...d.doctor, ...config.doctor },
     setup_command: config.setup_command,
+    build_command: config.build_command,
     conventions_md_path: config.conventions_md_path,
     domain_name: config.domain_name,
     domain_description: config.domain_description,

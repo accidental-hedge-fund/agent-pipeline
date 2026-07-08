@@ -146,6 +146,11 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "issue), or set `setup_command: \"\"` in `.github/pipeline.yml` to skip " +
     "the install step. Then remove the `blocked` label and re-run " +
     "`$pipeline 7`.",
+  "build-failed":
+    "The declared `build_command` failed while rebuilding generated artifacts " +
+    "for this round's commit (see the output above). Fix the build in the " +
+    "worktree, commit the fix, remove the `blocked` label, then re-run " +
+    "`$pipeline 7`.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {
