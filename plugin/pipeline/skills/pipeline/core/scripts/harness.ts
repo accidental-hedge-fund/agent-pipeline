@@ -290,12 +290,38 @@ export async function runCapped(
     const killGraceSec = opts.killGraceSec ?? 5;
     const hardDeadlineSec = opts.hardDeadlineSec ?? 30;
     const spawnImpl = opts.spawnFn ?? spawn;
-    const child = spawnImpl(cmd, args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      // detached creates a new process group so we can kill all descendants on timeout
-      ...(killProcessGroup ? { detached: true } : {}),
-    });
+    // node:child_process spawn() throws SYNCHRONOUSLY for certain argv contents —
+    // most notably TypeError [ERR_INVALID_ARG_VALUE] when an argv string contains a
+    // NUL byte (U+0000). The reviewer prompt is assembled from reviewed source, so a
+    // NUL byte anywhere in it reaches spawn() as an argv entry. Left unguarded, that
+    // throw escapes this Promise executor and crashes the whole pipeline process
+    // (#393) instead of resolving the same spawn_error HarnessResult the async
+    // child.on("error") path below already produces.
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawnImpl(cmd, args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        // detached creates a new process group so we can kill all descendants on timeout
+        ...(killProcessGroup ? { detached: true } : {}),
+      });
+    } catch (err) {
+      const duration = (Date.now() - start) / 1000;
+      const message = err instanceof Error ? err.message : String(err);
+      const isNulByte =
+        (err as { code?: string })?.code === "ERR_INVALID_ARG_VALUE" && /null bytes?/i.test(message);
+      const marker = isNulByte ? "NUL byte (U+0000) detected in harness argv payload\n" : "";
+      resolvePromise({
+        success: false,
+        stdout: "",
+        stderr: `${marker}[harness ${label}] spawn error: ${message}`,
+        exit_code: -1,
+        duration,
+        timed_out: false,
+        spawn_error: true,
+      });
+      return;
+    }
     let stdoutBuf = "";
     let stderrBuf = "";
     let timedOut = false;
