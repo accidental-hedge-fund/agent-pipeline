@@ -608,6 +608,24 @@ test("buildPRBody: states merging is the final step and labels the tag command a
   );
 });
 
+test("buildPRBody: names RELEASE_TAG_TOKEN and its provisioning in the fallback footer", () => {
+  const body = buildPRBody(SAMPLE_CTX, "v1.5.0");
+
+  assert.ok(body.includes("RELEASE_TAG_TOKEN"), "names the RELEASE_TAG_TOKEN secret");
+  assert.ok(
+    /fine-grained pat/i.test(body),
+    "describes the fine-grained PAT provisioning requirement",
+  );
+  assert.ok(
+    /contents:\s*read/i.test(body) && /contents:\s*write/i.test(body),
+    "names the contents: read + contents: write scopes",
+  );
+  assert.ok(
+    /repository actions secret/i.test(body),
+    "states it must be added as a repository Actions secret",
+  );
+});
+
 test("buildPRBody: uses placeholder when no shipped PRs", () => {
   const ctx: ReleaseContext = {
     ...SAMPLE_CTX,

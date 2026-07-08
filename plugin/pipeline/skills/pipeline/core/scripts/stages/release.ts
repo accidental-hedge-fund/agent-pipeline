@@ -722,6 +722,8 @@ export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
     `git tag -a v${version} -m "v${version} — ${theme}" && git push origin v${version}`,
     "```",
     "",
+    "The automation requires the `RELEASE_TAG_TOKEN` repository secret (a fine-grained PAT with `contents: read` + `contents: write` on this repository, added as a repository Actions secret). If this is the first release on this repo, confirm it's provisioned — otherwise the auto-tag workflow falls back to the manual step above.",
+    "",
     "_Prepared by `pipeline release`_",
   ].join("\n");
 }

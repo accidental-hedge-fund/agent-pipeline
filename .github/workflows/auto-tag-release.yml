@@ -16,6 +16,13 @@ name: auto-tag-release
 # feature commit that happens to start with "release:" can never tag by accident.
 # The detection pattern below is single-sourced and drift-guarded by
 # core/test/auto-tag-release-workflow.test.ts against release.ts's title format.
+#
+# Setup: RELEASE_TAG_TOKEN must be provisioned (a fine-grained PAT with
+# `contents: read` + `contents: write` on this repo, added as a repository Actions
+# secret named RELEASE_TAG_TOKEN) before a release merge can push the tag. It is
+# consumed ONLY by the "Create and push annotated tag" step below — checkout uses
+# the default GITHUB_TOKEN, so non-release pushes to main are unaffected by whether
+# the secret is provisioned.
 
 on:
   push:
@@ -32,7 +39,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history + tags
-          token: ${{ secrets.RELEASE_TAG_TOKEN }}
 
       - name: Detect release merge (subject)
         id: detect
@@ -112,9 +118,15 @@ jobs:
 
       - name: Create and push annotated tag
         if: steps.exists.outputs.exists == 'false'
+        env:
+          RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
         run: |
+          if [ -z "$RELEASE_TAG_TOKEN" ]; then
+            echo "::error::RELEASE_TAG_TOKEN is empty/absent — this release merge cannot be tagged. Provision a fine-grained PAT with 'contents: read' and 'contents: write' on this repository, and add it as a repository Actions secret named RELEASE_TAG_TOKEN."
+            exit 1
+          fi
           version="${{ steps.detect.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v${version}" -F /tmp/release-notes.md "${{ github.sha }}"
-          git push origin "refs/tags/v${version}"
+          git push "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git" "refs/tags/v${version}"
