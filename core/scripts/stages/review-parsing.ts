@@ -190,84 +190,8 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   return hashReviewBody(prefix) === artifact.bodyHash;
 }
 
-/**
- * Find the bodyHash rollout boundary for a single issue/PR's own comment
- * history (#390 delta, finding 7b445e1e): the earliest `createdAt` among
- * `trustedComments` whose body is a fully verified, current-format pipeline
- * review artifact (i.e. `isVerifiedPipelineReviewOutput` — a valid bodyHash
- * that matches the rendered body). That timestamp is real, observed evidence
- * that THIS installation was already emitting bodyHash by then — unlike a
- * hard-coded calendar date, it cannot predate the actual rollout, because it
- * IS the rollout as seen in this thread. Returns null when no such comment
- * exists yet, meaning this installation has not (yet, as far as this thread
- * shows) started emitting bodyHash, so there is no basis to suspect a
- * stripped field and the structural legacy check should apply unconditionally.
- */
-export function computeBodyHashRolloutBoundary(
-  comments: ReadonlyArray<{ body: string; createdAt: string }>,
-  trustedComments: ReadonlyArray<{ body: string; createdAt: string }>,
-): string | null {
-  let boundary: string | null = null;
-  let boundaryMs = Infinity;
-  for (const c of comments) {
-    if (!trustedComments.includes(c)) continue;
-    if (!isVerifiedPipelineReviewOutput(c.body)) continue;
-    const ms = Date.parse(c.createdAt);
-    if (!Number.isFinite(ms) || ms >= boundaryMs) continue;
-    boundary = c.createdAt;
-    boundaryMs = ms;
-  }
-  return boundary;
-}
 
-/**
- * Legacy verification for review comments that provably predate this
- * installation's own bodyHash rollout (#390 delta, keys e0b0c22e + 06e32d8d;
- * revised for finding 7b445e1e). `createdAtIso` is GitHub's server-assigned
- * comment timestamp — an author cannot backdate it. `rolloutBoundaryIso`
- * (from `computeBodyHashRolloutBoundary`) is the observed timestamp of this
- * thread's own earliest verified current-format comment, not a speculative
- * calendar cutoff — a hard-coded date risked stranding legitimate no-bodyHash
- * comments if this change reached production later than guessed. A comment
- * created at or after that boundary without a bodyHash is tampered (the
- * field was stripped), not historical, and never verifies here. When
- * `rolloutBoundaryIso` is null (no evidence yet that this installation emits
- * bodyHash), the date check is skipped and only the structural check below
- * applies. For genuinely historical comments the check is structural: the
- * artifact decodes with no bodyHash, nothing follows the artifact line, and
- * the body is review output from its FIRST line (prepended objections break
- * the anchor and gate). Residual gap, confined to pre-boundary history only:
- * text inserted between a historical heading and its artifact is
- * undetectable without a hash.
- */
-export function isLegacyVerifiedPipelineReviewOutput(
-  body: string,
-  createdAtIso: string,
-  rolloutBoundaryIso: string | null,
-): boolean {
-  const created = Date.parse(createdAtIso);
-  if (!Number.isFinite(created)) return false;
-  if (rolloutBoundaryIso !== null) {
-    const boundary = Date.parse(rolloutBoundaryIso);
-    if (Number.isFinite(boundary) && created >= boundary) return false;
-  }
-  const artifact = extractReviewArtifact(body);
-  if (artifact === null || typeof artifact.bodyHash === "string") return false;
-  REVIEW_ARTIFACT_RE.lastIndex = 0;
-  let lastMatch: RegExpExecArray | null = null;
-  let cur: RegExpExecArray | null;
-  while ((cur = REVIEW_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
-  REVIEW_ARTIFACT_RE.lastIndex = 0;
-  if (lastMatch === null) return false;
-  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
-  return LEGACY_REVIEW_OUTPUT_HEADING_RE.test(body.trimStart());
-}
 
-// Review artifacts are only emitted on review-verdict comments (`## Review N`
-// by formatReviewComment, `## Pre-merge Delta Review` by
-// formatDeltaReviewComment) — the legacy acceptance path anchors on exactly
-// those headings (#390 delta, key e0b0c22e).
-const LEGACY_REVIEW_OUTPUT_HEADING_RE = /^## (?:Review \d+\b|Pre-merge Delta Review\b)/;
 
 // ---------------------------------------------------------------------------
 // computeDiffHash

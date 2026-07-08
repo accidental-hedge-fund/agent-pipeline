@@ -755,11 +755,11 @@ test("findUnacknowledgedComments: human objection inserted before the trailing a
   assert.equal(unacked[0].author, "operator");
 });
 
-// #390 pre-merge delta, key e0b0c22e: review comments rendered BEFORE the
-// bodyHash field existed can never carry it — treating them all as unverified
-// re-gates existing review history (the castrecall #45 acceptance scenario).
-// A legacy artifact is accepted when the body is structurally complete review
-// output from its first line and nothing follows the artifact.
+// #390 option A (operator-blessed): there is NO legacy verification path —
+// a historical no-bodyHash verdict with objection wording gates ONCE, and a
+// plain acknowledgment from the trusted actor clears it permanently. Three
+// legacy-verifier variants each left a forgeable or stranding hole (#390
+// delta keys 06e32d8d, 7b445e1e, 37da0054).
 
 function stripBodyHash(body: string): string {
   const lines = body.split("\n");
@@ -772,8 +772,8 @@ function stripBodyHash(body: string): string {
   return lines.join("\n");
 }
 
-test("findUnacknowledgedComments: legacy pre-bodyHash review verdict with objection wording is not counted (#390 delta e0b0c22e)", () => {
-  const deltaReviewBody = stripBodyHash(formatDeltaReviewComment(
+test("findUnacknowledgedComments: historical no-bodyHash verdict gates once, then a plain acknowledgment clears it (#390 option A)", () => {
+  const legacyVerdict = stripBodyHash(formatDeltaReviewComment(
     undefined as unknown as PipelineConfig,
     {
       verdict: "needs-attention",
@@ -791,19 +791,26 @@ test("findUnacknowledgedComments: legacy pre-bodyHash review verdict with object
     "codex",
     new Set(["ed310f32"]),
   ));
-  const comments = [
+  const withoutAck = [
     makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
-    makeComment("operator", deltaReviewBody, ts(1)),
+    makeComment("operator", legacyVerdict, ts(1)),
   ];
-  const trusted = [comments[1]];
-  const unacked = findUnacknowledgedComments(comments, trusted);
   assert.equal(
-    unacked.length, 0,
-    "a genuine legacy (pre-bodyHash) review verdict must not gate on its own wording — existing history must not re-block resumes",
+    findUnacknowledgedComments(withoutAck, [withoutAck[1]]).length, 1,
+    "an unverifiable historical verdict with objection wording gates on first resume (fail closed)",
+  );
+
+  // The operator posts a plain acknowledgment — no scope-changing language —
+  // which anchors past the historical verdict and clears it permanently.
+  const ack = makeComment("operator", "Acknowledged — that is the pipeline's own prior verdict, carry on.", ts(2));
+  const withAck = [...withoutAck, ack];
+  assert.equal(
+    findUnacknowledgedComments(withAck, [withAck[1], ack]).length, 0,
+    "a plain trusted acknowledgment clears the historical verdict via the anchor mechanism",
   );
 });
 
-test("findUnacknowledgedComments: objection prepended before a legacy review verdict still gates (#390 delta e0b0c22e)", () => {
+test("findUnacknowledgedComments: objection prepended before a historical no-bodyHash verdict gates (#390 option A)", () => {
   const legacy = stripBodyHash(formatDeltaReviewComment(
     undefined as unknown as PipelineConfig,
     {
@@ -874,36 +881,4 @@ test("findUnacknowledgedComments: stripped bodyHash comment created after this t
   );
 });
 
-// Without an observed boundary (no verified bodyHash comment anywhere in this
-// thread yet), a no-bodyHash artifact is not treated as suspicious purely for
-// being recent — there's no evidence this installation has adopted bodyHash
-// at all, so a speculative calendar date must not be substituted (#390 delta
-// 7b445e1e).
-test("findUnacknowledgedComments: no-bodyHash comment with no observed rollout boundary is still legacy-eligible regardless of recency", () => {
-  const legacy = stripBodyHash(formatDeltaReviewComment(
-    undefined as unknown as PipelineConfig,
-    {
-      verdict: "needs-attention",
-      summary: "No-ship: do not proceed.",
-      findings: [],
-      next_steps: [],
-      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
-    },
-    "codex",
-    undefined,
-  ));
-  const comments = [
-    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", "2026-07-01T00:00:00Z"),
-    // Recent timestamp — under the old hard-coded-date design this would
-    // have been rejected as "post-rollout"; there is no other evidence in
-    // this thread that bodyHash is even in use here.
-    makeComment("operator", legacy, "2027-01-01T00:00:00Z"),
-  ];
-  const trusted = [comments[1]];
-  const unacked = findUnacknowledgedComments(comments, trusted);
-  assert.equal(
-    unacked.length, 0,
-    "no-bodyHash comment must not gate on a speculative recency check when no boundary is observed",
-  );
-});
 
