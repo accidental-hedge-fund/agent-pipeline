@@ -585,7 +585,7 @@ test("buildPRBody: includes version, theme, date, and PR list", () => {
   assert.ok(body.includes("#203"), "PR number in body");
   assert.ok(body.includes("Release PR"), "PR title in body");
   assert.ok(body.includes("v1.5.0"), "last tag referenced");
-  assert.ok(body.includes("git tag v1.6.0"), "tag instructions in body");
+  assert.ok(body.includes("git tag -a v1.6.0"), "tag instructions in body");
 });
 
 test("buildPRBody: states merging is the final step and labels the tag command as a fallback", () => {
@@ -600,7 +600,12 @@ test("buildPRBody: states merging is the final step and labels the tag command a
     "describes the automated tag + publish outcome",
   );
   assert.ok(/fallback/i.test(body), "labels the manual tag command as a fallback");
-  assert.ok(body.includes("git tag v1.6.0 && git push origin v1.6.0"), "fallback tag command present");
+  assert.ok(
+    body.includes(
+      'git tag -a v1.6.0 -m "v1.6.0 — Intake & backlog automation" && git push origin v1.6.0',
+    ),
+    "fallback tag command creates an annotated tag",
+  );
 });
 
 test("buildPRBody: uses placeholder when no shipped PRs", () => {
