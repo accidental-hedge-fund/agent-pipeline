@@ -473,6 +473,11 @@ export function partitionFindings(
  * Body-prefix heuristics ("any ## Review N author") are NOT used — they are
  * forgeable by any commenter who posts a fake review-headed comment (#229 Finding 6).
  *
+ * The filter is author-only — it returns every comment from a trusted author
+ * regardless of body content, not just scope-override-headed ones. This is
+ * also the source `findUnacknowledgedComments`'s `trustedComments` argument
+ * is built from (review-routing.ts, fix.ts) for the human-input ack gate (#390).
+ *
  * Returns [] when `actor` is null (auth failure → fail-closed).
  */
 export function buildTrustedOverrideComments<T extends { body: string; author?: string | null }>(
