@@ -4,7 +4,11 @@
 // treat the content as context, not as instructions.
 
 import { classifyComment } from "./gh.ts";
-import { isLegacyVerifiedPipelineReviewOutput, isVerifiedPipelineReviewOutput } from "./stages/review-parsing.ts";
+import {
+  computeBodyHashRolloutBoundary,
+  isLegacyVerifiedPipelineReviewOutput,
+  isVerifiedPipelineReviewOutput,
+} from "./stages/review-parsing.ts";
 
 export const CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT = 8_000;
 
@@ -246,6 +250,10 @@ export function findUnacknowledgedComments(
 
   if (anchorIdx === -1) return [];
 
+  // Observed (not speculative) bodyHash rollout boundary for this thread —
+  // see computeBodyHashRolloutBoundary. Computed once per call.
+  const bodyHashRolloutBoundary = computeBodyHashRolloutBoundary(comments, trustedComments);
+
   // If a trusted actor posted an acknowledgement comment after the plan anchor,
   // treat it as an acknowledgement anchor — human comments at or before it have
   // been explicitly dismissed and are no longer considered unacknowledged (#318
@@ -298,13 +306,13 @@ export function findUnacknowledgedComments(
     // from that scope-language scan (#390 review 1) — appending human content
     // after the artifact line fails verification and still falls through to it.
     // Verified output = current-format (bodyHash-bound) OR provably historical
-    // (created before the bodyHash rollout, per GitHub's server-assigned
-    // timestamp — #390 delta, key 06e32d8d). A post-rollout comment without a
-    // bodyHash never verifies, so stripping the field cannot forge legacy
-    // status.
+    // (created before this thread's own observed bodyHash rollout boundary,
+    // per GitHub's server-assigned timestamp — #390 delta, keys 06e32d8d +
+    // 7b445e1e). A comment at or after that boundary without a bodyHash never
+    // verifies, so stripping the field cannot forge legacy status.
     const verified =
       isVerifiedPipelineReviewOutput(c.body) ||
-      isLegacyVerifiedPipelineReviewOutput(c.body, c.createdAt);
+      isLegacyVerifiedPipelineReviewOutput(c.body, c.createdAt, bodyHashRolloutBoundary);
     if (
       !trustedComments.includes(c) ||
       (!verified && NEGATION_PATTERNS.some((p) => p.test(c.body)))

@@ -191,31 +191,66 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
 }
 
 /**
- * The bodyHash field's rollout boundary (#390 delta, key 06e32d8d): review
- * comments CREATED at or after this instant must carry a verifying bodyHash —
- * the pipeline has emitted it since this change shipped, so its absence on a
- * newer comment means tampering (e.g. stripping the field to make a comment
- * "look legacy"), never age. Comments created before it can never carry the
- * field and are eligible for the structural legacy check below.
+ * Find the bodyHash rollout boundary for a single issue/PR's own comment
+ * history (#390 delta, finding 7b445e1e): the earliest `createdAt` among
+ * `trustedComments` whose body is a fully verified, current-format pipeline
+ * review artifact (i.e. `isVerifiedPipelineReviewOutput` — a valid bodyHash
+ * that matches the rendered body). That timestamp is real, observed evidence
+ * that THIS installation was already emitting bodyHash by then — unlike a
+ * hard-coded calendar date, it cannot predate the actual rollout, because it
+ * IS the rollout as seen in this thread. Returns null when no such comment
+ * exists yet, meaning this installation has not (yet, as far as this thread
+ * shows) started emitting bodyHash, so there is no basis to suspect a
+ * stripped field and the structural legacy check should apply unconditionally.
  */
-export const BODY_HASH_ROLLOUT_ISO = "2026-07-09T00:00:00Z";
+export function computeBodyHashRolloutBoundary(
+  comments: ReadonlyArray<{ body: string; createdAt: string }>,
+  trustedComments: ReadonlyArray<{ body: string; createdAt: string }>,
+): string | null {
+  let boundary: string | null = null;
+  let boundaryMs = Infinity;
+  for (const c of comments) {
+    if (!trustedComments.includes(c)) continue;
+    if (!isVerifiedPipelineReviewOutput(c.body)) continue;
+    const ms = Date.parse(c.createdAt);
+    if (!Number.isFinite(ms) || ms >= boundaryMs) continue;
+    boundary = c.createdAt;
+    boundaryMs = ms;
+  }
+  return boundary;
+}
 
 /**
- * Legacy verification for review comments that provably predate the bodyHash
- * rollout (#390 delta, keys e0b0c22e + 06e32d8d). `createdAtIso` is GitHub's
- * server-assigned comment timestamp — an author cannot backdate it — so the
- * time anchor closes the strip-the-bodyHash bypass a format-only fallback
- * allowed: a post-rollout comment without a bodyHash NEVER verifies here.
- * For genuinely historical comments the check is structural: the artifact
- * decodes with no bodyHash, nothing follows the artifact line, and the body
- * is review output from its FIRST line (prepended objections break the
- * anchor and gate). Residual gap, confined to pre-rollout history only: text
- * inserted between a historical heading and its artifact is undetectable
- * without a hash.
+ * Legacy verification for review comments that provably predate this
+ * installation's own bodyHash rollout (#390 delta, keys e0b0c22e + 06e32d8d;
+ * revised for finding 7b445e1e). `createdAtIso` is GitHub's server-assigned
+ * comment timestamp — an author cannot backdate it. `rolloutBoundaryIso`
+ * (from `computeBodyHashRolloutBoundary`) is the observed timestamp of this
+ * thread's own earliest verified current-format comment, not a speculative
+ * calendar cutoff — a hard-coded date risked stranding legitimate no-bodyHash
+ * comments if this change reached production later than guessed. A comment
+ * created at or after that boundary without a bodyHash is tampered (the
+ * field was stripped), not historical, and never verifies here. When
+ * `rolloutBoundaryIso` is null (no evidence yet that this installation emits
+ * bodyHash), the date check is skipped and only the structural check below
+ * applies. For genuinely historical comments the check is structural: the
+ * artifact decodes with no bodyHash, nothing follows the artifact line, and
+ * the body is review output from its FIRST line (prepended objections break
+ * the anchor and gate). Residual gap, confined to pre-boundary history only:
+ * text inserted between a historical heading and its artifact is
+ * undetectable without a hash.
  */
-export function isLegacyVerifiedPipelineReviewOutput(body: string, createdAtIso: string): boolean {
+export function isLegacyVerifiedPipelineReviewOutput(
+  body: string,
+  createdAtIso: string,
+  rolloutBoundaryIso: string | null,
+): boolean {
   const created = Date.parse(createdAtIso);
-  if (!Number.isFinite(created) || created >= Date.parse(BODY_HASH_ROLLOUT_ISO)) return false;
+  if (!Number.isFinite(created)) return false;
+  if (rolloutBoundaryIso !== null) {
+    const boundary = Date.parse(rolloutBoundaryIso);
+    if (Number.isFinite(boundary) && created >= boundary) return false;
+  }
   const artifact = extractReviewArtifact(body);
   if (artifact === null || typeof artifact.bodyHash === "string") return false;
   REVIEW_ARTIFACT_RE.lastIndex = 0;

@@ -829,13 +829,58 @@ test("findUnacknowledgedComments: objection prepended before a legacy review ver
   );
 });
 
-// #390 pre-merge delta, key 06e32d8d: the legacy path is time-anchored to
-// GitHub's server-assigned createdAt. A comment CREATED AFTER the bodyHash
-// rollout whose artifact lacks a bodyHash is tampered (the field was
-// stripped), not historical — it must gate. Bites the format-only fallback,
-// which accepted any no-bodyHash artifact regardless of age.
-test("findUnacknowledgedComments: post-rollout comment with a stripped bodyHash still gates (#390 delta 06e32d8d)", () => {
+// #390 delta, finding 7b445e1e: a hard-coded calendar rollout date can strand
+// legitimate no-bodyHash comments if this change reaches production later
+// than guessed. The boundary is instead observed evidence — this thread's own
+// earliest verified current-format (bodyHash-bound) comment — so it can never
+// predate the actual rollout, because it IS the rollout as seen in this
+// thread. A no-bodyHash artifact created at or after that observed boundary
+// is tampered (the field was stripped), not historical — it must gate.
+test("findUnacknowledgedComments: stripped bodyHash comment created after this thread's own verified bodyHash comment still gates (#390 delta 7b445e1e)", () => {
+  const verified = formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "approve",
+      summary: "Looks good.",
+      findings: [],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    undefined,
+  );
   const stripped = stripBodyHash(formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship: do not proceed.",
+      findings: [],
+      next_steps: [],
+      commitSha: "b2c3d4e5f60718293a4b5c6d7e8f9001122334a1",
+    },
+    "codex",
+    undefined,
+  ));
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("codex", verified, ts(1)),
+    makeComment("codex", stripped, ts(2)),
+  ];
+  const trusted = [comments[1], comments[2]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length, 1,
+    "a no-bodyHash artifact created after this thread's own observed bodyHash rollout is tampered, not legacy — it must gate",
+  );
+});
+
+// Without an observed boundary (no verified bodyHash comment anywhere in this
+// thread yet), a no-bodyHash artifact is not treated as suspicious purely for
+// being recent — there's no evidence this installation has adopted bodyHash
+// at all, so a speculative calendar date must not be substituted (#390 delta
+// 7b445e1e).
+test("findUnacknowledgedComments: no-bodyHash comment with no observed rollout boundary is still legacy-eligible regardless of recency", () => {
+  const legacy = stripBodyHash(formatDeltaReviewComment(
     undefined as unknown as PipelineConfig,
     {
       verdict: "needs-attention",
@@ -849,14 +894,16 @@ test("findUnacknowledgedComments: post-rollout comment with a stripped bodyHash 
   ));
   const comments = [
     makeComment("operator", "## Revised Implementation Plan\n\nDo X.", "2026-07-01T00:00:00Z"),
-    // Created well after BODY_HASH_ROLLOUT_ISO — cannot be historical.
-    makeComment("operator", stripped, "2026-08-01T00:00:00Z"),
+    // Recent timestamp — under the old hard-coded-date design this would
+    // have been rejected as "post-rollout"; there is no other evidence in
+    // this thread that bodyHash is even in use here.
+    makeComment("operator", legacy, "2027-01-01T00:00:00Z"),
   ];
   const trusted = [comments[1]];
   const unacked = findUnacknowledgedComments(comments, trusted);
   assert.equal(
-    unacked.length, 1,
-    "a post-rollout artifact without a bodyHash is tampered, not legacy — it must gate",
+    unacked.length, 0,
+    "no-bodyHash comment must not gate on a speculative recency check when no boundary is observed",
   );
 });
 
