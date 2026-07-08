@@ -588,6 +588,21 @@ test("buildPRBody: includes version, theme, date, and PR list", () => {
   assert.ok(body.includes("git tag v1.6.0"), "tag instructions in body");
 });
 
+test("buildPRBody: states merging is the final step and labels the tag command as a fallback", () => {
+  const body = buildPRBody(SAMPLE_CTX, "v1.5.0");
+
+  assert.ok(
+    /merging this pr is the final step/i.test(body),
+    "states merging is the final step",
+  );
+  assert.ok(
+    /auto-tag|auto-creates|publishes the github release/i.test(body),
+    "describes the automated tag + publish outcome",
+  );
+  assert.ok(/fallback/i.test(body), "labels the manual tag command as a fallback");
+  assert.ok(body.includes("git tag v1.6.0 && git push origin v1.6.0"), "fallback tag command present");
+});
+
 test("buildPRBody: uses placeholder when no shipped PRs", () => {
   const ctx: ReleaseContext = {
     ...SAMPLE_CTX,

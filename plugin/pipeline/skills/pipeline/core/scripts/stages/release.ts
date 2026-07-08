@@ -714,7 +714,10 @@ export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
     "",
     "---",
     "",
-    "After this PR is merged, push the tag to trigger the automated GitHub Release:",
+    "**Merging this PR is the final step.** It auto-tags the merge commit " +
+      `(annotated \`v${version}\`) and publishes the GitHub Release — no manual follow-up needed.`,
+    "",
+    "_Fallback only_ — if the automation doesn't run (e.g. a missing/misconfigured tag-push credential), tag manually:",
     "```",
     `git tag v${version} && git push origin v${version}`,
     "```",
