@@ -496,6 +496,56 @@ test("runCapped: a capture stream erroring mid-run resolves with capture_error, 
 });
 
 // ---------------------------------------------------------------------------
+// synchronous spawn() throw (#393) — node:child_process spawn() throws
+// SYNCHRONOUSLY (not via the async child.on("error") path) for certain argv
+// contents, most notably a NUL byte (U+0000) in an argv string. Left
+// unguarded, that throw escapes runCapped's Promise executor and crashes the
+// whole pipeline process instead of resolving a spawn_error HarnessResult.
+// ---------------------------------------------------------------------------
+
+test("runCapped: a synchronous ERR_INVALID_ARG_VALUE (NUL byte) throw from spawn() resolves a spawn_error result instead of rejecting (#393)", async () => {
+  const spawnFn = (() => {
+    const err = new TypeError(
+      "The argument 'args[0]' must be a string without null bytes. Received 'a\\x00b'",
+    );
+    (err as unknown as { code: string }).code = "ERR_INVALID_ARG_VALUE";
+    throw err;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const result = await runCapped("unused", ["a\0b"], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error, true);
+  assert.equal(result.timed_out, false);
+  assert.equal(result.exit_code, -1);
+  assert.match(result.stderr, /NUL byte \(U\+0000\) detected in harness argv payload/);
+  assert.doesNotMatch(result.stderr, /\x00/, "the raw NUL byte must not be echoed into the captured stderr");
+});
+
+test("runCapped: a synchronous spawn() throw NOT related to NUL bytes resolves a spawn_error result without the NUL marker (#393)", async () => {
+  const spawnFn = (() => {
+    throw new Error("some other synchronous spawn failure");
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error, true);
+  assert.equal(result.timed_out, false);
+  assert.match(result.stderr, /some other synchronous spawn failure/);
+  assert.doesNotMatch(result.stderr, /NUL byte/, "the generic path must not add the NUL-byte marker");
+});
+
+test("invoke(): a prompt containing a real NUL byte resolves a spawn_error result end-to-end instead of throwing (#393)", async () => {
+  const cli = makeScript("nul-byte-cli", `printf '%s' "$1"`);
+  const result = await invoke(cli, tmpRoot, "prompt with a real \0 NUL byte", { stream: false });
+
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error, true);
+  assert.match(result.stderr, /NUL byte \(U\+0000\) detected in harness argv payload/);
+});
+
+// ---------------------------------------------------------------------------
 // forward-stream error (#384 delta review, key 84c9859e) — the DOWNSTREAM
 // side of the pipe (our own stdout/stderr: terminal-log tee, event-sink
 // socket) failing while the child command succeeds. Distinct from the
