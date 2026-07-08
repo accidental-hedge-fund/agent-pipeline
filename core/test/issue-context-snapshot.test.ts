@@ -881,4 +881,55 @@ test("findUnacknowledgedComments: stripped bodyHash comment created after this t
   );
 });
 
+// #390 delta, key e86a700f (verified false positive — this test proves the
+// claimed bypass does not reproduce): a legacy no-bodyHash follow-up APPROVE
+// cannot act as the acknowledgment anchor, because plain-ack anchoring
+// requires classifyComment === 'human' and review verdicts classify as
+// pipeline. The earlier legacy needs-attention therefore stays unacknowledged
+// until a separate plain human acknowledgment, exactly as option A requires.
+test("findUnacknowledgedComments: legacy needs-attention followed by legacy approve still gates until a plain human ack (#390 e86a700f)", () => {
+  const legacyNeedsAttention = stripBodyHash(formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship: do not proceed.",
+      findings: [{
+        severity: "high", title: "objection", body: "This is the wrong approach — don't do this.",
+        confidence: 0.9, recommendation: "Do not proceed.",
+      }],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    new Set(["ed310f32"]),
+  ));
+  // Follow-up approve: no negation language anywhere.
+  const legacyApprove = stripBodyHash(formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "approve",
+      summary: "All findings resolved; approving.",
+      findings: [],
+      next_steps: [],
+      commitSha: "b1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    undefined,
+  ));
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", legacyNeedsAttention, ts(1)),
+    makeComment("operator", legacyApprove, ts(2)),
+  ];
+  const trusted = [comments[1], comments[2]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length, 1,
+    "the legacy approve must not anchor past the legacy needs-attention — it stays unacknowledged",
+  );
+
+  const ack = makeComment("operator", "Acknowledged — historical pipeline output, carry on.", ts(3));
+  const cleared = findUnacknowledgedComments([...comments, ack], [...trusted, ack]);
+  assert.equal(cleared.length, 0, "only a plain human acknowledgment clears the thread");
+});
 
