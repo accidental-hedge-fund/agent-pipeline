@@ -62,12 +62,14 @@ import {
   finalizeRun,
   initRunDir,
   isValidSummaryBundle,
+  latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
   runDirPath,
   runIdFor,
   runsDir,
   startTerminalLogTee,
+  type RunEventsSummary,
   type RunStoreDeps,
   type TerminalLogTee,
 } from "./run-store.ts";
@@ -1730,6 +1732,10 @@ export interface RunStatusDeps {
   getForIssue?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ path: string; slug: string } | null>;
   /** For JSON mode (#154): fetch pipeline-label addition events for `last_event`. */
   getLabelEvents?: (cfg: PipelineConfig, issueNumber: number) => Promise<{ label: string; createdAt: string }[]>;
+  /** For JSON mode's `possibly_wedged` flag (#398): the most-recent run's
+   *  events.jsonl finalized/last-event summary for the issue, or null when no
+   *  run directory exists. */
+  getLatestRunEvents?: (cfg: PipelineConfig, issueNumber: number) => Promise<RunEventsSummary | null>;
 }
 
 const defaultRunStatusDeps: RunStatusDeps = {
@@ -1738,6 +1744,7 @@ const defaultRunStatusDeps: RunStatusDeps = {
   loadLatestPreflightResult,
   getForIssue: getOnDiskForIssue,
   getLabelEvents: getIssueLabelEvents,
+  getLatestRunEvents: (cfg, issueNumber) => latestRunEventsSummaryForIssue(cfg.repo_dir, issueNumber),
 };
 
 export async function runStatus(
@@ -1759,11 +1766,15 @@ export async function runStatus(
       const labelEvents = deps.getLabelEvents
         ? await deps.getLabelEvents(cfg, issueNumber)
         : [];
+      const runEvents = deps.getLatestRunEvents
+        ? await deps.getLatestRunEvents(cfg, issueNumber).catch(() => null)
+        : null;
       const payload: StatusPayload = buildStatusPayload(
         { ...detail, labelEvents },
         prNumber,
         worktreeInfo,
         cfg,
+        runEvents,
       );
       console.log(JSON.stringify(payload));
     } catch (err) {

@@ -3,11 +3,21 @@
 // The caller provides pre-fetched data; this module maps it to the stable JSON envelope.
 
 import { isBlocked, pickStage } from "./gh.ts";
+import type { RunEventsSummary } from "./run-store.ts";
 import type { PipelineConfig } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Envelope shapes (the public JSON contract — field names/types are stable)
 // ---------------------------------------------------------------------------
+
+/** Populated when a run is not finalized and has gone quiet past the largest
+ *  configured stage timeout — distinguishes a legitimately long stage from a
+ *  wedged run (#398). Null otherwise. */
+export interface PossiblyWedged {
+  last_event_age_ms: number;
+  threshold_ms: number;
+  last_event_type: string;
+}
 
 export interface StatusPayload {
   schema_version: "1";
@@ -21,6 +31,7 @@ export interface StatusPayload {
   review_summary: { verdict: string; findings_count: number; timestamp: string } | null;
   next_action: string;
   config: { repo: string; domain: string };
+  possibly_wedged: PossiblyWedged | null;
 }
 
 export interface StatusErrorEnvelope {
@@ -132,6 +143,61 @@ function deriveReviewSummary(
 }
 
 // ---------------------------------------------------------------------------
+// possibly_wedged (#398)
+// ---------------------------------------------------------------------------
+
+/** Config fields whose values are wall-clock stage timeouts, used to derive
+ *  the staleness threshold for `possibly_wedged`. */
+export type StageTimeoutConfig = Pick<
+  PipelineConfig,
+  | "implementation_timeout"
+  | "review_timeout"
+  | "plan_review_timeout"
+  | "fix_timeout"
+  | "ci_timeout"
+  | "test_gate"
+  | "eval_gate"
+>;
+
+/** Small margin added on top of the largest configured stage timeout before a
+ *  quiet run is flagged `possibly_wedged`, so a stage legitimately still
+ *  running near its cap is not mistaken for a wedge. */
+const WEDGE_MARGIN_MS = 60_000;
+
+/** The largest configured wall-clock stage timeout (seconds) across the
+ *  advance-loop stages — the staleness threshold below which a quiet,
+ *  unfinalized run is presumed to be running a long stage rather than wedged.
+ *  Tolerates a partial/fake `cfg` (as used by some existing test fixtures that
+ *  only carry `repo`/`domain`): a missing field contributes 0 rather than
+ *  throwing. */
+export function largestConfiguredStageTimeoutSec(cfg: Partial<StageTimeoutConfig>): number {
+  return Math.max(
+    cfg.implementation_timeout ?? 0,
+    cfg.review_timeout ?? 0,
+    cfg.plan_review_timeout ?? 0,
+    cfg.fix_timeout ?? 0,
+    cfg.ci_timeout ?? 0,
+    cfg.test_gate?.timeout ?? 0,
+    cfg.eval_gate?.timeout ?? 0,
+  );
+}
+
+function derivePossiblyWedged(
+  runEvents: RunEventsSummary | null | undefined,
+  thresholdMs: number,
+  now: Date,
+): PossiblyWedged | null {
+  if (!runEvents || runEvents.finalized || !runEvents.lastEvent) return null;
+  const lastEventAgeMs = now.getTime() - Date.parse(runEvents.lastEvent.at);
+  if (!Number.isFinite(lastEventAgeMs) || lastEventAgeMs <= thresholdMs) return null;
+  return {
+    last_event_age_ms: lastEventAgeMs,
+    threshold_ms: thresholdMs,
+    last_event_type: runEvents.lastEvent.type,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Payload assembler
 // ---------------------------------------------------------------------------
 
@@ -139,7 +205,9 @@ export function buildStatusPayload(
   detail: StatusIssueDetail,
   prNumber: number | null,
   worktreeInfo: { path: string; slug: string } | null,
-  cfg: Pick<PipelineConfig, "repo" | "domain">,
+  cfg: Pick<PipelineConfig, "repo" | "domain"> & StageTimeoutConfig,
+  runEvents: RunEventsSummary | null = null,
+  now: Date = new Date(),
 ): StatusPayload {
   const stage = pickStage(detail.labels);
   const blocked = isBlocked(detail.labels);
@@ -164,5 +232,6 @@ export function buildStatusPayload(
     review_summary: deriveReviewSummary(detail.comments),
     next_action: deriveNextAction(stage, blocked),
     config: { repo: cfg.repo, domain: cfg.domain },
+    possibly_wedged: derivePossiblyWedged(runEvents, largestConfiguredStageTimeoutSec(cfg) * 1000 + WEDGE_MARGIN_MS, now),
   };
 }

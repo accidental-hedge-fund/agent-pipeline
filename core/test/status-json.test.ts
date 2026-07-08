@@ -7,11 +7,23 @@ import {
   buildStatusPayload,
   deriveNextAction,
   deriveStatus,
+  largestConfiguredStageTimeoutSec,
+  type StageTimeoutConfig,
   type StatusIssueDetail,
 } from "../scripts/status-json.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
-const CFG = { repo: "acme/repo", domain: "test" } as unknown as Pick<PipelineConfig, "repo" | "domain">;
+const CFG = {
+  repo: "acme/repo",
+  domain: "test",
+  implementation_timeout: 2400,
+  review_timeout: 1500,
+  plan_review_timeout: 300,
+  fix_timeout: 2400,
+  ci_timeout: 900,
+  test_gate: { timeout: 300 },
+  eval_gate: { timeout: 300 },
+} as unknown as Pick<PipelineConfig, "repo" | "domain"> & StageTimeoutConfig;
 
 function makeDetail(overrides: Partial<StatusIssueDetail> = {}): StatusIssueDetail {
   return {
@@ -42,6 +54,7 @@ test("buildStatusPayload: all minimum fields are present", () => {
   assert.ok("review_summary" in payload);
   assert.ok("next_action" in payload);
   assert.ok("config" in payload);
+  assert.ok("possibly_wedged" in payload);
 });
 
 test("buildStatusPayload: schema_version is \"1\"", () => {
@@ -258,6 +271,64 @@ test("buildStatusPayload: review_summary counts findings", () => {
   assert.ok(payload.review_summary !== null);
   assert.equal(payload.review_summary.verdict, "needs-attention");
   assert.equal(payload.review_summary.findings_count, 2);
+});
+
+// ---------------------------------------------------------------------------
+// possibly_wedged (#398)
+// ---------------------------------------------------------------------------
+
+const NOW = new Date("2026-07-07T12:00:00Z");
+// CFG's largest timeout is implementation_timeout/fix_timeout at 2400s = 2,400,000ms;
+// +60s margin => 2,460,000ms threshold.
+const STALE_AT = new Date(NOW.getTime() - 2_460_001).toISOString();
+const FRESH_AT = new Date(NOW.getTime() - 1_000).toISOString();
+
+test("possibly_wedged: null when no run-events summary is available", () => {
+  const payload = buildStatusPayload(makeDetail(), null, null, CFG, null, NOW);
+  assert.equal(payload.possibly_wedged, null);
+});
+
+test("possibly_wedged: null when the run is finalized, regardless of last-event age", () => {
+  const payload = buildStatusPayload(
+    makeDetail(),
+    null,
+    null,
+    CFG,
+    { finalized: true, lastEvent: { type: "run_complete", at: STALE_AT } },
+    NOW,
+  );
+  assert.equal(payload.possibly_wedged, null);
+});
+
+test("possibly_wedged: null when the unfinalized run's last event is within the threshold", () => {
+  const payload = buildStatusPayload(
+    makeDetail(),
+    null,
+    null,
+    CFG,
+    { finalized: false, lastEvent: { type: "stage_start", at: FRESH_AT } },
+    NOW,
+  );
+  assert.equal(payload.possibly_wedged, null);
+});
+
+test("possibly_wedged: populated when the unfinalized run's last event predates the threshold", () => {
+  const payload = buildStatusPayload(
+    makeDetail(),
+    null,
+    null,
+    CFG,
+    { finalized: false, lastEvent: { type: "harness_timeout", at: STALE_AT } },
+    NOW,
+  );
+  assert.ok(payload.possibly_wedged !== null);
+  assert.equal(payload.possibly_wedged.last_event_type, "harness_timeout");
+  assert.equal(payload.possibly_wedged.threshold_ms, 2_460_000);
+  assert.equal(payload.possibly_wedged.last_event_age_ms, 2_460_001);
+});
+
+test("largestConfiguredStageTimeoutSec: returns the max over the configured stage timeouts", () => {
+  assert.equal(largestConfiguredStageTimeoutSec(CFG), 2400);
 });
 
 // ---------------------------------------------------------------------------

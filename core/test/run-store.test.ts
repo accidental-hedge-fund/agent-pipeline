@@ -15,6 +15,7 @@ import {
   isValidSummaryBundle,
   issueHistoryDir,
   issueHistoryPath,
+  latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
   readEvents,
@@ -419,6 +420,22 @@ test("readEvents: preserves unknown fields from future schema versions", async (
   const events = await readEvents(RUN_DIR, deps);
   assert.equal(events.length, 1);
   assert.equal((events[0] as Record<string, unknown>)["future_field"], "keep-me");
+});
+
+test("readEvents: includes harness_timeout events, and stage-timeline filters exclude them (#398)", async () => {
+  const { deps, files } = memRunStore();
+  const stageStart = { schema_version: 1, type: "stage_start", at: STARTED_AT_ISO, stage: "review-1" };
+  const timeout = { schema_version: 1, type: "harness_timeout", at: STARTED_AT_ISO, stage: "review-1", timeout_sec: 1500 };
+  const stageComplete = { schema_version: 1, type: "stage_complete", at: STARTED_AT_ISO, stage: "review-1", outcome: "advanced" };
+  files.set(EVENTS_JSONL, [stageStart, timeout, stageComplete].map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  const events = await readEvents(RUN_DIR, deps);
+  assert.equal(events.length, 3, "harness_timeout must be present in the returned array");
+  assert.ok(events.some((e) => e.type === "harness_timeout"));
+
+  const stageTimeline = events.filter((e) => e.type === "stage_start" || e.type === "stage_complete");
+  assert.equal(stageTimeline.length, 2, "stage-timeline filters must exclude harness_timeout");
+  assert.ok(!stageTimeline.some((e) => e.type === "harness_timeout"));
 });
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1277,119 @@ test("latestSummaryForIssue: treats summary.json with missing required fields as
   const result = await latestSummaryForIssue(REPO_DIR, ISSUE, deps);
   assert.ok(result !== null, "expected a bundle from the older valid run");
   assert.equal(result.runId, id1, "should skip the missing-fields entry and return the valid older run");
+});
+
+// ---------------------------------------------------------------------------
+// latestRunEventsSummaryForIssue (#398) — powers the `possibly_wedged` status flag
+// ---------------------------------------------------------------------------
+
+test("latestRunEventsSummaryForIssue: returns null when runs dir is absent (#398)", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => { const e = new Error("ENOENT") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; },
+    stat: async () => ({ mtime: new Date() }),
+  };
+  const result = await latestRunEventsSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null);
+});
+
+test("latestRunEventsSummaryForIssue: returns null when no run matches the issue prefix (#398)", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [{ name: "999-2026-06-20T10-00-00-000Z", isDirectory: () => true }],
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+  const result = await latestRunEventsSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.equal(result, null);
+});
+
+test("latestRunEventsSummaryForIssue: unfinalized run — finalized:false and lastEvent from the newest matching run's events.jsonl (#398)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T09-00-00-000Z`; // older
+  const id2 = `${ISSUE}-2026-06-20T10-00-00-000Z`; // newer
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+  const events2 = [
+    { schema_version: 1, type: "run_start", at: "2026-06-20T10:00:00Z" },
+    { schema_version: 1, type: "harness_timeout", at: "2026-06-20T10:30:00Z", stage: "review-1", timeout_sec: 1500 },
+  ];
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id2, "events.jsonl")) {
+        return events2.map((e) => JSON.stringify(e)).join("\n") + "\n";
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [
+      { name: id1, isDirectory: () => true },
+      { name: id2, isDirectory: () => true },
+    ],
+    stat: async (p) => {
+      if (p.endsWith(id2)) return { mtime: new Date(2000) };
+      if (p.endsWith(id1)) return { mtime: new Date(1000) };
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  };
+
+  const result = await latestRunEventsSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null);
+  assert.equal(result.finalized, false);
+  assert.deepEqual(result.lastEvent, { type: "harness_timeout", at: "2026-06-20T10:30:00Z" });
+});
+
+test("latestRunEventsSummaryForIssue: finalized run — finalized:true when events.jsonl contains run_complete (#398)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T10-00-00-000Z`;
+  const dir = path.join(REPO_DIR, ".agent-pipeline", "runs");
+  const events = [
+    { schema_version: 1, type: "run_start", at: "2026-06-20T10:00:00Z" },
+    { schema_version: 1, type: "run_complete", at: "2026-06-20T10:05:00Z", final_state: "ready-to-deploy", elapsed_ms: 300000 },
+  ];
+
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      if (p === path.join(dir, id1, "events.jsonl")) return events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [{ name: id1, isDirectory: () => true }],
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+
+  const result = await latestRunEventsSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null);
+  assert.equal(result.finalized, true);
+  assert.equal(result.lastEvent?.type, "run_complete");
+});
+
+test("latestRunEventsSummaryForIssue: empty events.jsonl — finalized:false, lastEvent:null (#398)", async () => {
+  const id1 = `${ISSUE}-2026-06-20T10-00-00-000Z`;
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async () => {},
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [{ name: id1, isDirectory: () => true }],
+    stat: async () => ({ mtime: new Date(1000) }),
+  };
+  const result = await latestRunEventsSummaryForIssue(REPO_DIR, ISSUE, deps);
+  assert.ok(result !== null);
+  assert.equal(result.finalized, false);
+  assert.equal(result.lastEvent, null);
 });
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
 import { invoke, runCapped, formatStderrExcerpt } from "../scripts/harness.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
 
@@ -598,4 +599,155 @@ test("runCapped: a forward-stream error arriving after settle is absorbed, not a
     () => forwardTo.stdout.emit("error", new Error("EPIPE (simulated, late)")),
     "a forward error landing after settle must not be an unhandled 'error' event",
   );
+});
+
+// ---------------------------------------------------------------------------
+// hard secondary deadline (#398) — runCapped must conclude even when a
+// detached grandchild survives SIGKILL and keeps the child's stdio pipes open
+// (so child.stdout/stderr never emit `close`) and the process-group kill is a
+// no-op. The SIGTERM→grace→SIGKILL escalation schedules its own final settle
+// as a NESTED setTimeout 200ms after SIGKILL; runCapped now also arms a
+// SIBLING failsafe timer at cap-fire time, independent of that chain, so a
+// throw or wedge anywhere in the nested path cannot prevent resolution.
+//
+// To prove the sibling failsafe — not the nested chain's own settle — is what
+// resolves the promise, this races the two: hardDeadlineSec is set shorter
+// than the chain's fixed 200ms tail, so the failsafe fires first. If the
+// failsafe were removed, resolution would only happen ~200ms later, past the
+// assertion window below, and this test would fail.
+// ---------------------------------------------------------------------------
+
+test("runCapped: the hard secondary deadline resolves timed_out:true ahead of the escalation chain's own settle, even with streams that never close and a no-op group kill (#398)", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999, // nonexistent PID → process.kill(-pid, sig) throws ESRCH: a no-op group kill
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  const start = Date.now();
+  // cap fires at 300ms. killGraceSec:1 + hardDeadlineSec:0 → failsafe fires at
+  // cap+1000ms, strictly before the chain's own settle at cap+1000ms+200ms.
+  const result = await runCapped("unused", [], tmpRoot, 0.3, false, "test", {
+    spawnFn,
+    killProcessGroup: true,
+    killGraceSec: 1,
+    hardDeadlineSec: 0,
+  });
+  const elapsed = Date.now() - start;
+
+  assert.equal(result.timed_out, true, "must resolve timed_out:true rather than pend forever");
+  assert.ok(
+    elapsed < 1450,
+    `must resolve via the failsafe (~1300ms after start), not the chain's own settle (~1500ms) — took ${elapsed}ms`,
+  );
+});
+
+test("runCapped: without a run-store context, no harness_timeout event is recorded and behavior is unchanged (bare caller, #398)", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  // Matches testgate.ts/eval.ts: no timeoutEvent opt at all.
+  const result = await runCapped("unused", [], tmpRoot, 0.1, false, "test-gate", {
+    spawnFn,
+    killProcessGroup: true,
+    killGraceSec: 0.1,
+    hardDeadlineSec: 0.1,
+  });
+
+  assert.equal(result.timed_out, true, "the failsafe still resolves it with no run-store context");
+});
+
+// ---------------------------------------------------------------------------
+// harness_timeout event recording (#398) — appended to the run store at the
+// moment the wall-clock cap fires, before/independent of resolution.
+// ---------------------------------------------------------------------------
+
+function fakeRunStoreDeps(): { deps: RunStoreDeps; appended: string[] } {
+  const appended: string[] = [];
+  const deps: RunStoreDeps = {
+    readFile: async () => {
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      throw err;
+    },
+    writeFile: async () => {},
+    appendFile: async (_p, data) => {
+      appended.push(data);
+    },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date() }),
+  };
+  return { deps, appended };
+}
+
+test("runCapped: appends a harness_timeout event to the run store at cap-fire time (#398)", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  const { deps, appended } = fakeRunStoreDeps();
+
+  const result = await runCapped("unused", [], tmpRoot, 0.1, false, "review-1", {
+    spawnFn,
+    killProcessGroup: true,
+    killGraceSec: 0.1,
+    hardDeadlineSec: 0.1,
+    timeoutEvent: { runDir: "/tmp/fake-run", runStoreDeps: deps, stage: "review-1" },
+  });
+
+  assert.equal(result.timed_out, true);
+  assert.equal(appended.length, 1, "exactly one event must be appended to events.jsonl");
+  const event = JSON.parse(appended[0]) as Record<string, unknown>;
+  assert.equal(event.type, "harness_timeout");
+  assert.equal(event.stage, "review-1");
+  assert.equal(event.timeout_sec, 0.1);
+  assert.equal(event.schema_version, 1);
+  assert.ok(typeof event.at === "string" && (event.at as string).length > 0);
+});
+
+test("runCapped: no harness_timeout event is appended on a normal pre-cap exit", async () => {
+  const cli = makeScript("quick-exit", "exit 0");
+  const { deps, appended } = fakeRunStoreDeps();
+
+  const result = await runCapped(cli, [], tmpRoot, 30, false, "review-1", {
+    timeoutEvent: { runDir: "/tmp/fake-run", runStoreDeps: deps, stage: "review-1" },
+  });
+
+  assert.equal(result.timed_out, false);
+  assert.equal(appended.length, 0, "no harness_timeout event on a normal, non-timing-out exit");
+});
+
+test("invoke(): threads opts.accounting into runCapped's timeoutEvent context — harness_timeout is recorded on invoke()'s own timeout path (#398)", async () => {
+  const cli = makeScript("slow-cli", "sleep 5");
+  const { deps, appended } = fakeRunStoreDeps();
+
+  const result = await invoke(cli, tmpRoot, "a prompt", {
+    stream: false,
+    timeoutSec: 0.3,
+    accounting: {
+      runDir: "/tmp/fake-run",
+      runStoreDeps: deps,
+      issue: 398,
+      stage: "review-1",
+    },
+  });
+
+  assert.equal(result.timed_out, true);
+  const timeoutEvents = appended
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((e) => e.type === "harness_timeout");
+  assert.equal(timeoutEvents.length, 1, "invoke() must thread accounting into runCapped's timeoutEvent");
+  assert.equal(timeoutEvents[0].stage, "review-1");
 });
