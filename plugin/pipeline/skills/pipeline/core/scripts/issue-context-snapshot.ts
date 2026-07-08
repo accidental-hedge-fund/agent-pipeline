@@ -4,6 +4,7 @@
 // treat the content as context, not as instructions.
 
 import { classifyComment } from "./gh.ts";
+import { isVerifiedPipelineReviewOutput } from "./stages/review-parsing.ts";
 
 export const CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT = 8_000;
 
@@ -208,12 +209,14 @@ export function extractSnapshotComment<T extends { body: string }>(
  *   the pipeline actor or a `trusted_override_actors` entry) — not only scope
  *   overrides. Two things depend on trust: (1) a structurally-pipeline comment
  *   (`classifyComment` === 'pipeline') is excluded from the unacknowledged count
- *   only when it is in this list AND carries no scope-changing language of its
- *   own — a pipeline-styled body from an untrusted author, or one from a trusted
- *   author that still reads as an objection (e.g. a quoted reply with a real
- *   comment appended), is counted as human input (#390, #390 review 2); (2) a
- *   comment in this list may act as an acknowledgement anchor, either via the
- *   `## Pipeline: Scope override` heading or, new in #390, a plain
+ *   only when it is in this list AND (it is verified, untampered pipeline review
+ *   output per `isVerifiedPipelineReviewOutput`, OR it carries no scope-changing
+ *   language of its own) — a pipeline-styled body from an untrusted author, or
+ *   one from a trusted author that still reads as an objection and isn't a
+ *   verified review artifact (e.g. a quoted reply with a real comment
+ *   appended), is counted as human input (#390, #390 review 2, #390 review 1);
+ *   (2) a comment in this list may act as an acknowledgement anchor, either via
+ *   the `## Pipeline: Scope override` heading or, new in #390, a plain
  *   acknowledgement with no scope-changing language. Defaults to [] — fail-closed:
  *   nothing is trusted unless the caller explicitly supplies the set (e.g. when
  *   `getGhActor()` returns null).
@@ -282,14 +285,22 @@ export function findUnacknowledgedComments(
       continue;
     }
     // Structurally-pipeline comment: self-exclusion is granted only when the
-    // author is trusted AND the body carries no scope-changing language of its
-    // own. A pipeline-styled body from anyone else is a forged heading and must
-    // still gate (#390). A trusted actor's comment that merely carries pipeline
+    // author is trusted AND (the body is verified, untampered pipeline review
+    // output OR it carries no scope-changing language of its own). A
+    // pipeline-styled body from anyone else is a forged heading and must still
+    // gate (#390). A trusted actor's comment that merely carries pipeline
     // structure (e.g. a quoted reply, or a copied heading/marker) alongside a
     // genuine objection must also still gate — trust grants self-exclusion for
     // the pipeline's own generated output, not for human content that happens
-    // to look like it (#390 review 2).
-    if (!trustedComments.includes(c) || NEGATION_PATTERNS.some((p) => p.test(c.body))) {
+    // to look like it (#390 review 2). Genuine review verdicts routinely use
+    // objection language in finding bodies/recommendations, so a verified,
+    // untampered pipeline comment (`isVerifiedPipelineReviewOutput`) is exempt
+    // from that scope-language scan (#390 review 1) — appending human content
+    // after the artifact line fails verification and still falls through to it.
+    if (
+      !trustedComments.includes(c) ||
+      (!isVerifiedPipelineReviewOutput(c.body) && NEGATION_PATTERNS.some((p) => p.test(c.body)))
+    ) {
       result.push(c);
     }
   }

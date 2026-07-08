@@ -14,6 +14,8 @@ import {
 } from "../scripts/issue-context-snapshot.ts";
 import { classifyComment } from "../scripts/gh.ts";
 import { buildTrustedOverrideComments } from "../scripts/review-policy.ts";
+import { formatDeltaReviewComment } from "../scripts/stages/review-rendering.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // classifyComment
@@ -637,5 +639,78 @@ test("findUnacknowledgedComments: trusted comment with a raw copied sentinel mar
   const trusted = [comments[1]];
   const unacked = findUnacknowledgedComments(comments, trusted);
   assert.equal(unacked.length, 1, "raw copied sentinel marker with an objection must still gate");
+  assert.equal(unacked[0].author, "operator");
+});
+
+test("findUnacknowledgedComments: genuine pipeline review verdict with objection wording in a finding is not counted (#390 review 1)", () => {
+  // Real review findings routinely use negation-shaped prose ("don't", "wrong
+  // approach", "disagree") when describing what's broken — that's normal
+  // reviewer language, not new human input. A complete, untampered pipeline
+  // delta-review comment (full sentinel chain + trailing artifact) must be
+  // excluded regardless of its wording.
+  const deltaReviewBody = formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship: this reintroduces the #390 failure mode.",
+      findings: [{
+        severity: "high",
+        title: "heuristic re-gates the pipeline's own output",
+        body: "This is the wrong approach; please don't apply it here — do not proceed.",
+        confidence: 0.88,
+        recommendation: "Do not apply human scope-language detection to pipeline comments.",
+      }],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    new Set(["ed310f32"]),
+  );
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", deltaReviewBody, ts(1)),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length,
+    0,
+    "genuine, untampered pipeline review verdict must not gate on its own objection wording",
+  );
+});
+
+test("findUnacknowledgedComments: human objection appended after a quoted genuine review verdict is still counted (#390 review 1)", () => {
+  // Same genuine, complete pipeline comment as above, but with a human
+  // objection appended after the trailing artifact line — this must still
+  // gate: verification requires nothing follow the artifact.
+  const deltaReviewBody = formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship.",
+      findings: [{
+        severity: "high",
+        title: "finding",
+        body: "don't do this",
+        confidence: 0.88,
+        recommendation: "revert",
+      }],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    new Set(["ed310f32"]),
+  );
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", `${deltaReviewBody}\n\nWait, I disagree, don't merge this.`, ts(1)),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length,
+    1,
+    "a human objection appended after a quoted pipeline verdict must still gate",
+  );
   assert.equal(unacked[0].author, "operator");
 });

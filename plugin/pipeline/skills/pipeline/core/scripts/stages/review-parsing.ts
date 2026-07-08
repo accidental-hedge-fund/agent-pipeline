@@ -142,6 +142,27 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
   }
 }
 
+/**
+ * True when `body` is verified, untampered pipeline-generated review output
+ * (#390 review 1): it decodes a valid `ReviewArtifact` (already guarded by
+ * `extractReviewArtifact` against sentinels injected before it) AND nothing
+ * follows the artifact line. `formatReviewComment`/`formatDeltaReviewComment`
+ * always emit the artifact as the last line, so genuine output never has
+ * trailing content — a human quoting a full pipeline comment and appending an
+ * objection after it fails this check and still falls back to scope-language
+ * detection.
+ */
+export function isVerifiedPipelineReviewOutput(body: string): boolean {
+  if (extractReviewArtifact(body) === null) return false;
+  REVIEW_ARTIFACT_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = REVIEW_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
+  REVIEW_ARTIFACT_RE.lastIndex = 0;
+  if (lastMatch === null) return false;
+  return body.slice(lastMatch.index + lastMatch[0].length).trim() === "";
+}
+
 // ---------------------------------------------------------------------------
 // computeDiffHash
 // ---------------------------------------------------------------------------
