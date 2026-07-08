@@ -186,20 +186,45 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
   const rawPrefix = body.slice(0, lastMatch.index);
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
-  if (typeof artifact.bodyHash === "string") {
-    return hashReviewBody(prefix) === artifact.bodyHash;
-  }
-  // Legacy pre-bodyHash artifact (#390 delta, key e0b0c22e): comments rendered
-  // before the bodyHash field existed can never carry it, and treating all of
-  // them as unverified re-gates existing review history — the exact castrecall
-  // #45 scenario this issue exists to fix. Accept a legacy artifact only when
-  // the body is structurally complete review output from its FIRST line (a
-  // review-verdict heading), plus the no-trailing-content check above: a
-  // trusted actor prepending an objection to a copied legacy verdict breaks
-  // the heading anchor and still gates. Residual (documented) gap: text
-  // inserted BETWEEN a legacy heading and its artifact is undetectable
-  // without a hash — new comments close this via bodyHash, and the legacy
-  // window only shrinks as history ages out.
+  if (typeof artifact.bodyHash !== "string") return false;
+  return hashReviewBody(prefix) === artifact.bodyHash;
+}
+
+/**
+ * The bodyHash field's rollout boundary (#390 delta, key 06e32d8d): review
+ * comments CREATED at or after this instant must carry a verifying bodyHash —
+ * the pipeline has emitted it since this change shipped, so its absence on a
+ * newer comment means tampering (e.g. stripping the field to make a comment
+ * "look legacy"), never age. Comments created before it can never carry the
+ * field and are eligible for the structural legacy check below.
+ */
+export const BODY_HASH_ROLLOUT_ISO = "2026-07-09T00:00:00Z";
+
+/**
+ * Legacy verification for review comments that provably predate the bodyHash
+ * rollout (#390 delta, keys e0b0c22e + 06e32d8d). `createdAtIso` is GitHub's
+ * server-assigned comment timestamp — an author cannot backdate it — so the
+ * time anchor closes the strip-the-bodyHash bypass a format-only fallback
+ * allowed: a post-rollout comment without a bodyHash NEVER verifies here.
+ * For genuinely historical comments the check is structural: the artifact
+ * decodes with no bodyHash, nothing follows the artifact line, and the body
+ * is review output from its FIRST line (prepended objections break the
+ * anchor and gate). Residual gap, confined to pre-rollout history only: text
+ * inserted between a historical heading and its artifact is undetectable
+ * without a hash.
+ */
+export function isLegacyVerifiedPipelineReviewOutput(body: string, createdAtIso: string): boolean {
+  const created = Date.parse(createdAtIso);
+  if (!Number.isFinite(created) || created >= Date.parse(BODY_HASH_ROLLOUT_ISO)) return false;
+  const artifact = extractReviewArtifact(body);
+  if (artifact === null || typeof artifact.bodyHash === "string") return false;
+  REVIEW_ARTIFACT_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = REVIEW_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
+  REVIEW_ARTIFACT_RE.lastIndex = 0;
+  if (lastMatch === null) return false;
+  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
   return LEGACY_REVIEW_OUTPUT_HEADING_RE.test(body.trimStart());
 }
 

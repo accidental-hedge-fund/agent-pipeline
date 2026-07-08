@@ -829,3 +829,34 @@ test("findUnacknowledgedComments: objection prepended before a legacy review ver
   );
 });
 
+// #390 pre-merge delta, key 06e32d8d: the legacy path is time-anchored to
+// GitHub's server-assigned createdAt. A comment CREATED AFTER the bodyHash
+// rollout whose artifact lacks a bodyHash is tampered (the field was
+// stripped), not historical — it must gate. Bites the format-only fallback,
+// which accepted any no-bodyHash artifact regardless of age.
+test("findUnacknowledgedComments: post-rollout comment with a stripped bodyHash still gates (#390 delta 06e32d8d)", () => {
+  const stripped = stripBodyHash(formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship: do not proceed.",
+      findings: [],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    undefined,
+  ));
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", "2026-07-01T00:00:00Z"),
+    // Created well after BODY_HASH_ROLLOUT_ISO — cannot be historical.
+    makeComment("operator", stripped, "2026-08-01T00:00:00Z"),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length, 1,
+    "a post-rollout artifact without a bodyHash is tampered, not legacy — it must gate",
+  );
+});
+
