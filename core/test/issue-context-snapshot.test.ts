@@ -714,3 +714,43 @@ test("findUnacknowledgedComments: human objection appended after a quoted genuin
   );
   assert.equal(unacked[0].author, "operator");
 });
+
+test("findUnacknowledgedComments: human objection inserted before the trailing artifact line still gates (#390 review 1 finding 1f4cb8cf)", () => {
+  // Same genuine comment, but the objection is spliced in BEFORE the final
+  // artifact line rather than appended after it — the artifact is still last,
+  // so the old "nothing follows the artifact" check alone would pass this.
+  // The body-hash binding must catch the tampered prefix and still gate.
+  const deltaReviewBody = formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship.",
+      findings: [{
+        severity: "high",
+        title: "finding",
+        body: "some finding body",
+        confidence: 0.88,
+        recommendation: "revert",
+      }],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    new Set(["ed310f32"]),
+  );
+  const bodyLines = deltaReviewBody.split("\n");
+  const artifactLine = bodyLines.pop()!;
+  const tampered = [...bodyLines, "I disagree, don't merge this.", artifactLine].join("\n");
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", tampered, ts(1)),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length,
+    1,
+    "objection text inserted before the trailing artifact line must still gate",
+  );
+  assert.equal(unacked[0].author, "operator");
+});

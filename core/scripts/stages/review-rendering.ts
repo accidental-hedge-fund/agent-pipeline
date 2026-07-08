@@ -6,6 +6,7 @@ import {
   DELTA_REVIEW_MARKER_PREFIX,
   encodeReviewArtifact,
   extractAllKeysFromComment,
+  hashReviewBody,
   recurrenceTag,
   REVIEW_MARKER_PREFIX_R1,
   REVIEW_MARKER_PREFIX_R2,
@@ -118,12 +119,14 @@ export function formatReviewComment(
   // individual sentinels as the primary read path for all gate logic.
   // Appended LAST, after all individual sentinels, when a commit SHA is available.
   if (verdict.commitSha) {
+    const bodyHash = hashReviewBody(lines.join("\n"));
     const artifact: ReviewArtifact = {
       round,
       reviewedSha: verdict.commitSha,
       diffHash: diffHash ?? null,
       blockingKeys: blockingKeys ? [...blockingKeys].sort() : [],
       review1Risk: round === 1 ? (review1Risk ?? null) : null,
+      bodyHash,
     };
     lines.push(encodeReviewArtifact(artifact));
   }
@@ -188,12 +191,14 @@ export function formatDeltaReviewComment(
   }
   // ReviewArtifact block (#264): delta reviews use round=2, review1Risk=null.
   if (verdict.commitSha) {
+    const bodyHash = hashReviewBody(lines.join("\n"));
     const artifact: ReviewArtifact = {
       round: 2,
       reviewedSha: verdict.commitSha,
       diffHash: diffHash ?? null,
       blockingKeys: blockingKeys ? [...blockingKeys].sort() : [],
       review1Risk: null,
+      bodyHash,
     };
     lines.push(encodeReviewArtifact(artifact));
   }
