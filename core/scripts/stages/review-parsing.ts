@@ -61,6 +61,14 @@ export interface ReviewArtifact {
   blockingKeys: string[];
   /** Review-1 risk tier, set on round-1 comments; null for round-2 and delta. */
   review1Risk: "low" | "standard" | null;
+  /**
+   * SHA-256 hex digest of the rendered comment body preceding this artifact
+   * line (#390 review 1). Optional for backward compat with artifacts encoded
+   * before this field existed. Lets `isVerifiedPipelineReviewOutput` prove the
+   * text before the artifact is exactly the pipeline-generated body, not just
+   * that a trailing artifact can be decoded.
+   */
+  bodyHash?: string;
 }
 
 /**
@@ -71,6 +79,11 @@ export function encodeReviewArtifact(artifact: ReviewArtifact): string {
   const json = JSON.stringify(artifact);
   const b64 = Buffer.from(json).toString("base64url");
   return `<!-- review-artifact: ${b64} -->`;
+}
+
+/** SHA-256 hex digest of `text`, used for the artifact's `bodyHash` field. */
+export function hashReviewBody(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
 }
 
 /** True when `re` has at least one match starting after `pos` in `body`. */
@@ -126,21 +139,59 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
       (obj.diffHash !== null && typeof obj.diffHash !== "string") ||
       !Array.isArray(obj.blockingKeys) ||
       !obj.blockingKeys.every((k: unknown) => typeof k === "string") ||
-      (obj.review1Risk !== null && obj.review1Risk !== "low" && obj.review1Risk !== "standard")
+      (obj.review1Risk !== null && obj.review1Risk !== "low" && obj.review1Risk !== "standard") ||
+      (obj.bodyHash !== undefined && typeof obj.bodyHash !== "string")
     ) {
       return null;
     }
-    return {
+    const artifact: ReviewArtifact = {
       round: obj.round as 1 | 2,
       reviewedSha: obj.reviewedSha as string,
       diffHash: obj.diffHash as string | null,
       blockingKeys: obj.blockingKeys as string[],
       review1Risk: obj.review1Risk as "low" | "standard" | null,
     };
+    if (typeof obj.bodyHash === "string") artifact.bodyHash = obj.bodyHash;
+    return artifact;
   } catch {
     return null;
   }
 }
+
+/**
+ * True when `body` is verified, untampered pipeline-generated review output
+ * (#390 review 1): it decodes a valid `ReviewArtifact` (already guarded by
+ * `extractReviewArtifact` against sentinels injected before it), nothing
+ * follows the artifact line, AND the artifact's `bodyHash` matches a fresh
+ * hash of the text preceding the artifact line (#390 review 1 finding
+ * 1f4cb8cf). The trailing-content check alone only proves an artifact can be
+ * decoded — it does not prove the body before it is the generated review
+ * text, so a trusted actor could otherwise insert objection text before a
+ * copied artifact line and still pass. Binding to `bodyHash` closes that gap:
+ * `formatReviewComment`/`formatDeltaReviewComment` hash the exact rendered
+ * prefix into the artifact, so any edit to that prefix — inserted before or
+ * within it — changes the hash and fails verification, falling back to
+ * scope-language detection. Comments without a `bodyHash` (encoded before
+ * this field existed) are conservatively treated as unverified.
+ */
+export function isVerifiedPipelineReviewOutput(body: string): boolean {
+  const artifact = extractReviewArtifact(body);
+  if (artifact === null) return false;
+  REVIEW_ARTIFACT_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = REVIEW_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
+  REVIEW_ARTIFACT_RE.lastIndex = 0;
+  if (lastMatch === null) return false;
+  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
+  const rawPrefix = body.slice(0, lastMatch.index);
+  const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
+  if (typeof artifact.bodyHash !== "string") return false;
+  return hashReviewBody(prefix) === artifact.bodyHash;
+}
+
+
+
 
 // ---------------------------------------------------------------------------
 // computeDiffHash

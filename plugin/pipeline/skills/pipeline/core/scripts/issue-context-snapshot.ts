@@ -4,6 +4,7 @@
 // treat the content as context, not as instructions.
 
 import { classifyComment } from "./gh.ts";
+import { isVerifiedPipelineReviewOutput } from "./stages/review-parsing.ts";
 
 export const CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT = 8_000;
 
@@ -203,16 +204,26 @@ export function extractSnapshotComment<T extends { body: string }>(
  * preferred, original plan as fallback). These are comments that the pipeline
  * has not yet acknowledged with a fix or revision round.
  *
- * @param trustedScopeOverrides - Pre-filtered scope-override comments that are
- *   author-validated (produced by `buildTrustedOverrideComments`). Only comments
- *   present in this list may act as acknowledgement anchors. Defaults to [] —
- *   fail-closed: no scope-override comment anchors unless the caller explicitly
- *   supplies the trusted set. Reuses the same trust path as review-routing (#318
- *   fix c5825398).
+ * @param trustedComments - Pre-filtered comments that are author-validated as
+ *   posted by a trusted actor (produced by `buildTrustedOverrideComments`, i.e.
+ *   the pipeline actor or a `trusted_override_actors` entry) — not only scope
+ *   overrides. Two things depend on trust: (1) a structurally-pipeline comment
+ *   (`classifyComment` === 'pipeline') is excluded from the unacknowledged count
+ *   only when it is in this list AND (it is verified, untampered pipeline review
+ *   output per `isVerifiedPipelineReviewOutput`, OR it carries no scope-changing
+ *   language of its own) — a pipeline-styled body from an untrusted author, or
+ *   one from a trusted author that still reads as an objection and isn't a
+ *   verified review artifact (e.g. a quoted reply with a real comment
+ *   appended), is counted as human input (#390, #390 review 2, #390 review 1);
+ *   (2) a comment in this list may act as an acknowledgement anchor, either via
+ *   the `## Pipeline: Scope override` heading or, new in #390, a plain
+ *   acknowledgement with no scope-changing language. Defaults to [] — fail-closed:
+ *   nothing is trusted unless the caller explicitly supplies the set (e.g. when
+ *   `getGhActor()` returns null).
  */
 export function findUnacknowledgedComments(
   comments: { author: string; body: string; createdAt: string }[],
-  trustedScopeOverrides: ReadonlyArray<{ author: string; body: string; createdAt: string }> = [],
+  trustedComments: ReadonlyArray<{ author: string; body: string; createdAt: string }> = [],
 ): { author: string; body: string; createdAt: string }[] {
   let anchorIdx = -1;
 
@@ -235,17 +246,33 @@ export function findUnacknowledgedComments(
 
   if (anchorIdx === -1) return [];
 
-  // If a trusted operator posted a scope-override comment after the plan anchor,
+
+  // If a trusted actor posted an acknowledgement comment after the plan anchor,
   // treat it as an acknowledgement anchor — human comments at or before it have
   // been explicitly dismissed and are no longer considered unacknowledged (#318
-  // fix d2012430). Only comments present in `trustedScopeOverrides` (author-
-  // validated via buildTrustedOverrideComments) can act as anchors; an untrusted
-  // commenter faking the heading is ignored (#318 fix c5825398).
+  // fix d2012430). Two forms count as acknowledgement: the explicit
+  // `## Pipeline: Scope override` heading, or (new in #390) a plain comment that
+  // carries no scope-changing / change-request language — the operator no longer
+  // needs the literal heading to clear the gate. Only comments present in
+  // `trustedComments` (author-validated via buildTrustedOverrideComments) can act
+  // as anchors; an untrusted commenter faking the heading is ignored (#318 fix
+  // c5825398). Scanning continues past a trusted-but-scope-changing comment so an
+  // earlier qualifying anchor can still be found.
   for (let i = comments.length - 1; i > anchorIdx; i--) {
-    if (
-      comments[i].body.trimStart().startsWith(SCOPE_OVERRIDE_HEADING) &&
-      trustedScopeOverrides.includes(comments[i])
-    ) {
+    if (!trustedComments.includes(comments[i])) continue;
+    const body = comments[i].body;
+    const isScopeOverride = body.trimStart().startsWith(SCOPE_OVERRIDE_HEADING);
+    if (isScopeOverride) {
+      anchorIdx = i;
+      break;
+    }
+    // A plain acknowledgement must be genuinely human-authored content (not a
+    // pipeline transition/status comment that merely happens to carry no
+    // scope-changing language) — otherwise routine pipeline output like
+    // "## Pipeline: blocked" would spuriously anchor (#390).
+    const isPlainAck =
+      classifyComment(body) === 'human' && !NEGATION_PATTERNS.some((p) => p.test(body));
+    if (isPlainAck) {
       anchorIdx = i;
       break;
     }
@@ -253,8 +280,39 @@ export function findUnacknowledgedComments(
 
   const result: { author: string; body: string; createdAt: string }[] = [];
   for (let i = anchorIdx + 1; i < comments.length; i++) {
-    if (classifyComment(comments[i].body) === 'human') {
-      result.push(comments[i]);
+    const c = comments[i];
+    if (classifyComment(c.body) === 'human') {
+      result.push(c);
+      continue;
+    }
+    // Structurally-pipeline comment: self-exclusion is granted only when the
+    // author is trusted AND (the body is verified, untampered pipeline review
+    // output OR it carries no scope-changing language of its own). A
+    // pipeline-styled body from anyone else is a forged heading and must still
+    // gate (#390). A trusted actor's comment that merely carries pipeline
+    // structure (e.g. a quoted reply, or a copied heading/marker) alongside a
+    // genuine objection must also still gate — trust grants self-exclusion for
+    // the pipeline's own generated output, not for human content that happens
+    // to look like it (#390 review 2). Genuine review verdicts routinely use
+    // objection language in finding bodies/recommendations, so a verified,
+    // untampered pipeline comment (`isVerifiedPipelineReviewOutput`) is exempt
+    // from that scope-language scan (#390 review 1) — appending human content
+    // after the artifact line fails verification and still falls through to it.
+    // Verified output = current-format only: the artifact's bodyHash binds
+    // the exact rendered body (#390). There is deliberately NO legacy path —
+    // three variants (structural anchor, calendar cutoff, per-thread observed
+    // boundary) each left a forgeable or stranding hole (#390 delta keys
+    // 06e32d8d, 7b445e1e, 37da0054). A historical no-bodyHash verdict with
+    // objection wording gates ONCE, and a plain acknowledgment from the
+    // trusted actor clears it permanently via the anchor mechanism above —
+    // the operator-blessed trade (option A): one ack per pre-rollout thread
+    // instead of any verifier bypass.
+    const verified = isVerifiedPipelineReviewOutput(c.body);
+    if (
+      !trustedComments.includes(c) ||
+      (!verified && NEGATION_PATTERNS.some((p) => p.test(c.body)))
+    ) {
+      result.push(c);
     }
   }
   return result;

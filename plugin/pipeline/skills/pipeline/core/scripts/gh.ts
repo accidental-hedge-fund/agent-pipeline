@@ -1240,25 +1240,52 @@ export function findLatestCommentMatching(
 // it the `## Pipeline: plan review` transition posted between the plan comment
 // and the reviewer feedback would be misread as human input on every run. The
 // enumerated review/plan headers match the comments posted across the planning
-// and review stages (see transition()/postComment call sites).
+// and review stages (see transition()/postComment call sites). `## Review <N>`
+// (any positive integer N) is matched separately via REVIEW_ROUND_RE below since
+// review rounds are unbounded.
 export const PIPELINE_COMMENT_HEADERS: readonly string[] = [
   "## Implementation Plan",
   "## Revised Implementation Plan",
   "## Plan Review",
-  "## Review 1",
-  "## Review 2",
+  "## Pre-merge Delta Review",
   "## Fix 1",
   "## Fix 2",
   "## Pipeline:",
   "## Pre-Planning Context",
 ];
 
+// Matches "## Review 1", "## Review 2", "## Review 3", ... — review rounds are
+// unbounded, so a fixed header list would miss round 3+ (#390).
+const REVIEW_ROUND_RE = /^## Review \d+\b/;
+
+// Pipeline machine-sentinel HTML markers (#16/#229/#259/#390). These are
+// invisible in rendered Markdown and can appear anywhere in the body (not just
+// the leading header), so they are matched via substring, not prefix.
+const PIPELINE_SENTINEL_MARKERS: readonly string[] = [
+  "<!-- pipeline-audit:",
+  "<!-- pipeline-override",
+  "<!-- pipeline-override-scope",
+  "<!-- pipeline-blocking-keys",
+  "<!-- pipeline-blocking-surfaces",
+  "<!-- reviewed-sha",
+];
+
 const PLAN_COMMENT_HEADER = "## Implementation Plan";
+
+/** Structural pipeline-marker test shared by isPipelineComment and classifyComment:
+ *  a known header prefix, a `## Review <N>` round heading, or a sentinel HTML marker. */
+function hasPipelineMarker(body: string): boolean {
+  const head = body.trimStart();
+  return (
+    PIPELINE_COMMENT_HEADERS.some((h) => head.startsWith(h)) ||
+    REVIEW_ROUND_RE.test(head) ||
+    PIPELINE_SENTINEL_MARKERS.some((m) => body.includes(m))
+  );
+}
 
 /** Was this comment body posted by the pipeline (vs. a human)? */
 function isPipelineComment(body: string): boolean {
-  const head = body.trimStart();
-  return PIPELINE_COMMENT_HEADERS.some((h) => head.startsWith(h));
+  return hasPipelineMarker(body);
 }
 
 /**
@@ -1268,7 +1295,7 @@ function isPipelineComment(body: string): boolean {
 export function classifyComment(body: string): 'human' | 'pipeline' {
   const head = body.trimStart();
   if (!head) return 'pipeline';
-  return PIPELINE_COMMENT_HEADERS.some((h) => head.startsWith(h)) ? 'pipeline' : 'human';
+  return hasPipelineMarker(body) ? 'pipeline' : 'human';
 }
 
 /**
