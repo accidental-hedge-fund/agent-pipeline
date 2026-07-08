@@ -605,3 +605,37 @@ test("findUnacknowledgedComments: trusted-actor comment with scope-changing lang
   assert.equal(unacked[0].author, "alice");
   assert.equal(unacked[1].author, "operator");
 });
+
+test("findUnacknowledgedComments: trusted marker-bearing comment with scope-changing language is still counted (#390 review 2)", () => {
+  // A trusted actor's comment that carries pipeline structure (a recognized
+  // heading here; a raw copied sentinel marker below) but is really a human
+  // objection must not be silently dropped as if it were genuine pipeline
+  // self-output.
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(
+      "operator",
+      "## Pre-merge Delta Review — needs-attention (commit abc1234)\n\nThis is wrong; don't proceed.",
+      ts(1),
+    ),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "marker-bearing trusted comment with objection language must still gate");
+  assert.equal(unacked[0].author, "operator");
+});
+
+test("findUnacknowledgedComments: trusted comment with a raw copied sentinel marker and an objection is still counted (#390 review 2)", () => {
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(
+      "operator",
+      "<!-- pipeline-audit: run=123 state=review --> Wait, revert this, wrong approach.",
+      ts(1),
+    ),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "raw copied sentinel marker with an objection must still gate");
+  assert.equal(unacked[0].author, "operator");
+});
