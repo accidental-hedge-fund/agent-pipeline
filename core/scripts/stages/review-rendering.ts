@@ -15,6 +15,7 @@ import {
   categoryMarker,
   directionMarker,
   findingKey,
+  findingPayloadFingerprint,
   formatBlockingSurfacesMarker,
   type PartitionResult,
   type Review1Risk,
@@ -80,6 +81,12 @@ export function formatReviewComment(
           ? ` ${directionMarker(f.spec_divergence_direction)}`
           : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}`);
+      // Machine-readable payload fingerprint, emitted at render time from the
+      // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
+      // (fix-stage summaries, disposition matching) read it verbatim instead
+      // of reconstructing it from lossy markdown, which truncated multi-line
+      // recommendations and mis-keyed colliding findings.
+      lines.push(`<!-- finding-fingerprint: ${findingPayloadFingerprint(f)} -->`);
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);
@@ -163,6 +170,12 @@ export function formatDeltaReviewComment(
           ? ` ${directionMarker(f.spec_divergence_direction)}`
           : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}`);
+      // Machine-readable payload fingerprint, emitted at render time from the
+      // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
+      // (fix-stage summaries, disposition matching) read it verbatim instead
+      // of reconstructing it from lossy markdown, which truncated multi-line
+      // recommendations and mis-keyed colliding findings.
+      lines.push(`<!-- finding-fingerprint: ${findingPayloadFingerprint(f)} -->`);
       if (loc) lines.push(`Location: \`${loc}\``);
       if (f.body) lines.push(f.body);
       if (f.recommendation) lines.push(`**Recommendation**: ${f.recommendation}`);

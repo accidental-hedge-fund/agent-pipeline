@@ -32,6 +32,7 @@ import {
   buildTrustedOverrideComments,
   effectiveReviewPolicy,
   extractBlockingSurfacesFromComment,
+  extractNonReproducingDispositions,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
@@ -544,7 +545,12 @@ export async function advanceReview(
   const trustedComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
   const overrides = extractOverrides(trustedComments);
   const scopes = extractScopedOverrides(trustedComments);
-  const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes);
+  // #391 review-2 finding 7b965502: a prior fix round's SHA-anchored
+  // non-reproducing disposition must also be consulted on review entry — not
+  // just fix entry — so a re-review at the same reviewed SHA does not re-block
+  // the same already-declared tooling artifact.
+  const nonReproducing = extractNonReproducingDispositions(trustedComments);
+  const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes, nonReproducing, commitSha);
   const blockingFindingSet = new Set<ReviewFinding>(partition.blocking);
   for (let i = 0; i < findingRecords.length; i++) {
     findingRecords[i].effective_blocking = blockingFindingSet.has(verdict.findings[i]);

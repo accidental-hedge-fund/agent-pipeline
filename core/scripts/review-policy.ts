@@ -319,8 +319,15 @@ export interface PartitionResult {
  * and not the title alone (which collapses genuinely different findings that
  * happen to share a key + title). Exact-duplicate payloads share a fingerprint
  * and collapse; materially different findings do not. Exported for tests.
+ *
+ * Accepts `Pick<ReviewFinding, ...>` (not the full type) so callers that only
+ * have a partial finding reconstructed from rendered review-comment text (e.g.
+ * the fix-stage `parseFindingSummaries`, #391) can compute the same
+ * fingerprint without a full `ReviewFinding`.
  */
-export function findingPayloadFingerprint(f: ReviewFinding): string {
+export function findingPayloadFingerprint(
+  f: Pick<ReviewFinding, "title" | "body" | "recommendation" | "line_start" | "line_end">,
+): string {
   const norm = (s: string | undefined): string =>
     (s ?? "").toLowerCase().replace(/[*_`~]/g, "").replace(/\s+/g, " ").trim();
   // Normalize the range: an omitted line_end means the single line `line_start`,
@@ -346,8 +353,13 @@ export function findingPayloadFingerprint(f: ReviewFinding): string {
  * - file: `normalizeFile(finding.file)` equals the scope value OR begins with
  *   `scopeValue + "/"` (directory-boundary-aware prefix, #229).
  *   A finding without a file does NOT match.
+ *
+ * Accepts `Pick<ReviewFinding, "category" | "file">` (not the full type) so
+ * callers that only have a partial finding reconstructed from rendered review
+ * text (e.g. the fix-stage override pre-filter, #391) can reuse this single
+ * identity implementation instead of re-deriving the match rule.
  */
-function matchFindingScope(f: ReviewFinding, s: ScopedOverride): boolean {
+export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s: ScopedOverride): boolean {
   if (s.type === "category") {
     const cat = (f.category ?? "").toLowerCase().trim();
     return cat !== "" && cat === s.value;
@@ -384,12 +396,30 @@ function matchFindingScope(f: ReviewFinding, s: ScopedOverride): boolean {
  * and correctly withhold the override so a real blocker cannot advance under it.
  * Scoped overrides bypass this guard by design (#229): a scope is explicitly
  * intended to match more than one finding.
+ *
+ * SHA-anchored non-reproducing disposition (#391): a finding whose key has one
+ * or more recorded {@link extractNonReproducingDispositions} entries is
+ * treated like a key override — same ambiguity guard — but ONLY when at least
+ * one of those entries has both a `sha` equal to `reviewedSha` (the SHA this
+ * verdict was produced against) AND a `fingerprint` equal to the finding's
+ * {@link findingPayloadFingerprint} (#391 review-1 finding 5805b17e). `findingKey`
+ * is intentionally coarse (file + severity + 5-line band), so a key+SHA match
+ * alone is not enough to prove it is the SAME finding — the fingerprint
+ * requirement rules out a different finding that happens to land in the same
+ * coarse bucket at the same SHA, and multiple dispositions are kept per key
+ * (#391 review-2 finding 53b23912) so a colliding finding's disposition is
+ * never lost. A disposition recorded against a since-superseded SHA, or whose
+ * fingerprint no longer matches, does not apply, so the finding is evaluated
+ * afresh. Callers MUST pre-filter the source comments to trusted authors
+ * before calling, mirroring the trust model of `overrides`.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
   policy: ReviewPolicy,
   overrides: Map<string, string> = new Map(),
   scopes: ScopedOverride[] = [],
+  nonReproducing: Map<string, { sha: string; fingerprint: string }[]> = new Map(),
+  reviewedSha: string | null = null,
 ): PartitionResult {
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
@@ -442,6 +472,27 @@ export function partitionFindings(
 
     if (overrides.has(key) && isBlockingCandidate && !isAmbiguous) {
       result.overridden.push({ kind: "key", finding: f, key, disposition: overrides.get(key)! });
+      continue;
+    }
+
+    // 2b. SHA-anchored non-reproducing disposition (#391): only consulted when
+    // the disposition's recorded SHA matches the SHA this verdict was produced
+    // against AND its recorded payload fingerprint matches this finding's
+    // current fingerprint (#391 review-1 finding 5805b17e) — the coarse key
+    // alone cannot distinguish a different finding that lands in the same
+    // file/severity/line-band bucket at the same SHA.
+    const nonRepro = reviewedSha
+      ? nonReproducing.get(key)?.find(
+          (d) => d.sha === reviewedSha && d.fingerprint === findingPayloadFingerprint(f),
+        )
+      : undefined;
+    if (nonRepro && isBlockingCandidate && !isAmbiguous) {
+      result.overridden.push({
+        kind: "key",
+        finding: f,
+        key,
+        disposition: `declared non-reproducing at ${reviewedSha.slice(0, 7)} by a prior fix round`,
+      });
       continue;
     }
 
@@ -643,6 +694,90 @@ export function scopedOverrideComment(args: {
     "",
     `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${safeReason} -->`,
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Non-reproducing disposition (#391) — SHA-anchored, machine-authored, weaker
+// than an operator override. Recorded when the fix harness declares a blocking
+// finding does not reproduce at the reviewed SHA (see fix.ts's does-not-reproduce
+// declaration parsing) so a later fix/review re-entry at the SAME SHA does not
+// reproduce the "reported success but produced no new commits" dead-end.
+// ---------------------------------------------------------------------------
+
+const NON_REPRODUCING_HEADING = "## Pipeline: Finding does not reproduce";
+// Third capture is the finding's payload fingerprint (#391 review-1 finding
+// 5805b17e) — 16 lowercase hex chars, matching findingPayloadFingerprint's
+// output — recorded alongside the key/SHA so a later re-review at the same SHA
+// can require a full-payload match, not just a coarse key match.
+const NON_REPRODUCING_RE =
+  /^<!-- pipeline-non-reproducing: ([0-9a-f]{8}) ([0-9a-fA-F]{40}) ([0-9a-f]{16}) -->$/m;
+
+/**
+ * The audited non-reproducing disposition comment (#391). Distinct heading and
+ * sentinel from `overrideComment` — this disposition is machine-authored and
+ * SHA-anchored, never an unconditional human clearance.
+ */
+export function nonReproducingDispositionComment(args: {
+  key: string;
+  reviewedSha: string;
+  fingerprint: string;
+  stage: string;
+  justification: string;
+  timestamp: string;
+  footer?: string;
+}): string {
+  const { key, reviewedSha, fingerprint, stage, justification, timestamp, footer } = args;
+  return [
+    NON_REPRODUCING_HEADING,
+    "",
+    `**Finding**: \`${key}\``,
+    `**Reviewed SHA**: \`${reviewedSha}\``,
+    `**Stage**: ${stage}`,
+    `**Recorded at**: ${timestamp}`,
+    "",
+    "### Justification (fix harness)",
+    justification,
+    "",
+    "This disposition is machine-authored and SHA-anchored: it is consulted only " +
+      "while the reviewed SHA is unchanged. A new commit re-opens the finding for review.",
+    "",
+    (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
+    "",
+    `<!-- pipeline-non-reproducing: ${key} ${reviewedSha} ${fingerprint} -->`,
+  ].join("\n");
+}
+
+/**
+ * Collect active non-reproducing dispositions from trusted-author comments as
+ * key → `{ sha, fingerprint }[]` (every disposition recorded under that coarse
+ * key, each anchored to the SHA and payload fingerprint it was declared
+ * against). The coarse key (file + severity + 5-line band) can collide across
+ * distinct findings, so multiple dispositions per key are preserved rather
+ * than the later one overwriting the earlier — a consumer must match on both
+ * SHA and fingerprint (#391 review-2 finding 53b23912), not key alone. Callers
+ * MUST pre-filter `comments` to trusted authors (e.g. via
+ * `buildTrustedOverrideComments`) before calling — mirrors the trust model of
+ * `extractOverrides`.
+ *
+ * Security invariants (parallel to extractOverrides):
+ * 1. Only comments with the `## Pipeline: Finding does not reproduce` heading are processed.
+ * 2. Only the last non-empty line is parsed as the machine sentinel.
+ */
+export function extractNonReproducingDispositions(
+  comments: { body: string }[],
+): Map<string, { sha: string; fingerprint: string }[]> {
+  const map = new Map<string, { sha: string; fingerprint: string }[]>();
+  for (const c of comments) {
+    if (!c.body.startsWith(NON_REPRODUCING_HEADING)) continue;
+    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    const m = NON_REPRODUCING_RE.exec(lastLine);
+    if (!m) continue;
+    const entry = { sha: m[2], fingerprint: m[3] };
+    const existing = map.get(m[1]);
+    if (existing) existing.push(entry);
+    else map.set(m[1], [entry]);
+  }
+  return map;
 }
 
 /**

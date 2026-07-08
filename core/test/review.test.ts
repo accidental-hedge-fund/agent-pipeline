@@ -37,7 +37,7 @@ import {
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
-import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, formatBlockingSurfacesMarker, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
+import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -538,6 +538,7 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
 
 const NA_ZERO = '{"verdict":"needs-attention","summary":"vague","findings":[],"next_steps":[]}';
 const APPROVE = '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}';
+const NA_WITH_FINDING_OBJ = { severity: "high", title: "bug", body: "b", confidence: 0.8, recommendation: "fix it" };
 const NA_WITH_FINDING =
   '{"verdict":"needs-attention","summary":"one issue","findings":' +
   '[{"severity":"high","title":"bug","body":"b","confidence":0.8,"recommendation":"fix it"}],' +
@@ -769,6 +770,83 @@ test("advanceReview (#17): an operator override on a blocking finding advances i
   assert.deepEqual(rec.blocked, []);
   assert.deepEqual(rec.transitions, [{ to: "pre-merge" }], "overridden finding → advance, not fix-2");
   assert.match(outcome.summary, /below policy/);
+});
+
+test("advanceReview (#391 review-2 finding 7b965502): a SHA-anchored non-reproducing disposition at the current reviewed SHA advances instead of routing to fix", async (t) => {
+  // A prior fix round declared this finding's key non-reproducing at the SHA
+  // this review is running against (makeDeps' getPrDetail returns head_sha =
+  // 40 'f's) — review entry must consult it, not just fix entry, so a re-review
+  // at the same SHA does not re-block the same already-declared tooling artifact.
+  const key = findingKey({ severity: "high", title: "bug" });
+  const sha = "f".repeat(40);
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{
+        body: nonReproducingDispositionComment({
+          key,
+          reviewedSha: sha,
+          fingerprint: findingPayloadFingerprint(NA_WITH_FINDING_OBJ),
+          stage: "fix-2",
+          justification: "tooling artifact, does not reproduce",
+          timestamp: "2026-01-01T00:00:00Z",
+        }),
+        author: TEST_ACTOR,
+      }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 9, 2, {}, 0, deps);
+  });
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "pre-merge" }],
+    "non-reproducing-dispositioned finding at the matching SHA → advance, not fix-2",
+  );
+  assert.match(outcome.summary, /below policy/);
+});
+
+test("advanceReview (#391): a non-reproducing disposition anchored to a stale SHA does not suppress — routes to fix as normal", async (t) => {
+  const key = findingKey({ severity: "high", title: "bug" });
+  const staleSha = "a".repeat(40); // does not match makeDeps' head_sha ("f" x 40)
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 1,
+      type: "issue",
+      title: "Title",
+      body: "Body",
+      state: "open",
+      url: "https://example.test/1",
+      labels: [],
+      comments: [{
+        body: nonReproducingDispositionComment({
+          key,
+          reviewedSha: staleSha,
+          fingerprint: findingPayloadFingerprint(NA_WITH_FINDING_OBJ),
+          stage: "fix-2",
+          justification: "tooling artifact, does not reproduce",
+          timestamp: "2026-01-01T00:00:00Z",
+        }),
+        author: TEST_ACTOR,
+      }],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+  await quiet(t, async () => {
+    await advanceReview(cfg, 9, 2, {}, 0, deps);
+  });
+  assert.deepEqual(
+    rec.transitions,
+    [{ to: "fix-2" }],
+    "a disposition anchored to a since-superseded SHA must not suppress — the finding still routes to fix",
+  );
 });
 
 // ---------------------------------------------------------------------------

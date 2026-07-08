@@ -11,6 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  computeEffectiveBlockingSet,
+  decideDoesNotReproduceAdvance,
   decideExternalCommitAdvance,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
@@ -18,14 +20,31 @@ import {
   enforceOpenspecSpecDeltaValidation,
   extractAllReviewFindingsHistory,
   extractBlockingReviewFindings,
+  filterUnambiguousDeclarations,
+  filterOverridesAfterReview,
   filterToBlockingFindings,
+  findTriggeringReviewComment,
   isCommitOnRemote,
+  parseDoesNotReproduceDeclarations,
+  parseFindingSummaries,
   resolveFixCommitGateMode,
 } from "../scripts/stages/fix.ts";
 
 const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
-import { categoryMarker, directionMarker, findingKey, SPEC_DIVERGENCE_CATEGORY } from "../scripts/review-policy.ts";
+import {
+  categoryMarker,
+  directionMarker,
+  extractNonReproducingDispositions,
+  extractOverrides,
+  extractScopedOverrides,
+  findingKey,
+  findingPayloadFingerprint,
+  nonReproducingDispositionComment,
+  overrideComment,
+  scopedOverrideComment,
+  SPEC_DIVERGENCE_CATEGORY,
+} from "../scripts/review-policy.ts";
 import type { VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import type { ValidateResult } from "../scripts/openspec.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
@@ -749,3 +768,795 @@ test("advanceFix: fix-harness invoke() call forwards cfg.effort.fix as reasoning
     "the invoke() call immediately following model resolution must forward cfg.effort?.fix as reasoningEffort",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #391: fix-round dead-end recovery — override pre-filter, does-not-reproduce
+// declaration parsing, and the non-reproducing disposition sentinel round-trip.
+// ---------------------------------------------------------------------------
+
+const SHA_R391_A = "a".repeat(40);
+const SHA_R391_B = "b".repeat(40);
+
+const findingA: ReviewFinding = {
+  severity: "high",
+  title: "Finding A — real blocker",
+  file: "core/scripts/stages/fix.ts",
+  line_start: 10,
+  body: "Must be fixed.",
+  confidence: 0.9,
+  recommendation: "Fix it.",
+};
+const findingB: ReviewFinding = {
+  severity: "high",
+  title: "Finding B — also blocking",
+  file: "core/scripts/stages/other.ts",
+  line_start: 20,
+  body: "Also must be fixed.",
+  confidence: 0.9,
+  recommendation: "Fix it too.",
+  category: "docs",
+};
+const keyA = findingKey(findingA);
+const keyB = findingKey(findingB);
+const FP_A = findingPayloadFingerprint(findingA);
+const FP_B = findingPayloadFingerprint(findingB);
+
+function twoFindingReview(): string {
+  return formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "two blockers", findings: [findingA, findingB], next_steps: [] },
+    1, "codex",
+    new Set([keyA, keyB]),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// parseFindingSummaries
+// ---------------------------------------------------------------------------
+
+test("parseFindingSummaries: recovers key, category, and file for each finding block", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const a = summaries.find((s) => s.key === keyA);
+  const b = summaries.find((s) => s.key === keyB);
+  assert.ok(a, "finding A must be recovered");
+  assert.ok(b, "finding B must be recovered");
+  assert.equal(a!.file, "core/scripts/stages/fix.ts");
+  assert.equal(a!.category, null, "finding A has no category");
+  assert.equal(b!.file, "core/scripts/stages/other.ts");
+  assert.equal(b!.category, "docs");
+});
+
+test("parseFindingSummaries: fingerprint matches findingPayloadFingerprint of the live finding (#391 review-1 finding 5805b17e)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const a = summaries.find((s) => s.key === keyA);
+  const b = summaries.find((s) => s.key === keyB);
+  assert.equal(a!.fingerprint, findingPayloadFingerprint(findingA));
+  assert.equal(b!.fingerprint, findingPayloadFingerprint(findingB));
+  assert.notEqual(a!.fingerprint, b!.fingerprint, "distinct findings must not share a fingerprint");
+});
+
+test("parseFindingSummaries: finding with no Location line (no file/line) → file null", () => {
+  const noLocFinding: ReviewFinding = {
+    severity: "medium",
+    title: "No location finding",
+    body: "abstract issue",
+    confidence: 0.8,
+    recommendation: "think about it",
+  };
+  const key = findingKey(noLocFinding);
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [noLocFinding], next_steps: [] },
+    1, "codex",
+    new Set([key]),
+  );
+  const summaries = parseFindingSummaries(body);
+  assert.equal(summaries.length, 1);
+  assert.equal(summaries[0].file, null);
+  assert.equal(summaries[0].category, null);
+});
+
+test("parseFindingSummaries: empty when body has no Findings section", () => {
+  assert.deepEqual(parseFindingSummaries("## Review 1 — approve\n\nnothing to see"), []);
+});
+
+// ---------------------------------------------------------------------------
+// computeEffectiveBlockingSet — the fix-entry override/non-reproducing pre-filter
+// ---------------------------------------------------------------------------
+
+test("computeEffectiveBlockingSet: key override subtracts exactly the matching finding", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const overrides = extractOverrides([
+    { body: overrideComment({ key: keyA, disposition: "rejected", reason: "false positive", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z" }) },
+  ]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, overrides, [], new Map(), null,
+  );
+  assert.deepEqual([...result.effectiveKeys].sort(), [keyB]);
+  assert.equal(result.dispositions.length, 1);
+  assert.equal(result.dispositions[0].key, keyA);
+  assert.match(result.dispositions[0].note, /override/);
+});
+
+test("computeEffectiveBlockingSet: category scope override subtracts every matching finding", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const scopes = extractScopedOverrides([
+    { body: scopedOverrideComment({
+      scopeType: "category", scopeValue: "docs", disposition: "deferred",
+      reason: "tracked separately", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+    }) },
+  ]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), scopes, new Map(), null,
+  );
+  // Only findingB carries category "docs" — findingA (no category) must survive.
+  assert.deepEqual([...result.effectiveKeys].sort(), [keyA]);
+  assert.equal(result.dispositions.length, 1);
+  assert.equal(result.dispositions[0].key, keyB);
+  assert.match(result.dispositions[0].note, /scope override/);
+});
+
+test("computeEffectiveBlockingSet: file-prefix scope override subtracts the matching finding", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const scopes = extractScopedOverrides([
+    { body: scopedOverrideComment({
+      scopeType: "file", scopeValue: "core/scripts/stages/fix.ts", disposition: "rejected",
+      reason: "not a real issue", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+    }) },
+  ]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), scopes, new Map(), null,
+  );
+  assert.deepEqual([...result.effectiveKeys].sort(), [keyB]);
+});
+
+test("computeEffectiveBlockingSet: no overrides/dispositions → effective set unchanged, no dispositions", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), [], new Map(), null,
+  );
+  assert.deepEqual([...result.effectiveKeys].sort(), [keyA, keyB].sort());
+  assert.deepEqual(result.dispositions, []);
+});
+
+test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only when the SHA matches the current reviewed SHA", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const nonReproducing = new Map([[keyA, [{ sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingA) }]]]);
+
+  const matching = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), [], nonReproducing, SHA_R391_A,
+  );
+  assert.deepEqual([...matching.effectiveKeys].sort(), [keyB], "matching SHA → keyA dispositioned");
+
+  const stale = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), [], nonReproducing, SHA_R391_B,
+  );
+  assert.deepEqual(
+    [...stale.effectiveKeys].sort(), [keyA, keyB].sort(),
+    "SHA changed since the disposition was recorded → finding re-opens (fails closed)",
+  );
+
+  const noEntry = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), [], nonReproducing, null,
+  );
+  assert.deepEqual(
+    [...noEntry.effectiveKeys].sort(), [keyA, keyB].sort(),
+    "no reviewed SHA at entry → non-reproducing dispositions never applied",
+  );
+});
+
+test("computeEffectiveBlockingSet: non-reproducing disposition subtracts only when the fingerprint also matches (#391 review-1 finding 5805b17e)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  // A disposition recorded for keyA's SHA but with a fingerprint belonging to a
+  // DIFFERENT finding (e.g. findingB's payload landed in keyA's coarse bucket in
+  // a hypothetical prior round) must not subtract findingA.
+  const mismatched = new Map([[keyA, [{ sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingB) }]]]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, new Map(), [], mismatched, SHA_R391_A,
+  );
+  assert.deepEqual(
+    [...result.effectiveKeys].sort(), [keyA, keyB].sort(),
+    "a fingerprint mismatch must not subtract keyA even though the key and SHA both match",
+  );
+});
+
+test("computeEffectiveBlockingSet: multiple dispositions under the same coarse key each still apply to their own finding (#391 review-2 finding 53b23912)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  // keyA and keyB are distinct here, but both dispositions are stored under a
+  // single coarse key to simulate a collision — the array must preserve both
+  // rather than the later entry overwriting the earlier one.
+  const collided = new Map([[keyA, [
+    { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingA) },
+    { sha: SHA_R391_A, fingerprint: findingPayloadFingerprint(findingB) },
+  ]]]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA]), summaries, new Map(), [], collided, SHA_R391_A,
+  );
+  assert.deepEqual([...result.effectiveKeys], [], "findingA's own disposition must still be found in the array");
+});
+
+test("computeEffectiveBlockingSet: all findings dispositioned (mixed override + scope) → empty effective set", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const overrides = extractOverrides([
+    { body: overrideComment({ key: keyA, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z" }) },
+  ]);
+  const scopes = extractScopedOverrides([
+    { body: scopedOverrideComment({
+      scopeType: "category", scopeValue: "docs", disposition: "deferred",
+      reason: "tracked", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+    }) },
+  ]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, overrides, scopes, new Map(), null,
+  );
+  assert.equal(result.effectiveKeys.size, 0);
+  assert.equal(result.dispositions.length, 2);
+});
+
+test("computeEffectiveBlockingSet: a marker key with no matching summary (schema/version skew) stays effective — fails closed (#391 review-3 finding d548d3d0)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const keyC = "deadbeef";
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyC]), summaries, new Map(), [], new Map(), null,
+  );
+  assert.deepEqual(
+    [...result.effectiveKeys].sort(), [keyA, keyC].sort(),
+    "the unmatched key must not silently disappear from the effective set",
+  );
+  const synthetic = result.effectiveSummaries.find((s) => s.key === keyC);
+  assert.ok(synthetic, "a synthetic identity must be carried for the unmatched key");
+  assert.equal(synthetic!.fingerprint, null);
+});
+
+test("computeEffectiveBlockingSet: a key-level override still dispositions an unmatched key", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const keyC = "deadbeef";
+  const overrides = extractOverrides([
+    { body: overrideComment({ key: keyC, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z" }) },
+  ]);
+  const result = computeEffectiveBlockingSet(
+    new Set([keyA, keyC]), summaries, overrides, [], new Map(), null,
+  );
+  assert.deepEqual([...result.effectiveKeys].sort(), [keyA]);
+  assert.ok(result.dispositions.some((d) => d.key === keyC && /override/.test(d.note)));
+});
+
+test("decideDoesNotReproduceAdvance: an unmatched marker key blocks the does-not-reproduce carve-out even when every known identity is covered", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const keyC = "deadbeef";
+  const preFilter = computeEffectiveBlockingSet(
+    new Set([keyA, keyC]), summaries, new Map(), [], new Map(), null,
+  );
+  const sha = "a".repeat(40);
+  const decision = decideDoesNotReproduceAdvance(
+    preFilter.effectiveSummaries,
+    [{ key: keyA, fingerprint: FP_A, reviewedSha: sha, justification: "j" }],
+    sha, 1,
+  );
+  assert.equal(
+    decision.advance, false,
+    "a lost identity with no fingerprint can never be covered by a declaration — must fail closed",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// findTriggeringReviewComment / filterOverridesAfterReview — override timing
+// guard (#391 review-1 finding bbc7d244): only overrides recorded AFTER the
+// triggering review comment may disposition its findings.
+// ---------------------------------------------------------------------------
+
+test("findTriggeringReviewComment: returns the latest matching review comment with its createdAt", () => {
+  const comments = [
+    { author: "codex", body: "unrelated comment", createdAt: "2026-06-01T00:00:00Z" },
+    { author: "codex", body: twoFindingReview(), createdAt: "2026-07-01T12:00:00Z" },
+  ];
+  const m = findTriggeringReviewComment(comments, 1);
+  assert.ok(m, "expected the review-1 comment to be found");
+  assert.equal(m!.createdAt, "2026-07-01T12:00:00Z");
+});
+
+test("findTriggeringReviewComment: null when no review-N comment matches", () => {
+  const comments = [{ author: "codex", body: "nothing here", createdAt: "2026-07-01T00:00:00Z" }];
+  assert.equal(findTriggeringReviewComment(comments, 1), null);
+});
+
+test("filterOverridesAfterReview: drops comments at/before the triggering review, keeps ones strictly after", () => {
+  const trusted = [
+    { author: "codex", body: "before", createdAt: "2026-06-30T00:00:00Z" },
+    { author: "codex", body: "same instant", createdAt: "2026-07-01T00:00:00Z" },
+    { author: "codex", body: "after", createdAt: "2026-07-02T00:00:00Z" },
+  ];
+  const filtered = filterOverridesAfterReview(trusted, { createdAt: "2026-07-01T00:00:00Z" });
+  assert.deepEqual(filtered.map((c) => c.body), ["after"]);
+});
+
+test("filterOverridesAfterReview: no triggering comment → returns []", () => {
+  const trusted = [{ author: "codex", body: "x", createdAt: "2026-07-01T00:00:00Z" }];
+  assert.deepEqual(filterOverridesAfterReview(trusted, null), []);
+});
+
+test("computeEffectiveBlockingSet + filterOverridesAfterReview: a stale override predating the review does NOT subtract its finding; one recorded after it does", () => {
+  const reviewCreatedAt = "2026-07-01T12:00:00Z";
+  const summaries = parseFindingSummaries(twoFindingReview());
+
+  const staleOverride = [
+    {
+      body: overrideComment({ key: keyA, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-06-01T00:00:00Z" }),
+      createdAt: "2026-06-01T00:00:00Z",
+    },
+  ];
+
+  // Sanity: without the after-review filter (the pre-fix behavior), this exact
+  // stale override incorrectly subtracts keyA even though it predates the
+  // triggering review — this is the bug the fix guards against.
+  const staleUnfiltered = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, extractOverrides(staleOverride), [], new Map(), null,
+  );
+  assert.deepEqual([...staleUnfiltered.effectiveKeys].sort(), [keyB]);
+
+  const staleFiltered = filterOverridesAfterReview(staleOverride, { createdAt: reviewCreatedAt });
+  const staleResult = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, extractOverrides(staleFiltered), [], new Map(), null,
+  );
+  assert.deepEqual(
+    [...staleResult.effectiveKeys].sort(), [keyA, keyB].sort(),
+    "an override predating the triggering review must not subtract its finding",
+  );
+
+  const freshOverride = [
+    {
+      body: overrideComment({ key: keyA, disposition: "rejected", reason: "fp", stage: "fix-1", timestamp: "2026-07-02T00:00:00Z" }),
+      createdAt: "2026-07-02T00:00:00Z",
+    },
+  ];
+  const freshFiltered = filterOverridesAfterReview(freshOverride, { createdAt: reviewCreatedAt });
+  const freshResult = computeEffectiveBlockingSet(
+    new Set([keyA, keyB]), summaries, extractOverrides(freshFiltered), [], new Map(), null,
+  );
+  assert.deepEqual(
+    [...freshResult.effectiveKeys].sort(), [keyB],
+    "an override recorded after the triggering review must subtract its finding",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// filterToBlockingFindings / extractBlockingReviewFindings — overriddenKeys param (#391)
+// ---------------------------------------------------------------------------
+
+test("filterToBlockingFindings: overriddenKeys omits the finding and adds a distinct note", () => {
+  const body = twoFindingReview();
+  const filtered = filterToBlockingFindings(body, new Set([keyA, keyB]), new Set([keyA]));
+  assert.ok(!filtered.includes(findingA.title), "overridden finding must be omitted");
+  assert.ok(filtered.includes(findingB.title), "remaining finding must survive");
+  assert.ok(filtered.includes("1 blocking finding was omitted"), "override omission note must be present");
+  assert.ok(filtered.includes("already dispositioned"), "note must explain the omission");
+});
+
+test("filterToBlockingFindings: overriddenKeys empty → identical to unfiltered call (no regression)", () => {
+  const body = twoFindingReview();
+  assert.equal(
+    filterToBlockingFindings(body, new Set([keyA, keyB]), new Set()),
+    filterToBlockingFindings(body, new Set([keyA, keyB])),
+  );
+});
+
+test("extractBlockingReviewFindings: overriddenKeys param excludes the dispositioned finding from the fix prompt", () => {
+  const comments = [{ body: twoFindingReview() }];
+  const filtered = extractBlockingReviewFindings(comments, 1, new Set([keyB]));
+  assert.ok(filtered.includes(findingA.title));
+  assert.ok(!filtered.includes(findingB.title));
+});
+
+// ---------------------------------------------------------------------------
+// parseDoesNotReproduceDeclarations
+// ---------------------------------------------------------------------------
+
+test("parseDoesNotReproduceDeclarations: parses a single well-formed declaration", () => {
+  const stdout = `Some harness prose.\n<!-- pipeline-does-not-reproduce: ${keyA} ${FP_A} ${SHA_R391_A} | this is a tooling artifact -->\nmore prose`;
+  const decls = parseDoesNotReproduceDeclarations(stdout);
+  assert.equal(decls.length, 1);
+  assert.deepEqual(decls[0], {
+    key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "this is a tooling artifact",
+  });
+});
+
+test("parseDoesNotReproduceDeclarations: parses multiple declarations", () => {
+  const stdout = [
+    `<!-- pipeline-does-not-reproduce: ${keyA} ${FP_A} ${SHA_R391_A} | reason one -->`,
+    `<!-- pipeline-does-not-reproduce: ${keyB} ${FP_B} ${SHA_R391_A} | reason two -->`,
+  ].join("\n");
+  const decls = parseDoesNotReproduceDeclarations(stdout);
+  assert.equal(decls.length, 2);
+  assert.deepEqual(decls.map((d) => d.key).sort(), [keyA, keyB].sort());
+});
+
+test("parseDoesNotReproduceDeclarations: malformed lines (bad key/sha/fingerprint length, missing pipe) are ignored", () => {
+  const stdout = [
+    "<!-- pipeline-does-not-reproduce: shortkey " + FP_A + " " + SHA_R391_A + " | reason -->",
+    "<!-- pipeline-does-not-reproduce: " + keyA + " tooshortfp " + SHA_R391_A + " | reason -->",
+    "<!-- pipeline-does-not-reproduce: " + keyA + " " + FP_A + " tooshortsha | reason -->",
+    "<!-- pipeline-does-not-reproduce: " + keyA + " " + FP_A + " " + SHA_R391_A + " no pipe here -->",
+    "plain prose mentioning pipeline-does-not-reproduce without the sentinel shape",
+  ].join("\n");
+  assert.deepEqual(parseDoesNotReproduceDeclarations(stdout), []);
+});
+
+test("parseDoesNotReproduceDeclarations: empty/absent → []", () => {
+  assert.deepEqual(parseDoesNotReproduceDeclarations(""), []);
+  assert.deepEqual(parseDoesNotReproduceDeclarations("no sentinel here at all"), []);
+});
+
+// ---------------------------------------------------------------------------
+// decideDoesNotReproduceAdvance
+// ---------------------------------------------------------------------------
+
+test("decideDoesNotReproduceAdvance: round 1, all invoked findings validly declared → advances to review-2", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [
+    { key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j1" },
+    { key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j2" },
+  ];
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => [keyA, keyB].includes(x.key)), decls, SHA_R391_A, 1);
+  assert.equal(decision.advance, true);
+  assert.ok(decision.advance && decision.to === "review-2");
+  assert.ok(decision.advance && decision.covered.size === 2);
+});
+
+test("decideDoesNotReproduceAdvance: round 2, all invoked findings validly declared → advances to pre-merge", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j1" }];
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A, 2);
+  assert.equal(decision.advance, true);
+  assert.ok(decision.advance && decision.to === "pre-merge");
+});
+
+test("decideDoesNotReproduceAdvance: declaration key outside the invoked set is ignored → does not advance", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j" }];
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A, 1);
+  assert.equal(decision.advance, false);
+  assert.ok(!decision.advance && decision.missing.has(keyA));
+});
+
+test("decideDoesNotReproduceAdvance: declaration SHA not equal to current HEAD is ignored → does not advance", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_B, justification: "j" }];
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A, 1);
+  assert.equal(decision.advance, false);
+  assert.ok(!decision.advance && decision.missing.has(keyA));
+});
+
+test("decideDoesNotReproduceAdvance: partial coverage → does not advance (fail closed)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j" }];
+  const decision = decideDoesNotReproduceAdvance(summaries.filter((x) => [keyA, keyB].includes(x.key)), decls, SHA_R391_A, 1);
+  assert.equal(decision.advance, false);
+  assert.ok(!decision.advance && decision.missing.size === 1 && decision.missing.has(keyB));
+});
+
+test("decideDoesNotReproduceAdvance: empty invoked set → does not advance (nothing to cover)", () => {
+  const decision = decideDoesNotReproduceAdvance([], [], SHA_R391_A, 1);
+  assert.equal(decision.advance, false);
+});
+
+// #391 pre-merge delta, key bb8d0a35: a key shared by two distinct rendered
+// findings requires a declaration for EACH finding's fingerprint — one
+// declaration alone leaves the other finding uncovered and fails closed.
+test("decideDoesNotReproduceAdvance: a key shared by two distinct findings requires both fingerprints declared", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  assert.equal(sharedKey, findingKey(collideB), "precondition: colliding keys");
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const fpA = findingPayloadFingerprint(collideA);
+  const fpB = findingPayloadFingerprint(collideB);
+  const sha = "a".repeat(40);
+
+  // Only collideA's fingerprint declared → collideB still uncovered.
+  const partial = decideDoesNotReproduceAdvance(
+    summaries,
+    [{ key: sharedKey, fingerprint: fpA, reviewedSha: sha, justification: "j" }],
+    sha, 1,
+  );
+  assert.equal(partial.advance, false, "one covered finding under a shared key must not advance the other");
+
+  // Both fingerprints declared → fully covered, advances.
+  const full = decideDoesNotReproduceAdvance(
+    summaries,
+    [
+      { key: sharedKey, fingerprint: fpA, reviewedSha: sha, justification: "j" },
+      { key: sharedKey, fingerprint: fpB, reviewedSha: sha, justification: "j" },
+    ],
+    sha, 1,
+  );
+  assert.equal(full.advance, true, "declaring both distinct findings under the shared key must advance");
+  assert.ok(full.advance && full.covered.size === 2);
+});
+
+// ---------------------------------------------------------------------------
+// review-policy.ts: non-reproducing disposition sentinel round-trip (#391)
+// ---------------------------------------------------------------------------
+
+test("nonReproducingDispositionComment / extractNonReproducingDispositions: round-trips key → [{ sha, fingerprint }]", () => {
+  const body = nonReproducingDispositionComment({
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1",
+    justification: "tooling artifact, not a real issue", timestamp: "2026-07-01T00:00:00Z",
+  });
+  const map = extractNonReproducingDispositions([{ body }]);
+  assert.deepEqual(map.get(keyA), [{ sha: SHA_R391_A, fingerprint: FP_A }]);
+});
+
+test("non-reproducing disposition sentinel is distinct from the operator override sentinel", () => {
+  const nonRepro = nonReproducingDispositionComment({
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1", justification: "j", timestamp: "2026-07-01T00:00:00Z",
+  });
+  const override = overrideComment({
+    key: keyA, disposition: "rejected", reason: "human decision", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+  });
+  // A non-reproducing comment must not be readable as an operator override, and vice versa.
+  assert.equal(extractOverrides([{ body: nonRepro }]).size, 0);
+  assert.equal(extractNonReproducingDispositions([{ body: override }]).size, 0);
+});
+
+test("extractNonReproducingDispositions: multiple dispositions for the same coarse key are all preserved, not overwritten (#391 review-2 finding 53b23912)", () => {
+  const first = nonReproducingDispositionComment({
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1", justification: "j1", timestamp: "2026-07-01T00:00:00Z",
+  });
+  const second = nonReproducingDispositionComment({
+    key: keyA, reviewedSha: SHA_R391_B, fingerprint: FP_B, stage: "fix-2", justification: "j2", timestamp: "2026-07-02T00:00:00Z",
+  });
+  const map = extractNonReproducingDispositions([{ body: first }, { body: second }]);
+  assert.deepEqual(map.get(keyA), [
+    { sha: SHA_R391_A, fingerprint: FP_A },
+    { sha: SHA_R391_B, fingerprint: FP_B },
+  ]);
+});
+
+test("extractNonReproducingDispositions: only comments with the controlled heading are processed", () => {
+  const spoof = `Some unrelated comment mentioning <!-- pipeline-non-reproducing: ${keyA} ${SHA_R391_A} ${FP_A} -->`;
+  assert.equal(extractNonReproducingDispositions([{ body: spoof }]).size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// advanceFix wiring order (#391): the override pre-filter and does-not-reproduce
+// carve-out have no injectable seam (advanceFix calls postComment/transition/
+// setBlocked/invoke directly — pre-existing test debt shared by every other
+// un-injected branch of this function, see decideExternalCommitAdvance and the
+// #366 "Effort threading" pin above). Pin the source so the ordering invariant
+// the acceptance criteria depend on — harness NOT invoked when everything is
+// dispositioned, no-commits block NOT reached when a valid declaration covers
+// every invoked finding — cannot silently regress.
+// ---------------------------------------------------------------------------
+
+test("advanceFix source pin: the all-dispositioned skip-advance return precedes the harness invoke() call", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const skipAdvanceIdx = src.indexOf('summary: "all blocking findings dispositioned"');
+  const invokeIdx = src.indexOf("const delegated = await invokeStageExecutor(");
+  assert.ok(skipAdvanceIdx !== -1, "expected the all-dispositioned skip-advance outcome to exist");
+  assert.ok(invokeIdx !== -1, "expected the stage-executor invocation to exist");
+  assert.ok(skipAdvanceIdx < invokeIdx, "the skip-advance return must occur before the harness is ever invoked");
+});
+
+test("advanceFix source pin: the does-not-reproduce carve-out is checked before the no-commits block", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedIdentities,");
+  const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
+  assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
+  assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
+  assert.ok(dnrIdx < noCommitsIdx, "the does-not-reproduce carve-out must be evaluated before the no-commits block");
+});
+
+test("advanceFix source pin: the all-dispositioned skip-advance path honors dry-run before transitioning (#391 review-2 finding 9c0750f9)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const skipAdvanceBlockIdx = src.indexOf(
+    "Every triggering blocking finding is already dispositioned — nothing left",
+  );
+  const dryRunCheckIdx = src.indexOf("if (opts.dryRun) {", skipAdvanceBlockIdx);
+  const dryRunReturnIdx = src.indexOf(
+    'summary: "[dry-run] all blocking findings dispositioned"',
+    skipAdvanceBlockIdx,
+  );
+  const transitionCallIdx = src.indexOf(
+    "await transition(cfg, issueNumber, stage, next, msg);",
+    skipAdvanceBlockIdx,
+  );
+  assert.ok(skipAdvanceBlockIdx !== -1, "expected the all-dispositioned skip-advance block to exist");
+  assert.ok(dryRunCheckIdx !== -1, "expected a dry-run check inside the all-dispositioned block");
+  assert.ok(dryRunReturnIdx !== -1, "expected a non-mutating dry-run return inside the all-dispositioned block");
+  assert.ok(transitionCallIdx !== -1, "expected the all-dispositioned block's transition() call to exist");
+  assert.ok(
+    dryRunCheckIdx < transitionCallIdx && dryRunReturnIdx < transitionCallIdx,
+    "the dry-run guard and its non-mutating return must precede the transition() call, " +
+      "so a dry-run of the all-dispositioned path never posts the transition comment or moves the stage label",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #391 pre-merge delta, keys 0fb96f45 + b827b914: verbatim render-time
+// fingerprints and ambiguity-refusing declaration filtering.
+// ---------------------------------------------------------------------------
+
+// b827b914: the fingerprint travels with the rendered finding — a multi-line
+// recommendation (which the old markdown reconstruction truncated at the first
+// line) round-trips exactly. Bites the reconstruction approach.
+test("parseFindingSummaries: multi-line recommendation round-trips the exact structured fingerprint via the render-time marker", () => {
+  const multiline: ReviewFinding = {
+    severity: "high",
+    title: "Multi-line rec finding",
+    file: "core/scripts/stages/fix.ts",
+    line_start: 10,
+    body: "Body.",
+    confidence: 0.9,
+    recommendation: "First line of the recommendation.\nSecond line with the crucial detail.",
+  };
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [multiline], next_steps: [] },
+    1, "codex",
+    new Set([findingKey(multiline)]),
+  );
+  const summary = parseFindingSummaries(body).find((s) => s.key === findingKey(multiline));
+  assert.ok(summary, "finding must be recovered");
+  assert.equal(
+    summary!.fingerprint,
+    findingPayloadFingerprint(multiline),
+    "the parsed fingerprint must be the exact render-time value, immune to markdown lossiness",
+  );
+});
+
+test("parseFindingSummaries: comment without the finding-fingerprint marker → fingerprint null (fail closed)", () => {
+  // A realistic pre-marker comment: current rendering minus the marker lines.
+  const body = twoFindingReview()
+    .split("\n")
+    .filter((l) => !l.startsWith("<!-- finding-fingerprint:"))
+    .join("\n");
+  const summary = parseFindingSummaries(body).find((s) => s.key === keyA);
+  assert.ok(summary, "finding must still be recovered from a pre-marker comment");
+  assert.equal(summary!.fingerprint, null);
+});
+
+// bb8d0a35: a declaration on a key that TWO rendered findings share is no
+// longer dropped outright — its verbatim fingerprint disambiguates which of
+// the two findings it means, so it is kept and the OTHER finding under the
+// same key stays independently uncovered.
+test("filterUnambiguousDeclarations: a verbatim fingerprint disambiguates a key shared by two rendered findings", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  assert.equal(sharedKey, findingKey(collideB), "precondition: colliding keys");
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const declA = {
+    key: sharedKey, fingerprint: findingPayloadFingerprint(collideA),
+    reviewedSha: "a".repeat(40), justification: "j",
+  };
+  assert.deepEqual(
+    filterUnambiguousDeclarations([declA], summaries),
+    [declA],
+    "a declaration whose fingerprint matches one of the colliding findings must be kept",
+  );
+});
+
+test("filterUnambiguousDeclarations: drops a declaration whose fingerprint matches no rendered finding under that key (malformed/hallucinated identity)", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decl = { key: keyA, fingerprint: FP_B, reviewedSha: SHA_R391_A, justification: "j" };
+  assert.deepEqual(filterUnambiguousDeclarations([decl], summaries), []);
+});
+
+test("filterUnambiguousDeclarations: keeps a declaration with a unique key and a verbatim fingerprint", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decl = { key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, justification: "j" };
+  const kept = filterUnambiguousDeclarations([decl], summaries);
+  assert.equal(kept.length, 1);
+});
+
+test("filterUnambiguousDeclarations: drops a declaration whose unique summary has no fingerprint marker", () => {
+  const summaries: Parameters<typeof filterUnambiguousDeclarations>[1] = [
+    { key: "aaaabbbb", category: null, file: "x.ts", fingerprint: null },
+  ];
+  const decl = { key: "aaaabbbb", fingerprint: "0123456789abcdef", reviewedSha: "a".repeat(40), justification: "j" };
+  assert.deepEqual(filterUnambiguousDeclarations([decl], summaries), []);
+});
+
+// #391 pre-merge delta, key 5a435224: when one of two colliding-key findings
+// already has a matching non-reproducing disposition, the effective scope
+// must carry ONLY the remaining identity — the advance decision then requires
+// a declaration for that identity alone. The pre-fix key-set rebuild pulled
+// the dispositioned sibling back into the required set, so a correct
+// declaration for the remaining finding still failed closed (the dead-end
+// this issue exists to remove).
+test("identity scope end-to-end: dispositioned colliding sibling stays out of the required set → remaining declaration advances", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  assert.equal(sharedKey, findingKey(collideB), "precondition: colliding keys");
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const fpA = findingPayloadFingerprint(collideA);
+  const fpB = findingPayloadFingerprint(collideB);
+  const sha = "a".repeat(40);
+
+  // Prior fix round dispositioned collideA at this SHA.
+  const preFilter = computeEffectiveBlockingSet(
+    new Set([sharedKey]), summaries, new Map(), [],
+    new Map([[sharedKey, [{ sha, fingerprint: fpA }]]]), sha,
+  );
+  assert.equal(preFilter.effectiveSummaries.length, 1, "only the undispositioned sibling remains in scope");
+  assert.equal(preFilter.effectiveSummaries[0].fingerprint, fpB);
+  assert.ok(preFilter.effectiveKeys.has(sharedKey), "the key stays effective while a sibling is actionable");
+
+  // The harness declares ONLY the remaining finding non-reproducing → advance.
+  const decision = decideDoesNotReproduceAdvance(
+    preFilter.effectiveSummaries,
+    [{ key: sharedKey, fingerprint: fpB, reviewedSha: sha, justification: "j" }],
+    sha, 1,
+  );
+  assert.equal(
+    decision.advance, true,
+    "a declaration covering exactly the post-disposition scope must advance — the dispositioned sibling is not required again",
+  );
+});
+
+test("computeEffectiveBlockingSet: all colliding identities dispositioned → key clears entirely", () => {
+  const collideA: ReviewFinding = {
+    severity: "high", title: "can starve", file: "x.ts", line_start: 46,
+    body: "A", confidence: 0.9, recommendation: "ra",
+  };
+  const collideB: ReviewFinding = {
+    severity: "high", title: "missing null check", file: "x.ts", line_start: 48,
+    body: "B", confidence: 0.9, recommendation: "rb",
+  };
+  const sharedKey = findingKey(collideA);
+  const body = formatReviewComment(
+    minCfg,
+    { verdict: "needs-attention", summary: "s", findings: [collideA, collideB], next_steps: [] },
+    1, "codex",
+    new Set([sharedKey]),
+  );
+  const summaries = parseFindingSummaries(body);
+  const sha = "a".repeat(40);
+  const preFilter = computeEffectiveBlockingSet(
+    new Set([sharedKey]), summaries, new Map(), [],
+    new Map([[sharedKey, [
+      { sha, fingerprint: findingPayloadFingerprint(collideA) },
+      { sha, fingerprint: findingPayloadFingerprint(collideB) },
+    ]]]), sha,
+  );
+  assert.equal(preFilter.effectiveSummaries.length, 0);
+  assert.equal(preFilter.effectiveKeys.size, 0, "no actionable identity → key clears → skip-advance path applies");
+});
+

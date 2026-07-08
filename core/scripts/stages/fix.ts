@@ -16,7 +16,16 @@ import {
   transition,
 } from "../gh.ts";
 import { findUnacknowledgedComments } from "../issue-context-snapshot.ts";
-import { buildTrustedOverrideComments } from "../review-policy.ts";
+import {
+  buildTrustedOverrideComments,
+  extractNonReproducingDispositions,
+  extractOverrides,
+  extractScopedOverrides,
+  findingPayloadFingerprint,
+  matchFindingScope,
+  nonReproducingDispositionComment,
+  type ScopedOverride,
+} from "../review-policy.ts";
 import { invoke } from "../harness.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
@@ -244,7 +253,77 @@ export async function advanceFix(
     return { advanced: false, status: "blocked", reason: "unacknowledged human input", blockerKind: "needs-human" };
   }
 
-  const findings = extractBlockingReviewFindings(detail.comments, round);
+  // #391: pre-filter the triggering review's blocking findings against LIVE
+  // overrides and SHA-anchored non-reproducing dispositions, before the harness
+  // is ever invoked. `extractBlockingReviewFindings`'s own filtering only knows
+  // the review comment's frozen `pipeline-blocking-keys` marker, which cannot
+  // reflect an override recorded after that comment was posted (the
+  // `override-auto-resume` gap). `effectiveBlockingKeys` stays null when the
+  // triggering review has no blocking-keys marker at all (legacy comment) —
+  // fail safe: no pre-filter, no skip-advance carve-out, existing behavior.
+  const triggeringReviewComment = findTriggeringReviewComment(detail.comments, round);
+  const reviewBody = triggeringReviewComment?.body ?? "";
+  const triggeringBlockingKeys = extractBlockingKeysMarker(reviewBody);
+  let overriddenKeys = new Set<string>();
+  let effectiveBlockingKeys: Set<string> | null = null;
+  let effectiveIdentities: FindingSummary[] | null = null;
+  let overridePreFilterNotes: string[] = [];
+  if (triggeringBlockingKeys && triggeringBlockingKeys.size > 0) {
+    // #391 review-1 finding bbc7d244: only key/scope overrides recorded AFTER
+    // the triggering review comment may disposition its findings — one
+    // predating the review must not silently suppress a finding the review
+    // still marked blocking.
+    const trustedAfterReview = filterOverridesAfterReview(trustedForAck, triggeringReviewComment);
+    const overrides = extractOverrides(trustedAfterReview);
+    const scopes = extractScopedOverrides(trustedAfterReview);
+    const nonReproducing = extractNonReproducingDispositions(trustedForAck);
+    const reviewedShaAtEntry = extractReviewedSha(trustedForAck, round)?.sha ?? null;
+    const summaries = parseFindingSummaries(reviewBody);
+    const preFilter = computeEffectiveBlockingSet(
+      triggeringBlockingKeys,
+      summaries,
+      overrides,
+      scopes,
+      nonReproducing,
+      reviewedShaAtEntry,
+    );
+    effectiveBlockingKeys = preFilter.effectiveKeys;
+    effectiveIdentities = preFilter.effectiveSummaries;
+    overriddenKeys = new Set(
+      [...triggeringBlockingKeys].filter((k) => !preFilter.effectiveKeys.has(k)),
+    );
+    overridePreFilterNotes = preFilter.dispositions.map((d) => `- \`${d.key}\` — ${d.note}`);
+  }
+
+  if (
+    triggeringBlockingKeys && triggeringBlockingKeys.size > 0 &&
+    effectiveBlockingKeys && effectiveBlockingKeys.size === 0
+  ) {
+    // Every triggering blocking finding is already dispositioned — nothing left
+    // to fix. Skip the harness entirely and advance directly (#391).
+    const next: Stage = round === 1 ? "review-2" : "pre-merge";
+    if (opts.dryRun) {
+      // #391 review-2 finding 9c0750f9: this bypass must honor dry-run exactly
+      // like the harness-invocation path below — a dry-run must never post the
+      // transition comment or move the issue's stage label.
+      console.log(
+        `[pipeline] #${issueNumber}: [dry-run] would advance ${stage} → ${next} ` +
+          `(all ${triggeringBlockingKeys.size} blocking finding(s) already dispositioned)`,
+      );
+      return { advanced: true, from: stage, to: next, summary: "[dry-run] all blocking findings dispositioned" };
+    }
+    const msg = [
+      `All ${triggeringBlockingKeys.size} blocking finding(s) from the triggering review are ` +
+        `already dispositioned by an active override or non-reproducing disposition — nothing ` +
+        `left to fix. Advancing to ${next} without invoking the fix harness.`,
+      "",
+      ...overridePreFilterNotes,
+    ].join("\n");
+    await transition(cfg, issueNumber, stage, next, msg);
+    return { advanced: true, from: stage, to: next, summary: "all blocking findings dispositioned" };
+  }
+
+  const findings = extractBlockingReviewFindings(detail.comments, round, overriddenKeys);
   if (!findings) {
     // No findings → just advance.
     const next: Stage = round === 1 ? "review-2" : "pre-merge";
@@ -257,6 +336,18 @@ export async function advanceFix(
     );
     return { advanced: true, from: stage, to: next, summary: "no findings to address" };
   }
+
+  // Keys actually rendered into the fix prompt this round — the set a
+  // does-not-reproduce declaration must fully cover to advance (#391). Empty
+  // when the triggering review carried no blocking-keys marker (legacy
+  // comment): fail closed, no does-not-reproduce carve-out is possible.
+  const invokedBlockingKeys = effectiveBlockingKeys ?? new Set<string>();
+  // The fingerprint-qualified counterpart of `invokedBlockingKeys` (#391
+  // delta, key 5a435224): the exact identities the fix round is scoped to,
+  // AFTER overrides and non-reproducing dispositions are removed. Empty for
+  // legacy comments with no blocking-keys marker — the does-not-reproduce
+  // carve-out then requires nothing and refuses (fail closed), as before.
+  const invokedIdentities = effectiveIdentities ?? [];
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would invoke ${harness} to fix findings`);
@@ -306,6 +397,10 @@ export async function advanceFix(
     fixRound: round,
     pipelineRunId,
     specContext,
+    // #391: the SHA the harness is being asked to assess against — headBefore
+    // at this point equals the reviewed SHA (no commits have happened yet).
+    // A does-not-reproduce declaration must exactly match this value.
+    reviewedSha: headBefore,
   });
   if (opts.stateDir) {
     await recordPrompt(
@@ -411,6 +506,53 @@ export async function advanceFix(
         );
         commitGateMode = resolveFixCommitGateMode(decision, verifiedOnRemote);
       } else {
+        // #391: before blocking, check whether the harness declared every
+        // invoked blocking finding non-reproducing at the reviewed SHA — a
+        // correctly-determined no-op (a tooling artifact / non-issue), not a
+        // silent failure. Fails closed: an empty invoked set, or any invoked
+        // finding left uncovered, falls through to the existing block below.
+        const declarations = parseDoesNotReproduceDeclarations(result.stdout ?? "");
+        // A declaration references a finding by (key, fingerprint) — the
+        // fingerprint, copied verbatim from the `finding-fingerprint` marker
+        // shown above the finding in the fix prompt, ties it to exactly one
+        // rendered finding even when the coarse key was minted for MULTIPLE
+        // distinct findings in this review (#391 pre-merge delta, key
+        // bb8d0a35). A declaration whose identity matches no rendered finding
+        // is dropped BEFORE the advance decision, so that finding stays
+        // uncovered and the round fails closed to the block below instead of
+        // recording a wrong disposition.
+        const declSummaries = parseFindingSummaries(reviewBody);
+        const unambiguous = filterUnambiguousDeclarations(declarations, declSummaries);
+        const dnrDecision = decideDoesNotReproduceAdvance(
+          invokedIdentities,
+          unambiguous,
+          headAfter,
+          round,
+        );
+        if (dnrDecision.advance) {
+          const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          for (const decl of dnrDecision.covered.values()) {
+            await postComment(
+              cfg,
+              issueNumber,
+              nonReproducingDispositionComment({
+                key: decl.key,
+                reviewedSha: decl.reviewedSha,
+                fingerprint: decl.fingerprint,
+                stage,
+                justification: decl.justification,
+                timestamp,
+                footer: cfg.marker_footer,
+              }),
+            );
+          }
+          const msg =
+            `${stage}: the fix harness produced no new commits, but declared ` +
+            `${dnrDecision.covered.size} blocking finding(s) non-reproducing at the reviewed SHA ` +
+            `(${headAfter}) — no code change required. Advancing to ${dnrDecision.to}.`;
+          await transition(cfg, issueNumber, stage, dnrDecision.to, msg);
+          return { advanced: true, from: stage, to: dnrDecision.to, summary: "no reproducible findings" };
+        }
         const noCommitsMsg = `${stage} reported success but produced no new commits.`;
         await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
         return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
@@ -644,13 +786,19 @@ export async function enforceExternalCommitGate(
 
 // ---- pure helpers ----
 
-export function extractReviewFindings(
-  comments: { body: string }[],
+/**
+ * Locate the triggering review-{round} comment, preserving its `createdAt` (#391
+ * review-1 finding bbc7d244) so callers can filter override/scope comments to
+ * those recorded after it. Shared by {@link extractReviewFindings} (which only
+ * needs the body) so the match predicate has a single implementation.
+ */
+export function findTriggeringReviewComment(
+  comments: { author: string; body: string; createdAt: string }[],
   round: 1 | 2,
-): string {
+): { author: string; body: string; createdAt: string } | null {
   const marker = `## Review ${round}`;
-  const m = findLatestCommentMatching(
-    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+  return findLatestCommentMatching(
+    comments,
     (b) =>
       b.startsWith(marker) &&
       (b.includes("needs-attention") ||
@@ -658,7 +806,34 @@ export function extractReviewFindings(
         b.toUpperCase().includes("REQUEST_CHANGES") ||
         b.toUpperCase().includes("REQUEST CHANGES")),
   );
+}
+
+export function extractReviewFindings(
+  comments: { body: string }[],
+  round: 1 | 2,
+): string {
+  const m = findTriggeringReviewComment(
+    comments.map((c) => ({ ...c, author: "", createdAt: "" })),
+    round,
+  );
   return m?.body ?? "";
+}
+
+/**
+ * Filter trusted override/scope comments to those created strictly after the
+ * triggering review comment (#391 review-1 finding bbc7d244). Without this, an
+ * override recorded before the review — or a stale one from a prior round —
+ * could silently subtract a finding the triggering review still marked
+ * blocking. Comments are ISO-8601 timestamped, so lexicographic string
+ * comparison sorts identically to chronological order. Returns `[]` when there
+ * is no triggering review comment to anchor against.
+ */
+export function filterOverridesAfterReview<T extends { createdAt: string }>(
+  comments: T[],
+  triggeringReviewComment: { createdAt: string } | null,
+): T[] {
+  if (!triggeringReviewComment) return [];
+  return comments.filter((c) => c.createdAt > triggeringReviewComment.createdAt);
 }
 
 /**
@@ -693,32 +868,37 @@ export function extractAllReviewFindingsHistory(
 // Mixed-verdict filtering: strip advisory findings from the fix prompt (#236)
 // ---------------------------------------------------------------------------
 
-/**
- * Removes non-blocking (advisory) findings from a review comment body so the
- * fix prompt's "Address EACH finding" instruction applies only to genuine
- * blockers. Advisory findings are identified via the formatter-controlled
- * `<!-- pipeline-advisory-ordinals: N,M -->` footer marker, which records the
- * 1-indexed positions of findings with blocking:false. This is fully
- * formatter-owned — no reviewer-controlled text can inject into it.
- *
- * Falls back to key-set membership (`blockingKeys`) for legacy comments that
- * pre-date the ordinals marker.
- *
- * Findings that carry no `override-key` token pass through unchanged (safety).
- * Returns the body unchanged when no advisory findings are present.
- * Exported for direct unit testing.
- */
-export function filterToBlockingFindings(body: string, blockingKeys: Set<string>): string {
-  const FINDINGS_HEADER = "\n### Findings";
-  const OVERRIDE_KEY_RE = /`override-key: ([0-9a-f]{8})`/;
-  // The pipeline-blocking-keys comment is a reliable footer boundary marker —
-  // it is always emitted when blockingKeys is supplied to formatReviewComment,
-  // and the footer text line immediately precedes it (separated by a single \n,
-  // not \n\n, so the \n\n-based section-end detection below would miss it).
-  const PK_MARKER = "\n<!-- pipeline-blocking-keys:";
+const FINDINGS_HEADER = "\n### Findings";
+// The pipeline-blocking-keys comment is a reliable footer boundary marker —
+// it is always emitted when blockingKeys is supplied to formatReviewComment,
+// and the footer text line immediately precedes it (separated by a single \n,
+// not \n\n, so the \n\n-based section-end detection below would miss it).
+const PK_MARKER = "\n<!-- pipeline-blocking-keys:";
+const OVERRIDE_KEY_RE = /`override-key: ([0-9a-f]{8})`/;
+const CATEGORY_MARKER_RE = /`category: ([^`]+)`/;
+const LOCATION_LINE_RE = /^Location: `(.+)`$/m;
+// Mirrors formatReviewComment's heading render: `**N. [SEV] title**...`.
+/** Verbatim per-finding payload fingerprint emitted by review rendering (#391). */
+const FINDING_FINGERPRINT_RE = /^<!-- finding-fingerprint: ([0-9a-f]{16}) -->$/m;
 
+interface SplitFindingsSection {
+  beforeFindings: string;
+  /** Per-finding blocks (and any trailing sections like "### Raw Review Output"). */
+  blocks: string[];
+  footer: string;
+}
+
+/**
+ * Locate the "### Findings" section of a rendered review comment body and
+ * split it into per-finding blocks + the trailing footer (sentinels + marker
+ * footer text). Shared by {@link filterToBlockingFindings} (which decides what
+ * to keep) and {@link parseFindingSummaries} (which reads identity fields from
+ * each block) so the block-boundary parsing has a single implementation.
+ * Returns null when the body has no "### Findings" section.
+ */
+function splitFindingsSection(body: string): SplitFindingsSection | null {
   const findingsIdx = body.indexOf(FINDINGS_HEADER);
-  if (findingsIdx === -1) return body;
+  if (findingsIdx === -1) return null;
 
   const beforeFindings = body.slice(0, findingsIdx);
   const afterFindingsLine = body.slice(findingsIdx + FINDINGS_HEADER.length);
@@ -749,7 +929,39 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
   // Split on blank-line + "**N." (finding boundary) OR blank-line + "##"
   // (section boundary like "### Raw Review Output" or "### Next Steps"), so
   // those optional sections are not accidentally discarded with an advisory block.
-  const blocks = findingsContent.split(/\n\n(?=\*\*\d+\.|\#\#)/);
+  const blocks = findingsContent
+    .split(/\n\n(?=\*\*\d+\.|\#\#)/)
+    .filter((b) => b.trim().length > 0);
+
+  return { beforeFindings, blocks, footer };
+}
+
+/**
+ * Removes non-blocking (advisory) findings and, when `overriddenKeys` is
+ * supplied, already-dispositioned findings (#391: active operator overrides or
+ * SHA-anchored non-reproducing dispositions) from a review comment body so the
+ * fix prompt's "Address EACH finding" instruction applies only to genuine,
+ * actionable blockers. Advisory findings are identified via the
+ * formatter-controlled `<!-- pipeline-advisory-ordinals: N,M -->` footer
+ * marker, which records the 1-indexed positions of findings with
+ * blocking:false. This is fully formatter-owned — no reviewer-controlled text
+ * can inject into it.
+ *
+ * Falls back to key-set membership (`blockingKeys`) for legacy comments that
+ * pre-date the ordinals marker.
+ *
+ * Findings that carry no `override-key` token pass through unchanged (safety).
+ * Returns the body unchanged when no advisory or overridden findings are present.
+ * Exported for direct unit testing.
+ */
+export function filterToBlockingFindings(
+  body: string,
+  blockingKeys: Set<string>,
+  overriddenKeys: Set<string> = new Set(),
+): string {
+  const split = splitFindingsSection(body);
+  if (!split) return body;
+  const { beforeFindings, blocks, footer } = split;
 
   // Parse the formatter-controlled advisory-ordinals footer (#236 delta fix).
   // Search only the footer (after the PK_MARKER boundary) so reviewer body text
@@ -761,9 +973,9 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
 
   const blocking: string[] = [];
   let advisoryCount = 0;
+  let overriddenCount = 0;
 
   for (const block of blocks) {
-    if (!block.trim()) continue;
     // Extract the 1-indexed ordinal from the finding title (**N. ...).
     const ordinalInBlock = /^\*\*(\d+)\./.exec(block.trimStart())?.[1];
     const ordinal = ordinalInBlock !== undefined ? parseInt(ordinalInBlock, 10) : null;
@@ -773,10 +985,17 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
       advisoryCount++;
       continue;
     }
-    // Key-set fallback: covers legacy comments (pre-ordinals marker) where advisory
-    // findings can only be identified by their key not being in blockingKeys.
     const keyMatch = block.match(OVERRIDE_KEY_RE);
     const key = keyMatch?.[1];
+    // Already-dispositioned check (#391): a blocking finding covered by an active
+    // override or non-reproducing disposition is omitted like an advisory finding,
+    // but counted and noted separately so the fix harness's scope is legible.
+    if (key && overriddenKeys.has(key)) {
+      overriddenCount++;
+      continue;
+    }
+    // Key-set fallback: covers legacy comments (pre-ordinals marker) where advisory
+    // findings can only be identified by their key not being in blockingKeys.
     if (!key || blockingKeys.has(key)) {
       blocking.push(block);
     } else {
@@ -784,31 +1003,45 @@ export function filterToBlockingFindings(body: string, blockingKeys: Set<string>
     }
   }
 
-  if (advisoryCount === 0) return body;
+  if (advisoryCount === 0 && overriddenCount === 0) return body;
 
-  const note = advisoryCount === 1
-    ? "Note: 1 advisory finding was omitted (marked non-blocking by the reviewer — not required work for this fix round)."
-    : `Note: ${advisoryCount} advisory findings were omitted (marked non-blocking by the reviewer — not required work for this fix round).`;
+  const notes: string[] = [];
+  if (advisoryCount > 0) {
+    notes.push(
+      advisoryCount === 1
+        ? "Note: 1 advisory finding was omitted (marked non-blocking by the reviewer — not required work for this fix round)."
+        : `Note: ${advisoryCount} advisory findings were omitted (marked non-blocking by the reviewer — not required work for this fix round).`,
+    );
+  }
+  if (overriddenCount > 0) {
+    notes.push(
+      overriddenCount === 1
+        ? "Note: 1 blocking finding was omitted (already dispositioned by an active override or non-reproducing disposition — not required work for this fix round)."
+        : `Note: ${overriddenCount} blocking findings were omitted (already dispositioned by an active override or non-reproducing disposition — not required work for this fix round).`,
+    );
+  }
 
   return [
     beforeFindings,
     FINDINGS_HEADER,
     ...blocking.map(b => "\n\n" + b),
-    "\n\n" + note + "\n",
+    "\n\n" + notes.join("\n") + "\n",
     footer,
   ].join("");
 }
 
 /**
  * Like {@link extractReviewFindings} but filters advisory (non-blocking) findings
- * out of the returned body so the fix harness only sees blocking findings (#236).
+ * out of the returned body so the fix harness only sees blocking findings (#236),
+ * and — when `overriddenKeys` is supplied — already-dispositioned findings (#391).
  * Relies on the `pipeline-blocking-keys` marker in the review comment. Returns
  * the body unchanged when no marker is present (legacy comments) or when all
- * findings are blocking.
+ * findings are blocking and non-overridden.
  */
 export function extractBlockingReviewFindings(
   comments: { body: string }[],
   round: 1 | 2,
+  overriddenKeys: Set<string> = new Set(),
 ): string {
   const body = extractReviewFindings(comments, round);
   if (!body) return body;
@@ -816,7 +1049,297 @@ export function extractBlockingReviewFindings(
   const blockingKeys = extractBlockingKeysMarker(body);
   if (!blockingKeys || blockingKeys.size === 0) return body;
 
-  return filterToBlockingFindings(body, blockingKeys);
+  return filterToBlockingFindings(body, blockingKeys, overriddenKeys);
+}
+
+// ---------------------------------------------------------------------------
+// Override / non-reproducing pre-filter (#391) — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/** Minimal per-finding identity fields recoverable from rendered review-comment
+ *  text: the finding's stable key (`override-key`), and — when present — its
+ *  category marker and location file, used for scope-override matching. The
+ *  `fingerprint` field mirrors `findingPayloadFingerprint` (#391 review-1
+ *  finding 5805b17e) — reconstructed from the block's title/body/recommendation/
+ *  line range — so a non-reproducing disposition can be matched on full payload,
+ *  not just the coarse `key`. */
+export interface FindingSummary {
+  key: string;
+  category: string | null;
+  file: string | null;
+  /** Verbatim render-time payload fingerprint, or null when the comment
+   *  predates the finding-fingerprint marker (fail closed: never matches). */
+  fingerprint: string | null;
+}
+
+/**
+ * Recover `{ key, category, file, fingerprint }` for every finding block in a
+ * rendered review comment body (#391). Findings without an `override-key`
+ * token are skipped (cannot be identified). Used to match blocking findings
+ * against active overrides/dispositions without re-deriving `findingKey` from
+ * scratch — the key is already embedded verbatim by `formatReviewComment`.
+ */
+export function parseFindingSummaries(body: string): FindingSummary[] {
+  const split = splitFindingsSection(body);
+  if (!split) return [];
+  const summaries: FindingSummary[] = [];
+  for (const block of split.blocks) {
+    const key = block.match(OVERRIDE_KEY_RE)?.[1];
+    if (!key) continue;
+    const category = block.match(CATEGORY_MARKER_RE)?.[1]?.trim() ?? null;
+    const locText = LOCATION_LINE_RE.exec(block)?.[1] ?? null;
+    let file: string | null = null;
+    if (locText) {
+      // Location renders as `file:line-line` (when line_start is present) or
+      // just `file` — strip the trailing range to recover the bare file path.
+      const rangeMatch = locText.match(/^(.*):(\d+)-(\d+)$/);
+      file = (rangeMatch ? rangeMatch[1] : locText) || null;
+    }
+    // Verbatim machine-readable fingerprint emitted at render time (#391
+    // delta, key b827b914) — never reconstructed from the lossy markdown,
+    // which truncated multi-line recommendations. Absent on comments rendered
+    // before the marker shipped: fingerprint null → never matches any
+    // disposition (fail closed).
+    const fingerprint = block.match(FINDING_FINGERPRINT_RE)?.[1] ?? null;
+    summaries.push({ key, category, file, fingerprint });
+  }
+  return summaries;
+}
+
+export interface OverridePreFilterDisposition {
+  key: string;
+  note: string;
+}
+
+export interface OverridePreFilterResult {
+  /** The triggering blocking keys minus any whose every identity is
+   *  dispositioned by an override or a SHA-matching non-reproducing
+   *  disposition. Derived from `effectiveSummaries` (#391 delta, 5a435224). */
+  effectiveKeys: Set<string>;
+  /** The fingerprint-qualified identities that remain actionable — the
+   *  authoritative fix-round scope. Prefer this over `effectiveKeys` wherever
+   *  identities matter (the does-not-reproduce advance decision). */
+  effectiveSummaries: FindingSummary[];
+  /** Human-readable audit lines, one per dispositioned key, in finding order. */
+  dispositions: OverridePreFilterDisposition[];
+}
+
+/**
+ * #391: subtract findings dispositioned by an active operator override (key or
+ * scope) or a SHA-anchored non-reproducing disposition from a fix round's
+ * triggering blocking set, before the harness is ever invoked. Matches by the
+ * finding's stable key (recovered verbatim from `override-key`) for key
+ * overrides and non-reproducing dispositions, and by `matchFindingScope` (the
+ * single identity implementation in `review-policy.ts`) for scope overrides —
+ * never a re-implementation.
+ *
+ * A non-reproducing disposition only dispositions a finding when
+ * `reviewedShaAtEntry` is non-null and at least one of the key's recorded
+ * dispositions has both a `sha` equal to `reviewedShaAtEntry` AND a
+ * `fingerprint` equal to the summary's `fingerprint` (#391 review-1 finding
+ * 5805b17e) — the coarse `key` alone cannot distinguish a different finding in
+ * the same bucket at the same SHA, so multiple dispositions are kept per key
+ * (#391 review-2 finding 53b23912) rather than one overwriting another. A
+ * stale disposition (superseded SHA or mismatched fingerprint) does not apply,
+ * and the finding is evaluated afresh.
+ *
+ * A blocking key with no matching summary (parseFindingSummaries could not
+ * recover it) fails closed: it stays effective as a synthetic
+ * fingerprint-null identity unless a key-level override applies (#391
+ * review-3 finding d548d3d0).
+ */
+export function computeEffectiveBlockingSet(
+  blockingKeys: Set<string>,
+  summaries: FindingSummary[],
+  overrides: Map<string, string>,
+  scopes: ScopedOverride[],
+  nonReproducing: Map<string, { sha: string; fingerprint: string }[]>,
+  reviewedShaAtEntry: string | null,
+): OverridePreFilterResult {
+  const dispositions: OverridePreFilterDisposition[] = [];
+  const effectiveSummaries: FindingSummary[] = [];
+  const matchedKeys = new Set<string>();
+  for (const s of summaries) {
+    if (!blockingKeys.has(s.key)) continue;
+    matchedKeys.add(s.key);
+
+    const scope = scopes.find((sc) =>
+      matchFindingScope({ category: s.category ?? undefined, file: s.file ?? undefined }, sc),
+    );
+    if (scope) {
+      dispositions.push({
+        key: s.key,
+        note: `scope override \`${scope.type}:${scope.value}\` (${scope.disposition}): ${scope.reason}`,
+      });
+      continue;
+    }
+
+    if (overrides.has(s.key)) {
+      dispositions.push({ key: s.key, note: `override (${overrides.get(s.key)})` });
+      continue;
+    }
+
+    // s.fingerprint === null (comment predates the render-time marker) never
+    // matches — an identity we cannot verify verbatim fails closed (#391
+    // delta, key b827b914).
+    const nonRepro = reviewedShaAtEntry && s.fingerprint !== null
+      ? nonReproducing.get(s.key)?.find(
+          (d) => d.sha === reviewedShaAtEntry && d.fingerprint === s.fingerprint,
+        )
+      : undefined;
+    if (nonRepro) {
+      dispositions.push({
+        key: s.key,
+        note: `declared non-reproducing at ${reviewedShaAtEntry.slice(0, 7)} by a prior fix round`,
+      });
+      continue;
+    }
+
+    effectiveSummaries.push(s);
+  }
+  // A marker key that parseFindingSummaries could not map back to a rendered
+  // finding (schema/version skew, malformed comment) must still block — the
+  // previous Set<key>-based implementation failed closed here, and losing the
+  // key silently would reopen that dead-end (#391 review-3 finding d548d3d0).
+  // A key-level override still applies (it matches by key alone, no
+  // category/file/fingerprint needed); a scope or non-reproducing disposition
+  // cannot, since both require signals this unmatched key doesn't have. The
+  // synthetic identity carries fingerprint: null, which — per the existing
+  // fail-closed convention above — can never be covered by a does-not-
+  // reproduce declaration.
+  for (const key of blockingKeys) {
+    if (matchedKeys.has(key)) continue;
+    if (overrides.has(key)) {
+      dispositions.push({ key, note: `override (${overrides.get(key)})` });
+      continue;
+    }
+    effectiveSummaries.push({ key, category: null, file: null, fingerprint: null });
+  }
+  // Identity-level scope (#391 delta, key 5a435224): the effective scope IS
+  // the surviving identities. A coarse key stays effective while ANY of its
+  // colliding identities remains actionable, and clears only when every one
+  // is dispositioned — a Set<key> alone cannot express the partial case
+  // (one dispositioned sibling, one actionable), which previously either
+  // dropped the actionable sibling from scope or pulled the dispositioned
+  // one back into the required set.
+  const effectiveKeys = new Set(effectiveSummaries.map((s) => s.key));
+  return { effectiveKeys, effectiveSummaries, dispositions };
+}
+
+// ---------------------------------------------------------------------------
+// Does-not-reproduce harness declarations (#391) — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+export interface DoesNotReproduceDeclaration {
+  key: string;
+  /** Verbatim render-time finding fingerprint (#391 pre-merge delta, key
+   *  bb8d0a35) — disambiguates which rendered finding this declaration means
+   *  when its coarse key was minted for more than one finding in the review. */
+  fingerprint: string;
+  reviewedSha: string;
+  justification: string;
+}
+
+// Anchored full-line + global; mirrors the `pipeline-override-scope` sentinel's
+// "disposition | reason" delimiter convention so justification text (which may
+// contain arbitrary punctuation) cannot break the fixed-field parse. The
+// fingerprint group mirrors FINDING_FINGERPRINT_RE's 16-hex-char shape — the
+// harness copies it verbatim from the `<!-- finding-fingerprint: ... -->`
+// marker shown above the finding it is declaring non-reproducing.
+const DOES_NOT_REPRODUCE_RE =
+  /^<!-- pipeline-does-not-reproduce: ([0-9a-f]{8}) ([0-9a-f]{16}) ([0-9a-fA-F]{40}) \| (.+?) -->$/gm;
+
+/**
+ * Parse does-not-reproduce declarations from raw fix-harness stdout (#391).
+ * Pure text scan — never validates a declaration against the invoked blocking
+ * set or the current HEAD (see {@link decideDoesNotReproduceAdvance} for that).
+ * Malformed or absent declarations yield [].
+ */
+export function parseDoesNotReproduceDeclarations(stdout: string): DoesNotReproduceDeclaration[] {
+  const out: DoesNotReproduceDeclaration[] = [];
+  DOES_NOT_REPRODUCE_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = DOES_NOT_REPRODUCE_RE.exec(stdout)) !== null) {
+    out.push({ key: m[1], fingerprint: m[2], reviewedSha: m[3], justification: m[4].trim() });
+  }
+  DOES_NOT_REPRODUCE_RE.lastIndex = 0;
+  return out;
+}
+
+/** Decision from {@link decideDoesNotReproduceAdvance} — either advance to the
+ *  round's next stage with the covered declarations, or fall through to the
+ *  existing no-commits block naming which invoked findings remain uncovered. */
+export type DoesNotReproduceDecision =
+  | { advance: true; to: Stage; covered: Map<string, DoesNotReproduceDeclaration> }
+  | { advance: false; missing: Set<string> };
+
+
+/**
+ * Drop does-not-reproduce declarations whose (key, fingerprint) identity does
+ * not match any rendered finding (#391 pre-merge delta, key bb8d0a35): a
+ * verbatim fingerprint — copied by the harness from the `finding-fingerprint`
+ * marker shown above the finding it declares — ties a declaration to exactly
+ * one rendered finding even when `findingKey` (coarse) was minted for more
+ * than one distinct finding in the review. Only a malformed or unmatched
+ * identity (fingerprint absent from any summary sharing the key, or the
+ * summary predates the fingerprint marker) is dropped; a genuinely ambiguous
+ * key no longer forces a drop once the fingerprint disambiguates it. Dropped
+ * declarations leave their finding uncovered, so `decideDoesNotReproduceAdvance`
+ * refuses the advance and the round fails closed to the no-commits block.
+ */
+export function filterUnambiguousDeclarations(
+  declarations: DoesNotReproduceDeclaration[],
+  summaries: FindingSummary[],
+): DoesNotReproduceDeclaration[] {
+  return declarations.filter((decl) =>
+    summaries.some((s) => s.key === decl.key && s.fingerprint !== null && s.fingerprint === decl.fingerprint),
+  );
+}
+
+/**
+ * #391: on a fix round's no-commit path, decide whether every rendered
+ * finding whose key belongs to the invoked blocking set (the keys actually
+ * rendered into the fix prompt this round) is covered by a valid
+ * does-not-reproduce declaration. Coverage is decided per rendered finding —
+ * identified by (key, fingerprint), not by the coarse key alone (#391
+ * pre-merge delta, key bb8d0a35) — so a key shared by several distinct
+ * findings requires one declaration per finding, not one for the whole key. A
+ * declaration is valid only when its (key, fingerprint) matches a rendered
+ * finding AND its reviewed SHA equals `currentHead` (the tree the harness
+ * actually saw); a finding with no verbatim fingerprint (pre-marker comment)
+ * can never be covered. Fails closed: an empty invoked set, no rendered
+ * findings for the invoked keys, or any invoked finding left uncovered, does
+ * not advance.
+ */
+export function decideDoesNotReproduceAdvance(
+  invokedIdentities: FindingSummary[],
+  declarations: DoesNotReproduceDeclaration[],
+  currentHead: string,
+  round: 1 | 2,
+): DoesNotReproduceDecision {
+  // The required set IS the caller's post-disposition invoked identities
+  // (#391 delta, key 5a435224) — never rebuilt from coarse keys, which pulled
+  // an already-dispositioned colliding sibling back into the requirement and
+  // recreated the no-op dead-end this carve-out exists to prevent.
+  const required = invokedIdentities;
+  const covered = new Map<string, DoesNotReproduceDeclaration>();
+  const missing = new Set<string>();
+  for (const s of required) {
+    const decl = s.fingerprint !== null
+      ? declarations.find(
+          (d) => d.key === s.key && d.fingerprint === s.fingerprint && !!currentHead && d.reviewedSha === currentHead,
+        )
+      : undefined;
+    if (decl) {
+      covered.set(`${s.key}:${s.fingerprint}`, decl);
+    } else {
+      missing.add(s.key);
+    }
+  }
+  if (required.length > 0 && missing.size === 0) {
+    return { advance: true, to: round === 1 ? "review-2" : "pre-merge", covered };
+  }
+  return { advance: false, missing };
 }
 
 // ---------------------------------------------------------------------------

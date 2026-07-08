@@ -268,6 +268,97 @@ test("partition: advisory-confidence duplicate shares key with blocker — overr
   assert.equal(p.advisory.length, 1, "low-confidence finding remains advisory");
 });
 
+// ---- non-reproducing disposition consultation at review entry (#391 review-2 finding 7b965502) ----
+
+test("partition: a non-reproducing disposition at the current reviewed SHA + matching fingerprint moves a blocking finding to overridden", () => {
+  const f = finding({ severity: "critical", file: "x.ts", title: "boom" });
+  const key = findingKey(f);
+  const sha = "a".repeat(40);
+  const nonReproducing = new Map([[key, [{ sha, fingerprint: findingPayloadFingerprint(f) }]]]);
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], nonReproducing, sha);
+  assert.equal(p.blocking.length, 0, "the disposition must suppress the finding at the matching SHA");
+  assert.equal(p.overridden.length, 1);
+  assert.equal(p.overridden[0].kind, "key");
+  assert.equal((p.overridden[0] as { key: string }).key, key);
+});
+
+test("partition: a non-reproducing disposition recorded at a stale (superseded) SHA does NOT suppress the finding — re-evaluated afresh", () => {
+  const f = finding({ severity: "critical", file: "x.ts", title: "boom" });
+  const key = findingKey(f);
+  const staleSha = "a".repeat(40);
+  const currentSha = "b".repeat(40);
+  const nonReproducing = new Map([[key, [{ sha: staleSha, fingerprint: findingPayloadFingerprint(f) }]]]);
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], nonReproducing, currentSha);
+  assert.equal(p.blocking.length, 1, "a disposition anchored to a since-superseded SHA must not apply");
+  assert.equal(p.overridden.length, 0);
+});
+
+test("partition: without the reviewedSha argument (pre-#391-fix call shape), a non-reproducing disposition never suppresses — fails closed", () => {
+  const f = finding({ severity: "critical", file: "x.ts", title: "boom" });
+  const key = findingKey(f);
+  const sha = "a".repeat(40);
+  const nonReproducing = new Map([[key, [{ sha, fingerprint: findingPayloadFingerprint(f) }]]]);
+  // Omitting reviewedSha (defaults to null) reproduces the pre-fix call sites that
+  // never threaded a reviewed SHA through to partitionFindings — the finding must
+  // still be classified as blocking, proving the consultation is gated on a real SHA match.
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], nonReproducing);
+  assert.equal(p.blocking.length, 1);
+  assert.equal(p.overridden.length, 0);
+});
+
+test("partition: an ambiguous key (two distinct findings share it) withholds the non-reproducing disposition too", () => {
+  const f1 = finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46 });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "missing null check", line_start: 48 });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same bucket → same key");
+  const sharedKey = findingKey(f1);
+  const sha = "a".repeat(40);
+  const nonReproducing = new Map([[sharedKey, [{ sha, fingerprint: findingPayloadFingerprint(f1) }]]]);
+  const p = partitionFindings([f1, f2], DEFAULT_POLICY, new Map(), [], nonReproducing, sha);
+  assert.equal(p.overridden.length, 0, "ambiguous key must not suppress either finding");
+  assert.equal(p.blocking.length, 2);
+});
+
+test("partition: a non-reproducing disposition does NOT suppress a different finding sharing the same coarse key at the same SHA (#391 review-1 finding 5805b17e)", () => {
+  // A prior fix round declared f1 non-reproducing at `sha`. A later re-review at
+  // the SAME sha reports a DIFFERENT single finding (f2) that happens to land in
+  // the same file/severity/5-line bucket, so findingKey(f1) === findingKey(f2).
+  // The key+SHA match alone must not suppress f2 — only a matching payload
+  // fingerprint may.
+  const f1 = finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46, body: "the foo path can starve", recommendation: "add a guard" });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "missing bounds check", line_start: 48, body: "the bar path lacks a bounds check", recommendation: "add a check" });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same bucket → same key");
+  const sharedKey = findingKey(f1);
+  const sha = "a".repeat(40);
+  const nonReproducing = new Map([[sharedKey, [{ sha, fingerprint: findingPayloadFingerprint(f1) }]]]);
+  // f2 is the ONLY finding in this verdict — not ambiguous by the payload-fingerprint
+  // guard — yet the disposition was recorded for f1's payload, not f2's.
+  const p = partitionFindings([f2], DEFAULT_POLICY, new Map(), [], nonReproducing, sha);
+  assert.equal(p.overridden.length, 0, "a disposition anchored to a different finding's fingerprint must not suppress f2");
+  assert.equal(p.blocking.length, 1, "f2 must remain blocking");
+});
+
+test("partition: colliding non-reproducing dispositions for the same coarse key at the same SHA both remain consultable (#391 review-2 finding 53b23912)", () => {
+  // f1 and f2 land in the same file/severity/5-line bucket → same coarse key.
+  // A prior fix round declared BOTH non-reproducing, at the same SHA, in
+  // separate rounds. Neither disposition may be lost — each must still
+  // suppress its own finding on a later re-review at that SHA.
+  const f1 = finding({ severity: "high", file: "x.ts", title: "can starve", line_start: 46, body: "the foo path can starve", recommendation: "add a guard" });
+  const f2 = finding({ severity: "high", file: "x.ts", title: "missing bounds check", line_start: 48, body: "the bar path lacks a bounds check", recommendation: "add a check" });
+  assert.equal(findingKey(f1), findingKey(f2), "precondition: same bucket → same key");
+  const sharedKey = findingKey(f1);
+  const sha = "a".repeat(40);
+  const nonReproducing = new Map([[sharedKey, [
+    { sha, fingerprint: findingPayloadFingerprint(f1) },
+    { sha, fingerprint: findingPayloadFingerprint(f2) },
+  ]]]);
+  const p1 = partitionFindings([f1], DEFAULT_POLICY, new Map(), [], nonReproducing, sha);
+  assert.equal(p1.overridden.length, 1, "f1's own disposition must still apply");
+  assert.equal(p1.blocking.length, 0);
+  const p2 = partitionFindings([f2], DEFAULT_POLICY, new Map(), [], nonReproducing, sha);
+  assert.equal(p2.overridden.length, 1, "f2's own disposition must still apply — not overwritten by f1's");
+  assert.equal(p2.blocking.length, 0);
+});
+
 test("partition: same key + same normalized title but materially different bodies — override withheld, both stay blocking (#144 round-3)", () => {
   // The review-ceiling finding: title-only distinctness collapsed two genuinely
   // different findings (same severity/file/5-line band → same key; titles equal
