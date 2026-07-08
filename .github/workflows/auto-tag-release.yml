@@ -1,0 +1,120 @@
+name: auto-tag-release
+
+# Auto-tags a release-PR merge commit (#411) so `release.yml` can publish the GitHub
+# Release without a trailing manual `git tag` step. This workflow only creates and
+# pushes the annotated tag; it never publishes a Release itself — that stays entirely
+# in release.yml, reached only via the `v*` tag push this workflow produces.
+#
+# GitHub does not re-trigger other workflows for events created by the default
+# GITHUB_TOKEN, so the tag push below authenticates with the RELEASE_TAG_TOKEN repo
+# secret (a fine-grained PAT / GitHub App token with `contents: write`, or a
+# write-scoped SSH deploy key) instead. GITHUB_TOKEN alone would push the tag but
+# release.yml would silently never run — reproducing the exact bug this fixes.
+#
+# Detection requires BOTH the commit subject matching the `pipeline release` title
+# format AND core/package.json's version agreeing with the subject's version, so a
+# feature commit that happens to start with "release:" can never tag by accident.
+# The detection pattern below is single-sourced and drift-guarded by
+# core/test/auto-tag-release-workflow.test.ts against release.ts's title format.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Detect release merge (subject)
+        id: detect
+        run: |
+          subject="$(git log -1 --format=%s)"
+          echo "Commit subject: $subject"
+          # Detection pattern — single source of truth for this workflow's release
+          # detection; do not restate it elsewhere. Kept in lock-step with the title
+          # `release.ts` builds (`release: X.Y.Z — <theme>`, em dash separator) by
+          # core/test/auto-tag-release-workflow.test.ts.
+          pattern='^release: ([0-9]+\.[0-9]+\.[0-9]+) — .*$'
+          if [[ "$subject" =~ $pattern ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "Not a release merge commit (subject does not match) — no-op."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.is_release == 'true'
+        with:
+          node-version: "24"
+
+      - name: Cross-check core/package.json version
+        id: version_check
+        if: steps.detect.outputs.is_release == 'true'
+        run: |
+          version="${{ steps.detect.outputs.version }}"
+          pkg_version="$(node -p "require('./core/package.json').version")"
+          if [ "$pkg_version" == "$version" ]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Subject looked like a release for v${version} but core/package.json is v${pkg_version} — skipping (no tag)."
+          fi
+
+      - name: Check whether the tag already exists
+        id: exists
+        if: steps.version_check.outputs.matched == 'true'
+        run: |
+          version="${{ steps.detect.outputs.version }}"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/v${version}")" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v${version} already exists on origin — no-op (a fallback tag push likely raced this workflow)."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve release notes
+        id: notes
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="$(git log -1 --format=%b)"
+          if ! printf '%s' "$body" | grep -q '[^[:space:]]'; then
+            echo "Merge-commit body is empty — falling back to the release PR body."
+            subject="$(git log -1 --format=%s)"
+            pr_number=""
+            if [[ "$subject" =~ \(#([0-9]+)\)$ ]]; then
+              pr_number="${BASH_REMATCH[1]}"
+            else
+              # Raw release subject (no squash "(#N)" suffix) — resolve the merged
+              # PR from the merge commit itself via GitHub's commits→PRs API.
+              pr_number="$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')"
+            fi
+            if [ -n "$pr_number" ]; then
+              body="$(gh pr view "$pr_number" --json body --jq .body)"
+            fi
+          fi
+          if ! printf '%s' "$body" | grep -q '[^[:space:]]'; then
+            echo "::error::No non-empty release notes could be resolved from the merge-commit body or the release PR body for v${{ steps.detect.outputs.version }}."
+            exit 1
+          fi
+          printf '%s\n' "$body" > /tmp/release-notes.md
+
+      - name: Create and push annotated tag
+        if: steps.exists.outputs.exists == 'false'
+        run: |
+          version="${{ steps.detect.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${version}" -F /tmp/release-notes.md "${{ github.sha }}"
+          git push origin "refs/tags/v${version}"
