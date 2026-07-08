@@ -284,6 +284,29 @@ test("RELEASE_TAG_TOKEN is referenced only within the tag-push step (excluding c
   });
 });
 
+// ---------------------------------------------------------------------------
+// Checkout-persisted credential can't shadow the tag-push PAT (#413 review 1)
+// ---------------------------------------------------------------------------
+//
+// actions/checkout persists the default GITHUB_TOKEN as an
+// `http.https://github.com/.extraheader` git config entry (persist-credentials
+// defaults to true). That config matches any https://github.com/ URL,
+// including the PAT-embedded push URL below, so without clearing it the tag
+// push could silently authenticate with GITHUB_TOKEN instead of
+// RELEASE_TAG_TOKEN — pushing the tag without triggering release.yml.
+
+test("tag-push step unsets the checkout-persisted extraheader before pushing with the PAT", () => {
+  const script = extractStepScript("Create and push annotated tag");
+  const unsetIdx = script.indexOf("http.https://github.com/.extraheader");
+  const pushIdx = script.indexOf("git push ");
+  assert.notEqual(unsetIdx, -1, "expected the tag-push step to unset the checkout-persisted extraheader");
+  assert.notEqual(pushIdx, -1, "expected the tag-push step to contain a git push command");
+  assert.ok(
+    unsetIdx < pushIdx,
+    "expected the extraheader unset to happen before git push, so the persisted GITHUB_TOKEN can't shadow RELEASE_TAG_TOKEN",
+  );
+});
+
 test("resolve release notes: raw subject with empty body and no PR found via API fails loudly", () => {
   const repoDir = initRepoWithCommit("release: 1.16.0 — Factory reliability", "");
   const notesPath = join(mkdtempSync(join(tmpdir(), "auto-tag-notes-out-")), "release-notes.md");

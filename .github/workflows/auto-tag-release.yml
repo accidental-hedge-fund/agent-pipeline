@@ -128,5 +128,11 @@ jobs:
           version="${{ steps.detect.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # actions/checkout persists the default GITHUB_TOKEN as an
+          # `http.https://github.com/.extraheader` config entry, which applies to
+          # any https://github.com/ URL — including the PAT-embedded push URL
+          # below. Unset it so this push can't silently authenticate with
+          # GITHUB_TOKEN (untriggering release.yml) instead of RELEASE_TAG_TOKEN.
+          git config --local --unset-all http.https://github.com/.extraheader || true
           git tag -a "v${version}" -F /tmp/release-notes.md "${{ github.sha }}"
           git push "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git" "refs/tags/v${version}"
