@@ -643,16 +643,35 @@ export async function advanceFix(
   // and tested — no auto-format commit ships untested, no test-fix commit unformatted.
   const fmtGateFn = deps.runFormatGate ?? runFormatGate;
   const gatesRunner = deps._runFormatAndTestGates ?? runFormatAndTestGates;
+  // #387 review-2 finding 1: also fold declared build_command artifacts after
+  // a format-gate auto-fix commit, not just the round's initial commit above —
+  // undeclared repos get no hook (foldBuildArtifacts stays undefined), so
+  // runFormatAndTestGates behaves exactly as before for them.
+  const buildCommand = cfg.build_command;
+  const foldBuildArtifacts = buildCommand
+    ? async (wtPath: string): Promise<{ ok: true } | { ok: false; reason: string }> => {
+        const buildResult = await includeBuildArtifacts(wtPath, buildCommand, deps.buildSideEffects ?? {});
+        if (buildResult.ran && !buildResult.ok) {
+          return { ok: false, reason: buildFailureBlockReason(buildCommand, buildResult.output) };
+        }
+        if (buildResult.ran && buildResult.ok && buildResult.amended) {
+          console.log(
+            `[pipeline] #${issueNumber}: folded build artifact(s) into format-gate commit: ${buildResult.paths.join(", ")}`,
+          );
+        }
+        return { ok: true };
+      }
+    : undefined;
   const gates = await gatesRunner(
     cfg, issueNumber, wt.path, stage, pipelineRunId, opts.stateDir,
-    { runFormatGate: fmtGateFn },
+    { runFormatGate: fmtGateFn, foldBuildArtifacts },
     opts.runDir, opts.runStoreDeps,
   );
   if (!gates.ok) {
     await setBlocked(cfg, issueNumber, gates.reason, stage,
-      gates.source === "test" ? "test-gate-exhausted" : "needs-human");
+      gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : "needs-human");
     return { advanced: false, status: "blocked", reason: gates.reason,
-      blockerKind: gates.source === "test" ? "test-gate-exhausted" : "needs-human" };
+      blockerKind: gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : "needs-human" };
   }
 
   const postGateDiff = await gitInWorktree(

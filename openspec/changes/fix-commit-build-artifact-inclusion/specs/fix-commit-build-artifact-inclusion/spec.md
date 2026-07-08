@@ -31,7 +31,10 @@ resulting changes into the round's HEAD commit via
 `git commit --amend --no-edit`, so the round's committed generated artifacts match the committed source when
 the gates certify it. The amend SHALL preserve the round commit's subject and its `Issue:` and
 `Pipeline-Run:` trailers, and SHALL NOT create a separate commit. When the build produces no change, no amend
-SHALL occur and the round commit's SHA SHALL be unchanged.
+SHALL occur and the round commit's SHA SHALL be unchanged. Because the format-gate's own auto-fix commits
+(run inside the same `runFormatAndTestGates` convergence loop) can also modify source after this initial
+fold, the fix stage SHALL re-run the same fold after every format-gate auto-fix commit and before the test
+gate re-runs, so the round's **final certified HEAD** — not just its initial commit — has fresh artifacts.
 
 #### Scenario: Fix edits source and build regenerates dist
 
@@ -55,6 +58,23 @@ SHALL occur and the round commit's SHA SHALL be unchanged.
 - **THEN** the fold SHALL run before `runFormatAndTestGates`
 - **AND** the format-gate pre-flight dirty check and the test-gate pre-run dirty check SHALL observe a clean
   worktree and SHALL NOT block on the rebuilt artifact
+
+#### Scenario: A format-gate auto-fix commit is also rebuilt and folded
+
+- **WHEN** the format/test gate convergence loop's format-gate step commits an auto-fix change (e.g. a
+  formatter rewrite) after the round's initial build fold already ran
+- **THEN** the fix stage SHALL rebuild and fold declared build artifacts into that format-gate commit too,
+  before the test gate re-runs
+- **AND** re-running the declared build command against the round's final certified HEAD SHALL produce no
+  diff
+
+#### Scenario: A build failure during the format-gate loop blocks distinctly
+
+- **WHEN** the rebuild-and-fold triggered by a format-gate auto-fix commit fails (the declared build command
+  exits non-zero)
+- **THEN** the round SHALL block with the same explicit build-failure reason and `build-failed` blocker kind
+  as a failure during the round's initial fold
+- **AND** the test gate SHALL NOT run against the stale/broken commit
 
 ### Requirement: An auto-fix (test-gate fix-loop) attempt SHALL rebuild and fold declared build artifacts into its commit
 
@@ -85,6 +105,15 @@ output-cap helper when long.
 - **THEN** the round SHALL block with a build-failure reason routed to `needs-human`
 - **AND** the reason SHALL be distinct from the test-gate "failed after N fix attempt(s)" message
 - **AND** SHALL include the captured build output (truncated when long)
+
+#### Scenario: An auto-fix attempt's build failure keeps its distinct reason and blocker kind through the top-level result
+
+- **WHEN** a test-gate fix-loop attempt's rebuild-and-fold fails
+- **THEN** the resulting `TestGateResult` SHALL carry a flag identifying it as a build failure, not a
+  genuine test/build-command failure
+- **AND** the fix stage's format/test gate convergence loop SHALL propagate that flag through to its own
+  blocked result rather than reporting the test-gate's generic "failed after N fix attempt(s)" wording
+- **AND** the round SHALL block with the `build-failed` blocker kind, not `test-gate-exhausted`
 - **AND** no amend or artifact commit SHALL occur
 
 ### Requirement: The rebuild-and-fold SHALL be inert when no build command is declared

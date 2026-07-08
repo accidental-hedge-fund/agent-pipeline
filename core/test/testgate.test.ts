@@ -1075,6 +1075,25 @@ test("gate (#387, 5.3 analog): declared build_command fails → blocks with a di
   assert.match(out.blockReason ?? "", /build_command/);
   assert.match(out.blockReason ?? "", /Type mismatch/);
   assert.doesNotMatch(out.blockReason ?? "", /failed after \d+ fix attempt/i);
+  assert.equal(out.buildFailure, true, "result must be flagged as a build failure, not a genuine test failure");
+});
+
+test("gate (#387 review-2 finding 2, bites): testGateBlockReason keeps the build-failure and test-failure wordings distinct", () => {
+  const buildFailGate = {
+    skipped: false as const,
+    passed: false,
+    attempts: 1,
+    blockReason: "Declared build_command 'npm run build' failed while rebuilding generated artifacts for this round's commit:\n\n```\ntsc: error TS2322: Type mismatch\n```",
+    buildFailure: true,
+  };
+  const testFailGate = {
+    skipped: false as const,
+    passed: false,
+    attempts: 2,
+    blockReason: "FAIL: 1 test failed",
+  };
+  assert.doesNotMatch(testGateBlockReason(buildFailGate), /failed after \d+ fix attempt/i);
+  assert.match(testGateBlockReason(testFailGate), /failed after 2 fix attempt/i);
 });
 
 test("gate (#387): attempt produced no new commit → build fold is skipped for that attempt", async () => {

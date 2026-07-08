@@ -34,6 +34,17 @@
       (e.g. `build-failed`), and return `{ advanced: false, status: "blocked" }` — no amend, no advance.
 - [x] 3.3 Add the helper (with its seams) to `AdvanceFixDeps`, defaulting to the real implementation; log a
       one-line note when artifacts are folded in.
+- [x] 3.4 (review-2 finding 1) A format-gate auto-fix commit inside the gate convergence loop can also edit
+      source after the round's initial fold. Thread an optional `foldBuildArtifacts` hook through
+      `runFormatAndTestGates` (`FormatTestGateDeps`), called after a format-gate commit and before the test
+      gate re-runs; `advanceFix` supplies it only when `build_command` is declared, so other
+      `runFormatAndTestGates` callers (the `implementing` stage) stay inert. A build failure here returns
+      `source: "build"` from `runFormatAndTestGates`, mapped to blocker kind `build-failed`.
+- [x] 3.5 (review-2 next-step) Propagate a build failure from the auto-fix (test-gate fix-loop) attempt fold
+      into the top-level blocker kind: flag it on `TestGateResult` (`buildFailure`) so
+      `testGateBlockReason` keeps the distinct build-failure wording (not wrapped in the test-gate's
+      "failed after N fix attempt(s)" message) and `runFormatAndTestGates` maps it to `source: "build"`
+      instead of `source: "test"`.
 
 ## 4. Wire into the auto-fix (test-gate) path
 
@@ -62,6 +73,14 @@
       assert it is folded into that attempt's commit before the test command re-runs.
 - [x] 5.6 Unrelated pre-existing dirt → when the post-commit worktree is not clean, the helper does not run
       the build (or does not fold the unrelated path) and the existing dirty-worktree block still fires.
+- [x] 5.7 (review-2 finding 1) A format-gate auto-fix commit triggers the fold before the test gate re-runs;
+      a fold failure at that point blocks with `source: "build"` (mapped to `build-failed`), distinct from
+      `source: "format"`/`"test"`. No format-gate commit → the fold is never attempted. No
+      `foldBuildArtifacts` hook supplied (e.g. the `implementing` stage) → the format-gate loop is
+      unaffected.
+- [x] 5.8 (review-2 next-step) An auto-fix attempt's build-fold failure is flagged `buildFailure: true` on
+      `TestGateResult`; `testGateBlockReason` keeps that reason unwrapped, and
+      `runFormatAndTestGates` maps it to `source: "build"` rather than `source: "test"`.
 
 ## 6. Mirror + CI
 

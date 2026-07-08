@@ -60,6 +60,13 @@ export interface TestGateResult {
    *  than a genuine test/build failure (#384). Consumed by
    *  `testGateBlockReason` to pick the matching wording. */
   toolingFailure?: boolean;
+  /** True when `blockReason` reports a declared `build_command` failure from
+   *  the auto-fix attempt's rebuild-and-fold (#387) rather than a genuine
+   *  test/build-command failure. Consumed by `testGateBlockReason` to keep the
+   *  build-failure reason distinct from the "failed after N fix attempt(s)"
+   *  wording, and by `runFormatAndTestGates` to map the block to the
+   *  `build-failed` blocker kind instead of `test-gate-exhausted`. */
+  buildFailure?: boolean;
 }
 
 /** Signature of the harness `invoke` — injectable so the loop is unit-testable. */
@@ -470,6 +477,7 @@ export async function runTestGate(
           passed: false,
           attempts: attempt,
           blockReason: buildFailureBlockReason(cfg.build_command, buildResult.output),
+          buildFailure: true,
         };
       }
       if (buildResult.ran && buildResult.ok && buildResult.amended) {
@@ -540,7 +548,7 @@ function toolingFailureBlockReason(output: string): string {
  *  rather than wrapped in the ordinary test-failure wording, so the two stay
  *  distinguishable. */
 export function testGateBlockReason(gate: TestGateResult): string {
-  if (gate.toolingFailure) {
+  if (gate.toolingFailure || gate.buildFailure) {
     return gate.blockReason ?? "(no output captured)";
   }
   return (

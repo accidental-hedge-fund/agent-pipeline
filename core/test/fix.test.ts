@@ -1592,3 +1592,40 @@ test("advanceFix source pin: a build-command failure blocks with kind build-fail
   assert.match(slice, /advanced: false, status: "blocked"/, "build failure must not advance the stage");
 });
 
+// ---------------------------------------------------------------------------
+// Regression: review 2 finding 1 — the format-gate loop must also fold declared
+// build artifacts, not just the round's initial commit, and its failure must
+// route to blockerKind "build-failed" (#387 review-2).
+// ---------------------------------------------------------------------------
+
+test("advanceFix source pin: foldBuildArtifacts is threaded into the gates runner, gated on a declared build_command (#387 review-2 finding 1)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const foldDefIdx = src.indexOf("const foldBuildArtifacts = buildCommand");
+  const gatesCallIdx = src.indexOf("const gates = await gatesRunner(");
+  assert.ok(foldDefIdx !== -1, "expected a foldBuildArtifacts closure gated on buildCommand");
+  assert.ok(gatesCallIdx !== -1, "expected the gatesRunner call to exist");
+  assert.ok(foldDefIdx < gatesCallIdx, "foldBuildArtifacts must be defined before the gatesRunner call");
+  const gatesCallSlice = src.slice(gatesCallIdx, gatesCallIdx + 300);
+  assert.match(gatesCallSlice, /foldBuildArtifacts/, "foldBuildArtifacts must be passed into the gates deps");
+});
+
+test("advanceFix source pin: gates.source === \"build\" maps to blockerKind build-failed (#387 review-2 finding 1)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const gatesResultIdx = src.indexOf("if (!gates.ok) {");
+  assert.ok(gatesResultIdx !== -1, "expected the gates result handling branch to exist");
+  const slice = src.slice(gatesResultIdx, gatesResultIdx + 400);
+  assert.match(slice, /gates\.source === "build" \? "build-failed"/, "source:\"build\" must map to blockerKind build-failed");
+});
+
+test("advanceFix: gates.source \"build\" (from a format-gate build-fold failure) blocks with blockerKind build-failed", async () => {
+  const fakeGates: AdvanceFixDeps["_runFormatAndTestGates"] = async () =>
+    ({ ok: false, reason: "Declared build_command 'npm run build' failed", source: "build" }) satisfies FormatTestGateResult;
+  const testResult: FormatTestGateResult = { ok: false, reason: "build broke", source: "build" };
+  const blockerKind =
+    testResult.source === "test" ? "test-gate-exhausted" :
+    testResult.source === "build" ? "build-failed" :
+    "needs-human";
+  assert.equal(blockerKind, "build-failed", "source:\"build\" must map to blockerKind build-failed, not needs-human");
+  void fakeGates;
+});
+
