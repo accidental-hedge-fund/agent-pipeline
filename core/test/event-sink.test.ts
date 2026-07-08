@@ -191,6 +191,68 @@ test("buildEventSinkDeps (default deliver): a synchronous throw from the stdin w
   assert.equal(uncaught, undefined);
 });
 
+// Regression (#403): defaultDeliver settled its promise from whichever of
+// stdin 'error' and process 'close' fired first. For a forwarder that exits
+// non-zero without reading stdin, an asynchronous EPIPE on the parent's
+// stdin write could beat 'close' under CPU contention, rejecting with
+// `write EPIPE` instead of the exit-code-shaped `exited 1` message the rest
+// of the suite (and operators) rely on. These tests force that ordering
+// deterministically with a real OS pipe (no mocking of stream internals,
+// which proved unreliable under the test runner's own scheduling): the
+// forwarder closes its own stdin read end immediately, then sleeps before
+// exiting. An oversized line guarantees the parent's write can't complete in
+// one shot, so the write fails with a genuine EPIPE (the read end is already
+// gone) well before the child's delayed exit fires 'close'.
+function makeEpipeBeforeCloseScript(exitCode: number): string {
+  return makeScript(`exec 0<&-\nsleep 0.3\nexit ${exitCode}`);
+}
+const OVERSIZED_LINE = "x".repeat(8 * 1024 * 1024) + "\n";
+
+test("buildEventSinkDeps (default deliver): stdin EPIPE ordered before close settles from the exit code, not the pipe error", async () => {
+  const cli = makeEpipeBeforeCloseScript(1);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+  await assert.rejects(
+    () => Promise.resolve(result.eventSink!(OVERSIZED_LINE)),
+    (err: Error) => err.message.includes("exited 1") && !err.message.includes("EPIPE"),
+  );
+});
+
+test("buildEventSinkDeps (default deliver): stdin EPIPE ordered before a zero exit still resolves", async () => {
+  const cli = makeEpipeBeforeCloseScript(0);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+  await assert.doesNotReject(() => Promise.resolve(result.eventSink!(OVERSIZED_LINE)));
+});
+
+// A non-EPIPE stdin error is a genuine, unrelated failure (not a dead-pipe
+// signal from an early-exiting forwarder) and must keep rejecting the
+// promise immediately, exactly as before #403. The forwarder here never
+// exits on its own (reads stdin to EOF that never comes), so an immediate
+// rejection can only come from the stdin error handler, not from `close`.
+test("buildEventSinkDeps (default deliver): a non-EPIPE stdin error still rejects immediately with that error, not the close outcome", async () => {
+  const net = await import("node:net");
+  const cli = makeScript(`cat > /dev/null`);
+  const cfg: Pick<PipelineConfig, "event_sink"> = { event_sink: { command: cli, mode: "additive" } };
+  const result = buildEventSinkDeps(cfg);
+
+  const origWrite = net.Socket.prototype.write;
+  net.Socket.prototype.write = function (this: import("node:net").Socket) {
+    process.nextTick(() => {
+      this.emit("error", Object.assign(new Error("synthetic stdin failure"), { code: "ECONNRESET" }));
+    });
+    return true;
+  };
+  try {
+    await assert.rejects(
+      () => Promise.resolve(result.eventSink!("line\n")),
+      /synthetic stdin failure/,
+    );
+  } finally {
+    net.Socket.prototype.write = origWrite;
+  }
+});
+
 test("buildEventSinkDeps (default deliver): an unspawnable command rejects rather than hanging", async () => {
   const cfg: Pick<PipelineConfig, "event_sink"> = {
     event_sink: { command: "/no/such/executable-343", mode: "additive" },

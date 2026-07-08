@@ -77,7 +77,15 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
     // regression-tested by "stdin EPIPE from an early-exiting forwarder..."
     // in event-sink.test.ts, which fails with an uncaught EPIPE if this
     // handler is removed.
+    //
+    // An EPIPE here is information about a dead pipe, not a delivery outcome
+    // (#403): the forwarder exited without reading stdin, so `close` is
+    // imminent and must settle the promise from the exit code — settling
+    // here too would race EPIPE-vs-close timing and surface a nondeterministic
+    // `write EPIPE` instead of the exit-code-shaped message. Any other stdin
+    // error keeps the prior immediate-reject behavior.
     child.stdin?.on("error", (err) => {
+      if ((err as NodeJS.ErrnoException).code === "EPIPE") return;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
