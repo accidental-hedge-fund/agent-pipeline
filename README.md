@@ -1025,6 +1025,27 @@ format_gate:
 
 **Failure handling:** a blocked format gate posts a `## Pipeline: Blocked` comment on the issue with the failing command and its output. Fix the formatting/lint issue in the worktree, commit, clear the `blocked` label, and re-run.
 
+## Build-artifact rebuild (optional, `build_command`)
+
+Some repos commit **generated build artifacts** — a `dist/` directory, a plugin manifest, a generated mirror — and enforce their freshness in CI with a check the pipeline doesn't run locally (`git diff --exit-code -- dist`, `openclaw plugins build --check`, etc.). When a fix or auto-fix round edits source but doesn't rebuild those artifacts, the round commits stale generated files: the pipeline's own test/build gate passes (the freshness check is a separate CI step), the item advances to `ready-to-deploy`, and then loses a round-trip to a CI artifact-drift failure.
+
+`build_command` closes that gap: declare a repo build command, and every **fix** and **auto-fix** (test-gate fix-loop) round that produces a commit runs it and folds any resulting artifact changes into that round's commit before the format/test gates run.
+
+```yaml
+build_command: "npm run build"
+```
+
+**How it runs:**
+
+1. After a fix-round or auto-fix-attempt commit, when the worktree is clean, the declared command runs in the worktree (via `bash -c`).
+2. If it produces worktree changes, they're staged and folded into the round's `HEAD` commit via `git commit --amend --no-edit` — the commit's subject and `Issue:`/`Pipeline-Run:` trailers are preserved, and no separate commit is created.
+3. If the build produces no changes, nothing is amended and the commit SHA is unchanged.
+4. A pre-existing uncommitted path (unrelated to this round) is left untouched — the build never runs against a dirty tree, so the existing dirty-worktree block still fires on it.
+
+**When no `build_command` is configured** (the default), the step is a no-op and behavior is completely unchanged — no build runs, no auto-detection, no fallback.
+
+**Failure handling:** if the declared command exits non-zero, the round blocks immediately with a `build-failed` blocker and the captured build output, distinct from a test-gate failure. No amend or artifact commit ever occurs on a failed build. Fix the build in the worktree, commit, clear the `blocked` label, and re-run.
+
 ## Troubleshooting
 
 ### Pipeline is blocked

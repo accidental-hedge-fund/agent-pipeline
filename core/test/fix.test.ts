@@ -1560,3 +1560,35 @@ test("computeEffectiveBlockingSet: all colliding identities dispositioned → ke
   assert.equal(preFilter.effectiveKeys.size, 0, "no actionable identity → key clears → skip-advance path applies");
 });
 
+// ---------------------------------------------------------------------------
+// advanceFix wiring order (#387): the build-artifact rebuild-and-fold has no
+// injectable seam at the call-site level (advanceFix calls setBlocked directly,
+// like every other un-injected branch — see the #391/#366 source pins above).
+// Pin the source so the acceptance-criteria ordering — after the lock-file
+// inclusion (#358), before the format/test gates — cannot silently regress.
+// The fold logic itself (includeBuildArtifacts) is unit-tested directly in
+// build-side-effects.test.ts.
+// ---------------------------------------------------------------------------
+
+test("advanceFix source pin: the build-artifact fold runs after lock-file inclusion and before the format/test gates (#387)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const lockIdx = src.indexOf("includeLockfileSideEffects(wt.path, deps.lockfileSideEffects ?? {})");
+  const buildIdx = src.indexOf("includeBuildArtifacts(wt.path, cfg.build_command, deps.buildSideEffects ?? {})");
+  const gatesIdx = src.indexOf("const gatesRunner = deps._runFormatAndTestGates ?? runFormatAndTestGates;");
+  assert.ok(lockIdx !== -1, "expected the lock-file inclusion call to exist");
+  assert.ok(buildIdx !== -1, "expected the build-artifact fold call to exist");
+  assert.ok(gatesIdx !== -1, "expected the format/test gates runner to exist");
+  assert.ok(lockIdx < buildIdx, "the build fold must run after the lock-file inclusion");
+  assert.ok(buildIdx < gatesIdx, "the build fold must run before the format/test gates");
+});
+
+test("advanceFix source pin: a build-command failure blocks with kind build-failed and no advance (#387)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const buildIdx = src.indexOf("includeBuildArtifacts(wt.path, cfg.build_command, deps.buildSideEffects ?? {})");
+  assert.ok(buildIdx !== -1, "expected the build-artifact fold call to exist");
+  const slice = src.slice(buildIdx, buildIdx + 500);
+  assert.match(slice, /buildResult\.ran && !buildResult\.ok/, "expected a build-failure branch immediately after the fold call");
+  assert.match(slice, /setBlocked\(cfg, issueNumber, reason, stage, "build-failed"\)/, "build failure must block with kind \"build-failed\"");
+  assert.match(slice, /advanced: false, status: "blocked"/, "build failure must not advance the stage");
+});
+

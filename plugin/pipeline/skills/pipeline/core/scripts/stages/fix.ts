@@ -43,6 +43,7 @@ import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
+import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import type { RunStoreDeps } from "../run-store.ts";
@@ -107,6 +108,14 @@ export interface AdvanceFixDeps {
    * real git subprocess is invoked.
    */
   lockfileSideEffects?: LockfileSideEffectsDeps;
+  /**
+   * Build-artifact side-effect inclusion deps (#387). Folds any uncommitted
+   * artifact changes produced by a repo-declared `build_command` into the
+   * round's HEAD commit before the format/test gates run. A no-op when
+   * `cfg.build_command` is unset. When absent, the real implementation is
+   * used. Tests inject fakes so no real git/build subprocess is invoked.
+   */
+  buildSideEffects?: BuildSideEffectsDeps;
   /**
    * Verifies that `sha` is already present on `origin/<branch>` (#349 review-1
    * finding 1). Used to confirm an external-commit advance decision was truly
@@ -604,6 +613,26 @@ export async function advanceFix(
     if (lockResult.included) {
       console.log(
         `[pipeline] #${issueNumber}: folded uncommitted lock file(s) into round commit: ${lockResult.paths.join(", ")}`,
+      );
+    }
+  }
+
+  // ---- Build-artifact rebuild-and-fold (#387) ----
+  // When a build command is declared, run it after the lock-file inclusion and
+  // fold any resulting generated-artifact changes into the round's HEAD commit
+  // before the format/test gates run, so committed artifacts match committed
+  // source. A no-op when cfg.build_command is unset; on build failure the round
+  // blocks explicitly rather than committing stale or broken artifacts.
+  if (cfg.build_command && headBefore && headAfter && headBefore !== headAfter) {
+    const buildResult = await includeBuildArtifacts(wt.path, cfg.build_command, deps.buildSideEffects ?? {});
+    if (buildResult.ran && !buildResult.ok) {
+      const reason = buildFailureBlockReason(cfg.build_command, buildResult.output);
+      await setBlocked(cfg, issueNumber, reason, stage, "build-failed");
+      return { advanced: false, status: "blocked", reason, blockerKind: "build-failed" };
+    }
+    if (buildResult.ran && buildResult.ok && buildResult.amended) {
+      console.log(
+        `[pipeline] #${issueNumber}: folded build artifact(s) into round commit: ${buildResult.paths.join(", ")}`,
       );
     }
   }

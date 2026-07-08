@@ -24,6 +24,7 @@ import {
 import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import { trySalvageUncommittedWork } from "./salvage-harness-work.ts";
 import { makeCommandRecord, recordCommand } from "./evidence-bundle.ts";
+import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "./build-side-effects.ts";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import { emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
@@ -94,6 +95,12 @@ export interface TestGateDeps {
   /** Return raw `git status --porcelain` output for dirty-path surfacing in block
    *  reasons (#352). Injectable so tests can verify path inclusion without real git. */
   gitStatusPorcelain?: (cwd: string) => Promise<string>;
+  /** Build-artifact side-effect inclusion deps (#387). Folds any uncommitted
+   *  artifact changes produced by a repo-declared `build_command` into a
+   *  fix-attempt's commit before the test command re-runs. A no-op when
+   *  `cfg.build_command` is unset. Tests inject fakes so no real git/build
+   *  subprocess is invoked. */
+  buildSideEffects?: BuildSideEffectsDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +452,30 @@ export async function runTestGate(
       const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
       if (trailerErr) {
         return { skipped: false, passed: false, attempts: attempt, blockReason: trailerErr };
+      }
+    }
+
+    // ---- Build-artifact rebuild-and-fold (#387) ----
+    // After this attempt's commit passes the clean-tree/commit-format/trailer
+    // checks above and before the test command re-runs, fold any resulting
+    // artifact changes from a declared build_command into that commit. A no-op
+    // when cfg.build_command is unset or the attempt produced no new commit.
+    const buildDeps = deps.buildSideEffects ?? {};
+    const buildAttemptHead = headBefore && headAfterFix !== headBefore ? headAfterFix : null;
+    if (cfg.build_command && buildAttemptHead) {
+      const buildResult = await includeBuildArtifacts(wtPath, cfg.build_command, buildDeps);
+      if (buildResult.ran && !buildResult.ok) {
+        return {
+          skipped: false,
+          passed: false,
+          attempts: attempt,
+          blockReason: buildFailureBlockReason(cfg.build_command, buildResult.output),
+        };
+      }
+      if (buildResult.ran && buildResult.ok && buildResult.amended) {
+        console.log(
+          `[pipeline] #${issueNumber}: folded build artifact(s) into test-fix attempt commit: ${buildResult.paths.join(", ")}`,
+        );
       }
     }
 

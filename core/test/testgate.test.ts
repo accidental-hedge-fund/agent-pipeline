@@ -971,6 +971,140 @@ test("gate (regression / #20, trailer enforcement): multiple fix commits, one mi
 });
 
 // ---------------------------------------------------------------------------
+// Build-artifact rebuild-and-fold in the auto-fix loop (#387)
+// ---------------------------------------------------------------------------
+
+test("gate (#387, 5.5): declared build_command folds artifact into attempt commit before the test command re-runs", async () => {
+  let n = 0;
+  let testRuns = 0;
+  const order: string[] = [];
+  let statusCall = 0;
+  let addCount = 0;
+  let amendCount = 0;
+  const out = await runTestGate(
+    { ...cfgWith({}), build_command: "npm run build" },
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        order.push("test");
+        testRuns++;
+        return testRuns === 1 ? failResult : passResult;
+      },
+      invoke: async () => okInvoke(),
+      gitHead: async () => `head-${n++}`,
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [
+        `fix: resolve test/build failures (#1)\n\nIssue: #1\nPipeline-Run: ${FIXED_RUN_ID}`,
+      ],
+      buildSideEffects: {
+        gitStatusPorcelain: async () => (statusCall++ === 0 ? "" : " M dist/bundle.js\n"),
+        runBuildCommand: async (_wt, cmd) => {
+          order.push(`build:${cmd}`);
+          return { code: 0, output: "built" };
+        },
+        gitAddAll: async () => { addCount++; },
+        gitAmendNoEdit: async () => { amendCount++; },
+      },
+    },
+    FIXED_RUN_ID,
+  );
+  assert.equal(out.passed, true);
+  assert.equal(addCount, 1, "artifact staged exactly once");
+  assert.equal(amendCount, 1, "attempt commit amended exactly once");
+  // "test" (initial failing run) → "build:…" (the attempt's rebuild-and-fold) →
+  // "test" (the re-run the fold must precede).
+  assert.deepEqual(
+    order,
+    ["test", "build:npm run build", "test"],
+    "build runs after the attempt's checks and before the test command re-runs",
+  );
+});
+
+test("gate (#387, 5.2 analog): no build_command declared → build runner never invoked in the auto-fix loop", async () => {
+  let n = 0;
+  let testRuns = 0;
+  let buildInvoked = 0;
+  const out = await runTestGate(cfgWith({}), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => (testRuns++ === 0 ? failResult : passResult),
+    invoke: async () => okInvoke(),
+    gitHead: async () => `head-${n++}`,
+    gitDirty: async () => false,
+    verifyTestFix: async () => ({ ok: true }),
+    gitCommitMessages: async () => [],
+    buildSideEffects: {
+      runBuildCommand: async () => { buildInvoked++; return { code: 0, output: "" }; },
+    },
+  });
+  assert.equal(out.passed, true);
+  assert.equal(buildInvoked, 0, "build runner must never be invoked when build_command is unset");
+});
+
+test("gate (#387, 5.3 analog): declared build_command fails → blocks with a distinct reason, no further attempts consumed", async () => {
+  let n = 0;
+  let invoked = 0;
+  const out = await runTestGate(
+    { ...cfgWith({ max_attempts: 3 }), build_command: "npm run build" },
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => {
+        invoked++;
+        return okInvoke();
+      },
+      gitHead: async () => `head-${n++}`,
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [
+        `fix: resolve test/build failures (#1)\n\nIssue: #1\nPipeline-Run: ${FIXED_RUN_ID}`,
+      ],
+      buildSideEffects: {
+        gitStatusPorcelain: async () => "",
+        runBuildCommand: async () => ({ code: 1, output: "tsc: error TS2322: Type mismatch" }),
+      },
+    },
+    FIXED_RUN_ID,
+  );
+  assert.equal(out.passed, false);
+  assert.equal(invoked, 1, "loop blocks on the first attempt's build failure — no further fix attempts");
+  assert.match(out.blockReason ?? "", /build_command/);
+  assert.match(out.blockReason ?? "", /Type mismatch/);
+  assert.doesNotMatch(out.blockReason ?? "", /failed after \d+ fix attempt/i);
+});
+
+test("gate (#387): attempt produced no new commit → build fold is skipped for that attempt", async () => {
+  // gitHead is constant, so headAfterFix === headBefore for every attempt —
+  // simulates a fix-harness invocation that made no commit and left no dirt
+  // (an edge case distinct from the #131 salvage path, which requires dirt).
+  let testRuns = 0;
+  let buildInvoked = 0;
+  const out = await runTestGate(
+    { ...cfgWith({}), build_command: "npm run build" },
+    1,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => (testRuns++ === 0 ? failResult : passResult),
+      invoke: async () => okInvoke(),
+      gitHead: async () => "head-constant",
+      gitDirty: async () => false,
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+      buildSideEffects: {
+        runBuildCommand: async () => { buildInvoked++; return { code: 0, output: "" }; },
+      },
+    },
+  );
+  assert.equal(out.passed, true);
+  assert.equal(buildInvoked, 0, "build must not run for an attempt that produced no new commit");
+});
+
+// ---------------------------------------------------------------------------
 // Uncommitted-work salvage in the test-fix loop (#131)
 // ---------------------------------------------------------------------------
 

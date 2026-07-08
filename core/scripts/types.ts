@@ -123,6 +123,7 @@ export const BLOCKER_KINDS = [
   "shipcheck-failed",
   "head-drift",
   "worktree-setup-failed",
+  "build-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -222,6 +223,11 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "Fix the root cause (package manager not installed, bad lockfile, network " +
     "issue), or set `setup_command: \"\"` in `.github/pipeline.yml` to skip " +
     "the install step. Then remove the `blocked` label and re-run " +
+    "`$pipeline {{N}}`.",
+  "build-failed":
+    "The declared `build_command` failed while rebuilding generated artifacts " +
+    "for this round's commit (see the output above). Fix the build in the " +
+    "worktree, commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
 };
 
@@ -369,6 +375,13 @@ export interface PipelineConfig {
   // instead of auto-detection. When set to "" the install step is skipped
   // entirely. When absent (undefined), auto-detection runs from lockfile.
   setup_command?: string;
+  // Repo build command run after fix/auto-fix edits (#387). When declared, the
+  // fix stage and the auto-fix (test-gate fix-loop) fold any generated-artifact
+  // changes it produces into the round's HEAD commit before the gates certify,
+  // so committed build artifacts (dist/, a plugin manifest, …) stay fresh. When
+  // absent (undefined), no build command runs and fix/auto-fix behavior is
+  // unchanged — there is no default/guessed command and no fallback.
+  build_command?: string;
   // Opt-in sandboxed harness execution (#21). When true, the claude implementer
   // is invoked with --permission-mode default (claude's native sandboxed mode)
   // instead of --permission-mode bypassPermissions. The codex harness is

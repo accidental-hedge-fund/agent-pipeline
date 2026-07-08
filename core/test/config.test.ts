@@ -978,6 +978,61 @@ test("resolveConfig: non-string setup_command is rejected (strict schema)", asyn
   }
 });
 
+// ---- build_command (#387) ----
+
+test("resolveConfig: build_command passes through from file config", async () => {
+  const repo = makeFakeRepo(`build_command: "npm run build"\n`);
+  const binDir = makeFakeGh("acme/bc1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.build_command, "npm run build");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: build_command absent → undefined (inert, no auto-detection)", async () => {
+  const repo = makeFakeRepo(`base_branch: main\n`);
+  const binDir = makeFakeGh("acme/bc2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.build_command, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: non-string build_command is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`build_command: 42\n`);
+  const binDir = makeFakeGh("acme/bc3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid .*pipeline\.yml/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("syncConfig: build_command is preserved through sync --apply", () => {
+  const repo = makeFakeRepo(`build_command: "npm run build"\n`);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(result.applied, true);
+  assert.match(synced, /^build_command: npm run build/m, "build_command must be preserved after sync");
+});
+
 // ---- harness_sandbox (#21) ----
 
 test("resolveConfig: harness_sandbox:true is accepted and returns true", async () => {
