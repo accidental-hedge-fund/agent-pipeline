@@ -754,3 +754,78 @@ test("findUnacknowledgedComments: human objection inserted before the trailing a
   );
   assert.equal(unacked[0].author, "operator");
 });
+
+// #390 pre-merge delta, key e0b0c22e: review comments rendered BEFORE the
+// bodyHash field existed can never carry it — treating them all as unverified
+// re-gates existing review history (the castrecall #45 acceptance scenario).
+// A legacy artifact is accepted when the body is structurally complete review
+// output from its first line and nothing follows the artifact.
+
+function stripBodyHash(body: string): string {
+  const lines = body.split("\n");
+  const idx = lines.findLastIndex((l) => l.startsWith("<!-- review-artifact: "));
+  if (idx === -1) throw new Error("fixture: no artifact line");
+  const b64 = lines[idx].slice("<!-- review-artifact: ".length, -" -->".length);
+  const obj = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+  delete obj.bodyHash;
+  lines[idx] = `<!-- review-artifact: ${Buffer.from(JSON.stringify(obj)).toString("base64").replace(/=+$/, "")} -->`;
+  return lines.join("\n");
+}
+
+test("findUnacknowledgedComments: legacy pre-bodyHash review verdict with objection wording is not counted (#390 delta e0b0c22e)", () => {
+  const deltaReviewBody = stripBodyHash(formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship: do not proceed with this approach.",
+      findings: [{
+        severity: "high",
+        title: "legacy verdict with negation prose",
+        body: "This is the wrong approach; don't apply it — do not proceed.",
+        confidence: 0.88,
+        recommendation: "Do not apply this.",
+      }],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    new Set(["ed310f32"]),
+  ));
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", deltaReviewBody, ts(1)),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length, 0,
+    "a genuine legacy (pre-bodyHash) review verdict must not gate on its own wording — existing history must not re-block resumes",
+  );
+});
+
+test("findUnacknowledgedComments: objection prepended before a legacy review verdict still gates (#390 delta e0b0c22e)", () => {
+  const legacy = stripBodyHash(formatDeltaReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship.",
+      findings: [],
+      next_steps: [],
+      commitSha: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334",
+    },
+    "codex",
+    undefined,
+  ));
+  const tampered = `I disagree — revert this.\n\n${legacy}`;
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", tampered, ts(1)),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(
+    unacked.length, 1,
+    "prepending human objection text breaks the legacy heading anchor and must still gate",
+  );
+});
+

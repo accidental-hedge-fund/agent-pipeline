@@ -176,7 +176,7 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
  */
 export function isVerifiedPipelineReviewOutput(body: string): boolean {
   const artifact = extractReviewArtifact(body);
-  if (artifact === null || typeof artifact.bodyHash !== "string") return false;
+  if (artifact === null) return false;
   REVIEW_ARTIFACT_RE.lastIndex = 0;
   let lastMatch: RegExpExecArray | null = null;
   let cur: RegExpExecArray | null;
@@ -186,8 +186,28 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
   const rawPrefix = body.slice(0, lastMatch.index);
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
-  return hashReviewBody(prefix) === artifact.bodyHash;
+  if (typeof artifact.bodyHash === "string") {
+    return hashReviewBody(prefix) === artifact.bodyHash;
+  }
+  // Legacy pre-bodyHash artifact (#390 delta, key e0b0c22e): comments rendered
+  // before the bodyHash field existed can never carry it, and treating all of
+  // them as unverified re-gates existing review history — the exact castrecall
+  // #45 scenario this issue exists to fix. Accept a legacy artifact only when
+  // the body is structurally complete review output from its FIRST line (a
+  // review-verdict heading), plus the no-trailing-content check above: a
+  // trusted actor prepending an objection to a copied legacy verdict breaks
+  // the heading anchor and still gates. Residual (documented) gap: text
+  // inserted BETWEEN a legacy heading and its artifact is undetectable
+  // without a hash — new comments close this via bodyHash, and the legacy
+  // window only shrinks as history ages out.
+  return LEGACY_REVIEW_OUTPUT_HEADING_RE.test(body.trimStart());
 }
+
+// Review artifacts are only emitted on review-verdict comments (`## Review N`
+// by formatReviewComment, `## Pre-merge Delta Review` by
+// formatDeltaReviewComment) — the legacy acceptance path anchors on exactly
+// those headings (#390 delta, key e0b0c22e).
+const LEGACY_REVIEW_OUTPUT_HEADING_RE = /^## (?:Review \d+\b|Pre-merge Delta Review\b)/;
 
 // ---------------------------------------------------------------------------
 // computeDiffHash
