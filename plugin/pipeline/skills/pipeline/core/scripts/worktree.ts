@@ -474,6 +474,9 @@ export interface CreateWorktreeDeps {
   releaseMutex?: (path: string) => void;
   /** Sleep for the given number of milliseconds (injectable for tests). */
   sleep?: (ms: number) => Promise<void>;
+  /** Random fraction in [0, 1) used to jitter the fetch retry backoff
+   *  (injectable so tests are deterministic; defaults to Math.random). */
+  jitter?: () => number;
   /** Write `node_modules` to `.git/info/exclude` inside the worktree (idempotent). */
   writeNodeModulesExclude?: (worktreePath: string) => Promise<void>;
   /** Return lstat of the given path, or null if ENOENT. */
@@ -561,6 +564,7 @@ export async function createWorktree(
   const acquireMutexFn = deps.acquireMutex ?? ((p: string) => acquireWorktreeMutex(p));
   const releaseMutexFn = deps.releaseMutex ?? releaseWorktreeMutex;
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const jitterFn = deps.jitter ?? Math.random;
   const writeNodeModulesExcludeFn = deps.writeNodeModulesExclude ?? realWriteNodeModulesExclude;
   const lstatPathFn = deps.lstatPath ?? realLstatPath;
   const unlinkPathFn = deps.unlinkPath ?? realUnlinkPath;
@@ -619,17 +623,13 @@ export async function createWorktree(
   // Ensure the worktree root exists.
   mkdirFn(worktreeRoot(cfg), { recursive: true });
 
-  // Fetch the latest base branch.
-  await gitFn(cfg, cfg.repo_dir, ["fetch", "origin", cfg.base_branch], { ignoreFailure: false });
-
-  // If the branch exists from a prior failed attempt, delete it.
-  await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
-
-  // Serialize git worktree add across concurrent pipeline instances in the
-  // same repo. The mutex is held only for the duration of the subprocess call
-  // so it never blocks unrelated pipeline work. A retry loop handles transient
-  // .git/config.lock contention (belt-and-suspenders for cases the mutex
-  // cannot prevent, e.g. a stale lock left by a crashed git process).
+  // Serialize the base-branch fetch and git worktree add across concurrent
+  // pipeline instances in the same repo. The mutex critical section covers
+  // the fetch (#402) as well as the pre-add stale-branch cleanup and
+  // `git worktree add` (#183) — two overlapping fetches of the same repo can
+  // otherwise race on the refs/remotes/origin/<base> ref lock, blocking
+  // whichever run loses the race. The mutex is held only for the duration of
+  // these subprocess calls so it never blocks unrelated pipeline work.
   //
   // The mutex is keyed on the canonical Git common directory (not cfg.repo_dir)
   // so two runs from different linked worktrees of the same repo share one
@@ -637,10 +637,11 @@ export async function createWorktree(
   const commonDir = await resolveGitCommonDirFn(cfg.repo_dir);
   const mutexPath = worktreeMutexPath(commonDir);
 
-  // Wait up to 90 s (the git subprocess timeout of 60 s plus 30 s margin)
-  // so a live holder that is mid-git-worktree-add cannot outlast the wait.
+  // Wait up to 150 s (60 s fetch subprocess timeout + 60 s add subprocess
+  // timeout + 30 s margin) so a live holder that is mid-fetch-then-add
+  // cannot outlast the wait.
   const MUTEX_POLL_MS = 200;
-  const MUTEX_TIMEOUT_MS = 90_000;
+  const MUTEX_TIMEOUT_MS = 150_000;
   let mutexWaited = 0;
   for (;;) {
     try {
@@ -657,6 +658,41 @@ export async function createWorktree(
   }
 
   try {
+    // Fetch the latest base branch, retrying on transient ref-lock contention
+    // (#402) left by a git process the mutex cannot coordinate with — e.g. a
+    // developer's manual `git fetch` or a lock left by a crashed pipeline git.
+    // The mutex above is the primary defense; this retry is belt-and-suspenders,
+    // scoped strictly to the ref-lock signature so auth/network/missing-remote
+    // failures still throw immediately.
+    const FETCH_MAX_ATTEMPTS = 4;
+    let lastFetchStderr = "";
+    let fetched = false;
+    for (let attempt = 0; attempt < FETCH_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        await sleepFn(200 * 2 ** (attempt - 1) + jitterFn() * 200); // 200-400ms, 400-600ms, 800-1000ms
+      }
+      const { code, stderr } = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["fetch", "origin", cfg.base_branch],
+        { ignoreFailure: true },
+      );
+      if (code === 0) {
+        fetched = true;
+        break;
+      }
+      lastFetchStderr = stderr;
+      if (!stderr.includes("cannot lock ref") && !stderr.includes("unable to update local ref")) {
+        throw new Error(`git fetch origin ${cfg.base_branch} failed: ${lastFetchStderr.trim()}`);
+      }
+    }
+    if (!fetched) {
+      throw new Error(`git fetch origin ${cfg.base_branch} failed: ${lastFetchStderr.trim()}`);
+    }
+
+    // If the branch exists from a prior failed attempt, delete it.
+    await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+
     // 1 initial attempt + 3 retries = 4 total, matching the spec.
     const MAX_ATTEMPTS = 4;
     let lastStderr = "";
