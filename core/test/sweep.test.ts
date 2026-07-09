@@ -429,6 +429,91 @@ test("sweep: harness exception records blocked, does not abort", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 9.5 Capture-shaped spec-generation output (#401): bounded single retry
+// ---------------------------------------------------------------------------
+
+// Narration + a **Tool: bash** block ahead of an incomplete spec (missing
+// User story / Acceptance criteria / Out of scope) — mirrors the 2026-07-07
+// #398/#390 sweep failures.
+const CAPTURE_SHAPED_OUTPUT = [
+  "Let me check the relevant code before writing the spec.",
+  "",
+  "**Tool: bash**",
+  "",
+  "Input:",
+  "```json",
+  '{"command":"grep -rn foo core/scripts"}',
+  "```",
+  "",
+  "## Summary",
+  "A thing.",
+].join("\n");
+
+test("sweep: capture-shaped output on first call, valid spec on retry — proceeds, harness called twice", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "add retry logic", body: "Short." };
+  let call = 0;
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    runHarness: async (_p) => {
+      call++;
+      return call === 1
+        ? { success: true, output: CAPTURE_SHAPED_OUTPUT }
+        : { success: true, output: VALID_SPEC_BODY };
+    },
+  });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(call, 2, "harness should be called exactly twice");
+  assert.equal(deps._updateCalls.length, 1, "issue should be updated with the retried spec");
+  assert.equal(deps._updateCalls[0].body, VALID_SPEC_BODY);
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("capture-shaped"), "should log the capture-shaped retry");
+});
+
+test("sweep: both calls capture-shaped — blocked, harness called exactly twice (no third call)", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "add retry logic", body: "Short." };
+  let call = 0;
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    runHarness: async (_p) => {
+      call++;
+      return { success: true, output: CAPTURE_SHAPED_OUTPUT };
+    },
+  });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(call, 2, "harness should be called exactly twice, never a third time");
+  assert.equal(deps._updateCalls.length, 0, "issue should not be updated");
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("BLOCKED"), "issue should be recorded as blocked");
+});
+
+test("sweep: non-capture-shaped invalid spec blocks immediately — harness called exactly once", async () => {
+  const thinIssue: SweepIssue = { number: 42, title: "add retry logic", body: "Short." };
+  let call = 0;
+  const deps = makeDeps({
+    listIssues: async () => [thinIssue],
+    runHarness: async (_p) => {
+      call++;
+      return { success: true, output: "## Summary\nA thing.\n## Acceptance criteria\n- [ ] works." };
+    },
+  });
+
+  await runSweep({ apply: true }, DEFAULT_CFG, {}, deps);
+
+  assert.equal(
+    call,
+    1,
+    "harness should be called exactly once — no retry is spent on a genuine content failure",
+  );
+  assert.equal(deps._updateCalls.length, 0);
+  const allLog = deps._logLines.join("\n");
+  assert.ok(allLog.includes("BLOCKED"), "issue should be recorded as blocked");
+});
+
+// ---------------------------------------------------------------------------
 // 9.5 Roadmap reconciliation dry-run: diff printed, no branch
 // ---------------------------------------------------------------------------
 

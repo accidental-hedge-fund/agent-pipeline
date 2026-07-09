@@ -336,6 +336,96 @@ test("intake: no issue or PR created when harness fails", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 6.7b Capture-shaped spec-generation output (#401): bounded single retry
+// ---------------------------------------------------------------------------
+
+// Narration + a **Tool: bash** block ahead of an incomplete spec (missing
+// User story / Acceptance criteria / Out of scope) — mirrors the 2026-07-07
+// #398/#390 sweep failures, also observed for intake (#396's notes).
+const CAPTURE_SHAPED_OUTPUT = [
+  "Let me check the relevant code before writing the spec.",
+  "",
+  "**Tool: bash**",
+  "",
+  "Input:",
+  "```json",
+  '{"command":"grep -rn foo core/scripts"}',
+  "```",
+  "",
+  "# Add retry logic",
+  "",
+  "## Summary",
+  "A thing.",
+].join("\n");
+
+const VALID_INTAKE_SPEC = [
+  "# Add retry logic to the fix loop",
+  "",
+  "## Summary",
+  "A retry mechanism for the fix loop that recovers from transient failures.",
+  "",
+  "## User story",
+  "As a pipeline operator,",
+  "I want the fix loop to retry on transient errors,",
+  "so that a temporary network failure does not block the run.",
+  "",
+  "## Acceptance criteria",
+  "- [ ] Running `pipeline N` with a transient fix error retries up to 3 times.",
+  "- [ ] A permanent error still blocks with a clear message.",
+  "",
+  "## Out of scope",
+  "- Retry logic for the planning or review stages.",
+].join("\n");
+
+test("intake: capture-shaped output on first call, valid spec on retry — proceeds, harness called twice", async () => {
+  let call = 0;
+  const deps = makeDeps({
+    runHarness: async (_p) => {
+      call++;
+      return call === 1
+        ? { success: true, output: CAPTURE_SHAPED_OUTPUT }
+        : { success: true, output: VALID_INTAKE_SPEC };
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+
+  await runIntake(opts, DEFAULT_CFG, deps);
+
+  assert.equal(call, 2, "harness should be called exactly twice");
+  assert.equal(deps._createIssueCalls.length, 1, "issue should be created with the retried spec");
+});
+
+test("intake: both calls capture-shaped — blocked, harness called exactly twice (no third call)", async () => {
+  let call = 0;
+  const deps = makeDeps({
+    runHarness: async (_p) => {
+      call++;
+      return { success: true, output: CAPTURE_SHAPED_OUTPUT };
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic to the fix loop", release: "1.6.0" };
+
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /missing required sections/);
+  assert.equal(call, 2, "harness should be called exactly twice, never a third time");
+  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created");
+});
+
+test("intake: non-capture-shaped invalid spec blocks immediately — harness called exactly once", async () => {
+  let call = 0;
+  const deps = makeDeps({
+    runHarness: async (_p) => {
+      call++;
+      return { success: true, output: "## Summary\nA thing.\n## Acceptance criteria\n- [ ] works." };
+    },
+  });
+  const opts: IntakeOpts = { description: "some feature", release: "1.6.0" };
+
+  await assert.rejects(() => runIntake(opts, DEFAULT_CFG, deps), /missing required sections/);
+  assert.equal(call, 1, "harness should be called exactly once — no retry is spent on a genuine content failure");
+  assert.equal(deps._createIssueCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // 6.8 Error path — ROADMAP anchor missing
 // ---------------------------------------------------------------------------
 

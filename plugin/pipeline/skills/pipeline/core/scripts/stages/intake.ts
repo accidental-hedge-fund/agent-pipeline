@@ -19,6 +19,7 @@ import {
   insertDetailSectionBullet,
   computeUnifiedDiff,
 } from "./release.ts";
+import { extractSpecDocument, isCaptureShaped, REQUIRED_SPEC_SECTIONS } from "./spec-output.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -406,13 +407,6 @@ export function extractOneLiner(body: string): string {
 // Spec validation
 // ---------------------------------------------------------------------------
 
-const REQUIRED_SPEC_SECTIONS = [
-  "## Summary",
-  "## User story",
-  "## Acceptance criteria",
-  "## Out of scope",
-];
-
 /**
  * Validate that the harness-generated spec body contains the required sections
  * and at least one checkable acceptance criterion. Throws a descriptive error
@@ -510,17 +504,34 @@ export async function runIntake(
     roadmapContext: releaseContext,
   });
 
-  const harnessResult = await d.runHarness(prompt, cfg.intake_timeout ?? DEFAULT_CONFIG.intake_timeout);
-  if (!harnessResult.success) {
-    const timeoutMsg = harnessResult.timed_out
-      ? ` (timed out after ${cfg.intake_timeout ?? DEFAULT_CONFIG.intake_timeout}s)`
-      : "";
-    throw new Error(
-      `[pipeline intake] spec-generation harness failed${timeoutMsg} — check the output above for details.`,
+  const intakeTimeout = cfg.intake_timeout ?? DEFAULT_CONFIG.intake_timeout;
+
+  const runOnce = async (attempt: "first" | "retry") => {
+    const result = await d.runHarness(prompt, intakeTimeout);
+    if (!result.success) {
+      const timeoutMsg = result.timed_out ? ` (timed out after ${intakeTimeout}s)` : "";
+      const retryMsg = attempt === "retry" ? " on retry" : "";
+      throw new Error(
+        `[pipeline intake] spec-generation harness failed${retryMsg}${timeoutMsg} — check the output above for details.`,
+      );
+    }
+    return result.output;
+  };
+
+  let rawOutput = await runOnce("first");
+
+  // Capture-shaped output (leading narration/tool-call artifacts ahead of a
+  // well-formed spec) is a transcript-capture mechanic, not a content
+  // problem — retry exactly once before falling through to section
+  // validation, which blocks on a genuine content failure as it always has.
+  if (isCaptureShaped(rawOutput)) {
+    d.log(
+      `[pipeline intake] spec-generation output looked capture-shaped (narration/tool-call artifacts) — retrying once...`,
     );
+    rawOutput = await runOnce("retry");
   }
 
-  const { title, body: specBody } = parseSpec(harnessResult.output);
+  const { title, body: specBody } = parseSpec(extractSpecDocument(rawOutput));
   const oneLiner = extractOneLiner(specBody);
 
   d.log(`[pipeline intake] spec generated: "${title}"`);

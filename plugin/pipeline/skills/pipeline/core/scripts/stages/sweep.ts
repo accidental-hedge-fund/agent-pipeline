@@ -25,6 +25,7 @@ import {
   computeUnifiedDiff,
 } from "./release.ts";
 import { inferReleaseSlot, extractOneLiner, reservePushArgs } from "./intake.ts";
+import { extractSpecDocument, isCaptureShaped, REQUIRED_SPEC_SECTIONS } from "./spec-output.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -397,13 +398,6 @@ export function isIssueInDetailSections(roadmapText: string, issueNum: number): 
 // Spec validation (reused from intake contract)
 // ---------------------------------------------------------------------------
 
-const REQUIRED_SPEC_SECTIONS = [
-  "## Summary",
-  "## User story",
-  "## Acceptance criteria",
-  "## Out of scope",
-];
-
 export function validateSweepSpecBody(body: string): void {
   const missing = REQUIRED_SPEC_SECTIONS.filter((s) => !body.includes(s));
   if (missing.length > 0) {
@@ -510,9 +504,11 @@ export async function runSweep(
       repoContext: targetRepo,
     });
 
-    let harnessResult: { success: boolean; output: string };
+    const sweepTimeout = cfg.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout;
+
+    let harnessResult: { success: boolean; output: string; timed_out?: boolean };
     try {
-      harnessResult = await d.runHarness(prompt, cfg.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout);
+      harnessResult = await d.runHarness(prompt, sweepTimeout);
     } catch (err) {
       classified.push({
         issue,
@@ -523,9 +519,7 @@ export async function runSweep(
     }
 
     if (harnessResult.timed_out) {
-      throw new Error(
-        `[pipeline sweep] harness timed out after ${cfg.sweep_timeout ?? DEFAULT_CONFIG.sweep_timeout}s — aborting sweep.`,
-      );
+      throw new Error(`[pipeline sweep] harness timed out after ${sweepTimeout}s — aborting sweep.`);
     }
     if (!harnessResult.success) {
       classified.push({
@@ -536,8 +530,41 @@ export async function runSweep(
       continue;
     }
 
+    // Capture-shaped output (leading narration/tool-call artifacts ahead of a
+    // well-formed spec) is a transcript-capture mechanic, not a content
+    // problem — retry exactly once before falling through to section
+    // validation, which blocks on a genuine content failure as it always has.
+    if (isCaptureShaped(harnessResult.output)) {
+      d.log(
+        `[pipeline sweep] #${issue.number}: spec-generation output looked capture-shaped (narration/tool-call artifacts) — retrying once...`,
+      );
+      try {
+        harnessResult = await d.runHarness(prompt, sweepTimeout);
+      } catch (err) {
+        classified.push({
+          issue,
+          action: "blocked",
+          reason: `harness error on retry: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+      if (harnessResult.timed_out) {
+        throw new Error(`[pipeline sweep] harness timed out after ${sweepTimeout}s on retry — aborting sweep.`);
+      }
+      if (!harnessResult.success) {
+        classified.push({
+          issue,
+          action: "blocked",
+          reason: "harness returned failure on retry (check output above for details)",
+        });
+        continue;
+      }
+    }
+
+    const specBody = extractSpecDocument(harnessResult.output);
+
     try {
-      validateSweepSpecBody(harnessResult.output);
+      validateSweepSpecBody(specBody);
     } catch (err) {
       classified.push({
         issue,
@@ -551,7 +578,7 @@ export async function runSweep(
       issue,
       action: "specced",
       reason: isSufficientReason(issue.body, sweepConfig),
-      newBody: harnessResult.output.trim(),
+      newBody: specBody,
     });
   }
 
