@@ -225,6 +225,88 @@ test("resolve release notes: non-empty merge-commit body is used directly, no gh
   assert.equal(notes, "notes straight from the merge commit");
 });
 
+// ---------------------------------------------------------------------------
+// RELEASE_TAG_TOKEN single point of use (#413)
+// ---------------------------------------------------------------------------
+//
+// The workflow's first live run failed at checkout on every push to main because
+// RELEASE_TAG_TOKEN was passed as actions/checkout's `token:` input — an empty
+// secret makes checkout hard-fail before the release-detection guard can no-op a
+// non-release commit. These tests pin the secret to its single legitimate use
+// (the tag-push step) and bite if it's reintroduced at checkout.
+
+test("RELEASE_TAG_TOKEN is never referenced by actions/checkout", () => {
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const checkoutIdx = workflowSrc.indexOf("uses: actions/checkout@");
+  assert.notEqual(checkoutIdx, -1, "expected an actions/checkout step in the workflow");
+
+  // actions/checkout's step block runs from its "uses:" line up to (but not
+  // including) the next "- uses:" or "- name:" step marker.
+  const rest = workflowSrc.slice(checkoutIdx);
+  const nextStepMatch = rest.slice(1).match(/\n\s*- (uses|name): /);
+  const checkoutBlock = nextStepMatch
+    ? rest.slice(0, nextStepMatch.index! + 1)
+    : rest;
+
+  assert.equal(
+    checkoutBlock.includes("RELEASE_TAG_TOKEN"),
+    false,
+    `expected actions/checkout's step block to never reference RELEASE_TAG_TOKEN, got:\n${checkoutBlock}`,
+  );
+});
+
+test("RELEASE_TAG_TOKEN is referenced only within the tag-push step (excluding comments)", () => {
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const lines = workflowSrc.split("\n");
+  const tagPushStepIdx = lines.findIndex(
+    (l) => l.trim() === "- name: Create and push annotated tag",
+  );
+  assert.notEqual(tagPushStepIdx, -1, "expected a 'Create and push annotated tag' step");
+
+  let tagPushStepEnd = lines.length;
+  for (let i = tagPushStepIdx + 1; i < lines.length; i++) {
+    if (/^\s*- (uses|name): /.test(lines[i])) {
+      tagPushStepEnd = i;
+      break;
+    }
+  }
+
+  // Header comments documenting the secret (its purpose, provisioning) are fine —
+  // this test pins where the secret is actually *consumed* by the YAML, not every
+  // prose mention of its name.
+  lines.forEach((line, i) => {
+    if (line.trim().startsWith("#")) return;
+    if (!line.includes("RELEASE_TAG_TOKEN")) return;
+    assert.ok(
+      i >= tagPushStepIdx && i < tagPushStepEnd,
+      `expected RELEASE_TAG_TOKEN reference at line ${i + 1} to be within the tag-push step (lines ${tagPushStepIdx + 1}-${tagPushStepEnd}), got: ${line}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Checkout-persisted credential can't shadow the tag-push PAT (#413 review 1)
+// ---------------------------------------------------------------------------
+//
+// actions/checkout persists the default GITHUB_TOKEN as an
+// `http.https://github.com/.extraheader` git config entry (persist-credentials
+// defaults to true). That config matches any https://github.com/ URL,
+// including the PAT-embedded push URL below, so without clearing it the tag
+// push could silently authenticate with GITHUB_TOKEN instead of
+// RELEASE_TAG_TOKEN — pushing the tag without triggering release.yml.
+
+test("tag-push step unsets the checkout-persisted extraheader before pushing with the PAT", () => {
+  const script = extractStepScript("Create and push annotated tag");
+  const unsetIdx = script.indexOf("http.https://github.com/.extraheader");
+  const pushIdx = script.indexOf("git push ");
+  assert.notEqual(unsetIdx, -1, "expected the tag-push step to unset the checkout-persisted extraheader");
+  assert.notEqual(pushIdx, -1, "expected the tag-push step to contain a git push command");
+  assert.ok(
+    unsetIdx < pushIdx,
+    "expected the extraheader unset to happen before git push, so the persisted GITHUB_TOKEN can't shadow RELEASE_TAG_TOKEN",
+  );
+});
+
 test("resolve release notes: raw subject with empty body and no PR found via API fails loudly", () => {
   const repoDir = initRepoWithCommit("release: 1.16.0 — Factory reliability", "");
   const notesPath = join(mkdtempSync(join(tmpdir(), "auto-tag-notes-out-")), "release-notes.md");
