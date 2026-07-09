@@ -305,7 +305,7 @@ The number is auto-detected as an issue or PR. PRs resolve to their linked closi
 
 **What it does:**
 
-1. **Spec generation (only model-invoking step):** invokes the claude harness with the description to produce a structured spec — Summary, User story, Acceptance criteria (testable `- [ ]` items), Out of scope, and Open questions only when genuinely ambiguous. Follows the same WHAT-not-HOW contract as the `/pm` skill.
+1. **Spec generation (only model-invoking step):** invokes the claude harness with the description to produce a structured spec — Summary, User story, Acceptance criteria (testable `- [ ]` items), Out of scope, and Open questions only when genuinely ambiguous. Follows the same WHAT-not-HOW contract as the `/pm` skill. The raw output is passed through an extraction guard that strips any leading narration/tool-call text ahead of the spec; if the result still looks capture-shaped (narration/tool-call markers with no valid spec found), the harness is retried once before the issue is blocked.
 2. **Issue creation (deterministic):** creates a GitHub issue with the generated spec body and two labels: `pipeline:ready` and `release:vX.Y.Z`.
 3. **ROADMAP PR (deterministic):** writes three mutations to `ROADMAP.md` — a release-plan table row, a per-issue sem-ver table row, and a detail-section bullet — commits them on a new branch (`intake/issue-N-<slug>`), and opens a PR targeting the default branch for human review.
 
@@ -374,7 +374,7 @@ The `body` field follows the WHAT-not-HOW section contract: **Summary**, **User 
 **What it does:**
 
 1. **Classify (deterministic):** for each open issue, applies a structural heuristic to decide if it is *sufficient* (leave as-is) or *thin* (needs re-speccing). The heuristic checks body length ≥ 150 chars, presence of ≥ 2 required section headings, and that the body isn't a single sentence.
-2. **Re-spec (model-invoking, one call per thin issue):** for each thin issue, invokes the claude harness to generate an implementable spec body following the WHAT-not-HOW contract (Summary, User story, Acceptance criteria, Out of scope; Open questions only when genuinely ambiguous). Author context is preserved, not discarded.
+2. **Re-spec (model-invoking, one call per thin issue):** for each thin issue, invokes the claude harness to generate an implementable spec body following the WHAT-not-HOW contract (Summary, User story, Acceptance criteria, Out of scope; Open questions only when genuinely ambiguous). Author context is preserved, not discarded. The raw output is passed through an extraction guard that strips any leading narration/tool-call text ahead of the spec; if the result still looks capture-shaped (narration/tool-call markers with no valid spec found), the harness is retried once before the issue is recorded as blocked.
 3. **Roadmap reconciliation (deterministic):** identifies open issues absent from any of the three ROADMAP structures (release-plan table, per-issue sem-ver table, detail sections) and adds them. Under `--apply`, the update is delivered as a branch + PR for human review — never committed directly to the default branch.
 
 **Flags:**
