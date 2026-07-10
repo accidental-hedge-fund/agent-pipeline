@@ -371,6 +371,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.14.1** ✅ shipped | patch | Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix | #384, #383 | Shipped 2026-07-07 (tag `v1.14.1`). See **Shipped** above for the per-PR detail. |
 | **v1.15.0** ✅ shipped | minor | Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate | #391, #398, #403, #390, #393, #387 | Shipped 2026-07-08 (tag `v1.15.0`). See **Shipped** above for the per-PR detail. |
 | **deferred** | minor | Graduated autonomy (forge-resistance) | #23 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open). #149 (bounded auto-loop) already shipped in v1.7.0. |
+| **v1.16.0** | minor | Cluster recurring papercuts into backlog issues, with opt-in auto-file | #421 | `pipeline improve` gains a new `papercut` cluster category: it reads agent-reported friction events captured across runs, groups recurring ones into clusters, and surfaces them in the same dry-run report and `--apply` issue-creation path used by existing categories (flaky-gate, token-waste) — including the same open-issue dedup. Additive; existing flows unchanged. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -422,6 +423,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #214 | minor | adds `roadmap.release_model` config | release_model / milestone grouping | ✅ v1.7.0 | #171 |
 | #216 | minor | new sub-command | triage (stage labels) | ✅ v1.7.0 | — |
 | #217 | minor | new sub-command | human-invoked PR merge | ✅ v1.7.0 | — |
+| #421 | minor | new sub-command | intake | v1.16.0 | — |
 | _(anchor)_ | — | — | structural insertion anchor for `intake`/`sweep` (do not remove) | *(none)* | — |
 
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
@@ -502,6 +504,7 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 
 ### v1.16.0 — papercuts: agent-logged friction capture + batch fix loop (minor)
 
+- **#421** — `pipeline improve` gains a new `papercut` cluster category: it reads agent-reported friction events captured across runs, groups recurring ones into clusters, and surfaces them in the same dry-run report and `--apply` issue-creation path used by existing categories (flaky-gate, token-waste) — including the same open-issue dedup.
 Open lane; issues filed via `intake` (bullets inserted below by intake runs). Theme: a first-class capture channel for the small non-blocking friction agents currently push through silently — retried flaky commands, misleading errors, undocumented setup steps, dead-end tool calls — recorded as run-artifact events (not a committed repo file: parallel worktrees make one conflict-prone, and the lessons convention forbids pipeline writes to the conventions file), plus the batch loop that clusters recurring friction into `pipeline:backlog` issues the factory then fixes itself. All additive and opt-in; defaults preserve current behavior.
 
 ## Decisions
