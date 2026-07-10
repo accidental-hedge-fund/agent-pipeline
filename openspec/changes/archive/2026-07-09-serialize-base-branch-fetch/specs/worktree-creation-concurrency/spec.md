@@ -1,8 +1,5 @@
-# worktree-creation-concurrency Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change concurrent-worktree-add-lock. Update Purpose after archive.
-## Requirements
 ### Requirement: Concurrent worktree creation is serialized by a per-repo mutex
 
 `createWorktree` SHALL acquire a cross-process per-repo mutex at `/tmp/pipeline-wt-<hash>.lock` (where `<hash>` is an 8-character hex prefix of the SHA-1 of the canonical Git common directory, resolved via `git -C cfg.repo_dir rev-parse --path-format=absolute --git-common-dir`) before invoking the base-branch fetch (`git fetch origin <base_branch>`), and SHALL hold the mutex across the base-branch fetch, the pre-add stale-branch cleanup (`git branch -D`), and `git worktree add`, releasing it immediately after `git worktree add` completes (success or failure). Extending the critical section over the fetch — not just `git worktree add` — is what serializes concurrent fetches of the same repo so they cannot race on the `refs/remotes/origin/<base_branch>` ref lock. Using the common directory (rather than `cfg.repo_dir`) ensures that two pipeline runs started from different linked worktrees of the same repository share the same mutex file. If the mutex file exists and its recorded PID is dead or invalid, the mutex SHALL be treated as stale, removed, and re-acquired without error. The stale-reclaim sequence (read PID, unlink, re-acquire) SHALL be serialized by a short-lived reclaimer lock (`<mutex-path>.reclaim`) so that two concurrent reclaimers cannot both unlink and race to reacquire. The mutex wait timeout SHALL be large enough that a single live holder performing both its base-branch fetch and its `git worktree add` cannot outlast a waiter (i.e. it SHALL account for both git subprocess timeouts plus margin).
@@ -34,21 +31,6 @@ TBD - created by archiving change concurrent-worktree-add-lock. Update Purpose a
 - **WHEN** the base-branch fetch throws (e.g. exhausted ref-lock retries or a non-contention failure) before `git worktree add` runs
 - **THEN** the mutex lock file SHALL be removed before `createWorktree` throws, leaking no lock
 
-### Requirement: git worktree add is retried on transient config-lock contention
-When `git worktree add` exits non-zero and the stderr output contains `"could not lock config file"`, `createWorktree` SHALL retry the command up to **3** times with exponential backoff (base interval approximately 200 ms, doubling each attempt). If all retries fail, `createWorktree` SHALL throw with the final stderr as the error message.
-
-#### Scenario: retry succeeds on second attempt
-- **WHEN** the first `git worktree add` fails with `.git/config.lock` in stderr and the second attempt succeeds
-- **THEN** `createWorktree` SHALL return normally without throwing
-
-#### Scenario: retries exhausted
-- **WHEN** all retry attempts fail with `.git/config.lock` contention
-- **THEN** `createWorktree` SHALL throw an error containing the final stderr
-
-#### Scenario: non-lock failures are not retried
-- **WHEN** `git worktree add` exits non-zero for a reason unrelated to `.git/config.lock` (e.g., branch already exists)
-- **THEN** `createWorktree` SHALL throw immediately without retrying
-
 ### Requirement: Mutex and retry logic are injectable for testing
 
 The mutex acquire, mutex release, sleep, Git common directory resolution, and backoff jitter source functions used in `createWorktree` SHALL be injectable via the existing `CreateWorktreeDeps` interface so that unit tests can simulate lock contention, stale files, ref-lock contention on the fetch, and retry sequencing without spawning real processes or waiting on real timers. The fetch retry path SHALL NOT call `Math.random` directly; it SHALL draw jitter from the injectable source so tests are deterministic.
@@ -67,6 +49,8 @@ The mutex acquire, mutex release, sleep, Git common directory resolution, and ba
 
 - **WHEN** injected deps make the first `gitCmd` `git fetch` return a ref-lock error and the second return success, with injected `sleep` and `jitter`
 - **THEN** the test SHALL confirm `createWorktree` retried the fetch and returned normally, using no real network, git, or timers
+
+## ADDED Requirements
 
 ### Requirement: The base-branch fetch is retried on transient ref-lock contention
 
@@ -96,4 +80,3 @@ Runs started by `pipeline queue` batch dispatch SHALL obtain their worktree thro
 - **WHEN** `pipeline queue` dispatches multiple runs concurrently against the same repo
 - **THEN** each run's base-branch fetch SHALL be serialized under the shared per-repo mutex and retried on ref-lock contention
 - **AND** no queued run SHALL be blocked at planning by a `cannot lock ref 'refs/remotes/origin/<base>'` failure caused by a sibling queued run
-

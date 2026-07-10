@@ -1175,6 +1175,202 @@ test("createWorktree: mutex wait succeeds after more than 30s of simulated waiti
 });
 
 // ---------------------------------------------------------------------------
+// createWorktree: fetch is serialized under the mutex and retried on
+// transient ref-lock contention (#402)
+//
+// Regression: two concurrent runs' `git fetch origin <base>` calls raced on
+// refs/remotes/origin/<base>, and the loser threw with "cannot lock ref …
+// unable to update local ref", blocking the run at planning. The fetch ran
+// OUTSIDE the mutex that already serializes `git worktree add` (#183). Fix:
+// move the mutex acquisition before the fetch, and add a bounded, ref-lock-
+// scoped retry as belt-and-suspenders against a lock the mutex cannot see.
+// ---------------------------------------------------------------------------
+
+const REF_LOCK_STDERR =
+  "From https://github.com/org/repo\n" +
+  " ! 313ca9e..c59dfca  main -> origin/main  (unable to update local ref)\n" +
+  "error: cannot lock ref 'refs/remotes/origin/main': is at c59dfcabb3f365273607493b466f56742eccb330 but expected 313ca9ea685d0439fd6e31b944ae260a05b9f1a5";
+
+test("createWorktree: fetch ref-lock contention on first attempt, success on second → returns normally (#402)", async () => {
+  const cfg = makeCreateCfg();
+  let fetchCalls = 0;
+  const sleptMs: number[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "fetch") {
+        fetchCalls++;
+        if (fetchCalls === 1) {
+          return { code: 1, stdout: "", stderr: REF_LOCK_STDERR };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    ...noopMutexDeps,
+    sleep: async (ms) => { sleptMs.push(ms); },
+  };
+
+  const result = await createWorktree(cfg, 42, "slug", deps);
+  assert.equal(fetchCalls, 2, "must retry the fetch once and succeed on the second attempt");
+  assert.ok(result.path.includes("pipeline-42-slug"));
+  assert.ok(sleptMs.length > 0, "must sleep via the injected fake, never a real timer");
+});
+
+test("createWorktree: non-contention fetch failure throws immediately without retrying (#402)", async () => {
+  const cfg = makeCreateCfg();
+  let fetchCalls = 0;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "fetch") {
+        fetchCalls++;
+        return {
+          code: 128,
+          stdout: "",
+          stderr: "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    ...noopMutexDeps,
+  };
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /git fetch origin main failed/,
+  );
+  assert.equal(fetchCalls, 1, "must not retry a non-contention fetch failure");
+});
+
+test("createWorktree: fetch ref-lock contention on every attempt → throws with final stderr after bounded attempts (#402)", async () => {
+  const cfg = makeCreateCfg();
+  let fetchCalls = 0;
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "fetch") {
+        fetchCalls++;
+        return { code: 1, stdout: "", stderr: REF_LOCK_STDERR };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    ...noopMutexDeps,
+  };
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /git fetch origin main failed/,
+  );
+  assert.equal(fetchCalls, 4, "must attempt 4 times (1 initial + 3 retries) before giving up");
+});
+
+test("createWorktree: fetch retry backoff draws jitter from the injected source, not Math.random (#402)", async () => {
+  const cfg = makeCreateCfg();
+  let fetchCalls = 0;
+  let jitterCalls = 0;
+  const sleptMs: number[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "fetch") {
+        fetchCalls++;
+        if (fetchCalls === 1) {
+          return { code: 1, stdout: "", stderr: REF_LOCK_STDERR };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    ...noopMutexDeps,
+    sleep: async (ms) => { sleptMs.push(ms); },
+    jitter: () => { jitterCalls++; return 0.5; },
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+  assert.ok(jitterCalls > 0, "jitter source must be consulted for the fetch retry backoff");
+  assert.deepEqual(sleptMs, [300], "backoff must incorporate the injected jitter fraction (200ms base + 0.5 * 200ms jitter)");
+});
+
+test("createWorktree: mutex is acquired before the fetch and released after a fetch failure (#402)", async () => {
+  const cfg = makeCreateCfg();
+  const events: string[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "fetch") {
+        events.push("fetch");
+        return { code: 128, stdout: "", stderr: "fatal: Could not resolve host: github.com" };
+      }
+      if (args[0] === "worktree" && args[1] === "add") events.push("worktree-add");
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    resolveGitCommonDir: async (d) => d,
+    acquireMutex: (_p) => { events.push("acquire"); },
+    releaseMutex: (_p) => { events.push("release"); },
+    sleep: async (_ms) => {},
+  };
+
+  await assert.rejects(() => createWorktree(cfg, 42, "slug", deps));
+  assert.deepEqual(
+    events,
+    ["acquire", "fetch", "release"],
+    "mutex must be acquired before the fetch and released in finally even when the fetch fails, without ever reaching worktree add",
+  );
+});
+
+test("createWorktree: mutex covers fetch through worktree add on the success path (#402)", async () => {
+  const cfg = makeCreateCfg();
+  const events: string[] = [];
+
+  const deps: CreateWorktreeDeps = {
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_cfg, _cwd, args) => {
+      if (args[0] === "fetch") events.push("fetch");
+      if (args[0] === "worktree" && args[1] === "add") events.push("worktree-add");
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    resolveGitCommonDir: async (d) => d,
+    acquireMutex: (_p) => { events.push("acquire"); },
+    releaseMutex: (_p) => { events.push("release"); },
+    sleep: async (_ms) => {},
+    writeNodeModulesExclude: async () => {},
+    lstatPath: async () => null,
+    unlinkPath: async () => {},
+  };
+
+  await createWorktree(cfg, 42, "slug", deps);
+  assert.deepEqual(
+    events,
+    ["acquire", "fetch", "worktree-add", "release"],
+    "mutex must be held across the fetch and git worktree add, released only after both complete",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Finding 3 (#183 review 2): reclaim lock blocks concurrent reclaimer from
 // unlinking the fresh main lock
 //
