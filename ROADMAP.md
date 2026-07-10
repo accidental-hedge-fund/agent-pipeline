@@ -504,6 +504,10 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 
 Open lane; issues filed via `intake` (bullets inserted below by intake runs). Theme: a first-class capture channel for the small non-blocking friction agents currently push through silently — retried flaky commands, misleading errors, undocumented setup steps, dead-end tool calls — recorded as run-artifact events (not a committed repo file: parallel worktrees make one conflict-prone, and the lessons convention forbids pipeline writes to the conventions file), plus the batch loop that clusters recurring friction into `pipeline:backlog` issues the factory then fixes itself. All additive and opt-in; defaults preserve current behavior.
 
+### v1.17.0 — factory observability: scoreboard exports & cost fidelity (minor)
+
+Open lane; issues filed via `intake` (bullets inserted below by intake runs). Theme: make the factory's run evidence consumable outside the CLI — time-bucketed scoreboard series for trend charts, self-contained shareable report exports, and tighter actual-cost capture — so downstream consumers (Pipeline Desk, client-facing reports) read trustworthy numbers without scraping terminal prose. The dashboard/UI itself stays downstream (the v1.5.0 desktop-contracts boundary holds); this lane ships only the data contracts and exports. All additive and opt-in; defaults preserve current behavior.
+
 ## Decisions
 
 - **#24** — The pipeline never extends past `ready-to-deploy` (no auto-merge / preview / canary / rollback). **Closed — still holds** (12 PRs left for human merge across the 2026-06-08/09 run, zero auto-merges).
