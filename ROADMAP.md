@@ -500,6 +500,10 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 
 - **#23** — Graduated-autonomy approval checkpoints, carried forward from the v1.5.0–v1.8.0 lines. Parked on a checkpoint-comment forge-resistance security property (clearance must require a pipeline-authored SHA-bound comment, not arbitrary matching text); PR #194 open. (#149 bounded auto-loop already shipped in v1.7.0.)
 
+### v1.16.0 — papercuts: agent-logged friction capture + batch fix loop (minor)
+
+Open lane; issues filed via `intake` (bullets inserted below by intake runs). Theme: a first-class capture channel for the small non-blocking friction agents currently push through silently — retried flaky commands, misleading errors, undocumented setup steps, dead-end tool calls — recorded as run-artifact events (not a committed repo file: parallel worktrees make one conflict-prone, and the lessons convention forbids pipeline writes to the conventions file), plus the batch loop that clusters recurring friction into `pipeline:backlog` issues the factory then fixes itself. All additive and opt-in; defaults preserve current behavior.
+
 ## Decisions
 
 - **#24** — The pipeline never extends past `ready-to-deploy` (no auto-merge / preview / canary / rollback). **Closed — still holds** (12 PRs left for human merge across the 2026-06-08/09 run, zero auto-merges).
