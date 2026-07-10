@@ -27,6 +27,8 @@ The next line moves agent-pipeline from "AI writes code under review" toward an 
 | #365 | Archive legacy active OpenSpec changes left on `main` and add a default-branch drift check | This is the concrete Drift Backstop proof: stale implementation intent must not pollute current agent context. |
 | #389 | Add cross-round review memory so later reviews do not contradict already-settled trade-offs | Review quality depends on durable reasoning context, not just another stateless adversarial pass. |
 | #395 | Add a first-class visual-gate stage with reviewable artifact evidence | Buyer-visible evidence matters more than "the suite exited 0"; humans need screenshots/traces/diffs at release time. |
+| #419 | Papercut capture: agent-logged friction events + CLI | Non-blocking friction agents push through today vanishes unrecorded; capturing it in run artifacts is the raw material for factory self-improvement. |
+| #421 | Cluster recurring papercuts into backlog issues, with opt-in auto-file | The GitHub issue is this factory's only unit of work — recurring friction must become backlog issues the pipeline then fixes itself. |
 
 **v1.17.0 — Public adoption + category proof (draft, issues not yet filed):**
 
@@ -402,6 +404,8 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.14.1** ✅ shipped | patch | Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix | #384, #383 | Shipped 2026-07-07 (tag `v1.14.1`). See **Shipped** above for the per-PR detail. |
 | **v1.15.0** ✅ shipped | minor | Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate | #391, #398, #403, #390, #393, #387 | Shipped 2026-07-08 (tag `v1.15.0`). See **Shipped** above for the per-PR detail. |
 | **deferred** | minor | Graduated autonomy (forge-resistance) | #23 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open). #149 (bounded auto-loop) already shipped in v1.7.0. |
+| **v1.16.0** | minor | Papercut capture: agent-logged friction events + CLI | #419 | Pipeline runs currently lose all record of small, non-blocking friction — a flaky command retried, a misleading error worked around, an undocumented setup step, a dead-end tool call — because none of it trips `blocker_set` or `human_intervention`. Additive; existing flows unchanged. |
+| **v1.16.0** | minor | Cluster recurring papercuts into backlog issues, with opt-in auto-file | #421 | `pipeline improve` gains a new `papercut` cluster category: it reads agent-reported friction events captured across runs, groups recurring ones into clusters, and surfaces them in the same dry-run report and `--apply` issue-creation path used by existing categories (flaky-gate, token-waste) — including the same open-issue dedup. Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Add `--bucket day|week` time-series output to pipeline scoreboard | #425 | The `scoreboard` command gains an optional `--bucket day|week` flag that, when set, adds a chronological series of per-period aggregates to the report — each period carrying the same metrics scoreboard already reports for the full window (cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, pass rates). Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Add self-contained HTML export to pipeline scoreboard | #427 | The `scoreboard` command gains an HTML export mode that renders the same metrics scoreboard already computes — cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, and test/eval/shipcheck pass rates — into a single static HTML file. Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Capture actual per-call cost from harness output, not just estimates | #429 | Stage accounting captures the real cost of each harness call from that harness's own output/telemetry whenever the harness exposes it, rather than relying solely on operator-supplied `--estimate-cost` fallbacks. Additive; existing flows unchanged. |
@@ -456,6 +460,8 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #214 | minor | adds `roadmap.release_model` config | release_model / milestone grouping | ✅ v1.7.0 | #171 |
 | #216 | minor | new sub-command | triage (stage labels) | ✅ v1.7.0 | — |
 | #217 | minor | new sub-command | human-invoked PR merge | ✅ v1.7.0 | — |
+| #419 | minor | new sub-command | intake | v1.16.0 | — |
+| #421 | minor | adds `papercuts.auto_file` key | intake | v1.16.0 | #419 |
 | #425 | minor | new sub-command | intake | v1.17.0 | — |
 | #427 | minor | new sub-command | intake | v1.17.0 | — |
 | #429 | minor | new sub-command | intake | v1.17.0 | — |
@@ -540,6 +546,9 @@ Compatibility rule: Pipeline Desk will support legacy PTY streaming until these 
 ### v1.16.0 — papercuts: agent-logged friction capture + batch fix loop (minor)
 
 Open lane; issues filed via `intake` (bullets inserted below by intake runs). Theme: a first-class capture channel for the small non-blocking friction agents currently push through silently — retried flaky commands, misleading errors, undocumented setup steps, dead-end tool calls — recorded as run-artifact events (not a committed repo file: parallel worktrees make one conflict-prone, and the lessons convention forbids pipeline writes to the conventions file), plus the batch loop that clusters recurring friction into `pipeline:backlog` issues the factory then fixes itself. All additive and opt-in; defaults preserve current behavior.
+
+- **#419** — Pipeline runs currently lose all record of small, non-blocking friction — a flaky command retried, a misleading error worked around, an undocumented setup step, a dead-end tool call — because none of it trips `blocker_set` or `human_intervention`.
+- **#421** — `pipeline improve` gains a new `papercut` cluster category: it reads agent-reported friction events captured across runs, groups recurring ones into clusters, and surfaces them in the same dry-run report and `--apply` issue-creation path used by existing categories (flaky-gate, token-waste).
 
 ### v1.17.0 — factory observability: scoreboard exports & cost fidelity (minor)
 
