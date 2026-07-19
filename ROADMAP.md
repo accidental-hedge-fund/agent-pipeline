@@ -573,6 +573,12 @@ This lane establishes the controlled execution boundary. It deliberately does no
 
 This lane turns controlled runs into defensible comparisons and adds direct API treatments without conflating them with native OAuth CLI harnesses.
 
+### v1.20.0 — reasoning assurance + design interrogation (minor)
+
+- **#436** — Add a risk-triggered design-interrogation gate that records material implementation-time decisions, assumptions, invariants, rejected alternatives, evidence, and generalization boundaries; an independent reviewer challenges those choices before advancement, with bounded recurrence-aware resolution and the full chain preserved in the evidence bundle.
+
+This lane closes the gap between one-shot plan review and diff-scoped implementation review. It is deliberately limited to configured high-risk surfaces—such as concurrency, storage, auth, migrations, infrastructure, public APIs, and large architectural changes—so deeper reasoning assurance does not become universal ceremony. It records explicit decision evidence, never hidden chain-of-thought, and adds no merge or release authority.
+
 ## Decisions
 
 - **#24** — The pipeline never extends past `ready-to-deploy` (no auto-merge / preview / canary / rollback). **Closed — still holds** (12 PRs left for human merge across the 2026-06-08/09 run, zero auto-merges).
