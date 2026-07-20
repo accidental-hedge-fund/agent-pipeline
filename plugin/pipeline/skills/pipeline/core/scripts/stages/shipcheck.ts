@@ -28,7 +28,7 @@ import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInW
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";
 import { readBundle as defaultReadBundle, patchBundleIdentity as defaultPatchBundleIdentity } from "../evidence-bundle.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
-import { resolveReviewerModelForHarness } from "../stage-routing.ts";
+import { resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import { substitute } from "../prompts/index.ts";
 import { SHIPCHECK_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
@@ -603,7 +603,11 @@ export async function advance(
     } else if (deps.invokeReviewer) {
       result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
     } else {
-      const model = resolveReviewerModelForHarness(cfg.models.review, reviewerHarness, !!cfg.models.reviewWasAuto);
+      const model = resolveReviewerModelForHarness(
+        cfg.harnesses.reviewerModel ?? cfg.models.review,
+        reviewerHarness,
+        reviewerModelSourceWasAuto(cfg, undefined),
+      );
       const harnessResult = await defaultInvoke(reviewerHarness, worktreeDir, prompt, {
         timeoutSec,
         model,

@@ -68,7 +68,7 @@ export {
   type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
-import { resolveReviewerModelForHarness } from "../stage-routing.ts";
+import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -1649,7 +1649,12 @@ async function defaultRunDeltaReview(
     deltaDiff,
     specContext,
   });
-  const model = resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto);
+  // Not yet guarded against the effective reviewer command — invokeReviewer
+  // applies resolveReviewerModelForHarness itself, per attempted harness, so a
+  // same-harness fallback (#39) is guarded against the harness it actually
+  // targets rather than the nominal `cfg.harnesses.reviewer` (#441 finding c0acb169).
+  const rawModel = cfg.harnesses.reviewerModel ?? cfg.models.review;
+  const modelWasAuto = reviewerModelSourceWasAuto(cfg, undefined);
   const invocation = await invokeReviewer(
     cfg.harnesses.reviewer,
     cfg.harnesses.implementer,
@@ -1657,7 +1662,8 @@ async function defaultRunDeltaReview(
     prompt,
     {
       timeoutSec: cfg.review_timeout,
-      model,
+      model: rawModel,
+      modelWasAuto,
       accounting: accounting
         ? {
             runDir: accounting.runDir,
@@ -1665,7 +1671,6 @@ async function defaultRunDeltaReview(
             issue: issueNumber,
             stage: "pre-merge",
             modelSlot: "review",
-            model,
           }
         : undefined,
     },

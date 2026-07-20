@@ -605,7 +605,12 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       planning: expandAutoModel(fileConfig.models?.planning, "planning", implementerHarness) ?? DEFAULT_CONFIG.models.planning,
       implementing: expandAutoModel(fileConfig.models?.implementing, "implementing", implementerHarness) ?? DEFAULT_CONFIG.models.implementing,
       review: expandAutoModel(fileConfig.models?.review, "review-2", "claude") ?? DEFAULT_CONFIG.models.review,
-      reviewWasAuto: fileConfig.models?.review === "auto",
+      // Undefined (no `models.review` in file config) resolves to the same
+      // claude-fable-5 default as an explicit `"auto"`, and must be treated
+      // identically by the reviewer-model guard (#441 finding 3e79bbb5):
+      // without a user-authored non-auto value, a codex reviewer must still
+      // fall back to its own default rather than receive a claude-only alias.
+      reviewWasAuto: fileConfig.models?.review === "auto" || fileConfig.models?.review === undefined,
       fix: expandAutoModel(fileConfig.models?.fix, "fix", implementerHarness) ?? DEFAULT_CONFIG.models.fix,
       intake: expandAutoModel(fileConfig.models?.intake, "intake", "claude") ?? DEFAULT_CONFIG.models.intake,
       sweep: expandAutoModel(fileConfig.models?.sweep, "sweep", "claude") ?? DEFAULT_CONFIG.models.sweep,

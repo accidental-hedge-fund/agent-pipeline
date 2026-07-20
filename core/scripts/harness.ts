@@ -78,6 +78,13 @@ export interface InvokeOptions {
   timeoutSec?: number;
   /** Optional model override. Honored by claude (`--model`) and codex (`-m`). Ignored for custom reviewer CLIs. */
   model?: string;
+  /**
+   * Whether `model` originated from the `"auto"` sentinel rather than an
+   * explicit user override (#441). Consulted only by `invokeReviewer`'s
+   * per-attempted-harness compatibility guard (`resolveReviewerModelForHarness`
+   * in stage-routing.ts); `invoke()` itself ignores this field.
+   */
+  modelWasAuto?: boolean;
   /** Stream output to process.stderr/stdout in real time. Default true. */
   stream?: boolean;
   /**

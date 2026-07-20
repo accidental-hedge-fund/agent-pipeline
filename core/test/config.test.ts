@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import { findGitRoot, syncConfig, repoMapAdd, repoMapRemove, repoMapList, validateOwnerRepo } from "../scripts/config.ts";
+import { resolveReviewerModelForHarness } from "../scripts/stage-routing.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -485,6 +486,35 @@ test("resolveConfig: review_harness absent under claude profile → reviewer is 
     const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
     assert.equal(cfg.harnesses.reviewer, "codex"); // profile cross-harness default
     assert.equal(cfg.harnesses.implementer, "claude");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review absent + reviewer=codex → the generated default is NOT treated as explicit (#441 finding a74ee050)", async () => {
+  // Regression: when `models.review` is absent from file config, resolveConfig()
+  // still supplies DEFAULT_CONFIG.models.review (claude-fable-5, a claude-only
+  // alias) for `cfg.models.review`. Without this fix, `reviewWasAuto` was false
+  // in this case, so the codex-reviewer guard (resolveReviewerModelForHarness)
+  // treated the generated default as an explicit override and forwarded
+  // `claude-fable-5` to `codex exec -m`, which codex rejects. `reviewWasAuto`
+  // must be true here so the guard omits the model for a codex reviewer.
+  const repo = makeFakeRepo(`base_branch: main\n`); // no models.review key at all
+  const binDir = makeFakeGh("acme/im-default");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // claude profile → reviewer=codex
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.equal(cfg.models.review, "claude-fable-5");
+    assert.equal(cfg.models.reviewWasAuto, true);
+    assert.equal(
+      resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto),
+      undefined,
+      "an unconfigured codex reviewer must fall back to its own default, not claude-fable-5",
+    );
   } finally {
     process.env.PATH = oldPath;
   }

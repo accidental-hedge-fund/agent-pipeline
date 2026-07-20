@@ -155,8 +155,10 @@ test("scaffoldDefaultConfig: scaffolded file round-trips through resolveConfig w
     assert.equal(cfg.ci_timeout, DEFAULT_CONFIG.ci_timeout);
     assert.equal(cfg.ci_poll_interval, DEFAULT_CONFIG.ci_poll_interval);
 
-    // Nested objects.
-    assert.deepEqual(cfg.models, { ...DEFAULT_CONFIG.models, reviewWasAuto: false });
+    // Nested objects. `models.review` is absent from the scaffolded config, so
+    // reviewWasAuto is true (#441 finding a74ee050) — no explicit override, same
+    // as an authored "auto".
+    assert.deepEqual(cfg.models, { ...DEFAULT_CONFIG.models, reviewWasAuto: true });
     assert.deepEqual(cfg.openspec, DEFAULT_CONFIG.openspec);
     assert.deepEqual(cfg.last30days, DEFAULT_CONFIG.last30days);
     assert.deepEqual(cfg.steps, DEFAULT_CONFIG.steps);

@@ -20,7 +20,7 @@ import {
   parseChecksAggregate,
 } from "../gh.ts";
 import { invoke as defaultInvoke } from "../harness.ts";
-import { resolveReviewerModelForHarness } from "../stage-routing.ts";
+import { resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { substitute } from "../prompts/index.ts";
 import { ELIGIBILITY_JUDGE_SCHEMA_BLOCK } from "../auto-merge-eligibility-schema.ts";
 import type {
@@ -682,7 +682,11 @@ export async function runEligibilityGate(
     } else {
       const harnessResult = await defaultInvoke(cfg.harnesses.reviewer, opts.worktreeDir, prompt, {
         timeoutSec,
-        model: resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto),
+        model: resolveReviewerModelForHarness(
+          cfg.harnesses.reviewerModel ?? cfg.models.review,
+          cfg.harnesses.reviewer,
+          reviewerModelSourceWasAuto(cfg, undefined),
+        ),
       });
       judgeResult = {
         stdout: harnessResult.stdout,

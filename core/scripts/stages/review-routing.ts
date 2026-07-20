@@ -472,11 +472,14 @@ export async function advanceReview(
     const composite = `${rec.key}\0${rec.payload_fingerprint}`;
     if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
   }
+  // `reviewer` is the effective reviewer (reassigned from `invocation.effectiveReviewer`
+  // above) — guard against it, not the nominal `cfg.harnesses.reviewer`, so a
+  // same-harness fallback (#39) records the model it actually received (#441).
   const reviewerModel =
     result.executor_model ??
     resolveReviewerModelForHarness(
       opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
-      cfg.harnesses.reviewer,
+      reviewer,
       reviewerModelSourceWasAuto(cfg, opts.model),
     );
   const executorEvidence = result.executor_name
@@ -991,11 +994,12 @@ export async function invokePromptHarnessReview(
       makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", assignment?.name ?? cfg.harnesses.reviewer, prompt),
     ).catch(() => {});
   }
-  const model = resolveReviewerModelForHarness(
-    opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
-    cfg.harnesses.reviewer,
-    reviewerModelSourceWasAuto(cfg, opts.model),
-  );
+  // Not yet guarded against the effective reviewer command — invokeReviewer
+  // applies resolveReviewerModelForHarness itself, per attempted harness,
+  // since a same-harness fallback (#39) may target a different harness than
+  // `cfg.harnesses.reviewer` (#441 finding c0acb169).
+  const rawModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+  const modelWasAuto = reviewerModelSourceWasAuto(cfg, opts.model);
   if (assignment) {
     const result = await invokeStageExecutor(
       stageName,
@@ -1024,7 +1028,8 @@ export async function invokePromptHarnessReview(
   );
   return invokeReviewer(cfg.harnesses.reviewer, cfg.harnesses.implementer, cwd, prompt, {
     timeoutSec: cfg.review_timeout,
-    model,
+    model: rawModel,
+    modelWasAuto,
     reasoningEffort,
     accounting: opts.runDir
       ? {
@@ -1033,7 +1038,6 @@ export async function invokePromptHarnessReview(
           issue: issueNumber,
           stage: `review-${round}`,
           modelSlot: "review",
-          model,
         }
       : undefined,
   });
