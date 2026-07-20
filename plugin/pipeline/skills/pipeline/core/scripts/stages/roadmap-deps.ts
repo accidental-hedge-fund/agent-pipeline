@@ -45,7 +45,7 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
         cfg.harnesses.reviewer,
         cfg.repo_dir,
         prompt,
-        { stream: true, model: resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer) },
+        { stream: true, model: resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto) },
       );
       return { success: result.success, output: result.stdout };
     },

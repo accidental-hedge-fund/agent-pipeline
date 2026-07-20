@@ -20,7 +20,7 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import { formatStderrExcerpt } from "../harness.ts";
-import { expandAutoEffort, resolveReviewerModelForHarness } from "../stage-routing.ts";
+import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   buildReviewAdversarialPrompt,
@@ -474,7 +474,11 @@ export async function advanceReview(
   }
   const reviewerModel =
     result.executor_model ??
-    resolveReviewerModelForHarness(opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review, cfg.harnesses.reviewer);
+    resolveReviewerModelForHarness(
+      opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
+      cfg.harnesses.reviewer,
+      reviewerModelSourceWasAuto(cfg, opts.model),
+    );
   const executorEvidence = result.executor_name
     ? { executorProvider: result.executor_provider, executorModel: result.executor_model }
     : {};
@@ -990,6 +994,7 @@ export async function invokePromptHarnessReview(
   const model = resolveReviewerModelForHarness(
     opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
     cfg.harnesses.reviewer,
+    reviewerModelSourceWasAuto(cfg, opts.model),
   );
   if (assignment) {
     const result = await invokeStageExecutor(

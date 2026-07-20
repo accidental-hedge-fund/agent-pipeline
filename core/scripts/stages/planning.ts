@@ -32,7 +32,7 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
-import { expandAutoEffort, resolveReviewerModelForHarness } from "../stage-routing.ts";
+import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   branchName,
@@ -569,6 +569,7 @@ export async function runPlanningPhases(
     const planReviewModel = resolveReviewerModelForHarness(
       opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
       reviewer,
+      reviewerModelSourceWasAuto(cfg, opts.model),
     );
     // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
     // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),

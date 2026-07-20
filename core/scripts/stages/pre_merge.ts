@@ -1649,7 +1649,7 @@ async function defaultRunDeltaReview(
     deltaDiff,
     specContext,
   });
-  const model = resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer);
+  const model = resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto);
   const invocation = await invokeReviewer(
     cfg.harnesses.reviewer,
     cfg.harnesses.implementer,

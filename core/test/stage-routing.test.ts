@@ -9,6 +9,7 @@ import {
   STAGE_ROUTING,
   isClaudeOnlyModelAlias,
   resolveReviewerModelForHarness,
+  reviewerModelSourceWasAuto,
 } from "../scripts/stage-routing.ts";
 
 test("resolveAuto: mechanical/iterative stages fork model by harness (implementing)", () => {
@@ -91,23 +92,46 @@ test("isClaudeOnlyModelAlias: does not flag codex-valid or unrelated ids", () =>
   assert.equal(isClaudeOnlyModelAlias("gpt-5.6-terra"), false);
 });
 
-test("resolveReviewerModelForHarness: codex reviewer + claude-only alias → undefined (omit -m)", () => {
-  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "codex"), undefined);
-  assert.equal(resolveReviewerModelForHarness("sonnet", "codex"), undefined);
+test("resolveReviewerModelForHarness: codex reviewer + auto-resolved claude-only alias → undefined (omit -m)", () => {
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "codex", true), undefined);
+  assert.equal(resolveReviewerModelForHarness("sonnet", "codex", true), undefined);
+});
+
+test("resolveReviewerModelForHarness: codex reviewer + EXPLICIT claude-only alias is forwarded verbatim (#441)", () => {
+  // An explicit (non-auto) reviewer model must reach codex even if it happens
+  // to be a claude-only alias, so codex can surface its own invalid-model error.
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "codex", false), "claude-fable-5");
+  assert.equal(resolveReviewerModelForHarness("sonnet", "codex", false), "sonnet");
 });
 
 test("resolveReviewerModelForHarness: codex reviewer + codex-valid explicit id passes through verbatim", () => {
-  assert.equal(resolveReviewerModelForHarness("gpt-5.6-terra", "codex"), "gpt-5.6-terra");
+  assert.equal(resolveReviewerModelForHarness("gpt-5.6-terra", "codex", false), "gpt-5.6-terra");
 });
 
 test("resolveReviewerModelForHarness: claude reviewer always passes the model through verbatim", () => {
-  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "claude"), "claude-fable-5");
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "claude", true), "claude-fable-5");
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "claude", false), "claude-fable-5");
 });
 
 test("resolveReviewerModelForHarness: custom reviewer CLI passes the model through verbatim (invoke() ignores it anyway)", () => {
-  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "my-reviewer"), "claude-fable-5");
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "my-reviewer", true), "claude-fable-5");
 });
 
 test("resolveReviewerModelForHarness: undefined model stays undefined for any harness", () => {
-  assert.equal(resolveReviewerModelForHarness(undefined, "codex"), undefined);
+  assert.equal(resolveReviewerModelForHarness(undefined, "codex", true), undefined);
+});
+
+test("reviewerModelSourceWasAuto: opts.model override is always explicit", () => {
+  const cfg = { harnesses: { reviewerModel: "auto-resolved", reviewerModelWasAuto: true }, models: { review: "sonnet", reviewWasAuto: true } };
+  assert.equal(reviewerModelSourceWasAuto(cfg as any, "gpt-5.6-terra"), false);
+});
+
+test("reviewerModelSourceWasAuto: falls back to harnesses.reviewerModelWasAuto when set", () => {
+  const cfg = { harnesses: { reviewerModel: "sonnet", reviewerModelWasAuto: false }, models: { review: "claude-fable-5", reviewWasAuto: true } };
+  assert.equal(reviewerModelSourceWasAuto(cfg as any, undefined), false);
+});
+
+test("reviewerModelSourceWasAuto: falls back to models.reviewWasAuto when reviewerModel is unset", () => {
+  const cfg = { harnesses: { reviewerModel: undefined, reviewerModelWasAuto: undefined }, models: { review: "claude-fable-5", reviewWasAuto: true } };
+  assert.equal(reviewerModelSourceWasAuto(cfg as any, undefined), true);
 });

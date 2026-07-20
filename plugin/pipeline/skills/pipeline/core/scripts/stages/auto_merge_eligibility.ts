@@ -682,7 +682,7 @@ export async function runEligibilityGate(
     } else {
       const harnessResult = await defaultInvoke(cfg.harnesses.reviewer, opts.worktreeDir, prompt, {
         timeoutSec,
-        model: resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer),
+        model: resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto),
       });
       judgeResult = {
         stdout: harnessResult.stdout,

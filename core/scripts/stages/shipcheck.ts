@@ -603,7 +603,7 @@ export async function advance(
     } else if (deps.invokeReviewer) {
       result = await deps.invokeReviewer(prompt, worktreeDir, timeoutSec);
     } else {
-      const model = resolveReviewerModelForHarness(cfg.models.review, reviewerHarness);
+      const model = resolveReviewerModelForHarness(cfg.models.review, reviewerHarness, !!cfg.models.reviewWasAuto);
       const harnessResult = await defaultInvoke(reviewerHarness, worktreeDir, prompt, {
         timeoutSec,
         model,

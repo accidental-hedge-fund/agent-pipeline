@@ -1258,14 +1258,34 @@ test("runPlanningPhases — plan-review with reviewer=codex and a claude-only re
   };
   const cfg = {
     ...eqCfg,
-    harnesses: { ...eqCfg.harnesses, reviewerModel: "claude-fable-5", reviewerEffort: "high" },
+    harnesses: { ...eqCfg.harnesses, reviewerModel: "claude-fable-5", reviewerModelWasAuto: true, reviewerEffort: "high" },
     plan_review_effort: "medium",
   } as unknown as PipelineConfig;
   await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
   assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
   const opts = capturedOpts[0] as Record<string, unknown>;
-  assert.equal(opts.model, undefined, "claude-only alias must never reach a codex reviewer invocation");
+  assert.equal(opts.model, undefined, "an auto-resolved claude-only alias must never reach a codex reviewer invocation");
   assert.equal(opts.reasoningEffort, "high", "reviewerEffort override is unaffected by the model guard");
+});
+
+test("runPlanningPhases — plan-review with reviewer=codex and an EXPLICIT claude-only reviewerModel alias forwards it verbatim (#441)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
+    },
+  };
+  const cfg = {
+    ...eqCfg,
+    harnesses: { ...eqCfg.harnesses, reviewerModel: "sonnet" },
+    plan_review_effort: "medium",
+  } as unknown as PipelineConfig;
+  await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.model, "sonnet", "an explicit (non-auto) reviewer model must reach codex verbatim");
 });
 
 test("runPlanningPhases — structured review_harness reviewerEffort: 'auto' resolves round-aware to plan-review's Definitive classification (max) (#366)", async () => {

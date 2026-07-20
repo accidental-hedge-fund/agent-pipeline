@@ -274,8 +274,17 @@ export interface PipelineConfig {
   // invariant across rounds); `reviewerEffort` is left as-authored (possibly
   // `"auto"`) because its resolution is round-aware and happens at each
   // reviewer call site (plan-review vs. review-1 vs. review-2).
-  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerEffort?: string };
-  models: { planning: string; implementing: string; review: string; fix: string; intake: string; sweep: string };
+  // `reviewerModelWasAuto` records whether `reviewerModel` originated from the
+  // `"auto"` sentinel (vs. an explicit alias) — reviewer call sites need this
+  // to omit only an `auto`-resolved claude-only alias for a codex reviewer,
+  // never an explicitly-configured one (#441).
+  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerModelWasAuto?: boolean; reviewerEffort?: string };
+  // `reviewWasAuto` mirrors `reviewerModelWasAuto` for the `models.review`
+  // fallback slot (#441): true when the file config explicitly set
+  // `models.review: auto`, so reviewer call sites can distinguish an
+  // auto-resolved claude-only alias from an explicit one when `reviewerModel`
+  // is unset and `models.review` is the effective source.
+  models: { planning: string; implementing: string; review: string; reviewWasAuto?: boolean; fix: string; intake: string; sweep: string };
   // Per-stage reasoning-effort overrides (#366), parallel to `models`. Each key
   // is independently optional; an absent key means no `--effort`/`-c
   // model_reasoning_effort` flag is emitted for that stage (the harness

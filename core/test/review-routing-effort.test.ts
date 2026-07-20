@@ -107,7 +107,11 @@ test("invokePromptHarnessReview: codex reviewer + models.review: auto → no -m 
   try {
     const cfg = baseCfg({
       harnesses: { implementer: "claude", reviewer: "codex" } as any,
-      models: { planning: "sonnet", implementing: "sonnet", review: "claude-fable-5", fix: "sonnet", intake: "sonnet", sweep: "sonnet" } as any,
+      models: {
+        planning: "sonnet", implementing: "sonnet",
+        review: "claude-fable-5", reviewWasAuto: true,
+        fix: "sonnet", intake: "sonnet", sweep: "sonnet",
+      } as any,
     });
     const { result } = await run(cfg, 2);
     const lines = result.stdout.split("\n");
@@ -123,11 +127,29 @@ test("invokePromptHarnessReview: codex reviewer + structured review_harness.mode
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfg = baseCfg({
-      harnesses: { implementer: "claude", reviewer: "codex", reviewerModel: "claude-fable-5" } as any,
+      harnesses: { implementer: "claude", reviewer: "codex", reviewerModel: "claude-fable-5", reviewerModelWasAuto: true } as any,
     });
     const { result } = await run(cfg, 2);
     const lines = result.stdout.split("\n");
     assert.equal(lines.indexOf("-m"), -1, "no -m flag when the resolved reviewerModel override is a claude-only alias");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invokePromptHarnessReview: codex reviewer + EXPLICIT review_harness.model (claude-only alias) is forwarded verbatim (#441)", async () => {
+  const binDir = makeFakeCodex();
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfg = baseCfg({
+      harnesses: { implementer: "claude", reviewer: "codex", reviewerModel: "sonnet" } as any,
+    });
+    const { result } = await run(cfg, 2);
+    const lines = result.stdout.split("\n");
+    const idx = lines.indexOf("-m");
+    assert.notEqual(idx, -1, "an explicit (non-auto) reviewer model must reach codex verbatim");
+    assert.equal(lines[idx + 1], "sonnet");
   } finally {
     process.env.PATH = oldPath;
   }
