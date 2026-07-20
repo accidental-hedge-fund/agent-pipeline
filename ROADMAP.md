@@ -1,6 +1,6 @@
 # Roadmap
 
-Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-07-09.
+Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-07-10.
 
 **Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. **v1.1.1 shipped 2026-06-14** (tag `v1.1.1`) — capability/evidence hardening: deterministic `doctor` preflight and per-run evidence bundles; see Shipped. **v1.2.0 shipped 2026-06-15** (tag `v1.2.0`) — reviewer pluggability & per-step models: configurable review harness, self-review fallback, `models.implementing`, and override durability; see Shipped. **v1.2.1 shipped 2026-06-16** (tag `v1.2.1`) — pipeline-run reliability (first patch on the 1.2 line): shell-backed (`bash -c` + `pipefail`) configured gate commands, worktree dependency-install with issue-number capacity reclaim, and a resumable `implementing` stage; see Shipped. **v1.2.2 shipped 2026-06-16** (tag `v1.2.2`) — more pipeline-run reliability (second patch on the 1.2 line): persistently-failing pre-merge CI routes to `needs-human` instead of looping, the worktree harness never stages a `node_modules` symlink, and concurrent `git worktree add` is serialized against the shared `.git/config` lock; see Shipped. **v1.3.0 shipped 2026-06-16** (tag `v1.3.0`) — isolation & harness output quality (third minor): opt-in sandboxed harness execution (`harness_sandbox`) and a configurable format/lint normalization gate (`format_gate`) that runs format-before-test to a bounded fixed point; see Shipped. (Graduated-autonomy approval checkpoints #23 and bounded auto-loop #149 were re-scoped from this minor to **v1.4.0** — see Release plan.) **v1.4.0 shipped 2026-06-16** (tag `v1.4.0`) — private eval / shipcheck gate (fourth minor): an opt-in reviewer-owned acceptance-rubric gate (`shipcheck`) that runs before `ready-to-deploy`, advisory-first and default-off; see Shipped. **v1.5.0 shipped 2026-06-16** (tag `v1.5.0`) — Pipeline Desk desktop contracts (fifth minor): host-neutral launcher & install discovery (#153), machine-readable JSON status/preflight (#154), stable run directory + JSON events + non-hanging log-follow (#155), `.github/pipeline.yml` JSON-schema & validation command (#156), and run-artifact conventions — non-fatal I/O, write-time injection denylist, `schema_version`, local-only fields (#161) — so Pipeline Desk can supervise runs without scraping terminal prose; see Shipped. **v1.6.0 shipped 2026-06-17** (tag `v1.6.0`) — Intake & backlog automation (sixth minor): front-door intake (#158), release-PR automation (#170), the backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168); see Shipped. (#23 + #149 carried forward again, now to **v1.7.0** — the approval-gate forge-resistance security property still needs convergence.) **v1.7.0 shipped 2026-06-19** (tag `v1.7.0`) — Control plane & release_model; see Shipped. **v1.8.0 shipped 2026-06-19** (tag `v1.8.0`) — faster intake/sweep + fail-fast timeouts (eighth minor): intake/sweep spec-generation pinned to a fast model + a lean tool-free harness (no MCP, no repo exploration) → ~15× faster intake (#220/#247), plus configurable `intake_timeout`/`sweep_timeout` (#248/#250); see Shipped. **v1.9.0 shipped 2026-06-21** (tag `v1.9.0`) — Observability & reliability hardening; see Shipped. **v1.9.1 shipped 2026-06-24** (tag `v1.9.1`) — convergence & reliability fixes (first patch on the 1.9 line): planning no longer stalls on inherited `xhigh` reasoning (#278) and a mid-planning crash now resumes by restarting instead of waiting (#271); pre-merge/merge converge on repos with no branch-protection-required checks (#275) and when Actions never fires a run for the archive commit (#281); transient `gh` API failures retry instead of crashing the run (#270); worktrees are cleaned up after a successful merge (#296); plus a non-mutating spec-refinement contract for existing issues (#295), a faster roadmap engine for small backlogs (#292), and a `release.yml` annotated-tag guard (#289); see Shipped. Everything below v1.9.1 is the post-1.9.1 line. **v1.10.0 shipped 2026-06-28** (tag `v1.10.0`) — factory scoreboard + stage-level cost accounting; see Shipped. **v1.11.0 shipped 2026-06-28** (tag `v1.11.0`) — CLI dispatch v2: command registry + lifecycle/CLI-parsing split (#263), queue and budget mode (#305); see Shipped. **v1.12.0 shipped 2026-06-29** (tag `v1.12.0`) — move /pipeline off -- conventions (namespaced command surface, #273), pre-merge silently skips OpenSpec archive when openspec CLI unavailable (#308); see Shipped. **v1.12.1 shipped 2026-06-30** (tag `v1.12.1`) — ci_mode: local skip-GitHub-Actions gate (#350), OpenSpec config-commit path-scoped fix (#352), Codex no-sandbox env (#355); see Shipped. **v1.12.2 shipped 2026-07-01** (tag `v1.12.2`) — disambiguate OpenSpec spec-divergence so fix rounds keep progressing (#356); injectable-dep rule added to implementing and fix prompts (#360); see Shipped. **v1.12.3 shipped 2026-07-01** (tag `v1.12.3`) — Fix harness commit step lock-file side-effects; see Shipped. **v1.12.4 shipped 2026-07-02** (tag `v1.12.4`) — Pre-merge fix round: auto-apply bounded fix for correctness findings; see Shipped. **v1.13.0 shipped 2026-07-04** (tag `v1.13.0`) — Fix-stage recovery + logging portability + repo-map CLI; see Shipped. **v1.14.0 shipped 2026-07-07** (tag `v1.14.0`) — Convergence & evidence: post-fix re-review correctness, eval-gate fix routing, durable evidence, crash recovery; see Shipped. **v1.14.1 shipped 2026-07-07** (tag `v1.14.1`) — Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix; see Shipped. **v1.15.0 shipped 2026-07-08** (tag `v1.15.0`) — Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate; see Shipped. Everything below v1.15.0 is the post-1.15.0 line.
 
@@ -30,7 +30,29 @@ The next line moves agent-pipeline from "AI writes code under review" toward an 
 | #419 | Papercut capture: agent-logged friction events + CLI | Non-blocking friction agents push through today vanishes unrecorded; capturing it in run artifacts is the raw material for factory self-improvement. |
 | #421 | Cluster recurring papercuts into backlog issues, with opt-in auto-file | The GitHub issue is this factory's only unit of work — recurring friction must become backlog issues the pipeline then fixes itself. |
 
-**v1.17.0 — Public adoption + category proof (draft, issues not yet filed):**
+**v1.17.0 — Factory observability: scoreboard exports + cost fidelity (minor):**
+
+| # | What | Why |
+|---|------|-----|
+| #425 | Add day/week time-series output to the scoreboard | Trend data makes harness performance and reliability changes visible across release windows. |
+| #427 | Add a self-contained HTML scoreboard export | Evaluation and factory evidence should be reviewable without the CLI or a hosted dashboard. |
+| #429 | Capture actual per-call harness cost and its provenance | Comparative reports must distinguish actual, estimated, and unknown cost instead of treating missing telemetry as free. |
+
+**v1.18.0 — Controlled multi-harness evaluation foundation (minor):**
+
+| # | What | Why |
+|---|------|-----|
+| #431 | Add first-class Grok Build, Pi, and OpenCode CLI adapters alongside Claude and Codex | The deployed CLI harness, including its tool loop and OAuth route, is part of the treatment being measured. |
+| #432 | Add a manifest-driven stage eval runner with frozen fixtures and isolated worktrees | Identical immutable inputs and isolated execution are required before harness/model/effort comparisons are credible. |
+
+**v1.19.0 — Objective grading + API comparison (minor):**
+
+| # | What | Why |
+|---|------|-----|
+| #433 | Add objective graders and comparative statistical reporting | Hidden checks, seeded defects, paired deltas, and confidence intervals turn run evidence into defensible decisions. |
+| #434 | Extend API executors for OpenRouter controls and provider provenance | Direct API treatments need controlled reasoning parameters and resolved-provider evidence, and must remain distinct from OAuth CLI products. |
+
+**Later (unscheduled) — Public adoption + category proof (draft, issues not yet filed; carried from the v1.17.0 draft when that slot became factory observability):**
 
 | Theme | Candidate work |
 |---|---|
@@ -556,6 +578,26 @@ Open lane; issues filed via `intake` (bullets inserted below by intake runs). Th
 - **#427** — The `scoreboard` command gains an HTML export mode that renders the same metrics scoreboard already computes — cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, and test/eval/shipcheck pass rates — into a single static HTML file.
 - **#429** — Stage accounting captures the real cost of each harness call from that harness's own output/telemetry whenever the harness exposes it, rather than relying solely on operator-supplied `--estimate-cost` fallbacks.
 Open lane; issues filed via `intake` (bullets inserted below by intake runs). Theme: make the factory's run evidence consumable outside the CLI — time-bucketed scoreboard series for trend charts, self-contained shareable report exports, and tighter actual-cost capture — so downstream consumers (Pipeline Desk, client-facing reports) read trustworthy numbers without scraping terminal prose. The dashboard/UI itself stays downstream (the v1.5.0 desktop-contracts boundary holds); this lane ships only the data contracts and exports. All additive and opt-in; defaults preserve current behavior.
+
+### v1.18.0 — controlled multi-harness evaluation foundation (minor)
+
+- **#431** — Generalize the existing Claude/Codex invocation seam into typed CLI harness adapters and add Grok Build, Pi, and OpenCode, preserving native OAuth/headless behavior while recording resolved harness/provider/model/effort provenance.
+- **#432** — Add a manifest-driven evaluation runner that expands harness × provider × model × effort treatments, replays frozen stage fixtures or isolated end-to-end runs in fresh worktrees, randomizes execution order, and writes resumable result artifacts without mutating production GitHub state.
+
+This lane establishes the controlled execution boundary. It deliberately does not claim that similarly named effort settings are equivalent across providers, and it treats the complete deployed CLI product — not only its nominal model — as the unit under test.
+
+### v1.19.0 — objective grading + API comparison (minor)
+
+- **#433** — Grade experiment runs with hidden deterministic checks, seeded review defects, acceptance rubrics, regression/scope checks, optional independent judging, paired per-fixture deltas, confidence intervals, and quality/resource Pareto reporting. Depends on #432's fixture and result contracts.
+- **#434** — Extend OpenAI-compatible API executors for per-treatment model overrides, provider-aware reasoning parameters, structured output, request controls, and resolved OpenRouter/provider usage provenance. Depends on #429's cost semantics and integrates with #432's experiment identity.
+
+This lane turns controlled runs into defensible comparisons and adds direct API treatments without conflating them with native OAuth CLI harnesses.
+
+### v1.20.0 — reasoning assurance + design interrogation (minor)
+
+- **#436** — Add a risk-triggered design-interrogation gate that records material implementation-time decisions, assumptions, invariants, rejected alternatives, evidence, and generalization boundaries; an independent reviewer challenges those choices before advancement, with bounded recurrence-aware resolution and the full chain preserved in the evidence bundle.
+
+This lane closes the gap between one-shot plan review and diff-scoped implementation review. It is deliberately limited to configured high-risk surfaces—such as concurrency, storage, auth, migrations, infrastructure, public APIs, and large architectural changes—so deeper reasoning assurance does not become universal ceremony. It records explicit decision evidence, never hidden chain-of-thought, and adds no merge or release authority.
 
 ## Decisions
 
