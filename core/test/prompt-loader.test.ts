@@ -11,12 +11,14 @@ import {
   buildEvalFixPrompt,
   buildFixPrompt,
   buildImplementingPrompt,
+  buildIntakePrompt,
   buildPlanningOpenspecPrompt,
   buildPlanningPrompt,
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
+  buildSweepPrompt,
   buildTestFixPrompt,
   substitute,
 } from "../scripts/prompts/index.ts";
@@ -1748,4 +1750,55 @@ test("review_adversarial: injects contextSnapshot when provided (#318)", () => {
   });
   assert.ok(out.includes("disagree note"), "review_adversarial must include contextSnapshot content");
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+// #423: intake/sweep spec-generation prompts must tell the model the harness is
+// tool-free, or a description referencing real code reliably triggers the model to
+// attempt repo exploration and burns the run on tool-call narration with no spec
+// produced. Single-sourced like SEVERITY_RUBRIC so the two templates cannot drift.
+
+test("spec-generation tool-free block: both intake and sweep prompts embed it byte-for-byte (#423)", () => {
+  const block = _testing.SPEC_GENERATION_TOOL_FREE_BLOCK;
+  const intake = buildIntakePrompt({
+    description: "Add a widget.",
+    repoContext: "acme/widget",
+    roadmapContext: "v1.0",
+  });
+  const sweep = buildSweepPrompt({
+    issueTitle: "Add a widget",
+    existingBody: "Some thin body.",
+    repoContext: "acme/widget",
+  });
+  for (const [name, out] of [["intake", intake], ["sweep", sweep]] as const) {
+    assert.ok(
+      out.includes(block),
+      `${name} prompt must embed the shared SPEC_GENERATION_TOOL_FREE_BLOCK byte-for-byte`,
+    );
+  }
+});
+
+// #421's failure mode: an intake description naming concrete file paths/functions
+// pushed the model to explore the repo instead of writing the spec. The fixed intake
+// prompt must carry the tool-free instruction for exactly this kind of description,
+// with no caller-side "you have no tools" preamble required.
+test("intake prompt: code-referencing description (#421-shaped) carries the tool-free instruction without a caller preamble (#423)", () => {
+  const codeReferencingDescription =
+    "Cluster recurring papercuts into backlog issues. Reads agent-reported friction " +
+    "events from `.agent-pipeline/runs/*/events.jsonl`, groups them the way " +
+    "`core/scripts/stages/improve.ts` already clusters flaky-gate/token-waste " +
+    "categories, and adds an opt-in `papercuts.auto_file` config key.";
+  const out = buildIntakePrompt({
+    description: codeReferencingDescription,
+    repoContext: "acme/widget",
+    roadmapContext: "v1.0",
+  });
+  assert.ok(
+    out.includes(_testing.SPEC_GENERATION_TOOL_FREE_BLOCK),
+    "intake prompt for a code-referencing description must contain the tool-free instruction",
+  );
+  assert.doesNotMatch(
+    codeReferencingDescription,
+    /no tools|do not explore|write the spec directly/i,
+    "the description itself must carry no caller-side tool-free preamble — the prompt template supplies the instruction",
+  );
 });
