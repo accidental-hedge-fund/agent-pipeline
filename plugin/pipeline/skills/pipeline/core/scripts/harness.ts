@@ -2,7 +2,7 @@
 // console while also capturing it for return.
 //
 // claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] [--effort Y] <prompt>
-// codex:   codex exec --full-auto -C <worktreeDir> [-c model_reasoning_effort=Y] <prompt>
+// codex:   codex exec --full-auto -C <worktreeDir> [-m X] [-c model_reasoning_effort=Y] <prompt>
 //          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
 //          --dangerously-bypass-approvals-and-sandbox mode on externally
 //          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
@@ -76,8 +76,15 @@ export interface HarnessResult {
 export interface InvokeOptions {
   /** Per-call wall-clock timeout in seconds. */
   timeoutSec?: number;
-  /** Optional model override. Currently only honored by claude. */
+  /** Optional model override. Honored by claude (`--model`) and codex (`-m`). Ignored for custom reviewer CLIs. */
   model?: string;
+  /**
+   * Whether `model` originated from the `"auto"` sentinel rather than an
+   * explicit user override (#441). Consulted only by `invokeReviewer`'s
+   * per-attempted-harness compatibility guard (`resolveReviewerModelForHarness`
+   * in stage-routing.ts); `invoke()` itself ignores this field.
+   */
+  modelWasAuto?: boolean;
   /** Stream output to process.stderr/stdout in real time. Default true. */
   stream?: boolean;
   /**
@@ -152,6 +159,7 @@ export async function invoke(
       "-C",
       worktreeDir,
     ];
+    if (opts.model) args.push("-m", opts.model);
     if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort=${opts.reasoningEffort}`);
     args.push(prompt);
   } else {

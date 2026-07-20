@@ -13,6 +13,7 @@
 // nonzero is a genuine failure and is returned as-is for the caller to block on.
 
 import { invoke, type HarnessResult, type InvokeOptions } from "./harness.ts";
+import { resolveReviewerModelForHarness } from "./stage-routing.ts";
 import type { Harness } from "./types.ts";
 
 export interface ReviewerInvocation {
@@ -48,6 +49,12 @@ export interface ReviewerInvocation {
  * harness; `implementer` is always a built-in `Harness` (the self-review
  * fallback target). `inv` is injectable so unit tests exercise every branch
  * without spawning.
+ *
+ * `opts.model`/`opts.modelWasAuto` are guarded separately against whichever
+ * harness is actually attempted (#441 finding c0acb169): an `auto`-resolved
+ * claude-only alias omits `-m` for the primary `reviewer` call AND, on a
+ * same-harness fallback, for the `implementer` call — the compatibility guard
+ * must track the effective command, not just the nominally configured reviewer.
  */
 export async function invokeReviewer(
   reviewer: string,
@@ -57,10 +64,12 @@ export async function invokeReviewer(
   opts: InvokeOptions = {},
   inv: typeof invoke = invoke,
 ): Promise<ReviewerInvocation> {
-  const result = await inv(reviewer, worktreeDir, prompt, opts);
+  const primaryModel = resolveReviewerModelForHarness(opts.model, reviewer, !!opts.modelWasAuto);
+  const result = await inv(reviewer, worktreeDir, prompt, { ...opts, model: primaryModel });
   if (result.spawn_error && reviewer !== implementer) {
     const configuredReviewerStderr = result.stderr;
-    const fallback = await inv(implementer, worktreeDir, prompt, opts);
+    const fallbackModel = resolveReviewerModelForHarness(opts.model, implementer, !!opts.modelWasAuto);
+    const fallback = await inv(implementer, worktreeDir, prompt, { ...opts, model: fallbackModel });
     // A self-review that produces no usable review output is not a usable review.
     // Treat an exit-0-but-empty fallback as unusable too — alongside spawn_error,
     // nonzero exit, and timeout — so callers' `!result.success` branch blocks with a

@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import { findGitRoot, syncConfig, repoMapAdd, repoMapRemove, repoMapList, validateOwnerRepo } from "../scripts/config.ts";
+import { resolveReviewerModelForHarness } from "../scripts/stage-routing.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -56,7 +57,7 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerEffort: undefined });
+    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerModelWasAuto: false, reviewerEffort: undefined });
     assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
     process.env.PATH = oldPath;
@@ -490,6 +491,35 @@ test("resolveConfig: review_harness absent under claude profile → reviewer is 
   }
 });
 
+test("resolveConfig: models.review absent + reviewer=codex → the generated default is NOT treated as explicit (#441 finding a74ee050)", async () => {
+  // Regression: when `models.review` is absent from file config, resolveConfig()
+  // still supplies DEFAULT_CONFIG.models.review (claude-fable-5, a claude-only
+  // alias) for `cfg.models.review`. Without this fix, `reviewWasAuto` was false
+  // in this case, so the codex-reviewer guard (resolveReviewerModelForHarness)
+  // treated the generated default as an explicit override and forwarded
+  // `claude-fable-5` to `codex exec -m`, which codex rejects. `reviewWasAuto`
+  // must be true here so the guard omits the model for a codex reviewer.
+  const repo = makeFakeRepo(`base_branch: main\n`); // no models.review key at all
+  const binDir = makeFakeGh("acme/im-default");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // claude profile → reviewer=codex
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.equal(cfg.models.review, "claude-fable-5");
+    assert.equal(cfg.models.reviewWasAuto, true);
+    assert.equal(
+      resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer, !!cfg.models.reviewWasAuto),
+      undefined,
+      "an unconfigured codex reviewer must fall back to its own default, not claude-fable-5",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: a non-string review_harness is rejected (strict schema)", async () => {
   const repo = makeFakeRepo(`review_harness: 42\n`);
   const binDir = makeFakeGh("acme/rh4");
@@ -530,7 +560,7 @@ async function captureWarnings(fn: () => void | Promise<void>): Promise<string[]
   return warnings;
 }
 
-test("resolveConfig: models.review set + reviewer=codex warns it is inert", async () => {
+test("resolveConfig: models.review set + reviewer=codex does NOT warn (codex reviewer honors -m)", async () => {
   const repo = makeFakeRepo(`models:\n  review: opus\n`);
   const binDir = makeFakeGh("acme/im1");
   const oldPath = process.env.PATH;
@@ -541,10 +571,26 @@ test("resolveConfig: models.review set + reviewer=codex warns it is inert", asyn
       // claude profile → reviewer=codex
       cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
     });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review set + custom reviewer CLI warns it is inert", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\nmodels:\n  review: opus\n`);
+  const binDir = makeFakeGh("acme/im1b");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
     const hit = warnings.find((w) => w.includes("models.review"));
     assert.ok(hit, `expected a warning for models.review, got: ${JSON.stringify(warnings)}`);
     assert.match(hit!, /opus/);
-    assert.match(hit!, /codex/);
+    assert.match(hit!, /my-reviewer/);
     assert.match(hit!, /ignored/);
   } finally {
     process.env.PATH = oldPath;

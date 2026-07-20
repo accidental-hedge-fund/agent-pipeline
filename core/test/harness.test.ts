@@ -427,6 +427,87 @@ test("invoke(): claude WITHOUT reasoningEffort has no --effort flag (#366)", asy
   }
 });
 
+// ---------------------------------------------------------------------------
+// codex model passthrough (#441) — invoke("codex", ..., { model }) must
+// include -m <model> in the codex args, alongside the existing effort
+// passthrough; the claude branch and custom reviewer CLIs are unaffected.
+// ---------------------------------------------------------------------------
+
+test("invoke(): codex with model+effort includes -m <model> and -c model_reasoning_effort=<level> (#441)", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", {
+      stream: false,
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    });
+    const lines = result.stdout.split("\n");
+    const mIdx = lines.indexOf("-m");
+    assert.ok(mIdx !== -1, "-m flag must be present in codex args");
+    assert.equal(lines[mIdx + 1], "gpt-5.6-terra", "-m value must be gpt-5.6-terra");
+    const cIdx = lines.indexOf("-c");
+    assert.ok(cIdx !== -1, "-c flag must be present in codex args");
+    assert.equal(lines[cIdx + 1], "model_reasoning_effort=high", "-c value must be model_reasoning_effort=high");
+    const args = result.stdout.replace(/\n$/, "").split("\n");
+    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must remain the trailing positional");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): codex with effort only (no model) has no -m flag (#441, today's behavior)", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "high" });
+    const lines = result.stdout.split("\n");
+    assert.equal(lines.indexOf("-m"), -1, "no -m flag when model is absent");
+    const cIdx = lines.indexOf("-c");
+    assert.ok(cIdx !== -1, "-c flag must still be present in codex args");
+    assert.equal(lines[cIdx + 1], "model_reasoning_effort=high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): claude branch model/effort argv is unchanged by the codex -m passthrough (#441)", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", {
+      stream: false,
+      model: "opus",
+      reasoningEffort: "high",
+    });
+    const lines = result.stdout.split("\n");
+    const modelIdx = lines.indexOf("--model");
+    assert.ok(modelIdx !== -1, "--model flag must be present in claude args");
+    assert.equal(lines[modelIdx + 1], "opus");
+    assert.equal(lines.indexOf("-m"), -1, "claude must never receive a bare -m flag");
+    const effortIdx = lines.indexOf("--effort");
+    assert.ok(effortIdx !== -1, "--effort flag must be present in claude args");
+    assert.equal(lines[effortIdx + 1], "high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): a custom reviewer CLI receives neither -m nor --model when a model is set (#441)", async () => {
+  const cli = makeScript("my-reviewer", `printf '%s\\n' "$@"`);
+  const result = await invoke(cli, tmpRoot, "PROMPT-MARKER", {
+    stream: false,
+    model: "x",
+    reasoningEffort: "high",
+  });
+  const args = result.stdout.replace(/\n$/, "").split("\n");
+  assert.equal(args.length, 1, "custom CLI receives only the prompt as a single positional arg");
+  assert.equal(args[0], "PROMPT-MARKER");
+});
+
 test("invoke(): a custom reviewer CLI ignores reasoningEffort — no --effort/-c flag emitted (#40, #366)", async () => {
   const cli = makeScript("my-reviewer", `printf '%s\\n' "$@"`);
   const result = await invoke(cli, tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "high" });

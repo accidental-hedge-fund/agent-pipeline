@@ -291,11 +291,21 @@ test("validateConfig: bad eval_gate.mode enum → error with rigorGating:true", 
 // 5.8 validateConfig: inert-model warning
 // ---------------------------------------------------------------------------
 
-test("validateConfig: models.review set while reviewer=codex → warning, valid:true", () => {
-  // reviewer=codex means models.review is inert
+test("validateConfig: models.review set while reviewer=codex → no warning (codex honors -m)", () => {
   const deps = makeDeps(
     'models:\n  review: "claude-opus-4-8"\n',
     { implementer: "claude", reviewer: "codex" },
+  );
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+  const d = result.diagnostics.find((x) => x.path === "models.review");
+  assert.equal(d, undefined, "no warning when reviewer is codex");
+});
+
+test("validateConfig: models.review set while reviewer is a custom CLI → warning, valid:true", () => {
+  const deps = makeDeps(
+    'review_harness: my-reviewer\nmodels:\n  review: "claude-opus-4-8"\n',
+    { implementer: "claude", reviewer: "claude" },
   );
   const result = validateConfig("/fake-repo", deps);
   assert.equal(result.valid, true, "warning-only should be valid");
@@ -421,16 +431,28 @@ test("validateConfig: review_harness overrides profile reviewer for inert-model 
   assert.equal(d, undefined, "no inert warning when review_harness overrides reviewer to claude");
 });
 
-test("validateConfig: review_harness overrides profile reviewer — warning when review_harness=codex", () => {
-  // Profile says reviewer=claude, but file overrides it to codex → models.review is inert → warning
+test("validateConfig: review_harness overrides profile reviewer — no warning when review_harness=codex", () => {
+  // Profile says reviewer=claude, but file overrides it to codex → models.review is honored via -m → no warning
   const deps = makeDeps(
     "review_harness: codex\nmodels:\n  review: \"claude-opus-4-8\"\n",
     { implementer: "codex", reviewer: "claude" },
   );
   const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+  const d = result.diagnostics.find((x) => x.path === "models.review");
+  assert.equal(d, undefined, "no inert warning when review_harness overrides reviewer to codex");
+});
+
+test("validateConfig: review_harness overrides profile reviewer — warning when review_harness is a custom CLI", () => {
+  // Profile says reviewer=claude, but file overrides it to a custom CLI → models.review is inert → warning
+  const deps = makeDeps(
+    "review_harness: my-reviewer\nmodels:\n  review: \"claude-opus-4-8\"\n",
+    { implementer: "codex", reviewer: "claude" },
+  );
+  const result = validateConfig("/fake-repo", deps);
   assert.equal(result.valid, true, "warning-only should still be valid");
   const d = result.diagnostics.find((x) => x.path === "models.review");
-  assert.ok(d, `expected inert warning when review_harness=codex, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.ok(d, `expected inert warning when review_harness is custom, got: ${JSON.stringify(result.diagnostics)}`);
   assert.equal(d!.severity, "warning");
 });
 

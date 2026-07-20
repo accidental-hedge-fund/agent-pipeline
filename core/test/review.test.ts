@@ -1454,6 +1454,39 @@ test("advanceReview (#40): harness failure without stderr omits CLI output secti
   assert.equal(outcome!.advanced, false);
 });
 
+// ---------------------------------------------------------------------------
+// Unavailable codex reviewer model — blocked evidence names the model (#441)
+// ---------------------------------------------------------------------------
+
+test("advanceReview (#441): unknown codex model exits nonzero → blocked evidence names the configured model and codex's CLI output", async (t) => {
+  const codexCfg = {
+    ...cfg,
+    harnesses: { reviewer: "codex", implementer: "claude" },
+    models: { review: "gpt-nonexistent" },
+  } as unknown as PipelineConfig;
+  const { deps, rec } = makeDeps([""]);
+  deps.runReview = async () => ({
+    result: {
+      success: false,
+      stdout: "",
+      stderr: "codex: error: unknown model \"gpt-nonexistent\"",
+      exit_code: 1,
+      duration: 0.2,
+      timed_out: false,
+    },
+    effectiveReviewer: "codex",
+    selfReview: false,
+  });
+  let outcome;
+  await quiet(t, async () => {
+    outcome = await advanceReview(codexCfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0], /gpt-nonexistent/, "blocked comment must name the configured model");
+  assert.match(rec.blocked[0], /unknown model/, "blocked comment must include codex's own CLI output");
+  assert.equal(outcome!.advanced, false, "must block, not silently retry with a different model");
+});
+
 test("advanceReview (#40): double-failure (self-review) with stderr includes excerpt in blocked comment", async (t) => {
   const { deps, rec } = makeDeps([""]);
   // selfReview=true means both the configured reviewer and the fallback failed.

@@ -16,7 +16,7 @@
 // (`warnInertModelAliases`) already covers it, exactly as it would for an
 // explicit (non-auto) override.
 
-import type { Harness } from "./types.ts";
+import type { Harness, PipelineConfig } from "./types.ts";
 
 export type StageNature = "mechanical" | "analytical" | "adversarial";
 export type StagePermanence = "ephemeral" | "iterative" | "definitive";
@@ -123,4 +123,56 @@ export function expandAutoEffort(
 ): string | undefined {
   if (raw === "auto") return resolveAuto(stage, harness).effort;
   return raw;
+}
+
+/** Model ids the claude CLI recognizes that codex does not (#441). The
+ *  Adversarial routing cells above resolve `auto` to `claude-fable-5` for
+ *  every reviewer harness — the only alias that reaches this check via auto
+ *  expansion — but the set also covers the other short claude aliases and any
+ *  `claude-*` id so an explicitly-authored claude alias is caught the same way. */
+const CLAUDE_ONLY_MODEL_ALIASES = new Set(["claude-fable-5", "sonnet", "opus", "haiku"]);
+
+export function isClaudeOnlyModelAlias(model: string): boolean {
+  return CLAUDE_ONLY_MODEL_ALIASES.has(model) || model.startsWith("claude-");
+}
+
+/**
+ * Reviewer-role model resolution guard (#441): an `auto`-resolved reviewer
+ * model that is a claude-only alias must never reach a codex reviewer
+ * invocation — codex has no equivalent and would reject it, and every
+ * Adversarial routing cell resolves `auto` to the same claude-only
+ * `claude-fable-5`. When `reviewerHarness` is `"codex"`, `model` is a
+ * claude-only alias, AND `wasAuto` is true, this returns `undefined` so the
+ * invocation omits `-m` (codex uses its configured default). An *explicit*
+ * (non-`auto`) reviewer model — even one that happens to be a claude-only
+ * alias like `sonnet` — is always forwarded verbatim so codex can surface its
+ * own invalid-model error rather than silently falling back. Single-sourced
+ * so every reviewer call site (review-routing, plan-review, pre_merge,
+ * roadmap-deps, auto_merge_eligibility, shipcheck) applies the same rule.
+ */
+export function resolveReviewerModelForHarness(
+  model: string | undefined,
+  reviewerHarness: string,
+  wasAuto: boolean,
+): string | undefined {
+  if (model === undefined) return undefined;
+  if (wasAuto && reviewerHarness === "codex" && isClaudeOnlyModelAlias(model)) return undefined;
+  return model;
+}
+
+/**
+ * Whether the reviewer model that will reach {@link resolveReviewerModelForHarness}
+ * (via the `optsModel ?? cfg.harnesses.reviewerModel ?? cfg.models.review`
+ * chain every reviewer call site uses) originated from the `"auto"` sentinel
+ * (#441). `optsModel` (a CLI `--model` override) is always explicit. Mirrors
+ * the same precedence the model value itself is resolved with, so the two
+ * never disagree about which source won.
+ */
+export function reviewerModelSourceWasAuto(
+  cfg: Pick<PipelineConfig, "harnesses" | "models">,
+  optsModel: string | undefined,
+): boolean {
+  if (optsModel !== undefined) return false;
+  if (cfg.harnesses.reviewerModel !== undefined) return !!cfg.harnesses.reviewerModelWasAuto;
+  return !!cfg.models.reviewWasAuto;
 }

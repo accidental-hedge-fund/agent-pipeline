@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { invokeReviewer, selfReviewBanner } from "../scripts/self-review.ts";
-import type { HarnessResult } from "../scripts/harness.ts";
+import type { HarnessResult, InvokeOptions } from "../scripts/harness.ts";
 import type { Harness } from "../scripts/types.ts";
 
 const ok = (stdout = '{"verdict":"approve"}'): HarnessResult => ({
@@ -254,6 +254,50 @@ test("invokeReviewer: custom reviewer spawn_error + fallback succeeds with real 
   assert.equal(out.selfReview, true);
   assert.equal(out.result.success, true, "a self-review with real output remains usable");
   assert.deepEqual(calls, ["my-reviewer", "claude"]);
+});
+
+/** Fake `invoke`: like `fakeInvoke`, but also records the `model` each call
+ *  actually received, so the per-attempted-harness model guard can be pinned. */
+function fakeInvokeCapturingModel(byHarness: Partial<Record<Harness, HarnessResult>>) {
+  const modelsByHarness: Partial<Record<Harness, string | undefined>> = {};
+  const inv = async (harness: Harness, _dir: string, _prompt: string, opts: InvokeOptions): Promise<HarnessResult> => {
+    modelsByHarness[harness] = opts.model;
+    const r = byHarness[harness];
+    if (!r) throw new Error(`test fake has no result for harness ${harness}`);
+    return r;
+  };
+  return { inv: inv as unknown as typeof import("../scripts/harness.ts").invoke, modelsByHarness };
+}
+
+// #441 finding c0acb169: the auto-model compatibility guard must be applied
+// against whichever harness is actually attempted, not just the nominally
+// configured reviewer — a same-harness fallback (#39) can target a different
+// harness than `reviewer`.
+test("invokeReviewer: auto-resolved claude-only model + codex reviewer unspawnable → fallback to claude implementer receives the model (not omitted)", async () => {
+  const { inv, modelsByHarness } = fakeInvokeCapturingModel({ codex: spawnErr(), claude: ok() });
+  await invokeReviewer("codex", "claude", "/wt", "prompt", { model: "claude-fable-5", modelWasAuto: true }, inv);
+  // The primary (codex) attempt omits the claude-only alias...
+  assert.equal(modelsByHarness.codex, undefined, "codex must not receive the claude-only alias");
+  // ...but the self-review fallback runs on claude, which the alias is valid for.
+  assert.equal(modelsByHarness.claude, "claude-fable-5", "claude fallback must receive the auto-resolved model");
+});
+
+test("invokeReviewer: auto-resolved claude-only model + claude reviewer unspawnable → fallback to codex implementer omits the model (#441)", async () => {
+  const { inv, modelsByHarness } = fakeInvokeCapturingModel({ claude: spawnErr(), codex: ok() });
+  await invokeReviewer("claude", "codex", "/wt", "prompt", { model: "claude-fable-5", modelWasAuto: true }, inv);
+  // The primary (claude) attempt receives the model normally...
+  assert.equal(modelsByHarness.claude, "claude-fable-5", "claude reviewer receives its auto-resolved model");
+  // ...but the self-review fallback runs on codex, which rejects the claude-only
+  // alias — without this fix, the pre-guarded model from the OLD reviewer would
+  // leak through and codex would reject it instead of using its own default.
+  assert.equal(modelsByHarness.codex, undefined, "codex fallback must omit the claude-only alias, not receive it");
+});
+
+test("invokeReviewer: EXPLICIT (non-auto) model is forwarded verbatim to the fallback harness too", async () => {
+  const { inv, modelsByHarness } = fakeInvokeCapturingModel({ codex: spawnErr(), claude: ok() });
+  await invokeReviewer("codex", "claude", "/wt", "prompt", { model: "claude-fable-5", modelWasAuto: false }, inv);
+  assert.equal(modelsByHarness.codex, "claude-fable-5", "an explicit model is forwarded verbatim to the primary attempt");
+  assert.equal(modelsByHarness.claude, "claude-fable-5", "an explicit model is forwarded verbatim to the fallback too");
 });
 
 test("selfReviewBanner: names the missing reviewer and the effective reviewer, marks it weaker", () => {
