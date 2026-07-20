@@ -20,6 +20,8 @@ Turn the rough description below into a decision-complete GitHub issue spec that
 
 ## Instructions
 
+{{no_tools_instruction}}
+
 Write the full spec now. Follow the section order above exactly:
 
 1. A short, punchy title line starting with `# ` that captures the feature in ≤10 words.

@@ -22,6 +22,8 @@ The existing issue has insufficient detail to be immediately implementable. Your
 
 ## Instructions
 
+{{no_tools_instruction}}
+
 Rewrite the issue body as a full spec following the contract above. Preserve any concrete constraints, user-specific requirements, or specific behaviors the original author mentioned — your job is to expand and clarify, not to replace or contradict existing context.
 
 Follow the section order exactly:

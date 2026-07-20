@@ -600,6 +600,18 @@ export function buildDeltaReviewPrompt(a: BuildDeltaReviewArgs): string {
   });
 }
 
+// Shared tool-free constraint injected into BOTH spec-generation prompts (#423),
+// single-sourced like SEVERITY_RUBRIC so intake.md and sweep.md cannot drift. The
+// lean spec-generation harness (#220) already runs with `--tools ""` +
+// `--strict-mcp-config`, but until this block existed the prompt never told the
+// model that — a description referencing real code (file paths, function names)
+// reliably triggered the model to attempt repo exploration, emit tool-call JSON as
+// narration, and burn the whole turn with no spec produced. This block states the
+// constraint up front so that trigger never fires.
+const SPEC_GENERATION_TOOL_FREE_BLOCK = `## No Tools Available
+
+You have no tools in this session — no file reads, greps, shell commands, or repository exploration of any kind. Do NOT attempt to read files, search the codebase, or run commands to ground or verify the spec. Write the complete spec in a single pass using only the description/context provided below, even where it names concrete file paths, function names, or other real code — treat those as accurate context supplied to you, not as something to go look up.`;
+
 export interface BuildIntakeArgs {
   description: string;
   repoContext: string;
@@ -611,6 +623,7 @@ export function buildIntakePrompt(a: BuildIntakeArgs): string {
     description: a.description,
     repo_context: a.repoContext,
     roadmap_context: a.roadmapContext,
+    no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
   });
 }
 
@@ -625,6 +638,7 @@ export function buildSweepPrompt(a: BuildSweepArgs): string {
     issue_title: a.issueTitle,
     existing_body: a.existingBody,
     repo_context: a.repoContext,
+    no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
   });
 }
 
@@ -658,4 +672,4 @@ export function buildBackfillPrompt(a: BuildBackfillArgs): string {
 // are exposed so the drift test can assert both review prompts embed the shared
 // constants byte-for-byte. SEVERITY_RUBRIC is exposed for the rubric-content test.
 // carryForwardSection is exposed for injection-boundary fixture tests.
-export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK, NON_BLOCKING_GUIDANCE_BLOCK, SEVERITY_RUBRIC, carryForwardSection, crossRepoContextSection };
+export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK, NON_BLOCKING_GUIDANCE_BLOCK, SEVERITY_RUBRIC, SPEC_GENERATION_TOOL_FREE_BLOCK, carryForwardSection, crossRepoContextSection };
