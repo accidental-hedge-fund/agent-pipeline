@@ -50,6 +50,17 @@ The next line moves agent-pipeline from "AI writes code under review" toward an 
 | #433 | Add objective graders and comparative statistical reporting | Hidden checks, seeded defects, paired deltas, and confidence intervals turn run evidence into defensible decisions. |
 | #434 | Extend API executors for OpenRouter controls and provider provenance | Direct API treatments need controlled reasoning parameters and resolved-provider evidence, and must remain distinct from OAuth CLI products. |
 
+**Later (unscheduled) — Public adoption + category proof (draft, issues not yet filed; carried from the v1.17.0 draft when that slot became factory observability):**
+
+| Theme | Candidate work |
+|---|---|
+| Category framing | Reframe README/docs around "outer-loop ownership" for agentic engineering: planning, review, evidence, drift, release accountability. |
+| Drift Backstop mode | Add a mode that can evaluate any PR, not only pipeline-created PRs, for docs/config/generated-artifact/spec drift and missing evidence. |
+| Evidence bundle contract | Stabilize a portable JSON schema plus PR/Markdown rendering for what was checked, which harness checked it, what changed, and what remains human-owned. |
+| Policy packs | Ship repo-consumable policy/rubric packs for generated artifacts, docs drift, release readiness, visual evidence, and security-sensitive changes. |
+| Factory Run demo | Publish a reproducible multi-issue demo showing scoreboard, run artifacts, caught defects, and the human merge boundary. |
+| Event-sink boundary | Keep local events open-source while documenting the hosted-control-plane seam for searchable history, dashboards, audit, SSO/RBAC, and enterprise integrations. |
+
 ## Shipped
 
 **Foundation (earlier):** **#13** configurable steps · **#15** test/build gate + bounded fix loop · **#11** last30days carry-forward.
