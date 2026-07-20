@@ -405,6 +405,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.17.0** | minor | Add `--bucket day|week` time-series output to pipeline scoreboard | #425 | The `scoreboard` command gains an optional `--bucket day|week` flag that, when set, adds a chronological series of per-period aggregates to the report — each period carrying the same metrics scoreboard already reports for the full window (cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, pass rates). Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Add self-contained HTML export to pipeline scoreboard | #427 | The `scoreboard` command gains an HTML export mode that renders the same metrics scoreboard already computes — cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, and test/eval/shipcheck pass rates — into a single static HTML file. Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Capture actual per-call cost from harness output, not just estimates | #429 | Stage accounting captures the real cost of each harness call from that harness's own output/telemetry whenever the harness exposes it, rather than relying solely on operator-supplied `--estimate-cost` fallbacks. Additive; existing flows unchanged. |
+| **v1.17.0** | minor | Scoreboard grouping by harness, model, effort, and executor | #437 | The `scoreboard` command gains an opt-in grouping flag that splits each stage's existing metrics — durations, fix rounds, review rounds and verdict outcomes, gate pass rates, needs-human rate, tokens, and cost — by who or what performed the work: harness, model, effort, or executor. Additive; existing flows unchanged. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
@@ -459,6 +460,7 @@ Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
 | #425 | minor | new sub-command | intake | v1.17.0 | — |
 | #427 | minor | new sub-command | intake | v1.17.0 | — |
 | #429 | minor | new sub-command | intake | v1.17.0 | — |
+| #437 | minor | new sub-command | intake | v1.17.0 | — |
 | _(anchor)_ | — | — | structural insertion anchor for `intake`/`sweep` (do not remove) | *(none)* | — |
 
 **How this maps to the prior value-tiers.** The earlier "Tier 0–3" ordering was value/decision-readiness ranked; this release plan is the same remaining work re-grouped by sem-ver theme and is now the execution spine. Notable moves to surface (not silently average): **#75** (was Tier 1) leads **v1.0.1** as a zero-config self-heal; **#70** (was Tier 1) joins the reviewer/model-config minor in **v1.2.0**; **#85** (was Tier 3, deferred on #83) folds into the **v1.1.0** review-quality bundle now that #83 has shipped; **#95** (previously untiered) joins #75 in the first patch. Within each release, issues stay value-ranked.
@@ -543,6 +545,7 @@ Open lane; issues filed via `intake` (bullets inserted below by intake runs). Th
 
 ### v1.17.0 — factory observability: scoreboard exports & cost fidelity (minor)
 
+- **#437** — The `scoreboard` command gains an opt-in grouping flag that splits each stage's existing metrics — durations, fix rounds, review rounds and verdict outcomes, gate pass rates, needs-human rate, tokens, and cost — by who or what performed the work: harness, model, effort, or executor.
 - **#425** — The `scoreboard` command gains an optional `--bucket day|week` flag that, when set, adds a chronological series of per-period aggregates to the report — each period carrying the same metrics scoreboard already reports for the full window (cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, pass rates).
 - **#427** — The `scoreboard` command gains an HTML export mode that renders the same metrics scoreboard already computes — cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, and test/eval/shipcheck pass rates — into a single static HTML file.
 - **#429** — Stage accounting captures the real cost of each harness call from that harness's own output/telemetry whenever the harness exposes it, rather than relying solely on operator-supplied `--estimate-cost` fallbacks.
