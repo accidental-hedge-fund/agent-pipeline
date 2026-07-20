@@ -108,7 +108,7 @@ const PartialConfigSchema = z.object({
     })
     .strict()
     .optional()
-    .describe("Per-phase model aliases; only honored when the role's harness is claude (codex ignores them). Each key also accepts \"auto\" (#366)."),
+    .describe("Per-phase model aliases. review is honored by both the claude and codex reviewer harnesses; planning/implementing/fix are honored only by the claude implementer harness (codex ignores them). Each key also accepts \"auto\" (#366)."),
   // Per-stage reasoning-effort overrides (#366), parallel to `models`. Each key
   // is independently optional; an absent key emits no effort flag so the
   // operator's global effort setting applies. Also accepts "auto".
@@ -735,11 +735,17 @@ const MODEL_ALIAS_ROLES = [
 /**
  * Warn (non-blocking) about `models.*` aliases that were explicitly set in
  * `.github/pipeline.yml` but are silently inert because the backing harness
- * role is `codex` — `harness.ts` passes `--model` only on the `claude` branch
- * (the codex branch ignores it). Advisory only: no throw, no fallback, and the
- * resolved config is unchanged (the inert alias is preserved in `config.models`).
- * Keys absent from `fileConfig.models` take their value from DEFAULT_CONFIG and
- * never warn — only user-authored, inert config does.
+ * ignores model aliases for that role:
+ * - implementer-role keys (`planning`/`implementing`/`fix`): inert when the
+ *   implementer harness is `codex` (implementer model passthrough is not
+ *   implemented — `harness.ts` passes `--model` only on the `claude` branch).
+ * - the reviewer-role key (`review`): inert only when the reviewer is a
+ *   **custom** CLI (neither `claude` nor `codex`) — the codex reviewer now
+ *   honors the model via `codex exec -m <model>`.
+ * Advisory only: no throw, no fallback, and the resolved config is unchanged
+ * (the inert alias is preserved in `config.models`). Keys absent from
+ * `fileConfig.models` take their value from DEFAULT_CONFIG and never warn —
+ * only user-authored, inert config does.
  */
 function warnInertModelAliases(
   fileModels: z.infer<typeof PartialConfigSchema>["models"],
@@ -749,9 +755,11 @@ function warnInertModelAliases(
   for (const { key, role } of MODEL_ALIAS_ROLES) {
     const value = fileModels[key];
     if (value === undefined) continue;
-    if (harnesses[role] !== "codex") continue;
+    const harness = harnesses[role];
+    const isInert = role === "reviewer" ? harness !== "claude" && harness !== "codex" : harness === "codex";
+    if (!isInert) continue;
     console.warn(
-      `[pipeline] config warning: models.${key} is set to "${value}" but the ${role} harness is "codex" — model aliases are only honored by the claude harness. The setting is ignored.`,
+      `[pipeline] config warning: models.${key} is set to "${value}" but the ${role} harness is "${harness}" — model aliases are not honored by that harness. The setting is ignored.`,
     );
   }
 }
@@ -1240,11 +1248,13 @@ export function validateConfig(
       for (const { key, role } of MODEL_ALIAS_ROLES) {
         const value = fileConfig.models[key];
         if (value === undefined) continue;
-        if (harnesses[role] !== "codex") continue;
+        const harness = harnesses[role];
+        const isInert = role === "reviewer" ? harness !== "claude" && harness !== "codex" : harness === "codex";
+        if (!isInert) continue;
         diagnostics.push({
           severity: "warning",
           path: `models.${key}`,
-          message: `models.${key} is set to "${value}" but the ${role} harness is "codex" — model aliases are only honored by the claude harness. The setting is ignored at runtime.`,
+          message: `models.${key} is set to "${value}" but the ${role} harness is "${harness}" — model aliases are not honored by that harness. The setting is ignored at runtime.`,
         });
       }
     }
@@ -1319,12 +1329,12 @@ function renderModelLines(models: PartialConfig["models"]): string {
   };
   if (!models) {
     return [
-      "# models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts \"auto\" (#366). Uncomment to override.",
+      "# models: # per-phase model alias. review is honored by both the claude and codex reviewer harnesses; planning/implementing/fix are honored only by the claude implementer harness (codex ignores them). A custom reviewer/implementer CLI ignores its alias too — setting an inert one prints a warning. Each key also accepts \"auto\" (#366). Uncomment to override.",
       ...keys.map((key) => `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`),
     ].join("\n");
   }
   return [
-    "models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts \"auto\".",
+    "models: # per-phase model alias. review is honored by both the claude and codex reviewer harnesses; planning/implementing/fix are honored only by the claude implementer harness (codex ignores them). A custom reviewer/implementer CLI ignores its alias too — setting an inert one prints a warning. Each key also accepts \"auto\".",
     ...keys.map((key) =>
       hasOwn(models, key)
         ? `  ${key}: ${yamlScalar(models[key])} # ${comments[key]}`

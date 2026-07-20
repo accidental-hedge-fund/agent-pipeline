@@ -20,7 +20,7 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import { formatStderrExcerpt } from "../harness.ts";
-import { expandAutoEffort } from "../stage-routing.ts";
+import { expandAutoEffort, resolveReviewerModelForHarness } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   buildReviewAdversarialPrompt,
@@ -387,10 +387,15 @@ export async function advanceReview(
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
     const stderrExcerpt = formatStderrExcerpt(result.stderr);
+    // Name the configured reviewer model in blocked-item evidence (#441) — e.g.
+    // an unavailable codex model exits nonzero, and the operator needs to see
+    // which model id they configured, not just codex's own error text.
+    const configuredModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+    const modelNote = configuredModel ? ` (configured model: "${configuredModel}")` : "";
     const detailMsg = selfReview
       ? `Neither the cross-harness reviewer (${configuredReviewer}) nor the implementing ` +
         `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
-      : `Review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
+      : `Review harness (${reviewer})${modelNote} failed: ${reason}${stderrExcerpt}`;
     await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
     return { advanced: false, status: "blocked", reason };
   }
@@ -467,7 +472,9 @@ export async function advanceReview(
     const composite = `${rec.key}\0${rec.payload_fingerprint}`;
     if ((fpCount.get(composite) ?? 0) > 1) rec.payload_fingerprint_ambiguous = true;
   }
-  const reviewerModel = result.executor_model ?? (opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review);
+  const reviewerModel =
+    result.executor_model ??
+    resolveReviewerModelForHarness(opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review, cfg.harnesses.reviewer);
   const executorEvidence = result.executor_name
     ? { executorProvider: result.executor_provider, executorModel: result.executor_model }
     : {};
@@ -980,7 +987,10 @@ export async function invokePromptHarnessReview(
       makePromptRecord(round === 1 ? "review-standard" : "review-adversarial", assignment?.name ?? cfg.harnesses.reviewer, prompt),
     ).catch(() => {});
   }
-  const model = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+  const model = resolveReviewerModelForHarness(
+    opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
+    cfg.harnesses.reviewer,
+  );
   if (assignment) {
     const result = await invokeStageExecutor(
       stageName,

@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
+import { resolveReviewerModelForHarness } from "../stage-routing.ts";
 import { getOpenIssues, createMilestone, getMilestones } from "../gh.ts";
 import type { RoadmapDeps } from "../roadmap/index.ts";
 import type { PipelineConfig } from "../types.ts";
@@ -44,7 +45,7 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
         cfg.harnesses.reviewer,
         cfg.repo_dir,
         prompt,
-        { stream: true, model: cfg.models.review },
+        { stream: true, model: resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer) },
       );
       return { success: result.success, output: result.stdout };
     },

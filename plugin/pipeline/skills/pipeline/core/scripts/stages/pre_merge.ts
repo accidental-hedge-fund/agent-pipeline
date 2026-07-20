@@ -68,6 +68,7 @@ export {
   type SpecConsistencyDeps,
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
+import { resolveReviewerModelForHarness } from "../stage-routing.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -1648,7 +1649,7 @@ async function defaultRunDeltaReview(
     deltaDiff,
     specContext,
   });
-  const model = cfg.models.review;
+  const model = resolveReviewerModelForHarness(cfg.models.review, cfg.harnesses.reviewer);
   const invocation = await invokeReviewer(
     cfg.harnesses.reviewer,
     cfg.harnesses.implementer,

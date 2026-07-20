@@ -124,3 +124,35 @@ export function expandAutoEffort(
   if (raw === "auto") return resolveAuto(stage, harness).effort;
   return raw;
 }
+
+/** Model ids the claude CLI recognizes that codex does not (#441). The
+ *  Adversarial routing cells above resolve `auto` to `claude-fable-5` for
+ *  every reviewer harness — the only alias that reaches this check via auto
+ *  expansion — but the set also covers the other short claude aliases and any
+ *  `claude-*` id so an explicitly-authored claude alias is caught the same way. */
+const CLAUDE_ONLY_MODEL_ALIASES = new Set(["claude-fable-5", "sonnet", "opus", "haiku"]);
+
+export function isClaudeOnlyModelAlias(model: string): boolean {
+  return CLAUDE_ONLY_MODEL_ALIASES.has(model) || model.startsWith("claude-");
+}
+
+/**
+ * Reviewer-role model resolution guard (#441): a resolved reviewer model that
+ * is a claude-only alias must never reach a codex reviewer invocation — codex
+ * has no equivalent and would reject it. When `reviewerHarness` is `"codex"`
+ * and `model` is a claude-only alias, this returns `undefined` so the
+ * invocation omits `-m` (codex uses its configured default). Any other model
+ * (including a codex-valid explicit id, or any model for a claude/custom
+ * reviewer) is returned verbatim — the operator owns naming a codex-valid id.
+ * Single-sourced so every reviewer call site (review-routing, plan-review,
+ * pre_merge, roadmap-deps, auto_merge_eligibility, shipcheck) applies the
+ * same rule.
+ */
+export function resolveReviewerModelForHarness(
+  model: string | undefined,
+  reviewerHarness: string,
+): string | undefined {
+  if (model === undefined) return undefined;
+  if (reviewerHarness === "codex" && isClaudeOnlyModelAlias(model)) return undefined;
+  return model;
+}

@@ -1229,6 +1229,30 @@ test("runPlanningPhases — structured review_harness reviewerModel/reviewerEffo
     ...eqBaseDeps(),
     invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
       capturedOpts.push(opts);
+      return { result: planReviewOk, effectiveReviewer: "claude", selfReview: false };
+    },
+  };
+  // reviewer=claude here so the reviewerModel override (a claude-only alias)
+  // is not subject to the codex alias-drop guard (#441) — that guard is
+  // covered separately below.
+  const cfg = {
+    ...eqCfg,
+    harnesses: { ...eqCfg.harnesses, reviewer: "claude", reviewerModel: "claude-fable-5", reviewerEffort: "high" },
+    plan_review_effort: "medium",
+  } as unknown as PipelineConfig;
+  await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
+  assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
+  const opts = capturedOpts[0] as Record<string, unknown>;
+  assert.equal(opts.model, "claude-fable-5", "reviewerModel override must win over cfg.models.review");
+  assert.equal(opts.reasoningEffort, "high", "reviewerEffort override must win over cfg.plan_review_effort");
+});
+
+test("runPlanningPhases — plan-review with reviewer=codex and a claude-only reviewerModel alias omits -m (#441)", async () => {
+  const capturedOpts: unknown[] = [];
+  const deps = {
+    ...eqBaseDeps(),
+    invokeReviewer: async (_reviewer: string, _primary: string, _cwd: string, _prompt: string, opts: unknown) => {
+      capturedOpts.push(opts);
       return { result: planReviewOk, effectiveReviewer: "codex", selfReview: false };
     },
   };
@@ -1240,8 +1264,8 @@ test("runPlanningPhases — structured review_harness reviewerModel/reviewerEffo
   await runPlanningPhases(cfg, 42, "Test issue", "test body", "run-42", {}, freeformHooks(), deps as any);
   assert.ok(capturedOpts.length >= 1, "invokeReviewer must have been called");
   const opts = capturedOpts[0] as Record<string, unknown>;
-  assert.equal(opts.model, "claude-fable-5", "reviewerModel override must win over cfg.models.review");
-  assert.equal(opts.reasoningEffort, "high", "reviewerEffort override must win over cfg.plan_review_effort");
+  assert.equal(opts.model, undefined, "claude-only alias must never reach a codex reviewer invocation");
+  assert.equal(opts.reasoningEffort, "high", "reviewerEffort override is unaffected by the model guard");
 });
 
 test("runPlanningPhases — structured review_harness reviewerEffort: 'auto' resolves round-aware to plan-review's Definitive classification (max) (#366)", async () => {

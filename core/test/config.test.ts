@@ -530,7 +530,7 @@ async function captureWarnings(fn: () => void | Promise<void>): Promise<string[]
   return warnings;
 }
 
-test("resolveConfig: models.review set + reviewer=codex warns it is inert", async () => {
+test("resolveConfig: models.review set + reviewer=codex does NOT warn (codex reviewer honors -m)", async () => {
   const repo = makeFakeRepo(`models:\n  review: opus\n`);
   const binDir = makeFakeGh("acme/im1");
   const oldPath = process.env.PATH;
@@ -541,10 +541,26 @@ test("resolveConfig: models.review set + reviewer=codex warns it is inert", asyn
       // claude profile → reviewer=codex
       cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
     });
+    assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review set + custom reviewer CLI warns it is inert", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\nmodels:\n  review: opus\n`);
+  const binDir = makeFakeGh("acme/im1b");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo });
+    });
     const hit = warnings.find((w) => w.includes("models.review"));
     assert.ok(hit, `expected a warning for models.review, got: ${JSON.stringify(warnings)}`);
     assert.match(hit!, /opus/);
-    assert.match(hit!, /codex/);
+    assert.match(hit!, /my-reviewer/);
     assert.match(hit!, /ignored/);
   } finally {
     process.env.PATH = oldPath;

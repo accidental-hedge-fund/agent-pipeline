@@ -2,7 +2,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveAuto, expandAutoModel, expandAutoEffort, STAGE_ROUTING } from "../scripts/stage-routing.ts";
+import {
+  resolveAuto,
+  expandAutoModel,
+  expandAutoEffort,
+  STAGE_ROUTING,
+  isClaudeOnlyModelAlias,
+  resolveReviewerModelForHarness,
+} from "../scripts/stage-routing.ts";
 
 test("resolveAuto: mechanical/iterative stages fork model by harness (implementing)", () => {
   assert.deepEqual(resolveAuto("implementing", "claude"), { model: "sonnet", effort: "low" });
@@ -65,4 +72,42 @@ test("expandAutoEffort: 'auto' routes through resolveAuto; other values pass thr
 test("STAGE_ROUTING: the same key backs planning (Analytical/Iterative) and plan-review (Adversarial/Definitive) with different classifications", () => {
   assert.deepEqual(STAGE_ROUTING.planning, { nature: "analytical", permanence: "iterative" });
   assert.deepEqual(STAGE_ROUTING["plan-review"], { nature: "adversarial", permanence: "definitive" });
+});
+
+// ---------------------------------------------------------------------------
+// isClaudeOnlyModelAlias / resolveReviewerModelForHarness (#441)
+// ---------------------------------------------------------------------------
+
+test("isClaudeOnlyModelAlias: recognizes the short claude aliases and any claude-* id", () => {
+  assert.equal(isClaudeOnlyModelAlias("claude-fable-5"), true);
+  assert.equal(isClaudeOnlyModelAlias("sonnet"), true);
+  assert.equal(isClaudeOnlyModelAlias("opus"), true);
+  assert.equal(isClaudeOnlyModelAlias("haiku"), true);
+  assert.equal(isClaudeOnlyModelAlias("claude-opus-4-8"), true);
+});
+
+test("isClaudeOnlyModelAlias: does not flag codex-valid or unrelated ids", () => {
+  assert.equal(isClaudeOnlyModelAlias("gpt-5.5"), false);
+  assert.equal(isClaudeOnlyModelAlias("gpt-5.6-terra"), false);
+});
+
+test("resolveReviewerModelForHarness: codex reviewer + claude-only alias → undefined (omit -m)", () => {
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "codex"), undefined);
+  assert.equal(resolveReviewerModelForHarness("sonnet", "codex"), undefined);
+});
+
+test("resolveReviewerModelForHarness: codex reviewer + codex-valid explicit id passes through verbatim", () => {
+  assert.equal(resolveReviewerModelForHarness("gpt-5.6-terra", "codex"), "gpt-5.6-terra");
+});
+
+test("resolveReviewerModelForHarness: claude reviewer always passes the model through verbatim", () => {
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "claude"), "claude-fable-5");
+});
+
+test("resolveReviewerModelForHarness: custom reviewer CLI passes the model through verbatim (invoke() ignores it anyway)", () => {
+  assert.equal(resolveReviewerModelForHarness("claude-fable-5", "my-reviewer"), "claude-fable-5");
+});
+
+test("resolveReviewerModelForHarness: undefined model stays undefined for any harness", () => {
+  assert.equal(resolveReviewerModelForHarness(undefined, "codex"), undefined);
 });

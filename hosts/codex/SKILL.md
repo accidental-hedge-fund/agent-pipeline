@@ -168,10 +168,10 @@ review_timeout: 1200
 fix_timeout: 1200
 ci_timeout: 900
 ci_poll_interval: 30
-models:                          # only the claude harness honors these; a key
-  planning: sonnet               # whose role runs on codex is ignored and a
-  implementing: sonnet           # config warning is printed (planning/implementing/fix
-  review: claude-fable-5         # → implementer, review → reviewer). Each key also accepts "auto".
+models:                          # planning/implementing/fix (implementer harness) are only
+  planning: sonnet               # honored by claude — a key whose role runs on codex is
+  implementing: sonnet           # ignored and a config warning is printed. review (reviewer
+  review: claude-fable-5         # harness) is honored by both claude and codex. Each key also accepts "auto".
   fix: sonnet
 effort:                          # per-phase reasoning effort — codex via -c model_reasoning_effort,
   planning: medium               # claude via --effort. Absent key: no flag. Each key also accepts "auto".

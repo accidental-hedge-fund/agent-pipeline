@@ -32,7 +32,7 @@ import {
 } from "../issue-context-snapshot.ts";
 import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
-import { expandAutoEffort } from "../stage-routing.ts";
+import { expandAutoEffort, resolveReviewerModelForHarness } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   branchName,
@@ -566,7 +566,10 @@ export async function runPlanningPhases(
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
     // the just-authored change files; freeform uses cfg.repo_dir.
     const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
-    const planReviewModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+    const planReviewModel = resolveReviewerModelForHarness(
+      opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
+      reviewer,
+    );
     // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
     // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
     // with a structured review_harness.effort override taking precedence when set.

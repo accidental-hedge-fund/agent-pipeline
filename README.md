@@ -673,10 +673,10 @@ ci_timeout: 900
 ci_mode: github                    # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait (see "ci_mode: local" below)
 intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
 sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
-models:                            # per-phase model alias — only the claude harness honors these. Each key also accepts "auto" (see "Auto model/effort routing").
-  planning: sonnet                 # planning / implementing / fix → implementer harness
+models:                            # per-phase model alias. Each key also accepts "auto" (see "Auto model/effort routing").
+  planning: sonnet                 # planning / implementing / fix → implementer harness (only the claude implementer honors these; codex ignores them)
   implementing: sonnet
-  review: claude-fable-5           # review → reviewer harness (default)
+  review: claude-fable-5           # review → reviewer harness (default) — honored by both the claude and codex reviewer (codex via `-m <model>`)
   fix: sonnet
   intake: sonnet                   # intake spec-generation (always the claude harness; set "haiku" for max speed)
   sweep: sonnet                    # sweep spec-generation (always the claude harness)
@@ -1557,7 +1557,7 @@ Each `Diagnostic` object has the shape:
 
 - `line` is present for YAML syntax errors (1-indexed); absent for field-level Zod errors.
 - For rigor/cost-gating fields (`review_policy.block_threshold`, `review_policy.min_confidence`, `review_policy.max_adversarial_rounds`, `steps.*`, `eval_gate.enabled/mode`, `shipcheck_gate.enabled/mode`), an invalid value produces a diagnostic with an additional `"rigorGating": true` marker. These are always `severity: "error"` (exit 1) — a typo must never silently flip a rigor switch.
-- Inert-model alias warnings (`models.*` set while the backing harness is `codex`) are `severity: "warning"` and do not affect the exit code when they are the only findings.
+- Inert-model alias warnings (`models.planning`/`implementing`/`fix` set while the implementer harness is `codex`, or `models.review` set while the reviewer is a custom CLI — neither `claude` nor `codex`) are `severity: "warning"` and do not affect the exit code when they are the only findings.
 
 Without `--json`, a human-readable summary is printed (one line per diagnostic). The same exit-code rules apply.
 
