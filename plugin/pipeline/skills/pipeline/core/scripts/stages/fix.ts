@@ -38,6 +38,7 @@ import {
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
@@ -46,7 +47,7 @@ import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../loc
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
-import type { RunStoreDeps } from "../run-store.ts";
+import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
@@ -719,6 +720,26 @@ export async function advanceFix(
     },
   );
   if (consistencyGuard) return consistencyGuard;
+
+  // #445: advisory-only — warn when the fix-round commit(s) left a gitignored,
+  // change-referenced artifact uncommitted. Never blocks. Recompute HEAD here
+  // (rather than reusing `headAfter`) since the format/test gates and
+  // lockfile/build folds above may have amended the round's commit.
+  const finalHeadAfter = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  if (headBefore && finalHeadAfter && headBefore !== finalHeadAfter) {
+    await detectIgnoredArtifacts(wt.path, headBefore, finalHeadAfter, {
+      emitEvent: (files) =>
+        opts.runDir
+          ? appendEvent(
+              opts.runDir,
+              { schema_version: RUN_SCHEMA_VERSION, type: "ignored_artifact_warning", at: new Date().toISOString().replace(/\.\d+Z$/, "Z"), stage, files },
+              opts.runStoreDeps,
+            ).catch(() => {})
+          : undefined,
+    });
+  }
 
   const branch = branchName(issueNumber, wt.slug);
   const push = await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
