@@ -16,6 +16,7 @@ import {
   artifactSubdir,
   renderArtifactIgnoreBlock,
   ensureArtifactIgnoreBlock,
+  writeAllSync,
   type ArtifactIgnoreDeps,
 } from "../scripts/artifact-ignore.ts";
 import { runsDir, issueHistoryDir } from "../scripts/run-store.ts";
@@ -223,6 +224,29 @@ test("ensureArtifactIgnoreBlock: operator already hand-ignores a contract path o
   const after = fake.get()!;
   assert.ok(after.startsWith(existing), "the operator's hand-authored line must remain unmodified");
   assert.ok(after.includes(".agent-pipeline/runs/"), "the managed block must still list runs/");
+});
+
+test("writeAllSync: 4-byte short writes are retried until every byte lands (delta review c08a516e)", () => {
+  // Regression for the #452 pre-merge delta finding: fs.writeSync may legally
+  // write fewer bytes than requested (ENOSPC/EIO-class pressure); ignoring the
+  // return value fsyncs+renames a truncated temp file over the operator-owned
+  // .gitignore. Simulate a writer capped at 4 bytes per call and require every
+  // byte to land, in order.
+  const content = Buffer.from(renderArtifactIgnoreBlock(), "utf8");
+  const landed: Buffer[] = [];
+  const cappedWriteSync = (_fd: number, buf: Buffer, offset: number, length: number): number => {
+    const n = Math.min(4, length);
+    landed.push(Buffer.from(buf.subarray(offset, offset + n)));
+    return n;
+  };
+  writeAllSync(99, content, cappedWriteSync);
+  assert.equal(Buffer.concat(landed).toString("utf8"), content.toString("utf8"));
+  assert.ok(landed.length >= Math.ceil(content.length / 4), "the writer must have looped");
+});
+
+test("writeAllSync: a zero-progress write throws instead of silently truncating", () => {
+  const stalled = (_fd: number, _buf: Buffer, _offset: number, _length: number): number => 0;
+  assert.throws(() => writeAllSync(99, Buffer.from("content", "utf8"), stalled), /no progress/);
 });
 
 test("ensureArtifactIgnoreBlock: default writer (real fs) writes via temp file + rename, no leftover temp file, mode preserved", () => {

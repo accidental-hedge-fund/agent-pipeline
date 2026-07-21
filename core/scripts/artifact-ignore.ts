@@ -127,6 +127,29 @@ const defaultReadFile = (fp: string): string | null => {
   }
 };
 
+/** Write every byte of `buf` to `fd`, looping on partial progress:
+ *  `fs.writeSync` may legally write fewer bytes than requested (exactly the
+ *  ENOSPC/EIO-class pressure the atomic writer guards against), so a single
+ *  un-checked call can leave a truncated temp file that then replaces the
+ *  operator-owned target (#452 pre-merge delta finding). Exported for tests
+ *  via the repo's injectable-dep convention. */
+export function writeAllSync(
+  fd: number,
+  buf: Buffer,
+  writeSyncImpl: (fd: number, buf: Buffer, offset: number, length: number) => number = fs.writeSync,
+): void {
+  let written = 0;
+  while (written < buf.length) {
+    const n = writeSyncImpl(fd, buf, written, buf.length - written);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error(
+        `agent-pipeline: short write made no progress (${written}/${buf.length} bytes written)`,
+      );
+    }
+    written += n;
+  }
+}
+
 /** Write via a temp file + rename in the same directory so an interrupted or
  *  failed write (ENOSPC/EIO/process kill) cannot leave a truncated,
  *  operator-owned .gitignore (#452 review round 2). Preserves the original
@@ -143,7 +166,7 @@ const defaultWriteFile = (fp: string, content: string): void => {
   try {
     const fd = fs.openSync(tmpPath, "wx");
     try {
-      fs.writeSync(fd, content, null, "utf8");
+      writeAllSync(fd, Buffer.from(content, "utf8"));
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
