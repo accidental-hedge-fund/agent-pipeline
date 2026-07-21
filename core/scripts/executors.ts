@@ -316,12 +316,15 @@ function buildModelEndpointRequest(
     ...(structuredOutputRequested ? { response_format: buildVerdictResponseFormat() } : {}),
   };
 
-  // The recorded payload omits `messages` (the prompt is tracked separately
-  // via prompt_chars/prompt_estimated_tokens) but otherwise reflects exactly
-  // what was transmitted after override merging — never the committed
-  // configuration (#434 api-executor-response-provenance).
+  // The recorded payload reflects exactly what was transmitted after override
+  // merging — never the committed configuration — including the sent
+  // `messages`, which are redacted for secrets at write time by the existing
+  // `sanitizeDeep`/`redactSecrets` pass applied to every accounting record
+  // (accounting.ts) (#434 api-executor-response-provenance: "exact sent
+  // request payload").
   const recordedPayload: Record<string, unknown> = {
     model: merged.model,
+    messages: body.messages,
     ...paramsFragment,
     ...effortFragment,
     ...(structuredOutputRequested ? { response_format: true } : {}),
@@ -413,17 +416,37 @@ function toHarnessResult(
   };
 }
 
+/** Read the selected upstream provider out of OpenRouter's documented router
+ *  metadata (https://openrouter.ai/docs/guides/features/router-metadata):
+ *  opted into via the `X-OpenRouter-Metadata: enabled` request header (sent
+ *  for the `openrouter` dialect — see invokeExternalExecutor), surfaced on the
+ *  response body as `openrouter_metadata.endpoints.available[]`, the entry
+ *  with `selected: true` naming the provider that served the request. Chat
+ *  completions responses carry no top-level `provider` field — reading one
+ *  would always be `undefined` and defeat provider attribution. Returns
+ *  `null` when the metadata is absent (e.g. a non-OpenRouter dialect, or the
+ *  endpoint didn't honor the opt-in header) — never guessed from another
+ *  field. */
+function extractOpenRouterProvider(obj: Record<string, unknown>): string | null {
+  const metadata = isRecord(obj.openrouter_metadata) ? obj.openrouter_metadata : undefined;
+  const endpoints = metadata && isRecord(metadata.endpoints) ? metadata.endpoints : undefined;
+  const available = endpoints && Array.isArray(endpoints.available) ? endpoints.available : [];
+  const selected = available.find((entry) => isRecord(entry) && entry.selected === true) as Record<string, unknown> | undefined;
+  return selected ? stringOrNull(selected.provider) : null;
+}
+
 /** Real HTTP-response fields verified against OpenRouter's and OpenAI's
  *  documented chat/completions response shapes (task 4.1):
- *   - OpenRouter: top-level `id` (request id), `provider` (upstream provider
- *     name, e.g. "OpenAI"), `model` (resolved model), `choices[0].finish_reason`,
+ *   - OpenRouter: top-level `id` (request id), `openrouter_metadata` (upstream
+ *     provider attribution — see `extractOpenRouterProvider` above), `model`
+ *     (resolved model), `choices[0].finish_reason`,
  *     `usage.prompt_tokens`/`completion_tokens`/`total_tokens`, and — only when
  *     the request opts in to `usage: {include: true}` — `usage.cost` plus
  *     `usage.prompt_tokens_details.cached_tokens` /
  *     `usage.completion_tokens_details.reasoning_tokens`.
  *   - Generic OpenAI-compatible: `id`, `model`, `choices[0].finish_reason`,
- *     `usage.prompt_tokens`/`completion_tokens`/`total_tokens` — no `provider`
- *     field and no `cost` field, both `null` rather than guessed.
+ *     `usage.prompt_tokens`/`completion_tokens`/`total_tokens` — no router
+ *     metadata and no `cost` field, both `null` rather than guessed.
  *  Any field absent from the parsed body stays `null` — never derived from
  *  another field, the model string, or `base_url` (#434 decision 7). */
 function extractProvenance(
@@ -461,8 +484,8 @@ function extractProvenance(
     requested_model: requestedModel,
     resolved_model: stringOrNull(obj.model),
     // Never derived from `model`'s slug prefix (e.g. "openai/gpt-5") — only
-    // from a `provider` field the endpoint itself reported.
-    upstream_provider: stringOrNull(obj.provider),
+    // from the documented `openrouter_metadata` the endpoint itself reported.
+    upstream_provider: extractOpenRouterProvider(obj),
     request_id: stringOrNull(obj.id),
     finish_reason: firstChoice ? stringOrNull(firstChoice.finish_reason) : null,
     usage: usage && Object.keys(usage).length > 0 ? usage : null,
@@ -570,7 +593,18 @@ export async function invokeExternalExecutor(
     }
     Object.assign(headers, headerResult.headers);
 
-    const built = buildModelEndpointRequest(name, stage, definition, prompt, override, headerResult.recorded);
+    // Opt-in header for OpenRouter's router metadata (task 4.1 fix): without
+    // it, `openrouter_metadata` is absent from the response body and
+    // `extractOpenRouterProvider` has nothing to read. Recorded alongside the
+    // declared headers since it's a fixed, non-secret value sent on every
+    // openrouter-dialect request.
+    const recordedHeaders = { ...headerResult.recorded };
+    if (resolveDialect(definition) === "openrouter") {
+      headers["X-OpenRouter-Metadata"] = "enabled";
+      recordedHeaders["X-OpenRouter-Metadata"] = "enabled";
+    }
+
+    const built = buildModelEndpointRequest(name, stage, definition, prompt, override, recordedHeaders);
     if (!built.ok) {
       return toHarnessResult(name, definition, {
         success: false,

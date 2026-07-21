@@ -3340,6 +3340,69 @@ test("resolveConfig: headers declaring authorization is rejected at parse time (
   );
 });
 
+test("resolveConfig: a malformed provider-routing field type is rejected at parse time, not passed through (#434)", async () => {
+  await expectInvalidConfig(
+    [
+      "executors:",
+      "  bad:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    dialect: openrouter",
+      "    params:",
+      "      provider:",
+      "        order: openai",
+      "",
+    ].join("\n"),
+    "acme/exec17",
+    /order/,
+  );
+});
+
+test("resolveConfig: an unknown key inside provider-routing preferences is rejected at parse time (#434)", async () => {
+  await expectInvalidConfig(
+    [
+      "executors:",
+      "  bad:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    dialect: openrouter",
+      "    params:",
+      "      provider:",
+      "        unknown_routing_key: true",
+      "",
+    ].join("\n"),
+    "acme/exec18",
+    /unknown_routing_key/,
+  );
+});
+
+test("resolveConfig: fully-typed provider-routing preferences are accepted (#434)", async () => {
+  const cfg = (await resolveWithConfig(
+    [
+      "executors:",
+      "  openrouter-review:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    dialect: openrouter",
+      "    params:",
+      "      provider:",
+      "        order: [openai, anthropic]",
+      "        allow_fallbacks: false",
+      "        data_collection: deny",
+      "        sort: price",
+      "        max_price:",
+      "          prompt: 1",
+      "          completion: 2",
+      "",
+    ].join("\n"),
+    "acme/exec19",
+  )) as { executors: Record<string, { params?: { provider?: { order?: string[] } } }> };
+  assert.deepEqual(cfg.executors["openrouter-review"].params?.provider?.order, ["openai", "anthropic"]);
+});
+
 test("resolveConfig: headers declaring content-type is rejected at parse time (#434)", async () => {
   await expectInvalidConfig(
     `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    headers:\n      content-type: "text/plain"\n`,

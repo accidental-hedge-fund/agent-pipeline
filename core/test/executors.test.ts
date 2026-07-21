@@ -338,6 +338,7 @@ test("invokeExternalExecutor: openrouter dialect sends allowlisted params, reaso
     assert.ok(body.response_format, "structured_output should add a response_format field");
     assert.equal(capturedHeaders?.["x-title"], "pipeline-eval");
     assert.equal(capturedHeaders?.["http-referer"], "https://pipeline.internal");
+    assert.equal(capturedHeaders?.["X-OpenRouter-Metadata"], "enabled");
   } finally {
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.OPENROUTER_REFERER;
@@ -511,6 +512,26 @@ test("invokeExternalExecutor: an OpenRouter-only routing override on a non-openr
   assert.equal(dispatched, false);
 });
 
+test("invokeExternalExecutor: a malformed provider-routing override (wrong field type) is rejected, no HTTP request issued (#434)", async () => {
+  const a = assignmentFor("openrouter-review");
+  let dispatched = false;
+  const fetchImpl = (async () => {
+    dispatched = true;
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor(
+    "review-1",
+    a,
+    "PROMPT",
+    { timeoutSec: 5 },
+    { fetchImpl },
+    { params: { provider: { order: "openai" } as unknown as Record<string, unknown> } },
+  );
+  assert.equal(result.success, false);
+  assert.match(result.stderr, /order/);
+  assert.equal(dispatched, false);
+});
+
 test("invokeExternalExecutor: two concurrent invocations with different model overrides do not interfere (#434)", async () => {
   const a = resolveStageExecutor(baseCfg(), "review-1")!;
   const capturedModels: string[] = [];
@@ -535,10 +556,11 @@ test("invokeExternalExecutor: OpenRouter-shaped response provenance is captured 
   process.env.OPENROUTER_REFERER = "ref";
   try {
     const a = assignmentFor("openrouter-review");
-    const fetchImpl = (async () =>
-      fakeResponse({
+    let sentHeaders: Headers | undefined;
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      sentHeaders = new Headers(init!.headers);
+      return fakeResponse({
         id: "gen-abc123",
-        provider: "OpenAI",
         model: "openai/gpt-5-2026-01-01",
         choices: [{ message: { content: '{"verdict":"approve","summary":"x","findings":[],"next_steps":[]}' }, finish_reason: "stop" }],
         usage: {
@@ -549,8 +571,19 @@ test("invokeExternalExecutor: OpenRouter-shaped response provenance is captured 
           prompt_tokens_details: { cached_tokens: 20 },
           completion_tokens_details: { reasoning_tokens: 10 },
         },
-      })) as unknown as typeof fetch;
+        // OpenRouter's documented router-metadata shape
+        // (https://openrouter.ai/docs/guides/features/router-metadata),
+        // opted into via the `X-OpenRouter-Metadata: enabled` request header —
+        // NOT a top-level `provider` field, which chat/completions responses
+        // never carry.
+        openrouter_metadata: {
+          requested: "openai/gpt-5",
+          endpoints: { available: [{ provider: "OpenAI", model: "openai/gpt-5-2026-01-01", selected: true }] },
+        },
+      });
+    }) as unknown as typeof fetch;
     const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(sentHeaders?.get("x-openrouter-metadata"), "enabled");
     const prov = result.executor_provenance!;
     assert.equal(prov.requested_model, "openai/gpt-5");
     assert.equal(prov.resolved_model, "openai/gpt-5-2026-01-01");
@@ -567,6 +600,37 @@ test("invokeExternalExecutor: OpenRouter-shaped response provenance is captured 
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.OPENROUTER_REFERER;
   }
+});
+
+test("invokeExternalExecutor: openrouter_metadata with no selected endpoint records a null provider, never guessed (#434)", async () => {
+  const a = assignmentFor("openrouter-review");
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  process.env.OPENROUTER_REFERER = "ref";
+  try {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        id: "gen-1",
+        model: "openai/gpt-5",
+        choices: [{ message: { content: '{"verdict":"approve","summary":"x","findings":[],"next_steps":[]}' } }],
+        openrouter_metadata: { requested: "openai/gpt-5", endpoints: { available: [] } },
+      })) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(result.executor_provenance?.upstream_provider, null);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_REFERER;
+  }
+});
+
+test("invokeExternalExecutor: the openai dialect does not send the OpenRouter metadata opt-in header (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!; // local-ollama has no dialect → default "openai"
+  let sentHeaders: Headers | undefined;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    sentHeaders = new Headers(init!.headers);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  assert.equal(sentHeaders?.get("x-openrouter-metadata"), null);
 });
 
 test("invokeExternalExecutor: generic OpenAI-compatible response provenance is captured (#434)", async () => {
@@ -647,10 +711,10 @@ test("invokeExternalExecutor: model-endpoint request payload is recorded in acco
     const fetchImpl = (async () =>
       fakeResponse({
         id: "gen-1",
-        provider: "OpenAI",
         model: "openai/gpt-5",
         choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.01 },
+        openrouter_metadata: { endpoints: { available: [{ provider: "OpenAI", selected: true }] } },
       })) as unknown as typeof fetch;
     await invokeExternalExecutor(
       "review-1",
@@ -671,6 +735,8 @@ test("invokeExternalExecutor: model-endpoint request payload is recorded in acco
     assert.equal(parsed.cost_source, "actual");
     assert.equal(parsed.request_payload.headers["http-referer"], "env:OPENROUTER_REFERER");
     assert.equal(parsed.request_payload.headers["x-title"], "pipeline-eval");
+    assert.equal(parsed.request_payload.headers["X-OpenRouter-Metadata"], "enabled");
+    assert.deepEqual(parsed.request_payload.messages, [{ role: "user", content: "prompt" }]);
   } finally {
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.OPENROUTER_REFERER;

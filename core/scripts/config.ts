@@ -69,6 +69,48 @@ const AgentSystemExecutorSchema = z
   })
   .strict();
 
+// OpenRouter's documented `provider` request object (provider-routing
+// preferences: https://openrouter.ai/docs/features/provider-routing) — a
+// strict field-by-field schema so a malformed or unknown routing key is
+// rejected at parse time rather than passed through as an untyped record.
+const OpenRouterSortSchema = z.union([
+  z.enum(["price", "throughput", "latency"]),
+  z.object({ by: z.string(), partition: z.enum(["model", "none"]).optional() }).strict(),
+]);
+
+const OpenRouterThroughputLatencySchema = z.union([
+  z.number(),
+  z
+    .object({ p50: z.number().optional(), p75: z.number().optional(), p90: z.number().optional(), p99: z.number().optional() })
+    .strict(),
+]);
+
+export const OpenRouterProviderPreferencesSchema = z
+  .object({
+    order: z.array(z.string()).optional(),
+    allow_fallbacks: z.boolean().optional(),
+    require_parameters: z.boolean().optional(),
+    data_collection: z.enum(["allow", "deny"]).optional(),
+    zdr: z.boolean().optional(),
+    enforce_distillable_text: z.boolean().optional(),
+    only: z.array(z.string()).optional(),
+    ignore: z.array(z.string()).optional(),
+    quantizations: z.array(z.enum(["int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32", "unknown"])).optional(),
+    sort: OpenRouterSortSchema.optional(),
+    preferred_min_throughput: OpenRouterThroughputLatencySchema.optional(),
+    preferred_max_latency: OpenRouterThroughputLatencySchema.optional(),
+    max_price: z
+      .object({
+        prompt: z.number().optional(),
+        completion: z.number().optional(),
+        request: z.number().optional(),
+        image: z.number().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 // Allowlisted `params` block (#434 api-executor-request-controls decision 3):
 // a strict passthrough would turn pipeline.yml into an untyped wire-format
 // hole where a typo silently no-ops. `provider`/`models` are OpenRouter-only
@@ -80,7 +122,7 @@ export const ModelEndpointParamsSchema = z
     seed: z.number().int().optional(),
     max_output_tokens: z.number().int().positive().optional(),
     stop: z.array(z.string()).optional(),
-    provider: z.record(z.string(), z.unknown()).optional().describe("OpenRouter provider-routing preferences — dialect: openrouter only."),
+    provider: OpenRouterProviderPreferencesSchema.optional().describe("OpenRouter provider-routing preferences — dialect: openrouter only."),
     models: z.array(z.string()).optional().describe("OpenRouter model fallback list — dialect: openrouter only."),
   })
   .strict();

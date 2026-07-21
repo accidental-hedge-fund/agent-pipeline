@@ -96,6 +96,26 @@ export interface AgentSystemExecutorDefinition {
 export const MODEL_ENDPOINT_DIALECTS = ["openai", "openrouter", "none"] as const;
 export type ModelEndpointDialect = (typeof MODEL_ENDPOINT_DIALECTS)[number];
 
+/** OpenRouter's documented provider-routing preferences object
+ *  (https://openrouter.ai/docs/features/provider-routing) — every field
+ *  OpenRouter's `provider` request object accepts, strictly typed so an
+ *  unknown or malformed routing key is rejected rather than passed through. */
+export interface OpenRouterProviderPreferences {
+  order?: string[];
+  allow_fallbacks?: boolean;
+  require_parameters?: boolean;
+  data_collection?: "allow" | "deny";
+  zdr?: boolean;
+  enforce_distillable_text?: boolean;
+  only?: string[];
+  ignore?: string[];
+  quantizations?: ("int4" | "int8" | "fp4" | "fp6" | "fp8" | "fp16" | "bf16" | "fp32" | "unknown")[];
+  sort?: "price" | "throughput" | "latency" | { by: string; partition?: "model" | "none" };
+  preferred_min_throughput?: number | { p50?: number; p75?: number; p90?: number; p99?: number };
+  preferred_max_latency?: number | { p50?: number; p75?: number; p90?: number; p99?: number };
+  max_price?: { prompt?: number; completion?: number; request?: number; image?: number };
+}
+
 /** Allowlisted request-parameter keys (#434 api-executor-request-controls).
  *  `provider`/`models` are OpenRouter-only routing options — rejected at
  *  parse time for any other dialect. */
@@ -107,7 +127,7 @@ export interface ModelEndpointParams {
   stop?: string[];
   /** OpenRouter provider-routing preferences object, sent verbatim as the
    *  request's `provider` field. openrouter dialect only. */
-  provider?: Record<string, unknown>;
+  provider?: OpenRouterProviderPreferences;
   /** OpenRouter model fallback list, sent verbatim as the request's `models`
    *  field. openrouter dialect only. */
   models?: string[];
