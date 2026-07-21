@@ -506,3 +506,226 @@ test("runCell: stage-mode invokes exactly one stage (never the other five)", asy
   assert.match(stagesInvoked[0], /Review the following diff/);
   assert.doesNotMatch(stagesInvoked[0], /Produce an implementation plan/);
 });
+
+test("runCell: checks are run and recorded in detail.checks only when the fixture declares one", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: ["npm run ci"],
+      hidden_checks: ["node --test hidden.test.ts"],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  let ranWith: string[] | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    runChecks: async (args) => {
+      ranWith = args.checks;
+      return { "npm run ci": true, "node --test hidden.test.ts": false };
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.deepEqual(ranWith, ["npm run ci", "node --test hidden.test.ts"]);
+  assert.deepEqual(result.outcome.detail?.checks, { "npm run ci": true, "node --test hidden.test.ts": false });
+});
+
+test("runCell: checks that would overrun the cell deadline classify as timeout, not completed", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: ["npm run ci"],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "review",
+      treatments: { harness: ["claude"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 0.02, // 20ms budget for the whole cell
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  let runChecksInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return successResult();
+    },
+    runChecks: async () => {
+      runChecksInvoked = true;
+      return { "npm run ci": true };
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, manifest, deps);
+  assert.equal(result.outcome.result_class, "timeout");
+  assert.equal(runChecksInvoked, false, "checks must never start once the cell deadline has already passed");
+});
+
+test("runCell: check execution is capped by the cell's remaining deadline, not a fixed per-check ceiling", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: ["npm run ci"],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "review",
+      treatments: { harness: ["claude"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 60,
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  let receivedDeadlineMs: number | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    runChecks: async (args) => {
+      receivedDeadlineMs = args.deadlineMs;
+      return { "npm run ci": true };
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, manifest, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.ok(receivedDeadlineMs !== undefined && receivedDeadlineMs > 0 && receivedDeadlineMs <= 60_000);
+});
+
+test("runCell: no hidden check name ever reaches the materialized prompt sent to the treatment", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: ["npm run ci"],
+      hidden_checks: ["node --test the-hidden-marker-check.ts"],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    runChecks: async () => ({}),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.doesNotMatch(result.materializedPrompt, /the-hidden-marker-check/);
+});
+
+test("runCell: checks are never run when the fixture declares none, with no dep provided", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.detail?.checks, undefined);
+});
+
+test("runCell: changed_paths is recorded only when the fixture declares an allowed-change boundary", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: [],
+      allowed_change_paths: ["core/scripts/gh.ts"],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    getChangedPaths: async () => ["core/scripts/gh.ts", "core/scripts/other.ts"],
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.deepEqual(result.outcome.detail?.changed_paths, ["core/scripts/gh.ts", "core/scripts/other.ts"]);
+
+  const withoutBoundary = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+  });
+  assert.equal(withoutBoundary.outcome.detail?.changed_paths, undefined);
+});
+
+test("runCell: review-mode findings are parsed from harness stdout into detail.findings", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: JSON.stringify({ verdict: "needs-attention", findings: [{ file: "a.ts", severity: "high" }] }),
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.deepEqual(result.outcome.detail?.findings, [{ file: "a.ts", severity: "high" }]);
+});

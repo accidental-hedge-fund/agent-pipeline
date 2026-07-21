@@ -84,6 +84,8 @@ $pipeline scoreboard --by <dimension>    group scoreboard metrics by harness|mod
 $pipeline scoreboard --html <path>       write a self-contained, offline HTML export of the report to <path> (local/archival only; makes no network requests, composes with the other scoreboard flags)
 $pipeline evals plan experiment.json     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 $pipeline evals run experiment.json      execute an experiment's cells (resumable); never writes to production GitHub
+$pipeline evals grade experiment.json/exp1   grade a completed experiment's cells; writes grades.jsonl (never gates a PR)
+$pipeline evals report experiment.json/exp1 --baseline <treatment_id>  paired comparative summary.json
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -187,6 +189,67 @@ Results land under `<output_dir>/<experiment-id>/`: `manifest.json`,
 cells). Every record carries `experiment_id`, `fixture_id`, `treatment_id`,
 `replicate`, `prompt_hash`, `config_hash`, and `base_sha` so a cell can be
 joined to ordinary run evidence.
+
+### Objective grading and comparative reporting
+
+`evals grade <experiment-dir>` / `evals report <experiment-dir> --baseline
+<treatment_id>` turn a completed experiment into objective grades and an
+uncertainty-aware comparison — like `evals` itself, **grades and summaries
+never gate a PR and never participate in the label-driven state machine**.
+`<experiment-dir>` is `<output_dir>/<experiment_id>`, the same directory
+`evals run` wrote into.
+
+Fixtures may additionally declare (all optional; omitting them still
+validates): `hidden_checks` (resolved only by the grader, never exposed to
+the treatment — rejected if also listed in `public_checks`),
+`seeded_defects` (review ground truth: `defect_id`, `path` + line range,
+`expected_severity`), `acceptance_criteria` (`id` + `statement`, plus
+optional `check_names` for implementation/fix or `keywords` for planning
+coverage), `allowed_change_paths` (the out-of-scope-change boundary — absent
+means `null`, never `0`), and versioned `grader_refs`
+(`{"grader": "review", "version": "1"}`; an unsupported grader/version fails
+validation).
+
+`evals grade` reads `manifest.json`/`runs.jsonl` and the fixtures and writes
+`grades.jsonl` fresh each run — never modifying `manifest.json`, `plan.json`,
+`runs.jsonl`, or `failures.jsonl`; regrading the same records is
+byte-identical. Only `completed` cells whose fixture declares a matching
+`grader_ref` are graded (others are reported `skipped`, never dropped
+silently); `infra_error`/`auth_error`/`timeout` cells never get a substitute
+score. Three deterministic, versioned graders: **`implementation-fix`**
+(hidden-test pass rate, acceptance completion, a regression count measured
+against a cached base-commit check baseline, a pre-existing-failure count,
+and an out-of-scope-change count), **`review`** (deterministic path +
+line-range matching against `seeded_defects` — precision/recall/F1, false
+positives, and a signed severity-calibration distribution that never
+cancels over/under calls; no model call), and **`planning`**
+(`planning-rubric-v1`: requirement coverage, unsupported assumptions,
+actionability, downstream compatibility — a treatment self-assessment is
+recorded as a separate observation and never read as a grade input).
+
+`--judge` (disabled by default) runs an optional model judge as its own
+record, flags disagreements with the deterministic grade, and never moves a
+deterministic field. A disagreement can carry a blinded human adjudication
+record keyed by an opaque hash of `cell_id` — never harness/provider/model/
+effort.
+
+`evals report --baseline <treatment_id>` writes a versioned `summary.json`:
+paired per-fixture quality deltas against the baseline (a fixture
+contributes only when both treatments have a completed, graded cell for it;
+replicates are reduced to one value before pairing; unpaired fixtures are
+named, not dropped), completion/failure-class rates, quality-vs-duration and
+quality-vs-cost Pareto frontiers (no combined score), and grouping by
+stage/harness/provider/model/effort/category/risk with an explicit `unknown`
+bucket. Every aggregate effect carries a confidence interval, its sample
+size, and the seeded, reproducible interval method; small samples are marked
+`underpowered` rather than hidden. A cell with no cost telemetry is excluded
+from cost aggregates and counted toward a reported coverage fraction —
+never zeroed.
+
+`core/evals/fixtures/*.json` includes a small checked-in synthetic set
+exercising every grader; the grading/reporting tests run entirely against
+checked-in synthetic fixtures and recorded cell records — no live model
+call, network request, real git operation, or subprocess spawn.
 
 ## Setup (zero install after first run)
 

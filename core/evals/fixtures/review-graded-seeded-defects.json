@@ -1,0 +1,32 @@
+{
+  "fixture_id": "review-graded-seeded-defects",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Review this diff for correctness before it merges.",
+  "stage_entry_artifacts": {
+    "review": {
+      "diff": "diff --git a/core/scripts/gh.ts b/core/scripts/gh.ts\n@@ -700,6 +700,7 @@ export async function createIssue(\n-  return Number(result.number);\n+  return Number(result.number ?? -1);\n"
+    }
+  },
+  "public_checks": [],
+  "seeded_defects": [
+    {
+      "defect_id": "gh-ts-silent-negative-sentinel",
+      "path": "core/scripts/gh.ts",
+      "line_start": 701,
+      "line_end": 702,
+      "expected_severity": "high"
+    },
+    {
+      "defect_id": "gh-ts-missing-regression-test",
+      "path": "core/test/gh.test.ts",
+      "line_start": 1,
+      "line_end": 5,
+      "expected_severity": "medium"
+    }
+  ],
+  "grader_refs": [{ "grader": "review", "version": "1" }],
+  "category": "review-defect-detection",
+  "risk": "medium",
+  "provenance": "synthetic"
+}

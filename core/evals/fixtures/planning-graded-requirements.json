@@ -1,0 +1,34 @@
+{
+  "fixture_id": "planning-graded-requirements",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Add a --dry-run flag to pipeline doctor that prints the checks it would run without executing any of them.",
+  "stage_entry_artifacts": {
+    "planning": {
+      "issue_title": "Add --dry-run flag to pipeline doctor",
+      "issue_body": "pipeline doctor always executes its full check suite. Add a --dry-run flag that lists the checks it would run, in order, without running them."
+    }
+  },
+  "public_checks": [],
+  "acceptance_criteria": [
+    {
+      "id": "flag-registered",
+      "statement": "The plan adds a --dry-run flag to the doctor command.",
+      "keywords": ["--dry-run"]
+    },
+    {
+      "id": "no-execution",
+      "statement": "The plan lists checks without executing them when --dry-run is set.",
+      "keywords": ["without executing", "list"]
+    },
+    {
+      "id": "test-coverage",
+      "statement": "The plan adds a test covering the new flag.",
+      "keywords": ["test"]
+    }
+  ],
+  "grader_refs": [{ "grader": "planning", "version": "1" }],
+  "category": "cli-feature",
+  "risk": "low",
+  "provenance": "synthetic"
+}

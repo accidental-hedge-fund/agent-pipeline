@@ -1,0 +1,26 @@
+{
+  "fixture_id": "fix-graded-null-guard",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Resolve this review finding with a minimal, surgical diff.",
+  "stage_entry_artifacts": {
+    "fix": {
+      "finding": "core/scripts/gh.ts: createIssue returns Number(result.number) without a null guard, so a malformed gh response silently becomes NaN instead of a clear error.",
+      "severity": "block"
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "hidden_checks": ["node --test test/gh.test.ts -- --grep createIssue"],
+  "acceptance_criteria": [
+    {
+      "id": "null-guard-added",
+      "statement": "createIssue throws or returns a typed error when result.number is missing, instead of coercing to NaN.",
+      "check_names": ["node --test test/gh.test.ts -- --grep createIssue"]
+    }
+  ],
+  "allowed_change_paths": ["core/scripts/gh.ts", "core/test/gh.test.ts"],
+  "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
+  "category": "review-fix-application",
+  "risk": "medium",
+  "provenance": "synthetic"
+}
