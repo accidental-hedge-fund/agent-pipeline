@@ -1,9 +1,17 @@
-// codex adapter — reproduces the pre-adapter argv byte-for-byte (#431 task 2.2).
+// codex adapter — reproduces the pre-adapter argv byte-for-byte apart from
+// prompt delivery (#431 task 2.2; #492 moved the prompt off argv).
 //
 // codex: codex exec [--json] --full-auto -C <worktreeDir> [-m X]
-//        [-c model_reasoning_effort=Y] <prompt>
+//        [-c model_reasoning_effort=Y] -
+//        (the trailing `-` sentinel; prompt delivered on stdin, not as a
+//        positional)
 //        PIPELINE_CODEX_NO_SANDBOX=1 swaps --full-auto for
 //        --dangerously-bypass-approvals-and-sandbox.
+//
+// #492: `codex exec --help` documents the prompt argument: "If not provided
+// as an argument (or if `-` is used), instructions are read from stdin" — the
+// explicit `-` sentinel (rather than omitting the positional) makes the
+// stdin-read unambiguous regardless of any other positional-looking argv.
 
 import {
   EMPTY_TELEMETRY,
@@ -97,13 +105,15 @@ export const codexAdapter: HarnessAdapter = {
     args.push(noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto", "-C", ctx.worktreeDir);
     if (ctx.model) args.push("-m", ctx.model);
     if (ctx.effort) args.push("-c", `model_reasoning_effort=${ctx.effort}`);
-    args.push(ctx.prompt);
+    args.push("-");
     return {
       cmd: "codex",
       args,
       cwd: ctx.worktreeDir,
       captureMode: telemetryMode ? "tail" : undefined,
       transformForward: telemetryMode ? makeCodexForwardTransform() : undefined,
+      promptDelivery: "stdin",
+      stdinPayload: ctx.prompt,
     };
   },
 

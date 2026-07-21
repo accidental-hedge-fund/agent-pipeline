@@ -17,6 +17,14 @@
 // `--auto` ("auto-approve permissions not explicitly denied") is always
 // passed — the default is unattended-unsafe for a headless pipeline run (it
 // can block on a permission prompt with no TTY to answer it).
+//
+// #492: `opencode run --help` (re-read at implementation time — golden rule 5)
+// documents no stdin or prompt-file channel for the message positional; `-f`
+// attaches a file alongside the message, it does not replace it. This adapter
+// therefore declares `promptDelivery: "argv"` explicitly rather than being
+// assumed to support another channel — an oversize prompt on this adapter is
+// refused by the pre-spawn guard in `runCapped` rather than silently
+// truncated or guessed at.
 
 import {
   EMPTY_TELEMETRY,
@@ -58,7 +66,7 @@ export const opencodeAdapter: HarnessAdapter = {
     // sandbox mode is rejected at preflight (capabilities.sandbox: false)
     // rather than reaching here and being silently widened.
     args.push("--auto");
-    return { cmd: "opencode", args, cwd: ctx.worktreeDir };
+    return { cmd: "opencode", args, cwd: ctx.worktreeDir, promptDelivery: "argv" };
   },
 
   async preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult> {

@@ -1084,6 +1084,11 @@ export async function invokePromptHarnessReview(
       harness: cfg.harnesses.reviewer,
       model: rawModel ?? null,
     }),
+    // #492: opt-in prompt-delivery channel for a custom reviewer CLI
+    // (review_harness.prompt_delivery). Ignored by invoke() for the
+    // implementer's own registered adapter on a same-harness fallback (#39) —
+    // that adapter declares its own channel.
+    promptDelivery: cfg.harnesses.reviewerPromptDelivery,
   });
 }
 

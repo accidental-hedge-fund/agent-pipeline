@@ -419,7 +419,12 @@ export interface PipelineConfig {
   // `"auto"` sentinel (vs. an explicit alias) — reviewer call sites need this
   // to omit only an `auto`-resolved claude-only alias for a codex reviewer,
   // never an explicitly-configured one (#441).
-  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerModelWasAuto?: boolean; reviewerEffort?: string };
+  // `reviewerPromptDelivery` (#492) is the resolved prompt-delivery channel
+  // for a custom reviewer CLI (`review_harness.prompt_delivery`), threaded
+  // into `invoke()`'s `InvokeOptions.promptDelivery`. `resolveConfig()`
+  // always sets it explicitly; call sites still treat absent as "argv" (the
+  // pre-#492 default) since there is no `tsc` step to enforce presence.
+  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerModelWasAuto?: boolean; reviewerEffort?: string; reviewerPromptDelivery?: "argv" | "stdin" };
   // `reviewWasAuto` mirrors `reviewerModelWasAuto` for the `models.review`
   // fallback slot (#441): true when the file config explicitly set
   // `models.review: auto`, so reviewer call sites can distinguish an

@@ -38,6 +38,35 @@ function makeScript(name: string, body: string): string {
   return cliPath;
 }
 
+/** Separator marker between the echoed argv and the echoed stdin content in
+ *  `makeArgvStdinScript`'s output — chosen to never collide with real argv
+ *  content in these tests. */
+const STDIN_MARKER = "<<<STDIN>>>";
+
+/** Write a fake CLI that echoes each argv element on its own line, then the
+ *  marker line, then its raw stdin — so a test can assert both the argv shape
+ *  AND the stdin payload of a #492 stdin-channel adapter (claude/codex) in one
+ *  spawn. `splitArgvStdin` below parses the two halves back apart. */
+function makeArgvStdinScript(name: string): string {
+  // Guarded with `[ "$#" -gt 0 ]`: with zero positional params, a bare
+  // `printf '%s\n' "$@"` still executes its format once with an empty
+  // substitution (GNU printf), printing a spurious blank line.
+  return makeScript(
+    name,
+    `if [ "$#" -gt 0 ]; then printf '%s\\n' "$@"; fi\nprintf '%s\\n' "${STDIN_MARKER}"\ncat`,
+  );
+}
+
+/** Split a `makeArgvStdinScript` CLI's stdout back into `{ argvLines, stdin }`. */
+function splitArgvStdin(stdout: string): { argvLines: string[]; stdin: string } {
+  const idx = stdout.indexOf(`${STDIN_MARKER}\n`);
+  assert.ok(idx !== -1, `stdout must contain the ${STDIN_MARKER} separator`);
+  const argvPart = stdout.slice(0, idx);
+  const stdin = stdout.slice(idx + STDIN_MARKER.length + 1);
+  const argvLines = argvPart.length ? argvPart.replace(/\n$/, "").split("\n") : [];
+  return { argvLines, stdin };
+}
+
 test("invoke(): a custom reviewer CLI is spawned and its stdout is captured as output", async () => {
   const verdict = '```json\n{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}\n```';
   // Single-quoted heredoc → the JSON (backticks, braces) is emitted verbatim.
@@ -188,7 +217,7 @@ test("invoke(): codex with sandbox:true produces args identical to sandbox:false
 });
 
 test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbox automation mode", async () => {
-  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const cli = makeArgvStdinScript("codex");
   const oldPath = process.env.PATH;
   const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
@@ -201,7 +230,10 @@ test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbo
       "explicit env opt-in must use Codex's no-sandbox automation mode",
     );
     assert.doesNotMatch(result.stdout, /--full-auto/, "no-sandbox mode must not also pass --full-auto");
-    assert.match(result.stdout, /test-prompt/, "prompt must still be passed through");
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    assert.equal(argvLines[argvLines.length - 1], "-", "codex must receive the trailing '-' stdin sentinel, not the prompt, as its last positional (#492)");
+    assert.doesNotMatch(argvLines.join("\n"), /test-prompt/, "the prompt must never appear in argv (#492)");
+    assert.equal(stdin, "test-prompt", "the prompt must be delivered on stdin instead (#492)");
   } finally {
     process.env.PATH = oldPath;
     if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
@@ -216,8 +248,8 @@ test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbo
 // We assert the argv routing via the same fake-claude-on-PATH approach.
 // ---------------------------------------------------------------------------
 
-test("invoke(): claude with lean:true appends --tools \"\" and --strict-mcp-config, keeps model, and never swallows the prompt (#220)", async () => {
-  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+test("invoke(): claude with lean:true appends --tools \"\" and --strict-mcp-config, keeps model, and delivers the prompt on stdin, never argv (#220, #492)", async () => {
+  const cli = makeArgvStdinScript("claude");
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
   try {
@@ -225,17 +257,18 @@ test("invoke(): claude with lean:true appends --tools \"\" and --strict-mcp-conf
     assert.match(result.stdout, /--tools/, "lean must pass --tools to restrict the tool set");
     assert.match(result.stdout, /--strict-mcp-config/, "lean must pass --strict-mcp-config so zero MCP servers load");
     assert.match(result.stdout, /--model\nsonnet/, "model must still be threaded in lean mode");
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
     // --tools is variadic: its value must be the empty string ("" = disable all
-    // tools), immediately followed by a FLAG (never the trailing prompt, which the
-    // variadic would otherwise consume).
-    const lines = result.stdout.split("\n");
-    const toolsIdx = lines.indexOf("--tools");
+    // tools), immediately followed by a FLAG (never a positional prompt, which
+    // the variadic would otherwise consume — moot now that the prompt is never
+    // in argv at all, but still proves --tools "" isn't left dangling).
+    const toolsIdx = argvLines.indexOf("--tools");
     assert.ok(toolsIdx !== -1, "--tools must be present");
-    assert.equal(lines[toolsIdx + 1], "", "--tools value must be the empty string (disable all built-in tools)");
-    assert.equal(lines[toolsIdx + 2], "--strict-mcp-config", "--tools \"\" must be immediately followed by a flag, not the prompt");
-    // The prompt must survive as the trailing positional.
-    const args = result.stdout.replace(/\n$/, "").split("\n");
-    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must reach the CLI as the trailing positional, un-swallowed");
+    assert.equal(argvLines[toolsIdx + 1], "", "--tools value must be the empty string (disable all built-in tools)");
+    assert.equal(argvLines[toolsIdx + 2], "--strict-mcp-config", "--tools \"\" must be immediately followed by a flag");
+    // The prompt must never appear in argv — it reaches the CLI on stdin (#492).
+    assert.doesNotMatch(argvLines.join("\n"), /PROMPT-MARKER/, "prompt must never appear in argv");
+    assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
     // Lean must NOT touch auth: --bare (which would disable keychain reads) is forbidden.
     assert.doesNotMatch(result.stdout, /--bare/, "lean must NOT use --bare (it disables keychain reads and breaks OAuth auth)");
   } finally {
@@ -362,18 +395,19 @@ test("invoke(): a timed-out harness kills its grandchild — proves invoke() thr
 // ---------------------------------------------------------------------------
 
 test("invoke(): codex with reasoningEffort:'medium' includes -c model_reasoning_effort=medium in args (#278)", async () => {
-  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const cli = makeArgvStdinScript("codex");
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
   try {
     const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "medium" });
-    const lines = result.stdout.split("\n");
-    const cIdx = lines.indexOf("-c");
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    const cIdx = argvLines.indexOf("-c");
     assert.ok(cIdx !== -1, "-c flag must be present in codex args");
-    assert.equal(lines[cIdx + 1], "model_reasoning_effort=medium", "-c value must be model_reasoning_effort=medium");
-    // Prompt must still be the last positional.
-    const args = result.stdout.replace(/\n$/, "").split("\n");
-    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must remain the trailing positional");
+    assert.equal(argvLines[cIdx + 1], "model_reasoning_effort=medium", "-c value must be model_reasoning_effort=medium");
+    // The prompt is delivered on stdin, not argv (#492); the trailing
+    // positional is the '-' stdin sentinel.
+    assert.equal(argvLines[argvLines.length - 1], "-", "codex must receive the trailing '-' stdin sentinel");
+    assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -405,17 +439,18 @@ test("invoke(): claude with reasoningEffort:'medium' does NOT include the codex 
 });
 
 test("invoke(): claude with reasoningEffort:'high' includes --effort high in args (#366)", async () => {
-  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const cli = makeArgvStdinScript("claude");
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
   try {
     const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "high" });
-    const lines = result.stdout.split("\n");
-    const effortIdx = lines.indexOf("--effort");
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    const effortIdx = argvLines.indexOf("--effort");
     assert.ok(effortIdx !== -1, "--effort flag must be present in claude args");
-    assert.equal(lines[effortIdx + 1], "high", "--effort value must be 'high'");
-    const args = result.stdout.replace(/\n$/, "").split("\n");
-    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must remain the trailing positional");
+    assert.equal(argvLines[effortIdx + 1], "high", "--effort value must be 'high'");
+    // The prompt is delivered on stdin, not argv (#492).
+    assert.doesNotMatch(argvLines.join("\n"), /PROMPT-MARKER/, "prompt must never appear in argv");
+    assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -440,7 +475,7 @@ test("invoke(): claude WITHOUT reasoningEffort has no --effort flag (#366)", asy
 // ---------------------------------------------------------------------------
 
 test("invoke(): codex with model+effort includes -m <model> and -c model_reasoning_effort=<level> (#441)", async () => {
-  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const cli = makeArgvStdinScript("codex");
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
   try {
@@ -449,15 +484,15 @@ test("invoke(): codex with model+effort includes -m <model> and -c model_reasoni
       model: "gpt-5.6-terra",
       reasoningEffort: "high",
     });
-    const lines = result.stdout.split("\n");
-    const mIdx = lines.indexOf("-m");
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    const mIdx = argvLines.indexOf("-m");
     assert.ok(mIdx !== -1, "-m flag must be present in codex args");
-    assert.equal(lines[mIdx + 1], "gpt-5.6-terra", "-m value must be gpt-5.6-terra");
-    const cIdx = lines.indexOf("-c");
+    assert.equal(argvLines[mIdx + 1], "gpt-5.6-terra", "-m value must be gpt-5.6-terra");
+    const cIdx = argvLines.indexOf("-c");
     assert.ok(cIdx !== -1, "-c flag must be present in codex args");
-    assert.equal(lines[cIdx + 1], "model_reasoning_effort=high", "-c value must be model_reasoning_effort=high");
-    const args = result.stdout.replace(/\n$/, "").split("\n");
-    assert.equal(args[args.length - 1], "PROMPT-MARKER", "prompt must remain the trailing positional");
+    assert.equal(argvLines[cIdx + 1], "model_reasoning_effort=high", "-c value must be model_reasoning_effort=high");
+    assert.equal(argvLines[argvLines.length - 1], "-", "codex must receive the trailing '-' stdin sentinel");
+    assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -522,6 +557,261 @@ test("invoke(): a custom reviewer CLI ignores reasoningEffort — no --effort/-c
   const args = result.stdout.replace(/\n$/, "").split("\n");
   assert.equal(args.length, 1, "custom CLI receives only the prompt as a single positional arg");
   assert.equal(args[0], "PROMPT-MARKER");
+});
+
+// ---------------------------------------------------------------------------
+// #492 — prompt delivery over MAX_ARG_STRLEN (128 KiB). Review prompts over
+// this size made the reviewer CLI spawn fail with a bare exit -1 that read as
+// transient. claude/codex now deliver the prompt on stdin (never argv); a
+// custom reviewer CLI defaults to the pre-#492 positional shape but can opt
+// into stdin; any remaining argv-delivery target refuses an oversize prompt
+// before spawning instead of hitting the OS limit.
+// ---------------------------------------------------------------------------
+
+test("invoke(): claude's default (non-lean) invocation delivers the prompt on stdin, never in argv (#492)", async () => {
+  const cli = makeArgvStdinScript("claude");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "PROMPT-MARKER", { stream: false });
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    assert.doesNotMatch(argvLines.join("\n"), /PROMPT-MARKER/, "prompt must never appear in claude's argv");
+    assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): codex's default invocation delivers the prompt on stdin with the trailing '-' sentinel, never in argv (#492)", async () => {
+  const cli = makeArgvStdinScript("codex");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false });
+    const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    assert.doesNotMatch(argvLines.join("\n"), /PROMPT-MARKER/, "prompt must never appear in codex's argv");
+    assert.equal(argvLines[argvLines.length - 1], "-", "codex must receive the documented '-' stdin sentinel");
+    assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): a prompt over 131,072 bytes reaches claude's stdin intact via stdin — proves the fix on the originally failing input shape (#492)", async () => {
+  // Measures the exact byte count read from stdin rather than echoing the
+  // 200 KB prompt back verbatim, so the assertion is not confounded by
+  // runCapped's own MAX_OUTPUT capture cap (a test-harness limit, unrelated
+  // to the MAX_ARG_STRLEN fix under test).
+  const cli = makeScript("claude", `wc -c`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const bigPrompt = "x".repeat(200_000); // > MAX_ARG_STRLEN (131,072 bytes)
+  try {
+    const result = await invoke("claude", tmpRoot, bigPrompt, { stream: false });
+    assert.equal(result.spawn_error ?? false, false, "an oversize prompt on the stdin channel must not be refused");
+    assert.equal(
+      result.stdout.trim(),
+      String(Buffer.byteLength(bigPrompt, "utf8")),
+      "the full oversize prompt must reach stdin, byte-for-byte",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("runCapped: an argv element over MAX_ARG_STRLEN is refused before spawn — named failure, not a bare spawn error (#492)", async () => {
+  let spawned = false;
+  const spawnFn = (() => {
+    spawned = true;
+    throw new Error("must not be called — the oversize guard must refuse before spawn");
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const oversizeArg = "y".repeat(131_073);
+  const result = await runCapped("unused", [oversizeArg], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(spawned, false, "spawn() must never be called for an oversize argv element");
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error, true, "the #39 self-review fallback still applies (only spawn_error is checked)");
+  assert.equal(result.oversize_argv, true, "must be distinguishable from a missing-CLI spawn error");
+  assert.match(result.stderr, /131072 bytes/, "must name the per-argument limit");
+  assert.match(result.stderr, /131073/, "must report the measured prompt/argument byte size");
+  assert.match(result.stderr, /standard input or a file/, "must name the prompt-delivery remedy");
+  assert.doesNotMatch(result.stderr, /not found|not executable|ENOENT/i, "must not read like a missing-CLI error");
+});
+
+test("runCapped: an argv element exactly at MAX_ARG_STRLEN (131,072 bytes) is refused — execve() counts the terminating NUL", async () => {
+  let spawned = false;
+  const spawnFn = (() => {
+    spawned = true;
+    throw new Error("must not be called — the oversize guard must refuse before spawn");
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const exactArg = "z".repeat(131_072);
+  const result = await runCapped("unused", [exactArg], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(spawned, false, "spawn() must never be called for an argument at exactly MAX_ARG_STRLEN");
+  assert.equal(result.oversize_argv, true, "a 131,072-byte argument cannot fit — execve() counts the terminating NUL");
+  assert.equal(result.success, false);
+});
+
+test("runCapped: an argv element one byte below MAX_ARG_STRLEN (131,071 bytes) is not refused", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = ((_cmd: string, _args: string[]) => {
+    setImmediate(() => fakeChild.emit("close", 0));
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const underArg = "z".repeat(131_071);
+  const result = await runCapped("unused", [underArg], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(result.oversize_argv ?? false, false, "an argument one byte below the limit must be spawned, not refused");
+  assert.equal(result.success, true);
+});
+
+test("invoke(): an unregistered reviewer CLI given an oversize prompt is never spawned and names review_harness.prompt_delivery as the remedy (#492)", async () => {
+  let spawned = false;
+  const missing = `oversize-argv-cli-${path.basename(tmpRoot)}`;
+  const bigPrompt = "a".repeat(131_073);
+  // No real CLI on PATH — if the guard failed to refuse pre-spawn, this would
+  // surface as ENOENT, not the oversize-specific failure asserted below.
+  const result = await invoke(missing, tmpRoot, bigPrompt, { stream: false });
+  assert.equal(spawned, false);
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error, true);
+  assert.equal(result.oversize_argv, true);
+  assert.doesNotMatch(result.stderr, /not found or not executable/, "must not be reported as a missing-CLI error");
+  assert.match(result.stderr, /review_harness\.prompt_delivery/, "must name the remedy setting");
+});
+
+test("invoke(): a custom reviewer CLI with promptDelivery:'stdin' is spawned with no prompt positional and the prompt on stdin (#492)", async () => {
+  const cli = makeArgvStdinScript("my-stdin-reviewer");
+  const result = await invoke(cli, tmpRoot, "PROMPT-MARKER", { stream: false, promptDelivery: "stdin" });
+  const { argvLines, stdin } = splitArgvStdin(result.stdout);
+  assert.deepEqual(argvLines, [], "no prompt positional must be passed on the stdin channel");
+  assert.equal(stdin, "PROMPT-MARKER");
+});
+
+test("invoke(): a custom reviewer CLI's default shape (promptDelivery absent) is byte-for-byte the pre-#492 positional shape", async () => {
+  const cli = makeScript("my-default-reviewer", `printf '%s\\n' "$@"`);
+  const result = await invoke(cli, tmpRoot, "PROMPT-MARKER", { stream: false });
+  const args = result.stdout.replace(/\n$/, "").split("\n");
+  assert.deepEqual(args, ["PROMPT-MARKER"], "default delivery must still be a single positional prompt argument");
+});
+
+test("runCapped: with no stdinPayload, stdio[0] stays 'ignore' (byte-for-byte no-op on the default path, #492)", async () => {
+  let capturedStdio: unknown;
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 123458,
+    kill: () => true,
+  });
+  const spawnFn = ((_cmd: string, _args: string[], options: { stdio?: unknown }) => {
+    capturedStdio = options.stdio;
+    setImmediate(() => fakeChild.emit("close", 0));
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.deepEqual(capturedStdio, ["ignore", "pipe", "pipe"], "stdin must stay 'ignore' when no stdinPayload is supplied");
+});
+
+test("runCapped: with a stdinPayload, stdio[0] becomes a file descriptor and the payload is delivered", async () => {
+  const cli = makeScript("stdin-echo", `cat`);
+  const result = await runCapped(cli, [], tmpRoot, 30, false, "test", { stdinPayload: "hello from stdin" });
+  assert.equal(result.success, true);
+  assert.equal(result.stdout, "hello from stdin");
+});
+
+test("runCapped: the fd handed to spawn already references the complete, on-disk payload before the child ever runs (#492 review 3, key 8c1c7cbf) — closes the pipe-finish race", async () => {
+  // Round 2's fix tracked the writable stream's 'finish' event as proof the
+  // child received the full prompt, but 'finish' only proves the parent
+  // flushed bytes into the OS pipe buffer — a child that read enough to make
+  // room, then exited, could discard unread trailing bytes with no error
+  // ever surfacing. Delivering via a real file removes the race outright: by
+  // the time spawn() is even called, the entire payload is already committed
+  // to disk, so whatever fd the child inherits always references complete
+  // content — there is no live producer for the child to race ahead of.
+  const payload = "x".repeat(200_000); // larger than a typical 64 KB pipe buffer
+  let observedFdContent: string | undefined;
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999111,
+    kill: () => true,
+  });
+  const spawnFn = ((_cmd: string, _args: string[], options: { stdio?: unknown[] }) => {
+    const fd = (options.stdio ?? [])[0] as number;
+    observedFdContent = fs.readFileSync(`/proc/self/fd/${fd}`, "utf8");
+    setImmediate(() => fakeChild.emit("close", 0));
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn, stdinPayload: payload });
+
+  assert.equal(
+    observedFdContent,
+    payload,
+    "the fd handed to spawn must already contain the complete payload at spawn time",
+  );
+});
+
+test("runCapped: a stdin prompt-file materialization failure surfaces as spawn_error+stdin_error without ever spawning (#492 review 3, key 8c1c7cbf)", async () => {
+  const missingCwd = path.join(tmpRoot, "does-not-exist-" + path.basename(tmpRoot));
+  let spawnCalled = false;
+  const spawnFn = ((..._args: unknown[]) => {
+    spawnCalled = true;
+    throw new Error("must not be called");
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const result = await runCapped("unused", [], missingCwd, 30, false, "test", {
+    spawnFn,
+    stdinPayload: "prompt too big to fit in argv",
+  });
+
+  assert.equal(spawnCalled, false, "spawn must never be attempted when the stdin file cannot be materialized");
+  assert.equal(result.success, false);
+  assert.equal(result.spawn_error, true, "must be flagged so the #39 self-review fallback triggers");
+  assert.equal(result.stdin_error, true);
+});
+
+test("invoke(): the grok adapter materializes the prompt file, references it via --prompt-file, and removes exactly that file afterward (#492)", async () => {
+  const cli = makeScript("grok", `cat "$2"`); // --prompt-file <path> is argv[0]/argv[1]
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("grok", tmpRoot, "GROK-PROMPT-MARKER", { stream: false });
+    assert.equal(result.success, true);
+    assert.equal(result.stdout, "GROK-PROMPT-MARKER", "the prompt file's content must reach the CLI verbatim");
+    const leftover = fs
+      .readdirSync(tmpRoot)
+      .filter((name) => name.startsWith(".pipeline-prompt-"));
+    assert.deepEqual(leftover, [], "the pipeline-created prompt file must be removed after the call completes");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): the grok adapter's prompt file is removed even when the CLI fails", async () => {
+  const cli = makeScript("grok", `exit 1`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("grok", tmpRoot, "GROK-PROMPT-MARKER", { stream: false });
+    assert.equal(result.success, false);
+    const leftover = fs
+      .readdirSync(tmpRoot)
+      .filter((name) => name.startsWith(".pipeline-prompt-"));
+    assert.deepEqual(leftover, [], "the prompt file must be cleaned up even on a failing invocation");
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });
 
 test("runCapped: grandchild that ignores SIGTERM is killed after SIGKILL grace period (#260)", async () => {

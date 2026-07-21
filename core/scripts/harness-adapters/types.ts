@@ -48,6 +48,20 @@ export interface AdapterInvocationContext extends AdapterRequest {
   env?: NodeJS.ProcessEnv;
 }
 
+/** How a prompt reaches its CLI (#492 — MAX_ARG_STRLEN spawn failures on
+ *  oversize prompts). `"argv"`: the prompt is already embedded in `args`
+ *  (unchanged pre-#492 shape). `"stdin"`: the prompt is NOT in `args` — it is
+ *  written to the child's standard input instead. `"file"`: the prompt is NOT
+ *  in `args` — it is written to a pipeline-owned file under the managed
+ *  worktree root that `args` references via the CLI's documented flag. */
+export type PromptDeliveryChannel = "argv" | "stdin" | "file";
+
+/** Linux `MAX_ARG_STRLEN` — the maximum size, in bytes, of a single argv
+ *  element (32 × PAGE_SIZE = 131,072 bytes on the common 4 KiB page size).
+ *  Single-sourced so the pre-spawn oversize guard in `runCapped` and its
+ *  regression tests never drift. */
+export const MAX_ARG_STRLEN = 131_072;
+
 /** The concrete command an adapter wants executed. `captureMode`/
  *  `transformForward` mirror `runCapped`'s options — adapter-declared instead
  *  of `harness === "claude"` tests at the call site. */
@@ -58,6 +72,18 @@ export interface AdapterInvocation {
   env?: NodeJS.ProcessEnv;
   captureMode?: "head" | "tail";
   transformForward?: (chunk: string) => string;
+  /** How the prompt reaches this CLI (#492). The adapter is the sole owner of
+   *  this decision — the call site in `harness.ts` never branches on harness
+   *  name to infer it. */
+  promptDelivery: PromptDeliveryChannel;
+  /** Present only when `promptDelivery === "stdin"`: the prompt bytes to write
+   *  to the child's standard input. Never also embedded in `args`. */
+  stdinPayload?: string;
+  /** Present only when `promptDelivery === "file"`: the prompt file the
+   *  runner must materialize under the managed worktree root before spawn and
+   *  remove after the call completes. `args` already references `path` via
+   *  the CLI's documented prompt-file flag. */
+  promptFile?: { path: string; content: string };
 }
 
 /** Per-call cost/token telemetry recovered from an adapter's machine-readable

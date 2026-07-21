@@ -15,6 +15,14 @@
 // `-a`/`--approve` is always passed (unattended headless run, no TTY to
 // answer a trust prompt).
 //
+// #492: `pi --help` (re-read at implementation time — golden rule 5) documents
+// no stdin or prompt-file channel for the message positional; `@file`
+// arguments attach file CONTENT alongside a message, they do not replace it.
+// This adapter therefore declares `promptDelivery: "argv"` explicitly rather
+// than being assumed to support another channel — an oversize prompt on this
+// adapter is refused by the pre-spawn guard in `runCapped` rather than
+// silently truncated or guessed at.
+//
 // `pi --list-models` is pi's lightweight authenticated-only probe (verified
 // live against the current CLI, review-2 finding 73d2e88a): with no login
 // completed it prints "No models available. Use /login ..." on stdout and
@@ -74,7 +82,7 @@ export const piAdapter: HarnessAdapter = {
     args.push("-a");
     // No --cwd/-C flag exists (design.md decision 4) — cwd carries the
     // worktree directory for the spawned process instead.
-    return { cmd: "pi", args, cwd: ctx.worktreeDir };
+    return { cmd: "pi", args, cwd: ctx.worktreeDir, promptDelivery: "argv" };
   },
 
   async preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult> {
