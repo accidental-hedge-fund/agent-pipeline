@@ -20,6 +20,7 @@
 // pre-#17 behavior exactly: every finding blocks.
 
 import { createHash } from "node:crypto";
+import { matchSettledFinding, type MatchBasis, type SettledFinding } from "./review-history.ts";
 import type { ReviewFinding } from "./types.ts";
 
 // Severity ordering, least → most severe. A finding blocks when its severity
@@ -301,11 +302,25 @@ export type OverriddenEntry =
       reason: string;
     };
 
+/**
+ * Audit detail for a `reversal-unacknowledged` demotion (#464): which settled
+ * finding the demoted finding was matched against, and how (`"key"` — the
+ * finding's stable key equals the settled entry's, or `"title-similarity"` —
+ * the normalized titles are similar enough to describe the same defect).
+ */
+export interface ReversalMatch {
+  settledKey: string;
+  settledTitle: string;
+  settledRound: number;
+  matchedBy: MatchBasis;
+}
+
 export interface PartitionResult {
   /** Findings that block: at/above threshold, at/above confidence, not overridden. */
   blocking: ReviewFinding[];
-  /** Below the severity threshold or confidence floor — recorded, not blocking. */
-  advisory: { finding: ReviewFinding; reason: string }[];
+  /** Below the severity threshold or confidence floor — recorded, not blocking.
+   *  `reversalMatch` is present iff `reason === "reversal-unacknowledged"`. */
+  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch }[];
   /** Operator-dispositioned via a `pipeline-override` or `pipeline-override-scope`
    *  sentinel — not blocking. Discriminated by `kind`. */
   overridden: OverriddenEntry[];
@@ -413,17 +428,21 @@ export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s
  * afresh. Callers MUST pre-filter the source comments to trusted authors
  * before calling, mirroring the trust model of `overrides`.
  *
- * Settled-surface reversal guard (#389): after the override/non-reproducing
- * checks (which still take precedence — an explicit disposition always wins),
- * a finding that would otherwise block, whose `surfaceKey` is in
- * `settledSurfaces`, and whose `prior_round_acknowledgment` is absent, empty,
- * or whitespace-only, is moved to advisory with reason `reversal-unacknowledged`
- * instead of blocking. This is the structural guard against a later round
- * silently re-flipping a trade-off an earlier round already settled (see
- * `review-history.ts`'s `settledSurfaces`). A finding carrying a non-empty
- * `prior_round_acknowledgment` blocks exactly as it would without this guard;
- * a finding on a surface absent from `settledSurfaces` (or when the caller
- * supplies no set at all) is unaffected.
+ * Settled-finding reversal guard (#389, narrowed to finding-level matching by
+ * #464): after the override/non-reproducing checks (which still take
+ * precedence — an explicit disposition always wins), a finding that would
+ * otherwise block, whose `prior_round_acknowledgment` is absent, empty, or
+ * whitespace-only, AND which `matchSettledFinding` reports as re-raising a
+ * specific entry in `settledFindings`, is moved to advisory with reason
+ * `reversal-unacknowledged` instead of blocking. This is the structural guard
+ * against a later round silently re-flipping a trade-off an earlier round
+ * already settled (see `review-history.ts`'s `matchSettledFinding`). Surface
+ * identity alone never suffices — a genuinely new, distinct defect that
+ * merely shares a file/category with a settled finding is NOT demoted; it is
+ * partitioned by `policy` alone (#464, fixing the #395 mis-fire). A finding
+ * carrying a non-empty `prior_round_acknowledgment` blocks exactly as it
+ * would without this guard; a finding matching no entry in `settledFindings`
+ * (or when the caller supplies no entries at all) is unaffected.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
@@ -432,7 +451,7 @@ export function partitionFindings(
   scopes: ScopedOverride[] = [],
   nonReproducing: Map<string, { sha: string; fingerprint: string }[]> = new Map(),
   reviewedSha: string | null = null,
-  settledSurfaces: Set<string> = new Set(),
+  settledFindingsList: SettledFinding[] = [],
 ): PartitionResult {
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
@@ -521,15 +540,26 @@ export function partitionFindings(
       continue;
     }
 
-    // 4. Settled-surface reversal guard (#389): an otherwise-blocking finding
-    // on a surface a prior round already settled, raised again without an
-    // acknowledgment, is demoted rather than allowed to silently re-flip the
-    // prior decision.
-    const fSurface = surfaceKey(f);
+    // 4. Settled-finding reversal guard (#389, finding-level matching #464):
+    // an otherwise-blocking finding that re-raises a SPECIFIC settled finding
+    // (not merely shares its surface), raised again without an acknowledgment,
+    // is demoted rather than allowed to silently re-flip the prior decision.
     const hasAcknowledgment = (f.prior_round_acknowledgment ?? "").trim() !== "";
-    if (fSurface !== null && settledSurfaces.has(fSurface) && !hasAcknowledgment) {
-      result.advisory.push({ finding: f, reason: "reversal-unacknowledged" });
-      continue;
+    if (!hasAcknowledgment) {
+      const match = matchSettledFinding(f, settledFindingsList);
+      if (match) {
+        result.advisory.push({
+          finding: f,
+          reason: "reversal-unacknowledged",
+          reversalMatch: {
+            settledKey: match.entry.key,
+            settledTitle: match.entry.title,
+            settledRound: match.entry.round,
+            matchedBy: match.basis,
+          },
+        });
+        continue;
+      }
     }
 
     result.blocking.push(f);

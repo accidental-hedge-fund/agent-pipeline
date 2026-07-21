@@ -7,10 +7,13 @@ import {
   DIGEST_MAX_CHARS,
   DIGEST_MAX_ENTRIES_PER_ROUND,
   DIGEST_MAX_ROUNDS,
+  matchSettledFinding,
   renderPriorRoundDigest,
-  settledSurfaceRounds,
-  settledSurfaces,
+  settledFindings,
+  titleSimilarity,
+  TITLE_SIMILARITY_THRESHOLD,
   type PriorRoundDigest,
+  type SettledFinding,
 } from "../scripts/review-history.ts";
 import { formatReviewComment } from "../scripts/stages/review-rendering.ts";
 import { findingKey, overrideComment, partitionFindings, scopedOverrideComment, surfaceKey } from "../scripts/review-policy.ts";
@@ -364,11 +367,11 @@ test("buildPriorRoundDigest is pure — same inputs produce the same output, cal
 });
 
 // ---------------------------------------------------------------------------
-// settledSurfaces
+// settledFindings (#464 — replaces the retired settledSurfaces/settledSurfaceRounds)
 // ---------------------------------------------------------------------------
 
-test("settledSurfaces: a surface's most recent occurrence being resolved-by-fix marks it settled", () => {
-  // Round-2's entry for CAP_FINDING's surface is resolved-by-fix (nothing re-blocks it in
+test("settledFindings: a finding's most recent occurrence being resolved-by-fix marks it settled, attributed to its round", () => {
+  // Round-2's entry for CAP_FINDING is resolved-by-fix (nothing re-blocks it in
   // round 3) — the accepted-trade-off case the reversal guard exists to protect.
   const other: ReviewFinding = { ...CAP_FINDING, file: "src/other.ts", title: "other issue" };
   const keyA = findingKey(CAP_FINDING);
@@ -382,11 +385,14 @@ test("settledSurfaces: a surface's most recent occurrence being resolved-by-fix 
     ],
     { actor: "pipeline-bot" },
   );
-  const settled = settledSurfaces(digest);
-  assert.ok(settled.has(surfaceKey(CAP_FINDING)!), "resolved-by-fix surface is settled");
+  const settled = settledFindings(digest);
+  const capEntry = settled.find((s) => s.key === keyA);
+  assert.ok(capEntry, "resolved-by-fix finding is settled");
+  assert.equal(capEntry?.surface, surfaceKey(CAP_FINDING));
+  assert.equal(capEntry?.round, 1);
 });
 
-test("settledSurfaces: overridden surface is settled", () => {
+test("settledFindings: overridden finding is settled", () => {
   const key = findingKey(CAP_FINDING);
   const round2 = formatReviewComment(cfg, verdict([CAP_FINDING], SHA_1), 2, "codex", new Set([key]));
   const override = overrideComment({
@@ -399,27 +405,100 @@ test("settledSurfaces: overridden surface is settled", () => {
     ],
     { actor: "pipeline-bot", trustedOverrideActors: ["operator"] },
   );
-  assert.ok(settledSurfaces(digest).has(surfaceKey(CAP_FINDING)!));
+  assert.ok(settledFindings(digest).some((s) => s.key === key));
 });
 
-test("settledSurfaces: a surface that never appeared in the digest is absent", () => {
+test("settledFindings: a digest with no rounds yields no settled findings", () => {
   const digest = buildPriorRoundDigest([], { actor: "pipeline-bot" });
-  assert.equal(settledSurfaces(digest).size, 0);
+  assert.equal(settledFindings(digest).length, 0);
 });
 
-test("settledSurfaceRounds: attributes the settling round number", () => {
-  const key = findingKey(CAP_FINDING);
-  const round2 = formatReviewComment(cfg, verdict([CAP_FINDING], SHA_1), 2, "codex", new Set([key]));
-  const round3 = formatReviewComment(cfg, verdict([], SHA_2), 2, "codex", new Set());
-  const digest = buildPriorRoundDigest(
-    [
-      { author: "pipeline-bot", body: round2 },
-      { author: "pipeline-bot", body: round3 },
-    ],
-    { actor: "pipeline-bot" },
-  );
-  const rounds = settledSurfaceRounds(digest);
-  assert.equal(rounds.get(surfaceKey(CAP_FINDING)!), 1);
+// ---------------------------------------------------------------------------
+// titleSimilarity / matchSettledFinding (#464)
+// ---------------------------------------------------------------------------
+
+test("titleSimilarity: near-identical restatement is above threshold", () => {
+  const a = "Later compact sections can starve";
+  const b = "Later compact sections can still starve";
+  assert.ok(titleSimilarity(a, b) >= TITLE_SIMILARITY_THRESHOLD);
+});
+
+test("titleSimilarity: the #395 mis-fire pair (distinct defects, same file) is below threshold", () => {
+  const settledTitle = "Artifact copy silently swallows errors instead of surfacing them";
+  const newTitle = "Captured artifacts are not actually PR-visible";
+  assert.ok(titleSimilarity(settledTitle, newTitle) < TITLE_SIMILARITY_THRESHOLD);
+});
+
+test("titleSimilarity: overlapping artifact/validation vocabulary describing distinct defects is below threshold (#464 review round 2)", () => {
+  // Both titles share "malformed artifact manifests" (three tokens), but one
+  // is about validation-time rejection and the other about downstream PR
+  // observability — genuinely distinct defects, not a reworded restatement.
+  const settledTitle = "Reject malformed artifact manifests";
+  const newTitle = "Malformed artifact manifests are not reported to the PR";
+  assert.ok(titleSimilarity(settledTitle, newTitle) < TITLE_SIMILARITY_THRESHOLD);
+});
+
+test("titleSimilarity: empty or unusable title yields 0", () => {
+  assert.equal(titleSimilarity("", "something"), 0);
+  assert.equal(titleSimilarity("something", ""), 0);
+});
+
+test("matchSettledFinding: key match across a differing line band/severity (still the same underlying finding)", () => {
+  const settled: SettledFinding[] = [
+    { key: findingKey({ severity: "high", file: "x.ts", title: "T", line_start: 46 }), surface: "x.ts|correctness", title: "can starve", round: 1 },
+  ];
+  // Same 5-line band (46-50), same key — differing title wording only.
+  const f = { severity: "high", file: "x.ts", category: "correctness", title: "can still starve", line_start: 48 };
+  const match = matchSettledFinding(f, settled);
+  assert.equal(match?.basis, "key");
+  assert.equal(match?.entry.key, settled[0].key);
+});
+
+test("matchSettledFinding: surface-only match (different key, dissimilar title) does NOT match — surface alone never suffices", () => {
+  const settled: SettledFinding[] = [
+    { key: "aaaaaaaa", surface: "x.ts|correctness", title: "Artifact copy silently swallows errors", round: 1 },
+  ];
+  const f = { severity: "high", file: "x.ts", category: "correctness", title: "Captured artifacts are not actually PR-visible" };
+  assert.equal(matchSettledFinding(f, settled), null);
+});
+
+test("matchSettledFinding: title-unavailable legacy entry cannot match by similarity, only by key", () => {
+  const titlelessSettled: SettledFinding[] = [
+    { key: "aaaaaaaa", surface: "x.ts|correctness", title: "(title unavailable)", round: 1 },
+  ];
+  const distinctDefect = { severity: "high", file: "x.ts", category: "correctness", title: "Some new distinct defect" };
+  assert.equal(matchSettledFinding(distinctDefect, titlelessSettled), null, "titleless entry ineligible for similarity branch");
+
+  // A finding whose key happens to equal the titleless entry's key still matches (by key).
+  const forcedKeyFinding = { severity: "high" as const, file: "x.ts", category: "correctness", title: "(title unavailable)" };
+  const forcedMatch = matchSettledFinding(forcedKeyFinding, [
+    { key: findingKey(forcedKeyFinding), surface: "x.ts|correctness", title: "(title unavailable)", round: 1 },
+  ]);
+  assert.equal(forcedMatch?.basis, "key");
+});
+
+test("matchSettledFinding: three-shared-domain-token pair with a distinct predicate on each side does not match despite Jaccard >= threshold (#464 review round 3)", () => {
+  // "Reject unsigned artifact manifests" vs "Unsigned artifact manifests
+  // expire" share three domain tokens (unsigned, artifact, manifest) and
+  // score 3/5 = 0.6 >= TITLE_SIMILARITY_THRESHOLD — but "reject" and "expire"
+  // are each exclusive to one side, describing distinct validation vs.
+  // lifecycle defects. Containment (one title's tokens fully inside the
+  // other's) must gate the match, not Jaccard alone.
+  const settledTitle = "Reject unsigned artifact manifests";
+  const newTitle = "Unsigned artifact manifests expire";
+  assert.ok(titleSimilarity(settledTitle, newTitle) >= TITLE_SIMILARITY_THRESHOLD, "Jaccard alone would match");
+
+  const settled: SettledFinding[] = [
+    { key: "aaaaaaaa", surface: "x.ts|correctness", title: settledTitle, round: 1 },
+  ];
+  const f = { severity: "high" as const, file: "x.ts", category: "correctness", title: newTitle };
+  assert.equal(matchSettledFinding(f, settled), null, "distinct predicate on each side must remain blocking, not auto-demoted");
+});
+
+test("matchSettledFinding: entry with no recorded surface matches only by key, never by surface", () => {
+  const settled: SettledFinding[] = [{ key: "aaaaaaaa", surface: null, title: "legacy finding", round: 1 }];
+  const f = { severity: "high", file: "x.ts", category: "correctness", title: "unrelated" };
+  assert.equal(matchSettledFinding(f, settled), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -524,7 +603,7 @@ test("castrecall-#5-style cap-reversal history: round-3 prompt marks round-1/rou
   );
   // Round 2 (adversarial): demands a hard cap — blocking finding on the limiter surface.
   const capFinding: ReviewFinding = {
-    severity: "high", title: "No cap on concurrent retries — can exhaust the pool",
+    severity: "high", title: "No cap on concurrent retries can exhaust the connection pool",
     file: "src/limiter.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "add a hard cap",
   };
   const capKey = findingKey(capFinding);
@@ -547,14 +626,16 @@ test("castrecall-#5-style cap-reversal history: round-3 prompt marks round-1/rou
   assert.match(prompt, /resolved-by-fix/);
   assert.match(prompt, /No cap on concurrent retries/);
 
-  // Round 3 re-litigates: reviewer now demands the cap be REMOVED — a new finding,
-  // same surface, no acknowledgment of the round-2 decision.
+  // Round 3 re-litigates: reviewer now demands the cap be REMOVED — the SAME
+  // underlying concern (the retry cap on the connection pool), argued the
+  // opposite way, same surface, no acknowledgment of the round-2 decision.
   const capRemovalFinding: ReviewFinding = {
-    severity: "high", title: "The retry cap added in the last fix throttles legitimate bursty traffic",
+    severity: "high",
+    title: "The cap on concurrent retries that exhausts legitimate bursty traffic on the connection pool should be removed",
     file: "src/limiter.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "remove the cap",
   };
   assert.notEqual(findingKey(capRemovalFinding), capKey, "precondition: a genuinely different finding, not an exact-key repeat");
-  const settled = settledSurfaces(digest);
+  const settled = settledFindings(digest);
   const partition = partitionFindings([capRemovalFinding], { block_threshold: "low", min_confidence: 0 }, new Map(), [], new Map(), null, settled);
   assert.equal(partition.blocking.length, 0, "unacknowledged reversal must not silently block");
   assert.equal(partition.advisory.length, 1);
@@ -602,15 +683,106 @@ test("castrecall-#61-style 401/403 reversal history: round-3 prompt marks the se
   assert.match(prompt, /resolved-by-fix/);
   assert.match(prompt, /Unauthenticated request returns 403 instead of 401/);
 
-  // Round 3 reverses the accepted semantics: now demands 403 instead of 401 on the
-  // same surface, without acknowledging round 2's accepted position.
+  // Round 3 reverses the accepted semantics: same underlying question (401 vs
+  // 403 for an unauthenticated request), argued the opposite way, same
+  // surface, without acknowledging round 2's accepted position.
   const authFinding403: ReviewFinding = {
-    severity: "high", title: "Unauthenticated request should return 403, not 401, to avoid leaking route existence",
+    severity: "high",
+    title: "The unauthenticated request should return 403 instead of 401 to avoid leaking route existence",
     file: "src/auth.ts", category: "security", body: "b", confidence: 0.9,
     recommendation: "return 403 uniformly",
   };
-  const settled = settledSurfaces(digest);
+  const settled = settledFindings(digest);
   const partition = partitionFindings([authFinding403], { block_threshold: "low", min_confidence: 0 }, new Map(), [], new Map(), null, settled);
   assert.equal(partition.blocking.length, 0, "unacknowledged 401/403 reversal must not silently block");
   assert.equal(partition.advisory[0].reason, "reversal-unacknowledged");
+});
+
+// ---------------------------------------------------------------------------
+// #464 mis-fire replay: #395's run demoted a genuinely NEW finding because it
+// shared a file/category with a settled one — the bug this change fixes.
+// ---------------------------------------------------------------------------
+
+test("#464 mis-fire replay: a genuinely new, distinct HIGH/0.99 finding on a previously-settled surface blocks per policy", () => {
+  // Round 1's blocking findings on the visual-gate artifact surface — none of
+  // which concern PR-visibility — all settle resolved-by-fix.
+  const whitespaceFinding: ReviewFinding = {
+    severity: "high", title: "Whitespace-only command passes validation and silently no-ops",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "reject",
+  };
+  const symlinkFinding: ReviewFinding = {
+    severity: "high", title: "Symlink target outside the artifact directory is not rejected",
+    file: "src/visual-gate/artifacts.ts", category: "security", body: "b", confidence: 0.9, recommendation: "reject",
+  };
+  const copyErrorFinding: ReviewFinding = {
+    severity: "high", title: "Artifact copy silently swallows errors instead of surfacing them",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "surface errors",
+  };
+  const round1Keys = new Set([whitespaceFinding, symlinkFinding, copyErrorFinding].map(findingKey));
+  const round1 = formatReviewComment(
+    cfg, verdict([whitespaceFinding, symlinkFinding, copyErrorFinding], SHA_1), 2, "codex", round1Keys,
+  );
+  const digest = buildPriorRoundDigest([{ author: "pipeline-bot", body: round1 }], { actor: "pipeline-bot" });
+  const settled = settledFindings(digest);
+  assert.ok(settled.length >= 3, "precondition: all three round-1 findings settled");
+
+  // Round 2: a distinct HIGH/0.99 defect on the SAME file+category as
+  // copyErrorFinding, but about a different concern entirely.
+  const prVisibilityFinding: ReviewFinding = {
+    severity: "high", confidence: 0.99, title: "Captured artifacts are not actually PR-visible",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", recommendation: "attach to the PR",
+  };
+  const partition = partitionFindings(
+    [prVisibilityFinding], { block_threshold: "low", min_confidence: 0 }, new Map(), [], new Map(), null, settled,
+  );
+  assert.equal(partition.blocking.length, 1, "the distinct new defect must block per policy");
+  assert.equal(partition.advisory.filter((a) => a.reason === "reversal-unacknowledged").length, 0);
+});
+
+test("#464 mis-fire replay variant: the same fixture's finding, reworded to genuinely re-raise the settled finding, is demoted", () => {
+  const copyErrorFinding: ReviewFinding = {
+    severity: "high", title: "Artifact copy silently swallows errors instead of surfacing them",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "surface errors",
+  };
+  const round1 = formatReviewComment(
+    cfg, verdict([copyErrorFinding], SHA_1), 2, "codex", new Set([findingKey(copyErrorFinding)]),
+  );
+  const digest = buildPriorRoundDigest([{ author: "pipeline-bot", body: round1 }], { actor: "pipeline-bot" });
+  const settled = settledFindings(digest);
+
+  const reraise: ReviewFinding = {
+    severity: "high", title: "Artifact copy errors are silently swallowed and never surfaced to the reviewer",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "surface errors",
+  };
+  const partition = partitionFindings(
+    [reraise], { block_threshold: "low", min_confidence: 0 }, new Map(), [], new Map(), null, settled,
+  );
+  assert.equal(partition.blocking.length, 0, "a true re-raise without acknowledgment must not block");
+  assert.equal(partition.advisory[0]?.reason, "reversal-unacknowledged");
+});
+
+test("#464 review round 2: a distinct defect sharing only artifact/validation vocabulary with a settled finding remains blocking", () => {
+  // The settled finding is about rejecting malformed manifests at
+  // validation time. The new finding shares three tokens ("malformed
+  // artifact manifests") but is about a different concern entirely —
+  // downstream PR observability — not a re-raise.
+  const rejectFinding: ReviewFinding = {
+    severity: "high", title: "Reject malformed artifact manifests",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "reject",
+  };
+  const round1 = formatReviewComment(
+    cfg, verdict([rejectFinding], SHA_1), 2, "codex", new Set([findingKey(rejectFinding)]),
+  );
+  const digest = buildPriorRoundDigest([{ author: "pipeline-bot", body: round1 }], { actor: "pipeline-bot" });
+  const settled = settledFindings(digest);
+
+  const prVisibilityFinding: ReviewFinding = {
+    severity: "high", confidence: 0.96, title: "Malformed artifact manifests are not reported to the PR",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", recommendation: "attach to the PR",
+  };
+  const partition = partitionFindings(
+    [prVisibilityFinding], { block_threshold: "low", min_confidence: 0 }, new Map(), [], new Map(), null, settled,
+  );
+  assert.equal(partition.blocking.length, 1, "distinct defect with overlapping vocabulary must block per policy");
+  assert.equal(partition.advisory.filter((a) => a.reason === "reversal-unacknowledged").length, 0);
 });

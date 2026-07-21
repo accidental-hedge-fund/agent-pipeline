@@ -20,6 +20,7 @@ import {
   formatBlockingSurfacesMarker,
   surfaceKey,
   type PartitionResult,
+  type ReversalMatch,
   type Review1Risk,
   SPEC_DIVERGENCE_CATEGORY,
 } from "../review-policy.ts";
@@ -63,12 +64,13 @@ function buildBlockingFindingsExtension(
  * When `verdict.commitSha` is present and the call is the full form (cfg supplied),
  * a ReviewArtifact block is appended as the last line after all individual sentinels.
  *
- * `reversalDemotions` (#389, optional): a `findingKey -> settling round number`
- * map for findings `partitionFindings` demoted with reason
+ * `reversalDemotions` (#389, optional): a `findingKey -> ReversalMatch` map
+ * for findings `partitionFindings` demoted with reason
  * `reversal-unacknowledged`. Each such finding's line renders a
- * `REVERSAL-UNACKNOWLEDGED` tag naming the round that settled its surface, so
- * the demotion is visible on the finding itself rather than only in the
- * separate advisory-advance comment.
+ * `REVERSAL-UNACKNOWLEDGED` tag naming the specific settled finding it
+ * re-raises (key + title) and the round that settled it (#464), so the
+ * demotion is visible on the finding itself rather than only in the separate
+ * advisory-advance comment.
  */
 export function formatReviewComment(
   cfgOrVerdict: PipelineConfig | (ReviewVerdict & { _raw?: string }),
@@ -78,7 +80,7 @@ export function formatReviewComment(
   blockingKeys?: Set<string>,
   diffHash?: string,
   review1Risk?: Review1Risk,
-  reversalDemotions?: Map<string, number>,
+  reversalDemotions?: Map<string, ReversalMatch>,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -111,8 +113,10 @@ export function formatReviewComment(
         f.category === SPEC_DIVERGENCE_CATEGORY && f.spec_divergence_direction
           ? ` ${directionMarker(f.spec_divergence_direction)}`
           : "";
-      const settlingRound = reversalDemotions?.get(findingKey(f));
-      const reversalTag = settlingRound !== undefined ? ` \`REVERSAL-UNACKNOWLEDGED: settled in round ${settlingRound}\`` : "";
+      const reversalMatch = reversalDemotions?.get(findingKey(f));
+      const reversalTag = reversalMatch
+        ? ` \`REVERSAL-UNACKNOWLEDGED: re-raises ${reversalMatch.settledKey} "${reversalMatch.settledTitle}" settled in round ${reversalMatch.settledRound}\``
+        : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}`);
       // Machine-readable payload fingerprint, emitted at render time from the
       // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
@@ -188,7 +192,7 @@ export function formatDeltaReviewComment(
   reviewer: string,
   blockingKeys?: Set<string>,
   diffHash?: string,
-  reversalDemotions?: Map<string, number>,
+  reversalDemotions?: Map<string, ReversalMatch>,
 ): string {
   const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
   const heading = shortSha
@@ -210,8 +214,10 @@ export function formatDeltaReviewComment(
         f.category === SPEC_DIVERGENCE_CATEGORY && f.spec_divergence_direction
           ? ` ${directionMarker(f.spec_divergence_direction)}`
           : "";
-      const settlingRound = reversalDemotions?.get(findingKey(f));
-      const reversalTag = settlingRound !== undefined ? ` \`REVERSAL-UNACKNOWLEDGED: settled in round ${settlingRound}\`` : "";
+      const reversalMatch = reversalDemotions?.get(findingKey(f));
+      const reversalTag = reversalMatch
+        ? ` \`REVERSAL-UNACKNOWLEDGED: re-raises ${reversalMatch.settledKey} "${reversalMatch.settledTitle}" settled in round ${reversalMatch.settledRound}\``
+        : "";
       lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}`);
       // Machine-readable payload fingerprint, emitted at render time from the
       // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers

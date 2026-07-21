@@ -49,8 +49,9 @@ import {
   findingKey,
   partitionFindings,
   surfaceKey,
+  type ReversalMatch,
 } from "../review-policy.ts";
-import { buildPriorRoundDigest, settledSurfaceRounds, settledSurfaces, type PriorRoundDigest } from "../review-history.ts";
+import { buildPriorRoundDigest, settledFindings, type PriorRoundDigest } from "../review-history.ts";
 import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { buildDeltaReviewPrompt, buildFixPrompt } from "../prompts/index.ts";
@@ -1347,21 +1348,19 @@ export async function enforceReviewShaGate(
       // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
       const overrides = extractOverrides(trustedOverrideComments);
       const scopes = extractScopedOverrides(trustedOverrideComments);
-      const settled = settledSurfaces(priorRoundsDigest);
+      const settled = settledFindings(priorRoundsDigest);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled);
-      const settledRounds = settledSurfaceRounds(priorRoundsDigest);
-      const reversalDemotions = new Map<string, number>();
-      for (const { finding, reason } of partition.advisory) {
-        if (reason !== "reversal-unacknowledged") continue;
-        const surface = surfaceKey(finding);
-        const settlingRound = surface !== null ? settledRounds.get(surface) : undefined;
-        if (settlingRound === undefined) continue;
-        reversalDemotions.set(findingKey(finding), settlingRound);
+      const reversalDemotions = new Map<string, ReversalMatch>();
+      for (const { finding, reason, reversalMatch } of partition.advisory) {
+        if (reason !== "reversal-unacknowledged" || !reversalMatch) continue;
+        reversalDemotions.set(findingKey(finding), reversalMatch);
         if (deps.runDir) {
           const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
           await appendEvent(deps.runDir, {
             schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
-            finding_key: findingKey(finding), surface, settling_round: settlingRound,
+            finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+            settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
+            matched_by: reversalMatch.matchedBy,
           }, deps.runStoreDeps).catch(() => {});
         }
       }
@@ -1492,8 +1491,7 @@ export async function enforceReviewShaGate(
             const reReviewDigest = buildPriorRoundDigest(reReviewIssueDetail.comments, {
               actor, trustedOverrideActors: cfg.trusted_override_actors,
             });
-            const reSettled = settledSurfaces(reReviewDigest);
-            const reSettledRounds = settledSurfaceRounds(reReviewDigest);
+            const reSettled = settledFindings(reReviewDigest);
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
               deps.runDir
@@ -1518,18 +1516,17 @@ export async function enforceReviewShaGate(
             const reEffective = reResult.effectiveReviewer ?? cfg.harnesses.reviewer;
             const reSelfReview = reResult.selfReview ?? false;
             const reLabel = reSelfReview ? `${reEffective} (self-review)` : reEffective;
-            const reReversalDemotions = new Map<string, number>();
-            for (const { finding, reason } of rePartition.advisory) {
-              if (reason !== "reversal-unacknowledged") continue;
-              const surface = surfaceKey(finding);
-              const settlingRound = surface !== null ? reSettledRounds.get(surface) : undefined;
-              if (settlingRound === undefined) continue;
-              reReversalDemotions.set(findingKey(finding), settlingRound);
+            const reReversalDemotions = new Map<string, ReversalMatch>();
+            for (const { finding, reason, reversalMatch } of rePartition.advisory) {
+              if (reason !== "reversal-unacknowledged" || !reversalMatch) continue;
+              reReversalDemotions.set(findingKey(finding), reversalMatch);
               if (deps.runDir) {
                 const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
                 await appendEvent(deps.runDir, {
                   schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
-                  finding_key: findingKey(finding), surface, settling_round: settlingRound,
+                  finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+                  settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
+                  matched_by: reversalMatch.matchedBy,
                 }, deps.runStoreDeps).catch(() => {});
               }
             }
