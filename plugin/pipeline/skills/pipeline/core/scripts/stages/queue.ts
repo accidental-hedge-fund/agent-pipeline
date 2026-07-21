@@ -56,8 +56,13 @@ export interface QueueOpts {
   profile?: string;
   batchId: string;
   base?: string;
-  /** Opt-in papercut auto-file settings (#421). Absent/auto_file:false → inert. */
+  /** Pipeline domain (#421 finding 2) — required when `papercuts.auto_file` is
+   *  set, so the batch-end auto-file trigger shares the same repository-wide
+   *  lock namespace as the run-finalization trigger. */
+  domain?: string;
+  /** Opt-in papercut auto-file settings (#421). Absent/enabled:false/auto_file:false → inert. */
   papercuts?: {
+    enabled: boolean;
     auto_file: boolean;
     auto_file_window_hours: number;
     auto_file_max_per_window: number;
@@ -110,6 +115,7 @@ export interface QueueDeps {
    *  `autoFilePapercuts` from `./papercut.ts`. */
   autoFilePapercuts(opts: {
     repoDir: string;
+    domain: string;
     windowHours: number;
     maxPerWindow: number;
     minOccurrences: number;
@@ -711,9 +717,10 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
 
   // Opt-in papercut auto-file (#421): best-effort, gated on resolved config,
   // wrapped so a failure here can never alter the batch's outcome or exit status.
-  if (opts.papercuts?.auto_file) {
+  if (opts.papercuts?.enabled && opts.papercuts?.auto_file && opts.domain) {
     await deps.autoFilePapercuts({
       repoDir: opts.repoDir,
+      domain: opts.domain,
       windowHours: opts.papercuts.auto_file_window_hours,
       maxPerWindow: opts.papercuts.auto_file_max_per_window,
       minOccurrences: opts.papercuts.auto_file_min_occurrences,

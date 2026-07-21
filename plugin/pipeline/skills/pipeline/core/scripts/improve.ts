@@ -61,8 +61,10 @@ export interface ImproveDeps {
   createIssue: (title: string, body: string) => Promise<string>;
   /** Check gh auth status. Returns true if authenticated. */
   ghAuthCheck: () => Promise<boolean>;
-  /** List open issues whose title carries the `[pipeline-improve]` prefix
-   *  (#421 dedup). Called once per invocation regardless of cluster count. */
+  /** List issues (open and closed) whose title carries the `[pipeline-improve]`
+   *  prefix. Callers that need dedup filter to `state === "OPEN"` themselves;
+   *  callers that need a rate-window count (#421 finding 3) use both states.
+   *  Called once per invocation regardless of cluster count. */
   listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
   log: (msg: string) => void;
 }
@@ -114,9 +116,12 @@ export function realImproveDeps(repoDir: string): ImproveDeps {
       return r.status === 0;
     },
     listOpenImproveIssues: async () => {
+      // --state all (not "open"): the auto-file rate-window cap (#421 finding 3)
+      // must count closed auto-filed issues too, so callers that need only open
+      // issues (dedup) filter on `state === "OPEN"` themselves.
       const r = spawnSync(
         "gh",
-        ["issue", "list", "--state", "open", "--json", "title,state,createdAt,number,url,labels", "--limit", "200"],
+        ["issue", "list", "--state", "all", "--json", "title,state,createdAt,number,url,labels", "--limit", "200"],
         { encoding: "utf8", cwd: repoDir },
       );
       if (r.status !== 0) {
@@ -557,6 +562,10 @@ export async function applyIssues(
     const url = await deps.createIssue(title, body);
     c.issueUrl = url || null;
     deps.log(`Created issue: ${url}`);
+    // Reserve the title in-memory (#421 finding 4): two clusters whose signals
+    // differ only past the 60-char truncation in proposedTitle() must not both
+    // create an issue for the same title within one invocation.
+    byTitle.set(title, { title, url: url || "", state: "OPEN", createdAt: "", labels: [] });
   }
 }
 

@@ -576,8 +576,33 @@ test("papercut auto-file: auto_file false makes zero autoFilePapercuts calls", a
   });
   await runQueue(
     makeOpts({
+      domain: "test-domain",
       papercuts: {
+        enabled: true,
         auto_file: false,
+        auto_file_window_hours: 24,
+        auto_file_max_per_window: 3,
+        auto_file_min_occurrences: 3,
+      },
+    }),
+    deps,
+  );
+  assert.equal(calls, 0);
+});
+
+test("papercut auto-file: enabled false makes zero autoFilePapercuts calls even when auto_file is true", async () => {
+  const issues = [makeIssue(1)];
+  let calls = 0;
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    autoFilePapercuts: async () => { calls++; },
+  });
+  await runQueue(
+    makeOpts({
+      domain: "test-domain",
+      papercuts: {
+        enabled: false,
+        auto_file: true,
         auto_file_window_hours: 24,
         auto_file_max_per_window: 3,
         auto_file_min_occurrences: 3,
@@ -590,7 +615,7 @@ test("papercut auto-file: auto_file false makes zero autoFilePapercuts calls", a
 
 test("papercut auto-file: auto_file true fires exactly once at batch end with resolved settings", async () => {
   const issues = [makeIssue(1)];
-  const calls: Array<{ repoDir: string; windowHours: number; maxPerWindow: number; minOccurrences: number }> = [];
+  const calls: Array<{ repoDir: string; domain: string; windowHours: number; maxPerWindow: number; minOccurrences: number }> = [];
   const deps = makeDeps({
     listEligibleIssues: async () => issues,
     autoFilePapercuts: async (opts) => { calls.push(opts); },
@@ -598,7 +623,9 @@ test("papercut auto-file: auto_file true fires exactly once at batch end with re
   await runQueue(
     makeOpts({
       repoDir: "/fake/repo",
+      domain: "test-domain",
       papercuts: {
+        enabled: true,
         auto_file: true,
         auto_file_window_hours: 12,
         auto_file_max_per_window: 2,
@@ -610,6 +637,7 @@ test("papercut auto-file: auto_file true fires exactly once at batch end with re
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0], {
     repoDir: "/fake/repo",
+    domain: "test-domain",
     windowHours: 12,
     maxPerWindow: 2,
     minOccurrences: 4,
@@ -628,8 +656,10 @@ test("papercut auto-file: a failing autoFilePapercuts still leaves batch-summary
     runQueue(
       makeOpts({
         repoDir: "/fake/repo",
+        domain: "test-domain",
         batchId: "2026-02-02T00-00-00-000Z",
         papercuts: {
+          enabled: true,
           auto_file: true,
           auto_file_window_hours: 24,
           auto_file_max_per_window: 3,

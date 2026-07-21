@@ -787,6 +787,23 @@ test("applyIssues: a closed issue with a matching title does not suppress creati
   assert.equal(clusters[0].alreadyTracked, undefined);
 });
 
+test("applyIssues: two clusters that truncate to the same title in one invocation create only one issue (finding 4)", async () => {
+  const longPrefix = "x".repeat(80);
+  const clusters: ClusterEntry[] = [
+    { category: "papercut", signal: `${longPrefix} variant one`, count: 5, runIds: ["run-1"], excerpt: "e" },
+    { category: "papercut", signal: `${longPrefix} variant two`, count: 4, runIds: ["run-2"], excerpt: "e" },
+  ];
+  const deps = makeApplyDeps();
+  await applyIssues(clusters, { minOccurrences: 3 }, deps);
+  assert.equal(
+    deps._createCalls.length,
+    1,
+    "both signals truncate to the same 60-char proposedTitle() — only one issue should be created",
+  );
+  assert.equal(clusters[0].issueUrl, "https://github.com/org/repo/issues/1");
+  assert.equal(clusters[1].alreadyTracked, true, "the second cluster should be recognized as a duplicate of the just-created title");
+});
+
 test("applyIssues: listOpenImproveIssues is called exactly once regardless of cluster count", async () => {
   const clusters: ClusterEntry[] = [
     { category: "blocker", signal: "ci failed", count: 5, runIds: ["run-1"], excerpt: "e" },

@@ -888,10 +888,11 @@ export async function runAdvance(
           }
           // Opt-in papercut auto-file (#421): best-effort, gated on resolved
           // config, wrapped so a failure here can never alter the run's outcome.
-          if (cfg.papercuts.auto_file) {
+          if (cfg.papercuts.enabled && cfg.papercuts.auto_file) {
             await autoFilePapercuts(
               {
                 repoDir: cfg.repo_dir,
+                domain: cfg.domain,
                 windowHours: cfg.papercuts.auto_file_window_hours,
                 maxPerWindow: cfg.papercuts.auto_file_max_per_window,
                 minOccurrences: cfg.papercuts.auto_file_min_occurrences,
