@@ -6,13 +6,17 @@ import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import {
   buildScoreboardReport,
+  escapeHtml,
   formatScoreboardHuman,
   parseEstimateCosts,
   parseScoreboardBucket,
   parseScoreboardGroupBy,
   parseScoreboardWindow,
+  renderScoreboardHtml,
   resolveGroupIdentity,
+  runScoreboard,
   type ScoreboardDeps,
+  type ScoreboardReport,
 } from "../scripts/scoreboard.ts";
 import { runsDir } from "../scripts/run-store.ts";
 
@@ -1299,4 +1303,358 @@ test("CLI: pipeline scoreboard --by harness --by model fails with a repeated-fla
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// --html self-contained offline export (#427)
+// ---------------------------------------------------------------------------
+
+function htmlFixtureReport(): ScoreboardReport {
+  const metrics = {
+    ready_to_deploy_without_human_intervention: { numerator: 3, denominator: 4, ratio: 0.75 },
+    cost_per_ready_pr_usd: {
+      value: 1.2345,
+      denominator: 4,
+      total_usd: 4.938,
+      actual_usd: 3.0,
+      estimated_usd: 1.938,
+      actual_call_count: 10,
+      estimated_call_count: 2,
+      missing_call_count: 0,
+    },
+    cost_accounting: {
+      totals: {
+        invocation_count: 12,
+        total_duration_ms: 65000,
+        command_count: 20,
+        subprocess_count: 5,
+        actual_cost_usd: 3.0,
+        estimated_cost_usd: 1.938,
+        unknown_cost_count: 0,
+        prompt_chars_total: 5000,
+        prompt_chars_max: 900,
+        prompt_estimated_tokens_total: 1250,
+      },
+      groups: [
+        {
+          issue: 42,
+          stage: "review<script>",
+          harness: "claude&code",
+          model_slot: 'primary"slot',
+          model: "sonnet'5",
+          outcome: "success",
+          invocation_count: 6,
+          total_duration_ms: 30000,
+          command_count: 10,
+          subprocess_count: 2,
+          actual_cost_usd: 1.5,
+          estimated_cost_usd: 0,
+          unknown_cost_count: 0,
+          prompt_chars_total: 2500,
+          prompt_chars_max: 500,
+          prompt_estimated_tokens_total: 600,
+        },
+      ],
+      coverage: { actual_calls: 10, estimated_calls: 2, unknown_calls: 0, actual_coverage: 0.8333 },
+    },
+    full_run_duration_ms: { count: 4, total_ms: 240000, min_ms: 30000, max_ms: 90000, avg_ms: 60000 },
+    stage_duration_ms: {
+      "planning<x>": { count: 4, total_ms: 40000, min_ms: 5000, max_ms: 15000, avg_ms: 10000 },
+      review: { count: 0, total_ms: 0, min_ms: null, max_ms: null, avg_ms: null },
+    },
+    harness_calls_per_successful_pr: { numerator: 16, denominator: 4, ratio: 4 },
+    retry_fix_rounds_per_pr: { numerator: 0, denominator: 0, ratio: null },
+    blocker_rate_by_kind: {
+      denominator: 8,
+      counts: { "needs-review&approve": 2, 'manual"gate': 1 },
+      rates: {
+        "needs-review&approve": { numerator: 2, denominator: 8, ratio: 0.25 },
+        'manual"gate': { numerator: 1, denominator: 8, ratio: 0.125 },
+      },
+    },
+    needs_human_rate: { numerator: 1, denominator: 8, ratio: 0.125 },
+    same_harness_fallback_rate: { numerator: 0, denominator: 0, ratio: null },
+    gate_pass_rates: {
+      test: { pass_rate: { numerator: 4, denominator: 4, ratio: 1 }, passed: 4, failed: 0, skipped: 0 },
+      eval: { pass_rate: { numerator: 0, denominator: 0, ratio: null }, passed: 0, failed: 0, skipped: 4 },
+      shipcheck: { pass_rate: { numerator: 3, denominator: 4, ratio: 0.75 }, passed: 3, failed: 1, skipped: 0 },
+    },
+  };
+
+  return {
+    schema_version: 1,
+    window: { since: "2026-06-01T00:00:00.000Z", until: "2026-07-01T00:00:00.000Z", days: 30 },
+    totals: { scanned_runs: 10, included_runs: 8, ready_runs: 5, successful_prs: 4, diagnostics: 1 },
+    metrics,
+    diagnostics: [
+      {
+        severity: "warning",
+        code: "missing_pr_for_ready_run",
+        path: "/runs/<abc>",
+        message: `Run 'x' has "quotes" & <tags>`,
+      },
+    ],
+    by: "harness",
+    grouping: {
+      groups: [
+        {
+          key: "claude&code",
+          invocation_count: 12,
+          total_duration_ms: 65000,
+          command_count: 20,
+          subprocess_count: 5,
+          actual_cost_usd: 3.0,
+          estimated_cost_usd: 1.938,
+          unknown_cost_count: 0,
+          prompt_chars_total: 5000,
+          prompt_chars_max: 900,
+          prompt_estimated_tokens_total: 1250,
+          actual_calls: 10,
+          estimated_calls: 2,
+          unknown_calls: 0,
+          actual_coverage: 0.8333,
+        },
+      ],
+    },
+    bucket: "week",
+    series: [
+      {
+        start: "2026-06-01T00:00:00.000Z",
+        end: "2026-06-08T00:00:00.000Z",
+        totals: { scanned_runs: 3, included_runs: 3, ready_runs: 2, successful_prs: 2, diagnostics: 0 },
+        metrics,
+      },
+    ],
+  };
+}
+
+test("escapeHtml: escapes all five HTML metacharacters (#427)", () => {
+  assert.equal(escapeHtml(`<script>&"'</script>`), "&lt;script&gt;&amp;&quot;&#39;&lt;/script&gt;");
+});
+
+test("renderScoreboardHtml: produces one complete document with no external resource references (#427)", () => {
+  const html = renderScoreboardHtml(htmlFixtureReport());
+  assert.ok(html.startsWith("<!DOCTYPE html>"));
+  assert.ok(html.trimEnd().endsWith("</html>"));
+  for (const forbidden of ["<script", "src=", "href=", "@import", "url(", "fetch(", "XMLHttpRequest", "http://", "https://", "//"]) {
+    assert.equal(html.includes(forbidden), false, `found forbidden token: ${forbidden}`);
+  }
+  assert.match(html, /<style>/);
+});
+
+test("renderScoreboardHtml: metric values match formatScoreboardHuman output (#427)", () => {
+  const report = htmlFixtureReport();
+  const human = formatScoreboardHuman(report);
+  const html = renderScoreboardHtml(report);
+  const tokens = [
+    "75.0% (3/4)",
+    "$1.2345",
+    "actual $3.0000",
+    "estimated $1.9380",
+    "avg 1m 0s",
+    "4.00 (16/4)",
+    "12.5% (1/8)",
+    "100.0% (4/4)",
+  ];
+  for (const token of tokens) {
+    assert.ok(human.includes(token), `test fixture bug: token missing from human output: ${token}`);
+    assert.ok(html.includes(token), `value not found in html export: ${token}`);
+  }
+});
+
+test("renderScoreboardHtml: null ratios and averages render as n/a, never 0 (#427)", () => {
+  const html = renderScoreboardHtml(htmlFixtureReport());
+  assert.ok(html.includes("n/a (0/0)"), "retry/fix-round and fallback rates must render n/a, not 0");
+  assert.ok(html.includes("review: n/a"), "a stage with no provable duration must render n/a");
+});
+
+test("renderScoreboardHtml: run-derived strings are escaped and cannot inject markup (#427)", () => {
+  const html = renderScoreboardHtml(htmlFixtureReport());
+  assert.equal(html.includes("<script>"), false);
+  assert.equal(html.includes("review<script>"), false);
+  assert.ok(html.includes("review&lt;script&gt;"));
+  assert.ok(html.includes("claude&amp;code"));
+  assert.ok(html.includes("primary&quot;slot"));
+  assert.ok(html.includes("sonnet&#39;5"));
+  assert.ok(html.includes("needs-review&amp;approve"));
+  assert.ok(html.includes("manual&quot;gate"));
+  assert.ok(html.includes("planning&lt;x&gt;"));
+  assert.ok(html.includes("/runs/&lt;abc&gt;"));
+  assert.ok(html.includes("&#39;x&#39;"));
+  assert.ok(html.includes("&quot;quotes&quot;"));
+  assert.ok(html.includes("&lt;tags&gt;"));
+});
+
+test("renderScoreboardHtml: rendering the same report twice is byte-identical (#427)", () => {
+  assert.equal(renderScoreboardHtml(htmlFixtureReport()), renderScoreboardHtml(htmlFixtureReport()));
+});
+
+test("runScoreboard: without --html the write seam is never invoked and stdout is unchanged (#427)", async () => {
+  const logs: string[] = [];
+  const deps: ScoreboardDeps = {
+    readFile: async (p: string) => { throw enoent(p); },
+    readdir: async () => { throw enoent(runsDir(REPO_DIR)); },
+    log: (msg: string) => logs.push(msg),
+    writeFile: async () => { throw new Error("writeFile must not be called without --html"); },
+    rename: async () => { throw new Error("rename must not be called without --html"); },
+    unlink: async () => { throw new Error("unlink must not be called without --html"); },
+  };
+  await runScoreboard({ repoDir: REPO_DIR }, deps);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /# pipeline scoreboard/);
+});
+
+test("runScoreboard: a failure after the write starts removes the temp file, writes nothing at the destination, and names the path (#427)", async () => {
+  const written = new Map<string, string>();
+  let unlinkedPath: string | null = null;
+  const deps: ScoreboardDeps = {
+    readFile: async (p: string) => { throw enoent(p); },
+    readdir: async () => { throw enoent(runsDir(REPO_DIR)); },
+    log: () => {},
+    writeFile: async (p: string, content: string) => { written.set(p, content); },
+    rename: async () => { throw new Error("EBOOM: simulated rename failure"); },
+    unlink: async (p: string) => { unlinkedPath = p; written.delete(p); },
+  };
+  await assert.rejects(
+    () => runScoreboard({ repoDir: REPO_DIR, html: "/out/report.html" }, deps),
+    /cannot write HTML export to \/out\/report\.html/,
+  );
+  assert.ok(unlinkedPath, "the temp file must be removed on failure");
+  assert.equal(written.has("/out/report.html"), false, "no bytes must land at the destination");
+  assert.equal(written.size, 0, "the temp file must not remain either");
+});
+
+test("CLI: pipeline scoreboard --html writes one complete document and exits 0, touching nothing under .agent-pipeline/runs (#427)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-basic-"));
+  try {
+    const dest = path.join(repo, "report.html");
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--repo-path", repo, "--html", dest],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+    assert.ok(fs.existsSync(dest));
+    const html = fs.readFileSync(dest, "utf8");
+    assert.ok(html.startsWith("<!DOCTYPE html>"));
+    assert.ok(html.trimEnd().endsWith("</html>"));
+    assert.equal(fs.existsSync(runsDir(repo)), false, "the export must never create the run store");
+    assert.deepEqual(fs.readdirSync(repo).sort(), ["report.html"], "no other file may be created");
+    // Stdout must still carry the normal human report.
+    assert.match(result.stdout, /Report window:/);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --html --json writes both the JSON to stdout and the HTML file (#427)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-json-"));
+  try {
+    const dest = path.join(repo, "report.html");
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--repo-path", repo, "--html", dest, "--json"],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.schema_version, 1);
+    assert.ok(fs.existsSync(dest));
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --html composes with --bucket and --by (#427)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-compose-"));
+  try {
+    const dest = path.join(repo, "report.html");
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard",
+        "--repo-path", repo, "--html", dest, "--bucket", "day", "--by", "harness", "--days", "3",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+    const html = fs.readFileSync(dest, "utf8");
+    assert.match(html, /Per-period breakdown \(day\)/);
+    assert.match(html, /Grouped by harness/);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --html fails clearly when the parent directory is missing, leaving no file behind (#427)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-badparent-"));
+  try {
+    const dest = path.join(repo, "missing-dir", "report.html");
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--repo-path", repo, "--html", dest],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot write HTML export/);
+    assert.ok(result.stderr.includes(dest), "the error must name the destination path");
+    assert.equal(fs.existsSync(dest), false);
+    assert.equal(fs.existsSync(path.join(repo, "missing-dir")), false, "the missing parent must not be created");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --html fails clearly when the destination is an existing directory, leaving no temp file behind (#427)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-isdir-"));
+  try {
+    const dest = path.join(repo, "report.html");
+    fs.mkdirSync(dest);
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--repo-path", repo, "--html", dest],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot write HTML export/);
+    assert.ok(result.stderr.includes(dest));
+    assert.deepEqual(fs.readdirSync(repo).sort(), ["report.html"], "only the pre-existing directory may remain");
+    assert.deepEqual(fs.readdirSync(dest), [], "no temp file may be left beside/under the destination");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+if (process.getuid && process.getuid() !== 0) {
+  test("CLI: pipeline scoreboard --html fails clearly when the destination directory is unwritable, leaving no file behind (#427)", () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-unwritable-"));
+    const targetDir = path.join(repo, "locked");
+    fs.mkdirSync(targetDir);
+    fs.chmodSync(targetDir, 0o500);
+    try {
+      const dest = path.join(targetDir, "report.html");
+      const result = spawnSync(
+        process.execPath,
+        ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--repo-path", repo, "--html", dest],
+        { encoding: "utf8" },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /cannot write HTML export/);
+      assert.ok(result.stderr.includes(dest));
+      assert.equal(fs.existsSync(dest), false);
+    } finally {
+      fs.chmodSync(targetDir, 0o700);
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+}
+
+test("CLI: pipeline scoreboard --help documents --html <path> (#427)", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--help"],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+  assert.match(result.stdout, /--html <path>/);
 });

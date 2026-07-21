@@ -81,6 +81,7 @@ $pipeline summary <run-id>               print evidence bundle for an exact run 
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
 $pipeline scoreboard --by <dimension>    group scoreboard metrics by harness|model|effort|executor (exactly one; missing/absent identities report as `unknown`, dimensions that can't apply — e.g. executor on a local-harness stage — report as `not applicable`)
+$pipeline scoreboard --html <path>       write a self-contained, offline HTML export of the report to <path> (local/archival only; makes no network requests, composes with the other scoreboard flags)
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
