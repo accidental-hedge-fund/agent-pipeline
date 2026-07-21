@@ -67,6 +67,15 @@ export interface HarnessTelemetry {
   text: string | null;
   costUsd: number | null;
   usage: Record<string, unknown> | null;
+  /** The actual model that served this call, recovered from the CLI's own
+   *  machine-readable output (e.g. claude's `modelUsage` envelope key) — never
+   *  guessed or copied from the requested model. `null` when the CLI's output
+   *  doesn't report one (review-2 finding 0b0c7e4b). */
+  resolvedModel: string | null;
+  /** Whether the CLI's own output reported a rate-limit/throttle signal for
+   *  this call. `null` when the CLI reports no such signal at all (not the
+   *  same as "not throttled" — see review-2 finding 0b0c7e4b). */
+  throttled: boolean | null;
 }
 
 /** Thin, injectable I/O seam for preflight checks — the same shape as
@@ -106,6 +115,14 @@ export interface AdapterProbe {
   /** e.g. "oauth:anthropic", "api-key:xai", or "unknown". Never inferred from
    *  the model name — a model alias can be served by more than one route. */
   providerAuthClass: string;
+  /** The actual model that served this call, recovered from the adapter's own
+   *  telemetry parsing (review-2 finding 0b0c7e4b) — `null` when the CLI's
+   *  output doesn't report one. Never copied from the requested model. */
+  resolvedModel?: string | null;
+  /** Whether the adapter's telemetry parsing found a rate-limit/throttle
+   *  signal for this call. `null`/absent when the CLI reports no such signal
+   *  at all — not the same as "not throttled". */
+  throttled?: boolean | null;
 }
 
 /** Treatment identity recorded into stage accounting (design.md decision 5, 6). */
@@ -119,9 +136,14 @@ export interface HarnessTreatment {
   resolvedEffort: string | null;
   /** Native CLI flag names actually used for this invocation (e.g. ["--model", "--effort"]). */
   nativeFlags: string[];
-  /** Whether this invocation was subject to a provider fallback or throttling.
-   *  No adapter implements fallback logic today — always false, never fabricated. */
-  fallback: boolean;
+  /** Whether this invocation was subject to a provider fallback. No adapter
+   *  has a documented way to detect a fallback today, so this is `null`
+   *  (unknown) rather than a fabricated `false` (review-2 finding 0b0c7e4b) —
+   *  it must never be inferred, only recovered from documented CLI output. */
+  fallback: boolean | null;
+  /** Whether this invocation was subject to provider-side throttling, per the
+   *  adapter's own probe (`null` when the CLI reports no such signal). */
+  throttled: boolean | null;
 }
 
 /** The complete adapter contract. Every registered adapter must implement
@@ -153,4 +175,10 @@ export function parseJsonLine(line: string): Record<string, unknown> | null {
 
 /** The empty telemetry result every adapter falls back to on unparseable or
  *  absent output — single-sourced so every adapter degrades identically. */
-export const EMPTY_TELEMETRY: HarnessTelemetry = { text: null, costUsd: null, usage: null };
+export const EMPTY_TELEMETRY: HarnessTelemetry = {
+  text: null,
+  costUsd: null,
+  usage: null,
+  resolvedModel: null,
+  throttled: null,
+};

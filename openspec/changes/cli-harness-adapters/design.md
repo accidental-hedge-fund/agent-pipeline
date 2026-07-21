@@ -134,7 +134,11 @@ when the CLI offers one) and never name a flag for these two.
 - `--provider <name>` + `--model <pattern>` — model selection (`provider/id` or bare id with
   optional `:<thinking>` suffix)
 - `--thinking <level>` — reasoning effort, one of `off|minimal|low|medium|high|xhigh|max` → effort
-  flag, recorded verbatim, no mapping
+  flag, recorded verbatim, no mapping. Preflight validates a requested effort against this exact
+  enum and fails as `unsupported-setting` otherwise (review-2 finding 16ab70d8) — this is the one
+  adapter where the valid set is itself verified and closed, so it's the one adapter that validates
+  it; grok/opencode/claude/codex effort values remain provider-defined open sets with no verified
+  enum to validate against (golden rule 5 forbids guessing one).
 - `-a, --approve` / `-na, --no-approve` — trust/permission mode for project-local files; the
   adapter always passes `-a` for pipeline invocations (unattended headless run, no TTY to answer a
   trust prompt) and records that in `describeTreatment` → `sandbox: true` capability, always-on for
@@ -142,16 +146,16 @@ when the CLI offers one) and never name a flag for these two.
 - **No documented `--cwd`/`-C` flag.** Pi has no working-directory override; it operates on the
   process's current working directory. → `workingDir: "cwd"` (adapter spawns with `cwd` set to the
   stage worktree, like claude's mechanism, not like codex/grok's explicit flag).
-- **No documented non-interactive login-status probe.** The only auth commands found are the
-  interactive `/login`/`/logout` REPL commands and an `--api-key <key>` override flag; there is no
-  `pi auth status`-equivalent. Preflight therefore can verify "CLI on `PATH`" and "`-p`/`--mode
-  json` flags exist in `pi --help`" but **cannot** distinguish "authenticated" from
-  "unauthenticated" before spawning a real request. Per decision 7 ("preflight fails loudly rather
-  than silently drop"), the pi adapter's preflight reports this sub-check as
-  `authState: "unknown"` (not `pass`/`fail`) with an explicit message that pi has no documented
-  auth-status probe and the first real invocation is the actual auth test — this is a documented
-  adapter limitation, not a guess, and doctor surfaces it as a distinct informational result rather
-  than blocking the run on it.
+- **No `pi auth status`-equivalent, but `--list-models` doubles as an authenticated-only probe
+  (verified live, review-2 finding 73d2e88a).** There is no interactive-free command that reports
+  login state directly — only the interactive `/login`/`/logout` REPL commands and an `--api-key
+  <key>` override flag exist for auth itself. However, `pi --list-models` run with no provider
+  authenticated prints `"No models available. Use /login ..."` to stdout and exits 0; run
+  authenticated it prints the actual model listing instead. Preflight uses this same "empty vs.
+  populated listing" shape already used for `opencode providers list`: an empty/no-models response
+  is treated as `unauthenticated` and blocks the stage (never `ok: true` on an unverified state),
+  a non-empty listing as `authenticated`. This supersedes the earlier `authState: "unknown"`
+  pass-through design, which let an unverified auth state reach stage invocation.
 
 ## Decision 5 — Adapter identity ≠ provider identity
 

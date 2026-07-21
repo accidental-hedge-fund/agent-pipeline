@@ -123,11 +123,15 @@ export const opencodeAdapter: HarnessAdapter = {
       cliVersion: probe.cliVersion,
       providerAuthClass: probe.providerAuthClass,
       requestedModel: req.model ?? null,
-      resolvedModel: req.model ?? null,
+      // The default (non-`--format json`) invocation carries no
+      // machine-readable envelope, so the actually-resolved model/effort are
+      // unknown, never echoed from the request (review-2 finding 0b0c7e4b).
+      resolvedModel: probe.resolvedModel ?? null,
       requestedEffort: req.effort ?? null,
-      resolvedEffort: req.effort ?? null,
+      resolvedEffort: null,
       nativeFlags,
-      fallback: false,
+      fallback: null,
+      throttled: probe.throttled ?? null,
     };
   },
 };

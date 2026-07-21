@@ -104,14 +104,67 @@ test("pi preflight: --help succeeding without -p/--print documented blocks as he
   assert.equal(result.failure, "headless-unavailable");
 });
 
-test("pi preflight: --help documents -p and succeeds is ready, with auth reported as unknown (not fabricated)", async () => {
+test("pi preflight: --help documents -p and --list-models reports a real model is ready and authenticated", async () => {
   const deps = fakeDeps({
     execCheck: () => true,
-    exec: () => ({ ok: true, stdout: "-p, --print   Print response and exit", stderr: "" }),
+    exec: (_f, args) =>
+      args.includes("--list-models")
+        ? { ok: true, stdout: "anthropic/claude-fable-5", stderr: "" }
+        : { ok: true, stdout: "-p, --print   Print response and exit", stderr: "" },
   });
   const result = await piAdapter.preflight(deps, {});
   assert.equal(result.ok, true);
-  assert.equal(result.authState, "unknown");
+  assert.equal(result.authState, "authenticated");
+});
+
+// --- Review-2 finding 73d2e88a: pi must fail closed on unverified auth ---
+
+test("pi preflight: --list-models reporting no models blocks as unauthenticated, never passes on an unverified auth state", async () => {
+  const deps = fakeDeps({
+    execCheck: () => true,
+    exec: (_f, args) =>
+      args.includes("--list-models")
+        ? { ok: true, stdout: "No models available. Use /login to log into a provider.", stderr: "" }
+        : { ok: true, stdout: "-p, --print   Print response and exit", stderr: "" },
+  });
+  const result = await piAdapter.preflight(deps, {});
+  assert.equal(result.ok, false);
+  assert.equal(result.failure, "unauthenticated");
+  assert.equal(result.authState, "unauthenticated");
+});
+
+test("pi preflight: a failing --list-models probe blocks as unauthenticated rather than passing", async () => {
+  const deps = fakeDeps({
+    execCheck: () => true,
+    exec: (_f, args) =>
+      args.includes("--list-models")
+        ? { ok: false, stdout: "", stderr: "boom" }
+        : { ok: true, stdout: "-p, --print   Print response and exit", stderr: "" },
+  });
+  const result = await piAdapter.preflight(deps, {});
+  assert.equal(result.ok, false);
+  assert.equal(result.failure, "unauthenticated");
+});
+
+// --- Review-2 finding 16ab70d8: pi must validate the requested effort ---
+
+test("pi preflight: an invalid --thinking level is rejected as unsupported-setting before invocation", async () => {
+  const deps = fakeDeps({ execCheck: () => true });
+  const result = await piAdapter.preflight(deps, { effort: "ludicrous" });
+  assert.equal(result.ok, false);
+  assert.equal(result.failure, "unsupported-setting");
+});
+
+test("pi preflight: a valid --thinking level passes the effort check", async () => {
+  const deps = fakeDeps({
+    execCheck: () => true,
+    exec: (_f, args) =>
+      args.includes("--list-models")
+        ? { ok: true, stdout: "anthropic/claude-fable-5", stderr: "" }
+        : { ok: true, stdout: "-p, --print   Print response and exit", stderr: "" },
+  });
+  const result = await piAdapter.preflight(deps, { effort: "high" });
+  assert.equal(result.ok, true);
 });
 
 // --- Finding 3: pi/opencode must reject a requested sandbox mode ---

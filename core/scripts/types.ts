@@ -903,6 +903,24 @@ export interface StageAccountingRecord {
    *  optional: absent when no effort was resolved for the call, and never
    *  reconstructed from current config when reading historical records (#437). */
   effort?: string | null;
+  /** Harness-adapter treatment provenance (#431, review-2 finding 0b0c7e4b).
+   *  All additive and optional: absent on records written before these
+   *  fields existed, and a reader must treat an absent field as unknown
+   *  rather than substituting a default. `resolved_model`/`resolved_effort`/
+   *  `fallback`/`throttled` are populated only when the adapter's own
+   *  telemetry parsing recovered them — never fabricated from the requested
+   *  value. */
+  adapter?: string | null;
+  adapter_cli_version?: string | null;
+  provider_auth_class?: string | null;
+  requested_model?: string | null;
+  resolved_model?: string | null;
+  requested_effort?: string | null;
+  resolved_effort?: string | null;
+  native_flags?: string[] | null;
+  fallback?: boolean | null;
+  throttled?: boolean | null;
+  termination_reason?: string | null;
 }
 
 export interface StageAccountingTotals {

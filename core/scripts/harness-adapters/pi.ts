@@ -15,14 +15,15 @@
 // `-a`/`--approve` is always passed (unattended headless run, no TTY to
 // answer a trust prompt).
 //
-// No documented non-interactive login-status probe exists (only the
-// interactive `/login`/`/logout` REPL commands and an `--api-key` override).
-// Per design.md decision 7 ("preflight fails loudly rather than silently
-// drop"), this is a genuine, accepted limitation: preflight reports this
-// sub-check as `authState: "unknown"` — never a fabricated pass/fail — with
-// an explicit message that the first real invocation is the actual auth
-// test. `ok: true` is still returned (this is informational, not a block);
-// doctor surfaces it as a distinct result rather than blocking the run.
+// `pi --list-models` is pi's lightweight authenticated-only probe (verified
+// live against the current CLI, review-2 finding 73d2e88a): with no login
+// completed it prints "No models available. Use /login ..." on stdout and
+// exits 0, so exit code alone can't distinguish the states, but the message
+// text can — same "empty vs populated listing" shape as `opencode providers
+// list`. A logged-in installation lists actual model entries instead. This
+// replaces the earlier `authState: "unknown"` pass-through: pi's preflight
+// now fails closed with `unauthenticated` when the listing comes back empty,
+// rather than letting an unverified auth state reach stage invocation.
 
 import {
   EMPTY_TELEMETRY,
@@ -51,8 +52,12 @@ const CAPABILITIES: AdapterCapabilities = {
   telemetry: "none",
 };
 
-export const PI_NO_AUTH_PROBE_MESSAGE =
-  "pi has no documented non-interactive auth-status probe — the first real invocation is the actual auth test.";
+// `--thinking <level>` documented enum (verified live, design.md decision 4)
+// — review-2 finding 16ab70d8: an invalid effort must fail preflight rather
+// than reach invocation and fail only after the stage has begun.
+const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+export const PI_NO_MODELS_MARKER = "No models available";
 
 export const piAdapter: HarnessAdapter = {
   name: "pi",
@@ -89,6 +94,13 @@ export const piAdapter: HarnessAdapter = {
           "pi has no unattended restricted-permission mode — only -a/--approve (full auto-approve) or an interactive prompt (which blocks headlessly) are available, so a requested sandbox mode is unsupported.",
       };
     }
+    if (req.effort && !PI_THINKING_LEVELS.has(req.effort)) {
+      return {
+        ok: false,
+        failure: "unsupported-setting",
+        message: `pi --thinking accepts one of ${[...PI_THINKING_LEVELS].join("|")} — requested effort "${req.effort}" is unsupported.`,
+      };
+    }
     const helpRes = await deps.exec("pi", ["--help"]);
     if (!helpRes.ok) {
       return {
@@ -105,9 +117,20 @@ export const piAdapter: HarnessAdapter = {
         message: "pi --help does not document -p/--print — headless mode may be unavailable in this installed version.",
       };
     }
-    // Documented, accepted limitation (design.md decision 4) — not a
-    // fabricated pass/fail. See module comment above.
-    return { ok: true, authState: "unknown", message: PI_NO_AUTH_PROBE_MESSAGE };
+    // `pi --list-models` prints "No models available. Use /login ..." and
+    // exits 0 when no provider is authenticated, vs. an actual model listing
+    // when one is (verified live, review-2 finding 73d2e88a — see module
+    // comment above). Exit code can't distinguish the states; message text can.
+    const modelsRes = await deps.exec("pi", ["--list-models"]);
+    if (!modelsRes.ok || modelsRes.stdout.includes(PI_NO_MODELS_MARKER)) {
+      return {
+        ok: false,
+        failure: "unauthenticated",
+        authState: "unauthenticated",
+        message: "pi reported no available models — run pi interactively once and complete /login.",
+      };
+    }
+    return { ok: true, authState: "authenticated" };
   },
 
   parseTelemetry(_capturedStdout: string): HarnessTelemetry {
@@ -123,11 +146,15 @@ export const piAdapter: HarnessAdapter = {
       cliVersion: probe.cliVersion,
       providerAuthClass: probe.providerAuthClass,
       requestedModel: req.model ?? null,
-      resolvedModel: req.model ?? null,
+      // pi has no machine-readable per-call output enabled (telemetry:
+      // "none"), so the actually-resolved model/effort are unknown, never
+      // echoed from the request (review-2 finding 0b0c7e4b).
+      resolvedModel: probe.resolvedModel ?? null,
       requestedEffort: req.effort ?? null,
-      resolvedEffort: req.effort ?? null,
+      resolvedEffort: null,
       nativeFlags,
-      fallback: false,
+      fallback: null,
+      throttled: probe.throttled ?? null,
     };
   },
 };

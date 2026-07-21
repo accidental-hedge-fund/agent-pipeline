@@ -40,8 +40,12 @@ export function parseCodexTelemetry(capturedStdout: string): HarnessTelemetry {
       usage = obj.usage;
     }
   }
-  // Codex never reports a per-call cost field (design.md — verified).
-  return text === null && usage === null ? EMPTY_TELEMETRY : { text, costUsd: null, usage };
+  // Codex never reports a per-call cost field, resolved model, or a
+  // rate-limit/throttle signal (design.md — verified) — resolvedModel and
+  // throttled stay unknown (null), never fabricated.
+  return text === null && usage === null
+    ? EMPTY_TELEMETRY
+    : { text, costUsd: null, usage, resolvedModel: null, throttled: null };
 }
 
 function extractCodexForwardableText(obj: Record<string, unknown>): string | null {
@@ -139,11 +143,15 @@ export const codexAdapter: HarnessAdapter = {
       cliVersion: probe.cliVersion,
       providerAuthClass: probe.providerAuthClass,
       requestedModel: req.model ?? null,
-      resolvedModel: req.model ?? null,
+      // Codex's JSON telemetry never reports the model/effort it actually
+      // resolved to (design.md — verified), so these stay unknown rather than
+      // echoing the request (review-2 finding 0b0c7e4b).
+      resolvedModel: probe.resolvedModel ?? null,
       requestedEffort: req.effort ?? null,
-      resolvedEffort: req.effort ?? null,
+      resolvedEffort: null,
       nativeFlags,
-      fallback: false,
+      fallback: null,
+      throttled: probe.throttled ?? null,
     };
   },
 };

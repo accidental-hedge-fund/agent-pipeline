@@ -129,7 +129,7 @@ export interface HarnessTelemetry {
  */
 export function parseHarnessTelemetry(harness: string, capturedStdout: string): HarnessTelemetry {
   const adapter = resolveAdapter(harness);
-  if (!adapter) return { text: null, costUsd: null, usage: null };
+  if (!adapter) return { text: null, costUsd: null, usage: null, resolvedModel: null, throttled: null };
   return adapter.parseTelemetry(capturedStdout);
 }
 
@@ -303,11 +303,19 @@ export async function invoke(
     // would add subprocess overhead to every model call) — cliVersion and
     // providerAuthClass are recorded as unknown rather than fabricated,
     // matching the "unreported provenance is recorded as unknown" contract.
+    // resolvedModel/throttled, when the adapter's own telemetry parsing
+    // recovered them (review-2 finding 0b0c7e4b), are threaded through here
+    // rather than fabricated by each adapter's describeTreatment.
     const treatment = adapter
       ? adapter.describeTreatment(
           { model: opts.model, effort: opts.reasoningEffort },
           { cmd, args, cwd },
-          { cliVersion: null, providerAuthClass: "unknown" } satisfies AdapterProbe,
+          {
+            cliVersion: null,
+            providerAuthClass: "unknown",
+            resolvedModel: telemetry?.resolvedModel ?? null,
+            throttled: telemetry?.throttled ?? null,
+          } satisfies AdapterProbe,
         )
       : null;
     const record = buildStageAccountingRecord({
@@ -338,6 +346,7 @@ export async function invoke(
       resolvedEffort: treatment?.resolvedEffort ?? null,
       nativeFlags: treatment?.nativeFlags ?? null,
       fallback: treatment?.fallback ?? null,
+      throttled: treatment?.throttled ?? null,
       terminationReason: harnessOutcome(finalResult),
     });
     await emitStageAccounting(

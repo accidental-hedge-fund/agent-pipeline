@@ -30,8 +30,26 @@ export function harnessTelemetryEnabled(): boolean {
   return process.env.PIPELINE_HARNESS_TELEMETRY !== "off";
 }
 
+/** Scans every `rate_limit_event` line (verified live: `{"type":
+ *  "rate_limit_event", "rate_limit_info": {"status": "allowed" | ...}}`) for a
+ *  non-"allowed" status. `null` when the stream carries no such event at all
+ *  (telemetry disabled, or an older CLI that doesn't emit it) — that is
+ *  "unknown", never "not throttled" (review-2 finding 0b0c7e4b). */
+function scanClaudeThrottled(lines: string[]): boolean | null {
+  let sawEvent = false;
+  for (const line of lines) {
+    const obj = parseJsonLine(line);
+    if (!obj || obj.type !== "rate_limit_event") continue;
+    sawEvent = true;
+    const info = isJsonRecord(obj.rate_limit_info) ? obj.rate_limit_info : null;
+    if (info && typeof info.status === "string" && info.status !== "allowed") return true;
+  }
+  return sawEvent ? false : null;
+}
+
 export function parseClaudeTelemetry(capturedStdout: string): HarnessTelemetry {
   const lines = capturedStdout.split("\n");
+  const throttled = scanClaudeThrottled(lines);
   for (let i = lines.length - 1; i >= 0; i--) {
     const obj = parseJsonLine(lines[i]);
     if (!obj || obj.type !== "result") continue;
@@ -41,9 +59,14 @@ export function parseClaudeTelemetry(capturedStdout: string): HarnessTelemetry {
         ? obj.total_cost_usd
         : null;
     const usage = isJsonRecord(obj.usage) ? obj.usage : null;
-    return { text, costUsd, usage };
+    // The actual served model is a key of `modelUsage` (verified live) — the
+    // requested `--model` value can be an alias, so this is the only reliable
+    // resolved-model signal claude's envelope offers.
+    const modelUsage = isJsonRecord(obj.modelUsage) ? obj.modelUsage : null;
+    const resolvedModel = modelUsage ? Object.keys(modelUsage)[0] ?? null : null;
+    return { text, costUsd, usage, resolvedModel, throttled };
   }
-  return EMPTY_TELEMETRY;
+  return { ...EMPTY_TELEMETRY, throttled };
 }
 
 function extractClaudeForwardableText(obj: Record<string, unknown>): string | null {
@@ -160,11 +183,16 @@ export const claudeAdapter: HarnessAdapter = {
       cliVersion: probe.cliVersion,
       providerAuthClass: probe.providerAuthClass,
       requestedModel: req.model ?? null,
-      resolvedModel: req.model ?? null,
+      // Recovered from the `result` envelope's `modelUsage` key when telemetry
+      // is enabled (see parseClaudeTelemetry); unknown otherwise — never
+      // echoed from the request (review-2 finding 0b0c7e4b).
+      resolvedModel: probe.resolvedModel ?? null,
       requestedEffort: req.effort ?? null,
-      resolvedEffort: req.effort ?? null,
+      // claude's envelope never reports the effort it actually resolved to.
+      resolvedEffort: null,
       nativeFlags,
-      fallback: false,
+      fallback: null,
+      throttled: probe.throttled ?? null,
     };
   },
 };

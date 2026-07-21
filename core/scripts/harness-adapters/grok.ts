@@ -92,11 +92,16 @@ export const grokAdapter: HarnessAdapter = {
       cliVersion: probe.cliVersion,
       providerAuthClass: probe.providerAuthClass,
       requestedModel: req.model ?? null,
-      resolvedModel: req.model ?? null,
+      // grok's `--output-format plain` invocation carries no machine-readable
+      // envelope (design.md — telemetry: "none"), so the actually-resolved
+      // model/effort are unknown, never echoed from the request (review-2
+      // finding 0b0c7e4b).
+      resolvedModel: probe.resolvedModel ?? null,
       requestedEffort: req.effort ?? null,
-      resolvedEffort: req.effort ?? null,
+      resolvedEffort: null,
       nativeFlags,
-      fallback: false,
+      fallback: null,
+      throttled: probe.throttled ?? null,
     };
   },
 };

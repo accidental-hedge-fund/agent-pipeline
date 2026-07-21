@@ -6,11 +6,13 @@ import type {
   StageAccountingUsage,
 } from "./types.ts";
 
-// v3 (#437): additive — records may now carry the resolved reasoning `effort`
-// passed to the harness. Adds no required field and removes none; readers
-// must not gate on this value equalling a specific version (design.md
+// v4 (#431, review-2 finding 0b0c7e4b): additive — records may now carry
+// harness-adapter treatment provenance (adapter name/version, provider/auth
+// class, requested vs. resolved model/effort, native flags, fallback,
+// throttled, termination reason). Adds no required field and removes none;
+// readers must not gate on this value equalling a specific version (design.md
 // decision 5).
-export const STAGE_ACCOUNTING_SCHEMA_VERSION = 3;
+export const STAGE_ACCOUNTING_SCHEMA_VERSION = 4;
 
 export interface UsageAccountingExtraction {
   usage?: StageAccountingUsage;
@@ -45,6 +47,17 @@ export interface BuildStageAccountingRecordInput {
   executorProvider?: string | null;
   executorModel?: string | null;
   effort?: string | null;
+  adapter?: string | null;
+  adapterCliVersion?: string | null;
+  providerAuthClass?: string | null;
+  requestedModel?: string | null;
+  resolvedModel?: string | null;
+  requestedEffort?: string | null;
+  resolvedEffort?: string | null;
+  nativeFlags?: string[] | null;
+  fallback?: boolean | null;
+  throttled?: boolean | null;
+  terminationReason?: string | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -155,6 +168,31 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(cleanOptionalString(input.executorProvider ?? null) !== null ? { executor_provider: cleanOptionalString(input.executorProvider ?? null) } : {}),
     ...(cleanOptionalString(input.executorModel ?? null) !== null ? { executor_model: cleanOptionalString(input.executorModel ?? null) } : {}),
     ...(cleanOptionalString(input.effort ?? null) !== null ? { effort: cleanOptionalString(input.effort ?? null) } : {}),
+    ...(cleanOptionalString(input.adapter ?? null) !== null ? { adapter: cleanOptionalString(input.adapter ?? null) } : {}),
+    ...(cleanOptionalString(input.adapterCliVersion ?? null) !== null
+      ? { adapter_cli_version: cleanOptionalString(input.adapterCliVersion ?? null) }
+      : {}),
+    ...(cleanOptionalString(input.providerAuthClass ?? null) !== null
+      ? { provider_auth_class: cleanOptionalString(input.providerAuthClass ?? null) }
+      : {}),
+    ...(cleanOptionalString(input.requestedModel ?? null) !== null
+      ? { requested_model: cleanOptionalString(input.requestedModel ?? null) }
+      : {}),
+    ...(cleanOptionalString(input.resolvedModel ?? null) !== null
+      ? { resolved_model: cleanOptionalString(input.resolvedModel ?? null) }
+      : {}),
+    ...(cleanOptionalString(input.requestedEffort ?? null) !== null
+      ? { requested_effort: cleanOptionalString(input.requestedEffort ?? null) }
+      : {}),
+    ...(cleanOptionalString(input.resolvedEffort ?? null) !== null
+      ? { resolved_effort: cleanOptionalString(input.resolvedEffort ?? null) }
+      : {}),
+    ...(Array.isArray(input.nativeFlags) && input.nativeFlags.length > 0 ? { native_flags: input.nativeFlags.filter((f) => typeof f === "string") } : {}),
+    ...(typeof input.fallback === "boolean" ? { fallback: input.fallback } : {}),
+    ...(typeof input.throttled === "boolean" ? { throttled: input.throttled } : {}),
+    ...(cleanOptionalString(input.terminationReason ?? null) !== null
+      ? { termination_reason: cleanOptionalString(input.terminationReason ?? null) }
+      : {}),
   };
   return sanitizeStageAccountingRecord(record);
 }
@@ -196,6 +234,27 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (executorModel !== null) cleaned.executor_model = executorModel;
   const effort = cleanOptionalString(record.effort ?? null);
   if (effort !== null) cleaned.effort = effort;
+  const adapter = cleanOptionalString(record.adapter ?? null);
+  if (adapter !== null) cleaned.adapter = adapter;
+  const adapterCliVersion = cleanOptionalString(record.adapter_cli_version ?? null);
+  if (adapterCliVersion !== null) cleaned.adapter_cli_version = adapterCliVersion;
+  const providerAuthClass = cleanOptionalString(record.provider_auth_class ?? null);
+  if (providerAuthClass !== null) cleaned.provider_auth_class = providerAuthClass;
+  const requestedModel = cleanOptionalString(record.requested_model ?? null);
+  if (requestedModel !== null) cleaned.requested_model = requestedModel;
+  const resolvedModel = cleanOptionalString(record.resolved_model ?? null);
+  if (resolvedModel !== null) cleaned.resolved_model = resolvedModel;
+  const requestedEffort = cleanOptionalString(record.requested_effort ?? null);
+  if (requestedEffort !== null) cleaned.requested_effort = requestedEffort;
+  const resolvedEffort = cleanOptionalString(record.resolved_effort ?? null);
+  if (resolvedEffort !== null) cleaned.resolved_effort = resolvedEffort;
+  if (Array.isArray(record.native_flags) && record.native_flags.length > 0) {
+    cleaned.native_flags = record.native_flags.filter((f) => typeof f === "string");
+  }
+  if (typeof record.fallback === "boolean") cleaned.fallback = record.fallback;
+  if (typeof record.throttled === "boolean") cleaned.throttled = record.throttled;
+  const terminationReason = cleanOptionalString(record.termination_reason ?? null);
+  if (terminationReason !== null) cleaned.termination_reason = terminationReason;
   return cleaned;
 }
 
