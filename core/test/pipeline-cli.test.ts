@@ -105,6 +105,10 @@ test("pipeline-cli: scoreboard — --json → []", () => {
   assert.deepEqual(roundTrip(["scoreboard", "--json"]), []);
 });
 
+test("pipeline-cli: scoreboard — --bucket day --json → [] (#425)", () => {
+  assert.deepEqual(roundTrip(["scoreboard", "--bucket", "day", "--json"]), []);
+});
+
 test("pipeline-cli: roadmap — --apply → []", () => {
   assert.deepEqual(roundTrip(["roadmap", "--apply"]), []);
 });

@@ -180,7 +180,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   scoreboard: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "since", "until", "days", "json", "estimateCost"]),
+    allowedFlags: new Set(["repoPath", "since", "until", "days", "json", "estimateCost", "bucket"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

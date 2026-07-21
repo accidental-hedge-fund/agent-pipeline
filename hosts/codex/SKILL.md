@@ -79,6 +79,7 @@ $pipeline:release <version>              prepare a release PR for the given vers
 $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
+$pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 

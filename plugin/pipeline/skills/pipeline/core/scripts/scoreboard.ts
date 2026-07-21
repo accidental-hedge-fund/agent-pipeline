@@ -117,18 +117,31 @@ export interface ScoreboardMetrics {
   };
 }
 
+export interface ScoreboardTotals {
+  scanned_runs: number;
+  included_runs: number;
+  ready_runs: number;
+  successful_prs: number;
+  diagnostics: number;
+}
+
+export type ScoreboardBucket = "day" | "week";
+
+export interface ScoreboardPeriod {
+  start: string;
+  end: string;
+  totals: ScoreboardTotals;
+  metrics: ScoreboardMetrics;
+}
+
 export interface ScoreboardReport {
   schema_version: 1;
   window: ScoreboardWindow;
-  totals: {
-    scanned_runs: number;
-    included_runs: number;
-    ready_runs: number;
-    successful_prs: number;
-    diagnostics: number;
-  };
+  totals: ScoreboardTotals;
   metrics: ScoreboardMetrics;
   diagnostics: ScoreboardDiagnostic[];
+  bucket?: ScoreboardBucket;
+  series?: ScoreboardPeriod[];
 }
 
 export interface ScoreboardOpts {
@@ -138,6 +151,7 @@ export interface ScoreboardOpts {
   days?: number;
   json?: boolean;
   estimateCost?: string[];
+  bucket?: string;
   now?: Date;
 }
 
@@ -255,6 +269,12 @@ function parseDateArg(value: string, flag: string): Date {
   return new Date(ms);
 }
 
+export function parseScoreboardBucket(value: string | undefined): ScoreboardBucket | null {
+  if (value === undefined) return null;
+  if (value === "day" || value === "week") return value;
+  throw new Error(`--bucket must be one of: day, week (got: ${value})`);
+}
+
 export function parseEstimateCosts(values: string[] | undefined): Record<string, number> {
   const estimates: Record<string, number> = {};
   for (const raw of values ?? []) {
@@ -278,9 +298,94 @@ export async function buildScoreboardReport(
   deps: Pick<ScoreboardDeps, "readFile" | "readdir"> = realScoreboardDeps(),
 ): Promise<ScoreboardReport> {
   const window = parseScoreboardWindow(opts);
+  const bucket = parseScoreboardBucket(opts.bucket);
   const estimates = parseEstimateCosts(opts.estimateCost);
   const scan = await scanRunStore(opts.repoDir, window, deps);
-  return aggregateRuns(window, scan, estimates);
+  const report = aggregateRuns(window, scan, estimates);
+  if (bucket === null) return report;
+
+  const periods = computePeriods(window, bucket);
+  const assigned = assignRunsToPeriods(periods, scan.runs);
+  const series: ScoreboardPeriod[] = periods.map((period, i) => buildPeriodEntry(period, assigned[i], estimates));
+  return { ...report, bucket, series };
+}
+
+interface PeriodBounds {
+  start: string;
+  end: string;
+  startMs: number;
+  endMs: number;
+}
+
+function floorToUTCDay(ms: number): number {
+  return Math.floor(ms / MS_PER_DAY) * MS_PER_DAY;
+}
+
+function floorToUTCWeekStart(ms: number): number {
+  const dayFloor = floorToUTCDay(ms);
+  const weekday = new Date(dayFloor).getUTCDay(); // 0=Sun..6=Sat
+  const daysSinceMonday = (weekday + 6) % 7;
+  return dayFloor - daysSinceMonday * MS_PER_DAY;
+}
+
+function computePeriods(window: ScoreboardWindow, bucket: ScoreboardBucket): PeriodBounds[] {
+  const sinceMs = Date.parse(window.since);
+  const untilMs = Date.parse(window.until);
+  const stepMs = bucket === "day" ? MS_PER_DAY : 7 * MS_PER_DAY;
+
+  const periods: PeriodBounds[] = [];
+  let startMs = sinceMs;
+  let boundary = bucket === "day" ? floorToUTCDay(sinceMs) : floorToUTCWeekStart(sinceMs);
+  while (true) {
+    const nextBoundary = boundary + stepMs;
+    const endMs = nextBoundary >= untilMs ? untilMs : nextBoundary;
+    periods.push({
+      start: new Date(startMs).toISOString(),
+      end: new Date(endMs).toISOString(),
+      startMs,
+      endMs,
+    });
+    if (nextBoundary >= untilMs) break;
+    startMs = nextBoundary;
+    boundary = nextBoundary;
+  }
+  return periods;
+}
+
+function assignRunsToPeriods(periods: PeriodBounds[], runs: IncludedRun[]): IncludedRun[][] {
+  const buckets: IncludedRun[][] = periods.map(() => []);
+  for (const run of runs) {
+    const ms = Date.parse(run.startAt);
+    let idx = periods.length - 1;
+    for (let i = 0; i < periods.length; i++) {
+      if (ms < periods[i].endMs) {
+        idx = i;
+        break;
+      }
+    }
+    buckets[idx].push(run);
+  }
+  return buckets;
+}
+
+function buildPeriodEntry(
+  period: PeriodBounds,
+  runs: IncludedRun[],
+  costEstimates: Record<string, number>,
+): ScoreboardPeriod {
+  const core = reduceRunsCore(runs, costEstimates);
+  return {
+    start: period.start,
+    end: period.end,
+    totals: {
+      scanned_runs: runs.length,
+      included_runs: runs.length,
+      ready_runs: core.readyRuns,
+      successful_prs: core.successfulPrs,
+      diagnostics: core.diagnostics.length,
+    },
+    metrics: core.metrics,
+  };
 }
 
 export async function runScoreboard(
@@ -470,15 +575,41 @@ async function readEventsArtifact(
   return { events, diagnostics };
 }
 
+interface ReducedCore {
+  readyRuns: number;
+  successfulPrs: number;
+  metrics: ScoreboardMetrics;
+  diagnostics: ScoreboardDiagnostic[];
+}
+
 function aggregateRuns(
   window: ScoreboardWindow,
   scan: ScanResult,
   costEstimates: Record<string, number>,
 ): ScoreboardReport {
-  const diagnostics = [...scan.diagnostics];
+  const core = reduceRunsCore(scan.runs, costEstimates);
+  const diagnostics = [...scan.diagnostics, ...core.diagnostics];
+
+  return {
+    schema_version: 1,
+    window,
+    totals: {
+      scanned_runs: scan.scannedRuns,
+      included_runs: scan.runs.length,
+      ready_runs: core.readyRuns,
+      successful_prs: core.successfulPrs,
+      diagnostics: diagnostics.length,
+    },
+    metrics: core.metrics,
+    diagnostics,
+  };
+}
+
+function reduceRunsCore(runs: IncludedRun[], costEstimates: Record<string, number>): ReducedCore {
+  const diagnostics: ScoreboardDiagnostic[] = [];
   const readyGroups = new Map<number, PrGroup>();
   let readyRuns = 0;
-  for (const run of scan.runs) {
+  for (const run of runs) {
     if (run.finalState !== "ready-to-deploy") continue;
     readyRuns++;
     if (run.pr === null) {
@@ -506,9 +637,9 @@ function aggregateRuns(
   let needsHuman = 0;
   let reviewRounds = 0;
   let sameHarnessFallbacks = 0;
-  const costAccounting = aggregateCostAccounting(scan.runs, diagnostics);
+  const costAccounting = aggregateCostAccounting(runs, diagnostics);
 
-  for (const run of scan.runs) {
+  for (const run of runs) {
     const fullDuration = fullRunDurationMs(run);
     if (fullDuration !== null) {
       fullRunDuration.add(fullDuration);
@@ -613,7 +744,7 @@ function aggregateRuns(
   const blockerRates: Record<string, RateValue> = {};
   for (const [kind, count] of [...blockerCounts.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     blockerCountsObj[kind] = count;
-    blockerRates[kind] = rate(count, scan.runs.length);
+    blockerRates[kind] = rate(count, runs.length);
   }
 
   const costTotal = roundUsd(cost.actualUsd + cost.estimatedUsd);
@@ -640,11 +771,11 @@ function aggregateRuns(
     harness_calls_per_successful_pr: rate(harnessCalls, successfulPrs),
     retry_fix_rounds_per_pr: rate(retryFixRounds, successfulPrs),
     blocker_rate_by_kind: {
-      denominator: scan.runs.length,
+      denominator: runs.length,
       counts: blockerCountsObj,
       rates: blockerRates,
     },
-    needs_human_rate: rate(needsHuman, scan.runs.length),
+    needs_human_rate: rate(needsHuman, runs.length),
     same_harness_fallback_rate: rate(sameHarnessFallbacks, reviewRounds),
     gate_pass_rates: {
       test: gateMetric(gateCounts.test),
@@ -653,19 +784,7 @@ function aggregateRuns(
     },
   };
 
-  return {
-    schema_version: 1,
-    window,
-    totals: {
-      scanned_runs: scan.scannedRuns,
-      included_runs: scan.runs.length,
-      ready_runs: readyRuns,
-      successful_prs: successfulPrs,
-      diagnostics: diagnostics.length,
-    },
-    metrics,
-    diagnostics,
-  };
+  return { readyRuns, successfulPrs, metrics, diagnostics };
 }
 
 function aggregateCostAccounting(
@@ -1397,6 +1516,28 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
     lines.push("Diagnostics:");
     for (const diagnostic of report.diagnostics) {
       lines.push(`  [${diagnostic.severity}] ${diagnostic.code}: ${diagnostic.path} - ${diagnostic.message}`);
+    }
+  }
+
+  if (report.bucket && report.series) {
+    lines.push("");
+    lines.push(`Per-period breakdown (${report.bucket}):`);
+    for (const period of report.series) {
+      lines.push("");
+      lines.push(`## ${period.start} to ${period.end}`);
+      lines.push(`Included runs: ${period.totals.included_runs}`);
+      lines.push(`Successful PRs: ${period.totals.successful_prs}`);
+      lines.push(`Ready runs: ${period.totals.ready_runs}`);
+      lines.push(`Ready-to-deploy without human intervention: ${formatRate(period.metrics.ready_to_deploy_without_human_intervention)}`);
+      lines.push(`Cost per ready PR: ${formatCostMetric(period.metrics.cost_per_ready_pr_usd)}`);
+      lines.push(`Full-run wall-clock duration: ${formatDuration(period.metrics.full_run_duration_ms)}`);
+      lines.push(`Harness calls per successful PR: ${formatRatioValue(period.metrics.harness_calls_per_successful_pr)}`);
+      lines.push(`Retry/fix-round count per PR: ${formatRatioValue(period.metrics.retry_fix_rounds_per_pr)}`);
+      lines.push(`pipeline:needs-human rate: ${formatRate(period.metrics.needs_human_rate)}`);
+      lines.push(`Same-harness fallback rate: ${formatRate(period.metrics.same_harness_fallback_rate)}`);
+      lines.push(`Test pass rate: ${formatGate(period.metrics.gate_pass_rates.test)}`);
+      lines.push(`Eval pass rate: ${formatGate(period.metrics.gate_pass_rates.eval)}`);
+      lines.push(`Shipcheck pass rate: ${formatGate(period.metrics.gate_pass_rates.shipcheck)}`);
     }
   }
 
