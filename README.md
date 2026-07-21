@@ -839,10 +839,48 @@ stage_executors:
 ```
 
 - **`agent-system`** executors may be assigned to **any** model-invoking stage. The pipeline `POST`s `{ "stage": "<name>", "prompt": "<full prompt text>" }` to `endpoint` (adding `authorization: Bearer <resolved-credential>` when `credential` is set) and expects back `{ "output": "<text>" }`; `output` becomes that stage's harness stdout and flows through the exact same downstream contract (including `parseStructuredVerdict` + `review_policy` for review stages) as a local `claude`/`codex` invocation.
-- **`model-endpoint`** executors are restricted to the **prompt-contained** stages `plan-review`, `review-1`, `review-2` — these are the only stages whose prompt already embeds everything needed (PR diff, plan text, conventions excerpt) inline, since a raw model endpoint cannot explore the repo or run tools. Assigning a `model-endpoint` executor to `planning`, `implementing`, `fix-1`, `fix-2`, or `shipcheck-gate` is rejected **at config-parse time** — before any stage runs — with an error naming both the stage and the executor.
+- **`model-endpoint`** executors are restricted to the **prompt-contained** stages `plan-review`, `review-1`, `review-2` — these are the only stages whose prompt already embeds everything needed (PR diff, plan text, conventions excerpt) inline. A raw model endpoint has no repository or tool access — it cannot check out the worktree, run tests, or commit — so it is structurally incapable of an execution-environment stage. Assigning a `model-endpoint` executor to `planning`, `implementing`, `fix-1`, `fix-2`, or `shipcheck-gate` is rejected **at config-parse time** — before any stage runs — with an error naming both the stage and the executor.
 - Credentials are **references** (an environment-variable name), resolved from the process environment only at invocation time. The secret value is never written to `pipeline.yml` and never appears in run evidence or accounting output — only the reference name does (or nothing, for an unauthenticated local endpoint).
 - A misconfigured, unreachable, or non-compliant executor is caught by a **preflight check before the stage runs** and blocks the item with an error naming the stage and provider. There is **no silent fallback** to the local `claude`/`codex` harness — this is a deliberate operator choice, distinct from (and takes priority over) the `review_harness` self-review fallback described above, which never applies to a `stage_executors` assignment.
 - Run evidence records which executor (and provider, and — for `model-endpoint` — model name) ran each delegated stage.
+
+#### `model-endpoint` request controls (OpenRouter and beyond)
+
+A `model-endpoint` definition can declare its wire **`dialect`**, an allowlisted **`params`** block, controlled extra **`headers`**, a **`reasoning`** effort request, and a **`structured_output`** hint — all optional; a bare `base_url`/`model` definition still sends today's minimal `{model, messages}` request, byte-identical to before. Example targeting OpenRouter:
+
+```yaml
+executors:
+  openrouter-review:
+    type: model-endpoint
+    base_url: https://openrouter.ai/api/v1
+    model: openai/gpt-5
+    credential: OPENROUTER_API_KEY        # env-var NAME, resolved at invocation time — never the literal value
+    dialect: openrouter                   # openai (default) | openrouter | none — declared explicitly, never guessed from base_url or model
+    params:
+      temperature: 0
+      seed: 7
+      max_output_tokens: 4096
+      provider:                           # OpenRouter-only routing preferences (rejected at parse time on any other dialect)
+        order: [openai]
+      models: [openai/gpt-5, anthropic/claude-fable-5]   # OpenRouter-only fallback list
+    headers:
+      x-title: agent-pipeline-review      # non-secret literal
+      http-referer:
+        env: OPENROUTER_REFERER           # resolved from the environment at invocation time only — never written to evidence
+    reasoning:
+      effort: high                        # encoded as OpenRouter's reasoning:{effort} field for this dialect
+      # on_unsupported: record            # opt-in: run anyway with effort recorded "unsupported" instead of failing preflight
+    structured_output: true               # adds this dialect's JSON-schema response_format — a transport hint only; parseStructuredVerdict + review_policy stay authoritative
+
+stage_executors:
+  review-2: openrouter-review
+```
+
+- **`dialect`** (`openai` default, `openrouter`, or `none`) is the sole source of truth for how reasoning effort and structured output are put on the wire, and for which response fields are read back as provenance — never inferred from `base_url` or `model`. `none` declares an endpoint that can express neither; requesting an effort against it fails preflight unless `reasoning.on_unsupported: record` is set, in which case the request is sent without the effort and the record marks it `unsupported` rather than silently dropping it.
+- **`params`** is a strict allowlist (`temperature`, `top_p`, `seed`, `max_output_tokens`, `stop`, plus the OpenRouter-only `provider`/`models` routing options) — an unrecognized key, or a routing option on a non-`openrouter` dialect, is rejected at config-parse time naming the offending key.
+- **`headers`** values are a non-secret literal string or `{ env: VAR_NAME }`; a `headers:` block can never declare `authorization` or `content-type` (rejected at parse time). A missing referenced env var fails preflight naming the stage, executor, header, and variable — the resolved value never reaches run evidence, only the header name and (for an `env:` entry) the reference name do.
+- Run evidence records the exact resolved request (model, params, encoded reasoning control, header names) after redaction, plus response provenance where the endpoint exposes it — resolved model, upstream provider, request id, finish reason, token/cache usage, reported cost, retry/rate-limit signals, timing — `null` when the endpoint doesn't report a field, never guessed from the model string. A `model-endpoint` invocation's accounting record also carries an explicit `api-key` execution class, distinct from a local `claude`/`codex` harness invocation, so the two are never conflated in a comparison.
+- An eval-runner cell (see `stage-eval-runner`) can bind an API treatment to a named `model-endpoint` executor via a `treatments.executor` axis, with `model`/`effort` supplied as a per-cell override computed in memory — the committed `executors:` definition is never rewritten, and an invalid override is classified as an infrastructure/config failure, never a completed treatment outcome.
 
 ### Local CI mode (`ci_mode: local`)
 

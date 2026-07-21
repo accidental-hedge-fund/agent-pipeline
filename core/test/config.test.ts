@@ -3270,3 +3270,116 @@ test("resolveConfig: model-endpoint executor with no credential (localhost Ollam
   )) as { executors: Record<string, { credential?: string }> };
   assert.equal(cfg.executors["local-ollama"].credential, undefined);
 });
+
+// --- #434 api-executor-request-controls: dialect/params/headers/reasoning/structured_output ---
+
+test("resolveConfig: model-endpoint with no dialect/params/headers still parses unchanged (#434)", async () => {
+  const cfg = (await resolveWithConfig(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n`,
+    "acme/exec11",
+  )) as { executors: Record<string, { dialect?: string; params?: unknown; headers?: unknown }> };
+  assert.equal(cfg.executors["local-ollama"].dialect, undefined);
+  assert.equal(cfg.executors["local-ollama"].params, undefined);
+  assert.equal(cfg.executors["local-ollama"].headers, undefined);
+});
+
+test("resolveConfig: model-endpoint with dialect: openrouter and allowlisted params is accepted (#434)", async () => {
+  const cfg = (await resolveWithConfig(
+    [
+      "executors:",
+      "  openrouter-review:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    credential: OPENROUTER_API_KEY",
+      "    dialect: openrouter",
+      "    params:",
+      "      temperature: 0",
+      "      seed: 7",
+      "      max_output_tokens: 4096",
+      "      provider:",
+      "        order: [openai]",
+      "      models: [openai/gpt-5, anthropic/claude-fable-5]",
+      "",
+    ].join("\n"),
+    "acme/exec12",
+  )) as { executors: Record<string, { dialect?: string; params?: { temperature?: number } }> };
+  assert.equal(cfg.executors["openrouter-review"].dialect, "openrouter");
+  assert.equal(cfg.executors["openrouter-review"].params?.temperature, 0);
+});
+
+test("resolveConfig: unknown dialect is rejected at parse time, naming the offending value (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    dialect: some-other-thing\n`,
+    "acme/exec13",
+    /dialect/i,
+  );
+});
+
+test("resolveConfig: unknown param key is rejected at parse time, naming the offending key (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    params:\n      temperatur: 0\n`,
+    "acme/exec14",
+    /temperatur/,
+  );
+});
+
+test("resolveConfig: an OpenRouter-only routing option on the default openai dialect is rejected, naming key + dialect (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: https://api.openai.com/v1\n    model: gpt-5\n    params:\n      provider:\n        order: [openai]\n`,
+    "acme/exec15",
+    /provider.*openrouter|openrouter.*provider/is,
+  );
+});
+
+test("resolveConfig: headers declaring authorization is rejected at parse time (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    headers:\n      authorization: "Bearer x"\n`,
+    "acme/exec16",
+    /authorization/,
+  );
+});
+
+test("resolveConfig: headers declaring content-type is rejected at parse time (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    headers:\n      content-type: "text/plain"\n`,
+    "acme/exec17",
+    /content-type/,
+  );
+});
+
+test("resolveConfig: a literal and an env-referenced header are both accepted (#434)", async () => {
+  const cfg = (await resolveWithConfig(
+    [
+      "executors:",
+      "  openrouter-review:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    headers:",
+      "      x-title: pipeline-eval",
+      "      http-referer:",
+      "        env: OPENROUTER_REFERER",
+      "",
+    ].join("\n"),
+    "acme/exec18",
+  )) as { executors: Record<string, { headers?: Record<string, unknown> }> };
+  assert.equal(cfg.executors["openrouter-review"].headers?.["x-title"], "pipeline-eval");
+  assert.deepEqual(cfg.executors["openrouter-review"].headers?.["http-referer"], { env: "OPENROUTER_REFERER" });
+});
+
+test("resolveConfig: structured_output enabled on dialect 'none' is rejected at parse time, naming the dialect (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    dialect: none\n    structured_output: true\n`,
+    "acme/exec19",
+    /structured_output.*none|none.*structured_output/is,
+  );
+});
+
+test("resolveConfig: reasoning.on_unsupported must be the literal 'record' (#434)", async () => {
+  await expectInvalidConfig(
+    `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    reasoning:\n      effort: high\n      on_unsupported: ignore\n`,
+    "acme/exec20",
+    /on_unsupported/,
+  );
+});

@@ -11,8 +11,13 @@ import {
   STAGES,
   MODEL_INVOKING_STAGES,
   EXECUTION_ENVIRONMENT_STAGES,
+  MODEL_ENDPOINT_DIALECTS,
+  MODEL_ENDPOINT_ROUTING_PARAM_KEYS,
+  MODEL_ENDPOINT_RESERVED_HEADERS,
   type Harness,
   type PipelineConfig,
+  type ModelEndpointDialect,
+  type ModelEndpointParams,
 } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 import { expandAutoEffort, expandAutoModel, isClaudeOnlyModelAlias } from "./stage-routing.ts";
@@ -64,14 +69,101 @@ const AgentSystemExecutorSchema = z
   })
   .strict();
 
+// Allowlisted `params` block (#434 api-executor-request-controls decision 3):
+// a strict passthrough would turn pipeline.yml into an untyped wire-format
+// hole where a typo silently no-ops. `provider`/`models` are OpenRouter-only
+// routing options — rejected below for any other dialect.
+export const ModelEndpointParamsSchema = z
+  .object({
+    temperature: z.number().optional(),
+    top_p: z.number().optional(),
+    seed: z.number().int().optional(),
+    max_output_tokens: z.number().int().positive().optional(),
+    stop: z.array(z.string()).optional(),
+    provider: z.record(z.string(), z.unknown()).optional().describe("OpenRouter provider-routing preferences — dialect: openrouter only."),
+    models: z.array(z.string()).optional().describe("OpenRouter model fallback list — dialect: openrouter only."),
+  })
+  .strict();
+
+const ModelEndpointHeaderValueSchema = z.union([z.string(), z.object({ env: z.string() }).strict()]);
+
+const ModelEndpointReasoningSchema = z
+  .object({
+    effort: z.string().optional(),
+    // Opt-in only (#434 decision 2): absent means an effort the declared
+    // dialect cannot express fails preflight rather than being dropped.
+    on_unsupported: z.literal("record").optional(),
+  })
+  .strict();
+
+const MODEL_ENDPOINT_ROUTING_PARAM_KEY_SET = new Set<string>(MODEL_ENDPOINT_ROUTING_PARAM_KEYS);
+const MODEL_ENDPOINT_RESERVED_HEADER_SET = new Set<string>(MODEL_ENDPOINT_RESERVED_HEADERS);
+
+/**
+ * Dialect-dependent checks that a single-field schema cannot express (#434
+ * task 1.2): an OpenRouter-only routing option declared for a dialect that
+ * doesn't support it, and structured output enabled for a dialect that
+ * cannot express it. Shared between the committed-config schema (below) and
+ * per-invocation override validation (executors.ts), so the two paths can
+ * never drift.
+ */
+export function validateModelEndpointDialectRules(
+  dialect: ModelEndpointDialect,
+  params: ModelEndpointParams | undefined,
+  structuredOutput: boolean | undefined,
+): string[] {
+  const errors: string[] = [];
+  if (params) {
+    for (const key of Object.keys(params)) {
+      if (MODEL_ENDPOINT_ROUTING_PARAM_KEY_SET.has(key) && dialect !== "openrouter") {
+        errors.push(
+          `params.${key} is an OpenRouter-only routing option — the executor declares dialect "${dialect}", not "openrouter"`,
+        );
+      }
+    }
+  }
+  if (structuredOutput && dialect === "none") {
+    errors.push(`structured_output is enabled but dialect "none" cannot express structured output`);
+  }
+  return errors;
+}
+
 const ModelEndpointExecutorSchema = z
   .object({
     type: z.literal("model-endpoint"),
     base_url: z.string().describe("Base URL of an OpenAI-compatible chat/completions endpoint (e.g. http://localhost:11434/v1)."),
     model: z.string().describe("Model name passed in the chat/completions request."),
     credential: z.string().optional().describe("Env-var name (or secret reference) resolved at invocation time — never a literal secret value."),
+    dialect: z
+      .enum(MODEL_ENDPOINT_DIALECTS)
+      .optional()
+      .describe(`Wire dialect — one of ${MODEL_ENDPOINT_DIALECTS.join(", ")}. Defaults to "openai" (today's minimal request) when omitted. Never inferred from base_url or model.`),
+    params: ModelEndpointParamsSchema.optional().describe("Allowlisted request parameters (temperature, top_p, seed, max_output_tokens, stop, provider/models routing)."),
+    headers: z
+      .record(z.string(), ModelEndpointHeaderValueSchema)
+      .optional()
+      .describe("Extra request headers: a non-secret literal string, or { env: VAR_NAME } resolved from the environment at invocation time. Cannot declare authorization or content-type."),
+    reasoning: ModelEndpointReasoningSchema.optional().describe("Requested reasoning effort and how an unsupported dialect should handle it."),
+    structured_output: z.boolean().optional().describe("Request the dialect's JSON/schema response-format field for a review stage. Transport hint only — verdict validation is unchanged."),
   })
-  .strict();
+  .strict()
+  .superRefine((def, ctx) => {
+    if (def.headers) {
+      for (const name of Object.keys(def.headers)) {
+        if (MODEL_ENDPOINT_RESERVED_HEADER_SET.has(name.toLowerCase())) {
+          ctx.addIssue({
+            code: "custom",
+            message: `headers cannot declare "${name}" — it would override the credential Authorization header or the fixed content-type`,
+            path: ["headers", name],
+          });
+        }
+      }
+    }
+    const dialect = def.dialect ?? "openai";
+    for (const message of validateModelEndpointDialectRules(dialect, def.params, def.structured_output)) {
+      ctx.addIssue({ code: "custom", message, path: ["params"] });
+    }
+  });
 
 const ExecutorDefinitionSchema = z.discriminatedUnion("type", [
   AgentSystemExecutorSchema,

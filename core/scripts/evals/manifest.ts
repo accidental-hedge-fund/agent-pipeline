@@ -22,7 +22,7 @@ export class ManifestValidationError extends Error {
   }
 }
 
-const AXIS_KEYS = ["harness", "provider", "model", "effort"] as const;
+const AXIS_KEYS = ["harness", "provider", "model", "effort", "executor"] as const;
 
 /** Validate a raw parsed manifest object against the known fixture ids.
  *  Throws ManifestValidationError naming the offending field on the first
