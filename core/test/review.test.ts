@@ -2893,10 +2893,13 @@ test("#233 (4.7): missing ceiling_action key (undefined) defaults to park — me
   assert.equal(createIssueCalls, 0, "no follow-up issue must be created with park default");
 });
 
-// (#233 delta) Regression: cache hit at ceiling with demote_and_advance must NOT route to fix.
-// Scenario: first attempt posted the blocking verdict (diffHash cached) but failed before
-// completing demotion. On re-entry the diff-hash cache would route to fix-2 — bypass it.
-test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete demotion → bypass cache, complete demotion, pre-merge (not fix-2)", async (t) => {
+// (#233 delta, updated #464) Regression: cache hit at ceiling with demote_and_advance must NOT
+// route to fix. Scenario: first attempt posted the blocking verdict (diffHash cached) but failed
+// before completing demotion. On re-entry the diff-hash cache would route to fix-2 — bypass it.
+// Since #464, the cached comment is also a settled prior-round entry, and the re-invoked reviewer
+// re-raises the identical finding unacknowledged — so the reversal-unacknowledged guard demotes it
+// to advisory before the ceiling's demote_and_advance ceremony runs (no follow-up issue is created).
+test("#233 delta: cache hit at ceiling with an unacknowledged re-raise → bypass cache, demote via reversal guard, pre-merge (not fix-2)", async (t) => {
   // Use cap=1 so a single cached blocking verdict places us at/over the ceiling.
   const cfgDemoteCap1 = {
     ...cfgDemote,
@@ -2952,12 +2955,69 @@ test("#233 delta: cache hit at ceiling with demote_and_advance and incomplete de
   assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "must NOT route to fix-2 via cache at ceiling with demote_and_advance");
   // Demotion completes: advance to pre-merge.
   assert.equal(outcome?.to, "pre-merge", "must advance to pre-merge via demotion after cache bypass");
-  // Follow-up issue must be created (demotion ran to completion).
-  assert.equal(createIssueCalls, 1, "follow-up issue must be created when demotion completes");
-  // Demotion comment must be posted.
+  // The reversal-unacknowledged guard (#464) demotes the re-raise before the ceiling's
+  // demote_and_advance ceremony runs — no follow-up issue is created for it.
+  assert.equal(createIssueCalls, 0, "reversal guard demotes the re-raise before ceiling demote_and_advance creates a follow-up issue");
+  // The reversal tag must be posted instead.
   assert.ok(
-    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted and deferred")),
-    "demotion comment must be posted on completion",
+    rec.comments.some((c) => c.includes("REVERSAL-UNACKNOWLEDGED")),
+    "posted comment must tag the demoted finding as REVERSAL-UNACKNOWLEDGED",
+  );
+});
+
+// (#464 review-1 finding 979431a8) Regression: the reversal-unacknowledged
+// guard must still demote an unacknowledged true re-raise on the round-cap
+// ceiling round itself — a prior version withheld settled findings entirely
+// on the ceiling round, letting the re-raise block instead of being demoted.
+test("#464 review-1: unacknowledged true re-raise on the ceiling round is still demoted to advisory", async (t) => {
+  const cfgCeilingCap1 = {
+    ...cfgConverge,
+    review_policy: { ...cfgConverge.review_policy, max_adversarial_rounds: 1 },
+  } as unknown as PipelineConfig;
+
+  // Round-1 comment settling FINDING_MEDIUM (resolved-by-fix: it does not
+  // reappear in any later round in the digest built from this history).
+  const settledRound1Comment = {
+    author: TEST_ACTOR,
+    body: [
+      `## Review 1 (Standard) — needs-attention (commit ${"a".repeat(7)})`,
+      "",
+      "**Reviewer**: codex",
+      "",
+      "minor nit found.",
+      "",
+      "*Automated by Claude Code Pipeline Skill*",
+      `<!-- pipeline-blocking-keys: ${findingKey(FINDING_MEDIUM)} -->`,
+      `<!-- reviewed-sha: ${"a".repeat(40)} -->`,
+    ].join("\n"),
+  };
+
+  // Round 2 (the ceiling round, cap=1) re-raises the identical finding
+  // (same severity/file/title → same findingKey) with no acknowledgment.
+  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  deps.getIssueDetail = async () =>
+    ({
+      number: 49,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "u",
+      labels: [],
+      comments: [settledRound1Comment],
+    }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgCeilingCap1, 49, 2, {}, 0, deps);
+  });
+
+  // The re-raise must be demoted to advisory — it must NOT remain blocking
+  // just because this is the ceiling round.
+  assert.equal(outcome?.to, "pre-merge", "unacknowledged true re-raise must be demoted, advancing to pre-merge");
+  assert.ok(
+    rec.comments.some((c) => c.includes("REVERSAL-UNACKNOWLEDGED")),
+    "posted comment must tag the demoted finding as REVERSAL-UNACKNOWLEDGED",
   );
 });
 

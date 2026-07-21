@@ -581,16 +581,7 @@ export async function advanceReview(
   // just fix entry — so a re-review at the same reviewed SHA does not re-block
   // the same already-declared tooling artifact.
   const nonReproducing = extractNonReproducingDispositions(trustedComments);
-  // The reversal-unacknowledged guard is withheld on the ceiling round itself
-  // (#464): the round-cap ceiling has its own dedicated, MORE audited handling
-  // for a recurring/unresolved finding — `demote_and_advance` creates a
-  // tracked follow-up issue and an override sentinel, a strictly more
-  // rigorous outcome than the guard's generic advisory demotion. Letting the
-  // guard fire first would silently swallow that mechanism.
-  const roundCapForGate = cfg.review_policy.max_adversarial_rounds;
-  const priorRoundCountForGate = detail.comments.filter((c) => c.body.startsWith(roundPfx)).length;
-  const atRoundCeiling = roundCapForGate > 0 && priorRoundCountForGate + 1 >= roundCapForGate;
-  const settled = priorRoundsDigest && !atRoundCeiling ? settledFindings(priorRoundsDigest) : [];
+  const settled = priorRoundsDigest ? settledFindings(priorRoundsDigest) : [];
   const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes, nonReproducing, commitSha, settled);
   const blockingFindingSet = new Set<ReviewFinding>(partition.blocking);
   for (let i = 0; i < findingRecords.length; i++) {
