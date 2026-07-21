@@ -78,9 +78,21 @@ export interface CostAccountingGroup extends CostAccountingTotals {
   outcome: string;
 }
 
+/** Cost-source coverage across the window's accounting records (#429) —
+ *  distinct from `totals`' USD sums: this answers "how much of this window is
+ *  measured, vs. guessed, vs. not known at all?" `actual_coverage` is `null`
+ *  when there are no calls, matching the existing zero-denominator rule. */
+export interface CostSourceCoverage {
+  actual_calls: number;
+  estimated_calls: number;
+  unknown_calls: number;
+  actual_coverage: number | null;
+}
+
 export interface CostAccountingMetric {
   totals: CostAccountingTotals;
   groups: CostAccountingGroup[];
+  coverage: CostSourceCoverage;
 }
 
 export interface ScoreboardMetrics {
@@ -663,6 +675,9 @@ function aggregateCostAccounting(
   const groups = new Map<string, CostAccountingGroup>();
   const totals = newCostAccountingTotals();
   const unknownCostKeys = new Set<string>();
+  let actualCalls = 0;
+  let estimatedCalls = 0;
+  let unknownCalls = 0;
 
   for (const run of runs) {
     for (const ref of collectAccountingRecords(run)) {
@@ -697,6 +712,10 @@ function aggregateCostAccounting(
       addAccounting(totals, normalized);
       groups.set(key, group);
 
+      if (normalized.cost_source === "actual") actualCalls++;
+      else if (normalized.cost_source === "estimated") estimatedCalls++;
+      else unknownCalls++;
+
       if (normalized.cost_source === "unknown") {
         const unknownKey = `${key}|${ref.path}`;
         if (!unknownCostKeys.has(unknownKey)) {
@@ -712,8 +731,16 @@ function aggregateCostAccounting(
     }
   }
 
+  const totalCalls = actualCalls + estimatedCalls + unknownCalls;
+
   return {
     totals: roundAccountingTotals(totals),
+    coverage: {
+      actual_calls: actualCalls,
+      estimated_calls: estimatedCalls,
+      unknown_calls: unknownCalls,
+      actual_coverage: totalCalls === 0 ? null : roundUsd(actualCalls / totalCalls),
+    },
     groups: [...groups.values()]
       .map(roundAccountingTotals)
       .sort((a, b) =>
@@ -1317,6 +1344,7 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   lines.push("");
   lines.push(`Ready-to-deploy without human intervention: ${formatRate(report.metrics.ready_to_deploy_without_human_intervention)}`);
   lines.push(`Cost per ready PR: ${formatCostMetric(report.metrics.cost_per_ready_pr_usd)}`);
+  lines.push(`Cost-source coverage: ${formatCoverage(report.metrics.cost_accounting.coverage)}`);
   lines.push("Cost/accounting by group:");
   if (report.metrics.cost_accounting.groups.length === 0) {
     lines.push("  (no stage accounting records)");
@@ -1388,6 +1416,14 @@ function formatRatioValue(value: RateValue): string {
 function formatCostMetric(value: CostMetric): string {
   const rendered = value.value === null ? "n/a" : `$${value.value.toFixed(4)}`;
   return `${rendered} (actual $${value.actual_usd.toFixed(4)}, estimated $${value.estimated_usd.toFixed(4)}, missing calls ${value.missing_call_count}, denominator ${value.denominator})`;
+}
+
+function formatCoverage(coverage: CostSourceCoverage): string {
+  const ratio = coverage.actual_coverage === null ? "n/a" : `${(coverage.actual_coverage * 100).toFixed(1)}%`;
+  return (
+    `actual ${coverage.actual_calls}; estimated ${coverage.estimated_calls}; ` +
+    `unknown ${coverage.unknown_calls}; actual coverage ${ratio}`
+  );
 }
 
 function formatAccountingGroup(group: CostAccountingGroup): string {
