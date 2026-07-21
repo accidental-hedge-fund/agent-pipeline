@@ -272,10 +272,12 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   // evals never touches GitHub (mutatesGitHub: false is the property the
   // no-production-writes guarantee is documented by) and never needs gh auth —
-  // it replays frozen fixtures offline. `pipeline evals plan|run <manifest>`.
+  // it replays frozen fixtures offline. `pipeline evals plan|run <manifest>`;
+  // `pipeline evals grade|report <experiment-dir>` (#433) grade/report only
+  // read/write files under the experiment dir — never a pipeline gate.
   evals: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "profile", "fixtures"]),
+    allowedFlags: new Set(["repoPath", "base", "profile", "fixtures", "baseline", "judge"]),
     needsConfig: true,
     needsGhAuth: false,
     mutatesGitHub: false,

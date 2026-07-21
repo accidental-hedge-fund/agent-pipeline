@@ -315,6 +315,8 @@ export function buildCmd(): Command {
     .option("--by <dimension>", "scoreboard: group metrics by harness|model|effort|executor; repeatable (to detect a duplicate flag)", collectRepeatable, [])
     .option("--html <path>", "scoreboard: write a self-contained offline HTML export of the report to this path")
     .option("--fixtures <dir>", "evals: directory of fixture JSON files (default: core/evals/fixtures)")
+    .option("--baseline <treatment_id>", "evals report: the treatment_id every paired delta is computed against (required)")
+    .option("--judge", "evals grade: opt in to the optional model judge (disabled by default; recorded separately from deterministic grades)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -865,18 +867,26 @@ async function main(): Promise<void> {
     return;
   }
 
-  // `pipeline evals plan|run <manifest>` — experiment harness dispatch (#432).
-  // Never resolves gh auth and mutatesGitHub is false in the registry: evaluation
-  // mode performs no production GitHub writes by construction (evals/gh-eval-surface.ts).
+  // `pipeline evals plan|run|grade|report` — experiment harness dispatch (#432,
+  // #433). Never resolves gh auth and mutatesGitHub is false in the registry:
+  // evaluation mode performs no production GitHub writes by construction
+  // (evals/gh-eval-surface.ts). grade/report never gate a PR or participate in
+  // the state machine — they only read/write files under the experiment dir.
   if (numArg === "evals") {
     const evalsSub = cmd.args[1];
-    const manifestArg = cmd.args[2];
-    if (evalsSub !== "plan" && evalsSub !== "run") {
-      console.error('pipeline evals: expected a subcommand — "plan" or "run".\n  Usage: pipeline evals <plan|run> <manifest.json>');
+    const pathArg = cmd.args[2];
+    if (evalsSub !== "plan" && evalsSub !== "run" && evalsSub !== "grade" && evalsSub !== "report") {
+      console.error(
+        'pipeline evals: expected a subcommand — "plan", "run", "grade", or "report".\n' +
+          "  Usage: pipeline evals <plan|run> <manifest.json>\n" +
+          "         pipeline evals grade <experiment-dir> [--judge]\n" +
+          "         pipeline evals report <experiment-dir> --baseline <treatment_id>",
+      );
       process.exit(2);
     }
-    if (!manifestArg) {
-      console.error(`pipeline evals ${evalsSub}: a manifest path argument is required.\n  Usage: pipeline evals ${evalsSub} <manifest.json>`);
+    if (!pathArg) {
+      const argName = evalsSub === "grade" || evalsSub === "report" ? "<experiment-dir>" : "<manifest.json>";
+      console.error(`pipeline evals ${evalsSub}: a ${argName} argument is required.`);
       process.exit(2);
     }
     let evalsCfg: import("./types.ts").PipelineConfig;
@@ -886,16 +896,44 @@ async function main(): Promise<void> {
       console.error(`pipeline evals: config error: ${(err as Error).message}`);
       process.exit(1);
     }
-    const manifestPath = path.resolve(evalsCfg.repo_dir, manifestArg);
     const fixturesDir = path.resolve(evalsCfg.repo_dir, opts.fixtures ?? "core/evals/fixtures");
-    const { planExperiment, runExperiment } = await import("./evals/run.ts");
     try {
-      if (evalsSub === "plan") {
-        const { manifest, plan } = await planExperiment(evalsCfg, manifestPath, fixturesDir);
-        console.log(`pipeline evals plan: ${plan.cells.length} cell(s) for experiment "${manifest.experiment_id}"`);
+      if (evalsSub === "plan" || evalsSub === "run") {
+        const manifestPath = path.resolve(evalsCfg.repo_dir, pathArg);
+        const { planExperiment, runExperiment } = await import("./evals/run.ts");
+        if (evalsSub === "plan") {
+          const { manifest, plan } = await planExperiment(evalsCfg, manifestPath, fixturesDir);
+          console.log(`pipeline evals plan: ${plan.cells.length} cell(s) for experiment "${manifest.experiment_id}"`);
+        } else {
+          const { manifest, executed } = await runExperiment(evalsCfg, manifestPath, fixturesDir);
+          console.log(`pipeline evals run: executed ${executed.length} cell(s) for experiment "${manifest.experiment_id}"`);
+        }
+        return;
+      }
+
+      const experimentPath = path.resolve(evalsCfg.repo_dir, pathArg);
+      const outputDir = path.dirname(experimentPath);
+      const experimentId = path.basename(experimentPath);
+      const { loadFixturesFromDir } = await import("./evals/run.ts");
+      const fixtures = loadFixturesFromDir(fixturesDir);
+
+      if (evalsSub === "grade") {
+        const { gradeExperiment } = await import("./evals/grading/grade.ts");
+        const { grades, skipped } = await gradeExperiment(evalsCfg, outputDir, experimentId, fixtures);
+        console.log(`pipeline evals grade: wrote ${grades.length} grade(s) for experiment "${experimentId}" (${skipped.length} cell(s) skipped)`);
+        if (opts.judge) {
+          console.warn(
+            "pipeline evals grade --judge: no judge harness is configured yet — judging requires a caller-supplied invokeJudge (see grading/judge.ts); skipping.",
+          );
+        }
       } else {
-        const { manifest, executed } = await runExperiment(evalsCfg, manifestPath, fixturesDir);
-        console.log(`pipeline evals run: executed ${executed.length} cell(s) for experiment "${manifest.experiment_id}"`);
+        if (!opts.baseline) {
+          console.error("pipeline evals report: --baseline <treatment_id> is required.");
+          process.exit(2);
+        }
+        const { reportExperiment } = await import("./evals/reporting/report.ts");
+        const summary = await reportExperiment(outputDir, experimentId, fixtures, { baselineTreatmentId: opts.baseline });
+        console.log(`pipeline evals report: wrote summary.json for experiment "${experimentId}" (${summary.treatments.length} treatment(s), baseline "${opts.baseline}")`);
       }
     } catch (err) {
       console.error(`pipeline evals ${evalsSub}: ${(err as Error).message}`);

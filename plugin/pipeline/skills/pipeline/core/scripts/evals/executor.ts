@@ -157,6 +157,47 @@ export interface CellExecutionDeps {
   removeWorktree?: (cfg: PipelineConfig, opts: { path: string; branch: string }) => Promise<void>;
   invokeHarness?: (args: HarnessInvokeArgs) => Promise<HarnessInvokeResultLike>;
   preflight?: (harness: string, req: { model?: string; effort?: string }) => Promise<PreflightResultLike>;
+  /** Run each named check as a shell command in the given worktree and report
+   *  pass (exit 0) / fail per check name. Only invoked when the fixture
+   *  declares at least one public or hidden check (grading needs the result;
+   *  a fixture declaring none never triggers this, so existing callers that
+   *  inject no fake are unaffected). */
+  runChecks?: (args: { worktreeDir: string; checks: string[] }) => Promise<Record<string, boolean>>;
+  /** Report the repository-relative paths that differ from `baseSha` in the
+   *  given worktree. Only invoked when the fixture declares
+   *  `allowed_change_paths` (out-of-scope-change grading needs it). */
+  getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+}
+
+async function defaultRunChecks(args: { worktreeDir: string; checks: string[] }): Promise<Record<string, boolean>> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  const results: Record<string, boolean> = {};
+  for (const check of args.checks) {
+    try {
+      await execFileAsync("sh", ["-c", check], { cwd: args.worktreeDir, timeout: 300_000 });
+      results[check] = true;
+    } catch {
+      results[check] = false;
+    }
+  }
+  return results;
+}
+
+async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: string }): Promise<string[]> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    const { stdout } = await execFileAsync("git", ["diff", "--name-only", args.baseSha], {
+      cwd: args.worktreeDir,
+      timeout: 30_000,
+    });
+    return stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
 }
 
 async function realPreflight(
@@ -292,6 +333,9 @@ export async function runCell(
     const cellDeadlineMs = Date.now() + manifest.timeout * 1000;
 
     const stageDetails: Record<string, unknown>[] = [];
+    let reviewFindings: unknown[] | undefined;
+    let planningOutputText: string | undefined;
+    let planningSelfAssessment: unknown;
     for (let i = 0; i < stages.length; i++) {
       const stage = stages[i];
       const prompt = prompts[i];
@@ -370,10 +414,37 @@ export async function runCell(
         exit_code: result.exit_code,
         duration: result.duration,
       });
+
+      // Grading-relevant stage output, captured here because it does not
+      // survive worktree teardown: review-mode findings (parsed from the
+      // harness's review-verdict JSON, best-effort) and planning-mode output
+      // text / self-assessment.
+      if (stage === "review") {
+        const findings = parseReviewFindings(result.stdout);
+        if (findings !== undefined) reviewFindings = findings;
+      }
+      if (stage === "planning") {
+        planningOutputText = result.stdout;
+        planningSelfAssessment = parseSelfAssessment(result.stdout);
+      }
     }
 
+    const detail: Record<string, unknown> = { stages: stageDetails };
+    const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+    if (allChecks.length > 0) {
+      const runChecksFn = deps.runChecks ?? defaultRunChecks;
+      detail.checks = await runChecksFn({ worktreeDir: identity.worktreePath, checks: allChecks });
+    }
+    if (fixture.allowed_change_paths !== undefined) {
+      const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
+      detail.changed_paths = await getChangedPathsFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+    }
+    if (reviewFindings !== undefined) detail.findings = reviewFindings;
+    if (planningOutputText !== undefined) detail.output_text = planningOutputText;
+    if (planningSelfAssessment !== undefined) detail.self_assessment = planningSelfAssessment;
+
     return {
-      outcome: { result_class: "completed", detail: { stages: stageDetails } },
+      outcome: { result_class: "completed", detail },
       materializedPrompt,
       effectiveConfig,
       ghRefusals: recorder.refusals,
@@ -393,6 +464,39 @@ export async function runCell(
       }
     }
   }
+}
+
+/** Best-effort extraction of `findings` from a review-mode harness's stdout,
+ *  which is expected to be the review-verdict JSON (review-schema.ts) when
+ *  the harness followed the prompt. Returns `undefined` — not a grading
+ *  failure — when stdout is not that shape; the review grader then reports
+ *  every seeded defect as an unmatched false negative rather than throwing. */
+function parseReviewFindings(stdout: string): unknown[] | undefined {
+  try {
+    const parsed = JSON.parse(stdout);
+    if (parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).findings)) {
+      return (parsed as Record<string, unknown>).findings as unknown[];
+    }
+  } catch {
+    // Not JSON — leave undefined.
+  }
+  return undefined;
+}
+
+/** Best-effort extraction of a treatment-emitted self-assessment from
+ *  planning-mode stdout, recorded as an observation only (types.ts) — the
+ *  planning grader must never read this as a grade input. */
+function parseSelfAssessment(stdout: string): unknown {
+  try {
+    const parsed = JSON.parse(stdout);
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      return obj.self_assessment ?? obj.self_score ?? obj.confidence;
+    }
+  } catch {
+    // Not JSON — no self-assessment to record.
+  }
+  return undefined;
 }
 
 /** Classify a non-timeout, non-spawn-error invocation *failure*
