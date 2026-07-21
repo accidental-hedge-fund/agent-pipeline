@@ -722,48 +722,63 @@ test("runCapped: with no stdinPayload, stdio[0] stays 'ignore' (byte-for-byte no
   assert.deepEqual(capturedStdio, ["ignore", "pipe", "pipe"], "stdin must stay 'ignore' when no stdinPayload is supplied");
 });
 
-test("runCapped: with a stdinPayload, stdio[0] becomes 'pipe' and the payload is written and delivered", async () => {
+test("runCapped: with a stdinPayload, stdio[0] becomes a file descriptor and the payload is delivered", async () => {
   const cli = makeScript("stdin-echo", `cat`);
   const result = await runCapped(cli, [], tmpRoot, 30, false, "test", { stdinPayload: "hello from stdin" });
   assert.equal(result.success, true);
   assert.equal(result.stdout, "hello from stdin");
 });
 
-test("runCapped: a stdin write failure forces the result to fail even when the child races ahead with a valid-looking exit-0 (#492 review 2, key 4b773135)", async () => {
-  const fakeStdin = Object.assign(new EventEmitter(), {
-    end: function end() {
-      // Simulate an async EPIPE arriving after end() is called — racing
-      // behind the child's own close event, which is queued first below.
-      setImmediate(() => fakeStdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
-    },
-  });
+test("runCapped: the fd handed to spawn already references the complete, on-disk payload before the child ever runs (#492 review 3, key 8c1c7cbf) — closes the pipe-finish race", async () => {
+  // Round 2's fix tracked the writable stream's 'finish' event as proof the
+  // child received the full prompt, but 'finish' only proves the parent
+  // flushed bytes into the OS pipe buffer — a child that read enough to make
+  // room, then exited, could discard unread trailing bytes with no error
+  // ever surfacing. Delivering via a real file removes the race outright: by
+  // the time spawn() is even called, the entire payload is already committed
+  // to disk, so whatever fd the child inherits always references complete
+  // content — there is no live producer for the child to race ahead of.
+  const payload = "x".repeat(200_000); // larger than a typical 64 KB pipe buffer
+  let observedFdContent: string | undefined;
   const fakeChild = Object.assign(new EventEmitter(), {
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
-    stdin: fakeStdin,
-    pid: 123460,
+    pid: 999111,
     kill: () => true,
   });
-  const spawnFn = ((_cmd: string, _args: string[], _options: unknown) => {
-    // Queued before the stdin write block runs, so this 'close' (with output
-    // that parses as an approval and exit code 0) fires before the async
-    // EPIPE above is known — the exact race the finding describes.
-    setImmediate(() => {
-      fakeChild.stdout.emit("data", Buffer.from('{"verdict":"approve"}'));
-      fakeChild.emit("close", 0);
-    });
+  const spawnFn = ((_cmd: string, _args: string[], options: { stdio?: unknown[] }) => {
+    const fd = (options.stdio ?? [])[0] as number;
+    observedFdContent = fs.readFileSync(`/proc/self/fd/${fd}`, "utf8");
+    setImmediate(() => fakeChild.emit("close", 0));
     return fakeChild;
   }) as unknown as typeof import("node:child_process").spawn;
 
-  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", {
+  await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn, stdinPayload: payload });
+
+  assert.equal(
+    observedFdContent,
+    payload,
+    "the fd handed to spawn must already contain the complete payload at spawn time",
+  );
+});
+
+test("runCapped: a stdin prompt-file materialization failure surfaces as spawn_error+stdin_error without ever spawning (#492 review 3, key 8c1c7cbf)", async () => {
+  const missingCwd = path.join(tmpRoot, "does-not-exist-" + path.basename(tmpRoot));
+  let spawnCalled = false;
+  const spawnFn = ((..._args: unknown[]) => {
+    spawnCalled = true;
+    throw new Error("must not be called");
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const result = await runCapped("unused", [], missingCwd, 30, false, "test", {
     spawnFn,
     stdinPayload: "prompt too big to fit in argv",
   });
 
-  assert.equal(result.success, false, "a failed stdin write must invalidate an otherwise exit-0 result");
+  assert.equal(spawnCalled, false, "spawn must never be attempted when the stdin file cannot be materialized");
+  assert.equal(result.success, false);
   assert.equal(result.spawn_error, true, "must be flagged so the #39 self-review fallback triggers");
   assert.equal(result.stdin_error, true);
-  assert.match(result.stdout, /"verdict":"approve"/, "captured output is preserved for diagnostics");
 });
 
 test("invoke(): the grok adapter materializes the prompt file, references it via --prompt-file, and removes exactly that file afterward (#492)", async () => {

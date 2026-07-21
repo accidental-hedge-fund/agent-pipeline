@@ -30,6 +30,8 @@
 // cost/usage-bearing envelope line always arrives last.
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
@@ -165,12 +167,10 @@ export interface HarnessResult {
   // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
   // Distinct from spawn_error: the process itself started successfully.
   capture_error?: boolean;
-  // True when the stdin-channel prompt write itself failed (e.g. EPIPE) before
-  // the child could be confirmed to have received it in full (#492 review 2,
-  // key 4b773135). A stdin write failure invalidates the invocation outright —
-  // the child's own exit code cannot be trusted as evidence the full prompt
-  // was read — so this always accompanies spawn_error: true, which the #39
-  // self-review fallback already checks for.
+  // True when a stdin-channel prompt could not be materialized to disk before
+  // spawn (#492 review 3, key 8c1c7cbf) — e.g. the worktree ran out of space.
+  // The process is never spawned in this case, so this always accompanies
+  // spawn_error: true, which the #39 self-review fallback already checks for.
   stdin_error?: boolean;
   // External stage executor evidence (#314). Populated only when the result
   // came from `executors.ts`'s dispatch path (a `stage_executors:` assignment),
@@ -522,11 +522,11 @@ export async function runCapped(
     // Absent by default: chunks are forwarded verbatim, matching pre-#429
     // behavior exactly.
     transformForward?: (chunk: string) => string;
-    // Payload to write to the child's standard input, then end the stream
-    // (#492). When present, stdio[0] becomes "pipe" instead of "ignore" —
-    // this is the ONLY condition under which the child's stdin is opened, so
-    // every existing caller with no stdin payload keeps stdin: "ignore"
-    // byte-for-byte.
+    // Payload to deliver on the child's standard input (#492). Materialized to
+    // a file and opened read-only before spawn (#492 review 3) — stdio[0] is
+    // that file's fd instead of "ignore". This is the ONLY condition under
+    // which the child's stdin is opened, so every existing caller with no
+    // stdin payload keeps stdin: "ignore" byte-for-byte.
     stdinPayload?: string;
   } = {},
 ): Promise<HarnessResult> {
@@ -560,6 +560,44 @@ export async function runCapped(
     });
   }
 
+  // #492 review 3 (key 8c1c7cbf): a stdin *pipe* only proves the parent
+  // finished writing into the OS pipe buffer, never that the child read past
+  // whatever it needed to make room — a child can exit 0 having discarded
+  // unread trailing bytes, so pipe "finish" cannot certify full-prompt
+  // consumption. A regular file has no such producer/consumer race: the
+  // entire payload is committed to disk before the child is spawned, so
+  // whatever the child reads from its stdin fd is always a complete,
+  // unbuffered view of the same bytes regardless of when it stops reading or
+  // exits. The file is unlinked immediately after spawn (the child's
+  // inherited fd keeps the underlying inode alive per POSIX semantics), so no
+  // prompt content is left on disk beyond the moment the child process starts.
+  let stdinFd: number | undefined;
+  let stdinFilePath: string | undefined;
+  if (opts.stdinPayload !== undefined) {
+    stdinFilePath = path.join(cwd, `.pipeline-stdin-${randomUUID()}.txt`);
+    try {
+      fsSync.writeFileSync(stdinFilePath, opts.stdinPayload, "utf8");
+      stdinFd = fsSync.openSync(stdinFilePath, "r");
+    } catch (err) {
+      try {
+        if (stdinFilePath) fsSync.rmSync(stdinFilePath, { force: true });
+      } catch {
+        // best effort
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      return Promise.resolve({
+        success: false,
+        stdout: "",
+        stderr: `[harness ${label}] failed to materialize the stdin prompt file: ${message}`,
+        exit_code: -1,
+        duration: 0,
+        timed_out: false,
+        spawn_error: true,
+        stdin_error: true,
+      });
+    }
+  }
+
   return new Promise<HarnessResult>((resolvePromise) => {
     const killProcessGroup = opts.killProcessGroup ?? false;
     // Grace period (seconds) between SIGTERM and SIGKILL on timeout. Configurable
@@ -580,7 +618,9 @@ export async function runCapped(
         cwd,
         // #492: stdin is opened only when this invocation carries a stdin
         // payload — every other caller keeps stdin: "ignore" byte-for-byte.
-        stdio: [opts.stdinPayload !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
+        // #492 review 3: a file descriptor, not "pipe" — see the stdinFd
+        // materialization above for why.
+        stdio: [stdinFd ?? "ignore", "pipe", "pipe"],
         // detached creates a new process group so we can kill all descendants on timeout
         ...(killProcessGroup ? { detached: true } : {}),
         // Merge in caller-supplied env additions (#419) on top of the inherited
@@ -603,6 +643,26 @@ export async function runCapped(
         spawn_error: true,
       });
       return;
+    } finally {
+      // The child has its own dup'd fd from the spawn syscall by the time
+      // spawnImpl() returns (success or throw) — close ours and unlink the
+      // file immediately. POSIX keeps the underlying inode readable via the
+      // child's fd until it closes it, so this never truncates what the
+      // child sees.
+      if (stdinFd !== undefined) {
+        try {
+          fsSync.closeSync(stdinFd);
+        } catch {
+          // best effort
+        }
+      }
+      if (stdinFilePath) {
+        try {
+          fsSync.rmSync(stdinFilePath, { force: true });
+        } catch {
+          // best effort
+        }
+      }
     }
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -641,31 +701,6 @@ export async function runCapped(
       }
     };
 
-    // A stdin write/EPIPE failure (#492 review 2, key 4b773135) means the CLI
-    // may have closed stdin before consuming the full prompt — the child could
-    // still exit 0 and emit output that parses as a valid verdict despite never
-    // seeing the whole prompt. That invalidates the outcome outright, so unlike
-    // a forward-stream failure (diagnostic only) a stdin failure forces the
-    // result to fail. `stdinSettled` gates the close-driven settle() below so
-    // it never resolves before the stdin write's own error/finish outcome is
-    // known — otherwise a close that fires first would race the async EPIPE.
-    let stdinNote = "";
-    let stdinFailed = false;
-    let stdinSettled = opts.stdinPayload === undefined;
-    let onStdinSettled: (() => void) | null = null;
-    const onStdinError = (err: Error) => {
-      if (stdinFailed) return;
-      stdinFailed = true;
-      stdinSettled = true;
-      stdinNote = `[harness ${label}] stdin write error: ${err.message}`;
-      onStdinSettled?.();
-    };
-    const onStdinFinish = () => {
-      if (stdinSettled) return;
-      stdinSettled = true;
-      onStdinSettled?.();
-    };
-
     const settle = (result: HarnessResult) => {
       if (settled) return;
       settled = true;
@@ -677,10 +712,7 @@ export async function runCapped(
         fwd.stdout.off("error", onForwardError);
         fwd.stderr.off("error", onForwardError);
       }
-      if (stdinFailed) {
-        result = { ...result, success: false, spawn_error: true, stdin_error: true };
-      }
-      const notes = [forwardNote, stdinNote].filter(Boolean).join("\n");
+      const notes = [forwardNote].filter(Boolean).join("\n");
       if (notes) {
         result = {
           ...result,
@@ -688,18 +720,6 @@ export async function runCapped(
         };
       }
       resolvePromise(result);
-    };
-
-    // The 'close' handler (below) defers to this once the stdin write's own
-    // outcome is known, so a stdin failure can never be masked by a 'close'
-    // that races ahead of the async EPIPE with an exit-0/valid-output result.
-    let pendingCloseResult: HarnessResult | null = null;
-    onStdinSettled = () => {
-      if (pendingCloseResult) {
-        const result = pendingCloseResult;
-        pendingCloseResult = null;
-        settle(result);
-      }
     };
 
     const killGroup = (signal: NodeJS.Signals) => {
@@ -820,14 +840,6 @@ export async function runCapped(
       if (stream) safeForward(fwd.stderr, text);
     });
 
-    // #492: write the stdin payload and end the stream now that stdout/stderr
-    // readers are attached, so nothing can be missed before the write.
-    if (opts.stdinPayload !== undefined && child.stdin) {
-      child.stdin.on("error", onStdinError);
-      child.stdin.on("finish", onStdinFinish);
-      child.stdin.end(opts.stdinPayload, "utf8");
-    }
-
     // A capture stream erroring mid-run (e.g. the pipe breaking before the
     // process exit is observed) is a tooling failure, not a genuine test
     // result — without this handler an unhandled stream 'error' would throw
@@ -879,10 +891,6 @@ export async function runCapped(
         duration,
         timed_out: false,
       };
-      if (!stdinSettled) {
-        pendingCloseResult = result;
-        return;
-      }
       settle(result);
     });
   });
