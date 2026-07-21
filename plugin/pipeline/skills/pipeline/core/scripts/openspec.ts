@@ -267,6 +267,31 @@ export function changeIdsFromPaths(paths: string[]): string[] {
 }
 
 /**
+ * Change ids the PR still carries active (unarchived) at HEAD, computed purely
+ * from the PR's changed-file list — never the local worktree filesystem (#467).
+ * `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`);
+ * `archivedIds` = ids appearing as `openspec/changes/archive/<id>/…`. Returns
+ * `activeIds \ archivedIds`. Worktree-independent by construction: it holds
+ * identically on a first run, an override-resumed run, a fresh process, or
+ * after the worktree has been removed.
+ */
+export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
+  const active = new Set<string>();
+  const archived = new Set<string>();
+  for (const raw of paths) {
+    const p = raw.replace(/\\/g, "/");
+    const archivedMatch = p.match(/(?:^|\/)openspec\/changes\/archive\/([^/]+)\//);
+    if (archivedMatch) {
+      archived.add(archivedMatch[1]);
+      continue;
+    }
+    const activeMatch = p.match(/(?:^|\/)openspec\/changes\/([^/]+)\//);
+    if (activeMatch && activeMatch[1] !== "archive") active.add(activeMatch[1]);
+  }
+  return [...active].filter((id) => !archived.has(id));
+}
+
+/**
  * Pure parser. Exit code is the source of truth for pass/fail (0 = valid). The
  * `--json` payload is parsed best-effort to surface issue messages; if it isn't
  * JSON we fall back to the raw text. Exported for tests.

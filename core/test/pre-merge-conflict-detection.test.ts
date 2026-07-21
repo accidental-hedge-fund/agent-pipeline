@@ -67,6 +67,9 @@ function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps;
     // In CI, gh api user fails with machine tokens → inject mock so the SHA gate
     // doesn't hit the real gh CLI and return null (#229).
     getGhActor: async () => "test-actor",
+    // Head-side OpenSpec active-change guard (#467) always fetches the PR diff;
+    // an empty diff means no openspec/changes/ path, so the guard is a no-op here.
+    getPrDiff: async () => "",
   };
   return { deps, rec };
 }

@@ -185,6 +185,7 @@ test("advance(): CI failure + rebaseAlreadyAttempted=true → setBlocked needs-h
     transition: async () => {},
     postComment: async () => {},
     getGhActor: async () => "test-actor",
+    getPrDiff: async () => "",
   };
 
   let out;
@@ -234,6 +235,7 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
     transition: async () => {},
     postComment: async () => {},
     getGhActor: async () => "test-actor",
+    getPrDiff: async () => "",
   };
 
   let out;

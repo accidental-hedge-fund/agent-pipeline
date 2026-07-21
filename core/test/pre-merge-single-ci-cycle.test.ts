@@ -67,6 +67,7 @@ function makeDeps(): { deps: AdvancePreMergeDeps; rec: Rec } {
     // In CI, gh api user fails with machine tokens → inject mock so the SHA gate
     // doesn't hit the real gh CLI and return null (#229).
     getGhActor: async () => "test-actor",
+    getPrDiff: async () => "",
   };
   return { deps, rec };
 }
@@ -133,6 +134,7 @@ test("pre-merge: post-CI conflict is caught by fresh Step 2 fetch, not stale pre
     transition: async () => {},
     postComment: async () => {},
     getGhActor: async () => "test-actor",
+    getPrDiff: async () => "",
   };
 
   const out = await advance(makeCfg(false), 95, {}, deps);
@@ -168,6 +170,7 @@ test("pre-merge: CI check result recorded in evidence bundle when stateDir provi
       transition: async () => {},
       setBlocked: async () => {},
       getGhActor: async () => "test-actor",
+      getPrDiff: async () => "",
     };
 
     await advance(makeCfg(false), 88, { stateDir: dir }, deps);
@@ -214,6 +217,7 @@ test("pre-merge: eval_gate disabled + shipcheck_gate enabled → still routes to
     transition: async () => {},
     setBlocked: async () => {},
     getGhActor: async () => "test-actor",
+    getPrDiff: async () => "",
   };
 
   const cfg = {
@@ -249,6 +253,7 @@ test("pre-merge: eval_gate disabled + shipcheck_gate disabled → still routes t
     transition: async () => {},
     setBlocked: async () => {},
     getGhActor: async () => "test-actor",
+    getPrDiff: async () => "",
   };
 
   const cfg = {

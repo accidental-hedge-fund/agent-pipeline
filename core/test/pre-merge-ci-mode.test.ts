@@ -102,6 +102,9 @@ function makeBaseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): AdvancePreM
     transition: async () => {},
     setBlocked: async () => {},
     getGhActor: async () => "test-actor",
+    // Head-side OpenSpec active-change guard (#467) always fetches the PR diff;
+    // an empty diff means no openspec/changes/ path, so the guard is a no-op here.
+    getPrDiff: async () => "",
     ...overrides,
   };
 }
