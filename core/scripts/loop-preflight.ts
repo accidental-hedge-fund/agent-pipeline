@@ -233,6 +233,9 @@ function expandRange(range: string): string[] {
   }
   const start = Number(match[1]);
   const end = Number(match[2]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+    throw new LoopArgError(`pipeline:loop: --range endpoints must be safe integers, got "${range}"`);
+  }
   if (start > end) {
     throw new LoopArgError(`pipeline:loop: --range start must be <= end, got "${range}"`);
   }

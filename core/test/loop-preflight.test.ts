@@ -346,6 +346,28 @@ test("normalizeLoopArgs — a --range at exactly MAX_RANGE_SPAN issues expands",
   assert.equal((args.selector as { value: string[] }).value.length, 1000);
 });
 
+test("normalizeLoopArgs — an unsafe equal-endpoint --range is rejected before span check (#451 review 1, finding dcb2a0a3)", () => {
+  assert.throws(
+    () => normalizeLoopArgs({ range: "9007199254740992-9007199254740992" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopArgError);
+      assert.match((err as Error).message, /safe integers/);
+      return true;
+    },
+  );
+});
+
+test("normalizeLoopArgs — a --range reaching an unsafe endpoint is rejected before span check (#451 review 1, finding dcb2a0a3)", () => {
+  assert.throws(
+    () => normalizeLoopArgs({ range: "9007199254740991-9007199254740992" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopArgError);
+      assert.match((err as Error).message, /safe integers/);
+      return true;
+    },
+  );
+});
+
 test("runLoopPreflight — invalid args short-circuit before any check runs (zero I/O)", async () => {
   let calls = 0;
   const deps = fakeDeps({
