@@ -409,3 +409,35 @@ test("pipeline-cli 7.4c: 'run' keyword maps to run entry (allowedFlags:all), not
   assert.equal(entry.allowedFlags, "all");
   assert.notEqual(entry, COMMAND_REGISTRY.advance);
 });
+
+// ---------------------------------------------------------------------------
+// papercut (#419) — agent-facing sub-command, hidden from --help
+// ---------------------------------------------------------------------------
+
+test("pipeline-cli: 'papercut --run <id> -m <msg>' parses run/message and routes to papercut entry, validateFlags []", () => {
+  const { opts, numArg } = parseCli(["papercut", "--run", "419-2026-01-01T00-00-00-000Z", "-m", "npm ci flaked"]);
+  assert.equal(numArg, "papercut");
+  assert.equal(opts.run, "419-2026-01-01T00-00-00-000Z");
+  assert.equal(opts.message, "npm ci flaked");
+  assert.deepEqual(roundTrip(["papercut", "--run", "419-x", "-m", "note"]), []);
+});
+
+test("pipeline-cli: 'papercut report --since <date> --until <date> --json' parses correctly", () => {
+  const { opts, numArg, numArg0 } = parseCli([
+    "papercut", "report", "--since", "2026-01-01", "--until", "2026-01-31", "--json",
+  ]);
+  assert.equal(numArg, "papercut");
+  assert.equal(numArg0, "papercut");
+  assert.equal(opts.since, "2026-01-01");
+  assert.equal(opts.until, "2026-01-31");
+  assert.equal(opts.json, true);
+});
+
+test("pipeline-cli: lookupCommand('papercut') resolves to the registry entry", () => {
+  const entry = lookupCommand("papercut");
+  assert.equal(entry, COMMAND_REGISTRY.papercut);
+});
+
+test("pipeline-cli: papercut with an unsupported flag → validateFlags returns the offending key", () => {
+  assert.deepEqual(roundTrip(["papercut", "--run", "419-x", "-m", "note", "--dry-run"]), ["dryRun"]);
+});

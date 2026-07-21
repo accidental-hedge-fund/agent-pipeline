@@ -1,0 +1,361 @@
+// Tests for the `pipeline papercut` sub-command (#419): record + report.
+//
+// All tests are filesystem- and network-free: I/O is injected via the
+// PapercutDeps seam (in-memory fakes only).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  recordPapercut,
+  reportPapercuts,
+  papercutsEnabled,
+  type PapercutDeps,
+} from "../scripts/stages/papercut.ts";
+
+// ---------------------------------------------------------------------------
+// Fake deps factory
+// ---------------------------------------------------------------------------
+
+interface FakeFile {
+  [path: string]: string;
+}
+
+function makeDeps(opts: {
+  files?: FakeFile;
+  dirs?: Record<string, Array<{ name: string; isDirectory(): boolean }>>;
+  emitThrows?: boolean;
+} = {}): PapercutDeps & {
+  _emitCalls: Array<{ runDir: string; payload: Record<string, unknown> }>;
+  _logLines: string[];
+} {
+  const files = opts.files ?? {};
+  const dirs = opts.dirs ?? {};
+  const emitCalls: Array<{ runDir: string; payload: Record<string, unknown> }> = [];
+  const logLines: string[] = [];
+
+  return {
+    _emitCalls: emitCalls,
+    _logLines: logLines,
+    emitPapercut: async (runDir, payload) => {
+      emitCalls.push({ runDir, payload });
+      if (opts.emitThrows) {
+        throw new Error("simulated append failure");
+      }
+    },
+    readFile: async (p) => {
+      if (!(p in files)) {
+        const err = new Error(`ENOENT: no such file, ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return files[p];
+    },
+    readdir: async (p) => {
+      if (!(p in dirs)) {
+        const err = new Error(`ENOENT: no such directory, ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return dirs[p];
+    },
+    log: (msg) => logLines.push(msg),
+  };
+}
+
+function dirEntry(name: string): { name: string; isDirectory(): boolean } {
+  return { name, isDirectory: () => true };
+}
+
+// ---------------------------------------------------------------------------
+// recordPapercut
+// ---------------------------------------------------------------------------
+
+test("recordPapercut: emits one event with run/issue/stage/harness/model/message", async () => {
+  const repoDir = "/repo";
+  const runDir = "/repo/.agent-pipeline/runs/419-2026-01-01T00-00-00-000Z";
+  const deps = makeDeps({
+    files: {
+      [`${runDir}/run.json`]: JSON.stringify({ issue: 419 }),
+    },
+  });
+
+  const oldStage = process.env.PIPELINE_STAGE;
+  const oldHarness = process.env.PIPELINE_HARNESS;
+  const oldModel = process.env.PIPELINE_MODEL;
+  process.env.PIPELINE_STAGE = "implementing";
+  process.env.PIPELINE_HARNESS = "claude";
+  process.env.PIPELINE_MODEL = "sonnet";
+  try {
+    await recordPapercut(
+      {
+        repoDir,
+        run: "419-2026-01-01T00-00-00-000Z",
+        message: "npm ci flaked once, retried",
+      },
+      deps,
+    );
+  } finally {
+    process.env.PIPELINE_STAGE = oldStage;
+    process.env.PIPELINE_HARNESS = oldHarness;
+    process.env.PIPELINE_MODEL = oldModel;
+  }
+
+  assert.equal(deps._emitCalls.length, 1);
+  const call = deps._emitCalls[0];
+  assert.equal(call.runDir, runDir);
+  assert.equal(call.payload.run_id, "419-2026-01-01T00-00-00-000Z");
+  assert.equal(call.payload.issue, 419);
+  assert.equal(call.payload.stage, "implementing");
+  assert.equal(call.payload.harness, "claude");
+  assert.equal(call.payload.model, "sonnet");
+  assert.equal(call.payload.message, "npm ci flaked once, retried");
+});
+
+test("recordPapercut: explicit stage/harness/model override env vars", async () => {
+  const repoDir = "/repo";
+  const deps = makeDeps();
+  const oldStage = process.env.PIPELINE_STAGE;
+  process.env.PIPELINE_STAGE = "fix-1";
+  try {
+    await recordPapercut(
+      {
+        repoDir,
+        run: "419-x",
+        message: "note",
+        stage: "review-2",
+      },
+      deps,
+    );
+  } finally {
+    process.env.PIPELINE_STAGE = oldStage;
+  }
+  assert.equal(deps._emitCalls[0].payload.stage, "review-2");
+});
+
+test("recordPapercut: absent run.json and unset env vars default to 0/null", async () => {
+  const repoDir = "/repo";
+  const deps = makeDeps();
+  const oldStage = process.env.PIPELINE_STAGE;
+  const oldHarness = process.env.PIPELINE_HARNESS;
+  const oldModel = process.env.PIPELINE_MODEL;
+  delete process.env.PIPELINE_STAGE;
+  delete process.env.PIPELINE_HARNESS;
+  delete process.env.PIPELINE_MODEL;
+  try {
+    await recordPapercut({ repoDir, run: "419-y", message: "note" }, deps);
+  } finally {
+    process.env.PIPELINE_STAGE = oldStage;
+    process.env.PIPELINE_HARNESS = oldHarness;
+    process.env.PIPELINE_MODEL = oldModel;
+  }
+  const call = deps._emitCalls[0];
+  assert.equal(call.payload.issue, 0);
+  assert.equal(call.payload.stage, null);
+  assert.equal(call.payload.harness, null);
+  assert.equal(call.payload.model, null);
+});
+
+test("recordPapercut: never throws and warns when the append seam throws", async () => {
+  const repoDir = "/repo";
+  const deps = makeDeps({ emitThrows: true });
+  await assert.doesNotReject(
+    recordPapercut({ repoDir, run: "419-z", message: "note" }, deps),
+  );
+  assert.equal(deps._emitCalls.length, 1);
+  assert.ok(deps._logLines.some((l) => /non-fatal/.test(l)));
+});
+
+test("recordPapercut: never throws when run.json read throws a non-ENOENT error", async () => {
+  const repoDir = "/repo";
+  const emitCalls: unknown[] = [];
+  const deps: PapercutDeps = {
+    emitPapercut: async (_runDir, payload) => {
+      emitCalls.push(payload);
+    },
+    readFile: async () => {
+      throw new Error("permission denied");
+    },
+    readdir: async () => [],
+    log: () => {},
+  };
+  await assert.doesNotReject(
+    recordPapercut({ repoDir, run: "419-bad", message: "note" }, deps),
+  );
+  // Falls back to issue: 0 rather than aborting the record.
+  assert.equal((emitCalls[0] as { issue: number }).issue, 0);
+});
+
+// ---------------------------------------------------------------------------
+// papercutsEnabled
+// ---------------------------------------------------------------------------
+
+test("papercutsEnabled: false when .github/pipeline.yml is absent", async () => {
+  const deps = makeDeps();
+  assert.equal(await papercutsEnabled("/repo", deps), false);
+});
+
+test("papercutsEnabled: false when the papercuts block is absent", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "base_branch: main\n" },
+  });
+  assert.equal(await papercutsEnabled("/repo", deps), false);
+});
+
+test("papercutsEnabled: false when papercuts.enabled is false", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "papercuts:\n  enabled: false\n" },
+  });
+  assert.equal(await papercutsEnabled("/repo", deps), false);
+});
+
+test("papercutsEnabled: true when papercuts.enabled is true", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "papercuts:\n  enabled: true\n" },
+  });
+  assert.equal(await papercutsEnabled("/repo", deps), true);
+});
+
+test("papercutsEnabled: false (not thrown) when the file is malformed YAML", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "papercuts: [oops\n" },
+  });
+  await assert.doesNotReject(async () => {
+    assert.equal(await papercutsEnabled("/repo", deps), false);
+  });
+});
+
+test("papercutsEnabled: false (not thrown) when readFile throws", async () => {
+  const deps: Pick<PapercutDeps, "readFile"> = {
+    readFile: async () => {
+      throw new Error("permission denied");
+    },
+  };
+  await assert.doesNotReject(async () => {
+    assert.equal(await papercutsEnabled("/repo", deps), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reportPapercuts
+// ---------------------------------------------------------------------------
+
+function papercutLine(at: string, message = "note"): string {
+  return JSON.stringify({
+    schema_version: 1,
+    type: "papercut",
+    at,
+    run_id: "419-r",
+    issue: 419,
+    stage: "implementing",
+    harness: "claude",
+    model: "sonnet",
+    message,
+  });
+}
+
+test("reportPapercuts: includes only in-window events across multiple runs", async () => {
+  const repoDir = "/repo";
+  const runsRoot = "/repo/.agent-pipeline/runs";
+  const deps = makeDeps({
+    dirs: {
+      [runsRoot]: [dirEntry("419-a"), dirEntry("419-b")],
+    },
+    files: {
+      [`${runsRoot}/419-a/events.jsonl`]: [
+        papercutLine("2026-01-01T00:00:00Z", "before window"),
+        papercutLine("2026-01-05T00:00:00Z", "in window"),
+      ].join("\n") + "\n",
+      [`${runsRoot}/419-b/events.jsonl`]: [
+        papercutLine("2026-01-10T00:00:00Z", "after window"),
+      ].join("\n") + "\n",
+    },
+  });
+
+  const events = await reportPapercuts(
+    { repoDir, since: "2026-01-02T00:00:00Z", until: "2026-01-06T00:00:00Z" },
+    deps,
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].message, "in window");
+});
+
+test("reportPapercuts: empty window yields []", async () => {
+  const repoDir = "/repo";
+  const runsRoot = "/repo/.agent-pipeline/runs";
+  const deps = makeDeps({
+    dirs: { [runsRoot]: [dirEntry("419-a")] },
+    files: {
+      [`${runsRoot}/419-a/events.jsonl`]: papercutLine("2026-01-01T00:00:00Z") + "\n",
+    },
+  });
+  const events = await reportPapercuts(
+    { repoDir, since: "2030-01-01T00:00:00Z" },
+    deps,
+  );
+  assert.deepEqual(events, []);
+});
+
+test("reportPapercuts: no runs directory yields []", async () => {
+  const repoDir = "/repo";
+  const deps = makeDeps();
+  const events = await reportPapercuts({ repoDir, since: "2026-01-01T00:00:00Z" }, deps);
+  assert.deepEqual(events, []);
+});
+
+test("reportPapercuts: malformed lines and non-papercut events are skipped", async () => {
+  const repoDir = "/repo";
+  const runsRoot = "/repo/.agent-pipeline/runs";
+  const deps = makeDeps({
+    dirs: { [runsRoot]: [dirEntry("419-a")] },
+    files: {
+      [`${runsRoot}/419-a/events.jsonl`]: [
+        "not json at all {{{",
+        JSON.stringify({ type: "run_start", at: "2026-01-02T00:00:00Z" }),
+        papercutLine("2026-01-03T00:00:00Z", "kept"),
+      ].join("\n") + "\n",
+    },
+  });
+  const events = await reportPapercuts(
+    { repoDir, since: "2026-01-01T00:00:00Z" },
+    deps,
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].message, "kept");
+});
+
+test("reportPapercuts: unreadable run directory is skipped, not fatal", async () => {
+  const repoDir = "/repo";
+  const runsRoot = "/repo/.agent-pipeline/runs";
+  const deps = makeDeps({
+    dirs: { [runsRoot]: [dirEntry("419-unreadable"), dirEntry("419-ok")] },
+    files: {
+      [`${runsRoot}/419-ok/events.jsonl`]: papercutLine("2026-01-02T00:00:00Z", "ok") + "\n",
+    },
+  });
+  const events = await reportPapercuts(
+    { repoDir, since: "2026-01-01T00:00:00Z" },
+    deps,
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].message, "ok");
+});
+
+test("reportPapercuts: results sorted ascending by at", async () => {
+  const repoDir = "/repo";
+  const runsRoot = "/repo/.agent-pipeline/runs";
+  const deps = makeDeps({
+    dirs: { [runsRoot]: [dirEntry("419-a")] },
+    files: {
+      [`${runsRoot}/419-a/events.jsonl`]: [
+        papercutLine("2026-01-05T00:00:00Z", "third"),
+        papercutLine("2026-01-01T00:00:00Z", "first"),
+        papercutLine("2026-01-03T00:00:00Z", "second"),
+      ].join("\n") + "\n",
+    },
+  });
+  const events = await reportPapercuts(
+    { repoDir, since: "2025-01-01T00:00:00Z" },
+    deps,
+  );
+  assert.deepEqual(events.map((e) => e.message), ["first", "second", "third"]);
+});

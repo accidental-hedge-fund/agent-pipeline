@@ -20,12 +20,43 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
-import type { Harness } from "./types.ts";
+import type { Harness, PipelineConfig } from "./types.ts";
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
 
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * Build the `env` addition for a harness child process carrying run/stage/
+ * harness/model identity (#419), so `pipeline papercut --run <run-id> ...`
+ * invoked by the agent mid-run can resolve identity without fabricating it.
+ * Single-sourced so implementing/fix/review call sites cannot drift.
+ *
+ * Returns `undefined` when `cfg.papercuts.enabled` is false (the default),
+ * so the harness child's environment is completely unchanged from pre-#419
+ * behavior on the default path — matching `runCapped`'s "no opts.env → no
+ * env key at all" contract.
+ */
+export function papercutIdentityEnv(
+  cfg: PipelineConfig,
+  identity: {
+    runId: string | null;
+    issue: number | null;
+    stage: string | null;
+    harness: string | null;
+    model: string | null;
+  },
+): NodeJS.ProcessEnv | undefined {
+  if (!cfg.papercuts?.enabled) return undefined;
+  const env: NodeJS.ProcessEnv = {};
+  if (identity.runId != null) env.PIPELINE_RUN_ID = identity.runId;
+  if (identity.issue != null) env.PIPELINE_ISSUE = String(identity.issue);
+  if (identity.stage != null) env.PIPELINE_STAGE = identity.stage;
+  if (identity.harness != null) env.PIPELINE_HARNESS = identity.harness;
+  if (identity.model != null) env.PIPELINE_MODEL = identity.model;
+  return env;
 }
 
 /** Run-store context for recording a `harness_timeout` event at cap-fire time
@@ -122,6 +153,11 @@ export interface InvokeOptions {
     usage?: unknown;
     estimatedCostUsd?: number | null;
   };
+  /** Additional env vars merged into the child process's environment on top of
+   *  process.env (#419 — papercuts.enabled run/stage/harness/model identity, so
+   *  `pipeline papercut --run <id> ...` can resolve identity without the agent
+   *  fabricating it). Absent by default: no env change from pre-#419 behavior. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export async function invoke(
@@ -181,6 +217,7 @@ export async function invoke(
           stage: opts.accounting.stage,
         }
       : undefined,
+    env: opts.env,
   });
   const endedAt = new Date();
   if (opts.accounting) {
@@ -288,6 +325,11 @@ export async function runCapped(
     // stdout/stderr (terminal-log tee, event-sink socket) — failing while the
     // child command itself succeeds. Defaults to the real process streams.
     forwardTo?: { stdout: ForwardStream; stderr: ForwardStream };
+    // Additional env vars to merge into the child's environment on top of
+    // process.env (#419 — papercuts.enabled run/stage/harness/model identity).
+    // Absent by default: the child inherits process.env unchanged, matching
+    // pre-#419 behavior exactly.
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
@@ -312,6 +354,9 @@ export async function runCapped(
         stdio: ["ignore", "pipe", "pipe"],
         // detached creates a new process group so we can kill all descendants on timeout
         ...(killProcessGroup ? { detached: true } : {}),
+        // Merge in caller-supplied env additions (#419) on top of the inherited
+        // process.env; absent opts.env is a no-op (spread of undefined is {}).
+        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       });
     } catch (err) {
       const duration = (Date.now() - start) / 1000;

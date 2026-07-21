@@ -174,6 +174,19 @@ export interface IgnoredArtifactWarningEvent extends RunEventBase {
   files: Array<{ path: string; source: string | null; line: number | null; pattern: string | null }>;
 }
 
+/** Agent-self-reported minor friction (#419), non-blocking. Flows through the
+ *  same `appendEvent` path as every other run event, so it inherits redaction
+ *  and external-sink delivery unchanged. See `emitPapercut`. */
+export interface PapercutEvent extends RunEventBase {
+  type: "papercut";
+  run_id: RunId;
+  issue: number;
+  stage: string | null;
+  harness: string | null;
+  model: string | null;
+  message: string;
+}
+
 export type { HumanInterventionEvent };
 
 export type RunEvent =
@@ -193,6 +206,7 @@ export type RunEvent =
   | StageAccountingEvent
   | HarnessTimeoutEvent
   | IgnoredArtifactWarningEvent
+  | PapercutEvent
   | HumanInterventionEvent;
 
 // ---------------------------------------------------------------------------
@@ -454,6 +468,47 @@ export async function emitStageAccounting(
   } catch (err) {
     console.warn(
       `[pipeline] run-store: emitStageAccounting failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// emitPapercut (#419)
+// ---------------------------------------------------------------------------
+
+/** Append a `papercut` event to events.jsonl via the standard `appendEvent`
+ *  path (so it gets redaction + external event-sink delivery for free, on
+ *  identical terms to `blocker_set`/`human_intervention`). Total function:
+ *  never throws — any failure (including a thrown/rejecting `appendEvent`) is
+ *  caught and logged as a non-fatal warning, mirroring `emitHumanIntervention`. */
+export async function emitPapercut(
+  runDir: string,
+  payload: {
+    run_id: RunId;
+    issue: number;
+    stage: string | null;
+    harness: string | null;
+    model: string | null;
+    message: string;
+  },
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  try {
+    const event: PapercutEvent = {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "papercut",
+      at: nowIso(),
+      run_id: payload.run_id,
+      issue: payload.issue,
+      stage: payload.stage,
+      harness: payload.harness,
+      model: payload.model,
+      message: sanitize(redactSecrets(payload.message)),
+    };
+    await appendEvent(runDir, event, deps);
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: emitPapercut failed (non-fatal): ${(err as Error).message}`,
     );
   }
 }

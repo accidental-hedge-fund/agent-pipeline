@@ -8,6 +8,7 @@ import {
   RUN_SCHEMA_VERSION,
   appendEvent,
   appendIssueHistory,
+  emitPapercut,
   emitStageAccounting,
   emitGhMetrics,
   finalizeRun,
@@ -546,6 +547,90 @@ test("emitStageAccounting: append failure is non-fatal", async () => {
   };
 
   await emitStageAccounting(RUN_DIR, accountingRecord(), deps);
+});
+
+// ---------------------------------------------------------------------------
+// emitPapercut (#419) — agent-logged friction, via the standard appendEvent path
+// ---------------------------------------------------------------------------
+
+test("emitPapercut: appended event carries full provenance (run/issue/stage/harness/model/message)", async () => {
+  const { deps, readFile } = memRunStore();
+  await emitPapercut(
+    RUN_DIR,
+    {
+      run_id: `${ISSUE}-${STARTED_AT}`,
+      issue: ISSUE,
+      stage: "implementing",
+      harness: "claude",
+      model: "sonnet",
+      message: "npm ci flaked once, retried",
+    },
+    deps,
+  );
+  const event = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.equal(event.type, "papercut");
+  assert.equal(event.schema_version, RUN_SCHEMA_VERSION);
+  assert.equal(event.run_id, `${ISSUE}-${STARTED_AT}`);
+  assert.equal(event.issue, ISSUE);
+  assert.equal(event.stage, "implementing");
+  assert.equal(event.harness, "claude");
+  assert.equal(event.model, "sonnet");
+  assert.equal(event.message, "npm ci flaked once, retried");
+  assert.equal(typeof event.at, "string");
+});
+
+test("emitPapercut: a message containing a redactable secret is redacted, and the event is still written", async () => {
+  const { deps, readFile } = memRunStore();
+  await emitPapercut(
+    RUN_DIR,
+    {
+      run_id: `${ISSUE}-${STARTED_AT}`,
+      issue: ISSUE,
+      stage: "fix-1",
+      harness: "codex",
+      model: "gpt-5.5",
+      message: "had to hardcode sk-ABCDEFGHIJKLMNOPQRST to get past the flaky auth check",
+    },
+    deps,
+  );
+  const raw = readFile(EVENTS_JSONL);
+  assert.ok(!raw.includes("sk-ABCDEFGHIJKLMNOPQRST"), "secret must not reach events.jsonl");
+  assert.ok(raw.includes("[REDACTED]"), "redacted span must be present");
+  const event = JSON.parse(raw.trim());
+  assert.equal(event.type, "papercut");
+});
+
+test("emitPapercut: reaches a configured event sink on the same terms as other events", async () => {
+  const { deps, readFile } = memRunStore();
+  const delivered: string[] = [];
+  deps.eventSink = (line) => { delivered.push(line); };
+  await emitPapercut(
+    RUN_DIR,
+    { run_id: "x", issue: ISSUE, stage: null, harness: null, model: null, message: "note" },
+    deps,
+  );
+  const fileLine = readFile(EVENTS_JSONL).trim();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].trim(), fileLine, "sink must receive the identical line written to events.jsonl");
+});
+
+test("emitPapercut: does not throw when appendEvent's underlying write throws", async () => {
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async () => { throw new Error("disk full"); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date() }),
+  };
+  await assert.doesNotReject(
+    emitPapercut(
+      RUN_DIR,
+      { run_id: "x", issue: ISSUE, stage: null, harness: null, model: null, message: "note" },
+      deps,
+    ),
+  );
 });
 
 // ---------------------------------------------------------------------------

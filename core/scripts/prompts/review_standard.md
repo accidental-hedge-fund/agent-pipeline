@@ -47,7 +47,7 @@ Report only material findings. No style nits, no speculative concerns without ev
 
 {{confidence_calibration}}
 
-{{non_blocking_guidance}}
+{{non_blocking_guidance}}{{papercut_instruction}}
 
 ## Calibration Examples
 

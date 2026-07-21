@@ -24,7 +24,7 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
        Issue: #{{issue_number}}
        Pipeline-Run: {{pipeline_run_id}}
 7. Do NOT push — the pipeline handles pushing after review.
-{{docs_instruction}}
+{{docs_instruction}}{{papercut_instruction}}
 ## Important
 - Keep changes minimal and focused on the issue scope.
 - Do not make migrations, infra changes, or product-scope expansions unless the issue/plan actually calls for them.

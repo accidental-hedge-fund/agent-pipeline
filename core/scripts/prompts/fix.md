@@ -83,4 +83,4 @@ Rules for this declaration:
          Issue: #{{issue_number}}
          Pipeline-Run: {{pipeline_run_id}}
 
-3. If a finding cannot be resolved (requires a product decision, or you genuinely disagree), describe the blocker in your output. Do NOT silently skip it.
+3. If a finding cannot be resolved (requires a product decision, or you genuinely disagree), describe the blocker in your output. Do NOT silently skip it.{{papercut_instruction}}

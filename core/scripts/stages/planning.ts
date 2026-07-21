@@ -30,7 +30,8 @@ import {
   CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT,
   PRE_PLANNING_CONTEXT_HEADER,
 } from "../issue-context-snapshot.ts";
-import { invoke, formatStderrExcerpt, type HarnessResult, type InvokeOptions } from "../harness.ts";
+import * as path from "node:path";
+import { invoke, formatStderrExcerpt, papercutIdentityEnv, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
@@ -1601,6 +1602,13 @@ export async function invokeImplementer(
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
       : undefined,
+    env: papercutIdentityEnv(cfg, {
+      runId: opts.runDir ? path.basename(opts.runDir) : null,
+      issue: accounting?.issue ?? null,
+      stage: accounting?.stage ?? "implementing",
+      harness,
+      model,
+    }),
   });
 }
 

@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
 import { spawnDetached } from "./detach.ts";
@@ -77,6 +77,12 @@ import {
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
+import {
+  recordPapercut,
+  reportPapercuts,
+  papercutsEnabled,
+  realPapercutDeps,
+} from "./stages/papercut.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
@@ -190,6 +196,10 @@ export interface CliOpts {
   repo?: string;
   /** Triage: target pre-pipeline stage label (ready or backlog). */
   stage?: string;
+  /** papercut: run-store run id to record/scope a report to. */
+  run?: string;
+  /** papercut: free-text friction message to record (-m/--message). */
+  message?: string;
   /** Remove issue N's on-disk worktree and local branch, then exit. */
   removeWorktree?: boolean;
   /** Modifier for --remove-worktree: remove despite uncommitted changes. */
@@ -281,6 +291,12 @@ export function buildCmd(): Command {
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
+    // papercut (#419) is agent-facing, not human-facing: registered and directly invocable
+    // (see command-registry.ts + the dispatch block below) but deliberately absent from the
+    // `[number]` argument's subcommand description above and from these two options'
+    // descriptions/visibility, so it never appears anywhere in --help output.
+    .addOption(new Option("--run <run-id>", "run-store run id to record an event against, or scope a report to").hideHelp())
+    .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
@@ -510,7 +526,7 @@ async function main(): Promise<void> {
   // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
   // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
   // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status") {
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -657,7 +673,8 @@ async function main(): Promise<void> {
     cmd.args[0] === "intake" ||
     cmd.args[0] === "triage" ||
     cmd.args[0] === "merge" ||
-    cmd.args[0] === "status"
+    cmd.args[0] === "status" ||
+    cmd.args[0] === "papercut"
       ? 2
       : cmd.args[0] === "unblock" || cmd.args[0] === "override"
       ? 3
@@ -728,6 +745,52 @@ async function main(): Promise<void> {
       { title: opts.title ?? "", body: opts.body ?? "" },
       realRefineSpecDeps(repoDir),
     );
+    return;
+  }
+
+  // Early papercut dispatch (#419) — agent-facing, hidden from --help (see the
+  // top-level `.argument()` description string above, which intentionally
+  // omits "papercut"). No gh auth or full config resolution: this must work
+  // unauthenticated, from inside a running stage, without ever blocking,
+  // pausing, or failing that stage. The record path is gated on a best-effort,
+  // gh-free `papercuts.enabled` lookup (papercutsEnabled) so the feature stays
+  // inert by default; a lookup failure also resolves to disabled. Record
+  // failures are swallowed at this CLI boundary too (belt-and-suspenders with
+  // recordPapercut's own try/catch) — the command always exits zero on the
+  // record path.
+  if (numArg === "papercut") {
+    const papercutStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(papercutStart) ?? papercutStart;
+    const deps = realPapercutDeps();
+    if (cmd.args[1] === "report") {
+      if (!opts.since) {
+        console.error(
+          "pipeline papercut report: --since is required.\n" +
+            "  Usage: pipeline papercut report --since <date> [--until <date>] --json",
+        );
+        process.exitCode = 2;
+        return;
+      }
+      const events = await reportPapercuts(
+        { repoDir, since: opts.since, until: opts.until },
+        deps,
+      );
+      process.stdout.write(JSON.stringify(events) + "\n");
+      process.exitCode = 0;
+      return;
+    }
+    try {
+      if (await papercutsEnabled(repoDir, deps)) {
+        await recordPapercut(
+          { repoDir, run: opts.run ?? "", message: opts.message ?? "" },
+          deps,
+        );
+      }
+    } catch {
+      // Never propagate — recordPapercut is already a total function, this is
+      // belt-and-suspenders at the CLI boundary per the spec's non-fatal contract.
+    }
+    process.exitCode = 0;
     return;
   }
 
