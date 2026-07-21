@@ -294,6 +294,183 @@ test("runCell: distinct provider treatments on the same qualified harness produc
   assert.equal(new Set(seenModels).size, 2);
 });
 
+test("runCell: strips git/ssh/gh credential sources beyond just tokens", async () => {
+  let seenEnv: NodeJS.ProcessEnv | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => {
+      seenEnv = args.env;
+      return successResult();
+    },
+  };
+  await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(seenEnv?.GIT_CONFIG_NOSYSTEM, "1");
+  assert.match(seenEnv?.GIT_CONFIG_GLOBAL ?? "", /\.eval-gitconfig-empty$/);
+  assert.match(seenEnv?.GIT_SSH_COMMAND ?? "", /IdentityFile=\/dev\/null/);
+  assert.match(seenEnv?.GIT_SSH_COMMAND ?? "", /IdentitiesOnly=yes/);
+});
+
+test("runCell: preflight failure classifies infra_error/auth_error but never rejects", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => { throw new Error("preflight probe crashed"); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /preflight probe crashed/);
+});
+
+test("runCell: a worktree-removal failure does not reject runCell or override the primary outcome", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => { throw new Error("git worktree remove failed"); },
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+});
+
+test("runCell: a rate-limit/throttle signal on invocation failure classifies as auth_error, not completed", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: false, timed_out: false, exit_code: 1, stdout: "", stderr: "", duration: 1, throttled: true,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "auth_error");
+});
+
+test("runCell: credentials that expire mid-invocation classify as auth_error via a preflight recheck", async () => {
+  let preflightCalls = 0;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => {
+      preflightCalls++;
+      // ok before the invocation, unauthenticated on the post-failure recheck.
+      return preflightCalls === 1 ? { ok: true } : { ok: false, failure: "unauthenticated", message: "token expired" };
+    },
+    invokeHarness: async () => ({ success: false, timed_out: false, exit_code: 1, stdout: "", stderr: "", duration: 1 }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "auth_error");
+  assert.match(result.outcome.error ?? "", /token expired/);
+  assert.equal(preflightCalls, 2);
+});
+
+test("runCell: an unsuccessful outcome with no auth/throttle signal is still classified as completed (recheck ok)", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({ success: false, timed_out: false, exit_code: 1, stdout: "wrong answer", stderr: "", duration: 3 }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+});
+
+test("runCell: an end-to-end cell shares one deadline across stages, not a fresh timeout per stage", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { planning: { a: 1 }, review: { b: 2 } },
+      public_checks: [],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "end-to-end",
+      treatments: { harness: ["claude"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 1,
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  const seenTimeouts: number[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => {
+      seenTimeouts.push(args.timeoutSec);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell({ mode: "end-to-end", cell_id: "exp1/f1/harness=claude/1" }), fixture, manifest, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(seenTimeouts.length, 2);
+  assert.ok(seenTimeouts[1] <= seenTimeouts[0], `second stage's remaining budget (${seenTimeouts[1]}) must not exceed the first's (${seenTimeouts[0]}) — each stage must not receive a fresh full timeout`);
+});
+
+test("runCell: an end-to-end cell that exhausts its deadline mid-run times out without invoking the remaining stages", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { planning: { a: 1 }, review: { b: 2 } },
+      public_checks: [],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "end-to-end",
+      treatments: { harness: ["claude"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 0.02, // 20ms budget for the whole cell
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  let invocations = 0;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => {
+      invocations++;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell({ mode: "end-to-end", cell_id: "exp1/f1/harness=claude/1" }), fixture, manifest, deps);
+  assert.equal(result.outcome.result_class, "timeout");
+  assert.equal(invocations, 1, "the second stage must never be invoked once the cell deadline has passed");
+});
+
 test("runCell: stage-mode invokes exactly one stage (never the other five)", async () => {
   const stagesInvoked: string[] = [];
   const fixture = validateFixture(

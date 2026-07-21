@@ -162,6 +162,22 @@ test("runExperiment: concurrency never exceeds the manifest's concurrency bound"
   assert.ok(maxInFlight > 1, "expected the pool to actually run cells concurrently, not serially");
 });
 
+test("runExperiment: a cell whose record cannot be durably appended is not reported as executed", async () => {
+  const { deps } = makeHarness({ f1: makeFixtureFile("f1", "review") }, makeManifestFile({ treatments: { harness: ["claude"] } }));
+  const cellExecution: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
+  };
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", {
+    ...deps,
+    appendFile: async () => { throw new Error("disk full"); },
+    cellExecution,
+  });
+  assert.equal(executed.length, 0, "a cell whose record failed to persist must not be reported as executed");
+});
+
 test("runExperiment: an infra_error cell is written to failures.jsonl and excluded from runs.jsonl", async () => {
   const { deps, outFiles } = makeHarness({ f1: makeFixtureFile("f1", "review") }, makeManifestFile({ treatments: { harness: ["claude"] } }));
   const cellExecution: CellExecutionDeps = {

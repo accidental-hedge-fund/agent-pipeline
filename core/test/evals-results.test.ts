@@ -135,3 +135,18 @@ test("appendCellRecord: a write failure is logged and swallowed, not thrown (non
   };
   await assert.doesNotReject(() => appendCellRecord("/out", makeRecord(), deps));
 });
+
+test("appendCellRecord: returns true when the record is durably written", async () => {
+  const { deps } = makeInMemoryFs();
+  const persisted = await appendCellRecord("/out", makeRecord(), deps);
+  assert.equal(persisted, true);
+});
+
+test("appendCellRecord: returns false when the write fails, so a caller can avoid reporting the cell as executed", async () => {
+  const deps: ResultsWriterDeps = {
+    mkdir: async () => {},
+    appendFile: async () => { throw new Error("disk full"); },
+  };
+  const persisted = await appendCellRecord("/out", makeRecord(), deps);
+  assert.equal(persisted, false);
+});

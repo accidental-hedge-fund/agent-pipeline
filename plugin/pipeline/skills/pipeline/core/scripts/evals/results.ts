@@ -64,12 +64,15 @@ function resultsFileFor(resultClass: CellResultClass): "runs.jsonl" | "failures.
  *  failures.jsonl for infra_error/auth_error/timeout). Never rewrites an
  *  existing line; a write failure is logged and swallowed, matching
  *  run-store.ts's non-fatal-write convention — a broken result stream must
- *  never abort the rest of the experiment. */
+ *  never abort the rest of the experiment. Returns whether the record was
+ *  durably written: a caller MUST NOT treat the cell as executed when this
+ *  is `false` (review 2 finding 9752932c) — the cell has no record on disk,
+ *  so the next `runExperiment` invocation's resume logic will retry it. */
 export async function appendCellRecord(
   outputDir: string,
   record: CellRecord,
   deps: ResultsWriterDeps = {},
-): Promise<void> {
+): Promise<boolean> {
   const mkdirFn = deps.mkdir ?? defaultMkdir;
   const appendFileFn = deps.appendFile ?? defaultAppendFile;
   const dir = experimentDir(outputDir, record.experiment_id);
@@ -78,8 +81,10 @@ export async function appendCellRecord(
   try {
     await mkdirFn(dir);
     await appendFileFn(filePath, line);
+    return true;
   } catch (err) {
     console.warn(`[pipeline] evals: appendCellRecord failed (non-fatal): ${(err as Error).message}`);
+    return false;
   }
 }
 

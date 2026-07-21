@@ -134,8 +134,16 @@ export async function runExperiment(
       detail: outcome.detail,
       error: outcome.error,
     };
-    await appendCellRecord(outputDir, record, deps);
-    executed.push(record);
+    const persisted = await appendCellRecord(outputDir, record, deps);
+    if (persisted) {
+      executed.push(record);
+    } else {
+      // No durable record exists for this cell (review 2 finding 9752932c) —
+      // do not report it as executed. The next `runExperiment` invocation's
+      // resume logic (readExistingRecords/cellsRemaining) will see no record
+      // on disk and retry it.
+      console.warn(`[pipeline] evals: cell ${cell.cell_id} ran but its record could not be durably written — it will be retried`);
+    }
   });
 
   return { manifest, plan, executed };

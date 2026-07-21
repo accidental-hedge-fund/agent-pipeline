@@ -163,6 +163,12 @@ export interface HarnessResult {
   executor_name?: string;
   executor_provider?: string; // agent-system: provider id; model-endpoint: base_url
   executor_model?: string; // model-endpoint only
+  // Rate-limit/throttle signal recovered from the adapter's own telemetry
+  // parsing (#431's HarnessTelemetry.throttled). `null`/absent when the CLI
+  // reports no such signal at all — not the same as "not throttled". Used by
+  // the eval runner (evals/executor.ts) to distinguish a provider refusal
+  // from a genuine treatment outcome (review 2 finding f97442bc).
+  throttled?: boolean | null;
 }
 
 export interface InvokeOptions {
@@ -289,8 +295,10 @@ export async function invoke(
   // telemetry capability at all) falls back to the raw captured output and
   // leaves accounting at `cost_source: "unknown"`.
   const telemetry = adapter ? adapter.parseTelemetry(result.stdout) : null;
-  const finalResult: HarnessResult =
-    telemetry && telemetry.text !== null ? { ...result, stdout: telemetry.text } : result;
+  const finalResult: HarnessResult = {
+    ...(telemetry && telemetry.text !== null ? { ...result, stdout: telemetry.text } : result),
+    throttled: telemetry?.throttled ?? null,
+  };
 
   if (opts.accounting) {
     const model = opts.accounting.model ?? opts.model ?? null;
