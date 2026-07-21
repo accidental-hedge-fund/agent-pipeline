@@ -55,6 +55,23 @@ function baseCfg(overrides: Partial<Pick<PipelineConfig, "executors" | "stage_ex
         base_url: "http://localhost:11434/v1",
         model: "llama3.1:70b",
       },
+      "openrouter-review": {
+        type: "model-endpoint" as const,
+        base_url: "https://openrouter.ai/api/v1",
+        model: "openai/gpt-5",
+        credential: "OPENROUTER_API_KEY",
+        dialect: "openrouter" as const,
+        params: { temperature: 0, seed: 7, provider: { order: ["openai"] }, models: ["openai/gpt-5"] },
+        headers: { "x-title": "pipeline-eval", "http-referer": { env: "OPENROUTER_REFERER" } },
+        reasoning: { effort: "high" },
+        structured_output: true,
+      },
+      "none-dialect": {
+        type: "model-endpoint" as const,
+        base_url: "http://localhost:11434/v1",
+        model: "llama3",
+        dialect: "none" as const,
+      },
     },
     stage_executors: { planning: "opencode-main", "review-1": "local-ollama" },
     ...overrides,
@@ -274,6 +291,480 @@ test("invokeExternalExecutor: accounting emits executor evidence and never the c
     assert.equal(parsed.executor_provider, "opencode");
   } finally {
     delete process.env.OPENCODE_API_KEY;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #434 api-executor-request-controls — dialect-aware request construction
+// ---------------------------------------------------------------------------
+
+function assignmentFor(name: string) {
+  return { name, definition: baseCfg().executors[name] } as ReturnType<typeof resolveStageExecutor> & object;
+}
+
+test("invokeExternalExecutor: no params/dialect declared → byte-identical to the pre-#434 minimal request", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  let captured: unknown;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    captured = JSON.parse(init!.body as string);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  assert.deepEqual(captured, { model: "llama3.1:70b", messages: [{ role: "user", content: "PROMPT" }] });
+});
+
+test("invokeExternalExecutor: openrouter dialect sends allowlisted params, reasoning, structured output and headers (#434)", async () => {
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  process.env.OPENROUTER_REFERER = "https://pipeline.internal";
+  try {
+    const a = assignmentFor("openrouter-review");
+    let captured: unknown;
+    let capturedHeaders: Record<string, string> | undefined;
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      captured = JSON.parse(init!.body as string);
+      capturedHeaders = init!.headers as Record<string, string>;
+      return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+    }) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(result.success, true);
+    const body = captured as Record<string, unknown>;
+    assert.equal(body.model, "openai/gpt-5");
+    assert.equal(body.temperature, 0);
+    assert.equal(body.seed, 7);
+    assert.deepEqual(body.provider, { order: ["openai"] });
+    assert.deepEqual(body.models, ["openai/gpt-5"]);
+    assert.deepEqual(body.reasoning, { effort: "high" });
+    assert.ok(body.response_format, "structured_output should add a response_format field");
+    assert.equal(capturedHeaders?.["x-title"], "pipeline-eval");
+    assert.equal(capturedHeaders?.["http-referer"], "https://pipeline.internal");
+    assert.equal(capturedHeaders?.["X-OpenRouter-Metadata"], "enabled");
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_REFERER;
+  }
+});
+
+test("invokeExternalExecutor: openrouter dialect rejects a case-variant X-OpenRouter-Metadata configured header instead of silently combining it (#434)", async () => {
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  try {
+    const cfg = baseCfg({
+      executors: {
+        ...baseCfg().executors,
+        "openrouter-review": {
+          ...baseCfg().executors["openrouter-review"],
+          headers: { "x-openrouter-metadata": "disabled" },
+        },
+      },
+    });
+    const a = { name: "openrouter-review", definition: cfg.executors["openrouter-review"] } as ReturnType<
+      typeof resolveStageExecutor
+    > & object;
+    const fetchImpl = (async () => fakeResponse({ choices: [{ message: { content: "ok" } }] })) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(result.success, false);
+    assert.match(result.stderr, /x-openrouter-metadata/);
+    assert.match(result.stderr, /reserved/);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+  }
+});
+
+test("invokeExternalExecutor: openai dialect encodes effort via reasoning_effort (#434)", async () => {
+  const cfg = baseCfg({
+    executors: {
+      ...baseCfg().executors,
+      "openai-review": {
+        type: "model-endpoint" as const,
+        base_url: "https://api.openai.com/v1",
+        model: "gpt-5",
+        reasoning: { effort: "medium" },
+      },
+    },
+  });
+  const assignment = { name: "openai-review", definition: cfg.executors["openai-review"] };
+  let captured: unknown;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    captured = JSON.parse(init!.body as string);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await invokeExternalExecutor("review-1", assignment, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  assert.equal((captured as Record<string, unknown>).reasoning_effort, "medium");
+});
+
+test("invokeExternalExecutor: dialect 'none' with an unsupported effort and no opt-in fails preflight, no HTTP request issued (#434)", async () => {
+  const a = assignmentFor("none-dialect");
+  let dispatched = false;
+  const fetchImpl = (async () => {
+    dispatched = true;
+    return fakeResponse({});
+  }) as unknown as typeof fetch;
+  const preflight = await preflightExecutor("review-1", a, { fetchImpl }, { effort: "high" });
+  assert.equal(preflight.ok, false);
+  if (!preflight.ok) {
+    assert.match(preflight.message, /none-dialect/);
+    assert.match(preflight.message, /review-1/);
+    assert.match(preflight.message, /"none"/);
+    assert.match(preflight.message, /high/);
+  }
+  assert.equal(dispatched, false);
+});
+
+test("invokeExternalExecutor: dialect 'none' with on_unsupported: record sends the request without effort and records it unsupported (#434)", async () => {
+  const cfg = baseCfg({
+    executors: {
+      ...baseCfg().executors,
+      "none-opt-in": {
+        type: "model-endpoint" as const,
+        base_url: "http://localhost:11434/v1",
+        model: "llama3",
+        dialect: "none" as const,
+        reasoning: { effort: "high", on_unsupported: "record" as const },
+      },
+    },
+  });
+  const assignment = { name: "none-opt-in", definition: cfg.executors["none-opt-in"] };
+  let captured: Record<string, unknown> | undefined;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    captured = JSON.parse(init!.body as string);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor("review-1", assignment, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  assert.equal(result.success, true);
+  assert.ok(!("reasoning" in (captured ?? {})) && !("reasoning_effort" in (captured ?? {})));
+  assert.equal(result.executor_provenance?.effort_support, "unsupported");
+  assert.equal(result.executor_provenance?.resolved_effort, null);
+});
+
+test("preflightExecutor: header referencing an unset env var fails, naming stage, executor, header, and variable (#434)", async () => {
+  delete process.env.OPENROUTER_REFERER;
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  try {
+    const a = assignmentFor("openrouter-review");
+    const fetchImpl = (async () => fakeResponse({})) as unknown as typeof fetch;
+    const result = await preflightExecutor("review-1", a, { fetchImpl });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.message, /openrouter-review/);
+      assert.match(result.message, /review-1/);
+      assert.match(result.message, /http-referer/);
+      assert.match(result.message, /OPENROUTER_REFERER/);
+    }
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+  }
+});
+
+test("invokeExternalExecutor: env-referenced header value never reaches the returned result or its JSON serialization (#434)", async () => {
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  process.env.OPENROUTER_REFERER = "https://super-secret-referer.internal";
+  try {
+    const a = assignmentFor("openrouter-review");
+    const fetchImpl = (async () => fakeResponse({ choices: [{ message: { content: "ok" } }] })) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.ok(!JSON.stringify(result).includes("https://super-secret-referer.internal"));
+    assert.ok(!JSON.stringify(result).includes("or-secret"));
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_REFERER;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #434 task 3 — per-invocation override seam
+// ---------------------------------------------------------------------------
+
+test("invokeExternalExecutor: a model override reaches the request; committed config object is untouched (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  let captured: Record<string, unknown> | undefined;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    captured = JSON.parse(init!.body as string);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl }, { model: "llama3.1:8b" });
+  assert.equal(captured?.model, "llama3.1:8b");
+  assert.equal(a.definition.model, "llama3.1:70b", "committed definition object must be unmodified");
+});
+
+test("invokeExternalExecutor: no override → parity with the committed definition (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  let captured: Record<string, unknown> | undefined;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    captured = JSON.parse(init!.body as string);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  assert.equal(captured?.model, "llama3.1:70b");
+});
+
+test("invokeExternalExecutor: an invalid override (unknown param key) is rejected with no HTTP request issued (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  let dispatched = false;
+  const fetchImpl = (async () => {
+    dispatched = true;
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor(
+    "review-1",
+    a,
+    "PROMPT",
+    { timeoutSec: 5 },
+    { fetchImpl },
+    { params: { temperatur: 0 } as unknown as Record<string, unknown> },
+  );
+  assert.equal(result.success, false);
+  assert.match(result.stderr, /temperatur/);
+  assert.equal(dispatched, false);
+});
+
+test("invokeExternalExecutor: an OpenRouter-only routing override on a non-openrouter dialect is rejected, no HTTP request issued (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!; // local-ollama has no dialect → default "openai"
+  let dispatched = false;
+  const fetchImpl = (async () => {
+    dispatched = true;
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor(
+    "review-1",
+    a,
+    "PROMPT",
+    { timeoutSec: 5 },
+    { fetchImpl },
+    { params: { provider: { order: ["openai"] } } },
+  );
+  assert.equal(result.success, false);
+  assert.match(result.stderr, /provider/);
+  assert.equal(dispatched, false);
+});
+
+test("invokeExternalExecutor: a malformed provider-routing override (wrong field type) is rejected, no HTTP request issued (#434)", async () => {
+  const a = assignmentFor("openrouter-review");
+  let dispatched = false;
+  const fetchImpl = (async () => {
+    dispatched = true;
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor(
+    "review-1",
+    a,
+    "PROMPT",
+    { timeoutSec: 5 },
+    { fetchImpl },
+    { params: { provider: { order: "openai" } as unknown as Record<string, unknown> } },
+  );
+  assert.equal(result.success, false);
+  assert.match(result.stderr, /order/);
+  assert.equal(dispatched, false);
+});
+
+test("invokeExternalExecutor: two concurrent invocations with different model overrides do not interfere (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  const capturedModels: string[] = [];
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    const body = JSON.parse(init!.body as string);
+    capturedModels.push(body.model);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await Promise.all([
+    invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl }, { model: "model-a" }),
+    invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl }, { model: "model-b" }),
+  ]);
+  assert.deepEqual(new Set(capturedModels), new Set(["model-a", "model-b"]));
+});
+
+// ---------------------------------------------------------------------------
+// #434 task 4 — response provenance capture
+// ---------------------------------------------------------------------------
+
+test("invokeExternalExecutor: OpenRouter-shaped response provenance is captured verbatim (#434)", async () => {
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  process.env.OPENROUTER_REFERER = "ref";
+  try {
+    const a = assignmentFor("openrouter-review");
+    let sentHeaders: Headers | undefined;
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      sentHeaders = new Headers(init!.headers);
+      return fakeResponse({
+        id: "gen-abc123",
+        model: "openai/gpt-5-2026-01-01",
+        choices: [{ message: { content: '{"verdict":"approve","summary":"x","findings":[],"next_steps":[]}' }, finish_reason: "stop" }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 50,
+          total_tokens: 150,
+          cost: 0.0042,
+          prompt_tokens_details: { cached_tokens: 20 },
+          completion_tokens_details: { reasoning_tokens: 10 },
+        },
+        // OpenRouter's documented router-metadata shape
+        // (https://openrouter.ai/docs/guides/features/router-metadata),
+        // opted into via the `X-OpenRouter-Metadata: enabled` request header —
+        // NOT a top-level `provider` field, which chat/completions responses
+        // never carry.
+        openrouter_metadata: {
+          requested: "openai/gpt-5",
+          endpoints: { available: [{ provider: "OpenAI", model: "openai/gpt-5-2026-01-01", selected: true }] },
+        },
+      });
+    }) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(sentHeaders?.get("x-openrouter-metadata"), "enabled");
+    const prov = result.executor_provenance!;
+    assert.equal(prov.requested_model, "openai/gpt-5");
+    assert.equal(prov.resolved_model, "openai/gpt-5-2026-01-01");
+    assert.equal(prov.upstream_provider, "OpenAI");
+    assert.equal(prov.request_id, "gen-abc123");
+    assert.equal(prov.finish_reason, "stop");
+    assert.equal(prov.cost_usd, 0.0042);
+    assert.equal(prov.usage?.prompt_tokens, 100);
+    assert.equal(prov.usage?.completion_tokens, 50);
+    assert.equal(prov.usage?.cached_input_tokens, 20);
+    assert.equal(prov.usage?.reasoning_tokens, 10);
+    assert.ok(typeof prov.duration_ms === "number");
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_REFERER;
+  }
+});
+
+test("invokeExternalExecutor: openrouter_metadata with no selected endpoint records a null provider, never guessed (#434)", async () => {
+  const a = assignmentFor("openrouter-review");
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  process.env.OPENROUTER_REFERER = "ref";
+  try {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        id: "gen-1",
+        model: "openai/gpt-5",
+        choices: [{ message: { content: '{"verdict":"approve","summary":"x","findings":[],"next_steps":[]}' } }],
+        openrouter_metadata: { requested: "openai/gpt-5", endpoints: { available: [] } },
+      })) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(result.executor_provenance?.upstream_provider, null);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_REFERER;
+  }
+});
+
+test("invokeExternalExecutor: the openai dialect does not send the OpenRouter metadata opt-in header (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!; // local-ollama has no dialect → default "openai"
+  let sentHeaders: Headers | undefined;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    sentHeaders = new Headers(init!.headers);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  assert.equal(sentHeaders?.get("x-openrouter-metadata"), null);
+});
+
+test("invokeExternalExecutor: generic OpenAI-compatible response provenance is captured (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  const fetchImpl = (async () =>
+    fakeResponse({
+      id: "chatcmpl-xyz",
+      model: "llama3.1:70b",
+      choices: [{ message: { content: "verdict text" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    })) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  const prov = result.executor_provenance!;
+  assert.equal(prov.request_id, "chatcmpl-xyz");
+  assert.equal(prov.resolved_model, "llama3.1:70b");
+  assert.equal(prov.upstream_provider, null, "generic OpenAI-compatible responses report no provider field");
+  assert.equal(prov.finish_reason, "stop");
+  assert.equal(prov.cost_usd, null, "no cost field reported");
+  assert.equal(prov.usage?.prompt_tokens, 10);
+});
+
+test("invokeExternalExecutor: response with no provider/usage/cost records null, never derived from the model slug (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  const fetchImpl = (async () =>
+    fakeResponse({
+      choices: [{ message: { content: "verdict text" } }],
+    })) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+  const prov = result.executor_provenance!;
+  assert.equal(prov.upstream_provider, null);
+  assert.equal(prov.resolved_model, null);
+  assert.equal(prov.cost_usd, null);
+  assert.equal(prov.usage, null);
+  assert.equal(prov.finish_reason, null);
+});
+
+test("invokeExternalExecutor: rate-limit (429) is retried and observed in provenance (#434)", async () => {
+  const a = resolveStageExecutor(baseCfg(), "review-1")!;
+  let calls = 0;
+  const fetchImpl = (async () => {
+    calls++;
+    if (calls === 1) return fakeResponse({}, 429);
+    return fakeResponse({ choices: [{ message: { content: "ok" } }] });
+  }) as unknown as typeof fetch;
+  const result = await invokeExternalExecutor(
+    "review-1",
+    a,
+    "PROMPT",
+    { timeoutSec: 5 },
+    { fetchImpl, sleepImpl: async () => {} },
+  );
+  assert.equal(result.success, true);
+  assert.equal(calls, 2);
+  assert.equal(result.executor_provenance?.retry_count, 1);
+  assert.equal(result.executor_provenance?.rate_limited, true);
+});
+
+test("invokeExternalExecutor: model-endpoint request payload is recorded in accounting evidence with headers by name only, never a resolved secret (#434)", async () => {
+  process.env.OPENROUTER_API_KEY = "or-secret-value";
+  process.env.OPENROUTER_REFERER = "https://super-secret-referer.internal";
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "executor-provenance-"));
+  try {
+    const { initRunDir } = await import("../scripts/run-store.ts");
+    const runDir = path.join(tmp, "43-2026-01-01T00-00-00-000Z");
+    await initRunDir({
+      runDir,
+      runId: "43-2026-01-01T00-00-00-000Z",
+      issue: 43,
+      repo: "acme/widgets",
+      profile: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    const a = assignmentFor("openrouter-review");
+    const fetchImpl = (async () =>
+      fakeResponse({
+        id: "gen-1",
+        model: "openai/gpt-5",
+        choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.01 },
+        openrouter_metadata: { endpoints: { available: [{ provider: "OpenAI", selected: true }] } },
+      })) as unknown as typeof fetch;
+    await invokeExternalExecutor(
+      "review-1",
+      a,
+      "prompt",
+      { timeoutSec: 5, accounting: { runDir, issue: 43, stage: "review-1", modelSlot: "review" } },
+      { fetchImpl },
+    );
+
+    const eventsRaw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
+    assert.ok(!eventsRaw.includes("or-secret-value"));
+    assert.ok(!eventsRaw.includes("https://super-secret-referer.internal"));
+    const accountingLine = eventsRaw.split("\n").find((l) => l.includes("stage_accounting"));
+    const parsed = JSON.parse(accountingLine!);
+    assert.equal(parsed.provider_auth_class, "api-key:model-endpoint");
+    assert.equal(parsed.upstream_provider, "OpenAI");
+    assert.equal(parsed.request_id, "gen-1");
+    assert.equal(parsed.cost_source, "actual");
+    assert.equal(parsed.request_payload.headers["http-referer"], "env:OPENROUTER_REFERER");
+    assert.equal(parsed.request_payload.headers["x-title"], "pipeline-eval");
+    assert.equal(parsed.request_payload.headers["X-OpenRouter-Metadata"], "enabled");
+    assert.deepEqual(parsed.request_payload.messages, [{ role: "user", content: "prompt" }]);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_REFERER;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

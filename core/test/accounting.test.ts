@@ -15,8 +15,113 @@ import {
   sanitizeStageAccountingRecord,
 } from "../scripts/accounting.ts";
 
-test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 4 for #431 harness-adapter provenance (additive — no field removed)", () => {
-  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 4);
+test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 5 for #434 model-endpoint response provenance (additive — no field removed)", () => {
+  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 5);
+});
+
+test("buildStageAccountingRecord: model-endpoint provenance fields are carried when present (#434)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 434,
+    stage: "review-1",
+    harness: "openrouter-review",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+    executorProvider: "https://openrouter.ai/api/v1",
+    executorModel: "openai/gpt-5",
+    providerAuthClass: "api-key:model-endpoint",
+    requestedModel: "openai/gpt-5",
+    resolvedModel: "openai/gpt-5-2026-01-01",
+    upstreamProvider: "OpenAI",
+    requestId: "gen-abc123",
+    finishReason: "stop",
+    retryCount: 1,
+    rateLimited: true,
+    requestedEffort: "high",
+    resolvedEffort: "high",
+    effortSupport: "encoded",
+  });
+  assert.equal(record.provider_auth_class, "api-key:model-endpoint");
+  assert.equal(record.resolved_model, "openai/gpt-5-2026-01-01");
+  assert.equal(record.upstream_provider, "OpenAI");
+  assert.equal(record.request_id, "gen-abc123");
+  assert.equal(record.finish_reason, "stop");
+  assert.equal(record.retry_count, 1);
+  assert.equal(record.rate_limited, true);
+  assert.equal(record.effort_support, "encoded");
+});
+
+test("buildStageAccountingRecord: absent model-endpoint provenance is omitted, never defaulted (#434)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 434,
+    stage: "review-1",
+    harness: "openrouter-review",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+  });
+  assert.ok(!("upstream_provider" in record));
+  assert.ok(!("request_id" in record));
+  assert.ok(!("finish_reason" in record));
+  assert.ok(!("retry_count" in record));
+  assert.ok(!("rate_limited" in record));
+  assert.ok(!("effort_support" in record));
+});
+
+test("buildStageAccountingRecord: a provider-reported cost classifies as actual (#434)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 434,
+    stage: "review-1",
+    harness: "openrouter-review",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+    usage: { cost_usd: 0.0123 },
+  });
+  assert.equal(record.cost_source, "actual");
+  assert.equal(record.cost_usd, 0.0123);
+});
+
+test("buildStageAccountingRecord: no reported cost falls back to existing estimated/unknown classification, no second cost field (#434)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 434,
+    stage: "review-1",
+    harness: "openrouter-review",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+  });
+  assert.equal(record.cost_source, "unknown");
+  assert.equal(record.cost_usd, null);
+  assert.ok(!("api_cost_usd" in record));
+});
+
+test("sanitizeStageAccountingRecord: a record predating model-endpoint provenance fields parses with them absent (#434)", () => {
+  const legacy = sanitizeStageAccountingRecord({
+    schema_version: 4,
+    run_id: "run-1",
+    issue: 434,
+    stage: "review-1",
+    harness: "claude",
+    model_slot: null,
+    model: null,
+    started_at: "2026-01-01T00:00:00.000Z",
+    ended_at: "2026-01-01T00:00:01.000Z",
+    duration_ms: 1000,
+    command_count: 1,
+    subprocess_count: 1,
+    outcome: "success",
+    blocker_kind: null,
+    cost_source: "unknown",
+    cost_usd: null,
+  });
+  assert.equal(legacy.upstream_provider, undefined);
+  assert.equal(legacy.request_id, undefined);
+  assert.equal(legacy.effort_support, undefined);
 });
 
 test("buildStageAccountingRecord: harness-adapter provenance fields are carried when present (#431)", () => {

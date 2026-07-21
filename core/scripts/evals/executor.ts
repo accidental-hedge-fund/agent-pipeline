@@ -11,7 +11,9 @@ import * as path from "node:path";
 import { createWorktreeAt, removeWorktreeAt } from "../worktree.ts";
 import { invoke as harnessInvoke } from "../harness.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
-import type { PipelineConfig } from "../types.ts";
+import { preflightExecutor, invokeExternalExecutor, type ExecutorAssignment } from "../executors.ts";
+import type { HarnessResult } from "../harness.ts";
+import type { ModelEndpointOverride, ModelInvokingStage, PipelineConfig } from "../types.ts";
 import {
   createEvalGhSurface,
   createRecordingRefusalRecorder,
@@ -19,7 +21,7 @@ import {
   type GhRefusalRecord,
 } from "./gh-eval-surface.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
-import type { Cell, CellOutcome, EvalStageName, ExperimentManifest, Fixture } from "./types.ts";
+import type { Cell, CellExecutionClass, CellOutcome, EvalStageName, ExperimentManifest, Fixture, Treatment } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
   return cellId.replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -169,6 +171,10 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Dispatch an API treatment through a named `model-endpoint` executor
+   *  (#434 task 6). Only invoked when the cell's treatment declares
+   *  `executor`. */
+  invokeExecutor?: (args: ExecutorInvokeArgs) => Promise<{ ok: true; result: HarnessResult } | { ok: false; error: string }>;
 }
 
 async function defaultRunChecks(
@@ -243,6 +249,68 @@ async function realInvokeHarness(args: HarnessInvokeArgs): Promise<HarnessInvoke
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// #434 stage-eval-runner integration — binding an API treatment to a named
+// model-endpoint executor with deterministic per-cell overrides.
+// ---------------------------------------------------------------------------
+
+/** The eval mode/stage pairs a `model-endpoint` executor can be bound to — the
+ *  same prompt-contained restriction `config.ts` enforces for a committed
+ *  `stage_executors:` assignment (executors.ts, external-stage-executors). */
+const API_TREATMENT_STAGE_MAP: Partial<Record<EvalStageName, ModelInvokingStage>> = {
+  "plan-review": "plan-review",
+  review: "review-1",
+};
+
+/** Derive the per-cell override deterministically from the treatment's own
+ *  coordinates (#434 task 6.1) — a pure function of `treatment`, so replaying
+ *  the same plan from the same manifest/seed always resolves the same
+ *  override (manifest.ts's cell_id is already a pure function of the same
+ *  coordinates, which is what gives this determinism for free). */
+export function deriveModelEndpointOverride(treatment: Treatment): ModelEndpointOverride {
+  return {
+    ...(treatment.model !== undefined ? { model: treatment.model } : {}),
+    ...(treatment.params !== undefined ? { params: treatment.params } : {}),
+    ...(treatment.effort !== undefined ? { effort: treatment.effort } : {}),
+  };
+}
+
+export interface ExecutorInvokeArgs {
+  cfg: PipelineConfig;
+  stage: ModelInvokingStage;
+  executorName: string;
+  prompt: string;
+  timeoutSec: number;
+  override: ModelEndpointOverride;
+}
+
+/** `{ok:false}` for every failure that must be classified `infra_error` (never
+ *  a completed treatment outcome, #434 task 6.2): an unknown executor name, an
+ *  executor that isn't a `model-endpoint`, or any preflight failure (missing
+ *  credential/header env var, invalid override, unreachable endpoint,
+ *  unsupported effort). `{ok:true}` carries the executor's `HarnessResult` —
+ *  itself may still be `success:false` (e.g. a non-2xx response), which IS a
+ *  genuine treatment outcome, mirroring how a local-CLI harness failure is
+ *  handled below. */
+async function realInvokeExecutor(
+  args: ExecutorInvokeArgs,
+): Promise<{ ok: true; result: HarnessResult } | { ok: false; error: string }> {
+  const definition = args.cfg.executors?.[args.executorName];
+  if (!definition) {
+    return { ok: false, error: `executor "${args.executorName}" is not defined under executors: in pipeline config` };
+  }
+  if (definition.type !== "model-endpoint") {
+    return { ok: false, error: `executor "${args.executorName}" is a "${definition.type}" executor — API treatments require a model-endpoint executor` };
+  }
+  const assignment: ExecutorAssignment = { name: args.executorName, definition };
+  const preflight = await preflightExecutor(args.stage, assignment, {}, args.override);
+  if (!preflight.ok) {
+    return { ok: false, error: preflight.message };
+  }
+  const result = await invokeExternalExecutor(args.stage, assignment, args.prompt, { timeoutSec: args.timeoutSec }, {}, args.override);
+  return { ok: true, result };
+}
+
 export interface CellExecutionResult {
   outcome: CellOutcome;
   materializedPrompt: string;
@@ -297,6 +365,61 @@ export async function runCell(
   }
 
   try {
+    // API treatment path (#434 task 6): the cell binds to a named
+    // model-endpoint executor instead of a local CLI harness. Kept entirely
+    // separate from the harness path below — a model-endpoint executor is
+    // only ever valid for a single prompt-contained stage, never the
+    // multi-stage end-to-end mode a local CLI harness can run.
+    if (cell.treatment.executor) {
+      const invokeExecutorFn = deps.invokeExecutor ?? realInvokeExecutor;
+      if (stages.length !== 1 || !(stages[0] in API_TREATMENT_STAGE_MAP)) {
+        return {
+          outcome: {
+            result_class: "infra_error",
+            error:
+              `API treatment executor "${cell.treatment.executor}" is only valid for a single-stage ` +
+              `"plan-review" or "review" cell — mode "${cell.mode}" requires ${stages.length} stage(s)`,
+          },
+          materializedPrompt,
+          effectiveConfig,
+          ghRefusals: recorder.refusals,
+        };
+      }
+      const pipelineStage = API_TREATMENT_STAGE_MAP[stages[0]]!;
+      const override = deriveModelEndpointOverride(cell.treatment);
+      const invoked = await invokeExecutorFn({
+        cfg,
+        stage: pipelineStage,
+        executorName: cell.treatment.executor,
+        prompt: prompts[0],
+        timeoutSec: manifest.timeout,
+        override,
+      });
+      if (!invoked.ok) {
+        return {
+          outcome: { result_class: "infra_error", error: invoked.error },
+          materializedPrompt,
+          effectiveConfig,
+          ghRefusals: recorder.refusals,
+        };
+      }
+      const result = invoked.result;
+      const executionClass: CellExecutionClass = "api-key";
+      const detail: Record<string, unknown> = {
+        stages: [{ stage: pipelineStage, success: result.success, exit_code: result.exit_code, duration: result.duration }],
+        execution_class: executionClass,
+        executor_provenance: result.executor_provenance ?? null,
+      };
+      const findings = parseReviewFindings(result.stdout);
+      if (findings !== undefined) detail.findings = findings;
+      return {
+        outcome: { result_class: "completed", detail },
+        materializedPrompt,
+        effectiveConfig,
+        ghRefusals: recorder.refusals,
+      };
+    }
+
     const harness = cell.treatment.harness;
     const effectiveHarness = harness ?? "claude";
 
@@ -439,7 +562,8 @@ export async function runCell(
       }
     }
 
-    const detail: Record<string, unknown> = { stages: stageDetails };
+    const cliExecutionClass: CellExecutionClass = "local-cli";
+    const detail: Record<string, unknown> = { stages: stageDetails, execution_class: cliExecutionClass };
     const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
     if (allChecks.length > 0) {
       // Checks run against the cell's remaining budget, not a fresh ceiling

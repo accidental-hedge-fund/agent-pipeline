@@ -169,6 +169,11 @@ export interface HarnessResult {
   // the eval runner (evals/executor.ts) to distinguish a provider refusal
   // from a genuine treatment outcome (review 2 finding f97442bc).
   throttled?: boolean | null;
+  /** model-endpoint response provenance (#434 api-executor-response-provenance).
+   *  Populated only for a `model-endpoint` executor invocation; absent for
+   *  every other result shape (agent-system, local claude/codex, custom
+   *  reviewer CLI). */
+  executor_provenance?: import("./types.ts").ModelEndpointProvenance;
 }
 
 export interface InvokeOptions {

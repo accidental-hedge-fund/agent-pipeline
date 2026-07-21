@@ -80,6 +80,92 @@ export interface AgentSystemExecutorDefinition {
   credential?: string;
 }
 
+// ---------------------------------------------------------------------------
+// model-endpoint request controls (#434) — declared explicitly, never sniffed
+// from `base_url` or `model` (design.md decision 1). Runtime-visible const
+// arrays because type-stripping means a type-only enum is not enforced.
+// ---------------------------------------------------------------------------
+
+/** Closed set of wire dialects a `model-endpoint` executor may declare.
+ *  `openai` (the default) speaks OpenAI's `reasoning_effort` field; `openrouter`
+ *  speaks OpenRouter's `reasoning: {effort}` object plus its `provider`/`models`
+ *  routing options; `none` is a genuinely minimal endpoint that can express
+ *  neither reasoning effort nor structured output — declaring it is how an
+ *  operator marks "this endpoint has none of that" rather than having the
+ *  pipeline guess. */
+export const MODEL_ENDPOINT_DIALECTS = ["openai", "openrouter", "none"] as const;
+export type ModelEndpointDialect = (typeof MODEL_ENDPOINT_DIALECTS)[number];
+
+/** OpenRouter's documented provider-routing preferences object
+ *  (https://openrouter.ai/docs/features/provider-routing) — every field
+ *  OpenRouter's `provider` request object accepts, strictly typed so an
+ *  unknown or malformed routing key is rejected rather than passed through. */
+export interface OpenRouterProviderPreferences {
+  order?: string[];
+  allow_fallbacks?: boolean;
+  require_parameters?: boolean;
+  data_collection?: "allow" | "deny";
+  zdr?: boolean;
+  enforce_distillable_text?: boolean;
+  only?: string[];
+  ignore?: string[];
+  quantizations?: ("int4" | "int8" | "fp4" | "fp6" | "fp8" | "fp16" | "bf16" | "fp32" | "unknown")[];
+  sort?: "price" | "throughput" | "latency" | { by: "price" | "throughput" | "latency"; partition?: "model" | "none" };
+  preferred_min_throughput?: number | { p50?: number; p75?: number; p90?: number; p99?: number };
+  preferred_max_latency?: number | { p50?: number; p75?: number; p90?: number; p99?: number };
+  max_price?: { prompt?: number; completion?: number; request?: number; image?: number };
+}
+
+/** Allowlisted request-parameter keys (#434 api-executor-request-controls).
+ *  `provider`/`models` are OpenRouter-only routing options — rejected at
+ *  parse time for any other dialect. */
+export interface ModelEndpointParams {
+  temperature?: number;
+  top_p?: number;
+  seed?: number;
+  max_output_tokens?: number;
+  stop?: string[];
+  /** OpenRouter provider-routing preferences object, sent verbatim as the
+   *  request's `provider` field. openrouter dialect only. */
+  provider?: OpenRouterProviderPreferences;
+  /** OpenRouter model fallback list, sent verbatim as the request's `models`
+   *  field. openrouter dialect only. */
+  models?: string[];
+}
+
+export const MODEL_ENDPOINT_PARAM_KEYS = [
+  "temperature",
+  "top_p",
+  "seed",
+  "max_output_tokens",
+  "stop",
+  "provider",
+  "models",
+] as const;
+
+/** OpenRouter-only routing keys within `params` — rejected at parse time for
+ *  any dialect other than `openrouter`. */
+export const MODEL_ENDPOINT_ROUTING_PARAM_KEYS = ["provider", "models"] as const;
+
+/** A header value is either a non-secret literal, or a reference resolved
+ *  from the named environment variable at invocation time only (design.md
+ *  decision 6). Never a literal secret value. */
+export type ModelEndpointHeaderValue = string | { env: string };
+
+/** Header names a `headers:` block may never declare — they would shadow the
+ *  credential Authorization header or the fixed content-type this module
+ *  sends. */
+export const MODEL_ENDPOINT_RESERVED_HEADERS = ["authorization", "content-type"] as const;
+
+/** Opt-in outcome when a requested effort cannot be expressed by the declared
+ *  dialect: instead of failing preflight (the default), the request is sent
+ *  without the effort control and the record carries an explicit
+ *  `unsupported` marker (design.md decision 2). */
+export interface ModelEndpointReasoning {
+  effort?: string;
+  on_unsupported?: "record";
+}
+
 /** A raw OpenAI-compatible chat/completions endpoint (e.g. local Ollama).
  *  Valid only for PROMPT_CONTAINED_STAGES. */
 export interface ModelEndpointExecutorDefinition {
@@ -87,9 +173,53 @@ export interface ModelEndpointExecutorDefinition {
   base_url: string;
   model: string;
   credential?: string;
+  /** Wire dialect (#434). Defaults to "openai" when omitted — the existing
+   *  minimal `{model, messages}` request, byte-identical to pre-#434 behavior. */
+  dialect?: ModelEndpointDialect;
+  params?: ModelEndpointParams;
+  headers?: Record<string, ModelEndpointHeaderValue>;
+  reasoning?: ModelEndpointReasoning;
+  /** Request the dialect's JSON/schema response-format field for a
+   *  prompt-contained review stage. Transport hint only — verdict validation
+   *  and review-policy gating are unchanged either way (design.md decision 5). */
+  structured_output?: boolean;
 }
 
 export type ExecutorDefinition = AgentSystemExecutorDefinition | ModelEndpointExecutorDefinition;
+
+/** Per-invocation override for a `model-endpoint` executor (#434 task 3) —
+ *  merged in memory over the committed definition; never written to
+ *  `.github/pipeline.yml`. Validated through the same allowlist/dialect rules
+ *  as committed configuration before any request is issued. */
+export interface ModelEndpointOverride {
+  model?: string;
+  params?: ModelEndpointParams;
+  effort?: string;
+}
+
+/** How a requested effort was actually handled for one invocation (#434
+ *  decision 2) — `null` when no effort was requested at all. */
+export type ModelEndpointEffortSupport = "encoded" | "unsupported";
+
+/** Response provenance captured for one `model-endpoint` invocation (#434
+ *  api-executor-response-provenance). Every field the endpoint does not
+ *  expose is `null` — never inferred from another field, the model string, or
+ *  `base_url` (design.md decision 7). */
+export interface ModelEndpointProvenance {
+  requested_model: string;
+  resolved_model: string | null;
+  upstream_provider: string | null;
+  request_id: string | null;
+  finish_reason: string | null;
+  usage: StageAccountingUsage | null;
+  cost_usd: number | null;
+  retry_count: number | null;
+  rate_limited: boolean | null;
+  duration_ms: number;
+  requested_effort: string | null;
+  resolved_effort: string | null;
+  effort_support: ModelEndpointEffortSupport | null;
+}
 
 // ---------------------------------------------------------------------------
 // Blocker kinds (#134) — closed set of structurally-distinct failure classes.
@@ -921,6 +1051,24 @@ export interface StageAccountingRecord {
   fallback?: boolean | null;
   throttled?: boolean | null;
   termination_reason?: string | null;
+  /** model-endpoint response provenance (#434 api-executor-response-provenance).
+   *  Additive and optional, same contract as the #431 block above: absent on
+   *  records written before these fields existed, and never fabricated when
+   *  the endpoint did not report a value. `provider_auth_class` carries the
+   *  API-key execution class (e.g. "api-key:model-endpoint") for a
+   *  model-endpoint invocation, distinct from a local-CLI harness record. */
+  upstream_provider?: string | null;
+  request_id?: string | null;
+  finish_reason?: string | null;
+  retry_count?: number | null;
+  rate_limited?: boolean | null;
+  effort_support?: string | null;
+  /** The exact request payload sent — resolved model, transmitted params,
+   *  encoded reasoning control, whether structured output was requested, and
+   *  the NAMES of headers sent (never a resolved header or credential value;
+   *  #434 decision 6). `null`/absent for a stage that did not run through a
+   *  `model-endpoint` executor. */
+  request_payload?: Record<string, unknown> | null;
 }
 
 export interface StageAccountingTotals {

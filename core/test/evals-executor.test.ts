@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { allocateCellIdentity, runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
+import { allocateCellIdentity, deriveModelEndpointOverride, runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
 import { validateManifest } from "../scripts/evals/manifest.ts";
 import type { Cell, Fixture } from "../scripts/evals/types.ts";
@@ -728,4 +728,242 @@ test("runCell: review-mode findings are parsed from harness stdout into detail.f
   };
   const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
   assert.deepEqual(result.outcome.detail?.findings, [{ file: "a.ts", severity: "high" }]);
+});
+
+// ---------------------------------------------------------------------------
+// #434 stage-eval-runner integration — API treatment bound to a named
+// model-endpoint executor
+// ---------------------------------------------------------------------------
+
+function apiCfg() {
+  return {
+    ...FAKE_CFG,
+    executors: {
+      "openrouter-review": {
+        type: "model-endpoint" as const,
+        base_url: "https://openrouter.ai/api/v1",
+        model: "openai/gpt-5",
+        dialect: "openrouter" as const,
+      },
+      "not-an-endpoint": {
+        type: "agent-system" as const,
+        provider: "opencode",
+        endpoint: "https://opencode.internal/api",
+      },
+    },
+  } as unknown as import("../scripts/types.ts").PipelineConfig;
+}
+
+function apiCell(overrides: Partial<Cell> = {}): Cell {
+  return makeCell({
+    treatment: { executor: "openrouter-review", model: "openai/gpt-5-mini", effort: "high" },
+    treatment_id: "executor=openrouter-review,model=openai/gpt-5-mini,effort=high",
+    ...overrides,
+  });
+}
+
+test("runCell: an API treatment reaches the request with its per-cell override", async () => {
+  let capturedOverride: unknown;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    invokeExecutor: async (args) => {
+      capturedOverride = args.override;
+      return { ok: true, result: successResult() as unknown as import("../scripts/harness.ts").HarnessResult };
+    },
+  };
+  const result = await runCell(apiCfg(), apiCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(capturedOverride, { model: "openai/gpt-5-mini", effort: "high" });
+  assert.equal((result.outcome.detail as Record<string, unknown>)?.execution_class, "api-key");
+});
+
+test("runCell: replaying the same cell resolves the same override (determinism)", async () => {
+  const overrides: unknown[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    invokeExecutor: async (args) => {
+      overrides.push(args.override);
+      return { ok: true, result: successResult() as unknown as import("../scripts/harness.ts").HarnessResult };
+    },
+  };
+  await runCell(apiCfg(), apiCell(), makeFixture(), MANIFEST, deps);
+  await runCell(apiCfg(), apiCell(), makeFixture(), MANIFEST, deps);
+  assert.deepEqual(overrides[0], overrides[1]);
+});
+
+test("runCell: an unknown executor name is classified infra_error, never a completed treatment outcome", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+  };
+  const result = await runCell(
+    apiCfg(),
+    apiCell({ treatment: { executor: "does-not-exist" } }),
+    makeFixture(),
+    MANIFEST,
+    deps,
+  );
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /does-not-exist/);
+});
+
+test("runCell: an executor that isn't a model-endpoint is classified infra_error", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+  };
+  const result = await runCell(
+    apiCfg(),
+    apiCell({ treatment: { executor: "not-an-endpoint" } }),
+    makeFixture(),
+    MANIFEST,
+    deps,
+  );
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /not-an-endpoint/);
+});
+
+test("runCell: an invalid per-cell override is classified infra_error, not a completed treatment outcome", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    invokeExecutor: async () => ({ ok: false, error: 'executor "openrouter-review" for stage "review-1" received an invalid params override: temperatur: unrecognized key' }),
+  };
+  const result = await runCell(apiCfg(), apiCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /temperatur/);
+});
+
+test("runCell: an end-to-end mode with an API treatment is rejected as infra_error (model-endpoint is single-stage only)", async () => {
+  const e2eManifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "end-to-end",
+      treatments: { executor: ["openrouter-review"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 60,
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "Do the thing.",
+      stage_entry_artifacts: { planning: {}, review: { diff: "..." } },
+      public_checks: [],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+  };
+  const result = await runCell(
+    apiCfg(),
+    apiCell({ mode: "end-to-end" }),
+    fixture,
+    e2eManifest,
+    deps,
+  );
+  assert.equal(result.outcome.result_class, "infra_error");
+});
+
+test("runCell: a local-CLI cell record carries execution_class 'local-cli', distinguishable without inspecting harness/model", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal((result.outcome.detail as Record<string, unknown>)?.execution_class, "local-cli");
+});
+
+// ---------------------------------------------------------------------------
+// #434 review 1 finding e2de1c5f — per-cell `params` override reaches the
+// request via `deriveModelEndpointOverride` / `invokeExecutor`, without
+// mutating committed executor configuration.
+// ---------------------------------------------------------------------------
+
+test("deriveModelEndpointOverride: carries treatment.params onto the override", () => {
+  const override = deriveModelEndpointOverride({
+    executor: "openrouter-review",
+    model: "openai/gpt-5-mini",
+    effort: "high",
+    params: { temperature: 0, seed: 7 },
+  });
+  assert.deepEqual(override, { model: "openai/gpt-5-mini", effort: "high", params: { temperature: 0, seed: 7 } });
+});
+
+test("deriveModelEndpointOverride: omits params when the treatment declares none", () => {
+  const override = deriveModelEndpointOverride({ executor: "openrouter-review" });
+  assert.deepEqual(override, {});
+  assert.ok(!("params" in override));
+});
+
+test("runCell: two cells with distinct treatment.params send distinct parameter payloads, without config mutation", async () => {
+  const cfg = apiCfg();
+  const committedParamsBefore = JSON.stringify((cfg.executors as Record<string, unknown>)["openrouter-review"]);
+  const capturedOverrides: unknown[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    invokeExecutor: async (args) => {
+      capturedOverrides.push(args.override);
+      return { ok: true, result: successResult() as unknown as import("../scripts/harness.ts").HarnessResult };
+    },
+  };
+  const cellA = apiCell({
+    treatment: { executor: "openrouter-review", params: { temperature: 0 } },
+    treatment_id: "executor=openrouter-review,params={\"temperature\":0}",
+  });
+  const cellB = apiCell({
+    treatment: { executor: "openrouter-review", params: { temperature: 1 } },
+    treatment_id: "executor=openrouter-review,params={\"temperature\":1}",
+  });
+  await runCell(cfg, cellA, makeFixture(), MANIFEST, deps);
+  await runCell(cfg, cellB, makeFixture(), MANIFEST, deps);
+  assert.deepEqual(capturedOverrides, [{ params: { temperature: 0 } }, { params: { temperature: 1 } }]);
+  assert.equal(JSON.stringify((cfg.executors as Record<string, unknown>)["openrouter-review"]), committedParamsBefore);
+});
+
+test("runCell: an API treatment's endpoint provenance is carried onto the cell detail", async () => {
+  const provenance = {
+    requested_model: "openai/gpt-5-mini",
+    resolved_model: "openai/gpt-5-mini-2026-01-01",
+    upstream_provider: "OpenAI",
+    request_id: "gen-1",
+    finish_reason: "stop",
+    usage: null,
+    cost_usd: 0.001,
+    retry_count: 0,
+    rate_limited: null,
+    duration_ms: 500,
+    requested_effort: "high",
+    resolved_effort: "high",
+    effort_support: "encoded",
+  };
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    invokeExecutor: async () => ({
+      ok: true,
+      result: { ...successResult(), executor_provenance: provenance } as unknown as import("../scripts/harness.ts").HarnessResult,
+    }),
+  };
+  const result = await runCell(apiCfg(), apiCell(), makeFixture(), MANIFEST, deps);
+  assert.deepEqual((result.outcome.detail as Record<string, unknown>)?.executor_provenance, provenance);
 });

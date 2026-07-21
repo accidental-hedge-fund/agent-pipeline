@@ -488,6 +488,41 @@ Key rules:
   `stage_executors` assignment).
 - Run evidence records which executor (and, for `model-endpoint`, which model)
   ran each delegated stage.
+
+`model-endpoint` also accepts request controls for experiment treatments — an
+explicit `dialect` (`openai` default | `openrouter` | `none`, never inferred from
+`base_url`/`model`), an allowlisted `params` block, `headers` by literal or `env:`
+reference, a `reasoning` effort request, and a `structured_output` hint (transport
+only — `parseStructuredVerdict` + `review_policy` stay authoritative):
+
+```yaml
+executors:
+  openrouter-review:
+    type: model-endpoint
+    base_url: https://openrouter.ai/api/v1
+    model: openai/gpt-5
+    credential: OPENROUTER_API_KEY
+    dialect: openrouter
+    params:
+      temperature: 0
+      provider: { order: [openai] }   # OpenRouter-only routing — rejected at parse time on any other dialect
+    headers:
+      http-referer: { env: OPENROUTER_REFERER }
+    reasoning:
+      effort: high
+    structured_output: true
+
+stage_executors:
+  review-2: openrouter-review
+```
+
+Response evidence records resolved model, upstream provider, request id, finish
+reason, usage, cost, and retry/rate-limit signals when the endpoint exposes them —
+`null` when it doesn't, never guessed from the model string — and every
+`model-endpoint` invocation's accounting record carries an explicit `api-key`
+execution class, distinct from a local `claude`/`codex` harness invocation. See
+`README.md`'s "External stage executors" section for the full request-control
+reference.
 ## Conventions & carry-forward lessons
 
 `readConventions` reads the target repo's conventions file (`conventions_md_path`, else `CLAUDE.md` on this host) and injects an excerpt into **every** stage prompt — planning, plan-review, plan-revision, implementing, both review rounds, and both fix rounds — via the `{{conventions}}` placeholder. This makes the conventions file the natural home for **carry-forward lessons**: a maintainer-curated `## Lessons / Gotchas` section (or a dedicated lessons file pointed at by `conventions_md_path`) recording recurring findings and repo-specific hazards. It is ordinary conventions text, so it rides the existing injection with **no extra config key, store, or flag** beyond the `conventions_md_path` / `CLAUDE.md` default.

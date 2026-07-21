@@ -4,6 +4,8 @@
 // an experiment harness, not a participant in the label-driven state machine
 // (openspec/changes/stage-eval-runner/design.md).
 
+import type { ModelEndpointParams } from "../types.ts";
+
 /** The six independently-invocable stage entry points, plus the end-to-end mode. */
 export const EVAL_STAGE_NAMES = [
   "planning",
@@ -96,12 +98,20 @@ export const SUPPORTED_GRADER_VERSIONS: Record<string, readonly string[]> = {
 };
 
 /** One value on the treatment matrix. Every axis is optional — a manifest may
- *  vary only harness, only effort, etc. */
+ *  vary only harness, only effort, etc. `executor` (#434) binds the cell to a
+ *  named `model-endpoint` executor from `.github/pipeline.yml` instead of a
+ *  local CLI harness — mutually exclusive with `harness` in practice, since a
+ *  cell is executed through exactly one or the other (executor.ts task 6). */
 export interface TreatmentAxes {
   harness?: string[];
   provider?: string[];
   model?: string[];
   effort?: string[];
+  executor?: string[];
+  /** Each entry is a JSON-encoded `ModelEndpointParams` object (manifest axis
+   *  values are uniformly string[]; manifest.ts parses and validates each
+   *  entry against the same allowlist a committed executor's `params:` uses). */
+  params?: string[];
 }
 
 /** One concrete point in the treatment matrix, after expansion. */
@@ -110,7 +120,16 @@ export interface Treatment {
   provider?: string;
   model?: string;
   effort?: string;
+  executor?: string;
+  /** Parsed from the manifest's JSON-encoded `params` axis value (#434 task 6.1). */
+  params?: ModelEndpointParams;
 }
+
+/** Execution/auth class recorded on a cell (#434 api-executor-response-provenance
+ *  requirement "cell records SHALL distinguish API endpoint treatments from CLI
+ *  harness treatments"). Mirrors the `provider_auth_class` value model-endpoint
+ *  invocations write onto the underlying stage accounting record. */
+export type CellExecutionClass = "api-key" | "local-cli";
 
 export interface ExperimentManifest {
   schema_version: number;

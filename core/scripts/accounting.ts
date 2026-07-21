@@ -1,4 +1,4 @@
-import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
+import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import type {
   StageAccountingCostSource,
   StageAccountingRecord,
@@ -6,13 +6,21 @@ import type {
   StageAccountingUsage,
 } from "./types.ts";
 
+// v5 (#434 api-executor-response-provenance): additive — records may now
+// carry model-endpoint response provenance (upstream provider, request id,
+// finish reason, retry count, rate-limit observation, effort-support marker).
+// `provider_auth_class` is reused (not redefined) to carry the API-key
+// execution class for a model-endpoint invocation. Adds no required field and
+// removes none; readers must not gate on this value equalling a specific
+// version (design.md decision 5, reused from #429/#431).
+//
 // v4 (#431, review-2 finding 0b0c7e4b): additive — records may now carry
 // harness-adapter treatment provenance (adapter name/version, provider/auth
 // class, requested vs. resolved model/effort, native flags, fallback,
 // throttled, termination reason). Adds no required field and removes none;
 // readers must not gate on this value equalling a specific version (design.md
 // decision 5).
-export const STAGE_ACCOUNTING_SCHEMA_VERSION = 4;
+export const STAGE_ACCOUNTING_SCHEMA_VERSION = 5;
 
 export interface UsageAccountingExtraction {
   usage?: StageAccountingUsage;
@@ -58,6 +66,13 @@ export interface BuildStageAccountingRecordInput {
   fallback?: boolean | null;
   throttled?: boolean | null;
   terminationReason?: string | null;
+  upstreamProvider?: string | null;
+  requestId?: string | null;
+  finishReason?: string | null;
+  retryCount?: number | null;
+  rateLimited?: boolean | null;
+  effortSupport?: string | null;
+  requestPayload?: Record<string, unknown> | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -193,6 +208,15 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(cleanOptionalString(input.terminationReason ?? null) !== null
       ? { termination_reason: cleanOptionalString(input.terminationReason ?? null) }
       : {}),
+    ...(cleanOptionalString(input.upstreamProvider ?? null) !== null
+      ? { upstream_provider: cleanOptionalString(input.upstreamProvider ?? null) }
+      : {}),
+    ...(cleanOptionalString(input.requestId ?? null) !== null ? { request_id: cleanOptionalString(input.requestId ?? null) } : {}),
+    ...(cleanOptionalString(input.finishReason ?? null) !== null ? { finish_reason: cleanOptionalString(input.finishReason ?? null) } : {}),
+    ...(finiteNonNegative(input.retryCount) !== null ? { retry_count: nonNegativeInteger(input.retryCount) } : {}),
+    ...(typeof input.rateLimited === "boolean" ? { rate_limited: input.rateLimited } : {}),
+    ...(cleanOptionalString(input.effortSupport ?? null) !== null ? { effort_support: cleanOptionalString(input.effortSupport ?? null) } : {}),
+    ...(input.requestPayload ? { request_payload: sanitizeDeep(input.requestPayload) } : {}),
   };
   return sanitizeStageAccountingRecord(record);
 }
@@ -255,6 +279,20 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (typeof record.throttled === "boolean") cleaned.throttled = record.throttled;
   const terminationReason = cleanOptionalString(record.termination_reason ?? null);
   if (terminationReason !== null) cleaned.termination_reason = terminationReason;
+  const upstreamProvider = cleanOptionalString(record.upstream_provider ?? null);
+  if (upstreamProvider !== null) cleaned.upstream_provider = upstreamProvider;
+  const requestId = cleanOptionalString(record.request_id ?? null);
+  if (requestId !== null) cleaned.request_id = requestId;
+  const finishReason = cleanOptionalString(record.finish_reason ?? null);
+  if (finishReason !== null) cleaned.finish_reason = finishReason;
+  const retryCount = finiteNonNegative(record.retry_count);
+  if (retryCount !== null) cleaned.retry_count = nonNegativeInteger(retryCount);
+  if (typeof record.rate_limited === "boolean") cleaned.rate_limited = record.rate_limited;
+  const effortSupport = cleanOptionalString(record.effort_support ?? null);
+  if (effortSupport !== null) cleaned.effort_support = effortSupport;
+  if (record.request_payload && typeof record.request_payload === "object") {
+    cleaned.request_payload = sanitizeDeep(record.request_payload);
+  }
   return cleaned;
 }
 

@@ -14,6 +14,7 @@ import {
   type Treatment,
   type TreatmentAxes,
 } from "./types.ts";
+import { ModelEndpointParamsSchema } from "../config.ts";
 
 export class ManifestValidationError extends Error {
   constructor(field: string, detail: string) {
@@ -22,7 +23,7 @@ export class ManifestValidationError extends Error {
   }
 }
 
-const AXIS_KEYS = ["harness", "provider", "model", "effort"] as const;
+const AXIS_KEYS = ["harness", "provider", "model", "effort", "executor", "params"] as const;
 
 /** Validate a raw parsed manifest object against the known fixture ids.
  *  Throws ManifestValidationError naming the offending field on the first
@@ -99,6 +100,26 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
     if (!Array.isArray(values) || values.length === 0 || values.some((v) => typeof v !== "string")) {
       throw new ManifestValidationError("treatments", `axis "${key}" must be a non-empty string[]`);
     }
+    if (key === "params") {
+      // Each entry is a JSON-encoded ModelEndpointParams object, validated
+      // against the same allowlist a committed executor's `params:` uses
+      // (#434 task 6.1) — an invalid entry fails manifest load, before any
+      // cell is produced or request sent.
+      for (const raw of values as string[]) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is not valid JSON: ${(err as Error).message}`);
+        }
+        const result = ModelEndpointParamsSchema.safeParse(parsed);
+        if (!result.success) {
+          const issue = result.error.issues[0];
+          const field = issue?.path?.join(".") || "<params>";
+          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is invalid: ${field}: ${issue?.message ?? "invalid value"}`);
+        }
+      }
+    }
     treatments[key as keyof TreatmentAxes] = values as string[];
     hasAnyAxis = true;
   }
@@ -156,11 +177,13 @@ export function loadManifest(
 }
 
 /** Deterministic slug over the treatment axes, stable regardless of key order
- *  in the manifest — always emitted in AXIS_KEYS order. */
+ *  in the manifest — always emitted in AXIS_KEYS order. `params` is a parsed
+ *  object rather than a string, so it is stringified deterministically
+ *  (sorted keys) rather than relying on default object-to-string coercion. */
 export function treatmentId(treatment: Treatment): string {
   return AXIS_KEYS
     .filter((k) => treatment[k] !== undefined)
-    .map((k) => `${k}=${treatment[k]}`)
+    .map((k) => `${k}=${k === "params" ? stableStringify(treatment.params) : treatment[k]}`)
     .join(",");
 }
 
@@ -172,7 +195,11 @@ function cartesianTreatments(axes: TreatmentAxes): Treatment[] {
     const next: Treatment[] = [];
     for (const combo of combos) {
       for (const value of values) {
-        next.push({ ...combo, [axis]: value });
+        // The "params" axis carries JSON-encoded ModelEndpointParams strings
+        // (already validated in validateManifest) — every other axis is the
+        // raw treatment value itself.
+        const resolvedValue: unknown = axis === "params" ? JSON.parse(value) : value;
+        next.push({ ...combo, [axis]: resolvedValue });
       }
     }
     combos = next;
