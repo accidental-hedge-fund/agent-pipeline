@@ -5,6 +5,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { runsDir } from "./run-store.ts";
 
 type JsonRecord = Record<string, unknown>;
@@ -188,6 +189,8 @@ export interface ScoreboardOpts {
   /** Raw `--by` flag values, collected repeatably so a repeated flag can be
    *  detected (not silently last-wins). Parsed by parseScoreboardGroupBy(). */
   by?: string[];
+  /** Write a self-contained offline HTML export of the report to this path (#427). */
+  html?: string;
   now?: Date;
 }
 
@@ -195,6 +198,13 @@ export interface ScoreboardDeps {
   readFile: (p: string) => Promise<string>;
   readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
   log: (msg: string) => void;
+  /** Write seam for the `--html` export (#427): exclusively creates `p` (fails
+   *  rather than following a pre-existing path, symlink or otherwise), then
+   *  renamed onto the destination, so a mid-write failure never leaves a
+   *  partial destination file. */
+  writeFile: (p: string, content: string) => Promise<void>;
+  rename: (from: string, to: string) => Promise<void>;
+  unlink: (p: string) => Promise<void>;
 }
 
 export function realScoreboardDeps(): ScoreboardDeps {
@@ -205,6 +215,9 @@ export function realScoreboardDeps(): ScoreboardDeps {
       return entries as Array<{ name: string; isDirectory(): boolean }>;
     },
     log: (msg) => process.stdout.write(`${msg}\n`),
+    writeFile: (p, content) => fsp.writeFile(p, content, { encoding: "utf8", flag: "wx" }),
+    rename: (from, to) => fsp.rename(from, to),
+    unlink: (p) => fsp.unlink(p),
   };
 }
 
@@ -450,6 +463,56 @@ export async function runScoreboard(
     process.stdout.write(formatScoreboardJson(report) + "\n");
   } else {
     deps.log(formatScoreboardHuman(report));
+  }
+  if (opts.html) {
+    const html = renderScoreboardHtml(report);
+    await writeScoreboardHtmlExport(opts.html, html, deps);
+  }
+}
+
+const HTML_EXPORT_TEMP_CREATE_ATTEMPTS = 5;
+
+/** Atomic write for the `--html` export (#427): the full document is rendered
+ *  in memory before any write occurs, then exclusively created under an
+ *  unpredictable temporary name in the destination's own directory and
+ *  renamed onto the destination. `writeFile` opens with `wx` (create-exclusive),
+ *  so a pre-created path at the temp name — including a symlink planted by
+ *  another local actor — is never opened or followed; a collision (or a
+ *  same-process race on the same name) surfaces as EEXIST and is retried under
+ *  a fresh random name. An invalid or unwritable destination (missing parent
+ *  dir, destination is a directory, unwritable directory) fails the
+ *  write/rename step and leaves no temp file behind — never creates missing
+ *  parent directories. */
+async function writeScoreboardHtmlExport(
+  destPath: string,
+  content: string,
+  deps: Pick<ScoreboardDeps, "writeFile" | "rename" | "unlink">,
+): Promise<void> {
+  const dir = path.dirname(destPath);
+  const base = path.basename(destPath);
+  let tempPath = "";
+  for (let attempt = 1; ; attempt++) {
+    tempPath = path.join(dir, `.${base}.tmp-${crypto.randomBytes(12).toString("hex")}`);
+    try {
+      await deps.writeFile(tempPath, content);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        if (attempt < HTML_EXPORT_TEMP_CREATE_ATTEMPTS) continue;
+        // EEXIST means this invocation never created the colliding file —
+        // unlinking it would delete a pre-existing file (or symlink) some
+        // other writer owns (#427 delta finding ada9497b).
+        throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
+      }
+      await deps.unlink(tempPath).catch(() => {});
+      throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
+    }
+  }
+  try {
+    await deps.rename(tempPath, destPath);
+  } catch (err) {
+    await deps.unlink(tempPath).catch(() => {});
+    throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
   }
 }
 
@@ -1769,4 +1832,187 @@ function formatMs(ms: number): string {
 
 function formatGate(value: GatePassMetric): string {
   return `${formatRate(value.pass_rate)}; skipped ${value.skipped}`;
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained offline HTML export (#427)
+// ---------------------------------------------------------------------------
+
+/** Escapes HTML metacharacters in run-derived strings so they render as text
+ *  rather than markup. Applied to every interpolation point that carries a
+ *  stage/harness/model/group-key/diagnostic string sourced from run artifacts. */
+export function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const SCOREBOARD_HTML_STYLE = `
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 2rem auto; max-width: 960px; color: #1a1a1a; background: #fff; line-height: 1.4; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    h2 { font-size: 1.15rem; margin-top: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
+    h3 { font-size: 1rem; margin-top: 1.25rem; }
+    table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1rem; }
+    th, td { text-align: left; padding: 0.25rem 0.6rem; border-bottom: 1px solid #eee; font-size: 0.9rem; vertical-align: top; }
+    th { background: #f5f5f5; white-space: nowrap; }
+    ul { margin: 0.25rem 0 1rem; padding-left: 1.25rem; }
+    li { font-size: 0.9rem; margin: 0.15rem 0; }
+    .meta { color: #555; font-size: 0.9rem; }
+    .empty { color: #777; font-style: italic; }
+    .diagnostic-warning { color: #8a6d00; }
+    .diagnostic-error { color: #a30000; }
+`;
+
+function htmlRow(label: string, value: string): string {
+  return `<tr><th>${escapeHtml(label)}</th><td>${value}</td></tr>`;
+}
+
+function htmlListOrEmpty(items: string[], emptyLabel: string): string {
+  if (items.length === 0) return `<p class="empty">${escapeHtml(emptyLabel)}</p>`;
+  return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function formatAccountingTotalsLine(totals: CostAccountingTotals): string {
+  return (
+    `total: invocations ${totals.invocation_count}; ` +
+    `actual $${totals.actual_cost_usd.toFixed(4)}; ` +
+    `estimated $${totals.estimated_cost_usd.toFixed(4)}; ` +
+    `unknown ${totals.unknown_cost_count}; ` +
+    `prompt chars ${totals.prompt_chars_total} (max ${totals.prompt_chars_max}); ` +
+    `est prompt tokens ${totals.prompt_estimated_tokens_total}; ` +
+    `duration ${formatMs(totals.total_duration_ms)}; ` +
+    `commands ${totals.command_count}; ` +
+    `subprocesses ${totals.subprocess_count}`
+  );
+}
+
+function renderFullMetricsSection(totals: ScoreboardTotals, metrics: ScoreboardMetrics): string {
+  const stageEntries = Object.entries(metrics.stage_duration_ms);
+  const blockerEntries = Object.entries(metrics.blocker_rate_by_kind.counts);
+  const accountingLines =
+    metrics.cost_accounting.groups.length === 0
+      ? []
+      : [formatAccountingTotalsLine(metrics.cost_accounting.totals), ...metrics.cost_accounting.groups.map(formatAccountingGroup)];
+
+  return `<section>
+<h2>Metrics</h2>
+<table>
+${htmlRow("Included runs", `${totals.included_runs} of ${totals.scanned_runs} scanned`)}
+${htmlRow("Successful PRs", String(totals.successful_prs))}
+${htmlRow("Ready runs", String(totals.ready_runs))}
+${htmlRow("Ready-to-deploy without human intervention", formatRate(metrics.ready_to_deploy_without_human_intervention))}
+${htmlRow("Cost per ready PR", formatCostMetric(metrics.cost_per_ready_pr_usd))}
+${htmlRow("Cost-source coverage", formatCoverage(metrics.cost_accounting.coverage))}
+${htmlRow("Full-run wall-clock duration", formatDuration(metrics.full_run_duration_ms))}
+${htmlRow("Harness calls per successful PR", formatRatioValue(metrics.harness_calls_per_successful_pr))}
+${htmlRow("Retry/fix-round count per PR", formatRatioValue(metrics.retry_fix_rounds_per_pr))}
+${htmlRow("pipeline:needs-human rate", formatRate(metrics.needs_human_rate))}
+${htmlRow("Same-harness fallback rate", formatRate(metrics.same_harness_fallback_rate))}
+${htmlRow("Test pass rate", formatGate(metrics.gate_pass_rates.test))}
+${htmlRow("Eval pass rate", formatGate(metrics.gate_pass_rates.eval))}
+${htmlRow("Shipcheck pass rate", formatGate(metrics.gate_pass_rates.shipcheck))}
+</table>
+<h3>Cost/accounting by group</h3>
+${htmlListOrEmpty(accountingLines, "(no stage accounting records)")}
+<h3>Stage wall-clock duration</h3>
+${htmlListOrEmpty(
+  stageEntries.map(([stage, metric]) => `${stage}: ${formatDuration(metric)}`),
+  "(no provable stage durations)",
+)}
+<h3>Blocker rate by kind</h3>
+${htmlListOrEmpty(
+  blockerEntries.map(([kind, count]) => `${kind}: ${count} (${formatRate(metrics.blocker_rate_by_kind.rates[kind])})`),
+  "(no human-intervention blockers recorded)",
+)}
+</section>`;
+}
+
+function renderPeriodMetricsSection(period: ScoreboardPeriod): string {
+  const metrics = period.metrics;
+  return `<section>
+<h3>${escapeHtml(period.start)} to ${escapeHtml(period.end)}</h3>
+<table>
+${htmlRow("Included runs", String(period.totals.included_runs))}
+${htmlRow("Successful PRs", String(period.totals.successful_prs))}
+${htmlRow("Ready runs", String(period.totals.ready_runs))}
+${htmlRow("Ready-to-deploy without human intervention", formatRate(metrics.ready_to_deploy_without_human_intervention))}
+${htmlRow("Cost per ready PR", formatCostMetric(metrics.cost_per_ready_pr_usd))}
+${htmlRow("Full-run wall-clock duration", formatDuration(metrics.full_run_duration_ms))}
+${htmlRow("Harness calls per successful PR", formatRatioValue(metrics.harness_calls_per_successful_pr))}
+${htmlRow("Retry/fix-round count per PR", formatRatioValue(metrics.retry_fix_rounds_per_pr))}
+${htmlRow("pipeline:needs-human rate", formatRate(metrics.needs_human_rate))}
+${htmlRow("Same-harness fallback rate", formatRate(metrics.same_harness_fallback_rate))}
+${htmlRow("Test pass rate", formatGate(metrics.gate_pass_rates.test))}
+${htmlRow("Eval pass rate", formatGate(metrics.gate_pass_rates.eval))}
+${htmlRow("Shipcheck pass rate", formatGate(metrics.gate_pass_rates.shipcheck))}
+</table>
+${period.by && period.grouping ? renderGroupingSection(period.by, period.grouping) : ""}
+</section>`;
+}
+
+function renderGroupingSection(by: ScoreboardGroupBy, grouping: ScoreboardGrouping): string {
+  return `<h3>Grouped by ${escapeHtml(by)}</h3>
+${htmlListOrEmpty(grouping.groups.map(formatGroupEntry), "(no stage accounting records)")}`;
+}
+
+function renderDiagnosticsSection(diagnostics: ScoreboardDiagnostic[]): string {
+  if (diagnostics.length === 0) return "";
+  const items = diagnostics
+    .map(
+      (d) =>
+        `<li class="diagnostic-${d.severity === "error" ? "error" : "warning"}">[${escapeHtml(d.severity)}] ${escapeHtml(d.code)}: ${escapeHtml(d.path)} - ${escapeHtml(d.message)}</li>`,
+    )
+    .join("");
+  return `<section>
+<h2>Diagnostics</h2>
+<ul>${items}</ul>
+</section>`;
+}
+
+function renderSeriesSection(bucket: ScoreboardBucket, series: ScoreboardPeriod[]): string {
+  return `<section>
+<h2>Per-period breakdown (${escapeHtml(bucket)})</h2>
+${series.map(renderPeriodMetricsSection).join("\n")}
+</section>`;
+}
+
+/** Renders one complete, self-contained, offline HTML document for a scoreboard
+ *  report (#427): no external script/stylesheet/font/image reference, no
+ *  `@import`, no absolute or protocol-relative URL, no `fetch`/`XMLHttpRequest`.
+ *  Pure — takes only the already-computed report, no clock/randomness/env reads. */
+export function renderScoreboardHtml(report: ScoreboardReport): string {
+  const sections: string[] = [
+    `<section>
+<h2>Window</h2>
+<table>
+${htmlRow("Report window", `${escapeHtml(report.window.since)} to ${escapeHtml(report.window.until)}`)}
+</table>
+</section>`,
+    renderFullMetricsSection(report.totals, report.metrics),
+  ];
+  if (report.by && report.grouping) {
+    sections.push(`<section>${renderGroupingSection(report.by, report.grouping)}</section>`);
+  }
+  sections.push(renderDiagnosticsSection(report.diagnostics));
+  if (report.bucket && report.series) {
+    sections.push(renderSeriesSection(report.bucket, report.series));
+  }
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent Pipeline Scoreboard</title>
+<style>${SCOREBOARD_HTML_STYLE}</style>
+</head>
+<body>
+<h1>Agent Pipeline Scoreboard</h1>
+<p class="meta">Offline export — generated locally from run-store artifacts; makes no network requests.</p>
+${sections.join("\n")}
+</body>
+</html>
+`;
 }

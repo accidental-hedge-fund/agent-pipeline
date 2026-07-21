@@ -118,6 +118,15 @@ test("pipeline-cli: scoreboard — --by is collected repeatably, not last-wins (
   assert.deepEqual(opts.by, ["harness", "model"]);
 });
 
+test("pipeline-cli: scoreboard — --html <path> → [] (#427)", () => {
+  assert.deepEqual(roundTrip(["scoreboard", "--html", "/tmp/report.html"]), []);
+});
+
+test("pipeline-cli: scoreboard — --html <path> is parsed onto opts.html (#427)", () => {
+  const { opts } = parseCli(["scoreboard", "--html", "/tmp/report.html", "--json"]);
+  assert.equal(opts.html, "/tmp/report.html");
+});
+
 test("pipeline-cli: roadmap — --apply → []", () => {
   assert.deepEqual(roundTrip(["roadmap", "--apply"]), []);
 });

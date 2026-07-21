@@ -302,6 +302,13 @@ test("command-registry: scoreboard.allowedFlags includes by (#437)", () => {
   assert.deepEqual(validateFlags(entry, cmd), []);
 });
 
+test("command-registry: scoreboard.allowedFlags includes html (#427)", () => {
+  const entry = COMMAND_REGISTRY.scoreboard;
+  assert.ok((entry.allowedFlags as Set<string>).has("html"));
+  const cmd = fakeCmdWithCliFlag("html");
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
 // ---------------------------------------------------------------------------
 // papercut (#419) — registered, agent-facing, hidden from --help
 // ---------------------------------------------------------------------------

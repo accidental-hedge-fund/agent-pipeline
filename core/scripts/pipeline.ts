@@ -218,6 +218,8 @@ export interface CliOpts {
    *  (harness|model|effort|executor). Collected repeatably so a repeated flag can
    *  be detected rather than silently last-wins (#437). */
   by?: string[];
+  /** scoreboard: write a self-contained offline HTML export of the report to this path (#427). */
+  html?: string;
   /** improve: emit top-N clusters in the report (default 5). */
   top?: number;
   /** improve: only report clusters with at least this many occurrences (default 3). */
@@ -309,6 +311,7 @@ export function buildCmd(): Command {
     .option("--estimate-cost <harness=usd>", "scoreboard: estimate missing harness-call costs; repeatable", collectRepeatable, [])
     .option("--bucket <unit>", "scoreboard: add a chronological day|week time-series alongside the full-window summary")
     .option("--by <dimension>", "scoreboard: group metrics by harness|model|effort|executor; repeatable (to detect a duplicate flag)", collectRepeatable, [])
+    .option("--html <path>", "scoreboard: write a self-contained offline HTML export of the report to this path")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -374,7 +377,7 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "scoreboard" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--json]\n\n" +
+      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--html <path>] [--json]\n\n" +
       "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
       "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
       "Options:\n" +
@@ -384,6 +387,7 @@ async function main(): Promise<void> {
       "  --estimate-cost <harness=usd>  estimate missing per-call cost; repeatable\n" +
       "  --bucket <unit>             add a chronological day|week time-series (default: none)\n" +
       "  --by <dimension>            group metrics by harness|model|effort|executor (default: none, exactly one)\n" +
+      "  --html <path>               write a self-contained, offline HTML export of the report to this path (local/archival only)\n" +
       "  --json                      emit one unfenced JSON object\n" +
       "  --repo-path <path>          override the target repo working tree\n\n" +
       "The command never modifies pipeline labels, branches, PRs, worktrees, config, or run artifacts.\n" +
@@ -847,6 +851,7 @@ async function main(): Promise<void> {
           estimateCost: opts.estimateCost,
           bucket: opts.bucket,
           by: opts.by,
+          html: opts.html,
         },
         realScoreboardDeps(),
       );
