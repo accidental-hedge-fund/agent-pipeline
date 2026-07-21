@@ -533,8 +533,28 @@ export async function advance(
   }
 
   // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(cfg, issueNumber, pipelineRunId, deps, opts.stateDir);
+  const archiveOutcome = await maybeArchiveOpenspec(
+    cfg,
+    issueNumber,
+    pipelineRunId,
+    { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+    opts.stateDir,
+    prNumber,
+  );
   if (archiveOutcome) return archiveOutcome;
+
+  // ---- Step 0.6: head-side active-change guard (#467) ----
+  // Worktree-independent postcondition: even if the archive step above no-opped
+  // for a reason not yet enumerated, pre-merge must never advance while the PR's
+  // own changed-file list still carries an unarchived `openspec/changes/<id>/`
+  // path it introduced. Behaves identically on a first run, an override-resumed
+  // run, a fresh process, or after the worktree has been removed. Skipped when
+  // `openspec.enabled: off` explicitly disables the integration (matches
+  // maybeArchiveOpenspec's own off-mode skip above).
+  if (cfg.openspec?.enabled !== "off") {
+    const openspecGuardOutcome = await enforceOpenspecActiveChangeGuard(cfg, issueNumber, prNumber, deps);
+    if (openspecGuardOutcome) return openspecGuardOutcome;
+  }
 
   // ---- Step 0.5: early conflict detection (#95) ----
   // GitHub cannot build the pull_request merge ref for a CONFLICTING PR, so
@@ -1792,11 +1812,59 @@ export async function archiveAlreadyDone(
 }
 
 /**
+ * Head-side postcondition (#467, design D1): before pre-merge advances, block
+ * while the PR's own changed-file list still carries an `openspec/changes/<id>/`
+ * path (id ≠ `archive`) not matched by a corresponding
+ * `openspec/changes/archive/<id>/` path in that same file list. Computed purely
+ * from `getPrDiff` → `diffFilePaths` — never the local worktree filesystem — so
+ * it behaves identically on a first run, an override-resumed run, a fresh
+ * process, or after the worktree has been removed. Returns `null` to continue
+ * when nothing remains active.
+ */
+export async function enforceOpenspecActiveChangeGuard(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  prNumber: number,
+  deps: AdvancePreMergeDeps = {},
+): Promise<Outcome | null> {
+  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+
+  let diff: string;
+  try {
+    diff = await getPrDiffFn(cfg, prNumber);
+  } catch (err) {
+    // Fail closed (#467): cannot prove the PR carries no active OpenSpec change,
+    // so do not let a fetch failure silently pass the guard.
+    const reason =
+      `Pre-merge cannot verify the OpenSpec active-change guard — fetching the PR diff failed ` +
+      `(${(err as Error).message}). Check gh auth/network and re-run.`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+    return { advanced: false, status: "blocked", reason };
+  }
+  const remaining = openspec.unarchivedChangeIdsFromPrFiles(diffFilePaths(diff));
+  if (remaining.length === 0) return null;
+
+  const reason =
+    `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${remaining.join(", ")}. ` +
+    `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
+  await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+  return { advanced: false, status: "blocked", reason };
+}
+
+/**
  * When OpenSpec is active, archive the change(s) this PR branch introduced so
  * their spec deltas fold into the living `openspec/specs/`. Idempotent: once an
  * archive commit exists on the branch, subsequent polling iterations skip this
  * step entirely. Returns a `waiting` Outcome after pushing (CI must re-run), a
  * `blocked` Outcome on failure, or null when there is nothing to do (continue the gate).
+ *
+ * Fails closed (#467): a candidate probe that errors, or a missing worktree
+ * while the PR itself still carries an `openspec/changes/<id>/` path, blocks
+ * rather than returning `null` — `null` is reserved for a positively
+ * established "nothing to archive". Every decision (archived / skipped /
+ * blocked) is recorded as a `gate_result` run event via `deps.runDir` so a
+ * silent skip is diagnosable from `events.jsonl` alone.
  */
 export async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
@@ -1804,6 +1872,7 @@ export async function maybeArchiveOpenspec(
   pipelineRunId: string,
   deps: AdvancePreMergeDeps = {},
   stateDir?: string,
+  prNumber?: number,
 ): Promise<Outcome | null> {
   const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
@@ -1812,6 +1881,7 @@ export async function maybeArchiveOpenspec(
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
+  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const branchDeveloperCommitsFn =
     deps.branchDeveloperCommits ?? ((wtPath, base) => computeBranchDeveloperCommits(
       gitFn,
@@ -1820,8 +1890,61 @@ export async function maybeArchiveOpenspec(
       { skipSubjectsStartingWith: [OPENSPEC_ARCHIVE_PREFIX] },
     ));
 
+  const recordDecision = async (result: "pass" | "fail" | "skipped", reason?: string): Promise<void> => {
+    if (!deps.runDir) return;
+    await appendEvent(
+      deps.runDir,
+      {
+        schema_version: RUN_SCHEMA_VERSION,
+        type: "gate_result",
+        at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+        gate: "openspec-archive",
+        result,
+        reason,
+      },
+      deps.runStoreDeps,
+    ).catch(() => {});
+  };
+
   const wt = await getForIssueFn(cfg, issueNumber);
-  if (!wt || !isActiveFn(cfg, wt.path)) return null;
+  if (!wt) {
+    // Worktree missing: fall back to the head-side PR file list (worktree-independent)
+    // rather than assuming there is nothing to archive (#467). `openspec.enabled: off`
+    // disables the integration outright regardless of file contents.
+    const mode = cfg.openspec?.enabled ?? "auto";
+    if (mode === "off" || prNumber === undefined) {
+      await recordDecision("skipped", "openspec-inactive");
+      return null;
+    }
+    let prPaths: string[];
+    try {
+      prPaths = diffFilePaths(await getPrDiffFn(cfg, prNumber));
+    } catch (err) {
+      const reason =
+        `Worktree for #${issueNumber} not found on disk and the PR diff fetch failed ` +
+        `(${(err as Error).message}), so it cannot be confirmed there is no active OpenSpec ` +
+        `change to archive. Restore the worktree (or gh auth) and re-run.`;
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+      await recordDecision("fail", reason);
+      return { advanced: false, status: "blocked", reason };
+    }
+    const remaining = openspec.unarchivedChangeIdsFromPrFiles(prPaths);
+    if (remaining.length > 0) {
+      const reason =
+        `OpenSpec worktree for #${issueNumber} not found on disk, and the pull request still ` +
+        `introduces active OpenSpec change(s): ${remaining.join(", ")}. Restore the worktree ` +
+        `(or re-run planning) so the archive step can run, then re-run the pipeline.`;
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+      await recordDecision("fail", reason);
+      return { advanced: false, status: "blocked", reason };
+    }
+    await recordDecision("skipped", "no-candidates");
+    return null;
+  }
+  if (!isActiveFn(cfg, wt.path)) {
+    await recordDecision("skipped", "openspec-inactive");
+    return null;
+  }
 
   // Changes this PR branch introduced, still active (not yet archived).
   const diff = await gitFn(
@@ -1829,6 +1952,17 @@ export async function maybeArchiveOpenspec(
     ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
     { ignoreFailure: true },
   );
+  if (diff.code !== 0) {
+    // Fail closed (#467): a failed probe must never be read as "no candidates" —
+    // `ignoreFailure: true` only suppresses the throw, not the meaning of a non-zero exit.
+    const detail = (diff.stderr || diff.stdout || "(no output)").trim();
+    const reason =
+      `Cannot determine active OpenSpec change candidates — ` +
+      `\`git diff --name-only origin/${cfg.base_branch}...HEAD\` failed (exit ${diff.code}): ${detail}`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await recordDecision("fail", reason);
+    return { advanced: false, status: "blocked", reason };
+  }
   const candidates = openspec
     .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
     .filter((id) => changeDirExistsFn(wt.path, id));
@@ -1836,7 +1970,10 @@ export async function maybeArchiveOpenspec(
   // Idempotency guard (#181, fix 2): evaluate candidates *before* consulting commit
   // history so a prior archive commit cannot mask re-introduced active change
   // directories. If no candidates remain, there is nothing to archive.
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    await recordDecision("skipped", "no-candidates");
+    return null;
+  }
 
   // ---- Consistency guard (#106): never archive a delta the code outgrew ----
   // OpenSpec deltas are frozen at planning; fix rounds only edit code. If a
@@ -1887,6 +2024,7 @@ export async function maybeArchiveOpenspec(
         "cannot resolve the pipeline actor identity (gh auth may be degraded) — " +
         "trusted review-comment filtering requires a known actor; check `gh auth status`";
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+      await recordDecision("fail", reason);
       return { advanced: false, status: "blocked", reason, blockerKind: "needs-human" };
     }
   }
@@ -1899,7 +2037,10 @@ export async function maybeArchiveOpenspec(
     getHeadSha: getHeadShaFn,
     trustedReviewAuthor,
   });
-  if (guard) return guard;
+  if (guard) {
+    await recordDecision("fail", guard.reason ?? "spec-consistency guard blocked");
+    return guard;
+  }
 
   // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
   // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
@@ -1926,36 +2067,39 @@ export async function maybeArchiveOpenspec(
       "pre-merge",
       "openspec-invalid",
     );
-    return {
-      advanced: false,
-      status: "blocked",
-      reason: preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive",
-    };
+    const blockedReason =
+      preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive";
+    await recordDecision("fail", blockedReason);
+    return { advanced: false, status: "blocked", reason: blockedReason };
   }
 
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
     if (res.unavailable) {
-      await setBlockedFn(
-        cfg,
-        issueNumber,
-        `openspec CLI unavailable — cannot archive change '${id}'. Install the openspec CLI and re-run.`,
-        "pre-merge",
-        "openspec-invalid",
-      );
+      const reason = `openspec CLI unavailable — cannot archive change '${id}'. Install the openspec CLI and re-run.`;
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+      await recordDecision("fail", `openspec CLI unavailable (${id})`);
       return { advanced: false, status: "blocked", reason: `openspec CLI unavailable (${id})` };
     }
     if (!res.success) {
-      await setBlockedFn(cfg, issueNumber, `openspec archive ${id} failed:\n${res.output}`, "pre-merge", "openspec-invalid");
-      return { advanced: false, status: "blocked", reason: `openspec archive failed (${id})` };
+      // Surface the CLI output verbatim (#467) — e.g. a "header not found" error from a
+      // retitled `## MODIFIED Requirements` delta the living spec does not (yet) contain.
+      const reason = `openspec archive ${id} failed:\n${res.output}`;
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+      await recordDecision("fail", reason);
+      return { advanced: false, status: "blocked", reason };
     }
   }
 
   // Commit + push the archived specs so CI validates the finalized state.
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
   const status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (!status.stdout.trim()) return null; // archive produced no diff (unexpected) → continue
+  if (!status.stdout.trim()) {
+    // archive produced no diff (unexpected) → continue
+    await recordDecision("skipped", "no-candidates");
+    return null;
+  }
   const commit = await gitFn(
     wt.path,
     ["commit", "-m", withTrailers(`${OPENSPEC_ARCHIVE_PREFIX}${issueNumber}`, issueNumber, pipelineRunId)],
@@ -1977,6 +2121,7 @@ export async function maybeArchiveOpenspec(
       "pre-merge",
       "push-failed",
     );
+    await recordDecision("fail", "archive commit failed");
     return { advanced: false, status: "blocked", reason: "archive commit failed" };
   }
   const pushBranch = branchName(issueNumber, wt.slug);
@@ -2004,9 +2149,11 @@ export async function maybeArchiveOpenspec(
       "pre-merge",
       "push-failed",
     );
+    await recordDecision("fail", "push failed after archive");
     return { advanced: false, status: "blocked", reason: "push failed after archive" };
   }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
+  await recordDecision("pass", candidates.join(", "));
   return { advanced: false, status: "waiting", reason: "openspec change archived; CI re-running" };
 }
 

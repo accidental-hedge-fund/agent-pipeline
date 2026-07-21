@@ -17,6 +17,7 @@ import {
   readChangeFile,
   readSpecDeltas,
   shouldPlanWithOpenspec,
+  unarchivedChangeIdsFromPrFiles,
 } from "../scripts/openspec.ts";
 
 function tmpDir(): string {
@@ -147,6 +148,43 @@ test("changeIdsFromPaths: distinct active change ids, excludes archive + non-cha
     "openspec/specs/auth/spec.md",
   ];
   assert.deepEqual(changeIdsFromPaths(paths).sort(), ["add-auth"]);
+});
+
+test("unarchivedChangeIdsFromPrFiles: active-only id is unarchived", () => {
+  const paths = ["openspec/changes/foo/proposal.md", "openspec/changes/foo/tasks.md"];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), ["foo"]);
+});
+
+test("unarchivedChangeIdsFromPrFiles: archived-only id is not unarchived", () => {
+  const paths = ["openspec/changes/archive/foo/proposal.md"];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), []);
+});
+
+test("unarchivedChangeIdsFromPrFiles: id present both active and archived nets to none remaining", () => {
+  const paths = [
+    "openspec/changes/foo/proposal.md",
+    "openspec/changes/archive/foo/proposal.md",
+  ];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), []);
+});
+
+test("unarchivedChangeIdsFromPrFiles: no openspec/changes paths → empty", () => {
+  const paths = ["src/index.ts", "openspec/specs/auth/spec.md"];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), []);
+});
+
+test("unarchivedChangeIdsFromPrFiles: nested paths and multiple ids", () => {
+  const paths = [
+    "openspec/changes/foo/specs/x/spec.md",
+    "openspec/changes/bar/proposal.md",
+    "openspec/changes/archive/bar/proposal.md",
+  ];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths).sort(), ["foo"]);
+});
+
+test("unarchivedChangeIdsFromPrFiles: archive id itself excluded from active set", () => {
+  const paths = ["openspec/changes/archive/proposal.md"];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), []);
 });
 
 test("shouldPlanWithOpenspec: off → false, on → true", () => {
