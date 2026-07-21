@@ -125,6 +125,27 @@ export const claudeAdapter: HarnessAdapter = {
         message: "claude CLI not found on PATH — install it and run `claude` once to complete login.",
       };
     }
+    // `claude auth status --json` is claude's documented non-interactive
+    // login-state probe (verified: `{ "loggedIn": true, ... }` on stdout,
+    // exit 0). An installed-but-logged-out CLI must fail this distinctly from
+    // the missing-CLI case above, never be reported ready.
+    const authRes = await deps.exec("claude", ["auth", "status", "--json"]);
+    let loggedIn = false;
+    if (authRes.ok) {
+      try {
+        loggedIn = (JSON.parse(authRes.stdout) as { loggedIn?: unknown }).loggedIn === true;
+      } catch {
+        loggedIn = false;
+      }
+    }
+    if (!loggedIn) {
+      return {
+        ok: false,
+        failure: "unauthenticated",
+        authState: "unauthenticated",
+        message: "claude CLI is installed but not authenticated — run `claude` and complete login.",
+      };
+    }
     return { ok: true, authState: "authenticated" };
   },
 

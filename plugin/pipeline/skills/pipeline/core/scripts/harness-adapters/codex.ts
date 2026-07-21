@@ -112,6 +112,19 @@ export const codexAdapter: HarnessAdapter = {
         message: "codex CLI not found on PATH — install it and run `codex login` to complete authentication.",
       };
     }
+    // `codex login status` is codex's documented non-interactive login-state
+    // probe (verified: prints "Logged in using ..." and exits 0 when
+    // authenticated). An installed-but-logged-out CLI must fail this
+    // distinctly from the missing-CLI case above, never be reported ready.
+    const authRes = await deps.exec("codex", ["login", "status"]);
+    if (!authRes.ok) {
+      return {
+        ok: false,
+        failure: "unauthenticated",
+        authState: "unauthenticated",
+        message: "codex CLI is installed but not authenticated — run `codex login` to complete authentication.",
+      };
+    }
     return { ok: true, authState: "authenticated" };
   },
 

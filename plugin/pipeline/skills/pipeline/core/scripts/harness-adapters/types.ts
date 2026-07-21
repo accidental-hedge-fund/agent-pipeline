@@ -30,14 +30,17 @@ export interface AdapterCapabilities {
 export interface AdapterRequest {
   model?: string;
   effort?: string;
+  /** When true, the caller is requesting a restricted-permission mode. Consulted
+   *  by `preflight` to decide whether the adapter's `sandbox` capability can
+   *  actually honor the request (rather than `buildInvocation` silently
+   *  widening permissions when it can't). */
+  sandbox?: boolean;
 }
 
 /** Full context handed to `buildInvocation`. */
 export interface AdapterInvocationContext extends AdapterRequest {
   prompt: string;
   worktreeDir: string;
-  /** When true and the adapter supports it, use a restricted-permission mode. */
-  sandbox?: boolean;
   /** When true and the adapter is claude, run a lean single-shot generation
    *  (no tools, no MCP servers). Ignored by every other adapter. */
   lean?: boolean;

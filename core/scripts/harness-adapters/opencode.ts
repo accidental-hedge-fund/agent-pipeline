@@ -35,7 +35,12 @@ import {
 const CAPABILITIES: AdapterCapabilities = {
   model: true,
   effort: true,
-  sandbox: true,
+  // opencode offers only `--auto` (auto-approve all permissions) or the
+  // interactive default, which blocks headlessly with no TTY to answer a
+  // permission prompt. There is no unattended *restricted* mode, so a
+  // requested sandbox cannot actually be honored — declared unsupported
+  // rather than silently widened (see preflight below).
+  sandbox: false,
   workingDir: "flag",
   telemetry: "none",
 };
@@ -48,9 +53,10 @@ export const opencodeAdapter: HarnessAdapter = {
     const args = ["run", ctx.prompt, "--dir", ctx.worktreeDir];
     if (ctx.model) args.push("-m", ctx.model);
     if (ctx.effort) args.push("--variant", ctx.effort);
-    // Always on for pipeline invocations (design.md decision 4) — never
-    // conditioned on ctx.sandbox, since the default (no --auto) is
-    // unattended-unsafe for a headless run regardless of sandbox request.
+    // Always on for pipeline invocations (design.md decision 4): the default
+    // (no --auto) is unattended-unsafe for a headless run. A requested
+    // sandbox mode is rejected at preflight (capabilities.sandbox: false)
+    // rather than reaching here and being silently widened.
     args.push("--auto");
     return { cmd: "opencode", args, cwd: ctx.worktreeDir };
   },
@@ -69,6 +75,14 @@ export const opencodeAdapter: HarnessAdapter = {
         ok: false,
         failure: "unsupported-setting",
         message: `opencode requires a "provider/model" formatted model (got "${req.model}") — set it as e.g. "anthropic/claude-opus-4".`,
+      };
+    }
+    if (req.sandbox) {
+      return {
+        ok: false,
+        failure: "unsupported-setting",
+        message:
+          "opencode has no unattended restricted-permission mode — only --auto (full auto-approve) or an interactive prompt (which blocks headlessly) are available, so a requested sandbox mode is unsupported.",
       };
     }
     const headless = await deps.execCheck("opencode", ["run", "--help"]);

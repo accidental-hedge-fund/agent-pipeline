@@ -41,7 +41,12 @@ import {
 const CAPABILITIES: AdapterCapabilities = {
   model: true,
   effort: true,
-  sandbox: true, // -a/--approve is the closest analogue; always-on for pipeline use
+  // pi offers only `-a`/`--approve` (unattended auto-approve) or the
+  // interactive `-na`/`--no-approve` prompt, which blocks headlessly with no
+  // TTY to answer it. There is no unattended *restricted* mode, so a
+  // requested sandbox cannot actually be honored — declared unsupported
+  // rather than silently widened (see preflight below).
+  sandbox: false,
   workingDir: "cwd",
   telemetry: "none",
 };
@@ -57,13 +62,17 @@ export const piAdapter: HarnessAdapter = {
     const args = ["-p", ctx.prompt];
     if (ctx.model) args.push("--model", ctx.model);
     if (ctx.effort) args.push("--thinking", ctx.effort);
+    // Always on for pipeline invocations (unattended headless run, no TTY to
+    // answer a trust prompt). A requested sandbox mode is rejected at
+    // preflight (capabilities.sandbox: false) rather than reaching here and
+    // being silently widened.
     args.push("-a");
     // No --cwd/-C flag exists (design.md decision 4) — cwd carries the
     // worktree directory for the spawned process instead.
     return { cmd: "pi", args, cwd: ctx.worktreeDir };
   },
 
-  async preflight(deps: AdapterPreflightDeps, _req: AdapterRequest): Promise<AdapterPreflightResult> {
+  async preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult> {
     const present = (await deps.execCheck("pi", ["--version"])) || (await deps.execCheck("pi", ["--help"]));
     if (!present) {
       return {
@@ -72,10 +81,24 @@ export const piAdapter: HarnessAdapter = {
         message: "pi CLI not found on PATH — install `@mariozechner/pi-coding-agent` and complete /login once interactively.",
       };
     }
+    if (req.sandbox) {
+      return {
+        ok: false,
+        failure: "unsupported-setting",
+        message:
+          "pi has no unattended restricted-permission mode — only -a/--approve (full auto-approve) or an interactive prompt (which blocks headlessly) are available, so a requested sandbox mode is unsupported.",
+      };
+    }
     const helpRes = await deps.exec("pi", ["--help"]);
-    const headlessDocumented =
-      helpRes.ok && (/-p\b|--print\b/.test(helpRes.stdout) || /--mode\b/.test(helpRes.stdout));
-    if (helpRes.ok && !headlessDocumented) {
+    if (!helpRes.ok) {
+      return {
+        ok: false,
+        failure: "headless-unavailable",
+        message: "pi --help failed to run — headless mode cannot be verified in this installation.",
+      };
+    }
+    const headlessDocumented = /-p\b|--print\b/.test(helpRes.stdout) || /--mode\b/.test(helpRes.stdout);
+    if (!headlessDocumented) {
       return {
         ok: false,
         failure: "headless-unavailable",
