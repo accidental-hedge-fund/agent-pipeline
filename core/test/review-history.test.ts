@@ -250,6 +250,56 @@ test("resolution: scoped category override matches by surface", () => {
   assert.equal(digest.rounds[0].entries[0].resolution, "overridden");
 });
 
+test("resolution: multiple scope-override sentinels in one trusted comment are all recognized (#389 R2 F1)", () => {
+  const OTHER_FINDING: ReviewFinding = {
+    severity: "high", title: "Unbounded retry loop", file: "src/retry.ts", category: "reliability",
+    body: "b", confidence: 0.9, recommendation: "add a retry cap",
+  };
+  const key1 = findingKey(CAP_FINDING);
+  const key2 = findingKey(OTHER_FINDING);
+  const round2 = formatReviewComment(
+    cfg, verdict([CAP_FINDING, OTHER_FINDING], SHA_1), 2, "codex", new Set([key1, key2]),
+  );
+  // A single trusted comment carrying two scope-override sentinels — the second
+  // sentinel must not be dropped by a single, non-looping regex exec.
+  const multiScope = [
+    "## Pipeline: Scope override",
+    "",
+    "**Scope**: `category:correctness`",
+    "**Disposition**: rejected",
+    "**Stage**: review-2",
+    "**Recorded at**: 2026-01-01T00:00:00Z",
+    "",
+    "### Reason",
+    "correctness findings on the limiter are pre-accepted",
+    "",
+    "**Scope**: `category:reliability`",
+    "**Disposition**: rejected",
+    "**Stage**: review-2",
+    "**Recorded at**: 2026-01-01T00:00:00Z",
+    "",
+    "### Reason",
+    "reliability findings on the retry path are pre-accepted",
+    "",
+    "*Automated by Claude Code Pipeline Skill*",
+    "",
+    "<!-- pipeline-override-scope: category:correctness rejected | correctness findings on the limiter are pre-accepted -->",
+    "<!-- pipeline-override-scope: category:reliability rejected | reliability findings on the retry path are pre-accepted -->",
+  ].join("\n");
+  const digest = buildPriorRoundDigest(
+    [
+      { author: "pipeline-bot", body: round2 },
+      { author: "operator", body: multiScope },
+    ],
+    { actor: "pipeline-bot", trustedOverrideActors: ["operator"] },
+  );
+  const entries = digest.rounds[0].entries;
+  const capEntry = entries.find((e) => e.key === key1);
+  const retryEntry = entries.find((e) => e.key === key2);
+  assert.equal(capEntry?.resolution, "overridden");
+  assert.equal(retryEntry?.resolution, "overridden", "second sentinel in the comment must also be recognized");
+});
+
 // ---------------------------------------------------------------------------
 // Trust boundary
 // ---------------------------------------------------------------------------

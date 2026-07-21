@@ -172,9 +172,8 @@ export function buildPriorRoundDigest(
     }
     if (c.body.startsWith(SCOPE_OVERRIDE_HEADING)) {
       SCOPE_OVERRIDE_RE.lastIndex = 0;
-      const m = SCOPE_OVERRIDE_RE.exec(c.body);
-      SCOPE_OVERRIDE_RE.lastIndex = 0;
-      if (m) {
+      let m: RegExpExecArray | null;
+      while ((m = SCOPE_OVERRIDE_RE.exec(c.body)) !== null) {
         const type = m[1] as "category" | "file";
         let value: string;
         try {
@@ -187,6 +186,7 @@ export function buildPriorRoundDigest(
         const reason = pipeIdx >= 0 ? captured.slice(pipeIdx + 3).trim() : captured;
         scopeOverrides.set(`${type}:${value}`, { type, value, reason, round: roundCounter });
       }
+      SCOPE_OVERRIDE_RE.lastIndex = 0;
     }
   }
 
