@@ -416,6 +416,90 @@ test("validateConfig: misspelled eval_gate.mode (mdoe) is an error, not silently
 });
 
 // ---------------------------------------------------------------------------
+// visual_gate (#395)
+// ---------------------------------------------------------------------------
+
+test("generateConfigSchema: visual_gate.mode has correct enum", () => {
+  const schema = generateConfigSchema();
+  const field = resolvePath(schema as Record<string, unknown>, "visual_gate.mode") as Record<string, unknown> | undefined;
+  assert.ok(field, "visual_gate.mode must exist in schema");
+  assert.deepEqual(field["enum"], ["gate", "advisory"]);
+});
+
+test("validateConfig: valid visual_gate block with enabled + command passes", () => {
+  const deps = makeDeps('visual_gate:\n  enabled: true\n  command: "npx playwright test"\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+});
+
+test("validateConfig: visual_gate.enabled true with no command is an error diagnostic", () => {
+  const deps = makeDeps("visual_gate:\n  enabled: true\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.command");
+  assert.ok(d, `expected a visual_gate.command diagnostic, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: visual_gate.enabled true with empty command is an error diagnostic", () => {
+  const deps = makeDeps('visual_gate:\n  enabled: true\n  command: ""\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.command");
+  assert.ok(d, `expected a visual_gate.command diagnostic, got: ${JSON.stringify(result.diagnostics)}`);
+});
+
+test("validateConfig: visual_gate.enabled false with no command does not error", () => {
+  const deps = makeDeps("visual_gate:\n  enabled: false\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+});
+
+test("validateConfig: bad visual_gate.enabled type → error with rigorGating:true", () => {
+  const deps = makeDeps("visual_gate:\n  enabled: \"yes\"\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.enabled");
+  assert.ok(d, `expected diagnostic for visual_gate.enabled, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("validateConfig: bad visual_gate.mode enum → error with rigorGating:true", () => {
+  const deps = makeDeps("visual_gate:\n  mode: blocking\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.mode");
+  assert.ok(d, `expected diagnostic for visual_gate.mode, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("validateConfig: misspelled visual_gate.enabled (enabeld) is an error, not silently accepted", () => {
+  const deps = makeDeps("visual_gate:\n  enabeld: true\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path.startsWith("visual_gate"));
+  assert.ok(d, `expected diagnostic for visual_gate unknown key, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: visual_gate.artifacts_dir escaping the repo root is an error", () => {
+  const deps = makeDeps("visual_gate:\n  artifacts_dir: \"../outside\"\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.artifacts_dir");
+  assert.ok(d, `expected a visual_gate.artifacts_dir diagnostic, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: visual_gate.artifacts_dir inside the repo root does not error", () => {
+  const deps = makeDeps("visual_gate:\n  artifacts_dir: \".pipeline-visual\"\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+});
+
+// ---------------------------------------------------------------------------
 // 5.12 validateConfig: review_harness override applies to inert-model detection (finding 3)
 // ---------------------------------------------------------------------------
 

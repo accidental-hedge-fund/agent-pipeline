@@ -21,6 +21,7 @@ import {
   buildReviewStandardPrompt,
   buildSweepPrompt,
   buildTestFixPrompt,
+  buildVisualFixPrompt,
   substitute,
 } from "../scripts/prompts/index.ts";
 import { sanitizeBriefForPrompt } from "../scripts/stages/planning.ts";
@@ -876,6 +877,73 @@ test("eval_fix prompt: instructs the trailers with substituted issue + run id (#
     attempt: 1,
     maxAttempts: 1,
     output: "fail",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /Issue: #15/);
+  assert.match(out, /Pipeline-Run: 15\/2026-06-08T14:32:00Z/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("visual_fix prompt: embeds the target repo's conventions (#108, #395)", () => {
+  const marker = "RUN-npm-run-ci-BEFORE-DONE-visual-9c2b";
+  const out = buildVisualFixPrompt({
+    cfg: configWithConventions(marker),
+    issueNumber: 15,
+    command: "npx playwright test",
+    attempt: 1,
+    maxAttempts: 2,
+    output: "fail",
+    artifacts: "screenshot.png",
+    pipelineRunId: "r",
+  });
+  assert.match(out, new RegExp(marker), "visual-fix prompt is missing the injected conventions content");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("visual_fix prompt: renders the readConventions stub (no throw) when no conventions file (#108, #395)", () => {
+  const out = buildVisualFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 5,
+    command: "npx playwright test",
+    attempt: 1,
+    maxAttempts: 2,
+    output: "fail",
+    artifacts: "(no artifacts captured)",
+    pipelineRunId: "r",
+  });
+  assert.match(out, /no conventions file found/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("visual_fix prompt: identifies the visual gate, command, attempt counter, output, and artifacts (#395)", () => {
+  const out = buildVisualFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "npx playwright test",
+    attempt: 2,
+    maxAttempts: 3,
+    output: "VISUAL-FAIL-OUTPUT-XYZ",
+    artifacts: "traces/attempt-2/trace.zip",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /#15/);
+  assert.match(out, /visual-gate/i);
+  assert.match(out, /npx playwright test/);
+  assert.match(out, /attempt 2 of 3/);
+  assert.match(out, /VISUAL-FAIL-OUTPUT-XYZ/);
+  assert.match(out, /traces\/attempt-2\/trace\.zip/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("visual_fix prompt: instructs the trailers with substituted issue + run id (#20, #395)", () => {
+  const out = buildVisualFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "npx playwright test",
+    attempt: 1,
+    maxAttempts: 1,
+    output: "fail",
+    artifacts: "(no artifacts captured)",
     pipelineRunId: "15/2026-06-08T14:32:00Z",
   });
   assert.match(out, /Issue: #15/);

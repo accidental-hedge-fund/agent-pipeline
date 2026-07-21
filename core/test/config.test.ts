@@ -307,6 +307,69 @@ test("resolveConfig: eval_gate enabled:false keeps other defaults", async () => 
   }
 });
 
+// ---- visual_gate (#395) ----
+
+test("resolveConfig: visual_gate defaults apply when block is absent", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/vg0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.visual_gate.enabled, DEFAULT_CONFIG.visual_gate.enabled);
+    assert.equal(cfg.visual_gate.enabled, false);
+    assert.equal(cfg.visual_gate.mode, DEFAULT_CONFIG.visual_gate.mode);
+    assert.equal(cfg.visual_gate.mode, "gate");
+    assert.equal(cfg.visual_gate.timeout, DEFAULT_CONFIG.visual_gate.timeout);
+    assert.equal(cfg.visual_gate.max_attempts, DEFAULT_CONFIG.visual_gate.max_attempts);
+    assert.equal(cfg.visual_gate.artifacts_dir, DEFAULT_CONFIG.visual_gate.artifacts_dir);
+    assert.equal(cfg.visual_gate.artifacts_dir, ".pipeline-visual");
+    assert.equal(cfg.visual_gate.command, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: visual_gate enabled with command, advisory mode, and custom artifacts_dir", async () => {
+  const repo = makeFakeRepo(
+    `visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  mode: advisory\n  timeout: 600\n  max_attempts: 3\n  artifacts_dir: ".e2e-out"\n`,
+  );
+  const binDir = makeFakeGh("acme/vg1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.visual_gate.enabled, true);
+    assert.equal(cfg.visual_gate.command, "npx playwright test");
+    assert.equal(cfg.visual_gate.mode, "advisory");
+    assert.equal(cfg.visual_gate.timeout, 600);
+    assert.equal(cfg.visual_gate.max_attempts, 3);
+    assert.equal(cfg.visual_gate.artifacts_dir, ".e2e-out");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: visual_gate enabled:false keeps other defaults", async () => {
+  const repo = makeFakeRepo(`visual_gate:\n  enabled: false\n`);
+  const binDir = makeFakeGh("acme/vg2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.visual_gate.enabled, false);
+    assert.equal(cfg.visual_gate.mode, DEFAULT_CONFIG.visual_gate.mode);
+    assert.equal(cfg.visual_gate.timeout, DEFAULT_CONFIG.visual_gate.timeout);
+    assert.equal(cfg.visual_gate.max_attempts, DEFAULT_CONFIG.visual_gate.max_attempts);
+    assert.equal(cfg.visual_gate.artifacts_dir, DEFAULT_CONFIG.visual_gate.artifacts_dir);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- review_policy (#17) ----
 
 test("resolveConfig: review_policy defaults apply when absent (block medium+, conf floor 0.7, bounded rounds)", async () => {
@@ -2514,6 +2577,22 @@ test("syncConfig: event_sink is preserved through sync --apply", () => {
   assert.match(synced, /^event_sink:/m, "event_sink block must be present after sync");
   assert.match(synced, /command: .*logger -t pipeline/);
   assert.match(synced, /mode: exclusive/);
+});
+
+test("syncConfig: visual_gate is preserved through sync --apply", () => {
+  const repo = makeFakeRepo(
+    `visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  mode: advisory\n  timeout: 600\n  max_attempts: 3\n  artifacts_dir: ".e2e-out"\n`,
+  );
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, true);
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  assert.match(synced, /^visual_gate:/m, "visual_gate block must be present after sync");
+  assert.match(synced, /enabled: true/);
+  assert.match(synced, /command: .*npx playwright test/);
+  assert.match(synced, /mode: advisory/);
+  assert.match(synced, /timeout: 600/);
+  assert.match(synced, /max_attempts: 3/);
+  assert.match(synced, /artifacts_dir: .*\.e2e-out/);
 });
 
 // ---------------------------------------------------------------------------

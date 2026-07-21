@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 13-stage state machine — planning → plan-review → implementing → review → fix → pre-merge → eval-gate → shipcheck-gate. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 14-stage state machine — planning → plan-review → implementing → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate. It does **not** auto-merge; you own the merge button.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
@@ -16,7 +16,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 | Structured review | Reviewers emit findings with severity, confidence, and file/line context. The same review input should lead to the same advance/block decision, not a model coin flip. |
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
-| Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `eval-gate` can run a repo-defined suite such as Playwright or visual checks. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
+| Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `visual-gate` can run a repo-defined E2E/visual suite (e.g. Playwright) and captures its artifacts as PR-visible evidence. `eval-gate` can run a repo-defined eval/scoring suite. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
 | Human merge | `ready-to-deploy` is terminal for the autonomous loop. A human owns the merge button. |
 
 | Naive AI loop | agent-pipeline lifecycle |
@@ -42,6 +42,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
   - [Configurable steps](#configurable-steps)
   - [Human plan feedback](#human-plan-feedback)
   - [Commit traceability trailers](#commit-traceability-trailers-always-on)
+  - [Visual gate](#visual-gate)
   - [Eval gate](#eval-gate)
   - [Shipcheck gate](#shipcheck-gate)
   - [OpenSpec integration](#openspec-integration)
@@ -711,6 +712,13 @@ test_gate:                           # run the repo's own tests/build before ope
   command: "pnpm test"               # optional explicit command; auto-detected when absent
   max_attempts: 3                    # fix-harness invocations before blocking
   timeout: 300                       # seconds per test/build run
+visual_gate:                         # run the repo's E2E/visual suite after pre-merge, before eval-gate
+  enabled: false                     # default: false; set true to enable (one-time declaration per repo)
+  command: "npx playwright test"     # shell command to run; supports pipes, env vars, &&, etc.
+  mode: gate                         # gate (default): fail routes to a fix round, blocks once attempts are exhausted | advisory: record result and always advance
+  timeout: 900                       # hard stage-level budget in seconds per visual run
+  max_attempts: 2                    # total visual runs (1 = no retry/fix round); gate mode: fix rounds = max_attempts - 1
+  artifacts_dir: .pipeline-visual     # worktree-relative dir the command writes screenshots/diffs/traces into
 eval_gate:                           # run the repo's eval harness after pre-merge, before ready-to-deploy
   enabled: false                     # default: false; set true to enable (one-time declaration per repo)
   command: "pnpm evals"              # shell command to run; supports pipes, env vars, &&, etc.
@@ -1248,9 +1256,41 @@ Pipeline-Run: <n>/<UTC-ISO-datetime>
 
 The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused for every commit in that run, so `git log --grep="Pipeline-Run: 42/"` surfaces all commits from every run on issue #42, and `git log --format="%(trailers:key=Issue)"` reads the issue link back via `git interpret-trailers`. The test/build gate enforces it: if a fix-harness commit lands without both trailers, the gate blocks rather than advancing. There is no toggle.
 
+### Visual gate
+
+When `visual_gate.enabled` (default **off**), the target repo's E2E/visual suite (e.g. Playwright) runs **after pre-merge, before `eval-gate`**, inside the issue's worktree. It's the same machinery as the eval gate below, plus one addition: a declared artifacts directory whose contents become PR-visible evidence — the human who owns the merge button gets to see what the change actually looks like, not just that a suite exited 0.
+
+- It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses output or diffs images.
+- **`mode: gate`** (default) — an ordinary (non-tooling) failure routes to a bounded fix round: the implementer harness is invoked with the visual output (gate name, command, bounded stdout/stderr, captured artifact paths) as context, commits and pushes a fix, and the visual command re-runs against the updated code. Only once `max_attempts` is exhausted does the item **block**, with the final output surfaced.
+- **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted.
+- `max_attempts` (default 2; `1` = no retry) bounds the total number of visual runs; in gate mode the fix-round budget is `max_attempts - 1`.
+- `timeout` (default **900**, higher than eval-gate's 300 — browser suites routinely run longer) is a hard stage-level budget in seconds per visual run.
+- **Tooling failures always block immediately, regardless of mode, and never route to a fix round.**
+- `artifacts_dir` (default `.pipeline-visual`, worktree-relative) is where the command should write screenshots/diffs/traces. After each run the stage enumerates the directory (bounded count/size, deterministic order, explicit truncation note if over budget), copies the files into the run directory so they survive worktree cleanup, and lists the captured paths in the `## Visual Gate` comment and the evidence bundle. A missing/empty directory is not a failure — it's recorded as "no artifacts captured" — and a path that resolves outside the worktree is rejected outright, never read.
+- The command's environment carries `PIPELINE_PR_NUMBER`, `PIPELINE_BRANCH`, `PIPELINE_ISSUE`, `PIPELINE_RUN_ID`, and `PIPELINE_VISUAL_ARTIFACTS_DIR` (absolute), so a repo-defined suite can target its own per-PR preview deployment instead of only a locally served build. The pipeline never fetches or validates any preview URL itself — that stays entirely inside your command.
+
+**Targeting a per-PR preview deployment** (e.g. a Vercel-style preview URL your CI already publishes for `PIPELINE_BRANCH`):
+
+```yaml
+visual_gate:
+  enabled: true
+  command: "PLAYWRIGHT_BASE_URL=$(./scripts/resolve-preview-url.sh $PIPELINE_PR_NUMBER) npx playwright test"
+  artifacts_dir: playwright-report
+```
+
+**Auth-protected pages**: supply seeded test credentials through the command's own environment (CI secrets, not the pipeline config) — the pipeline neither reads nor stores them, and any that do leak into output are redacted before posting:
+
+```yaml
+visual_gate:
+  enabled: true
+  command: "E2E_TEST_USER=$E2E_TEST_USER E2E_TEST_PASS=$E2E_TEST_PASS npx playwright test"
+```
+
+When disabled (the default), visual-gate transitions straight to `eval-gate` and the `visual-gate` label is never applied. **Rollback** is `visual_gate: { enabled: false }`.
+
 ### Eval gate
 
-When `eval_gate.enabled` (default **off**), the target repo's eval harness runs **after pre-merge, before `ready-to-deploy`**, inside the issue's worktree. It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode, elapsed, output excerpt) is always recorded as an issue comment.
+When `eval_gate.enabled` (default **off**), the target repo's eval harness runs **after visual-gate, before `shipcheck-gate`/`ready-to-deploy`**, inside the issue's worktree. It's a one-time opt-in per repo: set `enabled: true` and a `command`. The command runs through `sh -c` (so pipes, `&&`, and env vars work) and its **exit code alone** decides pass/fail — the pipeline never parses scores. The outcome (PASS/FAIL, mode, elapsed, output excerpt) is always recorded as an issue comment.
 
 - **`mode: gate`** (default) — an ordinary (non-tooling) failure routes to a bounded fix round: the implementer harness is invoked with the eval output (gate name, command, bounded stdout/stderr) as context, commits and pushes a fix, and the eval command re-runs against the updated code. Only once `max_attempts` is exhausted does the item **block**, with the final eval output surfaced.
 - **`mode: advisory`** — the result is recorded and the item **always advances**, even after retries are exhausted. Advisory failures are retried as a plain re-run (no fix round) up to `max_attempts`.
@@ -1259,7 +1299,7 @@ When `eval_gate.enabled` (default **off**), the target repo's eval harness runs 
 - **Tooling failures always block immediately, regardless of mode, and never route to a fix round** — if the command times out or can't be spawned the item is blocked even in advisory mode or with fix-round budget remaining.
 - A fix round that fails (harness error, no new commit, a dirty worktree, or a failed push) blocks the item the same way a test-gate fix round does — it never pushes a partial fix, and the eval command is not re-run.
 
-When disabled (the default), pre-merge advances straight to `ready-to-deploy` and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
+When disabled (the default), eval-gate advances straight to `shipcheck-gate` (or `ready-to-deploy`) and the `eval-gate` label is never applied. **Rollback** is `eval_gate: { enabled: false }`.
 
 ### Shipcheck gate
 
@@ -1569,7 +1609,7 @@ Each `Diagnostic` object has the shape:
 ```
 
 - `line` is present for YAML syntax errors (1-indexed); absent for field-level Zod errors.
-- For rigor/cost-gating fields (`review_policy.block_threshold`, `review_policy.min_confidence`, `review_policy.max_adversarial_rounds`, `steps.*`, `eval_gate.enabled/mode`, `shipcheck_gate.enabled/mode`), an invalid value produces a diagnostic with an additional `"rigorGating": true` marker. These are always `severity: "error"` (exit 1) — a typo must never silently flip a rigor switch.
+- For rigor/cost-gating fields (`review_policy.block_threshold`, `review_policy.min_confidence`, `review_policy.max_adversarial_rounds`, `steps.*`, `visual_gate.enabled/mode`, `eval_gate.enabled/mode`, `shipcheck_gate.enabled/mode`), an invalid value produces a diagnostic with an additional `"rigorGating": true` marker. These are always `severity: "error"` (exit 1) — a typo must never silently flip a rigor switch.
 - Inert-model alias warnings (`models.planning`/`implementing`/`fix` set while the implementer harness is `codex`, or `models.review` set while the reviewer is a custom CLI — neither `claude` nor `codex`) are `severity: "warning"` and do not affect the exit code when they are the only findings.
 
 Without `--json`, a human-readable summary is printed (one line per diagnostic). The same exit-code rules apply.

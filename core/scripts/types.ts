@@ -11,6 +11,7 @@ export const STAGES = [
   "review-2",
   "fix-2",
   "pre-merge",
+  "visual-gate",
   "eval-gate",
   "shipcheck-gate",
   "ready-to-deploy",
@@ -120,6 +121,8 @@ export const BLOCKER_KINDS = [
   "push-failed",
   "eval-gate-misconfigured",
   "eval-gate-failed",
+  "visual-gate-misconfigured",
+  "visual-gate-failed",
   "shipcheck-failed",
   "head-drift",
   "worktree-setup-failed",
@@ -209,6 +212,14 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
+  "visual-gate-misconfigured":
+    "`visual_gate.enabled` is true but no command is configured. Set " +
+    "`visual_gate.command` in `.github/pipeline.yml`, remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
+  "visual-gate-failed":
+    "The visual gate failed (see output above). Fix the failing E2E/visual " +
+    "checks in the worktree, commit, remove the `blocked` label, then " +
+    "re-run `$pipeline {{N}}`.",
   "shipcheck-failed":
     "The shipcheck gate returned a failing or partial verdict (see the shipcheck " +
     "comment above for the specific concerns). Address the flagged concerns in " +
@@ -335,6 +346,19 @@ export interface PipelineConfig {
     mode: "gate" | "advisory";
     timeout: number;   // seconds
     max_attempts: number; // total attempts (1 = no retry)
+  };
+  // Visual gate (#395). When enabled, runs the repo's E2E/visual suite after
+  // pre-merge and before eval-gate, capturing the artifacts it writes into
+  // `artifacts_dir` as PR-visible evidence. Same lifecycle as eval_gate (gate
+  // mode blocks on fail with bounded fix-round recovery; advisory records and
+  // always advances); the pipeline never parses output or diffs images.
+  visual_gate: {
+    enabled: boolean;
+    command?: string;
+    mode: "gate" | "advisory";
+    timeout: number;   // seconds
+    max_attempts: number; // total attempts (1 = no retry)
+    artifacts_dir: string; // worktree-relative
   };
   // Review severity policy (#17). Declares which finding severities block
   // progression vs. merely advise. Findings below `block_threshold` (or below
@@ -565,6 +589,7 @@ export const DEFAULT_CONFIG: Omit<
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
+  visual_gate: { enabled: false, mode: "gate" as const, timeout: 900, max_attempts: 2, artifacts_dir: ".pipeline-visual" },
   shipcheck_gate: {
     enabled: false,
     mode: "advisory" as const,

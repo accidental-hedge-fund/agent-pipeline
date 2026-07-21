@@ -171,6 +171,18 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Run the repo's eval harness after pre-merge."),
+  visual_gate: z
+    .object({
+      enabled: z.boolean().optional().describe("Enable the visual gate (set true to activate; one-time declaration per repo)."),
+      command: z.string().optional().describe("Shell command to run the E2E/visual suite (required when enabled)."),
+      mode: z.enum(["gate", "advisory"]).optional().describe("gate: block on failure; advisory: record result and advance."),
+      timeout: z.number().int().positive().optional().describe("Stage-level budget in seconds (shared across attempts)."),
+      max_attempts: z.number().int().positive().optional().describe("Total attempts before giving up (1 = no retry)."),
+      artifacts_dir: z.string().optional().describe("Worktree-relative directory the command writes screenshots/diffs/traces into."),
+    })
+    .strict()
+    .optional()
+    .describe("Run the repo's E2E/visual suite after pre-merge and before eval-gate, capturing artifacts as PR-visible evidence."),
   shipcheck_gate: z
     .object({
       enabled: z.boolean().optional().describe("Enable the shipcheck gate."),
@@ -715,6 +727,14 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       timeout: fileConfig.eval_gate?.timeout ?? DEFAULT_CONFIG.eval_gate.timeout,
       max_attempts: fileConfig.eval_gate?.max_attempts ?? DEFAULT_CONFIG.eval_gate.max_attempts,
     },
+    visual_gate: {
+      enabled: fileConfig.visual_gate?.enabled ?? DEFAULT_CONFIG.visual_gate.enabled,
+      command: fileConfig.visual_gate?.command,
+      mode: fileConfig.visual_gate?.mode ?? DEFAULT_CONFIG.visual_gate.mode,
+      timeout: fileConfig.visual_gate?.timeout ?? DEFAULT_CONFIG.visual_gate.timeout,
+      max_attempts: fileConfig.visual_gate?.max_attempts ?? DEFAULT_CONFIG.visual_gate.max_attempts,
+      artifacts_dir: fileConfig.visual_gate?.artifacts_dir ?? DEFAULT_CONFIG.visual_gate.artifacts_dir,
+    },
     shipcheck_gate: {
       enabled: fileConfig.shipcheck_gate?.enabled ?? DEFAULT_CONFIG.shipcheck_gate.enabled,
       mode: fileConfig.shipcheck_gate?.mode ?? DEFAULT_CONFIG.shipcheck_gate.mode,
@@ -1108,6 +1128,8 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "steps.adversarial_review",
   "eval_gate.enabled",
   "eval_gate.mode",
+  "visual_gate.enabled",
+  "visual_gate.mode",
   "shipcheck_gate.enabled",
   "shipcheck_gate.mode",
   "shipcheck_gate.max_rounds",
@@ -1394,6 +1416,30 @@ export function validateConfig(
     }
   }
 
+  // 6b. visual_gate: enabling the stage without a command is a config error
+  // (not merely a runtime block, unlike eval_gate) — a typo'd/omitted command
+  // must never let `visual_gate.enabled: true` silently pass validation.
+  if (fileConfig.visual_gate?.enabled && !fileConfig.visual_gate?.command) {
+    diagnostics.push({
+      severity: "error",
+      path: "visual_gate.command",
+      message: "visual_gate.enabled is true but no command is configured. Set visual_gate.command in .github/pipeline.yml.",
+    });
+  }
+  // A declared artifacts_dir that resolves outside the repo root can never be a
+  // valid worktree-relative path, regardless of which issue worktree runs it.
+  if (fileConfig.visual_gate?.artifacts_dir !== undefined) {
+    const resolved = path.resolve(gitRoot, fileConfig.visual_gate.artifacts_dir);
+    const rel = path.relative(gitRoot, resolved);
+    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      diagnostics.push({
+        severity: "error",
+        path: "visual_gate.artifacts_dir",
+        message: `visual_gate.artifacts_dir ("${fileConfig.visual_gate.artifacts_dir}") must resolve inside the repository root, not escape it.`,
+      });
+    }
+  }
+
   // 7. Stage-executor eligibility (#314) — same rule resolveConfig() throws on;
   // surfaced here as a diagnostic instead so `pipeline config validate`/`sync`
   // never throw.
@@ -1531,6 +1577,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const steps = { ...d.steps, ...config.steps };
   const testGate = { ...d.test_gate, ...config.test_gate };
   const evalGate = { ...d.eval_gate, ...config.eval_gate };
+  const visualGate = { ...d.visual_gate, ...config.visual_gate };
   const shipcheckGate = { ...d.shipcheck_gate, ...config.shipcheck_gate };
   const reviewPolicy = { ...d.review_policy, ...config.review_policy };
   const doctor = { ...d.doctor, ...config.doctor };
@@ -1612,6 +1659,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : "  # command: pnpm test # explicit command; auto-detected when absent",
     `  max_attempts: ${yamlScalar(testGate.max_attempts)} # fix-harness invocations before blocking`,
     `  timeout: ${yamlScalar(testGate.timeout)} # seconds per test/build run`,
+    "",
+    "visual_gate: # run the repo's E2E/visual suite after pre-merge and before eval-gate",
+    `  enabled: ${yamlScalar(visualGate.enabled)} # set true to enable (one-time declaration per repo)`,
+    visualGate.command !== undefined
+      ? `  command: ${yamlScalar(visualGate.command)} # shell command to run; required when enabled`
+      : "  # command: npx playwright test # shell command to run; required when enabled",
+    `  mode: ${yamlScalar(visualGate.mode)} # gate: block on fail | advisory: record and advance`,
+    `  timeout: ${yamlScalar(visualGate.timeout)} # stage-level budget in seconds (shared across attempts)`,
+    `  max_attempts: ${yamlScalar(visualGate.max_attempts)} # total attempts before giving up (1 = no retry)`,
+    `  artifacts_dir: ${yamlScalar(visualGate.artifacts_dir)} # worktree-relative dir the command writes screenshots/diffs/traces into`,
     "",
     "eval_gate: # run the repo's eval harness after pre-merge",
     `  enabled: ${yamlScalar(evalGate.enabled)} # set true to enable (one-time declaration per repo)`,
@@ -1807,6 +1864,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     steps: { ...d.steps, ...config.steps },
     test_gate: { ...d.test_gate, ...config.test_gate },
     eval_gate: { ...d.eval_gate, ...config.eval_gate },
+    visual_gate: { ...d.visual_gate, ...config.visual_gate },
     shipcheck_gate: { ...d.shipcheck_gate, ...config.shipcheck_gate },
     review_policy: { ...d.review_policy, ...config.review_policy },
     doctor: { ...d.doctor, ...config.doctor },
