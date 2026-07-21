@@ -1524,6 +1524,29 @@ test("runScoreboard: a failure after the write starts removes the temp file, wri
   assert.equal(written.size, 0, "the temp file must not remain either");
 });
 
+test("runScoreboard: a failure during the initial write removes the temp file and leaves an existing destination unchanged (#427)", async () => {
+  const written = new Map<string, string>();
+  written.set("/out/report.html", "pre-existing content");
+  let unlinkedPath: string | null = null;
+  const deps: ScoreboardDeps = {
+    readFile: async (p: string) => { throw enoent(p); },
+    readdir: async () => { throw enoent(runsDir(REPO_DIR)); },
+    log: () => {},
+    writeFile: async (p: string) => {
+      written.set(p, "");
+      throw new Error("EBOOM: simulated disk-full failure");
+    },
+    rename: async () => { throw new Error("rename must not be called when writeFile fails"); },
+    unlink: async (p: string) => { unlinkedPath = p; written.delete(p); },
+  };
+  await assert.rejects(
+    () => runScoreboard({ repoDir: REPO_DIR, html: "/out/report.html" }, deps),
+    /cannot write HTML export to \/out\/report\.html/,
+  );
+  assert.ok(unlinkedPath, "the temp file must be removed when the initial write fails");
+  assert.equal(written.get("/out/report.html"), "pre-existing content", "the existing destination must be left unchanged");
+});
+
 test("CLI: pipeline scoreboard --html writes one complete document and exits 0, touching nothing under .agent-pipeline/runs (#427)", () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-basic-"));
   try {

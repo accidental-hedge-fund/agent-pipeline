@@ -483,6 +483,7 @@ async function writeScoreboardHtmlExport(
   try {
     await deps.writeFile(tempPath, content);
   } catch (err) {
+    await deps.unlink(tempPath).catch(() => {});
     throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
   }
   try {
