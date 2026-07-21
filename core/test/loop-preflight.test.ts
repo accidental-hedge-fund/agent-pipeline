@@ -310,6 +310,42 @@ test("normalizeLoopArgs — standalone audit (no selector, no resume) is accepte
 // runLoopPreflight — fixed order, zero I/O on invalid args
 // ---------------------------------------------------------------------------
 
+test("runLoopPreflight — selector-free --audit skips the native-goal gate (#451 delta ac3bdbd2)", async () => {
+  // Audit is a read-only report on an existing canonical run: it must work on
+  // hosts whose engine lacks native /goal support.
+  const deps = compatibleDeps({
+    exec: () => ({ ok: true, stdout: "Usage: claude [options]\n", stderr: "" }), // no /goal advertised
+  });
+  const outcome = await runLoopPreflight({ audit: true }, "claude", deps, ROOTS);
+  assert.equal(outcome.ok, true);
+  assert.equal((outcome as { args: { audit: boolean } }).args.audit, true);
+});
+
+test("runLoopPreflight — --audit combined with a selector still requires native-goal (#451 delta ac3bdbd2)", async () => {
+  const deps = compatibleDeps({
+    exec: () => ({ ok: true, stdout: "Usage: claude [options]\n", stderr: "" }),
+  });
+  const outcome = await runLoopPreflight({ milestone: "v2", audit: true }, "claude", deps, ROOTS);
+  assert.equal(outcome.ok, false);
+  assert.equal((outcome as { failedCheck: string }).failedCheck, "native-goal");
+});
+
+test("normalizeLoopArgs — a --range spanning more than MAX_RANGE_SPAN issues is rejected before expansion (#451 delta 95357c6b)", () => {
+  assert.throws(
+    () => normalizeLoopArgs({ range: "1-99999999999" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopArgError);
+      assert.match((err as Error).message, /maximum is 1000/);
+      return true;
+    },
+  );
+});
+
+test("normalizeLoopArgs — a --range at exactly MAX_RANGE_SPAN issues expands", () => {
+  const args = normalizeLoopArgs({ range: "1-1000" });
+  assert.equal((args.selector as { value: string[] }).value.length, 1000);
+});
+
 test("runLoopPreflight — invalid args short-circuit before any check runs (zero I/O)", async () => {
   let calls = 0;
   const deps = fakeDeps({

@@ -215,6 +215,13 @@ export interface RawLoopArgs {
 
 const RANGE_RE = /^(\d+)-(\d+)$/;
 
+/** Hard ceiling on how many issue numbers a `--range` may denote (#451 delta
+ *  finding 95357c6b): expansion materializes the inclusive list, so an
+ *  unbounded span (e.g. `1-99999999999`) would loop and allocate effectively
+ *  forever before any preflight check can reject it. No real batch approaches
+ *  this bound — the factory's own limits cap concurrent work far lower. */
+export const MAX_RANGE_SPAN = 1000;
+
 /** Expands a validated `<start>-<end>` range into the inclusive list of issue
  *  numbers it denotes — the required `work-list` normalization target (#451
  *  review 2, finding 3: the active spec has no standalone `range` selector
@@ -228,6 +235,12 @@ function expandRange(range: string): string[] {
   const end = Number(match[2]);
   if (start > end) {
     throw new LoopArgError(`pipeline:loop: --range start must be <= end, got "${range}"`);
+  }
+  const span = end - start + 1;
+  if (!Number.isSafeInteger(span) || span > MAX_RANGE_SPAN) {
+    throw new LoopArgError(
+      `pipeline:loop: --range spans ${Number.isSafeInteger(span) ? span : "too many"} issues — the maximum is ${MAX_RANGE_SPAN}`,
+    );
   }
   const issues: string[] = [];
   for (let n = start; n <= end; n++) issues.push(String(n));
@@ -318,9 +331,16 @@ export async function runLoopPreflight(
     };
   }
 
-  const nativeGoal = await checkNativeGoalCapability(deps, engine);
-  if (nativeGoal.status === "fail") {
-    return { ok: false, failedCheck: "native-goal", detail: nativeGoal.detail, remediation: nativeGoal.remediation };
+  // Selector-free `--audit` is a read-only report on an existing canonical
+  // run: it starts and resumes nothing, so the native-goal capability gate
+  // does not apply — a cross-engine operator whose CLI lacks native /goal
+  // support must still be able to audit (#451 delta finding ac3bdbd2).
+  const auditOnly = args.audit && args.selector === undefined && args.resumeRunId === undefined;
+  if (!auditOnly) {
+    const nativeGoal = await checkNativeGoalCapability(deps, engine);
+    if (nativeGoal.status === "fail") {
+      return { ok: false, failedCheck: "native-goal", detail: nativeGoal.detail, remediation: nativeGoal.remediation };
+    }
   }
 
   return { ok: true, args };
