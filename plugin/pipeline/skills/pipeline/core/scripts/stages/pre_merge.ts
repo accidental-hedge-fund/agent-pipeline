@@ -138,6 +138,89 @@ export function isPipelineInternalCommit(messageHeadline: string): boolean {
 }
 
 /**
+ * Tri-state result of {@link resolveReviewedShaCurrency}: whether a SHA a
+ * delta review ran against (or a verdict was recorded against) is still the
+ * PR branch head at the moment of recording (#481).
+ * - `current`     — `candidateSha` is still the head, or every commit since
+ *   it is pipeline-internal (#98 exemption preserved).
+ * - `superseded`  — a newer developer/fix commit landed; `headSha` is the
+ *   current head. The verdict must be discarded, not recorded as blocking.
+ * - `unknown`     — the head or commit list could not be read/classified
+ *   (network failure, or `candidateSha`/the current head is absent from the
+ *   commit list — e.g. rebase/squash, or a stale commit-list read). Callers
+ *   MUST fail closed: never record a blocking verdict on `unknown`.
+ */
+export type ReviewedShaCurrency =
+  | { status: "current" }
+  | { status: "superseded"; headSha: string }
+  | { status: "unknown" };
+
+/**
+ * Seams needed to resolve whether `candidateSha` — the SHA a delta review
+ * ran against — is still the PR branch head (#481). Re-reads the PR head and,
+ * on mismatch, classifies the commits between `candidateSha` and the new head
+ * using the same `isPipelineInternalCommit` rule as the existing SHA gate
+ * reuse checks, so pipeline-internal-only commits (OpenSpec archive) still
+ * count as current.
+ */
+export async function resolveReviewedShaCurrency(
+  cfg: PipelineConfig,
+  prNumber: number,
+  candidateSha: string,
+  deps: {
+    getPrDetail: typeof getPrDetail;
+    getPrCommits: typeof getPrCommits;
+  },
+): Promise<ReviewedShaCurrency> {
+  try {
+    const newHead = (await deps.getPrDetail(cfg, prNumber)).head_sha;
+    if (newHead === candidateSha) return { status: "current" };
+    const commits = await deps.getPrCommits(cfg, prNumber);
+    const candidateIdx = commits.findIndex((c) => c.oid === candidateSha);
+    const newHeadIdx = commits.findIndex((c) => c.oid === newHead);
+    // Both SHAs must be present, and in order, to trust the fetched commit
+    // list as spanning the full range — otherwise the list may be stale
+    // (fetched before the newer push landed) or the history was rebased.
+    if (candidateIdx === -1 || newHeadIdx === -1 || newHeadIdx <= candidateIdx) {
+      return { status: "unknown" };
+    }
+    const landedSince = commits.slice(candidateIdx + 1, newHeadIdx + 1);
+    if (landedSince.every((c) => isPipelineInternalCommit(c.messageHeadline))) {
+      return { status: "current" };
+    }
+    return { status: "superseded", headSha: newHead };
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+/** Bound on additional delta-review attempts after a supersession within one
+ *  pre-merge entry (#481). Exceeding it falls back to the conservative full
+ *  re-review path rather than looping. */
+export const MAX_DELTA_SUPERSESSION_RETRIES = 1;
+
+/**
+ * Notice posted when a pre-merge delta verdict is discarded because the PR
+ * head moved past the SHA it was run against (#481). Carries no
+ * `pipeline-blocking-keys` marker and does not claim the new head as its
+ * reviewed commit — review history must not misrepresent a superseded
+ * verdict as describing the current head.
+ */
+export function supersededDeltaReviewNotice(reviewedSha: string, headSha: string): string {
+  return attestPipelineComment(
+    "pre-merge-delta-superseded",
+    [
+      `${DELTA_REVIEW_MARKER_PREFIX} — superseded`,
+      "",
+      `This delta review ran against \`${reviewedSha.slice(0, 7)}\`, but the PR branch head ` +
+        `had already moved to \`${headSha.slice(0, 7)}\` by the time the verdict was ready.`,
+      "The verdict is discarded — it carries no blocking authority — and the delta review " +
+        "re-runs against the current head.",
+    ].join("\n"),
+  );
+}
+
+/**
  * True iff a blocking finding's category is in the auto-fix allowlist
  * `{ correctness, missing-dep }`. Absent/empty/unknown category → false
  * (fail-closed: auto-fix only on positive signal). (#359)
@@ -1324,35 +1407,76 @@ export async function enforceReviewShaGate(
       // Diff changed: run a focused adversarial delta review of only the unreviewed
       // commits instead of routing back to a full review-2 round. The delta review
       // does NOT count against the max_adversarial_rounds ceiling.
-      const deltaDiff = reviewed.sha
-        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, head, deltaWorktreePath)
+      //
+      // The SHA a delta review targets can be superseded by a further fix push
+      // landing while the (slow) reviewer invocation is in flight (#481). Before
+      // recording anything for `targetHead`, re-validate it against the PR head:
+      // on supersession, discard the verdict — no blocking authority, no
+      // reviewed-sha claim on the new head — and re-run the delta review against
+      // it instead, bounded by MAX_DELTA_SUPERSESSION_RETRIES so a branch under
+      // continuous pushes degrades to the conservative full re-review path below
+      // rather than looping.
+      let targetHead = head;
+      let deltaDiff = reviewed.sha
+        ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, targetHead, deltaWorktreePath)
         : currentDiff; // reviewed SHA missing → review the full diff as the delta
-
-      const deltaSpecContext = deltaWt
+      let deltaSpecContext = deltaWt
         ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
         : "";
 
-      // Cross-round memory digest (#389): the pre-merge delta review is one of
-      // the rounds that can see prior-round history.
-      const priorRoundsDigest = buildPriorRoundDigest(detail.comments, {
-        actor, trustedOverrideActors: cfg.trusted_override_actors,
-      });
-      const deltaResult = await runDeltaReviewFn(
-        cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
-        deps.runDir
-          ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest }
-          : { priorRoundsDigest },
-      );
-      // Guard: needs-attention with zero findings indicates unparseable reviewer output
-      // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
-      // conservative catch path (full re-review) rather than treating zero findings as
-      // an implicit approval.
-      if (deltaResult.verdict === "needs-attention" && deltaResult.findings.length === 0) {
-        throw new Error(
-          `delta review returned needs-attention with zero findings (likely unparseable output); ` +
-          `summary: ${deltaResult.summary || "(none)"}`,
+      let deltaResult: DeltaReviewResult;
+      let priorRoundsDigest: PriorRoundDigest;
+      let supersessionAttempts = 0;
+      for (;;) {
+        // Cross-round memory digest (#389): the pre-merge delta review is one of
+        // the rounds that can see prior-round history.
+        priorRoundsDigest = buildPriorRoundDigest(detail.comments, {
+          actor, trustedOverrideActors: cfg.trusted_override_actors,
+        });
+        deltaResult = await runDeltaReviewFn(
+          cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
+          deps.runDir
+            ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest }
+            : { priorRoundsDigest },
         );
+        // Guard: needs-attention with zero findings indicates unparseable reviewer output
+        // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
+        // conservative catch path (full re-review) rather than treating zero findings as
+        // an implicit approval.
+        if (deltaResult.verdict === "needs-attention" && deltaResult.findings.length === 0) {
+          throw new Error(
+            `delta review returned needs-attention with zero findings (likely unparseable output); ` +
+            `summary: ${deltaResult.summary || "(none)"}`,
+          );
+        }
+
+        const currency = await resolveReviewedShaCurrency(cfg, prNumber, targetHead, {
+          getPrDetail: getPrDetailFn, getPrCommits: getPrCommitsFn,
+        });
+        if (currency.status === "current") break;
+        if (currency.status === "unknown" || supersessionAttempts >= MAX_DELTA_SUPERSESSION_RETRIES) {
+          throw new Error(
+            currency.status === "unknown"
+              ? `cannot confirm reviewed SHA ${targetHead.slice(0, 7)} is still the PR head; ` +
+                `falling back to conservative re-review`
+              : `delta review superseded again after ${supersessionAttempts} retry attempt(s); ` +
+                `falling back to conservative re-review`,
+          );
+        }
+        // Superseded: discard this verdict — post a superseded notice carrying no
+        // blocking-key marker and no claim on the new head — then re-run the
+        // delta review against it.
+        await postCommentFn(cfg, issueNumber, supersededDeltaReviewNotice(targetHead, currency.headSha));
+        supersessionAttempts++;
+        targetHead = currency.headSha;
+        deltaDiff = reviewed.sha
+          ? await getCommitDeltaDiffFn(cfg, prNumber, reviewed.sha, targetHead, deltaWorktreePath)
+          : await getPrDiffFn(cfg, prNumber);
+        deltaSpecContext = deltaWt
+          ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
+          : "";
       }
+
       // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
       const overrides = extractOverrides(trustedOverrideComments);
       const scopes = extractScopedOverrides(trustedOverrideComments);
@@ -1379,7 +1503,7 @@ export async function enforceReviewShaGate(
         summary: deltaResult.summary,
         findings: deltaResult.findings,
         next_steps: [] as string[],
-        commitSha: head,
+        commitSha: targetHead,
       };
       const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
@@ -1412,17 +1536,8 @@ export async function enforceReviewShaGate(
       await postCommentFn(cfg, issueNumber, deltaComment);
 
       if (partition.blocking.length === 0) {
-        // Re-validate HEAD: a push during the delta reviewer invocation means the
-        // approval covers a commit that is no longer HEAD. Rather than proceeding
-        // on a stale approval, fall back to the conservative full re-review path
-        // (Finding 2). We throw so the catch block handles the fallthrough.
-        const postDeltaHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
-        if (postDeltaHead !== head) {
-          throw new Error(
-            `PR HEAD moved from ${head.slice(0, 7)} to ${postDeltaHead.slice(0, 7)} ` +
-            `during delta review; delta approval is stale — re-entering SHA gate`,
-          );
-        }
+        // HEAD currency for `targetHead` was already confirmed above, before this
+        // comment was posted (#481) — no separate re-check needed here.
         // Delta review approves (or findings all below policy): pre-merge proceeds.
         console.log(`[pipeline] #${issueNumber}: pre-merge delta review approved; proceeding`);
         return null;
@@ -1560,6 +1675,36 @@ export async function enforceReviewShaGate(
                     : `${reCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}`;
                 })()
               : reCommentBody;
+
+            // A blocking post-auto-fix re-review verdict is subject to the same
+            // supersession re-validation as the initial delta review (#481): the
+            // approve branch below already re-confirms the head via its own
+            // ls-remote disambiguation, but a blocking outcome previously went
+            // straight to `setBlockedFn` on `newPrHead` with no currency check at
+            // all. Bound to a single conservative fallback (no further retry
+            // loop here) rather than blocking on a verdict the head has already
+            // moved past.
+            if (rePartition.blocking.length > 0 || reIsUnparseable) {
+              const reCurrency = await resolveReviewedShaCurrency(cfg, prNumber, newPrHead, {
+                getPrDetail: getPrDetailFn, getPrCommits: getPrCommitsFn,
+              });
+              if (reCurrency.status === "superseded") {
+                await postCommentFn(
+                  cfg, issueNumber,
+                  supersededDeltaReviewNotice(newPrHead, reCurrency.headSha),
+                );
+                throw new Error(
+                  `post-auto-fix re-review superseded: PR head moved from ${newPrHead.slice(0, 7)} ` +
+                  `to ${reCurrency.headSha.slice(0, 7)}; falling back to conservative re-review`,
+                );
+              }
+              if (reCurrency.status === "unknown") {
+                throw new Error(
+                  `cannot confirm post-auto-fix reviewed SHA ${newPrHead.slice(0, 7)} is still ` +
+                  `the PR head; falling back to conservative re-review`,
+                );
+              }
+            }
             await postCommentFn(cfg, issueNumber, reComment);
 
             if (rePartition.blocking.length === 0 && !reIsUnparseable) {
@@ -1581,7 +1726,7 @@ export async function enforceReviewShaGate(
               // unambiguous signal of a newer concurrent push on its own.
               const postFixPr = await getPrDetailFn(cfg, prNumber);
               const postFixHead = postFixPr.head_sha;
-              if (postFixHead !== newPrHead && postFixHead !== head) {
+              if (postFixHead !== newPrHead && postFixHead !== targetHead) {
                 throw new Error(
                   `PR HEAD moved from ${newPrHead.slice(0, 7)} to ${postFixHead.slice(0, 7)} ` +
                   `during pre-merge auto-fix re-review; re-entering SHA gate`,
