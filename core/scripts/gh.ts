@@ -1400,12 +1400,7 @@ export const PIPELINE_COMMENT_KINDS: readonly {
   {
     kind: "finding-does-not-reproduce",
     heading: "## Pipeline: Finding does not reproduce",
-    verify: "exempt",
-    reason:
-      "Machine-authored by the fix harness, but already trust-gated via its own SHA/fingerprint-anchored " +
-      "`pipeline-non-reproducing` sentinel with a documented last-non-empty-line security invariant " +
-      "(extractNonReproducingDispositions). Attesting it would require touching that invariant's ordering; " +
-      "out of #471's audited scope — tracked as a follow-up.",
+    verify: "pipeline-attest",
   },
   {
     kind: "pipeline-classifier-prefix",

@@ -25,7 +25,7 @@ import {
   buildNewHumanInputWarningComment,
   findUnacknowledgedComments,
 } from "../scripts/issue-context-snapshot.ts";
-import { buildTrustedOverrideComments } from "../scripts/review-policy.ts";
+import { buildTrustedOverrideComments, nonReproducingDispositionComment } from "../scripts/review-policy.ts";
 import { PIPELINE_COMMENT_KINDS, buildAttestedBlockedComment, buildTransitionComment } from "../scripts/gh.ts";
 import {
   attestPipelineComment,
@@ -251,6 +251,15 @@ const KIND_RENDERERS: Record<string, () => string> = {
   "pre-merge-rerun-scope": () => preMergeRerunScopeNotice(2),
   "pre-merge-diff-unchanged": () => diffUnchangedNotice("a".repeat(40), "b".repeat(40)),
   "pre-merge-stale-review": () => staleReviewNotice("a".repeat(40), "b".repeat(40)),
+  "finding-does-not-reproduce": () =>
+    nonReproducingDispositionComment({
+      key: "abcd1234",
+      reviewedSha: "a".repeat(40),
+      fingerprint: "b".repeat(16),
+      stage: "fix-1",
+      justification: "does not reproduce at this SHA",
+      timestamp: ts(0),
+    }),
 };
 
 // "review-artifact" kinds verify via the review-artifact record instead of the
