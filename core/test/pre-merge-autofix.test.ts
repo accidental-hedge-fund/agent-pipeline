@@ -20,6 +20,7 @@ import {
 import { computeDiffHash, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 import type { InvokeFn } from "../scripts/openspec-consistency.ts";
+import type { PriorRoundDigest } from "../scripts/review-history.ts";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -215,6 +216,79 @@ test("pre-merge auto-fix 5.1: all-correctness blocks → auto-fix → re-review 
   assert.equal(rec.comments.length, 2, "initial delta comment + re-review delta comment both posted");
   assert.match(rec.comments[1], /reviewed-sha:/, "re-review comment embeds new reviewed-sha");
   assert.match(rec.comments[1], /verdict-diff-hash:/, "re-review comment embeds diff-hash");
+});
+
+// ---------------------------------------------------------------------------
+// #389 review 1 finding 3: post-auto-fix re-review must rebuild the digest
+// from freshly fetched comments (including the just-posted initial delta
+// review), not reuse the pre-review snapshot.
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix / delta review: post-fix re-review digest is rebuilt from freshly posted comments, not the stale pre-review snapshot (#389 R1 F3)", async (t) => {
+  const commentsList: { author: string; body: string }[] = [
+    { body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR },
+  ];
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  // The initial delta review and the post-fix re-review both surface the SAME
+  // finding — the fix doesn't change the reviewer's mind, an unacknowledged
+  // reversal against the initial round's own (just-posted) verdict.
+  const recurringFinding: ReviewFinding = {
+    severity: "high", title: "Missing rate cap", file: "src/limiter.ts", category: "correctness",
+    body: "Details", confidence: 0.9, recommendation: "add a cap",
+  };
+  const digestsSeen: (PriorRoundDigest | undefined)[] = [];
+  let deltaCallCount = 0;
+  const runDeltaReview: RunDeltaReviewFn = async (_cfg, _issue, _detail, _diff, _wt, _spec, accounting) => {
+    deltaCallCount++;
+    digestsSeen.push(accounting?.priorRoundsDigest);
+    return { verdict: "needs-attention", findings: [recurringFinding], summary: `round ${deltaCallCount}` } as DeltaReviewResult;
+  };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ title: "T", body: "B", comments: [...commentsList] }) as any,
+    getPrDetail: async () => ({ head_sha: rec.autoFixCalls > 0 ? SHA_AFTER_FIX : SHA_HEAD }) as any,
+    getPrCommits: async () =>
+      ([
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+        { oid: SHA_HEAD, messageHeadline: "fix: address review 2 findings (#16)" },
+      ]) as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+    postComment: async (_cfg, _n, body) => {
+      rec.comments.push(body);
+      commentsList.push({ author: TEST_ACTOR, body });
+    },
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => {
+      rec.autoFixCalls++;
+      return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+    },
+    getRemoteHead: async () => SHA_AFTER_FIX,
+  };
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(deltaCallCount, 2, "initial delta review + post-fix re-review both ran");
+  assert.equal(
+    digestsSeen[0]?.rounds.length,
+    1,
+    "before the first delta review, only the round-2 review comment is a prior round",
+  );
+  assert.equal(
+    digestsSeen[1]?.rounds.length,
+    2,
+    "the re-review's digest must also include the just-posted initial delta-review round, not the stale pre-review snapshot",
+  );
+  assert.equal(
+    out,
+    null,
+    "the unacknowledged repeat of the just-settled finding must be demoted (reversal-unacknowledged), not re-blocked",
+  );
+  assert.deepEqual(rec.blocked, [], "setBlocked must NOT be called — the reversal is demoted, not re-blocked");
 });
 
 // ---------------------------------------------------------------------------

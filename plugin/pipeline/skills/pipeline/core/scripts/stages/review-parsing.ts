@@ -69,6 +69,15 @@ export interface ReviewArtifact {
    * that a trailing artifact can be decoded.
    */
   bodyHash?: string;
+  /**
+   * Structured record of this round's blocking findings (#389), one entry per
+   * finding in the blocking partition. Lets `buildPriorRoundDigest` derive a
+   * full cross-round digest entry (key, surface, severity, title) without
+   * scraping markdown. Optional for backward compat with artifacts encoded
+   * before this field existed — absent on legacy comments, which fall back to
+   * the `pipeline-blocking-surfaces` / `pipeline-blocking-keys` markers.
+   */
+  blockingFindings?: Array<{ key: string; surface: string | null; severity: string; title: string }>;
 }
 
 /**
@@ -84,6 +93,23 @@ export function encodeReviewArtifact(artifact: ReviewArtifact): string {
 /** SHA-256 hex digest of `text`, used for the artifact's `bodyHash` field. */
 export function hashReviewBody(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+/** Structural validator for `ReviewArtifact.blockingFindings` (#389): true only
+ *  when `v` is an array of objects each carrying `key`/`severity`/`title` as
+ *  strings and `surface` as a string or null. Used to reject a malformed or
+ *  tampered `blockingFindings` array rather than trust it structurally. */
+function isValidBlockingFindings(v: unknown): v is Array<{ key: string; surface: string | null; severity: string; title: string }> {
+  if (!Array.isArray(v)) return false;
+  return v.every(
+    (e) =>
+      typeof e === "object" &&
+      e !== null &&
+      typeof (e as Record<string, unknown>).key === "string" &&
+      ((e as Record<string, unknown>).surface === null || typeof (e as Record<string, unknown>).surface === "string") &&
+      typeof (e as Record<string, unknown>).severity === "string" &&
+      typeof (e as Record<string, unknown>).title === "string",
+  );
 }
 
 /** True when `re` has at least one match starting after `pos` in `body`. */
@@ -140,7 +166,8 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
       !Array.isArray(obj.blockingKeys) ||
       !obj.blockingKeys.every((k: unknown) => typeof k === "string") ||
       (obj.review1Risk !== null && obj.review1Risk !== "low" && obj.review1Risk !== "standard") ||
-      (obj.bodyHash !== undefined && typeof obj.bodyHash !== "string")
+      (obj.bodyHash !== undefined && typeof obj.bodyHash !== "string") ||
+      (obj.blockingFindings !== undefined && !isValidBlockingFindings(obj.blockingFindings))
     ) {
       return null;
     }
@@ -152,6 +179,9 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
       review1Risk: obj.review1Risk as "low" | "standard" | null,
     };
     if (typeof obj.bodyHash === "string") artifact.bodyHash = obj.bodyHash;
+    if (isValidBlockingFindings(obj.blockingFindings)) {
+      artifact.blockingFindings = obj.blockingFindings;
+    }
     return artifact;
   } catch {
     return null;

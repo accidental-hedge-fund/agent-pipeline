@@ -694,6 +694,14 @@ export interface ReviewFinding {
   // severity/confidence. false = advisory regardless of severity and confidence;
   // the finding is recorded but does NOT route to a fix round.
   blocking?: boolean;
+  // Cross-round memory reversal guard (#389). Required when this finding
+  // re-raises, as blocking, a surface the prior-round digest marks settled
+  // (resolved-by-fix or overridden): names the prior round and explains why a
+  // genuinely new resolution — not a reversal — is warranted. Absent, empty, or
+  // whitespace-only on a settled-surface finding demotes it to advisory with
+  // reason "reversal-unacknowledged" (see partitionFindings). Ignored when the
+  // finding's surface is not settled or no digest was supplied.
+  prior_round_acknowledgment?: string;
 }
 
 export interface ReviewVerdict {

@@ -27,6 +27,12 @@ import {
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
 } from "../prompts/index.ts";
+import {
+  buildPriorRoundDigest,
+  settledSurfaceRounds,
+  settledSurfaces,
+  type PriorRoundDigest,
+} from "../review-history.ts";
 import { getForIssue, getOnDiskForIssue } from "../worktree.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import {
@@ -97,6 +103,8 @@ export interface AdvanceReviewOpts {
   runStoreDeps?: RunStoreDeps;
   /** Pre-rendered context snapshot block for prompt injection (#318). Set internally by advanceReview. */
   contextSnapshot?: string;
+  /** Cross-round memory digest (#389). Set internally by advanceReview for round 2 only. */
+  priorRoundsDigest?: PriorRoundDigest;
   /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
    *  supply a fake `fetchImpl` so no real network call is made. */
   executorHttpDeps?: ExecutorHttpDeps;
@@ -243,6 +251,14 @@ export async function advanceReview(
   const plan = extractPlan(detail.comments);
   const review1Summary = round === 2 ? extractReview1Summary(detail.comments) : undefined;
   const priorReview2Findings = round === 2 ? extractReview2Findings(detail.comments) : undefined;
+  // Cross-round memory digest (#389): round 1 is by definition the first round
+  // of a run and re-reviews the full diff from scratch, so only round 2 (and
+  // its re-reviews) receives it.
+  const priorRoundsDigest: PriorRoundDigest | undefined =
+    round === 2
+      ? buildPriorRoundDigest(detail.comments, { actor, trustedOverrideActors: cfg.trusted_override_actors })
+      : undefined;
+  opts = { ...opts, priorRoundsDigest };
 
   // Extract pre-planning context snapshot (#318). Use exact header match to
   // avoid picking up the last30days brief (## Pre-Planning Context — last30days).
@@ -565,10 +581,30 @@ export async function advanceReview(
   // just fix entry — so a re-review at the same reviewed SHA does not re-block
   // the same already-declared tooling artifact.
   const nonReproducing = extractNonReproducingDispositions(trustedComments);
-  const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes, nonReproducing, commitSha);
+  const settled = priorRoundsDigest ? settledSurfaces(priorRoundsDigest) : new Set<string>();
+  const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes, nonReproducing, commitSha, settled);
   const blockingFindingSet = new Set<ReviewFinding>(partition.blocking);
   for (let i = 0; i < findingRecords.length; i++) {
     findingRecords[i].effective_blocking = blockingFindingSet.has(verdict.findings[i]);
+  }
+
+  // Settled-surface reversal guard demotions (#389): tag the finding in the
+  // posted comment and emit one audit event per demotion.
+  const settledRounds = priorRoundsDigest ? settledSurfaceRounds(priorRoundsDigest) : new Map<string, number>();
+  const reversalDemotions = new Map<string, number>();
+  for (const { finding, reason } of partition.advisory) {
+    if (reason !== "reversal-unacknowledged") continue;
+    const surface = surfaceKey(finding);
+    const settlingRound = surface !== null ? settledRounds.get(surface) : undefined;
+    if (settlingRound === undefined) continue;
+    reversalDemotions.set(findingKey(finding), settlingRound);
+    if (opts.runDir) {
+      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      await appendEvent(opts.runDir, {
+        schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+        finding_key: findingKey(finding), surface, settling_round: settlingRound,
+      }, opts.runStoreDeps).catch(() => {});
+    }
   }
   if (opts.stateDir) {
     await recordReview(opts.stateDir, issueNumber, {
@@ -589,7 +625,7 @@ export async function advanceReview(
   const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
   if (partition.blocking.length === 0) {
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions)));
     const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     if (partition.advisory.length || partition.overridden.length) {
@@ -615,7 +651,7 @@ export async function advanceReview(
     };
   }
 
-  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment)));
+  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions)));
 
   const priorRoundComments = detail.comments.filter((c) => c.body.startsWith(roundPfx));
   const roundCap = cfg.review_policy.max_adversarial_rounds;
@@ -981,7 +1017,10 @@ export async function invokePromptHarnessReview(
   const stageName: "review-1" | "review-2" = round === 1 ? "review-1" : "review-2";
   const prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext, contextSnapshot })
-    : buildReviewAdversarialPrompt({ cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext, contextSnapshot });
+    : buildReviewAdversarialPrompt({
+        cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext, contextSnapshot,
+        priorRoundsDigest: opts.priorRoundsDigest,
+      });
 
   // External stage executor delegation (#314): a `stage_executors` assignment
   // for this round bypasses the local reviewer harness (and its #39 self-review

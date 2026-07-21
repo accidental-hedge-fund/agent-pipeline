@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { domainContext, readConventions } from "../config.ts";
 import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
+import { renderPriorRoundDigest, type PriorRoundDigest } from "../review-history.ts";
 import { DEFAULT_CONFIG } from "../types.ts";
 import type { PipelineConfig } from "../types.ts";
 
@@ -342,6 +343,11 @@ export interface BuildAdversarialArgs extends BuildPlanArgs {
   priorReview2Findings?: string;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
+  /** Cross-round memory digest (#389): prior rounds' blocking findings, their
+   *  resolutions, and recorded override dispositions. Absent/empty for round 1
+   *  or any round with no recoverable prior-round history — the rendered
+   *  prompt is then byte-identical to the pre-#389 prompt. */
+  priorRoundsDigest?: PriorRoundDigest;
 }
 
 export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
@@ -362,6 +368,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     context_snapshot: contextSnapshotSection(a.contextSnapshot),
     review1_section: review1Section,
     prior_review2_findings: priorReview2Section,
+    prior_rounds_digest: priorRoundsDigestSection(a.priorRoundsDigest),
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
     confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
@@ -511,6 +518,19 @@ function carryForwardSection(s?: string): string {
   );
 }
 
+/**
+ * Render the `{{prior_rounds_digest}}` slot (#389). `renderPriorRoundDigest`
+ * already sanitizes and fences its own output; this only adds the leading
+ * separator when non-empty so an empty digest contributes nothing — keeping
+ * round-1 (and any history-less) rendering byte-identical to before this change.
+ */
+function priorRoundsDigestSection(digest?: PriorRoundDigest): string {
+  if (!digest) return "";
+  const rendered = renderPriorRoundDigest(digest);
+  if (!rendered.trim()) return "";
+  return "\n\n" + rendered;
+}
+
 function specSection(specContext?: string): string {
   if (!specContext || !specContext.trim()) return "";
   return (
@@ -599,6 +619,8 @@ export interface BuildDeltaReviewArgs {
   deltaDiff: string;
   /** OpenSpec spec deltas for changed paths; empty/undefined when not applicable. */
   specContext?: string;
+  /** Cross-round memory digest (#389); see {@link BuildAdversarialArgs.priorRoundsDigest}. */
+  priorRoundsDigest?: PriorRoundDigest;
 }
 
 /**
@@ -627,12 +649,14 @@ export function buildDeltaReviewPrompt(a: BuildDeltaReviewArgs): string {
     context_snapshot: "",
     review1_section: deltaScopeNote,
     prior_review2_findings: "",
+    prior_rounds_digest: priorRoundsDigestSection(a.priorRoundsDigest),
     spec_context: specSection(a.specContext),
     severity_rubric: SEVERITY_RUBRIC,
     confidence_calibration: buildConfidenceCalibrationWithPolicy(a.cfg.review_policy),
     non_blocking_guidance: NON_BLOCKING_GUIDANCE_BLOCK,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.deltaDiff, 50_000),
+    papercut_instruction: papercutInstructionSection(a.cfg),
   });
 }
 
@@ -708,4 +732,4 @@ export function buildBackfillPrompt(a: BuildBackfillArgs): string {
 // are exposed so the drift test can assert both review prompts embed the shared
 // constants byte-for-byte. SEVERITY_RUBRIC is exposed for the rubric-content test.
 // carryForwardSection is exposed for injection-boundary fixture tests.
-export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK, NON_BLOCKING_GUIDANCE_BLOCK, SEVERITY_RUBRIC, SPEC_GENERATION_TOOL_FREE_BLOCK, carryForwardSection, crossRepoContextSection };
+export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK, NON_BLOCKING_GUIDANCE_BLOCK, SEVERITY_RUBRIC, SPEC_GENERATION_TOOL_FREE_BLOCK, carryForwardSection, crossRepoContextSection, priorRoundsDigestSection };
