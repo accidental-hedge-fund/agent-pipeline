@@ -123,6 +123,24 @@ test("digest ladder: rung 4 — no recoverable keys contributes nothing (never i
   assert.equal(digest.rounds[0].entries.length, 0, "no entries synthesized from prose");
 });
 
+test("digest ladder: surfaces-marker-only legacy comment (no blocking-keys marker) still yields entries (#389 R1 F1)", () => {
+  const key = findingKey(CAP_FINDING);
+  const sk = surfaceKey(CAP_FINDING)!;
+  const body = [
+    "## Review 2 (Adversarial) — needs-attention",
+    "**Reviewer**: codex",
+    "",
+    "summary",
+    // Only the surfaces marker — no `pipeline-blocking-keys` marker at all.
+    `<!-- pipeline-blocking-surfaces: ${key}~${encodeURIComponent(sk)} -->`,
+  ].join("\n");
+  const digest = buildPriorRoundDigest([{ author: "pipeline-bot", body }], { actor: "pipeline-bot" });
+  assert.equal(digest.rounds[0].entries.length, 1, "the surfaces marker alone must still produce an entry");
+  const e = digest.rounds[0].entries[0];
+  assert.equal(e.key, key);
+  assert.equal(e.surface, sk);
+});
+
 // ---------------------------------------------------------------------------
 // Resolution branches
 // ---------------------------------------------------------------------------
@@ -179,6 +197,38 @@ test("resolution: overridden finding carries reason and recording round", () => 
   const e2 = digest.rounds[0].entries[0];
   assert.equal(e2.resolution, "overridden");
   assert.equal(e2.overrideRound, 1);
+  assert.equal(e2.overrideReason, "rejected");
+});
+
+test("resolution: override sentinel followed by trailing footer text is still recognized (#389 R1 F2)", () => {
+  const key = findingKey(CAP_FINDING);
+  const round2 = formatReviewComment(cfg, verdict([CAP_FINDING], SHA_1), 2, "codex", new Set([key]));
+  // The sentinel is NOT the final non-empty line — a footer follows it, as a
+  // trusted override comment may legitimately carry (e.g. a signature block).
+  const override = [
+    "## Pipeline: Finding override",
+    "",
+    `**Finding**: \`${key}\``,
+    "**Disposition**: rejected",
+    "**Stage**: review-2",
+    "**Recorded at**: 2026-01-01T00:00:00Z",
+    "",
+    "### Reason",
+    "cap is intentionally absent for burst traffic",
+    "",
+    `<!-- pipeline-override: ${key} rejected -->`,
+    "",
+    "*Automated by Claude Code Pipeline Skill*",
+  ].join("\n");
+  const digest = buildPriorRoundDigest(
+    [
+      { author: "pipeline-bot", body: round2 },
+      { author: "operator", body: override },
+    ],
+    { actor: "pipeline-bot", trustedOverrideActors: ["operator"] },
+  );
+  const e2 = digest.rounds[0].entries[0];
+  assert.equal(e2.resolution, "overridden", "override sentinel must be recognized even with trailing footer text");
   assert.equal(e2.overrideReason, "rejected");
 });
 

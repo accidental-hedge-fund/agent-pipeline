@@ -82,16 +82,6 @@ function extractLegacyReviewedSha(body: string): string | null {
   return last?.[1] ?? null;
 }
 
-function lastNonEmptyLine(body: string): string {
-  return (
-    body
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .at(-1) ?? ""
-  );
-}
-
 /**
  * Fallback ladder (design.md Decision 2 / spec "degrade gracefully"): each
  * comment independently tries, in order: the `blockingFindings` artifact
@@ -111,9 +101,15 @@ function extractRoundEntries(body: string, artifact: ReturnType<typeof extractRe
     }));
   }
   const marker = extractBlockingKeysMarker(body);
-  const keys = marker ?? (artifact?.blockingKeys !== undefined ? new Set(artifact.blockingKeys) : null);
-  if (keys === null) return [];
   const surfacesMap = extractBlockingSurfacesFromComment(body);
+  const keys =
+    marker ??
+    (artifact?.blockingKeys !== undefined
+      ? new Set(artifact.blockingKeys)
+      : surfacesMap.size > 0
+        ? new Set(surfacesMap.keys())
+        : null);
+  if (keys === null) return [];
   return [...keys]
     .sort()
     .map((key) => ({
@@ -170,13 +166,13 @@ export function buildPriorRoundDigest(
     }
     if (c.author === null || !trustedOverrideAuthors.has(c.author)) continue;
     if (c.body.startsWith(OVERRIDE_HEADING)) {
-      const m = OVERRIDE_RE.exec(lastNonEmptyLine(c.body));
+      const m = OVERRIDE_RE.exec(c.body);
       if (m) keyOverrides.set(m[1], { reason: m[2].trim(), round: roundCounter });
       continue;
     }
     if (c.body.startsWith(SCOPE_OVERRIDE_HEADING)) {
       SCOPE_OVERRIDE_RE.lastIndex = 0;
-      const m = SCOPE_OVERRIDE_RE.exec(lastNonEmptyLine(c.body));
+      const m = SCOPE_OVERRIDE_RE.exec(c.body);
       SCOPE_OVERRIDE_RE.lastIndex = 0;
       if (m) {
         const type = m[1] as "category" | "file";

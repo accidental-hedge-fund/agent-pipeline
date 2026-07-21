@@ -1485,14 +1485,24 @@ export async function enforceReviewShaGate(
             const reReviewDiff = await getCommitDeltaDiffFn(
               cfg, prNumber, reviewed.sha, newPrHead, deltaWorktreePath,
             );
+            // Rebuild the digest from freshly fetched issue comments (review finding
+            // #389 R1 F3): the just-posted delta-review comment (line ~1406 above)
+            // is prior-round history for this re-review, and the digest captured
+            // before that comment existed cannot demote a reversal against it.
+            const reReviewIssueDetail = await getIssueDetailFn(cfg, issueNumber);
+            const reReviewDigest = buildPriorRoundDigest(reReviewIssueDetail.comments, {
+              actor, trustedOverrideActors: cfg.trusted_override_actors,
+            });
+            const reSettled = settledSurfaces(reReviewDigest);
+            const reSettledRounds = settledSurfaceRounds(reReviewDigest);
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
               deps.runDir
-                ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest }
-                : { priorRoundsDigest },
+                ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest: reReviewDigest }
+                : { priorRoundsDigest: reReviewDigest },
             );
             const rePartition = partitionFindings(
-              reResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled,
+              reResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, reSettled,
             );
             // Mirror the initial delta review guard (#228): needs-attention with zero
             // findings is likely unparseable reviewer output — block conservatively.
@@ -1513,7 +1523,7 @@ export async function enforceReviewShaGate(
             for (const { finding, reason } of rePartition.advisory) {
               if (reason !== "reversal-unacknowledged") continue;
               const surface = surfaceKey(finding);
-              const settlingRound = surface !== null ? settledRounds.get(surface) : undefined;
+              const settlingRound = surface !== null ? reSettledRounds.get(surface) : undefined;
               if (settlingRound === undefined) continue;
               reReversalDemotions.set(findingKey(finding), settlingRound);
               if (deps.runDir) {
