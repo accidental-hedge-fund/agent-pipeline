@@ -212,6 +212,8 @@ export interface CliOpts {
   days?: number;
   /** scoreboard: explicit per-harness cost estimates, as harness=usd-per-call. */
   estimateCost?: string[];
+  /** scoreboard: emit a chronological day|week time-series alongside the full-window summary. */
+  bucket?: string;
   /** improve: emit top-N clusters in the report (default 5). */
   top?: number;
   /** improve: only report clusters with at least this many occurrences (default 3). */
@@ -301,6 +303,7 @@ export function buildCmd(): Command {
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
     .option("--estimate-cost <harness=usd>", "scoreboard: estimate missing harness-call costs; repeatable", collectRepeatable, [])
+    .option("--bucket <unit>", "scoreboard: add a chronological day|week time-series alongside the full-window summary")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -366,7 +369,7 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "scoreboard" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--json]\n\n" +
+      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--json]\n\n" +
       "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
       "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
       "Options:\n" +
@@ -374,6 +377,7 @@ async function main(): Promise<void> {
       "  --until <date>              window end (ISO-8601)\n" +
       "  --days <n>                  relative N-day window; default is last 30 days\n" +
       "  --estimate-cost <harness=usd>  estimate missing per-call cost; repeatable\n" +
+      "  --bucket <unit>             add a chronological day|week time-series (default: none)\n" +
       "  --json                      emit one unfenced JSON object\n" +
       "  --repo-path <path>          override the target repo working tree\n\n" +
       "The command never modifies pipeline labels, branches, PRs, worktrees, config, or run artifacts.\n" +
@@ -835,6 +839,7 @@ async function main(): Promise<void> {
           days: opts.days,
           json: !!opts.json,
           estimateCost: opts.estimateCost,
+          bucket: opts.bucket,
         },
         realScoreboardDeps(),
       );

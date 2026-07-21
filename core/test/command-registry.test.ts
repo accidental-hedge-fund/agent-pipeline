@@ -288,6 +288,13 @@ test("command-registry: a genuinely unsupported flag on a profile-free command i
   assert.deepEqual(validateFlags(entry, cmd), ["bogus"]);
 });
 
+test("command-registry: scoreboard.allowedFlags includes bucket (#425)", () => {
+  const entry = COMMAND_REGISTRY.scoreboard;
+  assert.ok((entry.allowedFlags as Set<string>).has("bucket"));
+  const cmd = fakeCmdWithCliFlag("bucket");
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
 // ---------------------------------------------------------------------------
 // papercut (#419) — registered, agent-facing, hidden from --help
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import {
   buildScoreboardReport,
   formatScoreboardHuman,
   parseEstimateCosts,
+  parseScoreboardBucket,
   parseScoreboardWindow,
   type ScoreboardDeps,
 } from "../scripts/scoreboard.ts";
@@ -742,6 +743,225 @@ test("CLI: pipeline scoreboard human output includes required headings without g
     assert.match(result.stdout, /Cost per ready PR:/);
     assert.match(result.stdout, /Cost\/accounting by group:/);
     assert.match(result.stdout, /Shipcheck pass rate:/);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// --bucket day|week time-series (#425)
+// ---------------------------------------------------------------------------
+
+function addReadyRun(
+  files: Record<string, string>,
+  runId: string,
+  startAt: string,
+  opts: { issue?: number; pr?: number } = {},
+): void {
+  const issue = opts.issue ?? 1;
+  const pr = opts.pr ?? issue;
+  addRun(files, runId, {
+    runJson: { started_at: startAt, issue },
+    events: [{ schema_version: 1, type: "run_complete", at: startAt, final_state: "ready-to-deploy", elapsed_ms: 60000, pr }],
+    summary: { issue, pr, finalState: "ready-to-deploy", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+}
+
+test("parseScoreboardBucket: accepts day/week, rejects anything else, and is a no-op when absent (#425)", () => {
+  assert.equal(parseScoreboardBucket(undefined), null);
+  assert.equal(parseScoreboardBucket("day"), "day");
+  assert.equal(parseScoreboardBucket("week"), "week");
+  assert.throws(() => parseScoreboardBucket("month"), /--bucket must be one of: day, week/);
+});
+
+test("buildScoreboardReport: day buckets align to UTC calendar days and are contiguous (#425)", async () => {
+  const files: Record<string, string> = {};
+  addReadyRun(files, "301-2026-06-01T00-00-00-000Z", "2026-06-01T12:00:00Z", { issue: 1 });
+  addReadyRun(files, "302-2026-06-02T00-00-00-000Z", "2026-06-02T12:00:00Z", { issue: 2 });
+  addReadyRun(files, "303-2026-06-03T00-00-00-000Z", "2026-06-03T12:00:00Z", { issue: 3 });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-04T00:00:00Z", bucket: "day" },
+    memDeps(files),
+  );
+
+  assert.equal(report.bucket, "day");
+  assert.equal(report.series?.length, 3);
+  const series = report.series!;
+  assert.equal(series[0].start, "2026-06-01T00:00:00.000Z");
+  assert.equal(series[1].start, "2026-06-02T00:00:00.000Z");
+  assert.equal(series[2].start, "2026-06-03T00:00:00.000Z");
+  assert.equal(series[2].end, "2026-06-04T00:00:00.000Z");
+  for (let i = 0; i < series.length - 1; i++) {
+    assert.equal(series[i].end, series[i + 1].start, `entry ${i}'s end must equal entry ${i + 1}'s start`);
+  }
+});
+
+test("buildScoreboardReport: week buckets align to Monday 00:00 UTC and clip to window bounds (#425)", async () => {
+  const files: Record<string, string> = {};
+  const report = await buildScoreboardReport(
+    // 2026-06-03 is a Wednesday.
+    { repoDir: REPO_DIR, since: "2026-06-03T00:00:00Z", until: "2026-06-17T00:00:00Z", bucket: "week" },
+    memDeps(files),
+  );
+
+  assert.equal(report.bucket, "week");
+  const series = report.series!;
+  assert.equal(series[0].start, "2026-06-03T00:00:00.000Z", "first entry start clips to window.since");
+  assert.equal(series[0].end, "2026-06-08T00:00:00.000Z", "first entry end aligns to the following Monday");
+  assert.equal(series[series.length - 1].end, "2026-06-17T00:00:00.000Z", "last entry end clips to window.until");
+  for (const entry of series.slice(1, -1)) {
+    assert.equal(new Date(entry.start).getUTCDay(), 1, "interior entries start on a Monday");
+    assert.equal(new Date(entry.end).getUTCDay(), 1, "interior entries end on a Monday");
+  }
+});
+
+test("buildScoreboardReport: a run on a period boundary is counted once, in the later period (#425)", async () => {
+  const files: Record<string, string> = {};
+  addReadyRun(files, "301-2026-06-02T00-00-00-000Z", "2026-06-02T00:00:00Z", { issue: 1 });
+  addReadyRun(files, "302-2026-06-03T00-00-00-000Z", "2026-06-03T00:00:00Z", { issue: 2 });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-03T00:00:00Z", bucket: "day" },
+    memDeps(files),
+  );
+
+  const series = report.series!;
+  assert.equal(series.length, 2);
+  assert.equal(series[0].totals.included_runs, 0, "boundary-hitting run belongs to the later period, not this one");
+  assert.equal(series[1].totals.included_runs, 2, "the run at `until` also lands in the final period");
+  const sum = series.reduce((total, period) => total + period.totals.included_runs, 0);
+  assert.equal(sum, report.totals.included_runs);
+});
+
+test("buildScoreboardReport: sum of series included_runs equals the window total (#425)", async () => {
+  const files: Record<string, string> = {};
+  addReadyRun(files, "301-2026-06-01T00-00-00-000Z", "2026-06-01T05:00:00Z", { issue: 1 });
+  addReadyRun(files, "302-2026-06-01T00-00-00-000Z", "2026-06-01T18:00:00Z", { issue: 2 });
+  addReadyRun(files, "303-2026-06-03T00-00-00-000Z", "2026-06-03T05:00:00Z", { issue: 3 });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-04T00:00:00Z", bucket: "day" },
+    memDeps(files),
+  );
+
+  const sum = report.series!.reduce((total, period) => total + period.totals.included_runs, 0);
+  assert.equal(sum, report.totals.included_runs);
+  assert.equal(report.totals.included_runs, 3);
+});
+
+test("buildScoreboardReport: an empty period reports zeroed totals and null ratios without throwing (#425)", async () => {
+  const files: Record<string, string> = {};
+  addReadyRun(files, "301-2026-06-01T00-00-00-000Z", "2026-06-01T05:00:00Z", { issue: 1 });
+  addReadyRun(files, "303-2026-06-03T00-00-00-000Z", "2026-06-03T05:00:00Z", { issue: 3 });
+  // No run on 2026-06-02.
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-04T00:00:00Z", bucket: "day" },
+    memDeps(files),
+  );
+
+  const middle = report.series!.find((p) => p.start === "2026-06-02T00:00:00.000Z");
+  assert.ok(middle, "the empty middle day must still appear in the series");
+  assert.equal(middle!.totals.included_runs, 0);
+  assert.equal(middle!.metrics.ready_to_deploy_without_human_intervention.ratio, null);
+  assert.equal(middle!.metrics.full_run_duration_ms.avg_ms, null);
+});
+
+test("buildScoreboardReport: window totals/metrics/diagnostics are identical whether or not --bucket is supplied (#425)", async () => {
+  const files: Record<string, string> = {};
+  addReadyRun(files, "301-2026-06-01T00-00-00-000Z", "2026-06-01T05:00:00Z", { issue: 1 });
+  addReadyRun(files, "302-2026-06-02T00-00-00-000Z", "2026-06-02T05:00:00Z", { issue: 2 });
+
+  const opts = { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-04T00:00:00Z" };
+  const withoutBucket = await buildScoreboardReport(opts, memDeps(files));
+  const withBucket = await buildScoreboardReport({ ...opts, bucket: "week" }, memDeps(files));
+
+  assert.deepEqual(withoutBucket.window, withBucket.window);
+  assert.deepEqual(withoutBucket.totals, withBucket.totals);
+  assert.deepEqual(withoutBucket.metrics, withBucket.metrics);
+  assert.deepEqual(withoutBucket.diagnostics, withBucket.diagnostics);
+  assert.equal(withoutBucket.bucket, undefined);
+  assert.equal(withoutBucket.series, undefined);
+});
+
+test("buildScoreboardReport: omitting --bucket produces no bucket/series keys (#425)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, now: new Date("2026-06-28T00:00:00Z") },
+    { ...memDeps(), readdir: async () => { throw enoent(runsDir(REPO_DIR)); } },
+  );
+  assert.ok(!("bucket" in report));
+  assert.ok(!("series" in report));
+});
+
+test("buildScoreboardReport: an unsupported --bucket value throws before scanning artifacts (#425)", async () => {
+  const deps = memDeps();
+  await assert.rejects(
+    () => buildScoreboardReport({ repoDir: REPO_DIR, bucket: "month" }, deps),
+    /--bucket must be one of: day, week/,
+  );
+  assert.deepEqual(deps.reads, [], "an invalid --bucket must fail before any artifact read");
+});
+
+test("formatScoreboardHuman: renders one labelled per-period group in chronological order, including empty periods (#425)", async () => {
+  const files: Record<string, string> = {};
+  addReadyRun(files, "301-2026-06-01T00-00-00-000Z", "2026-06-01T05:00:00Z", { issue: 1 });
+  addReadyRun(files, "303-2026-06-03T00-00-00-000Z", "2026-06-03T05:00:00Z", { issue: 3 });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-04T00:00:00Z", bucket: "day" },
+    memDeps(files),
+  );
+  const output = formatScoreboardHuman(report);
+
+  const idx1 = output.indexOf("2026-06-01T00:00:00.000Z");
+  const idx2 = output.indexOf("2026-06-02T00:00:00.000Z");
+  const idx3 = output.indexOf("2026-06-03T00:00:00.000Z");
+  assert.ok(idx1 >= 0 && idx2 > idx1 && idx3 > idx2, "periods must render in chronological order, including the empty one");
+  assert.match(output, /Per-period breakdown \(day\):/);
+});
+
+test("formatScoreboardHuman: no per-period section renders when --bucket is omitted (#425)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, now: new Date("2026-06-28T00:00:00Z") },
+    { ...memDeps(), readdir: async () => { throw enoent(runsDir(REPO_DIR)); } },
+  );
+  const output = formatScoreboardHuman(report);
+  assert.ok(!output.includes("Per-period breakdown"));
+});
+
+test("CLI: pipeline scoreboard --bucket day --json emits a parseable series (#425)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-bucket-json-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--bucket", "day", "--json", "--repo-path", repo],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.bucket, "day");
+    assert.ok(Array.isArray(parsed.series));
+    for (const entry of parsed.series) {
+      assert.ok("start" in entry && "end" in entry && "totals" in entry && "metrics" in entry);
+    }
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --bucket month fails clearly with no partial output (#425)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-bucket-bad-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--bucket", "month", "--json", "--repo-path", repo],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /day/);
+    assert.match(result.stderr, /week/);
+    assert.equal(result.stdout, "");
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
