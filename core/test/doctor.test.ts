@@ -93,7 +93,21 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     },
     fsExists: async (p) => (o.fsExists ? o.fsExists(p) : true),
     fileMtime: async (p) => (o.fileMtime ? o.fileMtime(p) : 1000),
-    readTextFile: async (p) => (o.readTextFile ? o.readTextFile(p) : '{"version":"1.0.0"}'),
+    readTextFile: async (p) => {
+      if (o.readTextFile) return o.readTextFile(p);
+      // Default fake environment is all-pass, including loop:contract-coherence
+      // (#451): a supported goal-loop install is "discovered" at every
+      // candidate root, so pre-existing doctor tests that don't care about
+      // goal-loop stay green. Tests targeting loop:contract-coherence itself
+      // override readTextFile/fsExists explicitly.
+      if (p.endsWith(".goal-loop-manifest.json")) {
+        return '{"package":"goal-loop","version":"0.2.0"}';
+      }
+      if (p.endsWith("state.py")) {
+        return 'CONTRACT_SCHEMA = "goal-loop/contract@2"\nLEDGER_SCHEMA = "goal-loop/ledger@2"\n';
+      }
+      return '{"version":"1.0.0"}';
+    },
   };
 }
 

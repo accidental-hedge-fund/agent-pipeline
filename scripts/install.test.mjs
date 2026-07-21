@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process";
 import {
   MANAGED_MARKER,
   DEPS,
+  checkLoopCoherence,
   detectPersonalSkill,
   uniqueBackupPath,
   offerRelocationWith,
@@ -1029,5 +1030,69 @@ test("last30daysPresent: returns null when skill missing from all locations", ()
     delete process.env.CODEX_HOME;
     cleanup(claudeTmp);
     cleanup(codexTmp);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// checkLoopCoherence (#451) — the installer's loop:contract-coherence gate.
+// Uses the real filesystem under CLAUDE_CONFIG_DIR/CODEX_HOME overrides (the
+// same seam as the last30daysPresent tests above) rather than a fake, since
+// checkLoopCoherence itself takes no injectable deps — it calls the same
+// shared check function doctor and pipeline:loop use. Returns { ok, message? }
+// instead of calling process.exit, so the incompatible-pairing path is
+// testable here.
+// ---------------------------------------------------------------------------
+
+function writeGoalLoopSkill(root, { version = "0.2.0", contractSchema = "goal-loop/contract@2", ledgerSchema = "goal-loop/ledger@2" } = {}) {
+  const dir = join(root, "skills", "goal-loop");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, ".goal-loop-manifest.json"), JSON.stringify({ package: "goal-loop", version }));
+  writeFileSync(
+    join(dir, "state.py"),
+    `CONTRACT_SCHEMA = "${contractSchema}"\nLEDGER_SCHEMA = "${ledgerSchema}"\n`,
+  );
+}
+
+test("checkLoopCoherence: goal-loop absent → ok:true (optional, not blocking)", async () => {
+  const claudeTmp = makeTmp();
+  const codexTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  process.env.CODEX_HOME = codexTmp;
+  try {
+    const result = await checkLoopCoherence();
+    assert.equal(result.ok, true);
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CODEX_HOME;
+    cleanup(claudeTmp);
+    cleanup(codexTmp);
+  }
+});
+
+test("checkLoopCoherence: supported goal-loop install → ok:true", async () => {
+  const claudeTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  writeGoalLoopSkill(claudeTmp);
+  try {
+    const result = await checkLoopCoherence();
+    assert.equal(result.ok, true);
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(claudeTmp);
+  }
+});
+
+test("checkLoopCoherence: unsupported contract schema → ok:false naming both sides", async () => {
+  const claudeTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  writeGoalLoopSkill(claudeTmp, { contractSchema: "goal-loop/contract@1" });
+  try {
+    const result = await checkLoopCoherence();
+    assert.equal(result.ok, false);
+    assert.match(result.message, /goal-loop\/contract@1/);
+    assert.match(result.message, /goal-loop\/contract@2/);
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(claudeTmp);
   }
 });

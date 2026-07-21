@@ -160,6 +160,19 @@ export const OPERATION_SURFACE = [
     cliArgs: "logs $ARGUMENTS",
     fast: true,
   },
+  // loop (#451) is a delegating entry, not a CLI forward: it runs the
+  // deterministic loop preflight (argument normalization, loop:contract-coherence,
+  // native-/goal capability) in the pipeline CLI, then hands off durable
+  // orchestration to the installed goal-loop skill — see
+  // openspec/changes/pipeline-loop-facade/design.md.
+  {
+    name: "loop",
+    desc: "Durable multi-item run — delegates to the installed goal-loop skill",
+    argHint: "[--milestone <name>] [--label <label>] [--range <spec>] [--roadmap-slice <slice>] [<N> ...] [--resume <run-id>] [--audit]",
+    cliArgs: "loop $ARGUMENTS",
+    fast: true,
+    delegating: true,
+  },
 ];
 
 function renderShim(profile) {
@@ -185,6 +198,13 @@ export function renderClaudeCommand(op, skillPath) {
   const specialNote = op.specialCli
     ? "\nNote: pass the issue number as the sole argument. `$1` is expanded to that number by this command."
     : "";
+  const delegatingNote = op.delegating
+    ? "\nThis command only runs the deterministic loop preflight (argument normalization, " +
+      "loop:contract-coherence, native-/goal capability) and prints the compiled selector as JSON. " +
+      "On success, delegate to the installed goal-loop skill's own instructions (its SKILL.md) using that " +
+      "selector — durable run identity, the ledger, locking, and resume all live in goal-loop, not here. " +
+      "On failure, stop and report the printed remediation; do not start any substitute loop."
+    : "";
 
   return [
     "---",
@@ -196,6 +216,7 @@ export function renderClaudeCommand(op, skillPath) {
     "",
     orchNote,
     ...(specialNote ? [specialNote] : []),
+    ...(delegatingNote ? [delegatingNote] : []),
   ].join("\n") + "\n";
 }
 

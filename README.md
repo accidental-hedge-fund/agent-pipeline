@@ -260,6 +260,9 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
 /pipeline:release <version>                   prepare a release PR for the given version
 /pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
+/pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (delegates to goal-loop)
+/pipeline:loop --resume <run-id>              resume an existing durable run by id, on either engine
+/pipeline:loop --audit                        read-only report for the run; no writes
 /pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
 /pipeline improve --top 10 --since 2026-06-01 --json  limit scope + emit JSON array of clusters
@@ -648,6 +651,40 @@ After every run, `queue` writes `.agent-pipeline/runs/batch-<batch_id>/batch-sum
 
 `halt_reason` is `null` when the batch ran to natural completion, `"budget_exhausted"` when the budget gate fired, or `"failure_rate_exceeded"` when the failure-rate gate fired. `excluded_count` is the number of eligible issues that were filtered out (by label/milestone/risk/cap) and not dispatched.
 
+## Durable multi-item runs (`pipeline:loop`)
+
+`pipeline queue` (above) is Pipeline's own bounded, single-session batch mode. For a
+**durable** run that spans sessions or engines — selection, dependency-aware ordering,
+recovery, reconciliation, and resume across many issues — use `/pipeline:loop` (Claude
+Code) or `$pipeline:loop` (Codex) instead. It is a thin facade: it runs a deterministic,
+read-only preflight in the Pipeline CLI, then delegates the actual durable run to the
+separately installed [goal-loop](https://github.com/comamitc/goal-loop) skill. Every
+selected item still executes through the normal Pipeline state machine and evidence
+gates — the facade never sets a stage label itself and never merges.
+
+```
+/pipeline:loop --milestone v2        select every issue in milestone v2
+/pipeline:loop --label backlog       select every issue carrying a label
+/pipeline:loop --range 400-420       select an issue-number range
+/pipeline:loop --roadmap-slice next  select a named roadmap slice
+/pipeline:loop 418 419 420           select an explicit issue list
+/pipeline:loop --resume <run-id>     resume an existing run — on either engine, by run id
+/pipeline:loop --audit               read-only report for a run; performs no write
+```
+
+The preflight order is fixed and every failure path is read-only, so it never leaves a
+lock, ledger write, or GitHub mutation behind: argument normalization, then
+`loop:contract-coherence` (verifies the installed goal-loop's contract/ledger schema
+ids are within Pipeline's supported set — also reported by `pipeline doctor` and
+checked by the installer), then a check that the active engine's built-in autonomous
+`/goal` mode is available. `pipeline:loop` refuses to start rather than falling back to
+a non-durable substitute loop when either check fails. `/goal-loop` and `$goal-loop`
+remain fully functional, undeprecated aliases for the same durable runs.
+
+See `openspec/changes/pipeline-loop-facade/design.md` for the convergence ADR (why a
+facade now, not a merged codebase) and the engine-neutral `pipeline/loop-execution@1`
+contract between the loop orchestrator and per-item Pipeline execution.
+
 ## Onboarding a new repo
 
 Before running the pipeline for the first time on a fresh repo, run `init` to create all pipeline labels and scaffold a starter config in one step:
@@ -939,6 +976,7 @@ The checks (each emits one sentence of remediation text on failure or warning):
 | `package-install` | `node_modules` exists and is not older than `package-lock.json` | the repo root has no `package-lock.json` |
 | `openspec-cli` | the `openspec` CLI is on `PATH` | OpenSpec is not active (`openspec.enabled: off`, or `auto` with no `openspec/` dir) |
 | `eval-command` | the configured eval command's binary resolves on `PATH` | the eval gate is off or has no `command` |
+| `loop:contract-coherence` | an installed [goal-loop](https://github.com/comamitc/goal-loop) skill is discovered whose contract/ledger schema ids are within Pipeline's supported set | — (fails, naming both sides, when goal-loop is absent or its schema ids are outside the supported set — see [`pipeline:loop`](#durable-multi-item-runs-pipelineloop)) |
 
 **Stale-install warning (#385).** `install:version-freshness` compares the installed engine against the latest `accidental-hedge-fund/agent-pipeline` GitHub release tag. A behind install reports `warn` — loud but **non-blocking**: it never fails the preflight, never sets a non-zero exit code, and never aborts a `--doctor` / `doctor.runOnStart` run. The remediation names the [update command](#updating-an-npxclone-install). The check only reports; it never updates anything itself.
 
