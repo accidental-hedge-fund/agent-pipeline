@@ -25,6 +25,7 @@ import {
   boundDesignDecisionRecord,
   challengeKey,
   decodeDesignGateState,
+  DesignRecordLimitsError,
   encodeDesignGateState,
   evaluateDesignGateTrigger,
   isBlockingChallenge,
@@ -62,6 +63,7 @@ import type {
   DesignChallenge,
   DesignChallengeResponse,
   DesignDecisionRecord,
+  DesignDecisionRecordBounding,
   DesignGateRound,
   DesignGateState,
   Harness,
@@ -328,7 +330,14 @@ export async function advanceDesignGate(
       return blockAndReturn(`could not obtain a valid decision record after one bounded re-ask: ${parsed.errors.join("; ")}`);
     }
     const redacted = redactDesignDecisionRecord(parsed.record);
-    const { record: bounded, bounding } = boundDesignDecisionRecord(redacted, cfg.design_gate.limits);
+    let bounded: DesignDecisionRecord;
+    let bounding: DesignDecisionRecordBounding;
+    try {
+      ({ record: bounded, bounding } = boundDesignDecisionRecord(redacted, cfg.design_gate.limits));
+    } catch (err) {
+      if (err instanceof DesignRecordLimitsError) return blockAndReturn(err.message);
+      throw err;
+    }
     state.decisionRecordVersions.push(bounded);
     state.bounding = bounding;
     await postCommentFn(cfg, issueNumber, buildDesignGateComment(state, "Decision record recorded.")).catch(() => {});
@@ -382,7 +391,7 @@ export async function advanceDesignGate(
 
   async function getResponse(
     blocking: (DesignChallenge & { challengeKey: string; blocking: boolean })[],
-  ): Promise<DesignChallengeResponse[]> {
+  ): Promise<{ responses: DesignChallengeResponse[] } | { blocked: string }> {
     const prompt = buildDesignResponsePrompt({
       body: issue.body,
       decisionRecordJson: decisionRecordJson(state),
@@ -392,15 +401,22 @@ export async function advanceDesignGate(
       timeoutSec: cfg.fix_timeout,
       model: cfg.models.fix,
     });
-    if (isHarnessUnavailable(result)) return [];
+    if (isHarnessUnavailable(result)) return { responses: [] };
     const payload = parseDesignResponses(result.stdout);
     if (payload.revisedRecord) {
       const redacted = redactDesignDecisionRecord(payload.revisedRecord);
-      const { record: bounded, bounding } = boundDesignDecisionRecord(redacted, cfg.design_gate.limits);
+      let bounded: DesignDecisionRecord;
+      let bounding: DesignDecisionRecordBounding;
+      try {
+        ({ record: bounded, bounding } = boundDesignDecisionRecord(redacted, cfg.design_gate.limits));
+      } catch (err) {
+        if (err instanceof DesignRecordLimitsError) return { blocked: err.message };
+        throw err;
+      }
       state.decisionRecordVersions.push(bounded);
       state.bounding = bounding;
     }
-    return payload.responses;
+    return { responses: payload.responses };
   }
 
   // Step 2: bounded interrogation/response loop.
@@ -424,7 +440,9 @@ export async function advanceDesignGate(
     }
 
     if (current.responses.length === 0) {
-      current.responses = await getResponse(blocking);
+      const responseResult = await getResponse(blocking);
+      if ("blocked" in responseResult) return blockAndReturn(responseResult.blocked);
+      current.responses = responseResult.responses;
       await postCommentFn(cfg, issueNumber, buildDesignGateComment(state, `Round ${current.round} response recorded.`)).catch(() => {});
     }
 

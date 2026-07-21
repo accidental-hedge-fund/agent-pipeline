@@ -272,10 +272,50 @@ export function parseDesignDecisionRecord(output: string): { record: DesignDecis
   return { record: null, errors: lastErrors };
 }
 
+/** Thrown when `design_gate.limits.max_artifact_bytes` is too small to encode
+ *  even a single minimally-shrunk decision, so the ceiling cannot be honored
+ *  without silently dropping the last decision (never allowed). */
+export class DesignRecordLimitsError extends Error {}
+
+/** Truncate `s` to at most `maxLen` bytes-of-intent (chars), reserving room
+ *  for `TRUNCATION_MARKER` *within* that budget so the returned string never
+ *  exceeds `maxLen` chars once the marker is appended. */
+function truncateWithMarker(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  const budget = Math.max(0, maxLen - TRUNCATION_MARKER.length);
+  return s.slice(0, budget) + TRUNCATION_MARKER;
+}
+
+function byteSize(record: DesignDecisionRecord): number {
+  return Buffer.byteLength(JSON.stringify(record), "utf8");
+}
+
+/** Re-clip every free-text field and cap every array field's length on a
+ *  decision, using the given per-field char cap and per-array entry cap.
+ *  Used for the deterministic artifact-byte-ceiling shrink pass below. */
+function reclipDecision(d: DesignDecision, fieldCap: number, arrayCap: number): DesignDecision {
+  const clip = (s: string) => truncateWithMarker(s, fieldCap);
+  return {
+    id: d.id,
+    title: clip(d.title),
+    surface: clip(d.surface),
+    alternatives: d.alternatives
+      .slice(0, Math.max(1, arrayCap))
+      .map((a) => ({ option: clip(a.option), rejected_because: clip(a.rejected_because) })),
+    assumptions: d.assumptions.slice(0, Math.max(1, arrayCap)).map(clip),
+    invariants: d.invariants.slice(0, Math.max(1, arrayCap)).map(clip),
+    evidence: d.evidence.slice(0, Math.max(1, arrayCap)).map(clip),
+    generalization_boundary: clip(d.generalization_boundary),
+    uncertainty: clip(d.uncertainty),
+  };
+}
+
 /** Apply `design_gate.limits` bounding to a VALID decision record: cap the
  *  decision count, truncate over-long free-text fields with an explicit
- *  marker, then cap the total serialized size. Truncation is always
- *  recorded — never silent. */
+ *  marker, then deterministically shrink until the serialized artifact never
+ *  exceeds `max_artifact_bytes`. Truncation is always recorded — never
+ *  silent. Throws `DesignRecordLimitsError` if `max_artifact_bytes` is too
+ *  small to encode even one minimally-shrunk decision. */
 export function boundDesignDecisionRecord(
   record: DesignDecisionRecord,
   limits: PipelineConfig["design_gate"]["limits"],
@@ -284,7 +324,7 @@ export function boundDesignDecisionRecord(
   const truncateField = (s: string): string => {
     if (s.length <= limits.max_field_chars) return s;
     fieldsTruncated++;
-    return s.slice(0, limits.max_field_chars) + TRUNCATION_MARKER;
+    return truncateWithMarker(s, limits.max_field_chars);
   };
   const decisionsDropped = Math.max(0, record.decisions.length - limits.max_decisions);
   const kept = record.decisions.slice(0, limits.max_decisions);
@@ -306,29 +346,34 @@ export function boundDesignDecisionRecord(
 
   let bounded: DesignDecisionRecord = { schema_version: record.schema_version, decisions: boundedDecisions };
   let artifactBytesTruncated = false;
-  let serialized = JSON.stringify(bounded);
-  while (Buffer.byteLength(serialized, "utf8") > limits.max_artifact_bytes && bounded.decisions.length > 1) {
+
+  // Cheapest reduction first: drop whole trailing decisions while more than
+  // one remains.
+  while (byteSize(bounded) > limits.max_artifact_bytes && bounded.decisions.length > 1) {
     artifactBytesTruncated = true;
     bounded = { ...bounded, decisions: bounded.decisions.slice(0, -1) };
-    serialized = JSON.stringify(bounded);
   }
-  if (Buffer.byteLength(serialized, "utf8") > limits.max_artifact_bytes && bounded.decisions.length === 1) {
-    // Single oversized decision left: truncate its largest field further rather
-    // than drop the last decision entirely (never fewer than the validated minimum of 1).
+
+  // Still over budget with the last decision(s) remaining: cap every array
+  // field to a single entry, then geometrically shrink every free-text field
+  // budget until the ceiling is met or the minimum encodable size is reached.
+  if (byteSize(bounded) > limits.max_artifact_bytes) {
     artifactBytesTruncated = true;
-    const only = bounded.decisions[0];
-    const shrink = (s: string): string => (s.length > 200 ? s.slice(0, 200) + TRUNCATION_MARKER : s);
-    bounded = {
-      ...bounded,
-      decisions: [
-        {
-          ...only,
-          uncertainty: shrink(only.uncertainty),
-          generalization_boundary: shrink(only.generalization_boundary),
-          evidence: only.evidence.map(shrink),
-        },
-      ],
-    };
+    bounded = { ...bounded, decisions: bounded.decisions.map((d) => reclipDecision(d, limits.max_field_chars, 1)) };
+
+    const minFieldCap = TRUNCATION_MARKER.length;
+    let fieldCap = limits.max_field_chars;
+    while (byteSize(bounded) > limits.max_artifact_bytes && fieldCap > minFieldCap) {
+      fieldCap = Math.max(minFieldCap, Math.floor(fieldCap / 2));
+      bounded = { ...bounded, decisions: bounded.decisions.map((d) => reclipDecision(d, fieldCap, 1)) };
+    }
+
+    if (byteSize(bounded) > limits.max_artifact_bytes) {
+      throw new DesignRecordLimitsError(
+        `design_gate.limits.max_artifact_bytes (${limits.max_artifact_bytes}) is too small to encode ` +
+          `a minimally valid decision record (minimum achievable size is ${byteSize(bounded)} bytes)`,
+      );
+    }
   }
 
   return {

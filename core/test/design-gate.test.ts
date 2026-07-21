@@ -10,6 +10,7 @@ import {
   challengeKey,
   decodeDesignGateState,
   DESIGN_DECISION_RECORD_SCHEMA_VERSION,
+  DesignRecordLimitsError,
   encodeDesignGateState,
   evaluateDesignGateTrigger,
   isBlockingChallenge,
@@ -216,8 +217,50 @@ test("boundDesignDecisionRecord: artifact byte ceiling honored", () => {
     max_field_chars: 4000,
     max_artifact_bytes: 500,
   });
-  assert.ok(Buffer.byteLength(JSON.stringify(bounded), "utf8") <= 500 || bounded.decisions.length === 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded), "utf8") <= 500);
   assert.equal(bounding.artifactBytesTruncated, true);
+});
+
+test("boundDesignDecisionRecord: byte ceiling honored even with large alternatives/assumptions on a single decision", () => {
+  const record = validRecord();
+  record.decisions[0].alternatives = Array.from({ length: 20 }, (_, i) => ({
+    option: `option ${i} `.repeat(50),
+    rejected_because: `rejected because ${i} `.repeat(50),
+  }));
+  record.decisions[0].assumptions = Array.from({ length: 20 }, (_, i) => `assumption ${i} `.repeat(50));
+  record.decisions[0].invariants = Array.from({ length: 20 }, (_, i) => `invariant ${i} `.repeat(50));
+  const { record: bounded, bounding } = boundDesignDecisionRecord(record, {
+    max_decisions: 8,
+    max_field_chars: 4000,
+    max_artifact_bytes: 500,
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded), "utf8") <= 500);
+  assert.equal(bounding.artifactBytesTruncated, true);
+});
+
+test("boundDesignDecisionRecord: truncated field never exceeds max_field_chars including the marker", () => {
+  const record = validRecord();
+  record.decisions[0].uncertainty = "x".repeat(100);
+  const { record: bounded } = boundDesignDecisionRecord(record, {
+    max_decisions: 8,
+    max_field_chars: 20,
+    max_artifact_bytes: 1_000_000,
+  });
+  assert.ok(bounded.decisions[0].uncertainty.length <= 20);
+  assert.ok(bounded.decisions[0].uncertainty.endsWith("…[truncated]"));
+});
+
+test("boundDesignDecisionRecord: throws when max_artifact_bytes is too small to encode a minimal record", () => {
+  const record = validRecord();
+  assert.throws(
+    () =>
+      boundDesignDecisionRecord(record, {
+        max_decisions: 8,
+        max_field_chars: 4000,
+        max_artifact_bytes: 10,
+      }),
+    DesignRecordLimitsError,
+  );
 });
 
 // ---------------------------------------------------------------------------

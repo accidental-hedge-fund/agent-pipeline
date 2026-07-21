@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   bundlePath,
+  collectDesignChallengeSummary,
   createBundle,
   finalizeBundle,
   formatEvidenceCommentBody,
@@ -24,7 +25,7 @@ import {
   recordStage,
   type BundleDeps,
 } from "../scripts/evidence-bundle.ts";
-import { EVIDENCE_SCHEMA_VERSION, type CommandRecord, type EvidenceBundle } from "../scripts/types.ts";
+import { EVIDENCE_SCHEMA_VERSION, type CommandRecord, type DesignGateState, type EvidenceBundle } from "../scripts/types.ts";
 import { redactSecrets, sanitize } from "../scripts/artifact-sanitize.ts";
 import { buildStageAccountingRecord } from "../scripts/accounting.ts";
 
@@ -463,6 +464,177 @@ test("formatSummary: partial run (no finalState) is labeled as such", () => {
     notifiedAt: null,
   };
   assert.match(formatSummary(partial), /partial run/i);
+});
+
+// ---------------------------------------------------------------------------
+// formatSummary: design-interrogation section (#436 review 1 finding 2)
+// ---------------------------------------------------------------------------
+
+function baseBundle(designInterrogation?: DesignGateState): EvidenceBundle {
+  return {
+    schema_version: 1,
+    schemaVersion: 1,
+    runId: "r",
+    issue: ISSUE,
+    pr: null,
+    branch: null,
+    harnesses: [],
+    stages: [],
+    reviews: [],
+    overrides: [],
+    recoveries: [],
+    finalState: null,
+    finalizedAt: null,
+    notifiedAt: null,
+    designInterrogation,
+  };
+}
+
+test("formatSummary: fired gate renders challenge counts, per-challenge disposition, and same-harness fallback", () => {
+  const state: DesignGateState = {
+    schema_version: 1,
+    trigger: { triggered: true, matched: [{ trigger: "storage", evidence: "src/db.ts" }], reason: "" },
+    reviewerIdentity: { harness: "claude", independence: "same-harness-fallback" },
+    decisionRecordVersions: [],
+    bounding: null,
+    rounds: [
+      {
+        round: 1,
+        reviewerRaw: null,
+        challenges: [
+          {
+            decision_id: "d1",
+            title: "Sharding key stability",
+            severity: "high",
+            confidence: 0.9,
+            falsifier: "x",
+            evidence_request: "y",
+            required_action: "defend",
+            challengeKey: "abc12345",
+            blocking: true,
+          },
+          {
+            decision_id: "d1",
+            title: "Low-risk naming nit",
+            severity: "low",
+            confidence: 0.9,
+            falsifier: "x",
+            evidence_request: "y",
+            required_action: "accept-uncertainty",
+            challengeKey: "def67890",
+            blocking: false,
+          },
+        ],
+        responses: [
+          { challengeKey: "abc12345", disposition: "defended", evidence: "src/db.ts:12 shows the invariant holds" },
+        ],
+      },
+    ],
+    outcome: "advanced",
+  };
+
+  const out = formatSummary(baseBundle(state));
+  assert.match(out, /Design interrogation/);
+  assert.match(out, /storage/);
+  assert.match(out, /same-harness/i);
+  assert.match(out, /1 blocking, 1 advisory/);
+  assert.match(out, /abc12345.*defended/);
+  assert.match(out, /def67890.*advisory/);
+});
+
+test("formatSummary: accepted uncertainty is rendered explicitly", () => {
+  const state: DesignGateState = {
+    schema_version: 1,
+    trigger: { triggered: true, matched: [{ trigger: "auth", evidence: "src/auth.ts" }], reason: "" },
+    reviewerIdentity: { harness: "codex", independence: "independent" },
+    decisionRecordVersions: [],
+    bounding: null,
+    rounds: [
+      {
+        round: 1,
+        reviewerRaw: null,
+        challenges: [
+          {
+            decision_id: "d1",
+            title: "Multi-tenant isolation boundary",
+            severity: "high",
+            confidence: 0.8,
+            falsifier: "x",
+            evidence_request: "y",
+            required_action: "accept-uncertainty",
+            challengeKey: "unc00001",
+            blocking: true,
+          },
+        ],
+        responses: [
+          {
+            challengeKey: "unc00001",
+            disposition: "uncertainty-accepted",
+            evidence: "would be falsified by a multi-tenant deployment",
+          },
+        ],
+      },
+    ],
+    outcome: "advanced",
+  };
+
+  const out = formatSummary(baseBundle(state));
+  assert.match(out, /accepted uncertainty/i);
+  assert.match(out, /would be falsified by a multi-tenant deployment/);
+});
+
+test("formatSummary: untriggered gate renders the one-line reason", () => {
+  const state: DesignGateState = {
+    schema_version: 1,
+    trigger: { triggered: false, matched: [], reason: "no-trigger-matched" },
+    reviewerIdentity: null,
+    decisionRecordVersions: [],
+    bounding: null,
+    rounds: [],
+    outcome: null,
+  };
+  const out = formatSummary(baseBundle(state));
+  assert.match(out, /not triggered \(no-trigger-matched\)/);
+});
+
+test("collectDesignChallengeSummary: later round's response wins over an earlier one for the same key", () => {
+  const state: DesignGateState = {
+    schema_version: 1,
+    trigger: { triggered: true, matched: [], reason: "" },
+    reviewerIdentity: null,
+    decisionRecordVersions: [],
+    bounding: null,
+    rounds: [
+      {
+        round: 1,
+        reviewerRaw: null,
+        challenges: [
+          {
+            decision_id: "d1",
+            title: "t",
+            severity: "high",
+            confidence: 0.9,
+            falsifier: "x",
+            evidence_request: "y",
+            required_action: "revise",
+            challengeKey: "key00001",
+            blocking: true,
+          },
+        ],
+        responses: [],
+      },
+      {
+        round: 2,
+        reviewerRaw: null,
+        challenges: [],
+        responses: [{ challengeKey: "key00001", disposition: "revised", evidence: "record updated" }],
+      },
+    ],
+    outcome: "advanced",
+  };
+  const summary = collectDesignChallengeSummary(state);
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0].disposition, "revised");
 });
 
 // ---------------------------------------------------------------------------
