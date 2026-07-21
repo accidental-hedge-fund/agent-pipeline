@@ -165,6 +165,13 @@ export interface HarnessResult {
   // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
   // Distinct from spawn_error: the process itself started successfully.
   capture_error?: boolean;
+  // True when the stdin-channel prompt write itself failed (e.g. EPIPE) before
+  // the child could be confirmed to have received it in full (#492 review 2,
+  // key 4b773135). A stdin write failure invalidates the invocation outright —
+  // the child's own exit code cannot be trusted as evidence the full prompt
+  // was read — so this always accompanies spawn_error: true, which the #39
+  // self-review fallback already checks for.
+  stdin_error?: boolean;
   // External stage executor evidence (#314). Populated only when the result
   // came from `executors.ts`'s dispatch path (a `stage_executors:` assignment),
   // never for the local claude/codex/custom-reviewer-CLI branches above. Read by
@@ -634,13 +641,29 @@ export async function runCapped(
       }
     };
 
-    // A stdin write/EPIPE failure (#492) is a diagnostic, like a forward-stream
-    // failure — never let it masquerade as a gate/verdict outcome; the command's
-    // own exit code (or lack of one) still drives the result.
+    // A stdin write/EPIPE failure (#492 review 2, key 4b773135) means the CLI
+    // may have closed stdin before consuming the full prompt — the child could
+    // still exit 0 and emit output that parses as a valid verdict despite never
+    // seeing the whole prompt. That invalidates the outcome outright, so unlike
+    // a forward-stream failure (diagnostic only) a stdin failure forces the
+    // result to fail. `stdinSettled` gates the close-driven settle() below so
+    // it never resolves before the stdin write's own error/finish outcome is
+    // known — otherwise a close that fires first would race the async EPIPE.
     let stdinNote = "";
+    let stdinFailed = false;
+    let stdinSettled = opts.stdinPayload === undefined;
+    let onStdinSettled: (() => void) | null = null;
     const onStdinError = (err: Error) => {
-      if (stdinNote) return;
-      stdinNote = `[harness ${label}] stdin write error (diagnostic; command outcome unaffected): ${err.message}`;
+      if (stdinFailed) return;
+      stdinFailed = true;
+      stdinSettled = true;
+      stdinNote = `[harness ${label}] stdin write error: ${err.message}`;
+      onStdinSettled?.();
+    };
+    const onStdinFinish = () => {
+      if (stdinSettled) return;
+      stdinSettled = true;
+      onStdinSettled?.();
     };
 
     const settle = (result: HarnessResult) => {
@@ -654,6 +677,9 @@ export async function runCapped(
         fwd.stdout.off("error", onForwardError);
         fwd.stderr.off("error", onForwardError);
       }
+      if (stdinFailed) {
+        result = { ...result, success: false, spawn_error: true, stdin_error: true };
+      }
       const notes = [forwardNote, stdinNote].filter(Boolean).join("\n");
       if (notes) {
         result = {
@@ -662,6 +688,18 @@ export async function runCapped(
         };
       }
       resolvePromise(result);
+    };
+
+    // The 'close' handler (below) defers to this once the stdin write's own
+    // outcome is known, so a stdin failure can never be masked by a 'close'
+    // that races ahead of the async EPIPE with an exit-0/valid-output result.
+    let pendingCloseResult: HarnessResult | null = null;
+    onStdinSettled = () => {
+      if (pendingCloseResult) {
+        const result = pendingCloseResult;
+        pendingCloseResult = null;
+        settle(result);
+      }
     };
 
     const killGroup = (signal: NodeJS.Signals) => {
@@ -786,6 +824,7 @@ export async function runCapped(
     // readers are attached, so nothing can be missed before the write.
     if (opts.stdinPayload !== undefined && child.stdin) {
       child.stdin.on("error", onStdinError);
+      child.stdin.on("finish", onStdinFinish);
       child.stdin.end(opts.stdinPayload, "utf8");
     }
 
@@ -832,14 +871,19 @@ export async function runCapped(
       if (timedOut) return;
       clearTimeout(timer);
       const duration = (Date.now() - start) / 1000;
-      settle({
+      const result: HarnessResult = {
         success: code === 0,
         stdout: stdoutBuf,
         stderr: stderrBuf,
         exit_code: code ?? -1,
         duration,
         timed_out: false,
-      });
+      };
+      if (!stdinSettled) {
+        pendingCloseResult = result;
+        return;
+      }
+      settle(result);
     });
   });
 }

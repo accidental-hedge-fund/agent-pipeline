@@ -729,6 +729,43 @@ test("runCapped: with a stdinPayload, stdio[0] becomes 'pipe' and the payload is
   assert.equal(result.stdout, "hello from stdin");
 });
 
+test("runCapped: a stdin write failure forces the result to fail even when the child races ahead with a valid-looking exit-0 (#492 review 2, key 4b773135)", async () => {
+  const fakeStdin = Object.assign(new EventEmitter(), {
+    end: function end() {
+      // Simulate an async EPIPE arriving after end() is called — racing
+      // behind the child's own close event, which is queued first below.
+      setImmediate(() => fakeStdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+    },
+  });
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    stdin: fakeStdin,
+    pid: 123460,
+    kill: () => true,
+  });
+  const spawnFn = ((_cmd: string, _args: string[], _options: unknown) => {
+    // Queued before the stdin write block runs, so this 'close' (with output
+    // that parses as an approval and exit code 0) fires before the async
+    // EPIPE above is known — the exact race the finding describes.
+    setImmediate(() => {
+      fakeChild.stdout.emit("data", Buffer.from('{"verdict":"approve"}'));
+      fakeChild.emit("close", 0);
+    });
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", {
+    spawnFn,
+    stdinPayload: "prompt too big to fit in argv",
+  });
+
+  assert.equal(result.success, false, "a failed stdin write must invalidate an otherwise exit-0 result");
+  assert.equal(result.spawn_error, true, "must be flagged so the #39 self-review fallback triggers");
+  assert.equal(result.stdin_error, true);
+  assert.match(result.stdout, /"verdict":"approve"/, "captured output is preserved for diagnostics");
+});
+
 test("invoke(): the grok adapter materializes the prompt file, references it via --prompt-file, and removes exactly that file afterward (#492)", async () => {
   const cli = makeScript("grok", `cat "$2"`); // --prompt-file <path> is argv[0]/argv[1]
   const oldPath = process.env.PATH;
