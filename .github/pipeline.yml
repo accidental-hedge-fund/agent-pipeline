@@ -23,7 +23,7 @@ ci_no_run_grace_s: 60 # seconds to wait before checking for zero check-runs when
 models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts "auto" (#366).
   planning: opus # implementer harness
   implementing: sonnet # implementer harness
-  review: sonnet # reviewer harness
+  review: auto # reviewer harness
   fix: sonnet # implementer harness
 #   intake: sonnet # intake spec-generation — always the claude harness (never inert)
 #   sweep: sonnet # sweep spec-generation — always the claude harness (never inert)
