@@ -23,3 +23,7 @@ node_modules/
 # Per-issue evidence history (issue-<N>.jsonl) written by the engine; local-only,
 # never committed.
 .agent-pipeline/history/
+
+# Stage-eval-runner experiment output (manifest/plan/runs/failures); local-only,
+# never committed.
+.agent-pipeline/evals/

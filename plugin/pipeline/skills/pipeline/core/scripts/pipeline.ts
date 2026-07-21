@@ -220,6 +220,8 @@ export interface CliOpts {
   by?: string[];
   /** scoreboard: write a self-contained offline HTML export of the report to this path (#427). */
   html?: string;
+  /** evals: directory of fixture JSON files (default: core/evals/fixtures). */
+  fixtures?: string;
   /** improve: emit top-N clusters in the report (default 5). */
   top?: number;
   /** improve: only report clusters with at least this many occurrences (default 3). */
@@ -261,7 +263,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -312,6 +314,7 @@ export function buildCmd(): Command {
     .option("--bucket <unit>", "scoreboard: add a chronological day|week time-series alongside the full-window summary")
     .option("--by <dimension>", "scoreboard: group metrics by harness|model|effort|executor; repeatable (to detect a duplicate flag)", collectRepeatable, [])
     .option("--html <path>", "scoreboard: write a self-contained offline HTML export of the report to this path")
+    .option("--fixtures <dir>", "evals: directory of fixture JSON files (default: core/evals/fixtures)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -862,6 +865,45 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline evals plan|run <manifest>` — experiment harness dispatch (#432).
+  // Never resolves gh auth and mutatesGitHub is false in the registry: evaluation
+  // mode performs no production GitHub writes by construction (evals/gh-eval-surface.ts).
+  if (numArg === "evals") {
+    const evalsSub = cmd.args[1];
+    const manifestArg = cmd.args[2];
+    if (evalsSub !== "plan" && evalsSub !== "run") {
+      console.error('pipeline evals: expected a subcommand — "plan" or "run".\n  Usage: pipeline evals <plan|run> <manifest.json>');
+      process.exit(2);
+    }
+    if (!manifestArg) {
+      console.error(`pipeline evals ${evalsSub}: a manifest path argument is required.\n  Usage: pipeline evals ${evalsSub} <manifest.json>`);
+      process.exit(2);
+    }
+    let evalsCfg: import("./types.ts").PipelineConfig;
+    try {
+      evalsCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline evals: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const manifestPath = path.resolve(evalsCfg.repo_dir, manifestArg);
+    const fixturesDir = path.resolve(evalsCfg.repo_dir, opts.fixtures ?? "core/evals/fixtures");
+    const { planExperiment, runExperiment } = await import("./evals/run.ts");
+    try {
+      if (evalsSub === "plan") {
+        const { manifest, plan } = await planExperiment(evalsCfg, manifestPath, fixturesDir);
+        console.log(`pipeline evals plan: ${plan.cells.length} cell(s) for experiment "${manifest.experiment_id}"`);
+      } else {
+        const { manifest, executed } = await runExperiment(evalsCfg, manifestPath, fixturesDir);
+        console.log(`pipeline evals run: executed ${executed.length} cell(s) for experiment "${manifest.experiment_id}"`);
+      }
+    } catch (err) {
+      console.error(`pipeline evals ${evalsSub}: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early queue dispatch — batch factory operation mode (#305). No issue number;
   // derives repo/config from local git state. Runs pipeline for a set of eligible
   // issues within explicit budget, concurrency, and failure-rate limits.
@@ -1083,7 +1125,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill",
+      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
     ];
     if (!recognized.includes(numArg)) {
       console.error(

@@ -1,0 +1,16 @@
+{
+  "fixture_id": "implementing-scoreboard-filter",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Add a `--since <date>` filter to `pipeline scoreboard` that excludes runs before the given date.",
+  "stage_entry_artifacts": {
+    "implementing": {
+      "plan": "1. Add a `since` option to the scoreboard CLI flags.\n2. Filter the loaded run records by `run.started_at >= since` before aggregation.\n3. Add a unit test covering the boundary date."
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "grader_refs": [],
+  "category": "cli-feature",
+  "risk": "low",
+  "provenance": "synthetic"
+}

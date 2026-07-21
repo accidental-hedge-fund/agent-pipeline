@@ -82,6 +82,8 @@ $pipeline scoreboard                     print read-only factory throughput/cost
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
 $pipeline scoreboard --by <dimension>    group scoreboard metrics by harness|model|effort|executor (exactly one; missing/absent identities report as `unknown`, dimensions that can't apply — e.g. executor on a local-harness stage — report as `not applicable`)
 $pipeline scoreboard --html <path>       write a self-contained, offline HTML export of the report to <path> (local/archival only; makes no network requests, composes with the other scoreboard flags)
+$pipeline evals plan experiment.json     expand + persist an experiment's run plan; invokes no harness, creates no worktree
+$pipeline evals run experiment.json      execute an experiment's cells (resumable); never writes to production GitHub
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -112,7 +114,7 @@ pipeline labels via `ensurePipelineLabels`, scaffolds a commented
 notice, if the file already exists), and ensures a sentinel-delimited
 engine-managed block in `.gitignore` covering every local-only artifact
 directory the engine writes — `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
-and `.agent-pipeline/history/`. The `.gitignore` step creates the file if absent,
+`.agent-pipeline/history/`, and `.agent-pipeline/evals/`. The `.gitignore` step creates the file if absent,
 appends the block if missing (preserving every pre-existing byte), or refreshes
 only the block's contents when it is present and stale. It is idempotent and
 additive — a normal `$pipeline N` run still self-creates any missing labels, so
@@ -145,6 +147,46 @@ with `doctor.runOnStart: true` or `--doctor`: a failing check aborts **before
 planning**, so no tokens are spent, while a warning prints but does not abort.
 `--fail-fast` (or `doctor.failFast: true`) stops at the first failure. The
 latest result is stored under `/tmp` and surfaced by `--status`.
+
+`evals` is a manifest-driven **experiment runner**, not a gate: it replays
+identical frozen fixtures through a matrix of harness/provider/model/effort
+treatments so an observed difference is attributable to the treatment, not to
+a changed issue, base commit, prompt version, or repository state. It is
+unrelated to the `eval-gate` stage (a pass/fail check on a real PR) — `evals`
+never touches `stages/eval.ts` and never participates in the label-driven
+state machine.
+
+An **experiment manifest** (JSON) declares `schema_version`, `experiment_id`,
+`fixture_ids`, `mode` (one of `planning`, `plan-review`, `implementing`,
+`review`, `fix`, `shipcheck`, or `end-to-end`), `treatments` (`harness` /
+`provider` / `model` / `effort` axes, each a string array), `replicates`,
+`seed`, `concurrency`, `timeout` (seconds, per cell), and `output_dir`
+(default `.agent-pipeline/evals`). A **fixture** (JSON, one per frozen task)
+declares `fixture_id`, `schema_version`, a full 40-char `base_commit`,
+`task_input`, `stage_entry_artifacts` (frozen inputs keyed by the stages it
+supports entering directly — see `core/evals/fixtures/` for one example per
+stage), `public_checks`, `grader_refs`, `category`, `risk`, and `provenance`
+(`synthetic` or `harvested`).
+
+`evals plan <manifest>` expands the Cartesian fixture × treatment × replicate
+matrix deterministically and writes `plan.json` **before** touching a harness
+or creating a worktree — the same manifest and seed always produce the same
+plan. `evals run <manifest>` additionally executes every cell that has no
+completed record yet, in seed-derived order interleaved across harnesses,
+each in a **fresh worktree checked out at the fixture's `base_commit`**
+(never the current branch head) — no two cells, including replicates, share a
+worktree, branch, or session. **Evaluation mode performs zero production
+GitHub writes**: no label, comment, PR, or push — the gh surface used in this
+mode refuses every mutating call. Interrupting and re-running `evals run`
+never re-executes a completed cell or rewrites an existing
+`runs.jsonl`/`failures.jsonl` line.
+
+Results land under `<output_dir>/<experiment-id>/`: `manifest.json`,
+`plan.json`, `runs.jsonl` (append-only, `completed` cells only), and
+`failures.jsonl` (append-only, `infra_error` / `auth_error` / `timeout`
+cells). Every record carries `experiment_id`, `fixture_id`, `treatment_id`,
+`replicate`, `prompt_hash`, `config_hash`, and `base_sha` so a cell can be
+joined to ordinary run evidence.
 
 ## Setup (zero install after first run)
 

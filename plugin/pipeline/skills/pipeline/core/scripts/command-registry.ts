@@ -270,6 +270,18 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // evals never touches GitHub (mutatesGitHub: false is the property the
+  // no-production-writes guarantee is documented by) and never needs gh auth —
+  // it replays frozen fixtures offline. `pipeline evals plan|run <manifest>`.
+  evals: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "fixtures"]),
+    needsConfig: true,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
   // papercut is agent-facing, not human-facing (#419): registered and directly
   // invocable by name, but hidden from `--help` and the generated host
   // pipeline:<command> surface — see dispatch in pipeline.ts and the exclusion

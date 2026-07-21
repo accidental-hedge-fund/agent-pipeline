@@ -1,0 +1,16 @@
+{
+  "fixture_id": "review-null-check-diff",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Review this diff for correctness before it merges.",
+  "stage_entry_artifacts": {
+    "review": {
+      "diff": "diff --git a/core/scripts/gh.ts b/core/scripts/gh.ts\n@@ -700,6 +700,7 @@ export async function createIssue(\n-  return Number(result.number);\n+  return Number(result.number ?? -1);\n"
+    }
+  },
+  "public_checks": [],
+  "grader_refs": [],
+  "category": "review-defect-detection",
+  "risk": "medium",
+  "provenance": "synthetic"
+}

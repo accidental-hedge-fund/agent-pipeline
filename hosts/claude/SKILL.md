@@ -90,6 +90,9 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline config repo-map <add|remove|list>  add/remove/list repo_map entries in .github/pipeline.yml
 /pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output
 /pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
+/pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
+/pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
+/pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -120,7 +123,7 @@ pipeline labels via `ensurePipelineLabels`, scaffolds a commented
 notice, if the file already exists), and ensures a sentinel-delimited
 engine-managed block in `.gitignore` covering every local-only artifact
 directory the engine writes — `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
-and `.agent-pipeline/history/`. The `.gitignore` step creates the file if absent,
+`.agent-pipeline/history/`, and `.agent-pipeline/evals/`. The `.gitignore` step creates the file if absent,
 appends the block if missing (preserving every pre-existing byte), or refreshes
 only the block's contents when it is present and stale. It is idempotent and
 additive — a normal `/pipeline N` run still self-creates any missing labels, so
@@ -227,6 +230,57 @@ spec-only PR. Never commits directly to the default branch; never merges.
 The diff is asserted to touch only paths under `openspec/` before the PR is created.
 Re-running after a slice lands is idempotent — applied requirements are recognized
 as already-covered and not duplicated.
+
+`evals` is a manifest-driven **experiment runner**, not a gate: it replays
+identical frozen fixtures through a matrix of harness/provider/model/effort
+treatments so an observed difference is attributable to the treatment, not to
+a changed issue, base commit, prompt version, or repository state. It is
+unrelated to the `eval-gate` stage (a pass/fail check on a real PR) — `evals`
+never touches `stages/eval.ts` and never participates in the label-driven
+state machine:
+
+```bash
+/pipeline evals plan experiment.json      # expand + persist the run plan only
+/pipeline evals run experiment.json       # execute every cell; resumable
+/pipeline evals run experiment.json --fixtures core/evals/fixtures
+```
+
+An **experiment manifest** (JSON) declares `schema_version`, `experiment_id`,
+`fixture_ids`, `mode` (one of `planning`, `plan-review`, `implementing`,
+`review`, `fix`, `shipcheck`, or `end-to-end`), `treatments` (`harness` /
+`provider` / `model` / `effort` axes, each a string array), `replicates`,
+`seed`, `concurrency`, `timeout` (seconds, per cell), and `output_dir`
+(default `.agent-pipeline/evals`). A **fixture** (JSON, one per frozen task)
+declares `fixture_id`, `schema_version`, a full 40-char `base_commit`,
+`task_input`, `stage_entry_artifacts` (frozen inputs keyed by the stages it
+supports entering directly — see `core/evals/fixtures/` for one example per
+stage), `public_checks`, `grader_refs`, `category`, `risk`, and `provenance`
+(`synthetic` or `harvested`).
+
+`plan` expands the Cartesian fixture × treatment × replicate matrix
+deterministically and writes `plan.json` **before** touching a harness or
+creating a worktree — the same manifest and seed always produce the same
+plan. `run` additionally executes every cell that has no completed record
+yet, in seed-derived order interleaved across harnesses, each in a **fresh
+worktree checked out at the fixture's `base_commit`** (never the current
+branch head) — no two cells, including replicates, share a worktree, branch,
+or session. **Evaluation mode performs zero production GitHub writes**: no
+label, comment, PR, or push — the gh surface used in this mode refuses every
+mutating call rather than relying on a scattered `if (!evalMode)` check.
+Interrupting and re-running `evals run` never re-executes a completed cell or
+rewrites an existing `runs.jsonl`/`failures.jsonl` line.
+
+Results land under `<output_dir>/<experiment-id>/`: `manifest.json` (the
+resolved manifest as executed), `plan.json`, `runs.jsonl` (append-only,
+`completed` cells only), and `failures.jsonl` (append-only, `infra_error` /
+`auth_error` / `timeout` cells — infrastructure and auth failures are never
+counted as a treatment outcome). Every record carries `experiment_id`,
+`fixture_id`, `treatment_id`, `replicate`, `prompt_hash`, `config_hash`, and
+`base_sha` so a cell can be joined to ordinary run evidence.
+
+Out of scope for this command: grading/scoring/statistics, installing or
+authenticating provider CLIs, and choosing a production model/effort policy
+from the results — those are separate, tracked work.
 
 ## Setup (zero install after first run)
 

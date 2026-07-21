@@ -753,6 +753,101 @@ export async function removeWorktree(
   await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
 }
 
+export interface CreateWorktreeAtDeps {
+  existsSync?: (p: string) => boolean;
+  mkdirSync?: (p: string, opts: { recursive: boolean }) => void;
+  gitCmd?: (
+    cfg: PipelineConfig,
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; timeoutMs?: number },
+  ) => Promise<{ stdout: string; stderr: string; code: number }>;
+  resolveGitCommonDir?: (repoDir: string) => Promise<string>;
+  acquireMutex?: (path: string) => void;
+  releaseMutex?: (path: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  writeNodeModulesExclude?: (worktreePath: string) => Promise<void>;
+}
+
+/** Create a worktree at an explicit path/branch, checked out at an arbitrary
+ *  base commit rather than at `origin/<base_branch>` HEAD. Used by the eval
+ *  runner (core/scripts/evals/) to isolate one experiment cell per fixture's
+ *  frozen `base_commit`. Deliberately does not carry createWorktree's
+ *  issue-capacity/reclaim logic — eval cells are not tracked per-issue and
+ *  each gets a unique path, so there is nothing to reclaim. */
+export async function createWorktreeAt(
+  cfg: PipelineConfig,
+  opts: { path: string; branch: string; baseCommit: string },
+  deps: CreateWorktreeAtDeps = {},
+): Promise<{ path: string; branch: string }> {
+  const existsFn = deps.existsSync ?? fs.existsSync;
+  const mkdirFn = deps.mkdirSync ?? ((p: string, o: { recursive: boolean }) => { fs.mkdirSync(p, o); });
+  const gitFn = deps.gitCmd ?? git;
+  const resolveGitCommonDirFn = deps.resolveGitCommonDir ?? realResolveGitCommonDir;
+  const acquireMutexFn = deps.acquireMutex ?? ((p: string) => acquireWorktreeMutex(p));
+  const releaseMutexFn = deps.releaseMutex ?? releaseWorktreeMutex;
+  const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const writeNodeModulesExcludeFn = deps.writeNodeModulesExclude ?? realWriteNodeModulesExclude;
+
+  const { path: wtPath, branch, baseCommit } = opts;
+  if (existsFn(wtPath)) {
+    throw new Error(`Eval worktree path already exists: ${wtPath}`);
+  }
+  mkdirFn(path.dirname(wtPath), { recursive: true });
+
+  const commonDir = await resolveGitCommonDirFn(cfg.repo_dir);
+  const mutexPath = worktreeMutexPath(commonDir);
+
+  const MUTEX_POLL_MS = 200;
+  const MUTEX_TIMEOUT_MS = 150_000;
+  let mutexWaited = 0;
+  for (;;) {
+    try {
+      acquireMutexFn(mutexPath);
+      break;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes("Worktree mutex held by process") || mutexWaited >= MUTEX_TIMEOUT_MS) {
+        throw err;
+      }
+      await sleepFn(MUTEX_POLL_MS);
+      mutexWaited += MUTEX_POLL_MS;
+    }
+  }
+
+  try {
+    await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+    const { code, stderr } = await gitFn(
+      cfg,
+      cfg.repo_dir,
+      ["worktree", "add", wtPath, "-b", branch, baseCommit],
+      { ignoreFailure: true },
+    );
+    if (code !== 0) {
+      throw new Error(`git worktree add failed: ${stderr.trim()}`);
+    }
+    await writeNodeModulesExcludeFn(wtPath);
+    return { path: wtPath, branch };
+  } finally {
+    releaseMutexFn(mutexPath);
+  }
+}
+
+/** Remove a worktree created by createWorktreeAt, scoped strictly to the
+ *  given path/branch (never resolved from an issue number). */
+export async function removeWorktreeAt(
+  cfg: PipelineConfig,
+  opts: { path: string; branch: string },
+  deps: { existsSync?: (p: string) => boolean; gitCmd?: typeof git } = {},
+): Promise<void> {
+  const existsFn = deps.existsSync ?? fs.existsSync;
+  const gitFn = deps.gitCmd ?? git;
+  if (existsFn(opts.path)) {
+    await gitFn(cfg, cfg.repo_dir, ["worktree", "remove", opts.path, "--force"], { ignoreFailure: true });
+  }
+  await gitFn(cfg, cfg.repo_dir, ["branch", "-D", opts.branch], { ignoreFailure: true });
+}
+
 // ---------------------------------------------------------------------------
 // Detached HEAD recovery
 // ---------------------------------------------------------------------------

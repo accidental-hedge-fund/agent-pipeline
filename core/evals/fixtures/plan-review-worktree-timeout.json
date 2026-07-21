@@ -1,0 +1,16 @@
+{
+  "fixture_id": "plan-review-worktree-timeout",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Make the worktree-creation mutex wait bounded and configurable instead of a hardcoded 150s timeout.",
+  "stage_entry_artifacts": {
+    "plan-review": {
+      "plan": "1. Add `worktree_mutex_timeout_ms` to PipelineConfig, default 150000.\n2. Read it in createWorktree's mutex wait loop instead of the literal.\n3. Add a unit test asserting the configured value is honored via injected sleep."
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "grader_refs": [],
+  "category": "config-plumbing",
+  "risk": "low",
+  "provenance": "synthetic"
+}
