@@ -1,3 +1,12 @@
+## RENAMED Requirements
+
+- FROM: `### Requirement: A blocking finding on a settled surface SHALL require an explicit prior-round acknowledgment`
+- TO: `### Requirement: A blocking finding that re-raises a settled finding SHALL require an explicit prior-round acknowledgment`
+- FROM: `### Requirement: A demoted reversal SHALL be surfaced in the review comment and as an event`
+- TO: `### Requirement: A demoted reversal SHALL name the settled finding it re-raises in the comment and the event`
+- FROM: `### Requirement: Regression coverage SHALL replay the observed oscillation histories`
+- TO: `### Requirement: Regression coverage SHALL pin both the oscillation histories and the mis-fire history`
+
 ## MODIFIED Requirements
 
 ### Requirement: A blocking finding that re-raises a settled finding SHALL require an explicit prior-round acknowledgment
