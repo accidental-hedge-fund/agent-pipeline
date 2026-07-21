@@ -15,8 +15,85 @@ import {
   sanitizeStageAccountingRecord,
 } from "../scripts/accounting.ts";
 
-test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 3 for #437 (additive — no field removed)", () => {
-  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 3);
+test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 4 for #431 harness-adapter provenance (additive — no field removed)", () => {
+  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 4);
+});
+
+test("buildStageAccountingRecord: harness-adapter provenance fields are carried when present (#431)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 431,
+    stage: "implementing",
+    harness: "grok",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+    adapter: "grok",
+    adapterCliVersion: "0.2.93",
+    providerAuthClass: "oauth:xai",
+    requestedModel: "grok-4",
+    resolvedModel: null,
+    requestedEffort: "high",
+    resolvedEffort: null,
+    nativeFlags: ["-m", "--reasoning-effort"],
+    fallback: null,
+    throttled: null,
+    terminationReason: "success",
+  });
+  assert.equal(record.adapter, "grok");
+  assert.equal(record.adapter_cli_version, "0.2.93");
+  assert.equal(record.provider_auth_class, "oauth:xai");
+  assert.equal(record.requested_model, "grok-4");
+  assert.equal(record.resolved_model, undefined, "unknown resolved_model must be omitted, never fabricated");
+  assert.equal(record.requested_effort, "high");
+  assert.equal(record.resolved_effort, undefined);
+  assert.deepEqual(record.native_flags, ["-m", "--reasoning-effort"]);
+  assert.equal(record.fallback, undefined, "unknown fallback must be omitted, never a fabricated false");
+  assert.equal(record.throttled, undefined);
+  assert.equal(record.termination_reason, "success");
+});
+
+test("buildStageAccountingRecord: a real false/true fallback/throttled value round-trips through sanitize (#431)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 431,
+    stage: "implementing",
+    harness: "claude",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+    fallback: false,
+    throttled: true,
+  });
+  assert.equal(record.fallback, false);
+  assert.equal(record.throttled, true);
+  const roundTripped = sanitizeStageAccountingRecord(record);
+  assert.equal(roundTripped.fallback, false);
+  assert.equal(roundTripped.throttled, true);
+});
+
+test("sanitizeStageAccountingRecord: a record predating adapter provenance fields parses with them absent (#431)", () => {
+  const legacy = sanitizeStageAccountingRecord({
+    schema_version: 3,
+    run_id: "run-1",
+    issue: 437,
+    stage: "planning",
+    harness: "claude",
+    model_slot: null,
+    model: null,
+    started_at: "2026-01-01T00:00:00.000Z",
+    ended_at: "2026-01-01T00:00:01.000Z",
+    duration_ms: 1000,
+    command_count: 1,
+    subprocess_count: 1,
+    outcome: "success",
+    blocker_kind: null,
+    cost_source: "unknown",
+    cost_usd: null,
+  });
+  assert.equal(legacy.adapter, undefined);
+  assert.equal(legacy.fallback, undefined);
+  assert.equal(legacy.throttled, undefined);
 });
 
 test("buildStageAccountingRecord: a resolved effort is carried verbatim (#437)", () => {

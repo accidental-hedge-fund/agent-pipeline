@@ -1033,14 +1033,52 @@ test("parseHarnessTelemetry: non-JSON noise interleaved with envelope lines is s
 test("parseHarnessTelemetry: empty input → null/empty result, never throws", () => {
   assert.doesNotThrow(() => parseHarnessTelemetry("claude", ""));
   const claude = parseHarnessTelemetry("claude", "");
-  assert.deepEqual(claude, { text: null, costUsd: null, usage: null });
+  assert.deepEqual(claude, { text: null, costUsd: null, usage: null, resolvedModel: null, throttled: null });
   const codex = parseHarnessTelemetry("codex", "");
-  assert.deepEqual(codex, { text: null, costUsd: null, usage: null });
+  assert.deepEqual(codex, { text: null, costUsd: null, usage: null, resolvedModel: null, throttled: null });
 });
 
 test("parseHarnessTelemetry: a custom reviewer CLI name always yields the empty result", () => {
   const telemetry = parseHarnessTelemetry("my-custom-reviewer", CLAUDE_TELEMETRY_FIXTURE);
-  assert.deepEqual(telemetry, { text: null, costUsd: null, usage: null });
+  assert.deepEqual(telemetry, { text: null, costUsd: null, usage: null, resolvedModel: null, throttled: null });
+});
+
+// ---------------------------------------------------------------------------
+// #431 review-2 finding 0b0c7e4b — resolvedModel/throttled must be recovered
+// from the CLI's own output, never fabricated from the requested value.
+// ---------------------------------------------------------------------------
+
+test("parseHarnessTelemetry: claude fixture with modelUsage → resolvedModel recovered, throttled false (an 'allowed' rate_limit_event was seen)", () => {
+  const withModelUsage = CLAUDE_TELEMETRY_FIXTURE.replace(
+    `"output_tokens":123}}`,
+    `"output_tokens":123},"modelUsage":{"claude-fable-5":{"inputTokens":10,"outputTokens":123}}}`,
+  );
+  const telemetry = parseHarnessTelemetry("claude", withModelUsage);
+  assert.equal(telemetry.resolvedModel, "claude-fable-5");
+  assert.equal(telemetry.throttled, false);
+});
+
+test("parseHarnessTelemetry: claude fixture with a non-'allowed' rate_limit_event → throttled true", () => {
+  const throttledFixture = CLAUDE_TELEMETRY_FIXTURE.replace(
+    `{"status":"allowed","resetsAt":1784644800}`,
+    `{"status":"rejected","resetsAt":1784644800}`,
+  );
+  const telemetry = parseHarnessTelemetry("claude", throttledFixture);
+  assert.equal(telemetry.throttled, true);
+});
+
+test("parseHarnessTelemetry: claude fixture with no rate_limit_event at all → throttled unknown (null), never a fabricated false", () => {
+  const noRateLimit = CLAUDE_TELEMETRY_FIXTURE.split("\n")
+    .filter((line) => !line.includes("rate_limit_event"))
+    .join("\n");
+  const telemetry = parseHarnessTelemetry("claude", noRateLimit);
+  assert.equal(telemetry.throttled, null);
+});
+
+test("parseHarnessTelemetry: codex fixture never reports resolvedModel or throttled — unknown, not fabricated", () => {
+  const telemetry = parseHarnessTelemetry("codex", CODEX_TELEMETRY_FIXTURE);
+  assert.equal(telemetry.resolvedModel, null);
+  assert.equal(telemetry.throttled, null);
 });
 
 // ---------------------------------------------------------------------------
