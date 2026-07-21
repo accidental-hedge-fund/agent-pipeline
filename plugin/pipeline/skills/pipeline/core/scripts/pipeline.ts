@@ -99,10 +99,12 @@ import {
   formatDoctorJson,
   formatDoctorSummary,
   loadLatestPreflightResult,
+  realDoctorDeps,
   runPreflight,
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
+import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type RawLoopArgs } from "./loop-preflight.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
@@ -247,6 +249,14 @@ export interface CliOpts {
   capability?: string;
   /** config repo-map add/remove: target relationship list (default: depends_on). */
   rel?: string;
+  /** loop: issue-number range selector, e.g. "400-420". */
+  range?: string;
+  /** loop: named roadmap slice selector. */
+  roadmapSlice?: string;
+  /** loop: resume an existing durable run by id (also shared by no other command). */
+  resume?: string;
+  /** loop: read-only report for the run instead of starting/resuming. */
+  audit?: boolean;
 }
 
 /**
@@ -263,7 +273,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -301,6 +311,11 @@ export function buildCmd(): Command {
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
+    // loop (#451): pipeline:loop deterministic preflight + delegation to goal-loop.
+    .option("--range <spec>", "loop: issue-number range selector, e.g. 400-420")
+    .option("--roadmap-slice <slice>", "loop: named roadmap slice selector")
+    .option("--resume <run-id>", "loop: resume an existing durable run by id, regardless of which engine created it")
+    .option("--audit", "loop: read-only report for the run instead of starting/resuming")
     // papercut (#419) is agent-facing, not human-facing: registered and directly invocable
     // (see command-registry.ts + the dispatch block below) but deliberately absent from the
     // `[number]` argument's subcommand description above and from these two options'
@@ -338,6 +353,57 @@ export function buildCmd(): Command {
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
   // second positional of `run <N>`, `path`, `config <verb>`, and `logs <id>`.
   return cmd;
+}
+
+/** IO seam for {@link runLoopCommand} — the same DoctorDeps-shaped preflight
+ *  used by `pipeline doctor` and the installer (design.md decision 4: one
+ *  implementation, no divergent copies). */
+export interface LoopCliDeps {
+  runLoopPreflight: typeof runLoopPreflight;
+}
+
+const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight };
+
+/** `pipeline loop ...` (#451): normalize arguments, run the deterministic
+ *  loop:contract-coherence + native-/goal checks, and — on success — print the
+ *  compiled selector as JSON for the calling agent to hand off to the
+ *  installed goal-loop skill (see each host's SKILL.md). Every failure path
+ *  exits non-zero with remediation and performs zero external mutation: no gh
+ *  call, no lock, no ledger write, no worktree or branch creation. */
+export async function runLoopCommand(
+  opts: CliOpts,
+  positionalIssues: string[],
+  deps: LoopCliDeps = defaultLoopCliDeps,
+): Promise<void> {
+  const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
+  const raw: RawLoopArgs = {
+    milestone: opts.milestone,
+    label: opts.label,
+    range: opts.range,
+    roadmapSlice: opts.roadmapSlice,
+    issues: positionalIssues,
+    resume: opts.resume,
+    audit: opts.audit,
+  };
+
+  const outcome: LoopPreflightOutcome = await deps.runLoopPreflight(raw, engine, realDoctorDeps());
+  if (!outcome.ok) {
+    console.error(`pipeline loop: ${outcome.failedCheck} — ${outcome.detail}`);
+    if (outcome.remediation) console.error(`  → ${outcome.remediation}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(
+    JSON.stringify({
+      schema_version: "1",
+      engine,
+      selector: outcome.args.selector ?? null,
+      resume_run_id: outcome.args.resumeRunId ?? null,
+      audit: outcome.args.audit,
+    }),
+  );
+  process.exitCode = 0;
 }
 
 async function main(): Promise<void> {
@@ -442,6 +508,9 @@ async function main(): Promise<void> {
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
   const isMergeCommand = numArg === "merge";
+  // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
+  // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
+  const isLoopCommand = numArg === "loop";
   // `pipeline refine-spec --title "<t>" --body "<b>"` — non-mutating spec refinement preview.
   const isRefineSpecCommand = numArg === "refine-spec";
 
@@ -1087,6 +1156,16 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline:loop` (#451) — deterministic preflight + delegation to goal-loop.
+  // Deliberately calls resolveConfig for NOTHING: it needs no PipelineConfig and
+  // makes no gh call on any path (see command-registry.ts's loop entry), so it
+  // is dispatched before the resolveConfig() block below, unlike every command
+  // that needs cfg.repo.
+  if (isLoopCommand) {
+    await runLoopCommand(opts, cmd.args.slice(1));
+    return;
+  }
+
   // Early triage dispatch — resolves config for cfg.repo so gh wrappers target the
   // configured repository. The handler validates issue number and stage, then makes
   // the gh calls to read/add/remove labels.
@@ -1164,6 +1243,7 @@ async function main(): Promise<void> {
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "release", "intake", "refine-spec",
       "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
+      "loop",
     ];
     if (!recognized.includes(numArg)) {
       console.error(

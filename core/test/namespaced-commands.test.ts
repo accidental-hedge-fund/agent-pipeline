@@ -33,6 +33,7 @@ const EXPECTED_OPERATIONS = new Set([
   "release",
   "roadmap",
   "logs",
+  "loop",
 ]);
 
 // ---------------------------------------------------------------------------

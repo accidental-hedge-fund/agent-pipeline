@@ -27,7 +27,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { OPERATION_SURFACE, renderClaudeCommand, renderCodexCommand } from "./build.mjs";
 
@@ -158,6 +158,44 @@ function preflight() {
   if (which("openspec")) log("  ✓ openspec (optional) — for OpenSpec-enabled repos");
   else log("  ℹ openspec not found (optional) — only for OpenSpec-enabled repos; install: npm i -g @fission-ai/openspec");
   log("");
+}
+
+// loop:contract-coherence (#451) — runs the SAME check function `pipeline doctor`
+// and the `pipeline:loop` run-start preflight use (core/scripts/loop-preflight.ts),
+// so the three surfaces cannot diverge (design.md decision 4). Unlike doctor (which
+// treats a missing goal-loop install as a hard failure — it IS one, for the purpose
+// of that diagnostic), the installer only refuses to complete an INCOMPATIBLE
+// pairing: goal-loop is optional for a standalone Pipeline install, so its absence
+// is reported as info, not a blocker. Runs before any host install (external
+// mutation) begins. Returns { ok, message? } rather than calling fail() itself,
+// so it stays unit-testable (fail() calls process.exit); main() calls fail()
+// on an ok:false result.
+async function checkLoopCoherence() {
+  let loopPreflight;
+  let doctor;
+  try {
+    loopPreflight = await import(pathToFileURL(join(REPO_ROOT, "core", "scripts", "loop-preflight.ts")).href);
+    doctor = await import(pathToFileURL(join(REPO_ROOT, "core", "scripts", "stages", "doctor.ts")).href);
+  } catch {
+    // loop-preflight module unavailable in this checkout — do not block an
+    // otherwise-normal Pipeline install on it.
+    return { ok: true };
+  }
+  const deps = doctor.realDoctorDeps();
+  const discovered = await loopPreflight.discoverGoalLoop(deps);
+  if (!discovered) {
+    log(
+      "  ℹ goal-loop not installed (optional) — /pipeline:loop and $pipeline:loop will be " +
+        "unavailable until it is: https://github.com/comamitc/goal-loop",
+    );
+    return { ok: true };
+  }
+  const result = await loopPreflight.checkLoopContractCoherence(deps);
+  if (result.status === "fail") {
+    return { ok: false, message: `loop:contract-coherence: ${result.detail}\n  → ${result.remediation}` };
+  }
+  log(`  ✓ loop:contract-coherence: ${result.detail}`);
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +794,8 @@ async function main() {
 
   if (verb === "install" || verb === "update") {
     preflight();
+    const loopCheck = await checkLoopCoherence();
+    if (!loopCheck.ok) fail(loopCheck.message);
     log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
     for (const h of hosts) {
       if (h === "claude") {
@@ -797,6 +837,7 @@ async function main() {
 export {
   MANAGED_MARKER,
   DEPS,
+  checkLoopCoherence,
   detectPersonalSkill,
   uniqueBackupPath,
   relocatePersonalSkill,

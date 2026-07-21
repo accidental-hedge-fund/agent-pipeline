@@ -129,6 +129,20 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // loop (#451) is a delegating entry, not a CLI forward: it runs the
+  // deterministic loop preflight (argument normalization, loop:contract-coherence,
+  // native-/goal capability) and then hands off to the installed goal-loop skill.
+  // It never touches gh or the repo config, and performs no external mutation
+  // of its own on any path.
+  loop: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["profile", "milestone", "label", "range", "roadmapSlice", "resume", "audit"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   summary: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath"]),

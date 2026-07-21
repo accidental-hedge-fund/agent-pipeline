@@ -90,6 +90,9 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline config repo-map <add|remove|list>  add/remove/list repo_map entries in .github/pipeline.yml
 /pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output
 /pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
+/pipeline:loop --milestone v2            canonical durable multi-item run — delegates to the installed goal-loop skill
+/pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
+/pipeline:loop --audit                   read-only report for the run; no writes
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 /pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
 /pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
@@ -111,6 +114,20 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
 resolved to their linked closing issue (the pipeline is issue-centric). PRs
 without a `Closes #N` reference are refused with an explanation.
+
+`/pipeline:loop` is the canonical command for a **durable** multi-item run —
+one that is expected to span sessions or engines. It is a thin facade: it runs
+a deterministic, read-only preflight in this skill (argument normalization,
+`loop:contract-coherence`, native-`/goal` capability), then delegates the
+actual durable run — selection, contract, ledger, lock, recovery,
+reconciliation, resume — to the separately installed **goal-loop** skill. It
+never sets a stage label or merges itself; every selected item still executes
+through this skill's own state machine and evidence gates. It refuses to start
+(with zero external mutation) when goal-loop is missing or its contract/ledger
+schema ids are outside this skill's supported set, or when the engine's
+built-in autonomous `/goal` mode is unavailable — there is no non-durable
+fallback loop. `/goal-loop` remains a fully functional, undeprecated alias for
+the same runs.
 
 `--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
 worktrees under `worktree_root` whose PR is already merged, removing the worktree

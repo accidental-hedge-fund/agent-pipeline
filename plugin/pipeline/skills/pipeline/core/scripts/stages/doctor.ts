@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { PipelineConfig } from "../types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
+import { checkLoopContractCoherence } from "../loop-preflight.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -491,6 +492,16 @@ export function buildPreflightChecks(
             `Install \`${bin}\` or fix \`eval_gate.command\` (\`${command}\`) so its binary resolves on PATH.`,
           );
     },
+  });
+
+  // 10. Loop contract coherence (#451) — verifies the installed goal-loop
+  //     skill's contract/ledger schema ids are within Pipeline's supported
+  //     set. Shared verbatim with the installer and the `pipeline:loop`
+  //     run-start preflight (design.md decision 4) — one implementation.
+  checks.push({
+    id: "loop:contract-coherence",
+    description: "Installed goal-loop contract/ledger schema ids are within Pipeline's supported set",
+    run: async (deps) => checkLoopContractCoherence(deps),
   });
 
   return checks;

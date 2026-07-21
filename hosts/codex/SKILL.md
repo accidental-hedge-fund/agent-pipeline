@@ -77,6 +77,9 @@ $pipeline:roadmap --apply                same, with write-backs applied
 $pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
 $pipeline:release <version>              prepare a release PR for the given version
 $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
+$pipeline:loop --milestone v2            canonical durable multi-item run — delegates to the installed goal-loop skill
+$pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
+$pipeline:loop --audit                   read-only report for the run; no writes
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -102,6 +105,19 @@ $pipeline --cleanup         → use $pipeline:cleanup
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
 resolved to their linked closing issue (the pipeline is issue-centric). PRs
 without a `Closes #N` reference are refused with an explanation.
+
+`$pipeline:loop` is the canonical command for a **durable** multi-item run —
+one that is expected to span sessions or engines. It is a thin facade: it runs
+a deterministic, read-only preflight in this skill (argument normalization,
+`loop:contract-coherence`, native-`/goal` capability), then delegates the
+actual durable run — selection, contract, ledger, lock, recovery,
+reconciliation, resume — to the separately installed **goal-loop** skill. It
+never sets a stage label or merges itself; every selected item still executes
+through this skill's own state machine and evidence gates. It refuses to start
+(with zero external mutation) when goal-loop is missing or its contract/ledger
+schema ids are outside this skill's supported set, or when Codex's built-in
+autonomous `/goal` mode is unavailable — there is no non-durable fallback loop.
+`$goal-loop` remains a fully functional, undeprecated alias for the same runs.
 
 `--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
 worktrees under `worktree_root` whose PR is already merged, removing the worktree
