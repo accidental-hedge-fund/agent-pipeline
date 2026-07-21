@@ -639,7 +639,22 @@ test("runCapped: an argv element over MAX_ARG_STRLEN is refused before spawn —
   assert.doesNotMatch(result.stderr, /not found|not executable|ENOENT/i, "must not read like a missing-CLI error");
 });
 
-test("runCapped: an argv element exactly at MAX_ARG_STRLEN is not refused", async () => {
+test("runCapped: an argv element exactly at MAX_ARG_STRLEN (131,072 bytes) is refused — execve() counts the terminating NUL", async () => {
+  let spawned = false;
+  const spawnFn = (() => {
+    spawned = true;
+    throw new Error("must not be called — the oversize guard must refuse before spawn");
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  const exactArg = "z".repeat(131_072);
+  const result = await runCapped("unused", [exactArg], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(spawned, false, "spawn() must never be called for an argument at exactly MAX_ARG_STRLEN");
+  assert.equal(result.oversize_argv, true, "a 131,072-byte argument cannot fit — execve() counts the terminating NUL");
+  assert.equal(result.success, false);
+});
+
+test("runCapped: an argv element one byte below MAX_ARG_STRLEN (131,071 bytes) is not refused", async () => {
   const fakeChild = Object.assign(new EventEmitter(), {
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
@@ -651,10 +666,10 @@ test("runCapped: an argv element exactly at MAX_ARG_STRLEN is not refused", asyn
     return fakeChild;
   }) as unknown as typeof import("node:child_process").spawn;
 
-  const exactArg = "z".repeat(131_072);
-  const result = await runCapped("unused", [exactArg], tmpRoot, 30, false, "test", { spawnFn });
+  const underArg = "z".repeat(131_071);
+  const result = await runCapped("unused", [underArg], tmpRoot, 30, false, "test", { spawnFn });
 
-  assert.equal(result.oversize_argv ?? false, false, "an argument exactly at the limit must be spawned, not refused");
+  assert.equal(result.oversize_argv ?? false, false, "an argument one byte below the limit must be spawned, not refused");
   assert.equal(result.success, true);
 });
 

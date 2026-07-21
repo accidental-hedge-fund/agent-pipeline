@@ -530,10 +530,12 @@ export async function runCapped(
   // surfaces a few seconds later as a bare spawn_error that reads as
   // transient (missing CLI, permissions) when it is neither — retrying the
   // same invocation can never succeed. Refuse before spawning with a named,
-  // actionable failure instead.
+  // actionable failure instead. MAX_ARG_STRLEN counts the terminating NUL, so
+  // a payload of exactly MAX_ARG_STRLEN bytes still cannot fit — reject at
+  // ">=", not ">".
   for (const arg of args) {
     const byteLength = Buffer.byteLength(arg, "utf8");
-    if (byteLength <= MAX_ARG_STRLEN) continue;
+    if (byteLength < MAX_ARG_STRLEN) continue;
     return Promise.resolve({
       success: false,
       stdout: "",
