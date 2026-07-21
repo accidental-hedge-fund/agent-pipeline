@@ -758,6 +758,33 @@ export interface TransitionDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * Build the "## Pipeline: <stage>" transition comment body. Pure + exported so
+ * the PIPELINE_COMMENT_KINDS behavioral drift guard exercises the actual
+ * renderer instead of a synthetic body (#471 review 1).
+ */
+export function buildTransitionComment(args: {
+  fromStage: Stage;
+  toStage: Stage;
+  harness: string;
+  ts: string;
+  summary: string;
+  runId: string;
+}): string {
+  const lines = [
+    `## Pipeline: ${args.toStage.replace(/-/g, " ")}`,
+    "",
+    `**Harness**: ${args.harness}`,
+    `**Transition**: \`${args.fromStage}\` → \`${args.toStage}\``,
+    `**Timestamp**: ${args.ts}`,
+  ];
+  if (args.summary) {
+    lines.push("", "### Summary", args.summary);
+  }
+  const rendered = lines.join("\n") + COMMENT_FOOTER + "\n" + buildAuditSentinel(args.runId, args.toStage);
+  return attestPipelineComment("stage-transition", rendered);
+}
+
 export async function transition(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -784,18 +811,7 @@ export async function transition(
   ) ?? "unassigned";
 
   const effectiveRunId = _activeRunId ?? "unknown";
-  const lines = [
-    `## Pipeline: ${toStage.replace(/-/g, " ")}`,
-    "",
-    `**Harness**: ${harness}`,
-    `**Transition**: \`${fromStage}\` → \`${toStage}\``,
-    `**Timestamp**: ${ts}`,
-  ];
-  if (summary) {
-    lines.push("", "### Summary", summary);
-  }
-  const rendered = lines.join("\n") + COMMENT_FOOTER + "\n" + buildAuditSentinel(effectiveRunId, toStage);
-  const comment = attestPipelineComment("stage-transition", rendered);
+  const comment = buildTransitionComment({ fromStage, toStage, harness, ts, summary, runId: effectiveRunId });
 
   await _editLabels(cfg, issueNumber, fromStage, toStage);
   await retryComment(() => _postComment(cfg, issueNumber, comment), 3, _sleep);
@@ -858,6 +874,24 @@ export function buildBlockedComment(args: {
   ].join("\n") + COMMENT_FOOTER;
 }
 
+/**
+ * Build the full attested "blocked" comment body ({@link buildBlockedComment}
+ * plus the audit sentinel and attestation marker). Pure + exported so the
+ * PIPELINE_COMMENT_KINDS drift guard exercises the real renderer (#471).
+ */
+export function buildAttestedBlockedComment(args: {
+  issueNumber: number;
+  stageStr: string;
+  harness: string;
+  ts: string;
+  reason: string;
+  kind: BlockerKind;
+  runId: string;
+}): string {
+  const rendered = buildBlockedComment(args) + "\n" + buildAuditSentinel(args.runId, "blocked");
+  return attestPipelineComment("blocked", rendered);
+}
+
 /** I/O seam for {@link setBlocked} so unit tests inject fakes — no real network. */
 export interface SetBlockedDeps {
   getIssueDetail?: (cfg: PipelineConfig, n: number) => Promise<{ labels: string[] }>;
@@ -887,9 +921,7 @@ export async function setBlocked(
   const harness = getHarnessLabel(detail.labels) ?? "unassigned";
 
   const effectiveRunId = _activeRunId ?? "unknown";
-  const rendered = buildBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind })
-    + "\n" + buildAuditSentinel(effectiveRunId, "blocked");
-  const body = attestPipelineComment("blocked", rendered);
+  const body = buildAttestedBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind, runId: effectiveRunId });
 
   await _addBlockedLabel(cfg, issueNumber);
   await retryComment(() => _postComment(cfg, issueNumber, body), 3, _sleep);
@@ -1262,43 +1294,128 @@ export const PIPELINE_COMMENT_HEADERS: readonly string[] = [
 // ---------------------------------------------------------------------------
 
 /**
+ * How a registered comment kind is verified as authentic pipeline output:
+ *   - "pipeline-attest": the builder calls `attestPipelineComment(kind, body)`
+ *     as its last step (#471).
+ *   - "review-artifact": the builder embeds a `<!-- review-artifact: … -->`
+ *     record instead (`formatReviewComment` / `formatDeltaReviewComment`,
+ *     #264/#390) — the older, review-specific verification path.
+ *   - "exempt": deliberately left unverified. `reason` is required and is
+ *     asserted present by the drift-guard test; see each entry's reason for
+ *     why attesting it would be unsafe or is out of scope.
+ */
+export type PipelineCommentVerification = "pipeline-attest" | "review-artifact" | "exempt";
+
+/**
  * Single-sourced enumeration of every comment TYPE ("kind") the pipeline
- * posts to an issue or PR, other than review verdicts (`formatReviewComment`
- * / `formatDeltaReviewComment`), which stay on the existing `review-artifact`
- * verification path (#264/#390) and do not need the generic attestation.
- *
- * Every OTHER pipeline-posted comment SHALL be attested via
- * `attestPipelineComment(kind, body)` as the last step before posting, using
- * the `kind` id listed here. This registry is:
+ * posts to an issue or PR (#471). This registry is:
  *   - the enumeration source for the behavioral drift-guard test (renders
- *     each kind and asserts it verifies + self-excludes from
- *     `findUnacknowledgedComments`), and
+ *     each "pipeline-attest"/"review-artifact" kind via its real builder and
+ *     asserts it verifies + self-excludes from `findUnacknowledgedComments`
+ *     where applicable), and
  *   - the target the source drift-guard test checks every `## Pipeline…`
- *     heading literal in `core/scripts/` against.
+ *     heading literal in `core/scripts/` against — a literal not covered by
+ *     an entry here (or, previously, a test-local allowlist; now folded into
+ *     the "exempt" entries below) fails that test.
  *
  * `heading` is the literal (or literal prefix, for dynamic-suffix headings)
  * each kind's rendered body starts with — documentation for humans and the
  * anchor the source guard matches against; it is NOT itself the attestation.
+ * `exactOnly: true` marks a `heading` that is a short, structurally generic
+ * prefix (e.g. the bare `## Pipeline: ` transition prefix) — the source guard
+ * requires an EXACT literal match for these rather than the looser
+ * `literal.startsWith(heading)` check, so a genuinely new, unattested
+ * `## Pipeline: <something new>` comment type cannot silently hide behind the
+ * transition prefix and pass the guard (#471 review 1).
  */
-export const PIPELINE_COMMENT_KINDS: readonly { kind: string; heading: string }[] = [
-  { kind: "stage-transition", heading: "## Pipeline: " },
-  { kind: "blocked", heading: "## Pipeline: Blocked at " },
-  { kind: "audit-repair", heading: "## Pipeline: Audit Repair" },
-  { kind: "audit-repair-blocked", heading: "## Pipeline: Blocked (audit repair)" },
-  { kind: "review-advance-severity", heading: "## Pipeline: Review " },
-  { kind: "review-ceiling", heading: "## Pipeline: Review ceiling reached" },
-  { kind: "review-ceiling-demotion", heading: "## Pipeline: Review ceiling — findings demoted and deferred" },
-  { kind: "new-human-input-warning", heading: "## Pipeline: New human input detected" },
-  { kind: "pipeline-complete", heading: "## Pipeline Complete" },
-  { kind: "auto-recovery", heading: "## Pipeline: Auto-Recovery" },
-  { kind: "auto-recovery-limit", heading: "## Pipeline: Auto-Recovery Limit" },
-  { kind: "auto-loop-continuation", heading: "## Pipeline: Auto-Loop Continuation" },
-  { kind: "auto-loop-exhausted", heading: "## Pipeline: Auto-Loop Budget Exhausted" },
-  { kind: "evidence-bundle", heading: "## Pipeline: Evidence bundle" },
-  { kind: "pre-merge-rerun-identity", heading: "## Pipeline: Re-running review — prior runner identity differs" },
-  { kind: "pre-merge-rerun-scope", heading: "## Pipeline: Re-running review — scoped override active" },
-  { kind: "pre-merge-diff-unchanged", heading: "## Pipeline: Diff unchanged since last review; verdict reused" },
-  { kind: "pre-merge-stale-review", heading: "## Pipeline: Re-running review" },
+export const PIPELINE_COMMENT_KINDS: readonly {
+  kind: string;
+  heading: string;
+  verify: PipelineCommentVerification;
+  exactOnly?: boolean;
+  reason?: string;
+}[] = [
+  { kind: "stage-transition", heading: "## Pipeline: ", verify: "pipeline-attest", exactOnly: true },
+  { kind: "blocked", heading: "## Pipeline: Blocked at ", verify: "pipeline-attest" },
+  { kind: "audit-repair", heading: "## Pipeline: Audit Repair", verify: "pipeline-attest" },
+  { kind: "audit-repair-blocked", heading: "## Pipeline: Blocked (audit repair)", verify: "pipeline-attest" },
+  { kind: "review-advance-severity", heading: "## Pipeline: Review ", verify: "pipeline-attest" },
+  { kind: "review-ceiling", heading: "## Pipeline: Review ceiling reached — human decision required", verify: "pipeline-attest" },
+  { kind: "review-ceiling-demotion", heading: "## Pipeline: Review ceiling — findings demoted and deferred", verify: "pipeline-attest" },
+  { kind: "new-human-input-warning", heading: "## Pipeline: New human input detected", verify: "pipeline-attest" },
+  { kind: "pipeline-complete", heading: "## Pipeline Complete", verify: "pipeline-attest" },
+  { kind: "auto-recovery", heading: "## Pipeline: Auto-Recovery", verify: "pipeline-attest" },
+  { kind: "auto-recovery-limit", heading: "## Pipeline: Auto-Recovery Limit", verify: "pipeline-attest" },
+  { kind: "auto-loop-continuation", heading: "## Pipeline: Auto-Loop Continuation", verify: "pipeline-attest" },
+  { kind: "auto-loop-exhausted", heading: "## Pipeline: Auto-Loop Budget Exhausted", verify: "pipeline-attest" },
+  { kind: "evidence-bundle", heading: "## Pipeline: Evidence bundle", verify: "pipeline-attest" },
+  { kind: "pre-merge-rerun-identity", heading: "## Pipeline: Re-running review — prior runner identity differs", verify: "pipeline-attest" },
+  { kind: "pre-merge-rerun-scope", heading: "## Pipeline: Re-running review — scoped override active", verify: "pipeline-attest" },
+  { kind: "pre-merge-diff-unchanged", heading: "## Pipeline: Diff unchanged since last review; verdict reused", verify: "pipeline-attest" },
+  { kind: "pre-merge-stale-review", heading: "## Pipeline: Re-running review", verify: "pipeline-attest" },
+  // Review verdicts (#264/#390) — verified via the existing review-artifact path, not
+  // the generic attestation marker. Headings are "## Review <N>" (REVIEW_ROUND_RE) and
+  // "## Pre-merge Delta Review", neither of which starts with "## Pipeline", so the
+  // source guard (which only scans `## Pipeline…` literals) never checks these; they are
+  // listed here purely so the registry enumerates every posted comment type per spec.
+  { kind: "review-verdict", heading: "## Review ", verify: "review-artifact" },
+  { kind: "pre-merge-delta-review", heading: "## Pre-merge Delta Review", verify: "review-artifact" },
+  // Deliberately unattested/unverified comment types, with justification. Moved here
+  // (from a prior test-local allowlist) so there is exactly one exported registry.
+  {
+    kind: "pre-planning-context",
+    heading: "## Pre-Planning Context",
+    verify: "exempt",
+    reason:
+      "Wraps untrusted human comment excerpts (buildContextSnapshot output) inline, posted BEFORE the plan " +
+      "anchor so it is never in findUnacknowledgedComments' scan window. Attesting the wrapper would " +
+      "immunize the embedded human excerpts it carries, same rationale as 'Unblocked' below.",
+  },
+  {
+    kind: "unblocked",
+    heading: "## Pipeline: Unblocked",
+    verify: "exempt",
+    reason:
+      "Embeds the human operator's verbatim --unblock answer text inline. Attesting the whole body would " +
+      "immunize genuine embedded human objection language from the NEGATION_PATTERNS scan — the exact " +
+      "forgery/bypass hole #390 and #471 close. Deliberately left unattested so embedded objection wording " +
+      "still gates via the existing no-negation-language branch.",
+  },
+  {
+    kind: "finding-override",
+    heading: "## Pipeline: Finding override",
+    verify: "exempt",
+    reason:
+      "Posted by the human operator directly via the `--override` CLI workflow (audited disposition), " +
+      "not constructed/posted anywhere in core/scripts/ — not an engine-posted comment.",
+  },
+  {
+    kind: "scope-override",
+    heading: "## Pipeline: Scope override",
+    verify: "exempt",
+    reason:
+      "Posted by the human operator directly via the `--override`/scope-override workflow, " +
+      "not constructed/posted anywhere in core/scripts/ — not an engine-posted comment.",
+  },
+  {
+    kind: "finding-does-not-reproduce",
+    heading: "## Pipeline: Finding does not reproduce",
+    verify: "exempt",
+    reason:
+      "Machine-authored by the fix harness, but already trust-gated via its own SHA/fingerprint-anchored " +
+      "`pipeline-non-reproducing` sentinel with a documented last-non-empty-line security invariant " +
+      "(extractNonReproducingDispositions). Attesting it would require touching that invariant's ordering; " +
+      "out of #471's audited scope — tracked as a follow-up.",
+  },
+  {
+    kind: "pipeline-classifier-prefix",
+    heading: "## Pipeline:",
+    verify: "exempt",
+    exactOnly: true,
+    reason:
+      "The bare classification prefix in PIPELINE_COMMENT_HEADERS/status-json.ts/pipeline.ts, used to " +
+      "recognize ANY pipeline comment for human/pipeline triage — not itself a distinct posted comment type.",
+  },
 ];
 
 // Matches "## Review 1", "## Review 2", "## Review 3", ... — review rounds are

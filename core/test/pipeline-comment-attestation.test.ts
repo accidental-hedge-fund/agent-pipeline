@@ -9,10 +9,11 @@
 // This file covers:
 //   1. The attestation primitive (encode/verify) in isolation.
 //   2. The #429 regression this issue was filed against.
-//   3. A behavioral drift guard: every kind in PIPELINE_COMMENT_KINDS verifies
-//      and self-excludes from findUnacknowledgedComments.
+//   3. A behavioral drift guard: every non-exempt kind in PIPELINE_COMMENT_KINDS
+//      is exercised through its REAL renderer, which must verify and
+//      self-exclude from findUnacknowledgedComments.
 //   4. A source drift guard: every `## Pipeline…`-family heading literal in
-//      core/scripts/ is represented in the registry (or a justified allowlist).
+//      core/scripts/ is represented in the single PIPELINE_COMMENT_KINDS registry.
 //   5. Negative cases proving the gate change added no new trust path.
 
 import { test } from "node:test";
@@ -20,9 +21,12 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findUnacknowledgedComments } from "../scripts/issue-context-snapshot.ts";
+import {
+  buildNewHumanInputWarningComment,
+  findUnacknowledgedComments,
+} from "../scripts/issue-context-snapshot.ts";
 import { buildTrustedOverrideComments } from "../scripts/review-policy.ts";
-import { PIPELINE_COMMENT_KINDS } from "../scripts/gh.ts";
+import { PIPELINE_COMMENT_KINDS, buildAttestedBlockedComment, buildTransitionComment } from "../scripts/gh.ts";
 import {
   attestPipelineComment,
   encodePipelineAttestation,
@@ -31,9 +35,30 @@ import {
   isVerifiedPipelineAttestation,
   isVerifiedPipelineOutput,
 } from "../scripts/stages/review-parsing.ts";
-import { advisoryAdvanceComment, formatReviewComment } from "../scripts/stages/review-rendering.ts";
+import {
+  advisoryAdvanceComment,
+  formatDeltaReviewComment,
+  formatReviewComment,
+  reviewCeilingComment,
+  reviewCeilingDemotionComment,
+} from "../scripts/stages/review-rendering.ts";
+import {
+  diffUnchangedNotice,
+  preMergeRerunIdentityNotice,
+  preMergeRerunScopeNotice,
+  staleReviewNotice,
+} from "../scripts/stages/pre_merge.ts";
+import { buildAutoRecoveryComment, buildAutoRecoveryLimitComment } from "../scripts/stages/auto_recover.ts";
+import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts";
+import { formatEvidenceCommentBody } from "../scripts/evidence-bundle.ts";
+import {
+  buildAuditRepairBlockedComment,
+  buildAuditRepairComment,
+  buildAutoLoopContinuationComment,
+  buildAutoLoopExhaustedComment,
+} from "../scripts/pipeline-run.ts";
 import type { PartitionResult } from "../scripts/review-policy.ts";
-import type { PipelineConfig } from "../scripts/types.ts";
+import type { EvidenceBundle, PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 
 const TEST_ACTOR = "pipeline-bot";
 
@@ -50,7 +75,41 @@ const EMPTY_PARTITION: PartitionResult = { blocking: [], advisory: [], overridde
 const advanceCfg = {
   review_policy: { block_threshold: "high", min_confidence: 0.5 },
   marker_footer: "*Automated by Claude Code Pipeline Skill*",
+  base_branch: "main",
+  auto_recovery_max_retries: 2,
+  auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+  harnesses: { implementer: "claude", reviewer: "codex" },
 } as unknown as PipelineConfig;
+
+function makeFinding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
+  return {
+    severity: "high",
+    title: "Something is wrong",
+    body: "Detailed explanation.",
+    confidence: 0.9,
+    recommendation: "Fix it.",
+    ...overrides,
+  };
+}
+
+function emptyEvidenceBundle(): EvidenceBundle {
+  return {
+    schema_version: 1,
+    schemaVersion: 1,
+    runId: "471/2026-01-01T00:00:00Z",
+    issue: 471,
+    pr: null,
+    branch: null,
+    harnesses: [],
+    stages: [],
+    reviews: [],
+    overrides: [],
+    recoveries: [],
+    finalState: null,
+    finalizedAt: null,
+    notifiedAt: null,
+  } as unknown as EvidenceBundle;
+}
 
 // ---------------------------------------------------------------------------
 // 1. Attestation primitive
@@ -150,25 +209,95 @@ test("#471/#429 regression: advisoryAdvanceComment is attested and does not gate
 });
 
 // ---------------------------------------------------------------------------
-// 3. Behavioral drift guard — every registry kind verifies + self-excludes
+// 3. Behavioral drift guard — every registry kind's REAL renderer verifies
+//    and self-excludes from findUnacknowledgedComments (#471 review 1: the
+//    guard must exercise actual engine output, not a synthetic re-attested
+//    stand-in — otherwise a builder that stops calling attestPipelineComment
+//    would not be caught).
 // ---------------------------------------------------------------------------
 
-test("PIPELINE_COMMENT_KINDS behavioral drift guard: every kind attests and self-excludes from findUnacknowledgedComments", () => {
-  for (const { kind } of PIPELINE_COMMENT_KINDS) {
-    // Render a representative body for the kind: heading text + prose that
-    // deliberately includes objection-shaped wording, so the test would fail
-    // if the kind were NOT actually attested (the whole point of the guard).
-    const rendered = `${kind} heading\n\nSome prose that says "instead" and "revert" and "wrong approach".`;
-    const attested = attestPipelineComment(kind, rendered);
-    assert.equal(isVerifiedPipelineOutput(attested), true, `kind "${kind}" must verify as pipeline output`);
+const CEILING_PARTITION: PartitionResult = { blocking: [makeFinding()], advisory: [], overridden: [] };
+
+// One real-renderer invocation per "pipeline-attest" kind, using minimal
+// representative arguments. If a builder stops calling attestPipelineComment,
+// the corresponding entry's output fails isVerifiedPipelineOutput below.
+const KIND_RENDERERS: Record<string, () => string> = {
+  "stage-transition": () =>
+    buildTransitionComment({ fromStage: "review-1", toStage: "fix-1", harness: "claude", ts: ts(0), summary: "", runId: "run-1" }),
+  blocked: () =>
+    buildAttestedBlockedComment({
+      issueNumber: 1,
+      stageStr: "review-1",
+      harness: "claude",
+      ts: ts(0),
+      reason: "test",
+      kind: "worktree-missing",
+      runId: "run-1",
+    }),
+  "audit-repair": () => buildAuditRepairComment("review-1", "run-1"),
+  "audit-repair-blocked": () => buildAuditRepairBlockedComment("run-1"),
+  "review-advance-severity": () => advisoryAdvanceComment(advanceCfg, 1, "codex", EMPTY_PARTITION),
+  "review-ceiling": () => reviewCeilingComment(advanceCfg, 1, "codex", CEILING_PARTITION, 3, []),
+  "review-ceiling-demotion": () => reviewCeilingDemotionComment(advanceCfg, 1, "codex", CEILING_PARTITION, 3, [], 999),
+  "new-human-input-warning": () =>
+    buildNewHumanInputWarningComment([{ author: "human1", createdAt: ts(0) }], "review-1"),
+  "pipeline-complete": () => buildPipelineCompleteComment(advanceCfg, 471, "Some issue", "PR #1", 0),
+  "auto-recovery": () => buildAutoRecoveryComment(advanceCfg, 0),
+  "auto-recovery-limit": () => buildAutoRecoveryLimitComment(advanceCfg, 2),
+  "auto-loop-continuation": () => buildAutoLoopContinuationComment(advanceCfg, 1, "review-1", "transient failure", 2, 30),
+  "auto-loop-exhausted": () => buildAutoLoopExhaustedComment(advanceCfg, 3, "review-1", "blocked", "transient failure", 45),
+  "evidence-bundle": () => formatEvidenceCommentBody(emptyEvidenceBundle(), "/tmp/bundle.json", "pipeline summary 471"),
+  "pre-merge-rerun-identity": () => preMergeRerunIdentityNotice("codex"),
+  "pre-merge-rerun-scope": () => preMergeRerunScopeNotice(2),
+  "pre-merge-diff-unchanged": () => diffUnchangedNotice("a".repeat(40), "b".repeat(40)),
+  "pre-merge-stale-review": () => staleReviewNotice("a".repeat(40), "b".repeat(40)),
+};
+
+// "review-artifact" kinds verify via the review-artifact record instead of the
+// generic attestation marker — rendered through their own real formatters.
+const REVIEW_ARTIFACT_RENDERERS: Record<string, () => string> = {
+  "review-verdict": () =>
+    formatReviewComment(
+      advanceCfg,
+      { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: "a".repeat(40) },
+      1,
+      "codex",
+    ),
+  "pre-merge-delta-review": () =>
+    formatDeltaReviewComment(
+      advanceCfg,
+      { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: "a".repeat(40) },
+      "codex",
+    ),
+};
+
+test("PIPELINE_COMMENT_KINDS behavioral drift guard: every registered kind is covered by a real-renderer fixture", () => {
+  for (const entry of PIPELINE_COMMENT_KINDS) {
+    if (entry.verify === "exempt") {
+      assert.ok(entry.reason && entry.reason.length > 0, `exempt kind "${entry.kind}" must carry a reason`);
+      continue;
+    }
+    const renderer =
+      entry.verify === "pipeline-attest" ? KIND_RENDERERS[entry.kind] : REVIEW_ARTIFACT_RENDERERS[entry.kind];
+    assert.ok(renderer, `kind "${entry.kind}" (verify: ${entry.verify}) has no real-renderer fixture in this test`);
+  }
+});
+
+test("PIPELINE_COMMENT_KINDS behavioral drift guard: every 'pipeline-attest'/'review-artifact' kind's real renderer verifies and self-excludes from findUnacknowledgedComments", () => {
+  for (const entry of PIPELINE_COMMENT_KINDS) {
+    if (entry.verify === "exempt") continue;
+    const renderer =
+      entry.verify === "pipeline-attest" ? KIND_RENDERERS[entry.kind] : REVIEW_ARTIFACT_RENDERERS[entry.kind];
+    const body = renderer();
+    assert.equal(isVerifiedPipelineOutput(body), true, `kind "${entry.kind}"'s real rendered output must verify as pipeline output`);
 
     const comments = [
       makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
-      makeComment(TEST_ACTOR, attested, ts(1)),
+      makeComment(TEST_ACTOR, body, ts(1)),
     ];
     const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
     const unacked = findUnacknowledgedComments(comments, trusted);
-    assert.deepEqual(unacked, [], `kind "${kind}" must self-exclude from findUnacknowledgedComments`);
+    assert.deepEqual(unacked, [], `kind "${entry.kind}" must self-exclude from findUnacknowledgedComments`);
   }
 });
 
@@ -190,46 +319,6 @@ test("PIPELINE_COMMENT_KINDS behavioral drift guard: an unattested body of a wou
 // ---------------------------------------------------------------------------
 // 4. Source drift guard — every heading literal in core/scripts/ is registered
 // ---------------------------------------------------------------------------
-
-// Headings intentionally excluded from PIPELINE_COMMENT_KINDS, with justification.
-// Each entry is a literal (or literal prefix) expected to appear in source.
-const SOURCE_GUARD_ALLOWLIST: readonly { literal: string; reason: string }[] = [
-  {
-    literal: "## Pipeline: Finding override",
-    reason:
-      "Posted by the human operator directly via the `--override` CLI workflow (audited disposition), " +
-      "not constructed/posted anywhere in core/scripts/ — not an engine-posted comment.",
-  },
-  {
-    literal: "## Pipeline: Scope override",
-    reason:
-      "Posted by the human operator directly via the `--override`/scope-override workflow, " +
-      "not constructed/posted anywhere in core/scripts/ — not an engine-posted comment.",
-  },
-  {
-    literal: "## Pipeline: Finding does not reproduce",
-    reason:
-      "Machine-authored by the fix harness, but already trust-gated via its own SHA/fingerprint-anchored " +
-      "`pipeline-non-reproducing` sentinel with a documented last-non-empty-line security invariant " +
-      "(extractNonReproducingDispositions). Attesting it would require touching that invariant's ordering; " +
-      "out of #471's audited scope — tracked as a follow-up.",
-  },
-  {
-    literal: "## Pipeline: Unblocked",
-    reason:
-      "Embeds the human operator's verbatim --unblock answer text inline. Attesting the whole body would " +
-      "immunize genuine embedded human objection language from the NEGATION_PATTERNS scan — the exact " +
-      "forgery/bypass hole #390 and #471 close. Deliberately left unattested so embedded objection wording " +
-      "still gates via the existing no-negation-language branch.",
-  },
-  {
-    literal: "## Pre-Planning Context",
-    reason:
-      "Wraps untrusted human comment excerpts (buildContextSnapshot output) inline, posted BEFORE the plan " +
-      "anchor so it is never in findUnacknowledgedComments' scan window. Attesting the wrapper would " +
-      "immunize the embedded human excerpts it carries, same rationale as '## Pipeline: Unblocked'.",
-  },
-];
 
 /** Strip `//` line comments and `/* ... *\/` block comments so the source scan only
  *  sees string/template literals that are actual code, not documentation prose
@@ -261,7 +350,25 @@ function findHeadingLiterals(src: string): string[] {
   return literals;
 }
 
-test("source drift guard: every '## Pipeline…' heading literal in core/scripts/ is in PIPELINE_COMMENT_KINDS or the justified allowlist", () => {
+/**
+ * A literal is covered by a registry entry when it exactly equals the
+ * entry's heading, or is a strictly SHORTER fragment of it (`heading.startsWith(literal)`
+ * — always safe: a short literal can't hide a distinct new comment type).
+ * The reverse direction (`literal.startsWith(heading)`, a LONGER literal
+ * extending a short registry heading) is only allowed when the entry is NOT
+ * `exactOnly` — `exactOnly` entries (the generic `## Pipeline: ` transition
+ * prefix, and the bare `## Pipeline:` classifier literal) are structurally
+ * generic enough that this direction would silently absorb any future
+ * `## Pipeline: <unrelated new kind>` literal (#471 review 1).
+ */
+function coveredByEntry(literal: string, entry: (typeof PIPELINE_COMMENT_KINDS)[number]): boolean {
+  if (literal === entry.heading) return true;
+  if (entry.heading.startsWith(literal)) return true;
+  if (entry.exactOnly) return false;
+  return literal.startsWith(entry.heading);
+}
+
+test("source drift guard: every '## Pipeline…' heading literal in core/scripts/ is represented in PIPELINE_COMMENT_KINDS", () => {
   const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts");
   const files: string[] = [];
   (function walk(dir: string) {
@@ -272,16 +379,12 @@ test("source drift guard: every '## Pipeline…' heading literal in core/scripts
     }
   })(scriptsDir);
 
-  const registryHeadings = PIPELINE_COMMENT_KINDS.map((k) => k.heading);
-  const allowlistLiterals = SOURCE_GUARD_ALLOWLIST.map((a) => a.literal);
   const unrepresented: { file: string; literal: string }[] = [];
 
   for (const file of files) {
     const src = stripComments(fs.readFileSync(file, "utf8"));
     for (const literal of findHeadingLiterals(src)) {
-      const covered =
-        registryHeadings.some((h) => literal.startsWith(h) || h.startsWith(literal)) ||
-        allowlistLiterals.some((a) => literal.startsWith(a) || a.startsWith(literal));
+      const covered = PIPELINE_COMMENT_KINDS.some((entry) => coveredByEntry(literal, entry));
       if (!covered) {
         unrepresented.push({ file: path.relative(scriptsDir, file), literal });
       }
@@ -291,8 +394,8 @@ test("source drift guard: every '## Pipeline…' heading literal in core/scripts
   assert.deepEqual(
     unrepresented,
     [],
-    `Every '## Pipeline…' heading literal must be represented in PIPELINE_COMMENT_KINDS or ` +
-      `SOURCE_GUARD_ALLOWLIST (with justification): ${JSON.stringify(unrepresented)}`,
+    `Every '## Pipeline…' heading literal must be represented in PIPELINE_COMMENT_KINDS (with a 'reason' ` +
+      `for kinds deliberately left verify: "exempt"): ${JSON.stringify(unrepresented)}`,
   );
 });
 

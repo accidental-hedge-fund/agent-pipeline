@@ -10,6 +10,39 @@ import { RUN_SCHEMA_VERSION, appendEvent, defaultRunStoreDeps, type RunStoreDeps
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
 
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildPipelineCompleteComment(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  title: string,
+  prRef: string,
+  advisoryRounds: number,
+): string {
+  const rawSummary = [
+    FINAL_SUMMARY_MARKER,
+    "",
+    `- **Issue**: #${issueNumber} — ${title}`,
+    `- **${prRef}**: ready to merge`,
+    `- **Implementer**: ${cfg.harnesses.implementer}`,
+    `- **Reviewer**: ${cfg.harnesses.reviewer}`,
+    `- **CI**: passing`,
+    `- **Conflicts**: none`,
+    ...(advisoryRounds
+      ? [
+          "",
+          `⚠️ **${advisoryRounds} review round(s) advanced with advisory findings** that were not fixed — ` +
+            `review the advisory comments on this PR before merging.`,
+        ]
+      : []),
+    "",
+    "Ready to merge. The pipeline does NOT auto-merge — push the merge button when you're satisfied.",
+    "",
+    "---",
+    cfg.marker_footer,
+  ].join("\n");
+  return attestPipelineComment("pipeline-complete", rawSummary);
+}
+
 export async function finalize(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -30,29 +63,7 @@ export async function finalize(
     const advisoryRounds = detail.comments.filter(
       (c) => c.body.startsWith("## Pipeline: Review") && c.body.includes("advanced under severity policy"),
     ).length;
-    const rawSummary = [
-      FINAL_SUMMARY_MARKER,
-      "",
-      `- **Issue**: #${issueNumber} — ${detail.title}`,
-      `- **${prRef}**: ready to merge`,
-      `- **Implementer**: ${cfg.harnesses.implementer}`,
-      `- **Reviewer**: ${cfg.harnesses.reviewer}`,
-      `- **CI**: passing`,
-      `- **Conflicts**: none`,
-      ...(advisoryRounds
-        ? [
-            "",
-            `⚠️ **${advisoryRounds} review round(s) advanced with advisory findings** that were not fixed — ` +
-              `review the advisory comments on this PR before merging.`,
-          ]
-        : []),
-      "",
-      "Ready to merge. The pipeline does NOT auto-merge — push the merge button when you're satisfied.",
-      "",
-      "---",
-      cfg.marker_footer,
-    ].join("\n");
-    const summary = attestPipelineComment("pipeline-complete", rawSummary);
+    const summary = buildPipelineCompleteComment(cfg, issueNumber, detail.title, prRef, advisoryRounds);
     await postComment(cfg, issueNumber, summary);
     console.log(`[pipeline] #${issueNumber}: final summary posted`);
     // Mirror the summary onto the PR — the merge decision happens there, not on

@@ -323,3 +323,22 @@ export function findUnacknowledgedComments(
   }
   return result;
 }
+
+/**
+ * Build the "## Pipeline: New human input detected" warning body. Pure +
+ * exported so both call sites (review-routing.ts, fix.ts) share one renderer
+ * and the PIPELINE_COMMENT_KINDS drift guard exercises the real output (#471).
+ */
+export function buildNewHumanInputWarningComment(
+  unacknowledged: { author: string; createdAt: string }[],
+  stage: string,
+  footer = "",
+): string {
+  const commentLines = unacknowledged
+    .map((c) => `- **@${c.author}** (${c.createdAt})`)
+    .join('\n');
+  return attestPipelineComment(
+    "new-human-input-warning",
+    `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.${footer}`,
+  );
+}

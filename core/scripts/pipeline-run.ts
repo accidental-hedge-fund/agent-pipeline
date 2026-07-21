@@ -73,6 +73,100 @@ import {
 } from "./types.ts";
 import type { CliOpts } from "./pipeline.ts";
 
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildAuditRepairComment(stage: Stage, runId: string): string {
+  return reviewStage.attestPipelineComment(
+    "audit-repair",
+    [
+      `## Pipeline: Audit Repair`,
+      ``,
+      `The audit sentinel for stage \`${stage}\` was missing from the recent comment history. Posting retroactively.`,
+      ``,
+      buildAuditSentinel(runId, stage),
+      ``,
+      `---`,
+      `*Automated by Claude Code Pipeline Skill*`,
+    ].join("\n"),
+  );
+}
+
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildAuditRepairBlockedComment(runId: string): string {
+  return reviewStage.attestPipelineComment(
+    "audit-repair-blocked",
+    [
+      `## Pipeline: Blocked (audit repair)`,
+      ``,
+      `The audit sentinel for \`blocked\` state was missing from the recent comment history. Posting retroactively.`,
+      ``,
+      `> **Note**: The original block reason could not be recovered — the blocker comment was not recorded.`,
+      ``,
+      `### How to unblock`,
+      `Remove the \`pipeline:blocked\` label and re-apply the active stage label (e.g. \`pipeline:fix-1\`) to resume the pipeline.`,
+      ``,
+      buildAuditSentinel(runId, "blocked"),
+      ``,
+      `---`,
+      `*Automated by Claude Code Pipeline Skill*`,
+    ].join("\n"),
+  );
+}
+
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildAutoLoopContinuationComment(
+  cfg: PipelineConfig,
+  roundsSpent: number,
+  stage: Stage,
+  reason: string,
+  roundsRemaining: number,
+  minutesRemaining: number,
+): string {
+  return reviewStage.attestPipelineComment(
+    "auto-loop-continuation",
+    [
+      `## Pipeline: Auto-Loop Continuation (${roundsSpent}/${cfg.auto_loop.max_rounds})`,
+      "",
+      `Automatically continuing past recoverable stop at \`${stage}\`:`,
+      `- **Reason**: ${reason}`,
+      `- **Rounds remaining**: ${roundsRemaining}`,
+      `- **Wall-clock remaining**: ${minutesRemaining.toFixed(1)} minutes`,
+      "",
+      "---",
+      cfg.marker_footer,
+    ].join("\n"),
+  );
+}
+
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildAutoLoopExhaustedComment(
+  cfg: PipelineConfig,
+  roundsSpent: number,
+  stage: Stage,
+  outStatus: string,
+  outReason: string,
+  elapsedMinutes: number,
+): string {
+  return reviewStage.attestPipelineComment(
+    "auto-loop-exhausted",
+    [
+      "## Pipeline: Auto-Loop Budget Exhausted",
+      "",
+      `The bounded auto-loop ran ${roundsSpent}/${cfg.auto_loop.max_rounds} round(s) and cannot continue:`,
+      `- **Stage**: \`${stage}\``,
+      `- **Last outcome**: ${outStatus} — ${outReason}`,
+      `- **Rounds used**: ${roundsSpent} / ${cfg.auto_loop.max_rounds}`,
+      `- **Time used**: ${elapsedMinutes.toFixed(1)} / ${cfg.auto_loop.max_wallclock_minutes} minutes`,
+      "",
+      "The issue is parked at `needs-human`. To resume:",
+      "- Fix the underlying issue and re-run `pipeline <N>` after relabeling to the appropriate stage.",
+      "- Or record an audited disposition with `--override \"<key>: <reason>\"` if applicable.",
+      "",
+      "---",
+      cfg.marker_footer,
+    ].join("\n"),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Module-level constants (local to this module)
 // ---------------------------------------------------------------------------
@@ -536,19 +630,7 @@ export async function runAdvance(
       // Skip stage-sentinel repair for manually-applied entry-point stages ("ready", "backlog")
       // since those are never created by transition() and have no sentinel to repair.
       if (!opts.dryRun && stage !== "ready" && stage !== "backlog") {
-        const repairBody = reviewStage.attestPipelineComment(
-          "audit-repair",
-          [
-            `## Pipeline: Audit Repair`,
-            ``,
-            `The audit sentinel for stage \`${stage}\` was missing from the recent comment history. Posting retroactively.`,
-            ``,
-            buildAuditSentinel(pipelineRunId, stage),
-            ``,
-            `---`,
-            `*Automated by Claude Code Pipeline Skill*`,
-          ].join("\n"),
-        );
+        const repairBody = buildAuditRepairComment(stage, pipelineRunId);
         await reconcileAuditComment(
           cfg, issueNumber, stage, pipelineRunId, repairBody, detail.comments, auditTrustedActor,
         );
@@ -556,24 +638,7 @@ export async function runAdvance(
       // Blocked-sentinel repair runs regardless of stage — an issue can be blocked while at
       // pipeline:ready (label write succeeded, comment post failed) and we must not skip it.
       if (!opts.dryRun && isBlocked(detail.labels)) {
-        const blockedRepairBody = reviewStage.attestPipelineComment(
-          "audit-repair-blocked",
-          [
-            `## Pipeline: Blocked (audit repair)`,
-            ``,
-            `The audit sentinel for \`blocked\` state was missing from the recent comment history. Posting retroactively.`,
-            ``,
-            `> **Note**: The original block reason could not be recovered — the blocker comment was not recorded.`,
-            ``,
-            `### How to unblock`,
-            `Remove the \`pipeline:blocked\` label and re-apply the active stage label (e.g. \`pipeline:fix-1\`) to resume the pipeline.`,
-            ``,
-            buildAuditSentinel(pipelineRunId, "blocked"),
-            ``,
-            `---`,
-            `*Automated by Claude Code Pipeline Skill*`,
-          ].join("\n"),
-        );
+        const blockedRepairBody = buildAuditRepairBlockedComment(pipelineRunId);
         await reconcileAuditComment(
           cfg, issueNumber, "blocked", pipelineRunId, blockedRepairBody, detail.comments, auditTrustedActor,
         );
@@ -777,20 +842,7 @@ export async function runAdvance(
             await postComment(
               cfg,
               issueNumber,
-              reviewStage.attestPipelineComment(
-                "auto-loop-continuation",
-                [
-                  `## Pipeline: Auto-Loop Continuation (${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds})`,
-                  "",
-                  `Automatically continuing past recoverable stop at \`${stage}\`:`,
-                  `- **Reason**: ${out.reason}`,
-                  `- **Rounds remaining**: ${roundsRemaining}`,
-                  `- **Wall-clock remaining**: ${minutesRemaining.toFixed(1)} minutes`,
-                  "",
-                  "---",
-                  cfg.marker_footer,
-                ].join("\n"),
-              ),
+              buildAutoLoopContinuationComment(cfg, autoLoopRoundsSpent, stage, out.reason, roundsRemaining, minutesRemaining),
             ).catch(() => {});
             if (stateDir) {
               await recordRecovery(stateDir, issueNumber, {
@@ -816,25 +868,7 @@ export async function runAdvance(
             await postComment(
               cfg,
               issueNumber,
-              reviewStage.attestPipelineComment(
-                "auto-loop-exhausted",
-                [
-                  "## Pipeline: Auto-Loop Budget Exhausted",
-                  "",
-                  `The bounded auto-loop ran ${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds} round(s) and cannot continue:`,
-                  `- **Stage**: \`${stage}\``,
-                  `- **Last outcome**: ${out.status} — ${out.reason}`,
-                  `- **Rounds used**: ${autoLoopRoundsSpent} / ${cfg.auto_loop.max_rounds}`,
-                  `- **Time used**: ${elapsedMinutes.toFixed(1)} / ${cfg.auto_loop.max_wallclock_minutes} minutes`,
-                  "",
-                  "The issue is parked at `needs-human`. To resume:",
-                  "- Fix the underlying issue and re-run `pipeline <N>` after relabeling to the appropriate stage.",
-                  "- Or record an audited disposition with `--override \"<key>: <reason>\"` if applicable.",
-                  "",
-                  "---",
-                  cfg.marker_footer,
-                ].join("\n"),
-              ),
+              buildAutoLoopExhaustedComment(cfg, autoLoopRoundsSpent, stage, out.status, out.reason, elapsedMinutes),
             ).catch(() => {});
             if (runDir) {
               await emitHumanIntervention(runDir, {

@@ -35,6 +35,39 @@ export function countRecoveryAttempts(comments: { body: string }[]): number {
   return rounds.size;
 }
 
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildAutoRecoveryLimitComment(cfg: PipelineConfig, recoveryCount: number): string {
+  return attestPipelineComment(
+    "auto-recovery-limit",
+    [
+      RECOVERY_LIMIT_MARKER,
+      "",
+      `Implementation produced no commits after ${recoveryCount} retries. ` +
+        `This issue may already be resolved on \`${cfg.base_branch}\`, or it may need manual intervention.`,
+      "",
+      "@comamitc",
+      "",
+      "---",
+      "*Automated by Claude Code Pipeline Skill*",
+    ].join("\n"),
+  );
+}
+
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildAutoRecoveryComment(cfg: PipelineConfig, recoveryCount: number): string {
+  return attestPipelineComment(
+    "auto-recovery",
+    [
+      `${RECOVERY_MARKER} (${recoveryCount + 1}/${cfg.auto_recovery_max_retries})`,
+      "",
+      "Implementation failed with no commits produced. Worktree cleaned up and issue reset to **ready** for retry.",
+      "",
+      "---",
+      "*Automated by Claude Code Pipeline Skill*",
+    ].join("\n"),
+  );
+}
+
 export async function tryAutoRecover(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -60,24 +93,7 @@ export async function tryAutoRecover(
   await removeWorktree(cfg, issueNumber, wt.slug);
 
   if (recoveryCount >= cfg.auto_recovery_max_retries) {
-    await postComment(
-      cfg,
-      issueNumber,
-      attestPipelineComment(
-        "auto-recovery-limit",
-        [
-          RECOVERY_LIMIT_MARKER,
-          "",
-          `Implementation produced no commits after ${recoveryCount} retries. ` +
-            `This issue may already be resolved on \`${cfg.base_branch}\`, or it may need manual intervention.`,
-          "",
-          "@comamitc",
-          "",
-          "---",
-          "*Automated by Claude Code Pipeline Skill*",
-        ].join("\n"),
-      ),
-    );
+    await postComment(cfg, issueNumber, buildAutoRecoveryLimitComment(cfg, recoveryCount));
     return {
       advanced: false,
       status: "blocked",
@@ -98,21 +114,7 @@ export async function tryAutoRecover(
   }
   await addLabel(cfg, issueNumber, "pipeline:ready");
 
-  await postComment(
-    cfg,
-    issueNumber,
-    attestPipelineComment(
-      "auto-recovery",
-      [
-        `${RECOVERY_MARKER} (${recoveryCount + 1}/${cfg.auto_recovery_max_retries})`,
-        "",
-        "Implementation failed with no commits produced. Worktree cleaned up and issue reset to **ready** for retry.",
-        "",
-        "---",
-        "*Automated by Claude Code Pipeline Skill*",
-      ].join("\n"),
-    ),
-  );
+  await postComment(cfg, issueNumber, buildAutoRecoveryComment(cfg, recoveryCount));
 
   // Evidence bundle (#147): record the recovery event. Best-effort + gated on
   // stateDir, so unit tests have no filesystem side effects.
