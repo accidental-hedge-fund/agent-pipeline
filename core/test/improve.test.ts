@@ -20,6 +20,7 @@ import {
   applyIssues,
   proposedTitle,
   listOpenImproveIssuesArgs,
+  parseOpenImproveIssuesPages,
   type ClusterEntry,
   type ImproveDeps,
   type OpenImproveIssue,
@@ -659,22 +660,78 @@ test("formatJson: papercut cluster emits category: papercut", () => {
 // 6.4 listOpenImproveIssuesArgs (#421 review 2: truncation regression)
 // ---------------------------------------------------------------------------
 
-test("listOpenImproveIssuesArgs: filters by title server-side instead of relying on --limit", () => {
-  // Regression for #421 review 2 finding: a client-side title filter applied
-  // *after* a `--limit 200` fetch silently drops matching issues in repos with
-  // 200+ newer unrelated issues. A `--search ... in:title` term makes the
-  // fetch itself scoped to `[pipeline-improve]` issues, so `--limit` no longer
-  // bounds unrelated repo issues out of the result.
+test("listOpenImproveIssuesArgs: paginates the plain issues endpoint instead of a capped search", () => {
+  // Regression for #421 review 2 (round 2) finding: GitHub's search API hard-caps *any*
+  // search at 1,000 total results, so a `--search ... in:title` fetch — no matter how high
+  // `--limit` is set — silently drops matches in repos with 1,000+ `[pipeline-improve]`
+  // issues. The plain `repos/{owner}/{repo}/issues` REST endpoint has no such cap; `--paginate`
+  // must be present to follow every page to completion.
   const args = listOpenImproveIssuesArgs();
-  const searchIdx = args.indexOf("--search");
-  assert.notEqual(searchIdx, -1, "expected a --search flag scoping the fetch by title");
-  assert.equal(args[searchIdx + 1], `"[pipeline-improve]" in:title`);
-
-  const limitIdx = args.indexOf("--limit");
-  assert.notEqual(limitIdx, -1);
+  assert.equal(args.indexOf("--search"), -1, "must not use the capped search API");
+  assert.ok(args.includes("--paginate"), "expected --paginate to fetch every page to completion");
+  assert.ok(args.includes("--slurp"), "expected --slurp so paginated pages can be flattened");
   assert.ok(
-    Number(args[limitIdx + 1]) > 200,
-    "limit must exceed the old 200 cap now that --search already scopes the fetch",
+    args.some((a) => a.startsWith("repos/") && a.includes("/issues")),
+    "expected the plain repo issues endpoint, not a search query",
+  );
+});
+
+test("parseOpenImproveIssuesPages: no truncation across 1,200 matching issues spanning many pages", () => {
+  // Regression for #421 review 2 round 2: search-API-based retrieval silently drops matches
+  // past 1,000 total results. Simulate 1,200 `[pipeline-improve]` issues spread across 12
+  // `--paginate --slurp` pages (100 each, matching the real per_page) and assert every one
+  // survives flattening — including the oldest, which a truncated fetch would drop first.
+  const pages = Array.from({ length: 12 }, (_, pageIdx) =>
+    Array.from({ length: 100 }, (_, i) => {
+      const n = pageIdx * 100 + i;
+      return {
+        title: `[pipeline-improve] Recurring papercut: issue ${n}`,
+        state: "open",
+        created_at: "2024-01-01T00:00:00Z",
+        html_url: `https://github.com/o/r/issues/${n}`,
+        labels: [],
+      };
+    }),
+  );
+  const result = parseOpenImproveIssuesPages(pages);
+  assert.equal(result.length, 1200, "expected all 1,200 matching issues, not capped at 1,000");
+  assert.ok(
+    result.some((i) => i.title === "[pipeline-improve] Recurring papercut: issue 1199"),
+    "the oldest/last-paged issue must survive — a 1,000-result cap would drop it",
+  );
+});
+
+test("parseOpenImproveIssuesPages: drops pull requests and non-matching titles", () => {
+  const pages = [
+    [
+      {
+        title: "[pipeline-improve] Recurring papercut: foo",
+        state: "open",
+        created_at: "2024-01-01T00:00:00Z",
+        html_url: "https://github.com/o/r/issues/1",
+        labels: [],
+      },
+      {
+        title: "[pipeline-improve] Recurring papercut: pr",
+        state: "open",
+        created_at: "2024-01-01T00:00:00Z",
+        html_url: "https://github.com/o/r/pull/2",
+        labels: [],
+        pull_request: {},
+      },
+      {
+        title: "unrelated issue",
+        state: "open",
+        created_at: "2024-01-01T00:00:00Z",
+        html_url: "https://github.com/o/r/issues/3",
+        labels: [],
+      },
+    ],
+  ];
+  const result = parseOpenImproveIssuesPages(pages);
+  assert.deepEqual(
+    result.map((i) => i.title),
+    ["[pipeline-improve] Recurring papercut: foo"],
   );
 });
 

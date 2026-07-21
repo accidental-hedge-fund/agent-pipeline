@@ -29,10 +29,9 @@ export interface ClusterEntry {
 }
 
 /** An open GitHub issue whose title carries the `[pipeline-improve]` prefix
- *  (#421 dedup). Confirmed field shape against real `gh issue list --json
- *  title,state,createdAt,number,url,labels` output: `state` is `"OPEN"` /
- *  `"CLOSED"` (uppercase), `labels` is `{ name: string }[]`, `createdAt` is
- *  ISO-8601. */
+ *  (#421 dedup). Normalized from `gh api repos/{owner}/{repo}/issues` (REST) pages: the raw
+ *  shape uses `html_url`/`created_at`/lowercase `state`, mapped to this shape's
+ *  `url`/`createdAt`/uppercase `"OPEN" | "CLOSED"` by `parseOpenImproveIssuesPages`. */
 export interface OpenImproveIssue {
   title: string;
   url: string;
@@ -76,24 +75,44 @@ export function proposedTitle(c: Pick<ClusterEntry, "category" | "signal">): str
   return `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
 }
 
-/** `gh issue list` args for fetching `[pipeline-improve]`-titled issues (#421 review 2
- *  finding: `--limit 200` applied before the local title filter silently dropped matches
- *  in repos with 200+ newer unrelated issues). `--search ... in:title` filters
- *  server-side, so `--limit` bounds the number of `[pipeline-improve]` issues rather than
- *  the number of unrelated issues in the repo. Exported for regression testing. */
+/** `gh api` args for fetching every repo issue, paginated to completion (#421 review 2
+ *  finding: `--search ... in:title` scopes the query server-side, but GitHub's search API
+ *  hard-caps *any* search at 1,000 total results — no `--limit` value can raise that ceiling,
+ *  so repos with 1,000+ `[pipeline-improve]` issues would still silently drop matches. The
+ *  plain `repos/{owner}/{repo}/issues` REST endpoint has no such cap: `--paginate` follows
+ *  every page to completion, and `--slurp` wraps each page's array into an outer array (see
+ *  `getOpenIssues` in `gh.ts` for the same pattern). Title filtering happens client-side in
+ *  `listOpenImproveIssues` below. Exported for regression testing. */
 export function listOpenImproveIssuesArgs(): string[] {
-  return [
-    "issue",
-    "list",
-    "--state",
-    "all",
-    "--search",
-    `"[pipeline-improve]" in:title`,
-    "--json",
-    "title,state,createdAt,number,url,labels",
-    "--limit",
-    "1000",
-  ];
+  return ["api", "repos/{owner}/{repo}/issues?state=all&per_page=100", "--paginate", "--slurp"];
+}
+
+/** Raw shape of one issue as returned by `gh api repos/{owner}/{repo}/issues`. */
+export interface RawApiIssue {
+  title: string;
+  state: string;
+  created_at: string;
+  html_url: string;
+  labels: Array<{ name: string }>;
+  /** Present on pull requests; absent on issues. The REST issues endpoint lists both. */
+  pull_request?: unknown;
+}
+
+/** Flatten `--slurp`-wrapped pages (`[[page1...], [page2...], ...]`), drop pull requests, and
+ *  filter to `[pipeline-improve]`-titled issues. Pure and exported so completeness across many
+ *  pages (#421 review 2 round 2: no truncation at 1,000+ matches) can be regression-tested
+ *  without a real `gh` process. */
+export function parseOpenImproveIssuesPages(pages: RawApiIssue[][]): OpenImproveIssue[] {
+  return pages
+    .flat()
+    .filter((i) => !i.pull_request && i.title.startsWith("[pipeline-improve]"))
+    .map((i) => ({
+      title: i.title,
+      url: i.html_url,
+      state: (i.state?.toLowerCase() === "closed" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
+      createdAt: i.created_at,
+      labels: (i.labels ?? []).map((l) => l.name),
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -136,29 +155,15 @@ export function realImproveDeps(repoDir: string): ImproveDeps {
       return r.status === 0;
     },
     listOpenImproveIssues: async () => {
-      // --state all (not "open"): the auto-file rate-window cap (#421 finding 3)
+      // state=all (not "open"): the auto-file rate-window cap (#421 finding 3)
       // must count closed auto-filed issues too, so callers that need only open
       // issues (dedup) filter on `state === "OPEN"` themselves.
       const r = spawnSync("gh", listOpenImproveIssuesArgs(), { encoding: "utf8", cwd: repoDir });
       if (r.status !== 0) {
         throw new Error(`gh issue list failed: ${r.stderr?.trim() ?? "unknown error"}`);
       }
-      const raw = JSON.parse(r.stdout || "[]") as Array<{
-        title: string;
-        state: string;
-        createdAt: string;
-        url: string;
-        labels: Array<{ name: string }>;
-      }>;
-      return raw
-        .filter((i) => i.title.startsWith("[pipeline-improve]"))
-        .map((i) => ({
-          title: i.title,
-          url: i.url,
-          state: (i.state === "CLOSED" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
-          createdAt: i.createdAt,
-          labels: (i.labels ?? []).map((l) => l.name),
-        }));
+      const pages = JSON.parse(r.stdout || "[]") as RawApiIssue[][];
+      return parseOpenImproveIssuesPages(pages);
     },
     log: (msg) => process.stdout.write(msg + "\n"),
   };
