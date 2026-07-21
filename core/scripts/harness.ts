@@ -32,6 +32,10 @@
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
+import { resolveAdapter } from "./harness-adapters/index.ts";
+import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
+import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
+import type { AdapterProbe } from "./harness-adapters/types.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
@@ -107,27 +111,14 @@ export interface HarnessTelemetry {
   usage: Record<string, unknown> | null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseJsonLine(line: string): Record<string, unknown> | null {
-  const trimmed = line.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    return isRecord(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * Parse a captured JSONL telemetry stream from a built-in harness back into
- * `{ text, costUsd, usage }` (#429). Pure and never throws — absent, truncated,
- * or non-JSON output yields a null/empty result so callers can fall back to
- * the raw captured stdout and an `unknown` cost source without failing the
- * stage (design.md decision 3).
+ * Parse a captured telemetry stream from a harness adapter back into
+ * `{ text, costUsd, usage }` (#429, generalized to a registry lookup by
+ * #431). Pure and never throws — absent, truncated, or non-JSON output
+ * yields a null/empty result so callers can fall back to the raw captured
+ * stdout and an `unknown` cost source without failing the stage (design.md
+ * decision 3). Unregistered harness names (custom reviewer CLIs, #40) yield
+ * the empty result, matching pre-#431 behavior exactly.
  *
  * Verified shapes (design.md — confirmed against the installed CLIs):
  *  - claude `--output-format stream-json`: the last `{"type":"result"}` line
@@ -137,106 +128,19 @@ function parseJsonLine(line: string): Record<string, unknown> | null {
  *    carries a `usage` object with token counters and no cost field.
  */
 export function parseHarnessTelemetry(harness: string, capturedStdout: string): HarnessTelemetry {
-  if (harness === "claude") return parseClaudeTelemetry(capturedStdout);
-  if (harness === "codex") return parseCodexTelemetry(capturedStdout);
-  return { text: null, costUsd: null, usage: null };
+  const adapter = resolveAdapter(harness);
+  if (!adapter) return { text: null, costUsd: null, usage: null };
+  return adapter.parseTelemetry(capturedStdout);
 }
 
-function parseClaudeTelemetry(capturedStdout: string): HarnessTelemetry {
-  const lines = capturedStdout.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const obj = parseJsonLine(lines[i]);
-    if (!obj || obj.type !== "result") continue;
-    const text = typeof obj.result === "string" ? obj.result : null;
-    const costUsd =
-      typeof obj.total_cost_usd === "number" && Number.isFinite(obj.total_cost_usd)
-        ? obj.total_cost_usd
-        : null;
-    const usage = isRecord(obj.usage) ? obj.usage : null;
-    return { text, costUsd, usage };
-  }
-  return { text: null, costUsd: null, usage: null };
-}
-
-function parseCodexTelemetry(capturedStdout: string): HarnessTelemetry {
-  const lines = capturedStdout.split("\n");
-  let text: string | null = null;
-  let usage: Record<string, unknown> | null = null;
-  for (const line of lines) {
-    const obj = parseJsonLine(line);
-    if (!obj) continue;
-    if (
-      obj.type === "item.completed" &&
-      isRecord(obj.item) &&
-      obj.item.type === "agent_message" &&
-      typeof obj.item.text === "string"
-    ) {
-      text = obj.item.text;
-    } else if (obj.type === "turn.completed" && isRecord(obj.usage)) {
-      usage = obj.usage;
-    }
-  }
-  // Codex never reports a per-call cost field (design.md — verified).
-  return { text, costUsd: null, usage };
-}
-
-/** Extract human-meaningful assistant text from one already-parsed telemetry
- *  line, for live terminal forwarding (#429). Returns null for every line that
- *  is not a verified assistant-text-bearing shape — envelope/metadata lines
- *  (system, rate_limit_event, turn.completed, …) are never forwarded. */
-function extractForwardableText(harness: string, obj: Record<string, unknown>): string | null {
-  if (harness === "claude") {
-    if (obj.type !== "stream_event" || !isRecord(obj.event)) return null;
-    const event = obj.event;
-    if (
-      event.type === "content_block_delta" &&
-      isRecord(event.delta) &&
-      event.delta.type === "text_delta" &&
-      typeof event.delta.text === "string"
-    ) {
-      return event.delta.text;
-    }
-    return null;
-  }
-  if (harness === "codex") {
-    if (
-      obj.type === "item.completed" &&
-      isRecord(obj.item) &&
-      obj.item.type === "agent_message" &&
-      typeof obj.item.text === "string"
-    ) {
-      return `${obj.item.text}\n`;
-    }
-    return null;
-  }
-  return null;
-}
-
-/** Build a stateful per-call transform that buffers partial JSON lines across
- *  chunk boundaries and forwards only the assistant text extracted by
- *  `extractForwardableText` — raw envelope JSON is never forwarded (#429). */
+/** Legacy standalone accessor retained for direct unit testing of the
+ *  claude/codex live-forwarding transforms (#429). `invoke()` itself uses
+ *  each adapter's own `buildInvocation().transformForward` instead of this
+ *  name-keyed lookup. Unregistered/other adapter names forward verbatim. */
 export function makeTelemetryForwardTransform(harness: string): (chunk: string) => string {
-  let buffered = "";
-  return (chunk: string): string => {
-    buffered += chunk;
-    const lines = buffered.split("\n");
-    buffered = lines.pop() ?? "";
-    let out = "";
-    for (const line of lines) {
-      const obj = parseJsonLine(line);
-      if (!obj) continue;
-      const text = extractForwardableText(harness, obj);
-      if (text) out += text;
-    }
-    return out;
-  };
-}
-
-/** `PIPELINE_HARNESS_TELEMETRY=off` is an escape-hatch kill-switch (#429), not
- *  a config surface: no `pipeline.yml` key, so nothing new to validate,
- *  document, or default-demote (design.md decision 3). */
-function harnessTelemetryEnabled(): boolean {
-  return process.env.PIPELINE_HARNESS_TELEMETRY !== "off";
+  if (harness === "claude") return makeClaudeForwardTransform();
+  if (harness === "codex") return makeCodexForwardTransform();
+  return (chunk: string) => chunk;
 }
 
 export interface HarnessResult {
@@ -326,49 +230,42 @@ export async function invoke(
   const stream = opts.stream ?? true;
   const timeoutSec = opts.timeoutSec ?? 1200;
 
+  // #431: dispatch through the adapter registry rather than branching on
+  // harness names. A name with no registered adapter takes the unregistered
+  // custom-reviewer-CLI path (#40) verbatim: `<cmd> <prompt>`.
+  const adapter = resolveAdapter(harness);
   let cmd: string;
   let args: string[];
-  let custom = false;
-  // Telemetry mode is the default for both built-in harnesses (#429);
-  // PIPELINE_HARNESS_TELEMETRY=off restores the pre-#429 plain-text argv.
-  const telemetryMode =
-    harnessTelemetryEnabled() && (harness === "claude" || harness === "codex");
-  if (harness === "claude") {
-    cmd = "claude";
-    const permMode = opts.sandbox ? "default" : "bypassPermissions";
-    args = telemetryMode
-      ? ["--print", "--permission-mode", permMode, "--verbose", "--output-format", "stream-json", "--include-partial-messages"]
-      : ["--print", "--permission-mode", permMode, "--output-format", "text"];
-    if (opts.lean) {
-      // Lean single-shot generation. `--tools` is variadic, so its empty value
-      // ("" = disable all tools) is placed immediately before `--strict-mcp-config`
-      // (a flag) — never before the trailing prompt positional, which the variadic
-      // would otherwise swallow.
-      args.push("--tools", "", "--strict-mcp-config");
-    }
-    if (opts.model) args.push("--model", opts.model);
-    if (opts.reasoningEffort) args.push("--effort", opts.reasoningEffort);
-    args.push(prompt);
-  } else if (harness === "codex") {
-    cmd = "codex";
-    const noSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
-    args = ["exec"];
-    if (telemetryMode) args.push("--json");
-    args.push(noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto", "-C", worktreeDir);
-    if (opts.model) args.push("-m", opts.model);
-    if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort=${opts.reasoningEffort}`);
-    args.push(prompt);
+  let cwd: string;
+  let captureMode: "head" | "tail" | undefined;
+  let transformForward: ((chunk: string) => string) | undefined;
+  const custom = adapter === null;
+  if (adapter) {
+    const inv = adapter.buildInvocation({
+      prompt,
+      worktreeDir,
+      model: opts.model,
+      effort: opts.reasoningEffort,
+      sandbox: opts.sandbox,
+      lean: opts.lean,
+      env: opts.env,
+    });
+    cmd = inv.cmd;
+    args = inv.args;
+    cwd = inv.cwd;
+    captureMode = inv.captureMode;
+    transformForward = inv.transformForward;
   } else {
     // A user-configured reviewer CLI (`review_harness`, #40). Invoke it with the
     // prompt as a single positional argument; its stdout is the verdict output
     // (parsed by parseStructuredVerdict, exactly like a built-in reviewer).
     cmd = harness;
     args = [prompt];
-    custom = true;
+    cwd = worktreeDir;
   }
 
   const startedAt = new Date();
-  const result = await runCapped(cmd, args, worktreeDir, timeoutSec, stream, harness, {
+  const result = await runCapped(cmd, args, cwd, timeoutSec, stream, harness, {
     killProcessGroup: true,
     timeoutEvent: opts.accounting
       ? {
@@ -380,17 +277,18 @@ export async function invoke(
     env: opts.env,
     // The cost/usage-bearing envelope line always arrives last, so telemetry
     // capture keeps the tail of the stream rather than the head (#429).
-    captureMode: telemetryMode ? "tail" : undefined,
-    transformForward: telemetryMode ? makeTelemetryForwardTransform(harness) : undefined,
+    captureMode,
+    transformForward,
   });
   const endedAt = new Date();
 
   // Recover per-call cost/usage from the captured envelope and reconstruct the
   // final assistant text as `stdout` (#429) — every existing consumer (verdict
   // parsing, fix rounds, gates) sees the same `stdout` shape as plain-text mode.
-  // Parsing never throws; an unparseable envelope falls back to the raw
-  // captured output and leaves accounting at `cost_source: "unknown"`.
-  const telemetry = telemetryMode ? parseHarnessTelemetry(harness, result.stdout) : null;
+  // Parsing never throws; an unparseable envelope (or an adapter with no
+  // telemetry capability at all) falls back to the raw captured output and
+  // leaves accounting at `cost_source: "unknown"`.
+  const telemetry = adapter ? adapter.parseTelemetry(result.stdout) : null;
   const finalResult: HarnessResult =
     telemetry && telemetry.text !== null ? { ...result, stdout: telemetry.text } : result;
 
@@ -400,6 +298,18 @@ export async function invoke(
       telemetry && (telemetry.costUsd !== null || telemetry.usage !== null)
         ? { total_cost_usd: telemetry.costUsd, usage: telemetry.usage }
         : opts.accounting.usage;
+    // Treatment-identity provenance (#431 task 6): populated only for a
+    // registered adapter. No per-invocation CLI probe is run here (that
+    // would add subprocess overhead to every model call) — cliVersion and
+    // providerAuthClass are recorded as unknown rather than fabricated,
+    // matching the "unreported provenance is recorded as unknown" contract.
+    const treatment = adapter
+      ? adapter.describeTreatment(
+          { model: opts.model, effort: opts.reasoningEffort },
+          { cmd, args, cwd },
+          { cliVersion: null, providerAuthClass: "unknown" } satisfies AdapterProbe,
+        )
+      : null;
     const record = buildStageAccountingRecord({
       runId: path.basename(opts.accounting.runDir),
       issue: opts.accounting.issue,
@@ -419,6 +329,16 @@ export async function invoke(
       promptChars: prompt.length,
       promptEstimatedTokens: Math.ceil(prompt.length / 4),
       effort: opts.reasoningEffort ?? null,
+      adapter: treatment?.adapter ?? null,
+      adapterCliVersion: treatment?.cliVersion ?? null,
+      providerAuthClass: treatment?.providerAuthClass ?? null,
+      requestedModel: treatment?.requestedModel ?? null,
+      resolvedModel: treatment?.resolvedModel ?? null,
+      requestedEffort: treatment?.requestedEffort ?? null,
+      resolvedEffort: treatment?.resolvedEffort ?? null,
+      nativeFlags: treatment?.nativeFlags ?? null,
+      fallback: treatment?.fallback ?? null,
+      terminationReason: harnessOutcome(finalResult),
     });
     await emitStageAccounting(
       opts.accounting.runDir,

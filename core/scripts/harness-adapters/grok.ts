@@ -1,0 +1,102 @@
+// grok adapter — Grok Build CLI (#431 task 3). Argv verified on-machine
+// against an installed `grok 0.2.93 (f00f9631)` (design.md decision 4):
+//
+//   grok --single <PROMPT> --cwd <CWD> --output-format plain --verbatim
+//        --permission-mode <mode> [-m <model>] [--reasoning-effort <effort>]
+//
+// `--output-format json/streaming-json` exist but their payload SCHEMA is not
+// verified (only the flag names are, per `grok --help`) — golden rule 5
+// forbids guessing an unverified schema, so this adapter invokes with
+// `--output-format plain` (guaranteed-usable assistant text as stdout) and
+// declares `telemetry: "none"`, matching the pre-#431 treatment every
+// third-party reviewer CLI already received. `parseTelemetry` degrades to
+// nulls, same as no telemetry data at all — cost stays `cost_source:
+// "unknown"`, unchanged from today's custom-CLI accounting.
+
+import {
+  EMPTY_TELEMETRY,
+  type AdapterCapabilities,
+  type AdapterInvocation,
+  type AdapterInvocationContext,
+  type AdapterPreflightDeps,
+  type AdapterPreflightResult,
+  type AdapterProbe,
+  type AdapterRequest,
+  type HarnessAdapter,
+  type HarnessTelemetry,
+  type HarnessTreatment,
+} from "./types.ts";
+
+const CAPABILITIES: AdapterCapabilities = {
+  model: true,
+  effort: true,
+  sandbox: true,
+  workingDir: "flag",
+  telemetry: "none",
+};
+
+export const grokAdapter: HarnessAdapter = {
+  name: "grok",
+  capabilities: CAPABILITIES,
+
+  buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
+    const args = [
+      "--single",
+      ctx.prompt,
+      "--cwd",
+      ctx.worktreeDir,
+      "--output-format",
+      "plain",
+      "--verbatim",
+      "--permission-mode",
+      ctx.sandbox ? "default" : "bypassPermissions",
+    ];
+    if (ctx.model) args.push("-m", ctx.model);
+    if (ctx.effort) args.push("--reasoning-effort", ctx.effort);
+    return { cmd: "grok", args, cwd: ctx.worktreeDir };
+  },
+
+  async preflight(deps: AdapterPreflightDeps, _req: AdapterRequest): Promise<AdapterPreflightResult> {
+    const present = await deps.execCheck("grok", ["--version"]);
+    if (!present) {
+      return {
+        ok: false,
+        failure: "missing-cli",
+        message: "grok CLI not found on PATH — install Grok Build and run `grok login`.",
+      };
+    }
+    // `grok models` is a lightweight authenticated-only probe (design.md
+    // decision 4): it requires a completed login to succeed.
+    const authRes = await deps.exec("grok", ["models"]);
+    if (!authRes.ok) {
+      return {
+        ok: false,
+        failure: "unauthenticated",
+        authState: "unauthenticated",
+        message: "grok CLI is installed but not authenticated — run `grok login`.",
+      };
+    }
+    return { ok: true, authState: "authenticated" };
+  },
+
+  parseTelemetry(_capturedStdout: string): HarnessTelemetry {
+    return EMPTY_TELEMETRY;
+  },
+
+  describeTreatment(req: AdapterRequest, _inv: AdapterInvocation, probe: AdapterProbe): HarnessTreatment {
+    const nativeFlags: string[] = [];
+    if (req.model) nativeFlags.push("-m");
+    if (req.effort) nativeFlags.push("--reasoning-effort");
+    return {
+      adapter: "grok",
+      cliVersion: probe.cliVersion,
+      providerAuthClass: probe.providerAuthClass,
+      requestedModel: req.model ?? null,
+      resolvedModel: req.model ?? null,
+      requestedEffort: req.effort ?? null,
+      resolvedEffort: req.effort ?? null,
+      nativeFlags,
+      fallback: false,
+    };
+  },
+};

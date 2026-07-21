@@ -97,6 +97,62 @@ written. The spec deltas therefore constrain *behavior* (headless, non-interacti
 working directory, model/effort mapped or explicitly declared unsupported, machine-readable output
 when the CLI offers one) and never name a flag for these two.
 
+**OpenCode — verified** via `npx --yes opencode-ai@latest --help` / `run --help` / `providers --help`
+(npm package `opencode-ai`, bin `opencode`, maintainer thdxr/SST):
+
+- `opencode run [message..]` — non-interactive single-turn mode; `message` is the prompt positional
+  (default `--interactive` is `false` for `run`, so no TUI is spawned)
+- `--dir <dir>` — "directory to run in" → `workingDir: "flag"`
+- `-m, --model <provider/model>` — model flag, format `provider/model` (so requested model must
+  already be in that shape or the adapter must prefix a provider; if the configured model has no
+  `/`, preflight fails rather than guessing a provider)
+- `--variant <level>` — "model variant (provider-specific reasoning effort, e.g., high, max,
+  minimal)" → effort flag; values are provider-specific and are recorded verbatim (decision 6), no
+  mapping
+- `--format default|json` — `json` = "raw JSON events" → `telemetry: "jsonl"`
+- `--auto` — "auto-approve permissions that are not explicitly denied (dangerous!)" — the closest
+  thing to a sandbox/permission-mode flag; treated as the adapter's `sandbox` capability. Default
+  (no `--auto`) is unattended-unsafe for a fully headless pipeline run (it can block on a permission
+  prompt with no TTY to answer it), so the adapter always passes `--auto` for pipeline invocations
+  and records that fact in `describeTreatment`.
+- `-c, --continue` / `-s, --session` — session resume; unused (pipeline stages are single-turn)
+- `opencode providers list` (alias `opencode providers ls` / `opencode auth`) — lists configured
+  provider credentials; used by preflight as the login-state probe. No documented flag reports
+  auth state as clean machine-readable JSON, so preflight parses the human-readable list output for
+  a non-empty provider entry; if that ever changes shape, preflight degrades to "authenticated
+  state unknown" rather than crashing (never inferred from the model name — decision 5).
+- No documented `--cwd`-vs-repo-root distinction beyond `--dir`; no separate "headless capability
+  probe" flag exists, so preflight's "headless mode available" check is satisfied by the CLI being
+  on `PATH` and `run --help` succeeding (i.e. the `run` subcommand exists in this version).
+
+**Pi (Pi Coding Agent) — verified** via `README.md` at `github.com/badlogic/pi-mono` (package
+`@mariozechner/pi-coding-agent`, project site `pi.dev`, by Armin Ronacher / earendil-works):
+
+- `-p, --print` — "Print response and exit" → single-turn headless mode; prompt passed as a
+  trailing positional argument (`pi -p "<prompt>"`)
+- `--mode json` — "Output all events as JSON lines" → `telemetry: "jsonl"`
+- `--provider <name>` + `--model <pattern>` — model selection (`provider/id` or bare id with
+  optional `:<thinking>` suffix)
+- `--thinking <level>` — reasoning effort, one of `off|minimal|low|medium|high|xhigh|max` → effort
+  flag, recorded verbatim, no mapping
+- `-a, --approve` / `-na, --no-approve` — trust/permission mode for project-local files; the
+  adapter always passes `-a` for pipeline invocations (unattended headless run, no TTY to answer a
+  trust prompt) and records that in `describeTreatment` → `sandbox: true` capability, always-on for
+  pipeline use
+- **No documented `--cwd`/`-C` flag.** Pi has no working-directory override; it operates on the
+  process's current working directory. → `workingDir: "cwd"` (adapter spawns with `cwd` set to the
+  stage worktree, like claude's mechanism, not like codex/grok's explicit flag).
+- **No documented non-interactive login-status probe.** The only auth commands found are the
+  interactive `/login`/`/logout` REPL commands and an `--api-key <key>` override flag; there is no
+  `pi auth status`-equivalent. Preflight therefore can verify "CLI on `PATH`" and "`-p`/`--mode
+  json` flags exist in `pi --help`" but **cannot** distinguish "authenticated" from
+  "unauthenticated" before spawning a real request. Per decision 7 ("preflight fails loudly rather
+  than silently drop"), the pi adapter's preflight reports this sub-check as
+  `authState: "unknown"` (not `pass`/`fail`) with an explicit message that pi has no documented
+  auth-status probe and the first real invocation is the actual auth test — this is a documented
+  adapter limitation, not a guess, and doctor surfaces it as a distinct informational result rather
+  than blocking the run on it.
+
 ## Decision 5 — Adapter identity ≠ provider identity
 
 `AdapterProbe` carries `{ cliVersion, providerAuthClass }`. `providerAuthClass` is a coarse,
