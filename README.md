@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 14-stage state machine — planning → plan-review → implementing → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 15-stage state machine — planning → plan-review → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate. It does **not** auto-merge; you own the merge button.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
@@ -714,6 +714,18 @@ test_gate:                           # run the repo's own tests/build before ope
   command: "pnpm test"               # optional explicit command; auto-detected when absent
   max_attempts: 3                    # fix-harness invocations before blocking
   timeout: 300                       # seconds per test/build run
+design_gate:                         # risk-triggered design-interrogation gate, between implementing and review-1 (#436)
+  enabled: false                    # default: false; disabled repos see no behavior change at all
+  triggers: [storage, auth]          # subset of built-in risk classes to arm (default: all — concurrency, storage, auth, migration, infrastructure, public-api, architecture)
+  extra_triggers:                    # merge additional path globs into a named class
+    storage: ["**/*warehouse*.*"]
+  max_rounds: 2                      # interrogation/response rounds before parking at needs-human
+  block_threshold: medium            # challenges at/above this severity block; below advise only
+  min_confidence: 0.6                # challenges below this confidence advise rather than block
+  limits:
+    max_decisions: 8                 # decisions retained per record
+    max_field_chars: 4000            # characters per free-text field before truncation
+    max_artifact_bytes: 65536        # persisted decision-record artifact byte ceiling
 visual_gate:                         # run the repo's E2E/visual suite after pre-merge, before eval-gate
   enabled: false                     # default: false; set true to enable (one-time declaration per repo)
   command: "npx playwright test"     # shell command to run; supports pipes, env vars, &&, etc.
@@ -1295,6 +1307,28 @@ Pipeline-Run: <n>/<UTC-ISO-datetime>
 ```
 
 The `Pipeline-Run` id is generated once per `/pipeline` invocation and reused for every commit in that run, so `git log --grep="Pipeline-Run: 42/"` surfaces all commits from every run on issue #42, and `git log --format="%(trailers:key=Issue)"` reads the issue link back via `git interpret-trailers`. The test/build gate enforces it: if a fix-harness commit lands without both trailers, the gate blocks rather than advancing. There is no toggle.
+
+### Design-interrogation gate (#436)
+
+`design_gate` sits between `implementing` and `review-1`. It is a real stage — traversed on every run — but it is **inert unless enabled and a risk trigger matches**: a disabled or untriggered run advances immediately with a recorded reason and zero harness calls, so existing repos and low-risk work observe no behavior change at all.
+
+- **Trigger evaluation is deterministic.** After `implementing` produces commits, a pure function checks the changed-file set, the issue's labels, and the diff size against the armed built-in risk classes: `concurrency`, `storage`, `auth`, `migration`, `infrastructure`, `public-api`, `architecture`. `triggers` (default: all) selects which classes are armed; `extra_triggers` merges additional path globs into a named class. Every run — fired or not — records why in the evidence bundle (`gate-disabled` or `no-trigger-matched` when it didn't fire; the matched trigger(s) and evidence when it did).
+- **When it fires**, the implementer harness is asked to make its material design decisions explicit: the decision and affected surface, alternatives considered and why rejected, assumptions/invariants, supporting repository evidence, the generalization boundary, and honest uncertainty — never chain-of-thought. The record is schema-versioned, validated (a decision with no alternatives, or a missing required field, is rejected and re-requested), size-bounded (`limits.max_decisions`/`max_field_chars`/`max_artifact_bytes`, with explicit truncation markers — never silent drops), and secret-redacted before it is persisted and embedded as a hidden artifact in the gate's issue comment.
+- **An independent reviewer** — the configured `review_harness` (the same independence mechanism as diff review) — challenges the record with 3–7 falsifiable challenges, or a clean `approve`. When the reviewer resolves to the same harness/model as the implementer, the round still runs, but the comment and evidence bundle explicitly disclose `same-harness-fallback` rather than overstating independence. A malformed/unparseable reviewer response gets one bounded re-ask, then blocks — it is never silently treated as approval.
+- **A challenge blocks** when its severity is at/above `block_threshold` (default `medium`) **and** its confidence is at/above `min_confidence` (default `0.6`); otherwise it's advisory evidence and does not block. For each blocking challenge the implementer must **defend** it (with evidence), **revise** the decision (re-emitted as a new record version), **accept the uncertainty explicitly**, or mark it **out-of-scope** (deferred, not expanding the change).
+- **The loop is bounded and recurrence-aware**, mirroring the review layer's hard-won convergence rules: `max_rounds` (default 2) caps interrogation/response rounds, and a blocking challenge that recurs after a response round parks at `needs-human` immediately — without spending further round budget — rather than looping indefinitely. Both the recurrence park and round-budget exhaustion post a punch list naming each unresolved challenge before the transition.
+- The full decision → challenge → response → verdict chain (with reviewer identity/independence) is recorded in the evidence bundle and rendered in the human-readable summary — redacted, with no hidden model reasoning captured. The gate never expands product scope beyond the issue/approved plan and never gains merge/release authority; it adds a coverage gate, replacing neither plan review nor standard/adversarial diff review.
+
+```yaml
+design_gate:
+  enabled: true
+  triggers: [storage, auth, migration]
+  max_rounds: 2
+  block_threshold: medium
+  min_confidence: 0.6
+```
+
+**Rollback** is `design_gate: { enabled: false }` (or simply omitting the block — off by default).
 
 ### Visual gate
 

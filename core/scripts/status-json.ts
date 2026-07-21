@@ -82,6 +82,7 @@ export function deriveNextAction(stage: string | null, blocked: boolean): string
     planning: "Planning is in progress.",
     "plan-review": "Plan review is in progress.",
     implementing: "Implementation is in progress.",
+    "design-gate": "Design-interrogation gate will run next (inert unless enabled and a risk trigger matched).",
     "review-1": "Standard review will run next.",
     "review-2": "Adversarial review will run next.",
     "fix-1": "Fix pass 1 will run next.",

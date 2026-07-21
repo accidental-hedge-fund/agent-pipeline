@@ -159,6 +159,11 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "for this round's commit (see the output above). Fix the build in the " +
     "worktree, commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
+  "design-gate-failed":
+    "The design-interrogation gate (#436) could not produce a valid decision " +
+    "record or challenge verdict after its bounded re-ask, or the reviewer " +
+    "harness is unavailable (see the error above). Investigate and fix the " +
+    "root cause, remove the `blocked` label, then re-run `$pipeline 7`.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {

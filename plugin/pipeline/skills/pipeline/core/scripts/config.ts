@@ -14,6 +14,7 @@ import {
   MODEL_ENDPOINT_DIALECTS,
   MODEL_ENDPOINT_ROUTING_PARAM_KEYS,
   MODEL_ENDPOINT_RESERVED_HEADERS,
+  DESIGN_GATE_TRIGGER_CLASSES,
   type Harness,
   type PipelineConfig,
   type ModelEndpointDialect,
@@ -284,6 +285,34 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Toggle optional pipeline steps on or off."),
+  // Risk-triggered design-interrogation gate (#436). Opt-in; default disabled
+  // so existing repos observe no behavior change. `triggers` selects which
+  // built-in risk classes are armed (default: all); `extra_triggers` merges
+  // additional path globs into a named class.
+  design_gate: z
+    .object({
+      enabled: z.boolean().optional().describe("Enable the design-interrogation gate (default false)."),
+      triggers: z.array(z.enum(DESIGN_GATE_TRIGGER_CLASSES)).optional().describe("Built-in risk classes armed for trigger evaluation (default: all)."),
+      extra_triggers: z
+        .partialRecord(z.enum(DESIGN_GATE_TRIGGER_CLASSES), z.array(z.string()))
+        .optional()
+        .describe("Additional path globs merged into a named trigger class."),
+      max_rounds: z.number().int().min(1).optional().describe("Maximum interrogation/response rounds before parking at needs-human (default 2)."),
+      block_threshold: z.enum(["critical", "high", "medium", "low"]).optional().describe("Challenges at or above this severity block advancement; below advise only (default medium)."),
+      min_confidence: z.number().min(0).max(1).optional().describe("Challenges below this confidence advise rather than block (default 0.6)."),
+      limits: z
+        .object({
+          max_decisions: z.number().int().positive().optional().describe("Maximum decisions retained per record (default 8)."),
+          max_field_chars: z.number().int().positive().optional().describe("Maximum characters per free-text field before truncation (default 4000)."),
+          max_artifact_bytes: z.number().int().positive().optional().describe("Maximum persisted artifact size in bytes (default 65536)."),
+        })
+        .strict()
+        .optional()
+        .describe("Size bounds for the decision-record artifact."),
+    })
+    .strict()
+    .optional()
+    .describe("Risk-triggered design-interrogation gate settings (#436). Off by default."),
   test_gate: z
     .object({
       enabled: z.boolean().optional().describe("Enable the test gate before opening a PR."),
@@ -847,6 +876,19 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       standard_review: fileConfig.steps?.standard_review ?? DEFAULT_CONFIG.steps.standard_review,
       adversarial_review: fileConfig.steps?.adversarial_review ?? DEFAULT_CONFIG.steps.adversarial_review,
       docs: fileConfig.steps?.docs ?? DEFAULT_CONFIG.steps.docs,
+    },
+    design_gate: {
+      enabled: fileConfig.design_gate?.enabled ?? DEFAULT_CONFIG.design_gate.enabled,
+      triggers: fileConfig.design_gate?.triggers ?? DEFAULT_CONFIG.design_gate.triggers,
+      extra_triggers: fileConfig.design_gate?.extra_triggers ?? DEFAULT_CONFIG.design_gate.extra_triggers,
+      max_rounds: fileConfig.design_gate?.max_rounds ?? DEFAULT_CONFIG.design_gate.max_rounds,
+      block_threshold: fileConfig.design_gate?.block_threshold ?? DEFAULT_CONFIG.design_gate.block_threshold,
+      min_confidence: fileConfig.design_gate?.min_confidence ?? DEFAULT_CONFIG.design_gate.min_confidence,
+      limits: {
+        max_decisions: fileConfig.design_gate?.limits?.max_decisions ?? DEFAULT_CONFIG.design_gate.limits.max_decisions,
+        max_field_chars: fileConfig.design_gate?.limits?.max_field_chars ?? DEFAULT_CONFIG.design_gate.limits.max_field_chars,
+        max_artifact_bytes: fileConfig.design_gate?.limits?.max_artifact_bytes ?? DEFAULT_CONFIG.design_gate.limits.max_artifact_bytes,
+      },
     },
     test_gate: {
       enabled: fileConfig.test_gate?.enabled ?? DEFAULT_CONFIG.test_gate.enabled,

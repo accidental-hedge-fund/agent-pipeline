@@ -574,12 +574,43 @@ export function formatSummary(bundle: EvidenceBundle): string {
     }
   }
 
+  if (bundle.designInterrogation) {
+    const di = bundle.designInterrogation;
+    lines.push("");
+    lines.push("Design interrogation:");
+    if (!di.trigger.triggered) {
+      lines.push(`  not triggered (${di.trigger.reason})`);
+    } else {
+      const identity = di.reviewerIdentity
+        ? `${di.reviewerIdentity.harness} (${di.reviewerIdentity.independence})`
+        : "(unknown)";
+      lines.push(`  triggered: ${di.trigger.matched.map((m) => m.trigger).join(", ")}`);
+      lines.push(`  reviewer:  ${identity}`);
+      lines.push(`  rounds:    ${di.rounds.length}`);
+      lines.push(`  outcome:   ${di.outcome ?? "(in progress)"}`);
+    }
+  }
+
   return lines.join("\n");
 }
 
 /** Print the human-readable summary to stdout. */
 export function printSummary(bundle: EvidenceBundle): void {
   console.log(formatSummary(bundle));
+}
+
+/** Write the design-interrogation record to the bundle (#436). Set for every
+ *  run that reaches `design-gate`, whether or not the gate fires. Non-fatal:
+ *  write errors are caught and logged. */
+export async function recordDesignInterrogation(
+  stateDir: string,
+  issue: number,
+  state: import("./types.ts").DesignGateState,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  bundle.designInterrogation = state;
+  await writeBundle(stateDir, issue, bundle, deps);
 }
 
 /** Write the auto-merge eligibility artifact to the bundle (#306).
