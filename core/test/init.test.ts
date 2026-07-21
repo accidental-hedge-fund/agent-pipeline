@@ -305,6 +305,23 @@ test("scaffoldDefaultConfig: scaffolded file includes commented-out repo_map blo
   assert.ok(content.includes("depended_on_by"), "scaffold must mention depended_on_by");
 });
 
+// ---- models: comment documents the post-#441 reviewer-alias contract (#454) ----
+
+test("scaffoldDefaultConfig: scaffolded models: comment documents passthrough + parse-time alias rejection, not the pre-#441 'codex ignores it' contract", async () => {
+  const repo = makeTempRepo();
+  await scaffoldDefaultConfig(repo);
+  const content = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  const modelsLine = content.split("\n").find((line) => line.includes("per-phase model alias"));
+  assert.ok(modelsLine, "scaffold must include the models: comment line");
+  assert.match(modelsLine!, /review is honored by both the claude and codex reviewer harnesses/);
+  assert.match(modelsLine!, /config error/, "must state a Claude alias against a codex reviewer is a config error");
+  assert.doesNotMatch(
+    modelsLine!,
+    /codex ignores (it|the reviewer)/,
+    "must not claim codex ignores the reviewer alias (that was the pre-#441 contract)",
+  );
+});
+
 test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map at empty-list defaults", async () => {
   const repo = makeTempRepo();
   const binDir = makeFakeGhBin({ repoSlug: "acme/scaffold-rm" });

@@ -537,6 +537,137 @@ test("resolveConfig: a non-string review_harness is rejected (strict schema)", a
   }
 });
 
+// ---- reviewer-model alias guard (#454) ----
+//
+// Before v1.15.2, a Claude-only `models.review`/`review_harness.model` alias
+// against a codex reviewer was documented as inert. #441 made the reviewer
+// alias load-bearing (passed through to `codex exec -m <model>`), so that
+// same pre-existing config now 400s mid-run instead of silently no-op'ing.
+// These regressions move the rejection to config-parse time.
+
+test("resolveConfig: models.review set to a Claude alias + reviewer=codex throws at parse time, naming key/value/harness/alternatives (#454)", async () => {
+  const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
+  const binDir = makeFakeGh("acme/alias-guard1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      // claude profile → reviewer=codex
+      () => cfgMod.resolveConfig({ repoPath: repo, profile: "claude" }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) &&
+        err.message.includes("models.review") &&
+        err.message.includes("sonnet") &&
+        err.message.includes("codex") &&
+        err.message.includes("auto"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness.model set to a Claude alias + command=codex throws at parse time, naming review_harness.model (#454)", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: codex\n  model: opus\n`);
+  const binDir = makeFakeGh("acme/alias-guard2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) &&
+        err.message.includes("review_harness.model") &&
+        err.message.includes("opus"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review 'auto' + reviewer=codex resolves cleanly, no throw (#454)", async () => {
+  const repo = makeFakeRepo(`models:\n  review: auto\n`);
+  const binDir = makeFakeGh("acme/alias-guard3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: no models block + reviewer=codex resolves cleanly, no throw (#454)", async () => {
+  const repo = makeFakeRepo(`base_branch: main\n`);
+  const binDir = makeFakeGh("acme/alias-guard4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: models.review set to a Claude alias + reviewer=claude resolves unchanged, no throw (#454)", async () => {
+  const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
+  const binDir = makeFakeGh("acme/alias-guard5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // codex profile (default) → reviewer=claude
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "claude");
+    assert.equal(cfg.models.review, "sonnet");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: tolerateInvalidConfig warns and falls back to the default reviewer model instead of throwing (#454)", async () => {
+  const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
+  const binDir = makeFakeGh("acme/alias-guard6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
+    const warnings = await captureWarnings(() => {
+      // claude profile → reviewer=codex
+      cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude", tolerateInvalidConfig: true });
+    });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.notEqual(cfg.models.review, "sonnet");
+    const hit = warnings.find((w) => w.includes("models.review"));
+    assert.ok(hit, `expected a warning naming models.review, got: ${JSON.stringify(warnings)}`);
+    assert.match(hit!, /sonnet/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: tolerateInvalidConfig + quiet emits no warning for a rejected reviewer alias (#454)", async () => {
+  const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
+  const binDir = makeFakeGh("acme/alias-guard7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const warnings = await captureWarnings(() => {
+      cfgMod.resolveConfig({ repoPath: repo, profile: "claude", tolerateInvalidConfig: true, quiet: true });
+    });
+    assert.deepEqual(warnings, []);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- inert models.* alias warning (#116) ----
 //
 // Model selection is claude-only (harness.ts passes --model only on the claude
@@ -560,18 +691,20 @@ async function captureWarnings(fn: () => void | Promise<void>): Promise<string[]
   return warnings;
 }
 
-test("resolveConfig: models.review set + reviewer=codex does NOT warn (codex reviewer honors -m)", async () => {
-  const repo = makeFakeRepo(`models:\n  review: opus\n`);
+test("resolveConfig: models.review set to a codex-plausible model + reviewer=codex does NOT warn or throw (codex reviewer honors -m) (#454)", async () => {
+  const repo = makeFakeRepo(`models:\n  review: gpt-5.6-terra\n`);
   const binDir = makeFakeGh("acme/im1");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    let cfg: any;
     const warnings = await captureWarnings(() => {
       // claude profile → reviewer=codex
-      cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+      cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
     });
     assert.deepEqual(warnings, [], `expected no warnings, got: ${JSON.stringify(warnings)}`);
+    assert.equal(cfg.models.review, "gpt-5.6-terra");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -1357,6 +1490,7 @@ format_gate: []
   assert.match(synced, /# Pipeline configuration for this repo — synced with `pipeline config sync`\./);
   assert.match(synced, /^base_branch: staging/m);
   assert.match(synced, /^models:/m);
+  assert.match(synced, /config error/, "config sync (#454) must refresh the models: comment to the post-#441 contract");
   assert.match(synced, /^  review: sonnet # reviewer harness/m);
   assert.doesNotMatch(synced, /^  planning:/m, "absent model aliases must stay commented, not become explicit");
   assert.match(synced, /^  command: npm run ci # explicit command/m);
