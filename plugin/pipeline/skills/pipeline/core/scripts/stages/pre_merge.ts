@@ -1322,12 +1322,55 @@ export async function enforceReviewShaGate(
 
   // Exact match → the verdict still covers HEAD, but only as an approval when no
   // recorded blockers remain unresolved (a blocking delta review leaves
-  // reviewed-sha == HEAD; see reuseBlockedBy).
+  // reviewed-sha == HEAD; see reuseBlockedBy). `head` above was read once at
+  // function entry, so a push can land between that read and the moment this
+  // branch acts on it (including while `reuseBlockedBy` itself awaits
+  // `setBlockedFn`) — re-resolve currency right before reusing recorded
+  // blocking keys (#481 Finding 1) rather than trusting the frozen `head`.
+  // `unknown` fails closed to the conservative full re-review path at the
+  // bottom of this function instead of reusing the recorded verdict.
   if (reviewed.sha && reviewed.sha === head) {
-    return (
-      (await reuseBlockedBy(findLatestReviewCommentBody(trustedComments, reviewed.round), "")) ??
-      null
-    );
+    try {
+      const currency = await resolveReviewedShaCurrency(cfg, prNumber, reviewed.sha, {
+        getPrDetail: getPrDetailFn, getPrCommits: getPrCommitsFn,
+      });
+      if (currency.status === "current") {
+        return (
+          (await reuseBlockedBy(findLatestReviewCommentBody(trustedComments, reviewed.round), "")) ??
+          null
+        );
+      }
+      if (currency.status === "unknown") {
+        throw new Error(
+          `cannot confirm reviewed SHA ${reviewed.sha.slice(0, 7)} is still the PR head; ` +
+            `falling back to conservative re-review`,
+        );
+      }
+      // superseded: a push landed between the initial `head` read and this
+      // check — fall through to the pipeline-internal-commits / diff-hash
+      // checks below rather than reusing recorded blocking keys.
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("cannot confirm reviewed SHA")) {
+        console.warn(`[pipeline] #${issueNumber}: ${err.message}`);
+        const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
+        await postCommentFn(cfg, issueNumber, staleReviewNotice(reviewed.sha, head));
+        await transitionFn(
+          cfg,
+          issueNumber,
+          "pre-merge",
+          reviewStage,
+          `Re-running review ${reviewed.round}: cannot confirm reviewed SHA ` +
+            `\`${reviewed.sha.slice(0, 7)}\` is still the PR head; falling back to conservative re-review.`,
+        );
+        return {
+          advanced: true,
+          from: "pre-merge",
+          to: reviewStage,
+          summary: `re-review: cannot confirm reviewed SHA currency`,
+        };
+      }
+      throw err;
+    }
   }
 
   // HEAD moved past the reviewed commit. Re-review ONLY when a developer/fix
@@ -1536,8 +1579,20 @@ export async function enforceReviewShaGate(
       await postCommentFn(cfg, issueNumber, deltaComment);
 
       if (partition.blocking.length === 0) {
-        // HEAD currency for `targetHead` was already confirmed above, before this
-        // comment was posted (#481) — no separate re-check needed here.
+        // Re-validate HEAD (#481 Finding 2): the currency check above ran
+        // BEFORE `postCommentFn` — itself a network call a fix-round push can
+        // land during — so it does not cover a push landing while the comment
+        // was being posted. Re-read HEAD now; if it moved past `targetHead`,
+        // the approval covers a commit that is no longer HEAD. Rather than
+        // proceeding on a stale approval, fall back to the conservative full
+        // re-review path. We throw so the catch block handles the fallthrough.
+        const postDeltaHead = (await getPrDetailFn(cfg, prNumber)).head_sha;
+        if (postDeltaHead !== targetHead) {
+          throw new Error(
+            `PR HEAD moved from ${targetHead.slice(0, 7)} to ${postDeltaHead.slice(0, 7)} ` +
+            `during delta review; delta approval is stale — re-entering SHA gate`,
+          );
+        }
         // Delta review approves (or findings all below policy): pre-merge proceeds.
         console.log(`[pipeline] #${issueNumber}: pre-merge delta review approved; proceeding`);
         return null;
