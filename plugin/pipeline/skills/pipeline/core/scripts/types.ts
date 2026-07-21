@@ -455,6 +455,12 @@ export interface DesignDecisionRecordBounding {
   fieldsTruncated: number;
   decisionsDropped: number;
   artifactBytesTruncated: boolean;
+  /** Decisions dropped by the byte-ceiling shrink pass, on top of
+   *  `decisionsDropped` (which only counts the `max_decisions` cap). */
+  decisionsDroppedByByteCeiling: number;
+  /** Array entries (alternatives/assumptions/invariants/evidence) dropped
+   *  when the byte-ceiling pass capped every array field to one entry. */
+  arrayEntriesDroppedByByteCeiling: number;
 }
 
 /** Required next action a challenge asks of the implementer. */

@@ -333,7 +333,7 @@ test("design-gate: crash/resume — does not re-invoke the implementer for an al
     trigger: { triggered: true, matched: [{ trigger: "storage", evidence: "path" }], reason: "triggered" },
     reviewerIdentity: { harness: "claude", independence: "independent" },
     decisionRecordVersions: [DECISION_RECORD],
-    bounding: { fieldsTruncated: 0, decisionsDropped: 0, artifactBytesTruncated: false },
+    bounding: { fieldsTruncated: 0, decisionsDropped: 0, artifactBytesTruncated: false, decisionsDroppedByByteCeiling: 0, arrayEntriesDroppedByByteCeiling: 0 },
     rounds: [],
     outcome: null,
   };
@@ -359,7 +359,7 @@ test("design-gate: crash before any verdict — resumes interrogation from the p
     trigger: { triggered: true, matched: [{ trigger: "storage", evidence: "path" }], reason: "triggered" },
     reviewerIdentity: null,
     decisionRecordVersions: [DECISION_RECORD],
-    bounding: { fieldsTruncated: 0, decisionsDropped: 0, artifactBytesTruncated: false },
+    bounding: { fieldsTruncated: 0, decisionsDropped: 0, artifactBytesTruncated: false, decisionsDroppedByByteCeiling: 0, arrayEntriesDroppedByByteCeiling: 0 },
     rounds: [],
     outcome: null,
   };

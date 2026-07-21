@@ -87,6 +87,20 @@ test("evaluateDesignGateTrigger: each built-in class matches its representative 
   }
 });
 
+test("evaluateDesignGateTrigger: **/ built-ins also match root-level paths (review 2 finding f4a4b5b5)", () => {
+  const cases: [string, string][] = [
+    ["storage", "schema.sql"],
+    ["migration", "schema.sql"],
+    ["infrastructure", "Dockerfile"],
+  ];
+  for (const [cls, file] of cases) {
+    const cfg = { design_gate: { enabled: true, triggers: [cls], extra_triggers: {} } } as any;
+    const result = evaluateDesignGateTrigger(cfg, { changedFiles: [file], labels: [], diffAdditions: 0, diffDeletions: 0 });
+    assert.equal(result.triggered, true, `expected ${cls} to trigger on root-level ${file}`);
+    assert.ok(result.matched.some((m) => m.trigger === cls), `expected matched to include ${cls} for ${file}`);
+  }
+});
+
 test("evaluateDesignGateTrigger: architecture class matches on changed-file-count threshold", () => {
   const cfg = { design_gate: { enabled: true, triggers: ["architecture"], extra_triggers: {} } } as any;
   const files = Array.from({ length: 20 }, (_, i) => `src/file${i}.ts`);
@@ -160,6 +174,15 @@ test("validateDesignDecisionRecord: empty alternatives is rejected", () => {
   assert.ok(result.errors.some((e) => e.includes("alternatives")));
 });
 
+test("validateDesignDecisionRecord: duplicate decision ids are rejected (review 2 finding e941d6c1)", () => {
+  const record = validRecord();
+  const dupe = { ...record.decisions[0], title: "A different title, same id" };
+  record.decisions.push(dupe);
+  const result = validateDesignDecisionRecord(record);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((e) => e.includes("duplicate id")));
+});
+
 test("validateDesignDecisionRecord: unknown schema_version is refused", () => {
   const record = { ...validRecord(), schema_version: 2 };
   const result = validateDesignDecisionRecord(record);
@@ -209,7 +232,7 @@ test("boundDesignDecisionRecord: excess decisions are dropped and counted", () =
   assert.equal(bounding.decisionsDropped, 2);
 });
 
-test("boundDesignDecisionRecord: artifact byte ceiling honored", () => {
+test("boundDesignDecisionRecord: artifact byte ceiling honored and decisions dropped by the ceiling are counted (review 2 finding 7c2183da)", () => {
   const record = validRecord();
   record.decisions = Array.from({ length: 8 }, (_, i) => ({ ...record.decisions[0], id: `d${i}` }));
   const { record: bounded, bounding } = boundDesignDecisionRecord(record, {
@@ -219,9 +242,15 @@ test("boundDesignDecisionRecord: artifact byte ceiling honored", () => {
   });
   assert.ok(Buffer.byteLength(JSON.stringify(bounded), "utf8") <= 500);
   assert.equal(bounding.artifactBytesTruncated, true);
+  // The `max_decisions` cap didn't drop anything (8 in, 8 allowed) — the
+  // dropped decisions all came from the byte-ceiling shrink loop, and that
+  // must be visible rather than folded silently into `decisionsDropped`.
+  assert.equal(bounding.decisionsDropped, 0);
+  assert.ok(bounding.decisionsDroppedByByteCeiling > 0);
+  assert.equal(bounded.decisions.length + bounding.decisionsDroppedByByteCeiling, 8);
 });
 
-test("boundDesignDecisionRecord: byte ceiling honored even with large alternatives/assumptions on a single decision", () => {
+test("boundDesignDecisionRecord: byte ceiling honored even with large alternatives/assumptions on a single decision — dropped array entries counted", () => {
   const record = validRecord();
   record.decisions[0].alternatives = Array.from({ length: 20 }, (_, i) => ({
     option: `option ${i} `.repeat(50),
@@ -236,6 +265,7 @@ test("boundDesignDecisionRecord: byte ceiling honored even with large alternativ
   });
   assert.ok(Buffer.byteLength(JSON.stringify(bounded), "utf8") <= 500);
   assert.equal(bounding.artifactBytesTruncated, true);
+  assert.ok(bounding.arrayEntriesDroppedByByteCeiling > 0);
 });
 
 test("boundDesignDecisionRecord: truncated field never exceeds max_field_chars including the marker", () => {
@@ -337,6 +367,14 @@ test("parseDesignVerdict: clean approval parses", () => {
   assert.equal(verdict!.challenges.length, 0);
 });
 
+test("parseDesignVerdict: approve with missing or non-array challenges is malformed, never an approval (review 2 finding efe19d3b)", () => {
+  assert.equal(parseDesignVerdict("```json\n" + JSON.stringify({ verdict: "approve" }) + "\n```"), null);
+  assert.equal(
+    parseDesignVerdict("```json\n" + JSON.stringify({ verdict: "approve", challenges: "none" }) + "\n```"),
+    null,
+  );
+});
+
 test("parseDesignVerdict: 3-7 challenge band accepted", () => {
   for (const n of [3, 5, 7]) {
     const verdict = parseDesignVerdict(makeVerdictJson(n));
@@ -395,7 +433,7 @@ test("encodeDesignGateState / decodeDesignGateState round-trip", () => {
     trigger: { triggered: true, matched: [{ trigger: "storage", evidence: "path" }], reason: "triggered" },
     reviewerIdentity: { harness: "codex", independence: "independent" },
     decisionRecordVersions: [validRecord()],
-    bounding: { fieldsTruncated: 0, decisionsDropped: 0, artifactBytesTruncated: false },
+    bounding: { fieldsTruncated: 0, decisionsDropped: 0, artifactBytesTruncated: false, decisionsDroppedByByteCeiling: 0, arrayEntriesDroppedByByteCeiling: 0 },
     rounds: [],
     outcome: null,
   };

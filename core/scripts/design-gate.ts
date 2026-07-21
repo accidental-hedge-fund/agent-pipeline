@@ -90,9 +90,14 @@ export const ARCHITECTURE_LINE_THRESHOLD = 500;
 function globToRegExp(pattern: string): RegExp {
   const regexStr = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "§§§")
+    // A `**/` path segment matches zero-or-more leading directories, so
+    // e.g. `**/*.sql` also matches a root-level `schema.sql` (#436 review 2
+    // finding f4a4b5b5) — must be handled before the bare-`**` case below.
+    .replace(/\*\*\//g, "§§§")
+    .replace(/\*\*/g, "¶¶¶")
     .replace(/\*/g, "[^/]*")
-    .replace(/§§§/g, ".*");
+    .replace(/§§§/g, "(?:.*/)?")
+    .replace(/¶¶¶/g, ".*");
   return new RegExp(`^${regexStr}$`, "i");
 }
 
@@ -240,6 +245,21 @@ export function validateDesignDecisionRecord(candidate: unknown): DecisionRecord
       });
     }
   });
+  // Duplicate decision IDs collapse challengeKey identity across distinct
+  // decisions (#436 review 2 finding e941d6c1) — reject before the record
+  // can reach challenge-key generation or evidence persistence.
+  const seenIds = new Set<string>();
+  const dupeIds = new Set<string>();
+  for (const raw of r.decisions) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const id = (raw as Record<string, unknown>).id;
+    if (typeof id !== "string" || id.trim() === "") continue;
+    if (seenIds.has(id)) dupeIds.add(id);
+    seenIds.add(id);
+  }
+  if (dupeIds.size > 0) {
+    errors.push(`decisions contains duplicate id(s): ${[...dupeIds].join(", ")}`);
+  }
   return { ok: errors.length === 0, errors };
 }
 
@@ -292,21 +312,31 @@ function byteSize(record: DesignDecisionRecord): number {
 
 /** Re-clip every free-text field and cap every array field's length on a
  *  decision, using the given per-field char cap and per-array entry cap.
- *  Used for the deterministic artifact-byte-ceiling shrink pass below. */
-function reclipDecision(d: DesignDecision, fieldCap: number, arrayCap: number): DesignDecision {
+ *  Used for the deterministic artifact-byte-ceiling shrink pass below.
+ *  Returns the count of array entries dropped by this call so callers can
+ *  surface it in `bounding` (#436 review 2 finding 7c2183da: byte-ceiling
+ *  removals must be auditable, not silent). */
+function reclipDecision(d: DesignDecision, fieldCap: number, arrayCap: number): { decision: DesignDecision; entriesDropped: number } {
   const clip = (s: string) => truncateWithMarker(s, fieldCap);
+  const cap = Math.max(1, arrayCap);
+  const dropped = (arr: unknown[]) => Math.max(0, arr.length - cap);
+  const entriesDropped =
+    dropped(d.alternatives) + dropped(d.assumptions) + dropped(d.invariants) + dropped(d.evidence);
   return {
-    id: d.id,
-    title: clip(d.title),
-    surface: clip(d.surface),
-    alternatives: d.alternatives
-      .slice(0, Math.max(1, arrayCap))
-      .map((a) => ({ option: clip(a.option), rejected_because: clip(a.rejected_because) })),
-    assumptions: d.assumptions.slice(0, Math.max(1, arrayCap)).map(clip),
-    invariants: d.invariants.slice(0, Math.max(1, arrayCap)).map(clip),
-    evidence: d.evidence.slice(0, Math.max(1, arrayCap)).map(clip),
-    generalization_boundary: clip(d.generalization_boundary),
-    uncertainty: clip(d.uncertainty),
+    decision: {
+      id: d.id,
+      title: clip(d.title),
+      surface: clip(d.surface),
+      alternatives: d.alternatives
+        .slice(0, cap)
+        .map((a) => ({ option: clip(a.option), rejected_because: clip(a.rejected_because) })),
+      assumptions: d.assumptions.slice(0, cap).map(clip),
+      invariants: d.invariants.slice(0, cap).map(clip),
+      evidence: d.evidence.slice(0, cap).map(clip),
+      generalization_boundary: clip(d.generalization_boundary),
+      uncertainty: clip(d.uncertainty),
+    },
+    entriesDropped,
   };
 }
 
@@ -346,11 +376,17 @@ export function boundDesignDecisionRecord(
 
   let bounded: DesignDecisionRecord = { schema_version: record.schema_version, decisions: boundedDecisions };
   let artifactBytesTruncated = false;
+  // Tracked separately from `decisionsDropped` (the `max_decisions` cap
+  // above) so every artifact-budget removal is individually auditable
+  // (#436 review 2 finding 7c2183da).
+  let decisionsDroppedByByteCeiling = 0;
+  let arrayEntriesDroppedByByteCeiling = 0;
 
   // Cheapest reduction first: drop whole trailing decisions while more than
   // one remains.
   while (byteSize(bounded) > limits.max_artifact_bytes && bounded.decisions.length > 1) {
     artifactBytesTruncated = true;
+    decisionsDroppedByByteCeiling++;
     bounded = { ...bounded, decisions: bounded.decisions.slice(0, -1) };
   }
 
@@ -359,13 +395,15 @@ export function boundDesignDecisionRecord(
   // budget until the ceiling is met or the minimum encodable size is reached.
   if (byteSize(bounded) > limits.max_artifact_bytes) {
     artifactBytesTruncated = true;
-    bounded = { ...bounded, decisions: bounded.decisions.map((d) => reclipDecision(d, limits.max_field_chars, 1)) };
+    const firstReclip = bounded.decisions.map((d) => reclipDecision(d, limits.max_field_chars, 1));
+    arrayEntriesDroppedByByteCeiling += firstReclip.reduce((sum, r) => sum + r.entriesDropped, 0);
+    bounded = { ...bounded, decisions: firstReclip.map((r) => r.decision) };
 
     const minFieldCap = TRUNCATION_MARKER.length;
     let fieldCap = limits.max_field_chars;
     while (byteSize(bounded) > limits.max_artifact_bytes && fieldCap > minFieldCap) {
       fieldCap = Math.max(minFieldCap, Math.floor(fieldCap / 2));
-      bounded = { ...bounded, decisions: bounded.decisions.map((d) => reclipDecision(d, fieldCap, 1)) };
+      bounded = { ...bounded, decisions: bounded.decisions.map((d) => reclipDecision(d, fieldCap, 1).decision) };
     }
 
     if (byteSize(bounded) > limits.max_artifact_bytes) {
@@ -378,7 +416,13 @@ export function boundDesignDecisionRecord(
 
   return {
     record: bounded,
-    bounding: { fieldsTruncated, decisionsDropped, artifactBytesTruncated },
+    bounding: {
+      fieldsTruncated,
+      decisionsDropped,
+      artifactBytesTruncated,
+      decisionsDroppedByByteCeiling,
+      arrayEntriesDroppedByByteCeiling,
+    },
   };
 }
 
@@ -478,9 +522,13 @@ export function parseDesignVerdict(output: string): DesignInterrogationVerdict |
     if (typeof data !== "object" || data === null) continue;
     const o = data as Record<string, unknown>;
     if (o.verdict === "approve") {
-      const challenges = Array.isArray(o.challenges) ? o.challenges : [];
-      if (challenges.length === 0) return { verdict: "approve", challenges: [] };
-      continue; // approve with challenges is malformed — try next candidate
+      // `challenges` must be an explicit empty array — a missing/non-array
+      // member is malformed output, not a clean approval (#436 review 2
+      // finding efe19d3b), and must fall through to the bounded re-ask path.
+      if (Array.isArray(o.challenges) && o.challenges.length === 0) {
+        return { verdict: "approve", challenges: [] };
+      }
+      continue; // malformed — try next candidate
     }
     if (o.verdict !== "needs-attention") continue;
     if (!Array.isArray(o.challenges)) continue;
