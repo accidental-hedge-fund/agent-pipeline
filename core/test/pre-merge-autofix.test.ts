@@ -123,8 +123,10 @@ function makeDeps(opts: {
         comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
       }) as any,
     getPrDetail: async () => {
-      // After fix committed, return the new head.
-      return { head_sha: rec.autoFixCalls > 0 ? (opts.reReviewPrHead ?? SHA_AFTER_FIX) : SHA_HEAD } as any;
+      // After a successful fix push, return the new head. An errored auto-fix
+      // attempt makes no push, so the head must stay unchanged (#481 review 2).
+      const fixPushed = opts.autoFixResult === "fix-committed" && rec.autoFixCalls > 0;
+      return { head_sha: fixPushed ? (opts.reReviewPrHead ?? SHA_AFTER_FIX) : SHA_HEAD } as any;
     },
     getPrCommits: async () => commits as any,
     getPrDiff: async () => NEW_DIFF,

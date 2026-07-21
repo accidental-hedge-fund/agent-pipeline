@@ -1600,6 +1600,10 @@ export async function enforceReviewShaGate(
 
       // Delta review found blocking findings. Attempt one bounded auto-fix
       // before blocking when all findings are in the category allowlist (#359).
+      // Tracks the head the verdict that will ultimately gate `setBlockedFn`
+      // below was produced against — `targetHead` unless an auto-fix re-review
+      // supersedes it (#481 review 2 finding 1).
+      let finalBlockingHead = targetHead;
       const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
       if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
         // One-attempt bound (crash-safe): detect a prior auto-fix commit by
@@ -1759,6 +1763,9 @@ export async function enforceReviewShaGate(
                   `the PR head; falling back to conservative re-review`,
                 );
               }
+              // Re-review's verdict (still blocking) now supersedes the initial
+              // delta verdict as the one that will gate `setBlockedFn` below.
+              finalBlockingHead = newPrHead;
             }
             await postCommentFn(cfg, issueNumber, reComment);
 
@@ -1808,6 +1815,26 @@ export async function enforceReviewShaGate(
           // fixRes.status === "error": fall through to block below.
         }
         // Prior auto-fix attempt detected: fall through to block below.
+      }
+
+      // Re-validate HEAD one last time before granting blocking authority (#481
+      // review 2 finding 1): the currency checks above only cover the window up
+      // to their own `postCommentFn` call, not the time since spent posting that
+      // comment, running an auto-fix attempt, or posting the re-review comment.
+      // A push landing in any of those windows must not leave a stale verdict
+      // blocking the issue — fail closed to the conservative full re-review.
+      const finalCurrency = await resolveReviewedShaCurrency(cfg, prNumber, finalBlockingHead, {
+        getPrDetail: getPrDetailFn, getPrCommits: getPrCommitsFn,
+      });
+      if (finalCurrency.status !== "current") {
+        throw new Error(
+          finalCurrency.status === "superseded"
+            ? `PR HEAD moved from ${finalBlockingHead.slice(0, 7)} to ` +
+              `${finalCurrency.headSha.slice(0, 7)} after the blocking verdict was recorded; ` +
+              `falling back to conservative re-review`
+            : `cannot confirm blocking verdict head ${finalBlockingHead.slice(0, 7)} is still ` +
+              `the PR head; falling back to conservative re-review`,
+        );
       }
 
       // Non-auto-fixable category, no seam, or fix round exhausted:
