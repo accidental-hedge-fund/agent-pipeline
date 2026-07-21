@@ -192,6 +192,29 @@ test("ensureArtifactIgnoreBlock: non-ENOENT read error (default fs impl) propaga
   }
 });
 
+test("ensureArtifactIgnoreBlock: unmatched opening sentinel (no closing) -> throws instead of silently appending a second block", () => {
+  // Regression for #452 review round 2 finding 1: an opening sentinel with no
+  // closing sentinel must fail closed, not be treated as "block absent". If it
+  // were treated as absent, a second run would pair this orphaned opener with
+  // the closer of a newly-appended block and delete everything between them.
+  const existing = [
+    "node_modules/",
+    "# >>> agent-pipeline artifacts (managed by `pipeline init`) >>>",
+    "operator line that must never be deleted",
+  ].join("\n");
+  const fake = makeFakeFs(existing);
+  assert.throws(() => ensureArtifactIgnoreBlock("/repo", fake.deps), /malformed managed block/);
+  assert.equal(fake.get(), existing, "no write must occur when the sentinel span is malformed");
+});
+
+test("ensureArtifactIgnoreBlock: duplicate opening sentinels -> throws instead of pairing the wrong markers", () => {
+  const oneBlock = renderArtifactIgnoreBlock();
+  const existing = `${oneBlock}\noperator line\n${oneBlock}`;
+  const fake = makeFakeFs(existing);
+  assert.throws(() => ensureArtifactIgnoreBlock("/repo", fake.deps), /malformed managed block/);
+  assert.equal(fake.get(), existing, "no write must occur when the block is duplicated");
+});
+
 test("ensureArtifactIgnoreBlock: operator already hand-ignores a contract path outside the block -> left untouched, block still lists it", () => {
   const existing = ".agent-pipeline/runs/\nnode_modules/\n";
   const fake = makeFakeFs(existing);
@@ -200,4 +223,27 @@ test("ensureArtifactIgnoreBlock: operator already hand-ignores a contract path o
   const after = fake.get()!;
   assert.ok(after.startsWith(existing), "the operator's hand-authored line must remain unmodified");
   assert.ok(after.includes(".agent-pipeline/runs/"), "the managed block must still list runs/");
+});
+
+test("ensureArtifactIgnoreBlock: default writer (real fs) writes via temp file + rename, no leftover temp file, mode preserved", () => {
+  // Regression for #452 review round 2 finding 2: writes must not truncate the
+  // target in place. Exercises the real defaultWriteFile (no injected
+  // writeFile) against a real directory.
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-ignore-test-"));
+  const gitignorePath = path.join(repoDir, ".gitignore");
+  const operatorContent = "node_modules/\n";
+  fs.writeFileSync(gitignorePath, operatorContent, "utf8");
+  fs.chmodSync(gitignorePath, 0o640);
+  try {
+    const result = ensureArtifactIgnoreBlock(repoDir);
+    assert.equal(result.outcome, "updated");
+    assert.equal(fs.statSync(gitignorePath).mode & 0o777, 0o640, "original file mode must be preserved");
+
+    const leftovers = fs
+      .readdirSync(repoDir)
+      .filter((name) => name !== ".gitignore" && name.includes(".gitignore"));
+    assert.deepEqual(leftovers, [], "no temp file should remain after a successful write");
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });

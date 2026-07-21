@@ -9,6 +9,7 @@
 // segment from the entries below, so a new artifact directory cannot exist
 // without a declared ignore entry — see the drift-guard test.
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -76,11 +77,28 @@ interface SentinelSpan {
   blockEnd: number;
 }
 
+function countOccurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+/** Parse the sentinel span strictly: a malformed managed block (unmatched or
+ *  duplicated opening/closing sentinels) throws rather than being silently
+ *  treated as absent, which would let a later run pair an orphaned sentinel
+ *  with the wrong counterpart and delete operator-authored lines between
+ *  them (#452 review round 2). */
 function findSentinelSpan(content: string): SentinelSpan | null {
+  const openCount = countOccurrences(content, SENTINEL_OPEN);
+  const closeCount = countOccurrences(content, SENTINEL_CLOSE);
+  if (openCount === 0 && closeCount === 0) return null;
   const openIdx = content.indexOf(SENTINEL_OPEN);
-  if (openIdx === -1) return null;
-  const closeIdx = content.indexOf(SENTINEL_CLOSE, openIdx);
-  if (closeIdx === -1) return null;
+  const closeIdx = content.indexOf(SENTINEL_CLOSE);
+  if (openCount !== 1 || closeCount !== 1 || closeIdx < openIdx) {
+    throw new Error(
+      "agent-pipeline: malformed managed block in .gitignore " +
+        `(found ${openCount} opening and ${closeCount} closing sentinel(s)); ` +
+        "refusing to write — fix or remove the managed block by hand and re-run.",
+    );
+  }
   let blockEnd = closeIdx + SENTINEL_CLOSE.length;
   if (content[blockEnd] === "\n") blockEnd += 1;
   return { openIdx, blockEnd };
@@ -109,8 +127,37 @@ const defaultReadFile = (fp: string): string | null => {
   }
 };
 
+/** Write via a temp file + rename in the same directory so an interrupted or
+ *  failed write (ENOSPC/EIO/process kill) cannot leave a truncated,
+ *  operator-owned .gitignore (#452 review round 2). Preserves the original
+ *  file's mode when overwriting. */
 const defaultWriteFile = (fp: string, content: string): void => {
-  fs.writeFileSync(fp, content, "utf8");
+  const dir = path.dirname(fp);
+  const tmpPath = path.join(dir, `.${path.basename(fp)}.${crypto.randomUUID()}.tmp`);
+  let mode: number | undefined;
+  try {
+    mode = fs.statSync(fp).mode;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  }
+  try {
+    const fd = fs.openSync(tmpPath, "wx");
+    try {
+      fs.writeSync(fd, content, null, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (mode !== undefined) fs.chmodSync(tmpPath, mode);
+    fs.renameSync(tmpPath, fp);
+  } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      /* best-effort cleanup; the original error is what matters */
+    }
+    throw err;
+  }
 };
 
 /** Ensure the engine-managed artifact ignore block exists (and is current) in
