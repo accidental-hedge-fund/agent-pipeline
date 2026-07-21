@@ -14,7 +14,7 @@ import { summarizeInterventions } from "./intervention.ts";
 // Public types
 // ---------------------------------------------------------------------------
 
-export type ClusterCategory = "review-finding" | "blocker" | "flaky-gate" | "token-waste";
+export type ClusterCategory = "review-finding" | "blocker" | "flaky-gate" | "token-waste" | "papercut";
 
 export interface ClusterEntry {
   category: ClusterCategory;
@@ -23,6 +23,22 @@ export interface ClusterEntry {
   runIds: string[];
   excerpt: string;
   issueUrl?: string | null;
+  /** True when issueUrl points at a pre-existing open issue found by dedup,
+   *  rather than one just created by this invocation. */
+  alreadyTracked?: boolean;
+}
+
+/** An open GitHub issue whose title carries the `[pipeline-improve]` prefix
+ *  (#421 dedup). Confirmed field shape against real `gh issue list --json
+ *  title,state,createdAt,number,url,labels` output: `state` is `"OPEN"` /
+ *  `"CLOSED"` (uppercase), `labels` is `{ name: string }[]`, `createdAt` is
+ *  ISO-8601. */
+export interface OpenImproveIssue {
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+  createdAt: string;
+  labels: string[];
 }
 
 export interface ImproveOpts {
@@ -45,7 +61,17 @@ export interface ImproveDeps {
   createIssue: (title: string, body: string) => Promise<string>;
   /** Check gh auth status. Returns true if authenticated. */
   ghAuthCheck: () => Promise<boolean>;
+  /** List open issues whose title carries the `[pipeline-improve]` prefix
+   *  (#421 dedup). Called once per invocation regardless of cluster count. */
+  listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
   log: (msg: string) => void;
+}
+
+/** `[pipeline-improve]`-prefixed issue title proposed for a cluster. Shared by
+ *  the report, dedup lookup, and issue-creation paths so all three agree on
+ *  the same title string. */
+export function proposedTitle(c: Pick<ClusterEntry, "category" | "signal">): string {
+  return `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +112,32 @@ export function realImproveDeps(repoDir: string): ImproveDeps {
     ghAuthCheck: async () => {
       const r = spawnSync("gh", ["auth", "status"], { encoding: "utf8", cwd: repoDir });
       return r.status === 0;
+    },
+    listOpenImproveIssues: async () => {
+      const r = spawnSync(
+        "gh",
+        ["issue", "list", "--state", "open", "--json", "title,state,createdAt,number,url,labels", "--limit", "200"],
+        { encoding: "utf8", cwd: repoDir },
+      );
+      if (r.status !== 0) {
+        throw new Error(`gh issue list failed: ${r.stderr?.trim() ?? "unknown error"}`);
+      }
+      const raw = JSON.parse(r.stdout || "[]") as Array<{
+        title: string;
+        state: string;
+        createdAt: string;
+        url: string;
+        labels: Array<{ name: string }>;
+      }>;
+      return raw
+        .filter((i) => i.title.startsWith("[pipeline-improve]"))
+        .map((i) => ({
+          title: i.title,
+          url: i.url,
+          state: (i.state === "CLOSED" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
+          createdAt: i.createdAt,
+          labels: (i.labels ?? []).map((l) => l.name),
+        }));
     },
     log: (msg) => process.stdout.write(msg + "\n"),
   };
@@ -195,7 +247,7 @@ export async function* readEventsLines(
 // Clustering engine — internal accumulation (keys + counts only, not full records)
 // ---------------------------------------------------------------------------
 
-interface ClusterAccum {
+export interface ClusterAccum {
   category: ClusterCategory;
   signal: string;
   count: number;
@@ -353,6 +405,35 @@ export function clusterTokenWaste(
   return hadData;
 }
 
+/** Extract a papercut message from a `papercut` event and accumulate into
+ *  clusters. Keyed on `papercut:${normalizeSignal(message)}` so an
+ *  agent-reported papercut can never collide with a telemetry-derived
+ *  cluster (#421 category isolation) even when the normalized text matches. */
+export function clusterPapercuts(
+  event: Record<string, unknown>,
+  runId: string,
+  clusters: Map<string, ClusterAccum>,
+): void {
+  if (event["type"] !== "papercut") return;
+  const message = typeof event["message"] === "string" ? event["message"] : "";
+  if (!message) return;
+  const normalized = normalizeSignal(message);
+  const key = `papercut:${normalized}`;
+  const existing = clusters.get(key);
+  if (existing) {
+    existing.count++;
+    existing.runIds.add(runId);
+  } else {
+    clusters.set(key, {
+      category: "papercut",
+      signal: normalized,
+      count: 1,
+      runIds: new Set([runId]),
+      excerpt: truncateExcerpt(message),
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // clustersToEntries — convert internal map to sorted ClusterEntry[]
 // ---------------------------------------------------------------------------
@@ -384,13 +465,16 @@ export function formatReport(clusters: ClusterEntry[], tokenWasteSkipped: boolea
     lines.push("");
   }
   for (const c of clusters) {
-    const proposedTitle = `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
     lines.push(`## [${c.category}] ${c.signal.slice(0, 80)}`);
     lines.push(`**Occurrences**: ${c.count}`);
     lines.push(`**Affected runs**: ${c.runIds.join(", ")}`);
     lines.push(`**Excerpt**: ${c.excerpt}`);
-    lines.push(`**Proposed issue title**: ${proposedTitle}`);
-    if (c.issueUrl) lines.push(`**Created issue**: ${c.issueUrl}`);
+    lines.push(`**Proposed issue title**: ${proposedTitle(c)}`);
+    if (c.issueUrl && c.alreadyTracked) {
+      lines.push(`**Already tracked**: ${c.issueUrl}`);
+    } else if (c.issueUrl) {
+      lines.push(`**Created issue**: ${c.issueUrl}`);
+    }
     lines.push("");
   }
   if (tokenWasteSkipped) {
@@ -413,6 +497,7 @@ export function formatJson(clusters: ClusterEntry[]): string {
       runIds: c.runIds,
       excerpt: c.excerpt,
       ...(c.issueUrl !== undefined ? { issueUrl: c.issueUrl } : {}),
+      ...(c.alreadyTracked !== undefined ? { alreadyTracked: c.alreadyTracked } : {}),
     })),
     null,
     2,
@@ -426,7 +511,7 @@ export function formatJson(clusters: ClusterEntry[]): string {
 export async function applyIssues(
   clusters: ClusterEntry[],
   opts: { minOccurrences?: number },
-  deps: Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "log">,
+  deps: Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "listOpenImproveIssues" | "log">,
 ): Promise<void> {
   const minOcc = opts.minOccurrences ?? 3;
 
@@ -437,9 +522,20 @@ export async function applyIssues(
     );
   }
 
+  // Fetched once per invocation regardless of cluster count (#421 D3).
+  const openIssues = await deps.listOpenImproveIssues();
+  const byTitle = new Map(openIssues.filter((i) => i.state === "OPEN").map((i) => [i.title, i]));
+
   const qualifying = clusters.filter((c) => c.count >= minOcc);
   for (const c of qualifying) {
-    const title = `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
+    const title = proposedTitle(c);
+    const existing = byTitle.get(title);
+    if (existing) {
+      c.issueUrl = existing.url;
+      c.alreadyTracked = true;
+      deps.log(`Already tracked: ${existing.url}`);
+      continue;
+    }
     const body = [
       `## Recurring pattern detected by \`pipeline improve\``,
       ``,
@@ -509,6 +605,7 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
       clusterReviewFindings(event, run.runId, clusters);
       clusterBlockers(event, run.runId, clusters);
       clusterFlakyGates(event, run.runId, clusters);
+      clusterPapercuts(event, run.runId, clusters);
     }
 
     const summaryPath = path.join(run.dir, "summary.json");
@@ -525,8 +622,13 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
   const entries = clustersToEntries(clusters, top);
 
   if (opts.apply) {
-    const applyDeps: Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "log"> = opts.json
-      ? { createIssue: deps.createIssue, ghAuthCheck: deps.ghAuthCheck, log: (msg) => { process.stderr.write(msg + "\n"); } }
+    const applyDeps: Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "listOpenImproveIssues" | "log"> = opts.json
+      ? {
+        createIssue: deps.createIssue,
+        ghAuthCheck: deps.ghAuthCheck,
+        listOpenImproveIssues: deps.listOpenImproveIssues,
+        log: (msg) => { process.stderr.write(msg + "\n"); },
+      }
       : deps;
     await applyIssues(entries, { minOccurrences: minOcc }, applyDeps);
     if (opts.json) {

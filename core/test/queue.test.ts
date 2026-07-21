@@ -59,6 +59,7 @@ function makeDeps(overrides: Partial<QueueDeps> = {}): QueueDeps & { written: Ma
     }),
     readRunCost: async (_issueNumber) => null,
     writeFile: async (filePath, content) => { written.set(filePath, content); },
+    autoFilePapercuts: async () => {},
     log: (msg) => { logs.push(msg); },
     clock: () => ++tick * 100,
     written,
@@ -549,6 +550,97 @@ test("batch-summary.json is written to the correct path", async () => {
 
   const expectedPath = `/fake/repo/.agent-pipeline/runs/batch-${batchId}/batch-summary.json`;
   assert.ok(written.has(expectedPath), `summary should be written to ${expectedPath}`);
+});
+
+// ---------------------------------------------------------------------------
+// papercut auto-file trigger (#421)
+// ---------------------------------------------------------------------------
+
+test("papercut auto-file: papercuts absent makes zero autoFilePapercuts calls", async () => {
+  const issues = [makeIssue(1)];
+  let calls = 0;
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    autoFilePapercuts: async () => { calls++; },
+  });
+  await runQueue(makeOpts({ papercuts: undefined }), deps);
+  assert.equal(calls, 0);
+});
+
+test("papercut auto-file: auto_file false makes zero autoFilePapercuts calls", async () => {
+  const issues = [makeIssue(1)];
+  let calls = 0;
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    autoFilePapercuts: async () => { calls++; },
+  });
+  await runQueue(
+    makeOpts({
+      papercuts: {
+        auto_file: false,
+        auto_file_window_hours: 24,
+        auto_file_max_per_window: 3,
+        auto_file_min_occurrences: 3,
+      },
+    }),
+    deps,
+  );
+  assert.equal(calls, 0);
+});
+
+test("papercut auto-file: auto_file true fires exactly once at batch end with resolved settings", async () => {
+  const issues = [makeIssue(1)];
+  const calls: Array<{ repoDir: string; windowHours: number; maxPerWindow: number; minOccurrences: number }> = [];
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    autoFilePapercuts: async (opts) => { calls.push(opts); },
+  });
+  await runQueue(
+    makeOpts({
+      repoDir: "/fake/repo",
+      papercuts: {
+        auto_file: true,
+        auto_file_window_hours: 12,
+        auto_file_max_per_window: 2,
+        auto_file_min_occurrences: 4,
+      },
+    }),
+    deps,
+  );
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    repoDir: "/fake/repo",
+    windowHours: 12,
+    maxPerWindow: 2,
+    minOccurrences: 4,
+  });
+});
+
+test("papercut auto-file: a failing autoFilePapercuts still leaves batch-summary.json written and batch exit unchanged", async () => {
+  const issues = [makeIssue(1)];
+  const written = new Map<string, string>();
+  const deps = makeDeps({
+    listEligibleIssues: async () => issues,
+    writeFile: async (p, c) => { written.set(p, c); },
+    autoFilePapercuts: async () => { throw new Error("simulated gh failure"); },
+  });
+  await assert.doesNotReject(() =>
+    runQueue(
+      makeOpts({
+        repoDir: "/fake/repo",
+        batchId: "2026-02-02T00-00-00-000Z",
+        papercuts: {
+          auto_file: true,
+          auto_file_window_hours: 24,
+          auto_file_max_per_window: 3,
+          auto_file_min_occurrences: 3,
+        },
+      }),
+      deps,
+    ),
+  );
+  const expectedPath = "/fake/repo/.agent-pipeline/runs/batch-2026-02-02T00-00-00-000Z/batch-summary.json";
+  assert.ok(written.has(expectedPath));
 });
 
 test("in-flight runs complete after budget gate fires", async () => {

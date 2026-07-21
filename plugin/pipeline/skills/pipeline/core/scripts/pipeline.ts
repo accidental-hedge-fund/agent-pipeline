@@ -890,6 +890,7 @@ async function main(): Promise<void> {
           profile: opts.profile,
           batchId,
           base: opts.base,
+          papercuts: queueCfg.papercuts,
         },
         realQueueDeps(queueCfg.repo_dir, opts.profile),
       );

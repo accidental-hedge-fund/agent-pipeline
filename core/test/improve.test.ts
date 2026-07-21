@@ -13,12 +13,15 @@ import {
   clusterBlockers,
   clusterFlakyGates,
   clusterTokenWaste,
+  clusterPapercuts,
   clustersToEntries,
   formatReport,
   formatJson,
   applyIssues,
+  proposedTitle,
   type ClusterEntry,
   type ImproveDeps,
+  type OpenImproveIssue,
   type RunInfo,
 } from "../scripts/improve.ts";
 
@@ -429,6 +432,79 @@ test("clusterTokenWaste: same high-duration stage across runs produces one clust
 });
 
 // ---------------------------------------------------------------------------
+// 2.2/2.4 clusterPapercuts (#421)
+// ---------------------------------------------------------------------------
+
+test("clusterPapercuts: repeated messages cluster together", () => {
+  const clusters = new Map();
+  const event = { type: "papercut", message: "test gate flaked twice" };
+  clusterPapercuts(event, "run-1", clusters);
+  clusterPapercuts(event, "run-2", clusters);
+  assert.equal(clusters.size, 1, `expected 1 cluster, got ${clusters.size}`);
+  const entry = [...clusters.values()][0];
+  assert.equal(entry.count, 2);
+  assert.equal(entry.category, "papercut");
+  assert.deepEqual([...entry.runIds].sort(), ["run-1", "run-2"]);
+});
+
+test("clusterPapercuts: distinct messages stay separate", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "papercut", message: "flaky test gate" }, "run-1", clusters);
+  clusterPapercuts({ type: "papercut", message: "slow review round" }, "run-1", clusters);
+  assert.equal(clusters.size, 2);
+});
+
+test("clusterPapercuts: non-papercut events are ignored", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "blocker_set", reason: "ci failed" }, "run-1", clusters);
+  assert.equal(clusters.size, 0);
+});
+
+test("clusterPapercuts: evidence excerpt is ≤ 200 chars", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "papercut", message: "m".repeat(300) }, "run-1", clusters);
+  const entry = [...clusters.values()][0];
+  assert.ok(entry.excerpt.length <= 200);
+});
+
+// ---------------------------------------------------------------------------
+// 3.1/3.2 category isolation (#421)
+// ---------------------------------------------------------------------------
+
+test("category isolation: an identically-normalized papercut and blocker signal produce two independent clusters", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "papercut", message: "ci failed" }, "run-1", clusters);
+  clusterPapercuts({ type: "papercut", message: "ci failed" }, "run-2", clusters);
+  clusterBlockers({ type: "blocker_set", reason: "ci failed" }, "run-3", clusters);
+  assert.equal(clusters.size, 2, `expected 2 clusters, got ${clusters.size}`);
+  const papercutEntry = clusters.get("papercut:ci failed");
+  const blockerEntry = clusters.get("blocker:ci failed");
+  assert.equal(papercutEntry.count, 2);
+  assert.equal(blockerEntry.count, 1);
+});
+
+test("category isolation: papercut and flaky-gate clusters about the same stage stay separate", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "papercut", message: "test gate" }, "run-1", clusters);
+  clusterFlakyGates({ type: "stage_complete", stage: "test gate", outcome: "error" }, "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  assert.equal(entries.length, 2);
+  const categories = entries.map((e) => e.category).sort();
+  assert.deepEqual(categories, ["flaky-gate", "papercut"]);
+});
+
+test("category isolation: papercut and token-waste clusters about the same stage stay separate", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "papercut", message: "review" }, "run-1", clusters);
+  const HIGH_MS = 35 * 60 * 1000;
+  clusterTokenWaste({ stages: [{ stage: "review", commands: [{ durationMs: HIGH_MS }] }] }, "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  assert.equal(entries.length, 2);
+  const categories = entries.map((e) => e.category).sort();
+  assert.deepEqual(categories, ["papercut", "token-waste"]);
+});
+
+// ---------------------------------------------------------------------------
 // 5.4 formatReport
 // ---------------------------------------------------------------------------
 
@@ -481,6 +557,31 @@ test("formatReport: includes created issue URL when issueUrl is set", () => {
   };
   const report = formatReport([cluster], false);
   assert.ok(report.includes("https://github.com/org/repo/issues/42"), `missing issueUrl: ${report}`);
+});
+
+test("formatReport: papercut clusters appear alongside other categories", () => {
+  const clusters: ClusterEntry[] = [
+    { category: "blocker", signal: "ci failed", count: 4, runIds: ["run-1"], excerpt: "e" },
+    { category: "papercut", signal: "flaky test gate", count: 3, runIds: ["run-2"], excerpt: "e" },
+  ];
+  const report = formatReport(clusters, false);
+  assert.ok(report.includes("[papercut] flaky test gate"), `missing papercut cluster: ${report}`);
+  assert.ok(report.includes("[blocker] ci failed"), `missing blocker cluster: ${report}`);
+});
+
+test("formatReport: already-tracked cluster is annotated distinctly from a newly created one", () => {
+  const cluster: ClusterEntry = {
+    category: "papercut",
+    signal: "flaky test gate",
+    count: 3,
+    runIds: ["run-1"],
+    excerpt: "e",
+    issueUrl: "https://github.com/org/repo/issues/12",
+    alreadyTracked: true,
+  };
+  const report = formatReport([cluster], false);
+  assert.ok(report.includes("Already tracked"), `missing already-tracked annotation: ${report}`);
+  assert.ok(!report.includes("Created issue"), `should not say Created issue: ${report}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -540,6 +641,19 @@ test("formatJson: issueUrl absent when not set", () => {
   assert.ok(!("issueUrl" in parsed[0]), "issueUrl should not be present");
 });
 
+test("formatJson: papercut cluster emits category: papercut", () => {
+  const cluster: ClusterEntry = {
+    category: "papercut",
+    signal: "flaky test gate",
+    count: 3,
+    runIds: ["run-1"],
+    excerpt: "e",
+  };
+  const json = formatJson([cluster]);
+  const parsed = JSON.parse(json) as Record<string, unknown>[];
+  assert.equal(parsed[0]["category"], "papercut");
+});
+
 // ---------------------------------------------------------------------------
 // 6.5 applyIssues
 // ---------------------------------------------------------------------------
@@ -548,15 +662,23 @@ function makeApplyDeps(overrides: Partial<{
   authed: boolean;
   createCalls: Array<{ title: string; body: string }>;
   shouldFailCreate: boolean;
-}> = {}): Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "log"> & {
+  openIssues: OpenImproveIssue[];
+}> = {}): Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "listOpenImproveIssues" | "log"> & {
   _createCalls: Array<{ title: string; body: string }>;
   _logLines: string[];
+  _listCalls: number;
 } {
   const authed = overrides.authed ?? true;
   const createCalls: Array<{ title: string; body: string }> = [];
   const logLines: string[] = [];
+  const openIssues = overrides.openIssues ?? [];
+  const listCallCounter = { n: 0 };
   const deps = {
     ghAuthCheck: async () => authed,
+    listOpenImproveIssues: async () => {
+      listCallCounter.n++;
+      return openIssues;
+    },
     createIssue: async (title: string, body: string) => {
       if (overrides.shouldFailCreate) throw new Error("gh create failed");
       createCalls.push({ title, body });
@@ -565,6 +687,9 @@ function makeApplyDeps(overrides: Partial<{
     log: (msg: string) => logLines.push(msg),
     _createCalls: createCalls,
     _logLines: logLines,
+    get _listCalls() {
+      return listCallCounter.n;
+    },
   };
   return deps;
 }
@@ -617,6 +742,80 @@ test("applyIssues: no clusters qualify when all below threshold", async () => {
   await applyIssues(clusters, { minOccurrences: 3 }, deps);
   assert.equal(deps._createCalls.length, 0);
   assert.equal(deps._logLines.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 4.2/4.4 applyIssues — open-issue dedup (#421)
+// ---------------------------------------------------------------------------
+
+test("applyIssues: second apply files nothing when an open issue already matches the title", async () => {
+  const clusters: ClusterEntry[] = [
+    { category: "blocker", signal: "ci failed", count: 5, runIds: ["run-1"], excerpt: "e" },
+  ];
+  const openIssues: OpenImproveIssue[] = [
+    {
+      title: proposedTitle(clusters[0]),
+      url: "https://github.com/org/repo/issues/99",
+      state: "OPEN",
+      createdAt: "2026-07-01T00:00:00Z",
+      labels: [],
+    },
+  ];
+  const deps = makeApplyDeps({ openIssues });
+  await applyIssues(clusters, { minOccurrences: 3 }, deps);
+  assert.equal(deps._createCalls.length, 0);
+  assert.equal(clusters[0].issueUrl, "https://github.com/org/repo/issues/99");
+  assert.equal(clusters[0].alreadyTracked, true);
+});
+
+test("applyIssues: a closed issue with a matching title does not suppress creation", async () => {
+  const clusters: ClusterEntry[] = [
+    { category: "blocker", signal: "ci failed", count: 5, runIds: ["run-1"], excerpt: "e" },
+  ];
+  const openIssues: OpenImproveIssue[] = [
+    {
+      title: proposedTitle(clusters[0]),
+      url: "https://github.com/org/repo/issues/99",
+      state: "CLOSED",
+      createdAt: "2026-07-01T00:00:00Z",
+      labels: [],
+    },
+  ];
+  const deps = makeApplyDeps({ openIssues });
+  await applyIssues(clusters, { minOccurrences: 3 }, deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.equal(clusters[0].alreadyTracked, undefined);
+});
+
+test("applyIssues: listOpenImproveIssues is called exactly once regardless of cluster count", async () => {
+  const clusters: ClusterEntry[] = [
+    { category: "blocker", signal: "ci failed", count: 5, runIds: ["run-1"], excerpt: "e" },
+    { category: "review-finding", signal: "null check", count: 4, runIds: ["run-2"], excerpt: "e" },
+    { category: "papercut", signal: "flaky test", count: 3, runIds: ["run-3"], excerpt: "e" },
+  ];
+  const deps = makeApplyDeps();
+  await applyIssues(clusters, { minOccurrences: 3 }, deps);
+  assert.equal(deps._listCalls, 1);
+  assert.equal(deps._createCalls.length, 3);
+});
+
+test("applyIssues: dedup applies to papercut clusters the same as non-papercut categories", async () => {
+  const clusters: ClusterEntry[] = [
+    { category: "papercut", signal: "flaky test gate", count: 4, runIds: ["run-1"], excerpt: "e" },
+  ];
+  const openIssues: OpenImproveIssue[] = [
+    {
+      title: proposedTitle(clusters[0]),
+      url: "https://github.com/org/repo/issues/7",
+      state: "OPEN",
+      createdAt: "2026-07-01T00:00:00Z",
+      labels: [],
+    },
+  ];
+  const deps = makeApplyDeps({ openIssues });
+  await applyIssues(clusters, { minOccurrences: 3 }, deps);
+  assert.equal(deps._createCalls.length, 0);
+  assert.equal(clusters[0].issueUrl, "https://github.com/org/repo/issues/7");
 });
 
 // ---------------------------------------------------------------------------

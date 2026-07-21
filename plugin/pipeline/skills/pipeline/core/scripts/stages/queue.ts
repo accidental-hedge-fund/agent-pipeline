@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { runsDir, runIdFor } from "../run-store.ts";
 import { BLOCKED_LABEL } from "../types.ts";
+import { autoFilePapercuts as realAutoFilePapercuts, realAutoFileDeps } from "./papercut.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -55,6 +56,13 @@ export interface QueueOpts {
   profile?: string;
   batchId: string;
   base?: string;
+  /** Opt-in papercut auto-file settings (#421). Absent/auto_file:false → inert. */
+  papercuts?: {
+    auto_file: boolean;
+    auto_file_window_hours: number;
+    auto_file_max_per_window: number;
+    auto_file_min_occurrences: number;
+  };
 }
 
 export interface PerIssueSummary {
@@ -97,6 +105,15 @@ export interface QueueDeps {
   readRunCost(issueNumber: number): Promise<number | null>;
   writeFile(filePath: string, content: string): Promise<void>;
   withQueueLock?<T>(repoDir: string, fn: () => Promise<T>): Promise<T>;
+  /** Opt-in papercut auto-file (#421) at batch end. Injectable so tests never
+   *  make a real gh/network call — the real impl delegates to
+   *  `autoFilePapercuts` from `./papercut.ts`. */
+  autoFilePapercuts(opts: {
+    repoDir: string;
+    windowHours: number;
+    maxPerWindow: number;
+    minOccurrences: number;
+  }): Promise<void>;
   log(msg: string): void;
   clock(): number;
 }
@@ -297,6 +314,7 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
     },
 
     withQueueLock: withQueueBatchLock,
+    autoFilePapercuts: (autoFileOpts) => realAutoFilePapercuts(autoFileOpts, realAutoFileDeps(repoDir)),
     log: (msg: string) => process.stdout.write(msg + "\n"),
     clock: () => Date.now(),
   };
@@ -690,6 +708,17 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
   );
   const artifactPath = path.join(artifactDir, "batch-summary.json");
   await deps.writeFile(artifactPath, JSON.stringify(summary, null, 2));
+
+  // Opt-in papercut auto-file (#421): best-effort, gated on resolved config,
+  // wrapped so a failure here can never alter the batch's outcome or exit status.
+  if (opts.papercuts?.auto_file) {
+    await deps.autoFilePapercuts({
+      repoDir: opts.repoDir,
+      windowHours: opts.papercuts.auto_file_window_hours,
+      maxPerWindow: opts.papercuts.auto_file_max_per_window,
+      minOccurrences: opts.papercuts.auto_file_min_occurrences,
+    }).catch(() => {});
+  }
 
   printHumanSummary(summary, artifactPath, deps);
   deps.log(`[pipeline queue] batch ${opts.batchId}: done`);

@@ -222,10 +222,17 @@ const PartialConfigSchema = z.object({
   papercuts: z
     .object({
       enabled: z.boolean().optional().describe("When true, gate the papercut instruction into prompts and pass run/stage identity to harness child processes."),
+      // Opt-in auto-file path (#421). Default off; when on, the engine clusters
+      // recurring papercuts and files pipeline:backlog issues without a human
+      // running `pipeline improve --apply`.
+      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end."),
+      auto_file_window_hours: z.number().positive().optional().describe("Trailing window (hours) over which papercut events are clustered for auto-filing."),
+      auto_file_max_per_window: z.number().int().positive().optional().describe("Maximum number of issues auto-filed within the trailing window."),
+      auto_file_min_occurrences: z.number().int().min(2).optional().describe("Minimum in-window occurrence count a papercut cluster must meet to be auto-filed."),
     })
     .strict()
     .optional()
-    .describe("Agent-logged minor-friction capture settings (#419)."),
+    .describe("Agent-logged minor-friction capture settings (#419) and opt-in auto-file settings (#421)."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -737,6 +744,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     },
     papercuts: {
       enabled: fileConfig.papercuts?.enabled ?? DEFAULT_CONFIG.papercuts.enabled,
+      auto_file: fileConfig.papercuts?.auto_file ?? DEFAULT_CONFIG.papercuts.auto_file,
+      auto_file_window_hours:
+        fileConfig.papercuts?.auto_file_window_hours ?? DEFAULT_CONFIG.papercuts.auto_file_window_hours,
+      auto_file_max_per_window:
+        fileConfig.papercuts?.auto_file_max_per_window ?? DEFAULT_CONFIG.papercuts.auto_file_max_per_window,
+      auto_file_min_occurrences:
+        fileConfig.papercuts?.auto_file_min_occurrences ?? DEFAULT_CONFIG.papercuts.auto_file_min_occurrences,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -1638,7 +1652,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "",
     config.papercuts !== undefined
       ? `papercuts: # agent-logged minor-friction capture (#419) — opt in to record friction via 'pipeline papercut' without stopping the run\n${yamlBlock(config.papercuts, 2)}`
-      : "# papercuts: # agent-logged minor-friction capture (#419) — uncomment to enable 'pipeline papercut' and its prompt instruction",
+      : [
+        "# papercuts: # agent-logged minor-friction capture (#419) — uncomment to enable 'pipeline papercut' and its prompt instruction",
+        "#   enabled: true",
+        "#   auto_file: false # opt in (#421) to auto-file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end",
+        `#   auto_file_window_hours: ${yamlScalar(papercuts.auto_file_window_hours)} # trailing window over which papercuts are clustered for auto-filing`,
+        `#   auto_file_max_per_window: ${yamlScalar(papercuts.auto_file_max_per_window)} # max issues auto-filed within the window`,
+        `#   auto_file_min_occurrences: ${yamlScalar(papercuts.auto_file_min_occurrences)} # min in-window occurrences a cluster must meet to be auto-filed`,
+      ].join("\n"),
     "",
     config.auto_loop !== undefined
       ? [

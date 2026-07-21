@@ -534,7 +534,7 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Improve sub-command
 
-`pipeline improve` is a **read-only** batch analyzer that reads `.agent-pipeline/runs/**/events.jsonl` and `summary.json`, clusters recurring failure patterns (review findings, blockers, flaky gates, token waste), and prints a dry-run report. It never modifies pipeline labels, branches, PRs, worktrees, or repo files.
+`pipeline improve` is a **read-only** batch analyzer that reads `.agent-pipeline/runs/**/events.jsonl` and `summary.json`, clusters recurring failure patterns (review findings, blockers, flaky gates, token waste) and agent-reported friction (papercuts), and prints a dry-run report. It never modifies pipeline labels, branches, PRs, worktrees, or repo files.
 
 ```bash
 /pipeline improve                         # dry-run: print cluster report to stdout
@@ -545,11 +545,13 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 /pipeline improve --apply --min-occurrences 5  # raise the issue-creation threshold
 ```
 
-**Cluster categories:** `review-finding` (same normalized finding title across runs), `blocker` (same normalized blocker reason), `flaky-gate` (same stage with repeated `outcome: error`), and `token-waste` (stages with anomalously high token count or duration, when data is available).
+**Cluster categories:** `review-finding` (same normalized finding title across runs), `blocker` (same normalized blocker reason), `flaky-gate` (same stage with repeated `outcome: error`), `token-waste` (stages with anomalously high token count or duration, when data is available), and `papercut` (same normalized message across agent-logged `pipeline papercut` events, #419/#421). A `papercut` cluster is never merged with a `flaky-gate`/`token-waste` cluster even when both describe the same underlying problem — agent-reported and telemetry-inferred evidence always stay in separate clusters.
 
-**Output:** the default human-readable report lists category, normalized signal, occurrence count, affected run IDs, an evidence excerpt, and a proposed issue title. `--json` emits a JSON array with the same fields. When `--apply --json` are combined, each cluster object also includes the `issueUrl` of the created issue.
+**Output:** the default human-readable report lists category, normalized signal, occurrence count, affected run IDs, an evidence excerpt, and a proposed issue title. `--json` emits a JSON array with the same fields. When `--apply --json` are combined, each cluster object also includes the `issueUrl` of the created issue (and `alreadyTracked: true` when it points at a pre-existing issue rather than one just created).
 
-**`--apply` safety:** only `gh issue create` is ever called — no label mutations, no branch writes, no pipeline state changes. Requires gh authentication; fails fast with a clear error if not authenticated.
+**`--apply` safety:** only `gh issue create` is ever called — no label mutations, no branch writes, no pipeline state changes. Requires gh authentication; fails fast with a clear error if not authenticated. Before creating anything, `--apply` looks up open issues titled `[pipeline-improve] ...` once per invocation and skips any cluster that already has an open issue — re-running `--apply` never files a duplicate.
+
+**Auto-file (opt-in, #421):** set `papercuts.auto_file: true` (see "Per-repo config") to skip the manual `--apply` step entirely. When enabled, the engine reuses this same clustering/dedup logic to file `pipeline:backlog`-only issues for recurring papercut clusters at `run_complete` and at the end of every `pipeline queue` batch, subject to `auto_file_min_occurrences`, a per-window rate cap (`auto_file_max_per_window` within `auto_file_window_hours`), and the same open-issue dedup as `--apply`. Auto-filed issues carry an explicit agent-reported-provenance statement and sanitized evidence, receive no label besides `pipeline:backlog`, and are never queued or advanced. The auto-file path is best-effort: any failure is logged and swallowed and can never fail a run, a stage, or a batch.
 
 ## Scoreboard sub-command
 
@@ -733,6 +735,12 @@ review_policy:                       # which review findings block progression v
 doctor:                              # deterministic preflight capability check — see "Preflight (doctor)"
   runOnStart: false                  # default: false; if true, run the preflight before planning and abort the run on any failure
   failFast: false                    # default: false; if true, stop at the first failing check instead of collecting all failures
+papercuts:                           # agent-logged minor-friction capture — see "Improve sub-command"
+  enabled: false                     # default: false; if true, gate the papercut instruction into prompts (`pipeline papercut`)
+  auto_file: false                   # default: false; if true, auto-file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end
+  auto_file_window_hours: 24         # default: 24 — trailing window over which papercuts are clustered for auto-filing
+  auto_file_max_per_window: 3        # default: 3 — max issues auto-filed within the window
+  auto_file_min_occurrences: 3       # default: 3 (must be ≥2) — min in-window occurrences a cluster must meet to be auto-filed
 review_harness: my-reviewer          # optional: override the reviewer CLI for the review step — see "Custom reviewer harness" (default: the profile's reviewer)
 # The implementer harness is owned by the install profile and cannot be set here.
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
