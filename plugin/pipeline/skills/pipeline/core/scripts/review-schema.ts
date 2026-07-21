@@ -14,7 +14,7 @@
 // unfilled placeholder, so a missing substitution is a hard error rather than a
 // prompt that reaches the reviewer with a literal `{{schema_block}}` token.
 
-import type { ReviewFinding, ReviewVerdict, ShipcheckVerdict, ShipcheckCriterion } from "./types.ts";
+import type { ReviewFinding, ReviewVerdict, ShipcheckVerdict, ShipcheckCriterion, DesignChallenge, DesignInterrogationVerdict } from "./types.ts";
 
 // The JSON body the reviewer is told to return. Field names and nesting order
 // MUST match `ReviewFinding` / `ReviewVerdict`; the drift guard test fails if
@@ -111,4 +111,43 @@ const SHIPCHECK_VERDICT_FIELD_GUARD: Record<keyof ShipcheckVerdict, true> = {
 export const SHIPCHECK_SCHEMA_FIELDS = {
   verdict: Object.keys(SHIPCHECK_VERDICT_FIELD_GUARD),
   criterion: Object.keys(SHIPCHECK_CRITERION_FIELD_GUARD),
+};
+
+// ---------------------------------------------------------------------------
+// Design-interrogation challenge verdict schema (#436) — single source of
+// truth for the design_interrogation.md prompt. Mirrors the pattern above.
+// ---------------------------------------------------------------------------
+
+export const DESIGN_CHALLENGE_SCHEMA_BLOCK = `{
+    "verdict": "approve" or "needs-attention",
+    "challenges": [
+        {
+            "decision_id": "<id of the decision this challenge targets>",
+            "title": "<short title of the challenge>",
+            "severity": "critical" | "high" | "medium" | "low",
+            "confidence": <0.0-1.0>,
+            "falsifier": "<what evidence would settle this challenge>",
+            "evidence_request": "<what the implementer should show to defend or revise>",
+            "required_action": "defend" | "revise" | "accept-uncertainty"
+        }
+    ]
+}`;
+
+const DESIGN_CHALLENGE_FIELD_GUARD: Record<keyof DesignChallenge, true> = {
+  decision_id: true,
+  title: true,
+  severity: true,
+  confidence: true,
+  falsifier: true,
+  evidence_request: true,
+  required_action: true,
+};
+const DESIGN_VERDICT_FIELD_GUARD: Record<keyof DesignInterrogationVerdict, true> = {
+  verdict: true,
+  challenges: true,
+};
+
+export const DESIGN_CHALLENGE_SCHEMA_FIELDS = {
+  verdict: Object.keys(DESIGN_VERDICT_FIELD_GUARD),
+  challenge: Object.keys(DESIGN_CHALLENGE_FIELD_GUARD),
 };

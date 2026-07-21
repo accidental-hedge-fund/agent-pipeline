@@ -1401,13 +1401,16 @@ export async function resumeFromImplementing(
     await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }, opts.runStoreDeps).catch(() => {});
   }
 
-  // ---- implementing → review-1 ----
-  await trans(cfg, issueNumber, "implementing", "review-1", opts.transitionMessage(prNumber));
+  // ---- implementing → design-gate ----
+  // Always traversed (#436): the design-gate stage itself decides whether it
+  // is inert (disabled/untriggered — advances immediately with a recorded
+  // reason) or fires, so this transition target is unconditional here.
+  await trans(cfg, issueNumber, "implementing", "design-gate", opts.transitionMessage(prNumber));
 
   return {
     advanced: true,
     from: "implementing",
-    to: "review-1",
+    to: "design-gate",
     summary: `PR #${prNumber} opened`,
   };
 }

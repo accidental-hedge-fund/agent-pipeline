@@ -134,7 +134,7 @@ test("resumeFromImplementing: gate passes + push ok + no existing PR → creates
     setBlocked: async (_cfg, _n, reason) => { setBlockedCalls.push(reason); },
     transition: async (_cfg, _n, from, to) => {
       assert.equal(from, "implementing");
-      assert.equal(to, "review-1");
+      assert.equal(to, "design-gate");
       transitionCalled = true;
     },
   };
@@ -158,7 +158,7 @@ test("resumeFromImplementing: gate passes + push ok + no existing PR → creates
   assert.equal(result.advanced, true);
   if (result.advanced) {
     assert.equal(result.from, "implementing");
-    assert.equal(result.to, "review-1");
+    assert.equal(result.to, "design-gate");
   }
 });
 
@@ -261,7 +261,7 @@ test("resumeFromImplementing: createPr throws but PR appeared concurrently → r
     setBlocked: async (_cfg, _n, reason) => { setBlockedCalls.push(reason); },
     transition: async (_cfg, _n, from, to, msg) => {
       assert.equal(from, "implementing");
-      assert.equal(to, "review-1");
+      assert.equal(to, "design-gate");
       assert.ok(msg?.includes("66"), "transition comment should reference PR #66");
       transitionCalled = true;
     },
@@ -284,7 +284,7 @@ test("resumeFromImplementing: createPr throws but PR appeared concurrently → r
   assert.equal(setBlockedCalls.length, 0, "setBlocked must NOT be called when PR appeared concurrently");
   assert.equal(result.advanced, true);
   if (result.advanced) {
-    assert.equal(result.to, "review-1");
+    assert.equal(result.to, "design-gate");
   }
 });
 

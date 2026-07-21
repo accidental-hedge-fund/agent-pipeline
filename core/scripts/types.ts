@@ -6,6 +6,7 @@ export const STAGES = [
   "planning",
   "plan-review",
   "implementing",
+  "design-gate",
   "review-1",
   "fix-1",
   "review-2",
@@ -42,6 +43,7 @@ export const MODEL_INVOKING_STAGES = [
   "planning",
   "plan-review",
   "implementing",
+  "design-gate",
   "review-1",
   "fix-1",
   "review-2",
@@ -52,7 +54,9 @@ export type ModelInvokingStage = (typeof MODEL_INVOKING_STAGES)[number];
 
 /** Prompt-contained stages: the prompt already carries (or can carry) all
  *  context needed to reach a verdict without exploring the repo — the only
- *  stages a `model-endpoint` executor may be assigned to. */
+ *  stages a `model-endpoint` executor may be assigned to. `design-gate` is
+ *  deliberately excluded (#436): both the implementer's decision-record
+ *  emission and the reviewer's challenge round need repository access. */
 export const PROMPT_CONTAINED_STAGES = ["plan-review", "review-1", "review-2"] as const;
 
 /** Execution-environment stages: need repo/tool access (read files, run
@@ -62,6 +66,7 @@ export const PROMPT_CONTAINED_STAGES = ["plan-review", "review-1", "review-2"] a
 export const EXECUTION_ENVIRONMENT_STAGES = [
   "planning",
   "implementing",
+  "design-gate",
   "fix-1",
   "fix-2",
   "shipcheck-gate",
@@ -257,6 +262,7 @@ export const BLOCKER_KINDS = [
   "head-drift",
   "worktree-setup-failed",
   "build-failed",
+  "design-gate-failed",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -370,7 +376,161 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "for this round's commit (see the output above). Fix the build in the " +
     "worktree, commit the fix, remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`.",
+  "design-gate-failed":
+    "The design-interrogation gate (#436) could not produce a valid decision " +
+    "record or challenge verdict after its bounded re-ask, or the reviewer " +
+    "harness is unavailable (see the error above). Investigate and fix the " +
+    "root cause, remove the `blocked` label, then re-run `$pipeline {{N}}`.",
 };
+
+// ---------------------------------------------------------------------------
+// Risk-triggered design-interrogation gate (#436) — trigger classes, decision
+// record, challenge verdict, and resumable gate state.
+// ---------------------------------------------------------------------------
+
+/** Built-in risk classes the `design-gate` stage can trigger on. Each is a
+ *  named set of path globs plus (for "architecture") a size threshold; a repo
+ *  may enable a subset via `design_gate.triggers` and extend any class's
+ *  globs via `design_gate.extra_triggers`. */
+export const DESIGN_GATE_TRIGGER_CLASSES = [
+  "concurrency",
+  "storage",
+  "auth",
+  "migration",
+  "infrastructure",
+  "public-api",
+  "architecture",
+] as const;
+export type DesignGateTriggerClass = (typeof DESIGN_GATE_TRIGGER_CLASSES)[number];
+
+/** One matched trigger: the class plus the concrete evidence that matched
+ *  (a changed path, a label name, or a size-threshold description). */
+export interface DesignGateTriggerMatch {
+  trigger: DesignGateTriggerClass;
+  evidence: string;
+}
+
+/** Deterministic reason a triggered/untriggered decision carries when the
+ *  gate does not fire. */
+export type DesignGateNoTriggerReason = "gate-disabled" | "no-trigger-matched";
+
+/** Pure result of `evaluateDesignGateTrigger` — recorded on the design-gate
+ *  stage record on every run, whether or not the gate fires. */
+export interface DesignGateTriggerResult {
+  triggered: boolean;
+  matched: DesignGateTriggerMatch[];
+  reason: string;
+}
+
+/** One alternative the implementer considered and rejected for a decision. */
+export interface DesignDecisionAlternative {
+  option: string;
+  rejected_because: string;
+}
+
+/** One material design decision recorded by the implementer (#436). Every
+ *  free-text field is subject to `design_gate.limits.max_field_chars`
+ *  truncation; `alternatives` must be non-empty for the decision to validate. */
+export interface DesignDecision {
+  id: string;
+  title: string;
+  surface: string;
+  alternatives: DesignDecisionAlternative[];
+  assumptions: string[];
+  invariants: string[];
+  evidence: string[];
+  generalization_boundary: string;
+  uncertainty: string;
+}
+
+/** Schema-versioned, size-bounded decision record artifact (#436). */
+export interface DesignDecisionRecord {
+  schema_version: number;
+  decisions: DesignDecision[];
+}
+
+/** Truncation/bounding note attached to a persisted `DesignDecisionRecord`
+ *  (never silent — `design-decision-record` spec). */
+export interface DesignDecisionRecordBounding {
+  fieldsTruncated: number;
+  decisionsDropped: number;
+  artifactBytesTruncated: boolean;
+  /** Decisions dropped by the byte-ceiling shrink pass, on top of
+   *  `decisionsDropped` (which only counts the `max_decisions` cap). */
+  decisionsDroppedByByteCeiling: number;
+  /** Array entries (alternatives/assumptions/invariants/evidence) dropped
+   *  when the byte-ceiling pass capped every array field to one entry. */
+  arrayEntriesDroppedByByteCeiling: number;
+}
+
+/** Required next action a challenge asks of the implementer. */
+export type DesignChallengeRequiredAction = "defend" | "revise" | "accept-uncertainty";
+
+/** One falsifiable challenge from the interrogation reviewer (#436). */
+export interface DesignChallenge {
+  decision_id: string;
+  title: string;
+  severity: "critical" | "high" | "medium" | "low";
+  confidence: number;
+  falsifier: string;
+  evidence_request: string;
+  required_action: DesignChallengeRequiredAction;
+}
+
+/** Verdict returned by the design-interrogation reviewer: `approve` (zero
+ *  challenges) or `needs-attention` with 3–7 challenges. */
+export interface DesignInterrogationVerdict {
+  verdict: "approve" | "needs-attention";
+  challenges: DesignChallenge[];
+}
+
+/** Disposition the implementer applies to one blocking challenge in a
+ *  response round. `out-of-scope` is not part of `required_action` — it is
+ *  the implementer's own escape hatch for a challenge that expands scope
+ *  beyond the issue/approved plan. */
+export type DesignChallengeDisposition = "defended" | "revised" | "uncertainty-accepted" | "out-of-scope";
+
+/** One implementer response to a specific challenge, keyed by its stable
+ *  `challengeKey`. */
+export interface DesignChallengeResponse {
+  challengeKey: string;
+  disposition: DesignChallengeDisposition;
+  evidence: string;
+}
+
+/** One round's record: the verdict's challenges (each carrying its stable key
+ *  and blocking/advisory classification) and the implementer's responses, if
+ *  a response round ran. */
+export interface DesignGateRound {
+  round: number;
+  reviewerRaw: string | null;
+  challenges: (DesignChallenge & { challengeKey: string; blocking: boolean })[];
+  responses: DesignChallengeResponse[];
+}
+
+/** Reviewer harness identity + independence disclosure (#436 D4). */
+export interface DesignGateReviewerIdentity {
+  harness: string;
+  model?: string;
+  effort?: string;
+  independence: "independent" | "same-harness-fallback";
+}
+
+/** Final disposition of a triggered gate run. */
+export type DesignGateOutcome = "advanced" | "parked-needs-human" | "blocked";
+
+/** Full resumable gate state (#436 D8), persisted to the run directory and
+ *  mirrored into the gate's issue-comment hidden artifact so a crash mid-gate
+ *  can rehydrate instead of re-invoking a completed round. */
+export interface DesignGateState {
+  schema_version: number;
+  trigger: DesignGateTriggerResult;
+  reviewerIdentity: DesignGateReviewerIdentity | null;
+  decisionRecordVersions: DesignDecisionRecord[];
+  bounding: DesignDecisionRecordBounding | null;
+  rounds: DesignGateRound[];
+  outcome: DesignGateOutcome | null;
+}
 
 export type OpenspecMode = "auto" | "on" | "off";
 
@@ -460,6 +620,26 @@ export interface PipelineConfig {
     standard_review: boolean;
     adversarial_review: boolean;
     docs: boolean;
+  };
+  // Risk-triggered design-interrogation gate (#436). Default-off: repos that
+  // never set this block observe no behavior change at all — the `design-gate`
+  // stage advances immediately with a recorded `gate-disabled` reason and no
+  // harness call. `triggers` selects which built-in risk classes are armed;
+  // `extra_triggers` merges additional path globs into a named class.
+  // `block_threshold`/`min_confidence` mirror `review_policy`'s severity gate,
+  // applied to challenges instead of findings.
+  design_gate: {
+    enabled: boolean;
+    triggers: DesignGateTriggerClass[];
+    extra_triggers: Partial<Record<DesignGateTriggerClass, string[]>>;
+    max_rounds: number;
+    block_threshold: "critical" | "high" | "medium" | "low";
+    min_confidence: number;
+    limits: {
+      max_decisions: number;
+      max_field_chars: number;
+      max_artifact_bytes: number;
+    };
   };
   // Test/build gate (#15). When enabled, the target repo's own test/build
   // command runs in the worktree during implementation and after each fix
@@ -722,6 +902,15 @@ export const DEFAULT_CONFIG: Omit<
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
+  design_gate: {
+    enabled: false,
+    triggers: [...DESIGN_GATE_TRIGGER_CLASSES],
+    extra_triggers: {},
+    max_rounds: 2,
+    block_threshold: "medium" as const,
+    min_confidence: 0.6,
+    limits: { max_decisions: 8, max_field_chars: 4000, max_artifact_bytes: 65_536 },
+  },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
   visual_gate: { enabled: false, mode: "gate" as const, timeout: 900, max_attempts: 2, artifacts_dir: ".pipeline-visual" },
@@ -1179,6 +1368,11 @@ export interface EvidenceBundle {
    *  present, the eligibility gate's behavioral-change-without-tests hard-deny
    *  is suppressed. */
   no_test_rationale?: string;
+  /** Full design-interrogation chain (#436): trigger record, reviewer identity,
+   *  decision-record versions, per-round challenges/dispositions, and the
+   *  gate's final outcome. Present for every run that reaches `design-gate`;
+   *  untriggered runs carry only `trigger` and `outcome: null`. */
+  designInterrogation?: DesignGateState;
 }
 
 // ---------------------------------------------------------------------------

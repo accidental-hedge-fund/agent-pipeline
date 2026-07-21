@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { domainContext, readConventions } from "../config.ts";
-import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
+import { REVIEW_VERDICT_SCHEMA_BLOCK, DESIGN_CHALLENGE_SCHEMA_BLOCK } from "../review-schema.ts";
 import { renderPriorRoundDigest, type PriorRoundDigest } from "../review-history.ts";
 import { DEFAULT_CONFIG } from "../types.ts";
 import type { PipelineConfig } from "../types.ts";
@@ -190,7 +190,26 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     docs_instruction: a.docsEnabled ? DOCS_INSTRUCTION_SECTION : "",
     spec_context: specContextSection(a.specContext),
     papercut_instruction: papercutInstructionSection(a.cfg),
+    design_gate_instruction: designGateInstructionSection(a.cfg),
   });
+}
+
+/**
+ * Design-interrogation-gate addendum (#436), injected into the implementing
+ * prompt only when `design_gate.enabled` is true — armed, not necessarily
+ * triggered (trigger evaluation runs after implementing produces commits).
+ * Tells the implementer to record material design decisions as it goes so a
+ * later triggered gate can interrogate them, without requiring any output
+ * from this stage itself. Empty (byte-identical prompt) when the gate is off,
+ * preserving default-inert behavior.
+ */
+function designGateInstructionSection(cfg: PipelineConfig): string {
+  if (!cfg.design_gate?.enabled) return "";
+  return `
+
+## Design-Interrogation Gate (may run after this stage)
+
+This repo has a risk-triggered design-interrogation gate armed. If your implementation makes a material design decision not already settled by the plan (a lock granularity, a storage shape, an auth boundary, a migration ordering, a concurrency model, or similar) for a risky surface (concurrency, storage, auth, migrations, infrastructure, public APIs, or a large architectural change), keep track of: the alternatives you considered and why you rejected them, the assumptions/invariants it depends on, and your honest uncertainty. If the gate fires, you will be asked to state these explicitly in a follow-up step — you do not need to produce anything for it now.`;
 }
 
 /**
@@ -756,6 +775,63 @@ export function buildBackfillPrompt(a: BuildBackfillArgs): string {
     repo_context: a.repoContext,
     living_spec_inventory: a.livingSpecInventory,
     evidence_corpus: a.evidenceCorpus,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Design-interrogation gate prompts (#436)
+// ---------------------------------------------------------------------------
+
+export interface BuildDesignDecisionRecordArgs {
+  issueNumber: number;
+  body: string;
+  plan: string;
+  changedFiles: string[];
+  triggerSummary: string;
+}
+
+export function buildDesignDecisionRecordPrompt(a: BuildDesignDecisionRecordArgs): string {
+  return substitute(loadTemplate("design_decision_record"), {
+    issue_body: a.body || "(no description)",
+    plan: a.plan,
+    changed_files: a.changedFiles.length ? a.changedFiles.map((f) => `- ${f}`).join("\n") : "(no changed files reported)",
+    trigger_summary: a.triggerSummary,
+  });
+}
+
+export interface BuildDesignInterrogationArgs {
+  body: string;
+  plan: string;
+  decisionRecordJson: string;
+  priorDispositions?: string;
+}
+
+export function buildDesignInterrogationPrompt(a: BuildDesignInterrogationArgs): string {
+  return substitute(loadTemplate("design_interrogation"), {
+    issue_body: a.body || "(no description)",
+    plan: a.plan,
+    decision_record: a.decisionRecordJson,
+    prior_dispositions: priorDispositionsSection(a.priorDispositions),
+    schema_block: DESIGN_CHALLENGE_SCHEMA_BLOCK,
+  });
+}
+
+function priorDispositionsSection(s?: string): string {
+  if (!s || !s.trim()) return "";
+  return `\n\n## Prior Dispositions (already addressed — do not re-litigate without cause)\n\n${s.trim()}`;
+}
+
+export interface BuildDesignResponseArgs {
+  body: string;
+  decisionRecordJson: string;
+  challengesText: string;
+}
+
+export function buildDesignResponsePrompt(a: BuildDesignResponseArgs): string {
+  return substitute(loadTemplate("design_response"), {
+    issue_body: a.body || "(no description)",
+    decision_record: a.decisionRecordJson,
+    challenges: a.challengesText,
   });
 }
 

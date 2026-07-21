@@ -517,6 +517,35 @@ function pad(s: string, width: number): string {
   return s.length >= width ? s : s + " ".repeat(width - s.length);
 }
 
+/** One design-interrogation challenge's final disposition, collapsed across
+ *  every round it appeared in (exported for tests). A challenge's `blocking`
+ *  flag and `evidence` reflect the last round it was recorded in; its
+ *  `disposition` reflects the last round in which the implementer responded
+ *  to it — `"unresolved"` if a blocking challenge never got a response. */
+export function collectDesignChallengeSummary(
+  state: import("./types.ts").DesignGateState,
+): { challengeKey: string; title: string; severity: string; blocking: boolean; disposition: string; evidence: string }[] {
+  const byKey = new Map<string, { title: string; severity: string; blocking: boolean }>();
+  const dispositionByKey = new Map<string, { disposition: string; evidence: string }>();
+  for (const round of state.rounds) {
+    for (const c of round.challenges) {
+      byKey.set(c.challengeKey, { title: c.title, severity: c.severity, blocking: c.blocking });
+    }
+    for (const r of round.responses) {
+      dispositionByKey.set(r.challengeKey, { disposition: r.disposition, evidence: r.evidence });
+    }
+  }
+  return Array.from(byKey.entries()).map(([challengeKey, meta]) => {
+    const resolved = dispositionByKey.get(challengeKey);
+    return {
+      challengeKey,
+      ...meta,
+      disposition: resolved?.disposition ?? (meta.blocking ? "unresolved" : "advisory"),
+      evidence: resolved?.evidence ?? "",
+    };
+  });
+}
+
 /** Format the bundle as human-readable text (pure; exported for tests). */
 export function formatSummary(bundle: EvidenceBundle): string {
   const lines: string[] = [];
@@ -574,12 +603,62 @@ export function formatSummary(bundle: EvidenceBundle): string {
     }
   }
 
+  if (bundle.designInterrogation) {
+    const di = bundle.designInterrogation;
+    lines.push("");
+    lines.push("Design interrogation:");
+    if (!di.trigger.triggered) {
+      lines.push(`  not triggered (${di.trigger.reason})`);
+    } else {
+      const identity = di.reviewerIdentity
+        ? `${di.reviewerIdentity.harness} (${di.reviewerIdentity.independence})`
+        : "(unknown)";
+      lines.push(`  triggered: ${di.trigger.matched.map((m) => m.trigger).join(", ")}`);
+      lines.push(`  reviewer:  ${identity}`);
+      if (di.reviewerIdentity?.independence === "same-harness-fallback") {
+        lines.push(`  fallback:  reviewer harness matches the implementer harness — interrogation ran without an independent reviewer`);
+      }
+      lines.push(`  rounds:    ${di.rounds.length}`);
+
+      const challenges = collectDesignChallengeSummary(di);
+      const blockingCount = challenges.filter((c) => c.blocking).length;
+      const advisoryCount = challenges.length - blockingCount;
+      lines.push(`  challenges: ${blockingCount} blocking, ${advisoryCount} advisory`);
+      for (const c of challenges) {
+        lines.push(`    ${c.blocking ? "[blocking]" : "[advisory]"} ${pad(c.severity, 8)} ${c.challengeKey}  ${c.title} — ${c.disposition}`);
+      }
+      const acceptedUncertainty = challenges.filter((c) => c.disposition === "uncertainty-accepted" && c.evidence);
+      if (acceptedUncertainty.length) {
+        lines.push("  accepted uncertainty:");
+        for (const c of acceptedUncertainty) {
+          lines.push(`    ${c.challengeKey}  ${c.evidence}`);
+        }
+      }
+
+      lines.push(`  outcome:   ${di.outcome ?? "(in progress)"}`);
+    }
+  }
+
   return lines.join("\n");
 }
 
 /** Print the human-readable summary to stdout. */
 export function printSummary(bundle: EvidenceBundle): void {
   console.log(formatSummary(bundle));
+}
+
+/** Write the design-interrogation record to the bundle (#436). Set for every
+ *  run that reaches `design-gate`, whether or not the gate fires. Non-fatal:
+ *  write errors are caught and logged. */
+export async function recordDesignInterrogation(
+  stateDir: string,
+  issue: number,
+  state: import("./types.ts").DesignGateState,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  bundle.designInterrogation = state;
+  await writeBundle(stateDir, issue, bundle, deps);
 }
 
 /** Write the auto-merge eligibility artifact to the bundle (#306).

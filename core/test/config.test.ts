@@ -370,6 +370,58 @@ test("resolveConfig: visual_gate enabled:false keeps other defaults", async () =
   }
 });
 
+// ---- design_gate (#436) ----
+
+test("resolveConfig: design_gate absent — disabled by default with documented defaults", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/dg0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.design_gate.enabled, false);
+    assert.deepEqual(cfg.design_gate.triggers, DEFAULT_CONFIG.design_gate.triggers);
+    assert.deepEqual(cfg.design_gate.extra_triggers, {});
+    assert.equal(cfg.design_gate.max_rounds, 2);
+    assert.equal(cfg.design_gate.block_threshold, "medium");
+    assert.equal(cfg.design_gate.min_confidence, 0.6);
+    assert.equal(cfg.design_gate.limits.max_decisions, 8);
+    assert.equal(cfg.design_gate.limits.max_field_chars, 4000);
+    assert.equal(cfg.design_gate.limits.max_artifact_bytes, 65_536);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: design_gate enabled with a trigger subset", async () => {
+  const repo = makeFakeRepo(`design_gate:\n  enabled: true\n  triggers: ["storage", "auth"]\n`);
+  const binDir = makeFakeGh("acme/dg1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.design_gate.enabled, true);
+    assert.deepEqual(cfg.design_gate.triggers, ["storage", "auth"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: design_gate unknown key is rejected at parse time", async () => {
+  const repo = makeFakeRepo(`design_gate:\n  enabled: true\n  always: true\n`);
+  const binDir = makeFakeGh("acme/dg2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid.*always/s);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- review_policy (#17) ----
 
 test("resolveConfig: review_policy defaults apply when absent (block medium+, conf floor 0.7, bounded rounds)", async () => {

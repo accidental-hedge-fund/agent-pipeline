@@ -77,6 +77,7 @@ test("state machine: STAGES order is forward", () => {
     "planning",
     "plan-review",
     "implementing",
+    "design-gate",
     "review-1",
     "fix-1",
     "review-2",
