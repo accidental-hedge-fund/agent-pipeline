@@ -1,10 +1,15 @@
 // Grading entry point (eval-graders, `pipeline evals grade <experiment-dir>`).
 //
-// Reads manifest.json, runs.jsonl, and the fixtures; opens no runner-written
-// file for writing; writes grades.jsonl fresh each invocation so regrading is
-// byte-identical (design.md decision 1). Grades only `completed` cells whose
-// fixture declares a grader_ref for the mode's applicable grader — a cell
-// that is not gradeable is reported in `skipped`, never silently dropped.
+// Reads manifest.json, runs.jsonl, failures.jsonl, and the fixtures; opens no
+// runner-written file for writing; writes grades.jsonl fresh each invocation
+// so regrading is byte-identical (design.md decision 1). Grades only
+// `completed` cells whose fixture declares a grader_ref for the mode's
+// applicable grader — a failure-class cell (infra_error/auth_error/timeout)
+// is never graded, and a completed cell that is not gradeable is reported in
+// `skipped`, never silently dropped. A cell whose mode has no single
+// applicable grader (`end-to-end`, `plan-review`) may still emit a
+// `composite` grade for whichever underlying review/planning stage output
+// the executor captured and the fixture declares a grader_ref for.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -15,7 +20,7 @@ import { parseReportedFindings, gradeReview } from "./graders/review.ts";
 import { gradePlanning } from "./graders/planning.ts";
 import type { CellRecord, EvalMode, ExperimentManifest, Fixture } from "../types.ts";
 import type { PipelineConfig } from "../../types.ts";
-import type { CellIdentity, GradeRecord, SkippedCell } from "./types.ts";
+import type { CellIdentity, CompositeSubGradePayload, GradeRecord, GraderVersion, SkippedCell } from "./types.ts";
 
 export interface GradeIODeps {
   readFile?: (filePath: string) => Promise<string | null>;
@@ -85,13 +90,18 @@ export async function gradeExperiment(
 
   const runsText = await readFileFn(path.join(dir, "runs.jsonl"));
   const runs = runsText ? parseJsonl<CellRecord>(runsText) : [];
+  // failures.jsonl is also read (design.md decision 1) so a failure-class
+  // cell is explicitly accounted for below rather than assumed absent from
+  // the stream this loop processes.
+  const failuresText = await readFileFn(path.join(dir, "failures.jsonl"));
+  const failures = failuresText ? parseJsonl<CellRecord>(failuresText) : [];
 
   const graderId = graderIdForMode(manifest.mode);
   const grades: GradeRecord[] = [];
   const skipped: SkippedCell[] = [];
   const baselineCache = new Map<string, Record<string, boolean>>();
 
-  for (const record of runs) {
+  for (const record of [...runs, ...failures]) {
     const identity: CellIdentity = {
       cell_id: record.cell_id,
       experiment_id: record.experiment_id,
@@ -99,13 +109,53 @@ export async function gradeExperiment(
       treatment_id: record.treatment_id,
       replicate: record.replicate,
     };
+    // A failure-class cell (infra_error/auth_error/timeout) contributes to
+    // reliability reporting only — never a quality grade (eval-graders
+    // review 2 finding 370add6f).
+    if (record.result_class !== "completed") {
+      skipped.push({ ...identity, reason: `cell result_class is "${record.result_class}" — reliability only, not graded` });
+      continue;
+    }
     const fixture = fixtures.get(record.fixture_id);
     if (!fixture) {
       skipped.push({ ...identity, reason: `fixture "${record.fixture_id}" not found` });
       continue;
     }
     if (!graderId) {
-      skipped.push({ ...identity, reason: `manifest mode "${manifest.mode}" has no applicable grader` });
+      // The manifest's mode has no single applicable grader (e.g.
+      // `end-to-end`, `plan-review`), but the executor may still have
+      // captured a real review or planning stage's output as part of that
+      // composite cell — grade whichever of those the fixture declares a
+      // grader_ref for, rather than discarding them (review 2 finding
+      // b493406e).
+      const detailForComposite = record.detail ?? {};
+      const compositeGrades: CompositeSubGradePayload[] = [];
+      const compositeGraders: GraderVersion[] = [];
+      if (detailForComposite.findings !== undefined) {
+        const reviewRef = fixture.grader_refs.find((r) => r.grader === "review");
+        if (reviewRef) {
+          const findings = parseReportedFindings(detailForComposite.findings as unknown[] | undefined);
+          compositeGrades.push({ kind: "review", grade: gradeReview(fixture, findings) });
+          compositeGraders.push({ grader: reviewRef.grader, version: reviewRef.version });
+        }
+      }
+      if (detailForComposite.output_text !== undefined) {
+        const planningRef = fixture.grader_refs.find((r) => r.grader === "planning");
+        if (planningRef) {
+          const outputText = (detailForComposite.output_text as string) ?? "";
+          compositeGrades.push({
+            kind: "planning",
+            grade: gradePlanning(fixture, outputText),
+            self_assessment_observed: detailForComposite.self_assessment,
+          });
+          compositeGraders.push({ grader: planningRef.grader, version: planningRef.version });
+        }
+      }
+      if (compositeGrades.length === 0) {
+        skipped.push({ ...identity, reason: `manifest mode "${manifest.mode}" has no applicable grader` });
+      } else {
+        grades.push({ ...identity, graders: compositeGraders, payload: { kind: "composite", grades: compositeGrades } });
+      }
       continue;
     }
     const ref = fixture.grader_refs.find((r) => r.grader === graderId);

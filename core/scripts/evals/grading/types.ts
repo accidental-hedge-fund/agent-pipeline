@@ -67,10 +67,20 @@ export interface PlanningGrade {
   downstream_compatibility: { matched_signals: number; total_signals: number; score: number };
 }
 
+/** One sub-grade contributed to a composite cell — a cell whose mode (e.g.
+ *  `end-to-end`) has no single applicable grader but whose executor captured
+ *  output from an underlying review or planning stage (eval-graders review 2
+ *  finding b493406e: a composite cell's captured stage output must not be
+ *  discarded just because the cell's mode itself has no direct grader). */
+export type CompositeSubGradePayload =
+  | { kind: "review"; grade: ReviewGrade }
+  | { kind: "planning"; grade: PlanningGrade; self_assessment_observed?: unknown };
+
 export type StageGradePayload =
   | { kind: "implementation-fix"; grade: ImplementationFixGrade }
   | { kind: "review"; grade: ReviewGrade }
-  | { kind: "planning"; grade: PlanningGrade; self_assessment_observed?: unknown };
+  | { kind: "planning"; grade: PlanningGrade; self_assessment_observed?: unknown }
+  | { kind: "composite"; grades: CompositeSubGradePayload[] };
 
 /** One line of grades.jsonl. */
 export interface GradeRecord extends CellIdentity {

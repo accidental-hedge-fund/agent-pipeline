@@ -4,31 +4,45 @@
 // contains it, and it is never combined with duration or cost into one score
 // (eval-comparative-reporting's "no combined weighted score").
 
-import type { GradeRecord } from "../grading/types.ts";
+import type { CompositeSubGradePayload, GradeRecord } from "../grading/types.ts";
+import type { ImplementationFixGrade, PlanningGrade, ReviewGrade } from "../grading/types.ts";
 
 function rate(numerator: number, total: number): number {
   return total === 0 ? 1 : numerator / total;
 }
 
+function scoreImplementationFix(g: ImplementationFixGrade): number {
+  const hiddenRate = rate(g.hidden_tests.passed, g.hidden_tests.total);
+  const acceptanceRate = rate(g.acceptance.completed, g.acceptance.total);
+  const regressionPenalty = Math.min(1, g.regressions * 0.25);
+  return Math.max(0, (hiddenRate + acceptanceRate) / 2 - regressionPenalty);
+}
+
+function scoreReview(g: ReviewGrade): number {
+  return g.f1 ?? 0;
+}
+
+function scorePlanning(g: PlanningGrade): number {
+  const coverageRate = rate(g.requirement_coverage.covered, g.requirement_coverage.total);
+  const assumptionPenalty = Math.min(1, g.unsupported_assumptions * 0.1);
+  return Math.max(0, (coverageRate + g.actionability.score + g.downstream_compatibility.score) / 3 - assumptionPenalty);
+}
+
+function scoreCompositeSubGrade(sub: CompositeSubGradePayload): number {
+  return sub.kind === "review" ? scoreReview(sub.grade) : scorePlanning(sub.grade);
+}
+
 export function qualityScore(grade: GradeRecord): number {
   switch (grade.payload.kind) {
-    case "implementation-fix": {
-      const g = grade.payload.grade;
-      const hiddenRate = rate(g.hidden_tests.passed, g.hidden_tests.total);
-      const acceptanceRate = rate(g.acceptance.completed, g.acceptance.total);
-      const regressionPenalty = Math.min(1, g.regressions * 0.25);
-      return Math.max(0, (hiddenRate + acceptanceRate) / 2 - regressionPenalty);
-    }
+    case "implementation-fix":
+      return scoreImplementationFix(grade.payload.grade);
     case "review":
-      return grade.payload.grade.f1 ?? 0;
-    case "planning": {
-      const g = grade.payload.grade;
-      const coverageRate = rate(g.requirement_coverage.covered, g.requirement_coverage.total);
-      const assumptionPenalty = Math.min(1, g.unsupported_assumptions * 0.1);
-      return Math.max(
-        0,
-        (coverageRate + g.actionability.score + g.downstream_compatibility.score) / 3 - assumptionPenalty,
-      );
+      return scoreReview(grade.payload.grade);
+    case "planning":
+      return scorePlanning(grade.payload.grade);
+    case "composite": {
+      const scores = grade.payload.grades.map(scoreCompositeSubGrade);
+      return scores.length === 0 ? 0 : scores.reduce((a, b) => a + b, 0) / scores.length;
     }
   }
 }
