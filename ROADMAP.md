@@ -511,6 +511,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.18.0** ✅ shipped | minor | Controlled multi-harness evaluation foundation: Grok Build/Pi/OpenCode adapters + manifest-driven stage eval runner | #431, #432, #481 | Shipped 2026-07-21 (tag `v1.18.0`). See **Shipped** above for the per-PR detail. |
 | **v1.19.0** ✅ shipped | minor | Objective grading + API comparison: eval graders with statistical reporting + OpenRouter executor experiment controls | #433, #434 | Shipped 2026-07-21 (tag `v1.19.0`). See **Shipped** above for the per-PR detail. |
 | **v1.20.0** ✅ shipped | minor | Risk-triggered design-interrogation gate + large-prompt harness delivery | #436, #492 | Shipped 2026-07-21 (tag `v1.20.0`). See **Shipped** above for the per-PR detail. |
+| **v1.21.0** | minor | Durable goal orchestration behind pipeline:loop | #451 | pipeline:loop facade — deterministic preflight (engine-scoped goal-loop discovery, contract coherence, native-goal capability with audit-only bypass), selector normalization (milestone/label/range→work-list/roadmap-slice/issue list), and delegation to the installed goal-loop skill for durable multi-item runs. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
