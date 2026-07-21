@@ -76,6 +76,26 @@ export function proposedTitle(c: Pick<ClusterEntry, "category" | "signal">): str
   return `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
 }
 
+/** `gh issue list` args for fetching `[pipeline-improve]`-titled issues (#421 review 2
+ *  finding: `--limit 200` applied before the local title filter silently dropped matches
+ *  in repos with 200+ newer unrelated issues). `--search ... in:title` filters
+ *  server-side, so `--limit` bounds the number of `[pipeline-improve]` issues rather than
+ *  the number of unrelated issues in the repo. Exported for regression testing. */
+export function listOpenImproveIssuesArgs(): string[] {
+  return [
+    "issue",
+    "list",
+    "--state",
+    "all",
+    "--search",
+    `"[pipeline-improve]" in:title`,
+    "--json",
+    "title,state,createdAt,number,url,labels",
+    "--limit",
+    "1000",
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Real deps
 // ---------------------------------------------------------------------------
@@ -119,11 +139,7 @@ export function realImproveDeps(repoDir: string): ImproveDeps {
       // --state all (not "open"): the auto-file rate-window cap (#421 finding 3)
       // must count closed auto-filed issues too, so callers that need only open
       // issues (dedup) filter on `state === "OPEN"` themselves.
-      const r = spawnSync(
-        "gh",
-        ["issue", "list", "--state", "all", "--json", "title,state,createdAt,number,url,labels", "--limit", "200"],
-        { encoding: "utf8", cwd: repoDir },
-      );
+      const r = spawnSync("gh", listOpenImproveIssuesArgs(), { encoding: "utf8", cwd: repoDir });
       if (r.status !== 0) {
         throw new Error(`gh issue list failed: ${r.stderr?.trim() ?? "unknown error"}`);
       }

@@ -19,6 +19,7 @@ import {
   formatJson,
   applyIssues,
   proposedTitle,
+  listOpenImproveIssuesArgs,
   type ClusterEntry,
   type ImproveDeps,
   type OpenImproveIssue,
@@ -652,6 +653,29 @@ test("formatJson: papercut cluster emits category: papercut", () => {
   const json = formatJson([cluster]);
   const parsed = JSON.parse(json) as Record<string, unknown>[];
   assert.equal(parsed[0]["category"], "papercut");
+});
+
+// ---------------------------------------------------------------------------
+// 6.4 listOpenImproveIssuesArgs (#421 review 2: truncation regression)
+// ---------------------------------------------------------------------------
+
+test("listOpenImproveIssuesArgs: filters by title server-side instead of relying on --limit", () => {
+  // Regression for #421 review 2 finding: a client-side title filter applied
+  // *after* a `--limit 200` fetch silently drops matching issues in repos with
+  // 200+ newer unrelated issues. A `--search ... in:title` term makes the
+  // fetch itself scoped to `[pipeline-improve]` issues, so `--limit` no longer
+  // bounds unrelated repo issues out of the result.
+  const args = listOpenImproveIssuesArgs();
+  const searchIdx = args.indexOf("--search");
+  assert.notEqual(searchIdx, -1, "expected a --search flag scoping the fetch by title");
+  assert.equal(args[searchIdx + 1], `"[pipeline-improve]" in:title`);
+
+  const limitIdx = args.indexOf("--limit");
+  assert.notEqual(limitIdx, -1);
+  assert.ok(
+    Number(args[limitIdx + 1]) > 200,
+    "limit must exceed the old 200 cap now that --search already scopes the fetch",
+  );
 });
 
 // ---------------------------------------------------------------------------
