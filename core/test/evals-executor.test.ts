@@ -218,6 +218,82 @@ test("runCell: two replicates of the same treatment get distinct worktrees/branc
   assert.equal(new Set(seen).size, 2);
 });
 
+test("runCell: strips GitHub/git write credentials from the real harness process env", async () => {
+  let seenEnv: NodeJS.ProcessEnv | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => {
+      seenEnv = args.env;
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(seenEnv?.GH_TOKEN, "");
+  assert.equal(seenEnv?.GITHUB_TOKEN, "");
+  assert.equal(seenEnv?.GH_ENTERPRISE_TOKEN, "");
+  assert.equal(seenEnv?.SSH_AUTH_SOCK, "");
+  assert.match(seenEnv?.GH_CONFIG_DIR ?? "", /\.eval-gh-config-empty$/);
+});
+
+test("runCell: a provider treatment on a harness with no provider axis is rejected as infra_error, not silently ignored", async () => {
+  let invoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => { invoked = true; return successResult(); },
+  };
+  const cell = makeCell({ treatment: { harness: "claude", provider: "anthropic" } });
+  const result = await runCell(FAKE_CFG, cell, makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /no separate provider axis/);
+  assert.equal(invoked, false, "an incompatible provider/harness treatment must never be executed as a no-op");
+});
+
+test("runCell: a provider treatment on a provider-qualified harness is folded into the model string", async () => {
+  let seenModel: string | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => { seenModel = args.model; return successResult(); },
+  };
+  const cell = makeCell({
+    treatment: { harness: "opencode", provider: "anthropic", model: "claude-opus-4" },
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(seenModel, "anthropic/claude-opus-4");
+});
+
+test("runCell: distinct provider treatments on the same qualified harness produce distinct invocations", async () => {
+  const seenModels: string[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => { seenModels.push(args.model ?? ""); return successResult(); },
+  };
+  await runCell(
+    FAKE_CFG,
+    makeCell({ treatment: { harness: "opencode", provider: "anthropic", model: "claude-opus-4" } }),
+    makeFixture(),
+    MANIFEST,
+    deps,
+  );
+  await runCell(
+    FAKE_CFG,
+    makeCell({ treatment: { harness: "opencode", provider: "openai", model: "claude-opus-4" } }),
+    makeFixture(),
+    MANIFEST,
+    deps,
+  );
+  assert.equal(new Set(seenModels).size, 2);
+});
+
 test("runCell: stage-mode invokes exactly one stage (never the other five)", async () => {
   const stagesInvoked: string[] = [];
   const fixture = validateFixture(

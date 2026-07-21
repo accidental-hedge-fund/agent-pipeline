@@ -25,6 +25,61 @@ function sanitizeForPath(cellId: string): string {
   return cellId.replace(/[^a-zA-Z0-9._-]/g, "-");
 }
 
+/** Harnesses whose CLI accepts a `provider/model`-formatted model value
+ *  (opencode.ts's `-m` flag, design.md decision 4 of #431's cli-harness-adapters
+ *  change) — i.e. the only harnesses for which a `provider` treatment axis can
+ *  actually change the invocation rather than being silently ignored. */
+const PROVIDER_QUALIFIED_HARNESSES = new Set(["opencode"]);
+
+/** Fold a cell's `provider` treatment into the model string handed to the
+ *  harness, or report why it cannot. A `provider` value only has an effect for
+ *  a harness whose CLI accepts a `provider/model` value; every other harness
+ *  is provider-locked (the CLI itself talks to one provider), so a `provider`
+ *  treatment there would silently confound cells that differ only by
+ *  `provider` (review 1 finding 2b468247) — this is therefore reported as an
+ *  incompatible cell rather than executed as a no-op. */
+function resolveTreatmentModel(
+  harness: string,
+  treatment: { provider?: string; model?: string },
+): { ok: true; model: string | undefined } | { ok: false; error: string } {
+  if (!treatment.provider) {
+    return { ok: true, model: treatment.model };
+  }
+  if (!PROVIDER_QUALIFIED_HARNESSES.has(harness)) {
+    return {
+      ok: false,
+      error: `harness "${harness}" has no separate provider axis — it cannot honor treatment provider "${treatment.provider}"`,
+    };
+  }
+  if (!treatment.model) {
+    return {
+      ok: false,
+      error: `harness "${harness}" requires a "provider/model" formatted model, but the treatment specifies provider "${treatment.provider}" with no model`,
+    };
+  }
+  return { ok: true, model: `${treatment.provider}/${treatment.model}` };
+}
+
+/** Env overrides that strip GitHub/git write credentials from the harness
+ *  child process (review 1 finding ddab0172): the injected `EvalGhSurface`
+ *  only refuses calls made through it, but a real harness is an external CLI
+ *  that can shell out to `gh`/`git` directly with the operator's ambient
+ *  credentials, bypassing that surface entirely. Redirecting `GH_CONFIG_DIR`
+ *  to an empty, cell-scoped directory makes `gh` see no stored login;
+ *  blanking the token env vars defeats env-based `gh`/git auth; dropping
+ *  `SSH_AUTH_SOCK` defeats agent-based `git push` over SSH. This is
+ *  enforcement at the actual process boundary, not a prompt-only convention. */
+function isolatedGhEnv(worktreeDir: string): NodeJS.ProcessEnv {
+  return {
+    GH_TOKEN: "",
+    GITHUB_TOKEN: "",
+    GH_ENTERPRISE_TOKEN: "",
+    GH_CONFIG_DIR: path.join(worktreeDir, ".eval-gh-config-empty"),
+    SSH_AUTH_SOCK: "",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
 export interface CellIdentity {
   worktreePath: string;
   branch: string;
@@ -52,6 +107,9 @@ export interface HarnessInvokeArgs {
   model?: string;
   effort?: string;
   gh: EvalGhSurface;
+  /** Env overrides merged on top of the child process's environment —
+   *  used to strip GitHub/git write credentials (see `isolatedGhEnv`). */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface HarnessInvokeResultLike {
@@ -108,6 +166,7 @@ async function realInvokeHarness(args: HarnessInvokeArgs): Promise<HarnessInvoke
     model: args.model,
     effort: args.effort,
     stream: false,
+    env: args.env,
   });
   return result;
 }
@@ -167,9 +226,21 @@ export async function runCell(
 
   try {
     const harness = cell.treatment.harness;
+    const effectiveHarness = harness ?? "claude";
+
+    const resolvedModel = resolveTreatmentModel(effectiveHarness, cell.treatment);
+    if (!resolvedModel.ok) {
+      return {
+        outcome: { result_class: "infra_error", error: resolvedModel.error },
+        materializedPrompt,
+        effectiveConfig,
+        ghRefusals: recorder.refusals,
+      };
+    }
+
     if (harness) {
       const preflightResult = await preflightFn(harness, {
-        model: cell.treatment.model,
+        model: resolvedModel.model,
         effort: cell.treatment.effort,
       });
       if (!preflightResult.ok) {
@@ -190,13 +261,14 @@ export async function runCell(
       let result: HarnessInvokeResultLike;
       try {
         result = await invokeHarnessFn({
-          harness: harness ?? "claude",
+          harness: effectiveHarness,
           worktreeDir: identity.worktreePath,
           prompt,
           timeoutSec: manifest.timeout,
-          model: cell.treatment.model,
+          model: resolvedModel.model,
           effort: cell.treatment.effort,
           gh: ghSurface,
+          env: isolatedGhEnv(identity.worktreePath),
         });
       } catch (err) {
         return {
