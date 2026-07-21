@@ -33,6 +33,7 @@ import {
   applyMilestones,
 } from "./writeback.ts";
 import type { WritebackDeps } from "./writeback.ts";
+import { ROADMAP_ARTIFACT, artifactSubdir } from "../artifact-ignore.ts";
 
 export interface RoadmapOpts {
   apply: boolean;
@@ -507,7 +508,7 @@ function generateHygiene(items: InventoryItem[]): { hygiene: HygieneItem[]; open
 function resolveOutputDir(repoDir: string, repo: string, optsOutputDir?: string): string {
   if (optsOutputDir) return optsOutputDir;
   const repoSlug = repo.replace("/", "_");
-  return path.join(repoDir, ".agent-pipeline", "roadmap", repoSlug);
+  return path.join(artifactSubdir(repoDir, ROADMAP_ARTIFACT), repoSlug);
 }
 
 /**
