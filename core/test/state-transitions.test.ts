@@ -21,7 +21,8 @@ const TABLE: ExpectedTransition[] = [
   { from: "review-2",      outcome: "needs-attention", to: "fix-2" },
   { from: "review-2",      outcome: "ceiling",        to: "needs-human" },     // max_adversarial_rounds reached with findings still blocking
   { from: "fix-2",         outcome: "advance",        to: "pre-merge" },
-  { from: "pre-merge",     outcome: "advance",        to: "eval-gate" },
+  { from: "pre-merge",     outcome: "advance",        to: "visual-gate" },
+  { from: "visual-gate",   outcome: "advance",        to: "eval-gate" },
   { from: "eval-gate",     outcome: "advance",        to: "shipcheck-gate" },
   { from: "shipcheck-gate", outcome: "advance",       to: "ready-to-deploy" },
 ];
@@ -81,12 +82,22 @@ test("state machine: STAGES order is forward", () => {
     "review-2",
     "fix-2",
     "pre-merge",
+    "visual-gate",
     "eval-gate",
     "shipcheck-gate",
     "ready-to-deploy",
     "needs-human",
   ];
   assert.deepEqual([...STAGES], expected);
+});
+
+test("state machine: visual-gate sits between pre-merge and eval-gate (#395)", () => {
+  const stages = [...STAGES];
+  const preMergeIdx = stages.indexOf("pre-merge");
+  const visualGateIdx = stages.indexOf("visual-gate");
+  const evalGateIdx = stages.indexOf("eval-gate");
+  assert.ok(visualGateIdx > preMergeIdx, "visual-gate must come after pre-merge");
+  assert.ok(visualGateIdx < evalGateIdx, "visual-gate must come before eval-gate");
 });
 
 test("state machine: eval-gate sits between pre-merge and ready-to-deploy", () => {

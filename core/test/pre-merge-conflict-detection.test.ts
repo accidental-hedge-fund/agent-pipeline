@@ -266,7 +266,7 @@ test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)"
   assert.deepEqual(out, {
     advanced: true,
     from: "pre-merge",
-    to: "ready-to-deploy",
+    to: "visual-gate",
     summary: `PR #${PR_NUMBER} pre-merge gates passed`,
   });
   assert.equal(rec.ciPolls, 1, "zero checks treated as passing, exactly one consult");

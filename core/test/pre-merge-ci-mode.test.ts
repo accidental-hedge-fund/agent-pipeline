@@ -152,7 +152,7 @@ test("pre-merge ci_mode: local with passing test-gate advances without calling g
 
   assert.equal(getPrChecksCalled, false, "local mode must NOT call getPrChecks");
   assert.equal(out.advanced, true, "local mode with passing test-gate must advance");
-  assert.equal((out as { to: string }).to, "ready-to-deploy");
+  assert.equal((out as { to: string }).to, "visual-gate");
 });
 
 // ---------------------------------------------------------------------------

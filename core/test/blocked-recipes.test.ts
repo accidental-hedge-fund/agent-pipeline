@@ -131,6 +131,14 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "The eval gate failed (see output above). Fix the failing evals in the " +
     "worktree, commit, remove the `blocked` label, then re-run " +
     "`$pipeline 7`.",
+  "visual-gate-misconfigured":
+    "`visual_gate.enabled` is true but no command is configured. Set " +
+    "`visual_gate.command` in `.github/pipeline.yml`, remove the " +
+    "`blocked` label, then re-run `$pipeline 7`.",
+  "visual-gate-failed":
+    "The visual gate failed (see output above). Fix the failing E2E/visual " +
+    "checks in the worktree, commit, remove the `blocked` label, then " +
+    "re-run `$pipeline 7`.",
   "shipcheck-failed":
     "The shipcheck gate returned a failing or partial verdict (see the shipcheck " +
     "comment above for the specific concerns). Address the flagged concerns in " +

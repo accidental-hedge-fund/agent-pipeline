@@ -77,22 +77,24 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
 }
 
 for (const docs of [true, false]) {
-  test(`pre-merge happy path: one CI cycle straight to ready-to-deploy (steps.docs=${docs}) (#91)`, async (t) => {
+  test(`pre-merge happy path: one CI cycle straight to visual-gate (steps.docs=${docs}) (#91, #395)`, async (t) => {
     const { deps, rec } = makeDeps();
     let out;
     await quiet(t, async () => {
       out = await advance(makeCfg(docs), 91, {}, deps);
     });
     // One advance() call is terminal — no intermediate waiting round in which
-    // the old docs step pushed a commit and forced CI to re-run.
+    // the old docs step pushed a commit and forced CI to re-run. Pre-merge
+    // always routes to visual-gate now (#395); a disabled visual-gate skips
+    // itself forward to eval-gate/shipcheck-gate/ready-to-deploy.
     assert.deepEqual(out, {
       advanced: true,
       from: "pre-merge",
-      to: "ready-to-deploy",
+      to: "visual-gate",
       summary: `PR #${PR_NUMBER} pre-merge gates passed`,
     });
     assert.equal(rec.ciPolls, 1, "CI consulted exactly once on the happy path");
-    assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "ready-to-deploy" }]);
+    assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "visual-gate" }]);
     assert.deepEqual(rec.blocked, []);
   });
 }
@@ -186,10 +188,13 @@ test("pre-merge: CI check result recorded in evidence bundle when stateDir provi
 });
 
 // ---------------------------------------------------------------------------
-// Finding 1 regression: eval_gate:false + shipcheck_gate:true → shipcheck-gate
+// #395: pre-merge always routes to visual-gate now — the conditional
+// eval_gate/shipcheck_gate skip logic moved into the visual-gate stage's own
+// disabled path (mirroring eval-gate's precedent), since visual-gate is no
+// longer the last of the optional gate chain.
 // ---------------------------------------------------------------------------
 
-test("pre-merge: eval_gate disabled + shipcheck_gate enabled → transitions to shipcheck-gate", async (t) => {
+test("pre-merge: eval_gate disabled + shipcheck_gate enabled → still routes to visual-gate first (#395)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const SHA = "4444444444444444444444444444444444444444";
@@ -220,11 +225,11 @@ test("pre-merge: eval_gate disabled + shipcheck_gate enabled → transitions to 
   const out = await advance(cfg, 148, {}, deps);
 
   assert.equal(out.advanced, true);
-  assert.equal((out as { to: string }).to, "shipcheck-gate",
-    "when eval disabled but shipcheck enabled, pre-merge must route to shipcheck-gate");
+  assert.equal((out as { to: string }).to, "visual-gate",
+    "pre-merge always routes to visual-gate; eval/shipcheck routing happens inside visual-gate's own disabled-skip");
 });
 
-test("pre-merge: eval_gate disabled + shipcheck_gate disabled → transitions to ready-to-deploy (unchanged behavior)", async (t) => {
+test("pre-merge: eval_gate disabled + shipcheck_gate disabled → still routes to visual-gate first (#395)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const SHA = "5555555555555555555555555555555555555555";
@@ -255,8 +260,8 @@ test("pre-merge: eval_gate disabled + shipcheck_gate disabled → transitions to
   const out = await advance(cfg, 149, {}, deps);
 
   assert.equal(out.advanced, true);
-  assert.equal((out as { to: string }).to, "ready-to-deploy",
-    "when both gates disabled, pre-merge must route to ready-to-deploy");
+  assert.equal((out as { to: string }).to, "visual-gate",
+    "pre-merge always routes to visual-gate; visual-gate's own disabled-skip advances to eval-gate");
 });
 
 // ---------------------------------------------------------------------------

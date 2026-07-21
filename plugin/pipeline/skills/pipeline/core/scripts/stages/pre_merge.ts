@@ -466,11 +466,10 @@ export async function advance(
   }
 
   if (opts.dryRun) {
-    const dryNextStage = cfg.eval_gate.enabled
-      ? "eval-gate"
-      : cfg.shipcheck_gate?.enabled ? "shipcheck-gate" : "ready-to-deploy";
+    // Always route through visual-gate (#395); a disabled visual-gate skips
+    // itself forward to the first enabled later gate — see stages/visual.ts.
     console.log(`[pipeline] #${issueNumber}: [dry-run] would archive+CI+merge for PR #${prNumber}`);
-    return { advanced: true, from: "pre-merge", to: dryNextStage, summary: "[dry-run]" };
+    return { advanced: true, from: "pre-merge", to: "visual-gate", summary: "[dry-run]" };
   }
 
   // ---- Review-SHA gate (#16): runs before any pre-merge work ----
@@ -881,11 +880,11 @@ export async function advance(
   }
 
   // ---- Step 3: advance ----
-  // Route to the first enabled late-stage gate. Skip eval-gate when disabled to
-  // avoid spurious label churn; similarly skip shipcheck-gate when disabled.
-  const nextStage = cfg.eval_gate.enabled
-    ? "eval-gate"
-    : cfg.shipcheck_gate?.enabled ? "shipcheck-gate" : "ready-to-deploy";
+  // Always route through visual-gate (#395), matching the infographic's
+  // visual-gate → eval-gate order. A disabled visual-gate is not a case
+  // pre-merge special-cases here — the visual-gate stage itself skips forward
+  // to the first enabled later gate (mirroring eval-gate's own disabled path).
+  const nextStage: Stage = "visual-gate";
   await transitionFn(
     cfg,
     issueNumber,
