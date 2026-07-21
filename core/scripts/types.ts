@@ -898,6 +898,11 @@ export interface StageAccountingRecord {
    *  absent for a stage that ran on the local claude/codex harness, unchanged. */
   executor_provider?: string | null;
   executor_model?: string | null;
+  /** Reasoning effort actually resolved and passed to the harness for this
+   *  invocation (`--effort` / `model_reasoning_effort`, #366). Additive and
+   *  optional: absent when no effort was resolved for the call, and never
+   *  reconstructed from current config when reading historical records (#437). */
+  effort?: string | null;
 }
 
 export interface StageAccountingTotals {

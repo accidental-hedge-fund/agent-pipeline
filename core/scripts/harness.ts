@@ -418,6 +418,7 @@ export async function invoke(
       estimatedCostUsd: opts.accounting.estimatedCostUsd,
       promptChars: prompt.length,
       promptEstimatedTokens: Math.ceil(prompt.length / 4),
+      effort: opts.reasoningEffort ?? null,
     });
     await emitStageAccounting(
       opts.accounting.runDir,

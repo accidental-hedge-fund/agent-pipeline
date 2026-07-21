@@ -6,11 +6,11 @@ import type {
   StageAccountingUsage,
 } from "./types.ts";
 
-// v2 (#429): additive — records may now carry `cost_source: "actual"` derived
-// from built-in harness telemetry rather than only "estimated"/"unknown".
-// Adds no required field and removes none; readers must not gate on this
-// value equalling a specific version (design.md decision 5).
-export const STAGE_ACCOUNTING_SCHEMA_VERSION = 2;
+// v3 (#437): additive — records may now carry the resolved reasoning `effort`
+// passed to the harness. Adds no required field and removes none; readers
+// must not gate on this value equalling a specific version (design.md
+// decision 5).
+export const STAGE_ACCOUNTING_SCHEMA_VERSION = 3;
 
 export interface UsageAccountingExtraction {
   usage?: StageAccountingUsage;
@@ -44,6 +44,7 @@ export interface BuildStageAccountingRecordInput {
   prHeadSha?: string | null;
   executorProvider?: string | null;
   executorModel?: string | null;
+  effort?: string | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -153,6 +154,7 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(typeof input.prHeadSha === "string" && input.prHeadSha ? { pr_head_sha: input.prHeadSha } : {}),
     ...(cleanOptionalString(input.executorProvider ?? null) !== null ? { executor_provider: cleanOptionalString(input.executorProvider ?? null) } : {}),
     ...(cleanOptionalString(input.executorModel ?? null) !== null ? { executor_model: cleanOptionalString(input.executorModel ?? null) } : {}),
+    ...(cleanOptionalString(input.effort ?? null) !== null ? { effort: cleanOptionalString(input.effort ?? null) } : {}),
   };
   return sanitizeStageAccountingRecord(record);
 }
@@ -192,6 +194,8 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (executorProvider !== null) cleaned.executor_provider = executorProvider;
   const executorModel = cleanOptionalString(record.executor_model ?? null);
   if (executorModel !== null) cleaned.executor_model = executorModel;
+  const effort = cleanOptionalString(record.effort ?? null);
+  if (effort !== null) cleaned.effort = effort;
   return cleaned;
 }
 

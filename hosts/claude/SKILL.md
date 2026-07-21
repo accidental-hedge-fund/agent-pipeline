@@ -84,6 +84,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 /pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
+/pipeline scoreboard --by <dimension>    group scoreboard metrics by harness|model|effort|executor (exactly one; missing/absent identities report as `unknown`, dimensions that can't apply — e.g. executor on a local-harness stage — report as `not applicable`)
 /pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh
 /pipeline config repo-map <add|remove|list>  add/remove/list repo_map entries in .github/pipeline.yml
 /pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output

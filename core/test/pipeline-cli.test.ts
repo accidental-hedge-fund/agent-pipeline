@@ -109,6 +109,15 @@ test("pipeline-cli: scoreboard — --bucket day --json → [] (#425)", () => {
   assert.deepEqual(roundTrip(["scoreboard", "--bucket", "day", "--json"]), []);
 });
 
+test("pipeline-cli: scoreboard — --by harness --json → [] (#437)", () => {
+  assert.deepEqual(roundTrip(["scoreboard", "--by", "harness", "--json"]), []);
+});
+
+test("pipeline-cli: scoreboard — --by is collected repeatably, not last-wins (#437)", () => {
+  const { opts } = parseCli(["scoreboard", "--by", "harness", "--by", "model", "--json"]);
+  assert.deepEqual(opts.by, ["harness", "model"]);
+});
+
 test("pipeline-cli: roadmap — --apply → []", () => {
   assert.deepEqual(roundTrip(["roadmap", "--apply"]), []);
 });

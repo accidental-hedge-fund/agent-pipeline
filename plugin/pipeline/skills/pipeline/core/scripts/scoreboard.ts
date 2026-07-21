@@ -95,6 +95,35 @@ export interface CostAccountingMetric {
   coverage: CostSourceCoverage;
 }
 
+/** Generic execution-identity grouping dimension for `--by` (#437). Distinct
+ *  from `CostAccountingGroup`'s fixed six-key grouping: this collapses along
+ *  exactly one recorded identity. `harness` groups on the record's harness
+ *  field verbatim (the configured executor name for a delegated stage);
+ *  `executor` groups on the record's executor provider — the two stay
+ *  distinct identities over distinct fields. */
+export type ScoreboardGroupBy = "harness" | "model" | "effort" | "executor";
+
+export const SCOREBOARD_GROUP_BY_VALUES: ScoreboardGroupBy[] = ["harness", "model", "effort", "executor"];
+
+/** One identity value's slice of the window's record-scoped metrics. The key
+ *  is the recorded identity used verbatim, or the literal `unknown` (field
+ *  absent/empty) or `not applicable` (dimension cannot apply to the record) —
+ *  see design decision in openspec/changes/scoreboard-treatment-grouping. */
+export interface ScoreboardGroupEntry extends CostAccountingTotals {
+  key: string;
+  actual_calls: number;
+  estimated_calls: number;
+  unknown_calls: number;
+  actual_coverage: number | null;
+  /** Distinct `executor_model` values observed in this group. Present only
+   *  when grouping `--by executor`. */
+  executor_models?: string[];
+}
+
+export interface ScoreboardGrouping {
+  groups: ScoreboardGroupEntry[];
+}
+
 export interface ScoreboardMetrics {
   ready_to_deploy_without_human_intervention: RateValue;
   cost_per_ready_pr_usd: CostMetric;
@@ -132,6 +161,8 @@ export interface ScoreboardPeriod {
   end: string;
   totals: ScoreboardTotals;
   metrics: ScoreboardMetrics;
+  by?: ScoreboardGroupBy;
+  grouping?: ScoreboardGrouping;
 }
 
 export interface ScoreboardReport {
@@ -142,6 +173,8 @@ export interface ScoreboardReport {
   diagnostics: ScoreboardDiagnostic[];
   bucket?: ScoreboardBucket;
   series?: ScoreboardPeriod[];
+  by?: ScoreboardGroupBy;
+  grouping?: ScoreboardGrouping;
 }
 
 export interface ScoreboardOpts {
@@ -152,6 +185,9 @@ export interface ScoreboardOpts {
   json?: boolean;
   estimateCost?: string[];
   bucket?: string;
+  /** Raw `--by` flag values, collected repeatably so a repeated flag can be
+   *  detected (not silently last-wins). Parsed by parseScoreboardGroupBy(). */
+  by?: string[];
   now?: Date;
 }
 
@@ -275,6 +311,20 @@ export function parseScoreboardBucket(value: string | undefined): ScoreboardBuck
   throw new Error(`--bucket must be one of: day, week (got: ${value})`);
 }
 
+/** Validates `--by` before any artifact is read (spec requirement). `null`
+ *  for an absent flag; throws naming all four dimensions for an unsupported
+ *  value; throws stating that exactly one dimension is supported when the
+ *  flag was supplied more than once. */
+export function parseScoreboardGroupBy(values: string[] | undefined): ScoreboardGroupBy | null {
+  if (values === undefined || values.length === 0) return null;
+  if (values.length > 1) {
+    throw new Error(`--by supports exactly one grouping dimension per invocation, got ${values.length}: ${values.join(", ")}`);
+  }
+  const value = values[0];
+  if ((SCOREBOARD_GROUP_BY_VALUES as string[]).includes(value)) return value as ScoreboardGroupBy;
+  throw new Error(`--by must be one of: ${SCOREBOARD_GROUP_BY_VALUES.join(", ")} (got: ${value})`);
+}
+
 export function parseEstimateCosts(values: string[] | undefined): Record<string, number> {
   const estimates: Record<string, number> = {};
   for (const raw of values ?? []) {
@@ -299,14 +349,15 @@ export async function buildScoreboardReport(
 ): Promise<ScoreboardReport> {
   const window = parseScoreboardWindow(opts);
   const bucket = parseScoreboardBucket(opts.bucket);
+  const groupBy = parseScoreboardGroupBy(opts.by);
   const estimates = parseEstimateCosts(opts.estimateCost);
   const scan = await scanRunStore(opts.repoDir, window, deps);
-  const report = aggregateRuns(window, scan, estimates);
+  const report = aggregateRuns(window, scan, estimates, groupBy);
   if (bucket === null) return report;
 
   const periods = computePeriods(window, bucket);
   const assigned = assignRunsToPeriods(periods, scan.runs);
-  const series: ScoreboardPeriod[] = periods.map((period, i) => buildPeriodEntry(period, assigned[i], estimates));
+  const series: ScoreboardPeriod[] = periods.map((period, i) => buildPeriodEntry(period, assigned[i], estimates, groupBy));
   return { ...report, bucket, series };
 }
 
@@ -372,8 +423,9 @@ function buildPeriodEntry(
   period: PeriodBounds,
   runs: IncludedRun[],
   costEstimates: Record<string, number>,
+  groupBy: ScoreboardGroupBy | null,
 ): ScoreboardPeriod {
-  const core = reduceRunsCore(runs, costEstimates);
+  const core = reduceRunsCore(runs, costEstimates, groupBy);
   return {
     start: period.start,
     end: period.end,
@@ -385,6 +437,7 @@ function buildPeriodEntry(
       diagnostics: core.diagnostics.length,
     },
     metrics: core.metrics,
+    ...(groupBy ? { by: groupBy, grouping: core.grouping } : {}),
   };
 }
 
@@ -580,14 +633,16 @@ interface ReducedCore {
   successfulPrs: number;
   metrics: ScoreboardMetrics;
   diagnostics: ScoreboardDiagnostic[];
+  grouping?: ScoreboardGrouping;
 }
 
 function aggregateRuns(
   window: ScoreboardWindow,
   scan: ScanResult,
   costEstimates: Record<string, number>,
+  groupBy: ScoreboardGroupBy | null,
 ): ScoreboardReport {
-  const core = reduceRunsCore(scan.runs, costEstimates);
+  const core = reduceRunsCore(scan.runs, costEstimates, groupBy);
   const diagnostics = [...scan.diagnostics, ...core.diagnostics];
 
   return {
@@ -602,10 +657,15 @@ function aggregateRuns(
     },
     metrics: core.metrics,
     diagnostics,
+    ...(groupBy ? { by: groupBy, grouping: core.grouping } : {}),
   };
 }
 
-function reduceRunsCore(runs: IncludedRun[], costEstimates: Record<string, number>): ReducedCore {
+function reduceRunsCore(
+  runs: IncludedRun[],
+  costEstimates: Record<string, number>,
+  groupBy: ScoreboardGroupBy | null = null,
+): ReducedCore {
   const diagnostics: ScoreboardDiagnostic[] = [];
   const readyGroups = new Map<number, PrGroup>();
   let readyRuns = 0;
@@ -637,7 +697,7 @@ function reduceRunsCore(runs: IncludedRun[], costEstimates: Record<string, numbe
   let needsHuman = 0;
   let reviewRounds = 0;
   let sameHarnessFallbacks = 0;
-  const costAccounting = aggregateCostAccounting(runs, diagnostics);
+  const { costAccounting, grouping } = aggregateCostAccounting(runs, diagnostics, groupBy);
 
   for (const run of runs) {
     const fullDuration = fullRunDurationMs(run);
@@ -784,19 +844,48 @@ function reduceRunsCore(runs: IncludedRun[], costEstimates: Record<string, numbe
     },
   };
 
-  return { readyRuns, successfulPrs, metrics, diagnostics };
+  return { readyRuns, successfulPrs, metrics, diagnostics, grouping };
+}
+
+/** Resolves the group key an accounting record falls into for a single
+ *  execution-identity dimension (#437). Values are used verbatim — never
+ *  case-folded or aliased. `harness` and `executor` stay distinct identities
+ *  over distinct recorded fields: `harness` is the record's harness value
+ *  (the configured executor NAME for a delegated stage); `executor` is the
+ *  record's executor provider, with a record carrying no executor evidence
+ *  at all assigned to "not applicable" (rather than "unknown", which is
+ *  reserved for a delegated record whose provider specifically wasn't
+ *  recorded). */
+export function resolveGroupIdentity(record: NormalizedAccountingRecord, dimension: ScoreboardGroupBy): string {
+  switch (dimension) {
+    case "harness":
+      return record.harness;
+    case "model":
+      return record.model;
+    case "effort":
+      return record.effort;
+    case "executor":
+      if (record.executor_provider) return record.executor_provider;
+      if (record.executor_model) return "unknown";
+      return "not applicable";
+  }
 }
 
 function aggregateCostAccounting(
   runs: IncludedRun[],
   diagnostics: ScoreboardDiagnostic[],
-): CostAccountingMetric {
+  groupBy: ScoreboardGroupBy | null,
+): { costAccounting: CostAccountingMetric; grouping?: ScoreboardGrouping } {
   const groups = new Map<string, CostAccountingGroup>();
   const totals = newCostAccountingTotals();
   const unknownCostKeys = new Set<string>();
   let actualCalls = 0;
   let estimatedCalls = 0;
   let unknownCalls = 0;
+
+  type GroupByEntry = ScoreboardGroupEntry & { actual_calls: number; estimated_calls: number; unknown_calls: number };
+  const groupByGroups = new Map<string, GroupByEntry>();
+  const executorModelsByKey = new Map<string, Set<string>>();
 
   for (const run of runs) {
     for (const ref of collectAccountingRecords(run)) {
@@ -847,12 +936,34 @@ function aggregateCostAccounting(
           });
         }
       }
+
+      if (groupBy) {
+        const groupKey = resolveGroupIdentity(normalized, groupBy);
+        const groupByEntry: GroupByEntry = groupByGroups.get(groupKey) ?? {
+          key: groupKey,
+          ...newCostAccountingTotals(),
+          actual_calls: 0,
+          estimated_calls: 0,
+          unknown_calls: 0,
+          actual_coverage: null,
+        };
+        addAccounting(groupByEntry, normalized);
+        if (normalized.cost_source === "actual") groupByEntry.actual_calls++;
+        else if (normalized.cost_source === "estimated") groupByEntry.estimated_calls++;
+        else groupByEntry.unknown_calls++;
+        groupByGroups.set(groupKey, groupByEntry);
+
+        if (groupBy === "executor" && normalized.executor_model) {
+          if (!executorModelsByKey.has(groupKey)) executorModelsByKey.set(groupKey, new Set());
+          executorModelsByKey.get(groupKey)!.add(normalized.executor_model);
+        }
+      }
     }
   }
 
   const totalCalls = actualCalls + estimatedCalls + unknownCalls;
 
-  return {
+  const costAccounting: CostAccountingMetric = {
     totals: roundAccountingTotals(totals),
     coverage: {
       actual_calls: actualCalls,
@@ -871,6 +982,24 @@ function aggregateCostAccounting(
         a.outcome.localeCompare(b.outcome)
       ),
   };
+
+  if (!groupBy) return { costAccounting };
+
+  const groupingEntries: ScoreboardGroupEntry[] = [...groupByGroups.values()].map((entry) => {
+    const groupTotalCalls = entry.actual_calls + entry.estimated_calls + entry.unknown_calls;
+    const rounded = roundAccountingTotals(entry);
+    const result: ScoreboardGroupEntry = {
+      ...rounded,
+      actual_coverage: groupTotalCalls === 0 ? null : roundUsd(entry.actual_calls / groupTotalCalls),
+    };
+    if (groupBy === "executor") {
+      result.executor_models = [...(executorModelsByKey.get(entry.key) ?? [])].sort();
+    }
+    return result;
+  });
+  groupingEntries.sort((a, b) => b.invocation_count - a.invocation_count || a.key.localeCompare(b.key));
+
+  return { costAccounting, grouping: { groups: groupingEntries } };
 }
 
 function collectAccountingRecords(run: IncludedRun): AccountingRecordRef[] {
@@ -884,10 +1013,7 @@ function collectAccountingRecords(run: IncludedRun): AccountingRecordRef[] {
     .filter((ref) => ref.record["type"] === "stage_accounting");
 }
 
-function normalizeAccountingRecord(
-  record: JsonRecord,
-  run: IncludedRun,
-): (CostAccountingTotals & {
+interface NormalizedAccountingRecord extends CostAccountingTotals {
   issue: number;
   stage: string;
   harness: string;
@@ -896,7 +1022,20 @@ function normalizeAccountingRecord(
   outcome: string;
   cost_source: string;
   cost_usd: number | null;
-}) | null {
+  /** Raw effort/executor identity (#437) — `effort` defaults to the literal
+   *  "unknown" like `model`/`model_slot`; `executor_provider`/`executor_model`
+   *  are left null/absent (not defaulted) so resolveGroupIdentity() can tell
+   *  "no executor evidence at all" (not applicable) from "evidence but no
+   *  provider" (unknown) apart from a normal missing field. */
+  effort: string;
+  executor_provider: string | null;
+  executor_model: string | null;
+}
+
+function normalizeAccountingRecord(
+  record: JsonRecord,
+  run: IncludedRun,
+): NormalizedAccountingRecord | null {
   const issue = numberField(record, "issue") ?? run.issue;
   const stage = stringField(record, "stage");
   const harness = stringField(record, "harness");
@@ -904,22 +1043,16 @@ function normalizeAccountingRecord(
   if (issue === null || !stage || !harness || !outcome) return null;
   const source = stringField(record, "cost_source") ?? "unknown";
   const costUsd = numberField(record, "cost_usd");
-  const normalized: CostAccountingTotals & {
-    issue: number;
-    stage: string;
-    harness: string;
-    model_slot: string;
-    model: string;
-    outcome: string;
-    cost_source: string;
-    cost_usd: number | null;
-  } = {
+  const normalized: NormalizedAccountingRecord = {
     issue,
     stage,
     harness,
     model_slot: stringField(record, "model_slot") ?? stringField(record, "modelSlot") ?? "unknown",
     model: stringField(record, "model") ?? "unknown",
     outcome,
+    effort: stringField(record, "effort") ?? "unknown",
+    executor_provider: stringField(record, "executor_provider") ?? stringField(record, "executorProvider"),
+    executor_model: stringField(record, "executor_model") ?? stringField(record, "executorModel"),
     invocation_count: 1,
     total_duration_ms: Math.max(0, Math.round(numberField(record, "duration_ms") ?? numberField(record, "durationMs") ?? 0)),
     command_count: Math.max(0, Math.round(numberField(record, "command_count") ?? numberField(record, "commandCount") ?? 0)),
@@ -1511,6 +1644,11 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   lines.push(`Eval pass rate: ${formatGate(report.metrics.gate_pass_rates.eval)}`);
   lines.push(`Shipcheck pass rate: ${formatGate(report.metrics.gate_pass_rates.shipcheck)}`);
 
+  if (report.by && report.grouping) {
+    lines.push("");
+    appendGroupingSection(lines, report.by, report.grouping);
+  }
+
   if (report.diagnostics.length > 0) {
     lines.push("");
     lines.push("Diagnostics:");
@@ -1538,6 +1676,10 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
       lines.push(`Test pass rate: ${formatGate(period.metrics.gate_pass_rates.test)}`);
       lines.push(`Eval pass rate: ${formatGate(period.metrics.gate_pass_rates.eval)}`);
       lines.push(`Shipcheck pass rate: ${formatGate(period.metrics.gate_pass_rates.shipcheck)}`);
+      if (period.by && period.grouping) {
+        lines.push("");
+        appendGroupingSection(lines, period.by, period.grouping);
+      }
     }
   }
 
@@ -1579,6 +1721,35 @@ function formatAccountingGroup(group: CostAccountingGroup): string {
     `duration ${formatMs(group.total_duration_ms)}; ` +
     `commands ${group.command_count}; ` +
     `subprocesses ${group.subprocess_count}`
+  );
+}
+
+function appendGroupingSection(lines: string[], by: ScoreboardGroupBy, grouping: ScoreboardGrouping): void {
+  lines.push(`Grouped by ${by}:`);
+  if (grouping.groups.length === 0) {
+    lines.push("  (no stage accounting records)");
+    return;
+  }
+  for (const group of grouping.groups) {
+    lines.push(`  ${formatGroupEntry(group)}`);
+  }
+}
+
+function formatGroupEntry(group: ScoreboardGroupEntry): string {
+  const coverage = group.actual_coverage === null ? "n/a" : `${(group.actual_coverage * 100).toFixed(1)}%`;
+  const models = group.executor_models && group.executor_models.length > 0 ? `; executor models ${group.executor_models.join(", ")}` : "";
+  return (
+    `${group.key}: invocations ${group.invocation_count}; ` +
+    `actual $${group.actual_cost_usd.toFixed(4)} (${group.actual_calls} calls); ` +
+    `estimated $${group.estimated_cost_usd.toFixed(4)} (${group.estimated_calls} calls); ` +
+    `unknown ${group.unknown_cost_count} (${group.unknown_calls} calls); ` +
+    `actual coverage ${coverage}; ` +
+    `prompt chars ${group.prompt_chars_total} (max ${group.prompt_chars_max}); ` +
+    `est prompt tokens ${group.prompt_estimated_tokens_total}; ` +
+    `duration ${formatMs(group.total_duration_ms)}; ` +
+    `commands ${group.command_count}; ` +
+    `subprocesses ${group.subprocess_count}` +
+    models
   );
 }
 
