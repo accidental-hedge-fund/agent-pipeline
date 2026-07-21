@@ -412,6 +412,18 @@ export function matchFindingScope(f: Pick<ReviewFinding, "category" | "file">, s
  * fingerprint no longer matches, does not apply, so the finding is evaluated
  * afresh. Callers MUST pre-filter the source comments to trusted authors
  * before calling, mirroring the trust model of `overrides`.
+ *
+ * Settled-surface reversal guard (#389): after the override/non-reproducing
+ * checks (which still take precedence — an explicit disposition always wins),
+ * a finding that would otherwise block, whose `surfaceKey` is in
+ * `settledSurfaces`, and whose `prior_round_acknowledgment` is absent, empty,
+ * or whitespace-only, is moved to advisory with reason `reversal-unacknowledged`
+ * instead of blocking. This is the structural guard against a later round
+ * silently re-flipping a trade-off an earlier round already settled (see
+ * `review-history.ts`'s `settledSurfaces`). A finding carrying a non-empty
+ * `prior_round_acknowledgment` blocks exactly as it would without this guard;
+ * a finding on a surface absent from `settledSurfaces` (or when the caller
+ * supplies no set at all) is unaffected.
  */
 export function partitionFindings(
   findings: ReviewFinding[],
@@ -420,6 +432,7 @@ export function partitionFindings(
   scopes: ScopedOverride[] = [],
   nonReproducing: Map<string, { sha: string; fingerprint: string }[]> = new Map(),
   reviewedSha: string | null = null,
+  settledSurfaces: Set<string> = new Set(),
 ): PartitionResult {
   const threshold = severityRank(policy.block_threshold);
   const result: PartitionResult = { blocking: [], advisory: [], overridden: [] };
@@ -505,9 +518,21 @@ export function partitionFindings(
       if (belowSeverity) reasons.push(`severity ${f.severity} below threshold ${policy.block_threshold}`);
       if (belowConfidence) reasons.push(`confidence ${f.confidence} below ${policy.min_confidence}`);
       result.advisory.push({ finding: f, reason: reasons.join("; ") });
-    } else {
-      result.blocking.push(f);
+      continue;
     }
+
+    // 4. Settled-surface reversal guard (#389): an otherwise-blocking finding
+    // on a surface a prior round already settled, raised again without an
+    // acknowledgment, is demoted rather than allowed to silently re-flip the
+    // prior decision.
+    const fSurface = surfaceKey(f);
+    const hasAcknowledgment = (f.prior_round_acknowledgment ?? "").trim() !== "";
+    if (fSurface !== null && settledSurfaces.has(fSurface) && !hasAcknowledgment) {
+      result.advisory.push({ finding: f, reason: "reversal-unacknowledged" });
+      continue;
+    }
+
+    result.blocking.push(f);
   }
   return result;
 }
@@ -544,8 +569,10 @@ export function buildTrustedOverrideComments<T extends { body: string; author?: 
 
 // Machine-readable override sentinel, mirroring the `reviewed-sha` precedent
 // (#16). Anchored to line-start; the disposition token is recorded for display.
-const OVERRIDE_RE = /^<!-- pipeline-override: ([0-9a-f]{8}) (.+?) -->$/m;
-const OVERRIDE_HEADING = "## Pipeline: Finding override";
+// Exported (#389) so review-history.ts can attribute an override to the round
+// in which it was recorded without duplicating this parsing logic.
+export const OVERRIDE_RE = /^<!-- pipeline-override: ([0-9a-f]{8}) (.+?) -->$/m;
+export const OVERRIDE_HEADING = "## Pipeline: Finding override";
 
 /**
  * Collect active overrides from issue/PR comments as key → disposition text.
@@ -569,9 +596,11 @@ export function extractOverrides(comments: { body: string }[]): Map<string, stri
 // Machine-readable scope override sentinel (#229). Anchored to line-start; the
 // scope type+value and disposition token are recorded. Global flag so multiple
 // sentinels in one comment can be read; callers reset lastIndex before/after.
-const SCOPE_OVERRIDE_RE = /^<!-- pipeline-override-scope: (category|file):(\S+) (.+?) -->$/gm;
+// Exported (#389) so review-history.ts can attribute a scope override to the
+// round in which it was recorded without duplicating this parsing logic.
+export const SCOPE_OVERRIDE_RE = /^<!-- pipeline-override-scope: (category|file):(\S+) (.+?) -->$/gm;
 
-const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
+export const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
 
 /**
  * Collect active scoped overrides (#229) from issue/PR comments. A later sentinel

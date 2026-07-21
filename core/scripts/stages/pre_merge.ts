@@ -48,7 +48,10 @@ import {
   extractScopedOverrides,
   findingKey,
   partitionFindings,
+  surfaceKey,
 } from "../review-policy.ts";
+import { buildPriorRoundDigest, settledSurfaceRounds, settledSurfaces, type PriorRoundDigest } from "../review-history.ts";
+import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { buildDeltaReviewPrompt, buildFixPrompt } from "../prompts/index.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
@@ -929,7 +932,7 @@ export type RunDeltaReviewFn = (
   deltaDiff: string,
   worktreePath: string,
   specContext: string,
-  accounting?: { runDir: string; runStoreDeps?: RunStoreDeps },
+  accounting?: { runDir?: string; runStoreDeps?: RunStoreDeps; priorRoundsDigest?: PriorRoundDigest },
 ) => Promise<DeltaReviewResult>;
 
 /**
@@ -1321,9 +1324,16 @@ export async function enforceReviewShaGate(
         ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
         : "";
 
+      // Cross-round memory digest (#389): the pre-merge delta review is one of
+      // the rounds that can see prior-round history.
+      const priorRoundsDigest = buildPriorRoundDigest(detail.comments, {
+        actor, trustedOverrideActors: cfg.trusted_override_actors,
+      });
       const deltaResult = await runDeltaReviewFn(
         cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
-        deps.runDir ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps } : undefined,
+        deps.runDir
+          ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest }
+          : { priorRoundsDigest },
       );
       // Guard: needs-attention with zero findings indicates unparseable reviewer output
       // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
@@ -1338,7 +1348,24 @@ export async function enforceReviewShaGate(
       // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
       const overrides = extractOverrides(trustedOverrideComments);
       const scopes = extractScopedOverrides(trustedOverrideComments);
-      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes);
+      const settled = settledSurfaces(priorRoundsDigest);
+      const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled);
+      const settledRounds = settledSurfaceRounds(priorRoundsDigest);
+      const reversalDemotions = new Map<string, number>();
+      for (const { finding, reason } of partition.advisory) {
+        if (reason !== "reversal-unacknowledged") continue;
+        const surface = surfaceKey(finding);
+        const settlingRound = surface !== null ? settledRounds.get(surface) : undefined;
+        if (settlingRound === undefined) continue;
+        reversalDemotions.set(findingKey(finding), settlingRound);
+        if (deps.runDir) {
+          const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          await appendEvent(deps.runDir, {
+            schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+            finding_key: findingKey(finding), surface, settling_round: settlingRound,
+          }, deps.runStoreDeps).catch(() => {});
+        }
+      }
 
       const newHash = computeDiffHash(currentDiff);
       const deltaCommentVerdict = {
@@ -1364,6 +1391,7 @@ export async function enforceReviewShaGate(
         `pre-merge delta review by ${deltaReviewerLabel}`,
         blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
         newHash,
+        reversalDemotions,
       );
       // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
       // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).
@@ -1459,10 +1487,12 @@ export async function enforceReviewShaGate(
             );
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
-              deps.runDir ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps } : undefined,
+              deps.runDir
+                ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest }
+                : { priorRoundsDigest },
             );
             const rePartition = partitionFindings(
-              reResult.findings, cfg.review_policy, overrides, scopes,
+              reResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled,
             );
             // Mirror the initial delta review guard (#228): needs-attention with zero
             // findings is likely unparseable reviewer output — block conservatively.
@@ -1479,6 +1509,21 @@ export async function enforceReviewShaGate(
             const reEffective = reResult.effectiveReviewer ?? cfg.harnesses.reviewer;
             const reSelfReview = reResult.selfReview ?? false;
             const reLabel = reSelfReview ? `${reEffective} (self-review)` : reEffective;
+            const reReversalDemotions = new Map<string, number>();
+            for (const { finding, reason } of rePartition.advisory) {
+              if (reason !== "reversal-unacknowledged") continue;
+              const surface = surfaceKey(finding);
+              const settlingRound = surface !== null ? settledRounds.get(surface) : undefined;
+              if (settlingRound === undefined) continue;
+              reReversalDemotions.set(findingKey(finding), settlingRound);
+              if (deps.runDir) {
+                const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+                await appendEvent(deps.runDir, {
+                  schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+                  finding_key: findingKey(finding), surface, settling_round: settlingRound,
+                }, deps.runStoreDeps).catch(() => {});
+              }
+            }
             const reCommentBody = formatDeltaReviewComment(
               cfg,
               {
@@ -1491,6 +1536,7 @@ export async function enforceReviewShaGate(
               `pre-merge delta review by ${reLabel}`,
               reBlockingKeys.size > 0 ? reBlockingKeys : undefined,
               reNewHash,
+              reReversalDemotions,
             );
             const reComment = reSelfReview
               ? (() => {
@@ -1639,7 +1685,7 @@ async function defaultRunDeltaReview(
   deltaDiff: string,
   worktreePath: string,
   specContext: string,
-  accounting?: { runDir: string; runStoreDeps?: RunStoreDeps },
+  accounting?: { runDir?: string; runStoreDeps?: RunStoreDeps; priorRoundsDigest?: PriorRoundDigest },
 ): Promise<DeltaReviewResult> {
   const prompt = buildDeltaReviewPrompt({
     cfg,
@@ -1648,6 +1694,7 @@ async function defaultRunDeltaReview(
     body: issueDetail.body,
     deltaDiff,
     specContext,
+    priorRoundsDigest: accounting?.priorRoundsDigest,
   });
   // Not yet guarded against the effective reviewer command — invokeReviewer
   // applies resolveReviewerModelForHarness itself, per attempted harness, so a
@@ -1664,7 +1711,7 @@ async function defaultRunDeltaReview(
       timeoutSec: cfg.review_timeout,
       model: rawModel,
       modelWasAuto,
-      accounting: accounting
+      accounting: accounting?.runDir
         ? {
             runDir: accounting.runDir,
             runStoreDeps: accounting.runStoreDeps,

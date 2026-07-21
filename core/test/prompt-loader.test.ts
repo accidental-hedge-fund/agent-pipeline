@@ -16,6 +16,7 @@ import {
   buildPlanningPrompt,
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
+  buildDeltaReviewPrompt,
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
   buildSweepPrompt,
@@ -423,6 +424,72 @@ test("review_adversarial: omits the ratchet section on a first run, includes it 
   assert.match(rerun, /Prior Adversarial Findings \(this is a re-review\)/);
   assert.match(rerun, /verify EACH prior finding is resolved/);
   assert.match(rerun, /stranding/);
+});
+
+// ---------------------------------------------------------------------------
+// Cross-round memory digest injection (#389)
+// ---------------------------------------------------------------------------
+
+test("review_adversarial: byte-identical to no-digest rendering when priorRoundsDigest is absent", () => {
+  const base = { cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "diff" };
+  const withoutField = buildReviewAdversarialPrompt(base);
+  const withEmptyDigest = buildReviewAdversarialPrompt({ ...base, priorRoundsDigest: { rounds: [] } });
+  assert.equal(withEmptyDigest, withoutField, "an empty digest must render byte-identical to omitting the field");
+});
+
+test("review_adversarial: digest section is injected for round 2 when prior rounds exist", () => {
+  const digest = {
+    rounds: [
+      {
+        round: 1,
+        reviewedSha: "a".repeat(40),
+        entries: [
+          { key: "ab12cd34", surface: "src/x.ts|correctness", severity: "high", title: "Missing cap", resolution: "resolved-by-fix" as const },
+        ],
+      },
+    ],
+  };
+  const out = buildReviewAdversarialPrompt({
+    cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "diff", priorRoundsDigest: digest,
+  });
+  assert.match(out, /Prior Round Digest/);
+  assert.match(out, /ab12cd34/);
+  assert.match(out, /<untrusted-external-evidence>/);
+});
+
+test("review_standard: has no {{prior_rounds_digest}} placeholder and no digest section (drift guard)", () => {
+  const template = _testing.loadTemplate("review_standard");
+  assert.doesNotMatch(template, /\{\{\s*prior_rounds_digest\s*\}\}/);
+  const out = buildReviewStandardPrompt({
+    cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", plan: "P", diff: "d",
+  });
+  assert.doesNotMatch(out, /Prior Round Digest/);
+});
+
+test("buildDeltaReviewPrompt: digest section present when priorRoundsDigest is supplied", () => {
+  const digest = {
+    rounds: [
+      {
+        round: 1,
+        reviewedSha: "b".repeat(40),
+        entries: [
+          { key: "ef56gh78", surface: "src/y.ts|security", severity: "critical", title: "Auth bypass", resolution: "overridden" as const, overrideReason: "rejected", overrideRound: 1 },
+        ],
+      },
+    ],
+  };
+  const out = buildDeltaReviewPrompt({
+    cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", deltaDiff: "diff", priorRoundsDigest: digest,
+  });
+  assert.match(out, /Prior Round Digest/);
+  assert.match(out, /ef56gh78/);
+});
+
+test("buildDeltaReviewPrompt: byte-identical to no-digest rendering when priorRoundsDigest is absent", () => {
+  const base = { cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", deltaDiff: "diff" };
+  const withoutField = buildDeltaReviewPrompt(base);
+  const withEmptyDigest = buildDeltaReviewPrompt({ ...base, priorRoundsDigest: { rounds: [] } });
+  assert.equal(withEmptyDigest, withoutField);
 });
 
 test("review prompts: both include the shared severity rubric (calibration for the policy threshold)", () => {

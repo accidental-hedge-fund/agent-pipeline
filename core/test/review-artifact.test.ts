@@ -254,3 +254,39 @@ test("ReviewArtifact: returns null when blockingKeys contains non-string", () =>
   const body = `<!-- review-artifact: ${b64} -->`;
   assert.equal(extractReviewArtifact(body), null);
 });
+
+// ---------------------------------------------------------------------------
+// blockingFindings extension (#389)
+// ---------------------------------------------------------------------------
+
+test("ReviewArtifact: round-trips blockingFindings", () => {
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    blockingFindings: [
+      { key: "ab12cd34", surface: "core/foo.ts|correctness", severity: "high", title: "A cap is missing" },
+      { key: "ef56gh78", surface: null, severity: "medium", title: "(title unavailable)" },
+    ],
+  };
+  const decoded = extractReviewArtifact(encodeReviewArtifact(artifact));
+  assert.deepEqual(decoded, artifact);
+});
+
+test("ReviewArtifact: an artifact without blockingFindings still decodes (backward compat)", () => {
+  const decoded = extractReviewArtifact(encodeReviewArtifact(SAMPLE));
+  assert.deepEqual(decoded, SAMPLE);
+  assert.equal(decoded?.blockingFindings, undefined);
+});
+
+test("ReviewArtifact: returns null when blockingFindings is malformed (missing key)", () => {
+  const obj = {
+    round: 1,
+    reviewedSha: "a".repeat(40),
+    diffHash: null,
+    blockingKeys: [],
+    review1Risk: null,
+    blockingFindings: [{ surface: null, severity: "high", title: "x" }],
+  };
+  const b64 = Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const body = `<!-- review-artifact: ${b64} -->`;
+  assert.equal(extractReviewArtifact(body), null);
+});

@@ -27,6 +27,7 @@ import {
   extractCeilingFollowupNumber,
   extractDiffHashFromComment,
   extractReview1Risk,
+  extractReviewArtifact,
   extractReviewedSha,
   formatReviewComment,
   parseStructuredVerdict,
@@ -3031,10 +3032,16 @@ test("surface-recurrence (#234): 3 rounds of new keys on the same surface → gu
     line_start: 20,
   };
   // Round 3 (current): finding C on same surface, again different key.
+  // prior_round_acknowledgment (#389): this surface was blocking in the immediately
+  // preceding round with nothing since disproving it, so the cross-round reversal
+  // guard would otherwise demote it to advisory before the #234 surface-recurrence
+  // guard below ever sees it — supplying an acknowledgment keeps this test isolated
+  // to exercising the #234 guard.
   const findingC: ReviewFinding = {
     ...findingA,
     title: "Package.json field Z still missing",
     line_start: 30,
+    prior_round_acknowledgment: "Still unresolved on this surface — not a reversal of an accepted fix.",
   };
 
   // Verify the three findings are on the same surface but have different keys
@@ -3130,7 +3137,13 @@ test("surface-recurrence (#234): exact-key repeat parks before the surface guard
     severity: "medium", title: "exact repeat", file: "src/a.ts", category: "correctness",
     body: "b", confidence: 0.9, recommendation: "r", line_start: 10,
   };
-  const naA = JSON.stringify({ verdict: "needs-attention", summary: "repeat", findings: [findingA], next_steps: [] });
+  // #389: acknowledge so the cross-round reversal guard doesn't intercept this
+  // finding before the exact-key recurrence guard under test gets to run.
+  const currentFindingA: ReviewFinding = {
+    ...findingA,
+    prior_round_acknowledgment: "Still unresolved — not a reversal of an accepted fix.",
+  };
+  const naA = JSON.stringify({ verdict: "needs-attention", summary: "repeat", findings: [currentFindingA], next_steps: [] });
   const { deps, rec } = makeDeps([naA]);
   // One prior round with the exact same finding (same key) — triggers exact-key recurrence guard.
   deps.getIssueDetail = async () => detailWithComments([priorSurfaceComment(2, [findingA])]);
@@ -3155,6 +3168,9 @@ test("surface-recurrence (#234): streak below threshold → guard does not fire"
   };
   const findingB: ReviewFinding = {
     ...findingA, title: "issue round 2", line_start: 15,
+    // #389: acknowledge so the cross-round reversal guard doesn't intercept this
+    // finding before the #234 surface-recurrence guard under test gets to run.
+    prior_round_acknowledgment: "Still unresolved — not a reversal of an accepted fix.",
   };
   assert.notEqual(findingKey(findingA), findingKey(findingB), "precondition: different keys");
   assert.equal(surfaceKey(findingA), surfaceKey(findingB), "precondition: same surface");
@@ -3183,7 +3199,12 @@ test("surface-recurrence (#234): surface_recurrence_rounds=0 disables the guard"
     body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
   };
   const findingB: ReviewFinding = { ...findingA, title: "round 2", line_start: 15 };
-  const findingC: ReviewFinding = { ...findingA, title: "round 3", line_start: 25 };
+  // #389: the reversal guard is independent of surface_recurrence_rounds, so
+  // acknowledge here too — this test isolates the #234 guard's disabled state.
+  const findingC: ReviewFinding = {
+    ...findingA, title: "round 3", line_start: 25,
+    prior_round_acknowledgment: "Still unresolved — not a reversal of an accepted fix.",
+  };
   const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
 
   const { deps, rec } = makeDeps([naC]);
@@ -3207,7 +3228,12 @@ test("surface-recurrence (#234): demote_and_advance — below-high cluster demot
     body: "b", confidence: 0.9, recommendation: "r", line_start: 5,
   };
   const findingB: ReviewFinding = { ...findingA, title: "nit round 2", line_start: 15 };
-  const findingC: ReviewFinding = { ...findingA, title: "nit round 3", line_start: 25 };
+  // #389: acknowledge so the cross-round reversal guard doesn't intercept this
+  // finding before the #234 demote-and-advance guard under test gets to run.
+  const findingC: ReviewFinding = {
+    ...findingA, title: "nit round 3", line_start: 25,
+    prior_round_acknowledgment: "Still unresolved — not a reversal of an accepted fix.",
+  };
   assert.notEqual(findingKey(findingA), findingKey(findingC), "precondition: different keys");
 
   const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
@@ -3243,8 +3269,11 @@ test("surface-recurrence (#234): high finding in fired cluster is never auto-dem
   };
   const findingB: ReviewFinding = { ...findingA, title: "nit round 2", line_start: 15 };
   // Current round: HIGH severity on same surface.
+  // #389: acknowledge so the cross-round reversal guard doesn't intercept this
+  // finding before the #234 guard's high-severity-never-demoted check runs.
   const findingC: ReviewFinding = {
     ...findingA, title: "critical bug round 3", severity: "high", line_start: 25,
+    prior_round_acknowledgment: "Still unresolved — not a reversal of an accepted fix.",
   };
   const naC = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingC], next_steps: [] });
   let createIssueCalls = 0;
@@ -3303,6 +3332,76 @@ test("surface-recurrence (#234): advisory-only round emits empty surfaces marker
   assert.match(body, /<!-- pipeline-blocking-surfaces:  -->/);
   const surfacesMap = extractBlockingSurfacesFromComment(body);
   assert.equal(surfacesMap.size, 0, "advisory-only round must produce empty surfaces map");
+});
+
+test("cross-round memory (#389): formatReviewComment populates blockingFindings on the artifact", () => {
+  const f: ReviewFinding = {
+    severity: "high", title: "a".repeat(200), file: "src/x.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const key = findingKey(f);
+  const body = formatReviewComment(
+    cfgSurface,
+    { verdict: "needs-attention", summary: "s", findings: [f], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set([key]),
+  );
+  const artifact = extractReviewArtifact(body);
+  assert.ok(artifact?.blockingFindings, "artifact must carry blockingFindings");
+  assert.equal(artifact!.blockingFindings!.length, 1);
+  const entry = artifact!.blockingFindings![0];
+  assert.equal(entry.key, key);
+  assert.equal(entry.surface, surfaceKey(f));
+  assert.equal(entry.severity, "high");
+  assert.equal(entry.title.length, 120, "title truncated to 120 chars");
+});
+
+test("cross-round memory (#389): formatReviewComment renders the REVERSAL-UNACKNOWLEDGED tag naming the settling round", () => {
+  const f: ReviewFinding = {
+    severity: "high", title: "cap missing", file: "src/limiter.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const key = findingKey(f);
+  const body = formatReviewComment(
+    cfgSurface,
+    { verdict: "needs-attention", summary: "s", findings: [f], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set<string>(), // demoted → not in the blocking-keys set
+    undefined,
+    undefined,
+    new Map([[key, 2]]),
+  );
+  assert.match(body, /`REVERSAL-UNACKNOWLEDGED: settled in round 2`/);
+  assert.match(body, /cap missing/, "the finding itself is still rendered, not dropped");
+});
+
+test("cross-round memory (#389): no reversalDemotions map → no tag rendered", () => {
+  const f: ReviewFinding = {
+    severity: "high", title: "cap missing", file: "src/limiter.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const body = formatReviewComment(
+    cfgSurface,
+    { verdict: "needs-attention", summary: "s", findings: [f], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set([findingKey(f)]),
+  );
+  assert.doesNotMatch(body, /REVERSAL-UNACKNOWLEDGED/);
+});
+
+test("cross-round memory (#389): an artifact without blockingFindings (no blockingKeys arg) still decodes", () => {
+  const body = formatReviewComment(
+    cfgSurface,
+    { verdict: "approve", summary: "s", findings: [], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+  );
+  const artifact = extractReviewArtifact(body);
+  assert.ok(artifact);
+  assert.equal(artifact!.blockingFindings, undefined);
 });
 
 test("surface-recurrence (#234): demote_and_advance from review-1 routes to review-2 not pre-merge", async (t) => {

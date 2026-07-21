@@ -268,6 +268,63 @@ test("partition: advisory-confidence duplicate shares key with blocker — overr
   assert.equal(p.advisory.length, 1, "low-confidence finding remains advisory");
 });
 
+// ---- settled-surface reversal guard (#389) ----
+
+test("partition: blocking finding on a settled surface without acknowledgment is demoted to advisory", () => {
+  const f = finding({ severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing" });
+  const settled = new Set([surfaceKey(f)!]);
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
+  assert.equal(p.blocking.length, 0, "unacknowledged reversal must not block");
+  assert.equal(p.advisory.length, 1);
+  assert.equal(p.advisory[0].reason, "reversal-unacknowledged");
+});
+
+test("partition: blocking finding on a settled surface WITH a non-empty acknowledgment blocks normally", () => {
+  const f = finding({
+    severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing",
+    prior_round_acknowledgment: "Round 2 accepted no cap for burst traffic, but this change removed rate limiting entirely — a materially different, unaccepted risk.",
+  });
+  const settled = new Set([surfaceKey(f)!]);
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
+  assert.equal(p.blocking.length, 1, "an acknowledged reversal blocks exactly as it would without the guard");
+  assert.equal(p.advisory.length, 0);
+});
+
+test("partition: whitespace-only acknowledgment does not count as an acknowledgment", () => {
+  const f = finding({
+    severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing",
+    prior_round_acknowledgment: "   ",
+  });
+  const settled = new Set([surfaceKey(f)!]);
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
+  assert.equal(p.blocking.length, 0);
+  assert.equal(p.advisory[0].reason, "reversal-unacknowledged");
+});
+
+test("partition: a finding on a surface NOT in settledSurfaces is unaffected by the guard", () => {
+  const f = finding({ severity: "high", file: "src/other.ts", category: "correctness", title: "unrelated" });
+  const settled = new Set(["src/limiter.ts|correctness"]); // does not match f's surface
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
+  assert.equal(p.blocking.length, 1);
+});
+
+test("partition: omitting settledSurfaces entirely leaves partitioning unchanged (default empty set)", () => {
+  const f = finding({ severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing" });
+  const withDefault = partitionFindings([f], DEFAULT_POLICY);
+  const withExplicitEmpty = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, new Set());
+  assert.deepEqual(withDefault, withExplicitEmpty);
+  assert.equal(withDefault.blocking.length, 1);
+});
+
+test("partition: an override still takes precedence over the settled-surface reversal guard", () => {
+  const f = finding({ severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing" });
+  const key = findingKey(f);
+  const settled = new Set([surfaceKey(f)!]);
+  const p = partitionFindings([f], DEFAULT_POLICY, new Map([[key, "rejected"]]), [], new Map(), null, settled);
+  assert.equal(p.overridden.length, 1, "explicit override wins over the reversal guard");
+  assert.equal(p.advisory.length, 0);
+});
+
 // ---- non-reproducing disposition consultation at review entry (#391 review-2 finding 7b965502) ----
 
 test("partition: a non-reproducing disposition at the current reviewed SHA + matching fingerprint moves a blocking finding to overridden", () => {
