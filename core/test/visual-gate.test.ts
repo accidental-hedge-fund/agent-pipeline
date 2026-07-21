@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import {
@@ -525,6 +525,22 @@ test("visual-gate: enabled with no command → blocked (visual-gate-misconfigure
   assert.equal(log.blocked[0].kind, "visual-gate-misconfigured");
 });
 
+test("visual-gate: enabled with a whitespace-only command → blocked (visual-gate-misconfigured), no runVisual", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, command: "   " });
+  const deps = makeDeps(log, [passResult()]);
+  const origRun = deps.runVisual;
+  let runCalled = 0;
+  deps.runVisual = async (...a) => { runCalled++; return origRun!(...a); };
+
+  const out = await advanceVisual(cfg, 502, {}, deps);
+
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "visual-gate-misconfigured");
+  assert.equal(runCalled, 0, "a whitespace-only command must never reach sh -c");
+});
+
 // ---------------------------------------------------------------------------
 // Dry-run: no GitHub writes
 // ---------------------------------------------------------------------------
@@ -707,4 +723,31 @@ test("visual-gate: artifacts_dir escaping the worktree → error surfaced, no re
   assert.equal(listCalled, 0, "an escaping artifacts_dir must never be listed");
   assert.equal(copyCalled, 0, "an escaping artifacts_dir must never be copied from");
   assert.ok(log.comments[0].includes("no artifacts captured"));
+});
+
+test("visual-gate: artifacts_dir that is a symlink escaping the worktree → error surfaced, no read/copy attempted", async () => {
+  const worktreeDir = await mkdtemp(join(tmpdir(), "visual-symlink-wt-"));
+  const outsideDir = await mkdtemp(join(tmpdir(), "visual-symlink-outside-"));
+  try {
+    await writeFile(join(outsideDir, "secret.png"), "not-a-real-image");
+    await symlink(outsideDir, join(worktreeDir, ".pipeline-visual"), "dir");
+
+    const log = makeCallLog();
+    const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, artifacts_dir: ".pipeline-visual" });
+    let listCalled = 0;
+    let copyCalled = 0;
+    const deps = makeDeps(log, [passResult("checks passed")], { path: worktreeDir, slug: "symlink-slug" });
+    deps.listArtifacts = async () => { listCalled++; return []; };
+    deps.copyArtifacts = async () => { copyCalled++; };
+
+    const out = await advanceVisual(cfg, 803, {}, deps);
+
+    assert.equal(out.advanced, true);
+    assert.equal(listCalled, 0, "a symlinked artifacts_dir escaping the worktree must never be listed");
+    assert.equal(copyCalled, 0, "a symlinked artifacts_dir escaping the worktree must never be copied from");
+    assert.ok(log.comments[0].includes("no artifacts captured"));
+  } finally {
+    await rm(worktreeDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
 });

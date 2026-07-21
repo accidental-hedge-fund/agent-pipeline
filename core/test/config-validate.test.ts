@@ -449,6 +449,14 @@ test("validateConfig: visual_gate.enabled true with empty command is an error di
   assert.ok(d, `expected a visual_gate.command diagnostic, got: ${JSON.stringify(result.diagnostics)}`);
 });
 
+test("validateConfig: visual_gate.enabled true with a whitespace-only command is an error diagnostic", () => {
+  const deps = makeDeps('visual_gate:\n  enabled: true\n  command: "   "\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.command");
+  assert.ok(d, `expected a visual_gate.command diagnostic, got: ${JSON.stringify(result.diagnostics)}`);
+});
+
 test("validateConfig: visual_gate.enabled false with no command does not error", () => {
   const deps = makeDeps("visual_gate:\n  enabled: false\n");
   const result = validateConfig("/fake-repo", deps);

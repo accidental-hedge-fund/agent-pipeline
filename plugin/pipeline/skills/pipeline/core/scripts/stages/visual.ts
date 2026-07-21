@@ -214,6 +214,38 @@ export function resolveArtifactsDir(
   return { ok: true, abs };
 }
 
+/** Canonicalize `abs` (following symlinks) and re-check containment under the
+ *  canonicalized worktree root, so a symlinked `artifacts_dir` — or a symlink
+ *  anywhere on its path — cannot escape the worktree despite passing the
+ *  lexical check in `resolveArtifactsDir`. Returns `{ ok: true, real: null }`
+ *  when the path does not exist yet (the caller's existing "no artifacts"
+ *  path already handles that case). */
+async function realpathContained(
+  worktreePath: string,
+  abs: string,
+): Promise<{ ok: true; real: string | null } | { ok: false; reason: string }> {
+  let realWorktree: string;
+  try {
+    realWorktree = await fsp.realpath(worktreePath);
+  } catch {
+    return { ok: true, real: null };
+  }
+  let realAbs: string;
+  try {
+    realAbs = await fsp.realpath(abs);
+  } catch {
+    return { ok: true, real: null };
+  }
+  const rel = path.relative(realWorktree, realAbs);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return {
+      ok: false,
+      reason: `visual_gate.artifacts_dir resolves outside the worktree root once symlinks are resolved.`,
+    };
+  }
+  return { ok: true, real: realAbs };
+}
+
 async function defaultListArtifacts(absDir: string): Promise<{ rel: string; size: number }[]> {
   const out: { rel: string; size: number }[] = [];
   async function walk(dir: string, prefix: string): Promise<void> {
@@ -279,14 +311,19 @@ async function captureArtifacts(
   if (!resolved.ok) {
     return { captured: false, files: [], truncated: false, totalFound: 0, escapeError: resolved.reason };
   }
-  const all = await deps.listArtifacts(resolved.abs);
+  const canonical = await realpathContained(worktreePath, resolved.abs);
+  if (!canonical.ok) {
+    return { captured: false, files: [], truncated: false, totalFound: 0, escapeError: canonical.reason };
+  }
+  const absDir = canonical.real ?? resolved.abs;
+  const all = await deps.listArtifacts(absDir);
   if (all.length === 0) {
     return { captured: false, files: [], truncated: false, totalFound: 0 };
   }
   const { files, truncated } = boundArtifacts(all);
   if (opts.runDir) {
     const destDir = path.join(opts.runDir, "visual", `attempt-${attempt}`);
-    await deps.copyArtifacts(resolved.abs, files, destDir).catch(() => {});
+    await deps.copyArtifacts(absDir, files, destDir).catch(() => {});
   }
   return { captured: true, files, truncated, totalFound: all.length };
 }
@@ -581,7 +618,7 @@ export async function advanceVisual(
     return { advanced: true, from: "visual-gate", to: NEXT_STAGE, summary: "visual-gate disabled" };
   }
 
-  if (!cfg.visual_gate.command) {
+  if (!cfg.visual_gate.command?.trim()) {
     await setBlockedFn(
       cfg,
       issueNumber,

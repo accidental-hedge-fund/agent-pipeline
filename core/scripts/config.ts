@@ -1419,7 +1419,7 @@ export function validateConfig(
   // 6b. visual_gate: enabling the stage without a command is a config error
   // (not merely a runtime block, unlike eval_gate) — a typo'd/omitted command
   // must never let `visual_gate.enabled: true` silently pass validation.
-  if (fileConfig.visual_gate?.enabled && !fileConfig.visual_gate?.command) {
+  if (fileConfig.visual_gate?.enabled && !fileConfig.visual_gate?.command?.trim()) {
     diagnostics.push({
       severity: "error",
       path: "visual_gate.command",
