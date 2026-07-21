@@ -511,6 +511,12 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
   assert.equal(report.metrics.cost_accounting.totals.prompt_chars_max, 1200);
   assert.equal(report.metrics.cost_accounting.totals.prompt_estimated_tokens_total, 600);
 
+  // #429 — cost-source coverage: 1 actual, 1 estimated, 1 unknown of 3 total calls.
+  assert.equal(report.metrics.cost_accounting.coverage.actual_calls, 1);
+  assert.equal(report.metrics.cost_accounting.coverage.estimated_calls, 1);
+  assert.equal(report.metrics.cost_accounting.coverage.unknown_calls, 1);
+  assert.equal(report.metrics.cost_accounting.coverage.actual_coverage, Math.round((1 / 3) * 10000) / 10000);
+
   const reviewGroup = report.metrics.cost_accounting.groups.find((g) => g.stage === "review-1");
   assert.ok(reviewGroup, "expected review accounting group");
   assert.equal(reviewGroup.invocation_count, 2);
@@ -532,7 +538,92 @@ test("buildScoreboardReport: groups summary accounting by issue stage harness mo
   const human = formatScoreboardHuman(report);
   assert.match(human, /prompt chars 2400 \(max 1200\)/);
   assert.match(human, /est prompt tokens 600/);
+  // #429 — the human report names actual/estimated/unknown call counts and the ratio.
+  assert.match(human, /Cost-source coverage: actual 1; estimated 1; unknown 1; actual coverage 33\.3%/);
   assert.ok(report.diagnostics.some((d) => d.code === "unknown_accounting_cost" && d.message.includes("not counted as free")));
+});
+
+test("buildScoreboardReport: cost-source coverage is null (not 0) for an empty window (#429)", async () => {
+  const files: Record<string, string> = {};
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+
+  assert.equal(report.metrics.cost_accounting.coverage.actual_calls, 0);
+  assert.equal(report.metrics.cost_accounting.coverage.estimated_calls, 0);
+  assert.equal(report.metrics.cost_accounting.coverage.unknown_calls, 0);
+  assert.equal(report.metrics.cost_accounting.coverage.actual_coverage, null);
+
+  const human = formatScoreboardHuman(report);
+  assert.match(human, /Cost-source coverage: actual 0; estimated 0; unknown 0; actual coverage n\/a/);
+});
+
+test("buildScoreboardReport: a mixed set of schema_version 1 and 2 stage_accounting records aggregates fully with no dropped records or version diagnostics (#429)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "429-2026-07-01T00-00-00-000Z", {
+    runJson: { started_at: "2026-07-01T00:00:00Z", issue: 429 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-07-01T00:00:00Z", issue: 429, repo: "owner/repo" },
+      {
+        schema_version: 1,
+        type: "stage_accounting",
+        at: "2026-07-01T00:01:00Z",
+        run_id: "429-2026-07-01T00-00-00-000Z",
+        issue: 429,
+        stage: "review-1",
+        harness: "codex",
+        model_slot: "review",
+        model: "sonnet",
+        started_at: "2026-07-01T00:00:10Z",
+        ended_at: "2026-07-01T00:00:40Z",
+        duration_ms: 30000,
+        command_count: 1,
+        subprocess_count: 1,
+        outcome: "success",
+        blocker_kind: null,
+        cost_source: "estimated",
+        cost_usd: 0.5,
+      },
+      {
+        schema_version: 2,
+        type: "stage_accounting",
+        at: "2026-07-01T00:02:00Z",
+        run_id: "429-2026-07-01T00-00-00-000Z",
+        issue: 429,
+        stage: "review-2",
+        harness: "claude",
+        model_slot: "review",
+        model: "opus",
+        started_at: "2026-07-01T00:01:10Z",
+        ended_at: "2026-07-01T00:01:40Z",
+        duration_ms: 30000,
+        command_count: 1,
+        subprocess_count: 1,
+        outcome: "success",
+        blocker_kind: null,
+        cost_source: "actual",
+        cost_usd: 0.02,
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-07-01T00:10:00Z", final_state: "ready-to-deploy", elapsed_ms: 600000, pr: 429 },
+    ],
+    summaryRaw: "{not-json",
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-07-31T00:00:00Z" },
+    memDeps(files),
+  );
+
+  assert.equal(report.metrics.cost_accounting.totals.invocation_count, 2, "both v1 and v2 records must be counted");
+  assert.equal(report.metrics.cost_accounting.coverage.actual_calls, 1);
+  assert.equal(report.metrics.cost_accounting.coverage.estimated_calls, 1);
+  assert.equal(report.metrics.cost_accounting.coverage.unknown_calls, 0);
+  assert.ok(
+    !report.diagnostics.some((d) => d.code === "invalid_accounting_record"),
+    "no record should be dropped or flagged solely for its schema_version",
+  );
 });
 
 test("buildScoreboardReport: missing or corrupt summary falls back to stage_accounting events (#304)", async () => {
@@ -596,6 +687,7 @@ test("formatScoreboardHuman: contains every required metric heading (#301)", asy
     "Successful PRs:",
     "Ready-to-deploy without human intervention:",
     "Cost per ready PR:",
+    "Cost-source coverage:",
     "Cost/accounting by group:",
     "Full-run wall-clock duration:",
     "Stage wall-clock duration:",

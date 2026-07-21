@@ -18,7 +18,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { invoke, runCapped, formatStderrExcerpt } from "../scripts/harness.ts";
+import {
+  invoke,
+  runCapped,
+  formatStderrExcerpt,
+  parseHarnessTelemetry,
+  makeTelemetryForwardTransform,
+} from "../scripts/harness.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
@@ -950,4 +956,285 @@ test("invoke(): no opts.env → the real spawned child sees no PIPELINE_RUN_ID (
   const cli = makeScript("print-run-id-absent", `printf '%s' "${"$"}{PIPELINE_RUN_ID:-<unset>}"`);
   const result = await invoke(cli, tmpRoot, "prompt", { stream: false });
   assert.equal(result.stdout, "<unset>");
+});
+
+// ---------------------------------------------------------------------------
+// #429 — actual per-call cost capture from harness telemetry
+//
+// Fixture lines below are structurally faithful reproductions of real output
+// captured from the installed `claude`/`codex` CLIs in telemetry mode
+// (design.md — verified against the installed CLIs, per golden rule #5), with
+// identifiers replaced by markers so tests can assert they are never persisted
+// or forwarded.
+// ---------------------------------------------------------------------------
+
+const CLAUDE_TELEMETRY_FIXTURE = [
+  `{"type":"system","subtype":"init","session_id":"SECRET-SESSION-abc123"}`,
+  `{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}`,
+  `{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}`,
+  `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}`,
+  `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}}`,
+  `{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+  `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1784644800}}`,
+  `{"type":"result","subtype":"success","is_error":false,"result":"hello world","session_id":"SECRET-SESSION-abc123","total_cost_usd":0.0014383,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":8133,"output_tokens":123}}`,
+].join("\n");
+
+const CODEX_TELEMETRY_FIXTURE = [
+  `{"type":"thread.started","thread_id":"SECRET-THREAD-xyz"}`,
+  `{"type":"turn.started"}`,
+  `{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hello world"}}`,
+  `{"type":"turn.completed","usage":{"input_tokens":14385,"cached_input_tokens":10496,"output_tokens":6,"reasoning_output_tokens":0}}`,
+].join("\n");
+
+// ---------------------------------------------------------------------------
+// parseHarnessTelemetry — pure envelope parser (never throws, tasks.md 1.5)
+// ---------------------------------------------------------------------------
+
+test("parseHarnessTelemetry: claude fixture → text/costUsd/usage from the terminal result line", () => {
+  const telemetry = parseHarnessTelemetry("claude", CLAUDE_TELEMETRY_FIXTURE);
+  assert.equal(telemetry.text, "hello world");
+  assert.equal(telemetry.costUsd, 0.0014383);
+  assert.equal(telemetry.usage?.input_tokens, 10);
+  assert.equal(telemetry.usage?.cache_read_input_tokens, 8133);
+  assert.equal(telemetry.usage?.output_tokens, 123);
+});
+
+test("parseHarnessTelemetry: codex fixture → agent_message text, turn.completed usage, no cost field", () => {
+  const telemetry = parseHarnessTelemetry("codex", CODEX_TELEMETRY_FIXTURE);
+  assert.equal(telemetry.text, "hello world");
+  assert.equal(telemetry.costUsd, null, "codex never reports a per-call cost field");
+  assert.equal(telemetry.usage?.input_tokens, 14385);
+  assert.equal(telemetry.usage?.cached_input_tokens, 10496);
+  assert.equal(telemetry.usage?.output_tokens, 6);
+});
+
+test("parseHarnessTelemetry: truncated final line (cut off mid-object) degrades to nulls, never throws", () => {
+  const truncated = CLAUDE_TELEMETRY_FIXTURE.split("\n").slice(0, -1).join("\n") +
+    `\n{"type":"result","subtype":"success","result":"cut off half`;
+  assert.doesNotThrow(() => parseHarnessTelemetry("claude", truncated));
+  const telemetry = parseHarnessTelemetry("claude", truncated);
+  assert.equal(telemetry.text, null);
+  assert.equal(telemetry.costUsd, null);
+  assert.equal(telemetry.usage, null);
+});
+
+test("parseHarnessTelemetry: non-JSON noise interleaved with envelope lines is skipped, not fatal", () => {
+  const withNoise = [
+    "warning: some deprecation notice on stderr-like text",
+    "",
+    CLAUDE_TELEMETRY_FIXTURE,
+    "trailing garbage that is not JSON at all {{{",
+  ].join("\n");
+  const telemetry = parseHarnessTelemetry("claude", withNoise);
+  assert.equal(telemetry.text, "hello world");
+  assert.equal(telemetry.costUsd, 0.0014383);
+});
+
+test("parseHarnessTelemetry: empty input → null/empty result, never throws", () => {
+  assert.doesNotThrow(() => parseHarnessTelemetry("claude", ""));
+  const claude = parseHarnessTelemetry("claude", "");
+  assert.deepEqual(claude, { text: null, costUsd: null, usage: null });
+  const codex = parseHarnessTelemetry("codex", "");
+  assert.deepEqual(codex, { text: null, costUsd: null, usage: null });
+});
+
+test("parseHarnessTelemetry: a custom reviewer CLI name always yields the empty result", () => {
+  const telemetry = parseHarnessTelemetry("my-custom-reviewer", CLAUDE_TELEMETRY_FIXTURE);
+  assert.deepEqual(telemetry, { text: null, costUsd: null, usage: null });
+});
+
+// ---------------------------------------------------------------------------
+// makeTelemetryForwardTransform — live terminal forwarding of assistant text
+// only, never raw envelope JSON (tasks.md 2.3)
+// ---------------------------------------------------------------------------
+
+test("makeTelemetryForwardTransform('claude'): forwards only content_block_delta text, never raw envelope JSON", () => {
+  const transform = makeTelemetryForwardTransform("claude");
+  let forwarded = "";
+  for (const line of CLAUDE_TELEMETRY_FIXTURE.split("\n")) {
+    forwarded += transform(`${line}\n`);
+  }
+  assert.equal(forwarded, "hello world");
+  assert.doesNotMatch(forwarded, /"type"/, "raw envelope JSON must never be forwarded");
+  assert.doesNotMatch(forwarded, /SECRET-SESSION/, "session identifiers must never be forwarded");
+});
+
+test("makeTelemetryForwardTransform('codex'): forwards only the completed agent_message text, never raw envelope JSON", () => {
+  const transform = makeTelemetryForwardTransform("codex");
+  let forwarded = "";
+  for (const line of CODEX_TELEMETRY_FIXTURE.split("\n")) {
+    forwarded += transform(`${line}\n`);
+  }
+  assert.equal(forwarded, "hello world\n");
+  assert.doesNotMatch(forwarded, /"type"/, "raw envelope JSON must never be forwarded");
+  assert.doesNotMatch(forwarded, /SECRET-THREAD/, "thread identifiers must never be forwarded");
+});
+
+test("makeTelemetryForwardTransform: a JSON line split across two chunk boundaries is still parsed once complete", () => {
+  const transform = makeTelemetryForwardTransform("claude");
+  const line = `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"split-ok"}}}\n`;
+  const mid = Math.floor(line.length / 2);
+  const first = transform(line.slice(0, mid));
+  const second = transform(line.slice(mid));
+  assert.equal(first, "", "an incomplete line must not be forwarded yet");
+  assert.equal(second, "split-ok", "the completed line is forwarded once the boundary chunk arrives");
+});
+
+// ---------------------------------------------------------------------------
+// invoke() end-to-end telemetry wiring — fake claude/codex CLIs on PATH emit
+// the recorded fixtures verbatim, proving the whole path: stdout reconstruction,
+// accounting cost_source classification, and no persisted secrets (tasks.md 3.3/3.4).
+// ---------------------------------------------------------------------------
+
+test("invoke(): a claude telemetry-mode call reconstructs stdout as the final assistant text and records cost_source:actual", async () => {
+  const cli = makeScript("claude", `cat <<'HARNESS_EOF'\n${CLAUDE_TELEMETRY_FIXTURE}\nHARNESS_EOF`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  try {
+    const result = await invoke("claude", tmpRoot, "prompt", {
+      stream: false,
+      accounting: { runDir, issue: 429, stage: "review-1" },
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.stdout, "hello world", "stdout must be the reconstructed assistant text, not the raw JSONL");
+
+    const raw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim();
+    assert.doesNotMatch(raw, /SECRET-SESSION/, "session_id must never be persisted");
+    assert.doesNotMatch(raw, /hello world/, "assistant text must never be persisted into the accounting record");
+    const event = JSON.parse(raw);
+    assert.equal(event.cost_source, "actual");
+    assert.equal(event.cost_usd, 0.0014);
+    assert.equal(event.usage.input_tokens, 10);
+    assert.equal(event.usage.output_tokens, 123);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): a codex telemetry-mode call reconstructs stdout as the agent_message text and records tokens with a non-actual cost_source", async () => {
+  const cli = makeScript("codex", `cat <<'HARNESS_EOF'\n${CODEX_TELEMETRY_FIXTURE}\nHARNESS_EOF`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  try {
+    const result = await invoke("codex", tmpRoot, "prompt", {
+      stream: false,
+      accounting: { runDir, issue: 429, stage: "review-1" },
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.stdout, "hello world");
+
+    const raw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim();
+    const event = JSON.parse(raw);
+    assert.notEqual(event.cost_source, "actual", "codex telemetry never reports a cost field");
+    assert.equal(event.cost_source, "unknown");
+    assert.equal(event.cost_usd, null);
+    assert.equal(event.usage.input_tokens, 14385);
+    assert.equal(event.usage.cached_input_tokens, 10496);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): PIPELINE_HARNESS_TELEMETRY=off restores the plain-text argv for claude and codex", async () => {
+  const claudeCli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  const oldTelemetry = process.env.PIPELINE_HARNESS_TELEMETRY;
+  process.env.PATH = `${path.dirname(claudeCli)}:${oldPath}`;
+  process.env.PIPELINE_HARNESS_TELEMETRY = "off";
+  try {
+    const claudeResult = await invoke("claude", tmpRoot, "test-prompt", { stream: false });
+    assert.match(claudeResult.stdout, /--output-format\ntext/, "kill-switch must restore --output-format text");
+    assert.doesNotMatch(claudeResult.stdout, /stream-json/, "kill-switch must not pass stream-json");
+    assert.doesNotMatch(claudeResult.stdout, /--include-partial-messages/, "kill-switch must not pass --include-partial-messages");
+
+    const codexCli = makeScript("codex", `printf '%s\\n' "$@"`);
+    process.env.PATH = `${path.dirname(codexCli)}:${oldPath}`;
+    const codexResult = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
+    assert.doesNotMatch(codexResult.stdout, /--json/, "kill-switch must not pass --json to codex");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldTelemetry === undefined) delete process.env.PIPELINE_HARNESS_TELEMETRY;
+    else process.env.PIPELINE_HARNESS_TELEMETRY = oldTelemetry;
+  }
+});
+
+test("invoke(): telemetry mode is the default — claude passes --verbose --output-format stream-json --include-partial-messages", async () => {
+  const cli = makeScript("claude", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("claude", tmpRoot, "test-prompt", { stream: false });
+    assert.match(result.stdout, /--verbose/);
+    assert.match(result.stdout, /--output-format\nstream-json/);
+    assert.match(result.stdout, /--include-partial-messages/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): telemetry mode is the default — codex passes --json", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
+    assert.match(result.stdout, /--json/);
+    assert.match(result.stdout, /--full-auto/, "the sandbox flag must still be present alongside --json");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): an unparseable claude envelope falls back to the raw captured output and cost_source:unknown, without failing the stage", async () => {
+  const cli = makeScript("claude", `printf 'plain text with no JSON envelope at all\\n'`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  try {
+    const result = await invoke("claude", tmpRoot, "prompt", {
+      stream: false,
+      accounting: { runDir, issue: 429, stage: "review-1" },
+    });
+    assert.equal(result.success, true, "unparseable telemetry must not fail the stage");
+    assert.match(result.stdout, /plain text with no JSON envelope at all/, "raw captured output is the fallback stdout");
+    const event = JSON.parse(fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim());
+    assert.equal(event.cost_source, "unknown");
+    assert.equal(event.cost_usd, null);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("runCapped: telemetry captureMode:'tail' preserves the final result line even when total output exceeds MAX_OUTPUT", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  const finalLine = `{"type":"result","subtype":"success","result":"hello world","total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":1}}\n`;
+
+  setImmediate(() => {
+    // Emit well over MAX_OUTPUT (100_000 chars) of filler before the essential
+    // final line, simulating a verbose stream-json call whose delta events
+    // dwarf the final envelope. Head-mode capture would drop the final line
+    // entirely; tail-mode must preserve it.
+    const filler = `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}}\n`;
+    for (let i = 0; i < 1200; i++) fakeChild.stdout.emit("data", Buffer.from(filler));
+    fakeChild.stdout.emit("data", Buffer.from(finalLine));
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", {
+    spawnFn,
+    captureMode: "tail",
+  });
+
+  assert.equal(result.success, true);
+  const telemetry = parseHarnessTelemetry("claude", result.stdout);
+  assert.equal(telemetry.text, "hello world", "the final result line must survive tail-mode capture");
+  assert.equal(telemetry.costUsd, 0.01);
 });

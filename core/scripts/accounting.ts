@@ -6,7 +6,11 @@ import type {
   StageAccountingUsage,
 } from "./types.ts";
 
-export const STAGE_ACCOUNTING_SCHEMA_VERSION = 1;
+// v2 (#429): additive — records may now carry `cost_source: "actual"` derived
+// from built-in harness telemetry rather than only "estimated"/"unknown".
+// Adds no required field and removes none; readers must not gate on this
+// value equalling a specific version (design.md decision 5).
+export const STAGE_ACCOUNTING_SCHEMA_VERSION = 2;
 
 export interface UsageAccountingExtraction {
   usage?: StageAccountingUsage;
@@ -58,6 +62,7 @@ const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
   cache_read_input_tokens: "cached_input_tokens",
   reasoning_tokens: "reasoning_tokens",
   reasoningTokens: "reasoning_tokens",
+  reasoning_output_tokens: "reasoning_tokens",
   cost_usd: "cost_usd",
   costUsd: "cost_usd",
   total_cost_usd: "cost_usd",

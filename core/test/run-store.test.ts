@@ -27,7 +27,7 @@ import {
   type RunStoreDeps,
 } from "../scripts/run-store.ts";
 import type { EvidenceBundle, IssueHistoryEntry } from "../scripts/types.ts";
-import { buildStageAccountingRecord } from "../scripts/accounting.ts";
+import { buildStageAccountingRecord, STAGE_ACCOUNTING_SCHEMA_VERSION } from "../scripts/accounting.ts";
 import { GhMetricsCollector } from "../scripts/gh.ts";
 import type { GhMetricsSummary } from "../scripts/gh.ts";
 
@@ -476,7 +476,7 @@ test("emitStageAccounting: appends stage_accounting and streams identical stdout
   assert.equal(stdoutLines.length, 1);
   assert.equal(stdoutLines[0], `${line}\n`, "stdout JSON line must match events.jsonl exactly");
   const event = JSON.parse(line);
-  assert.equal(event.schema_version, 1);
+  assert.equal(event.schema_version, STAGE_ACCOUNTING_SCHEMA_VERSION);
   assert.equal(event.type, "stage_accounting");
   assert.equal(event.stage, "review-1");
   assert.equal(event.harness, "claude");

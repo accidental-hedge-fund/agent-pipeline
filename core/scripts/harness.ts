@@ -1,11 +1,14 @@
 // Run a harness CLI inside a worktree directory, streaming output to the
 // console while also capturing it for return.
 //
-// claude:  claude --print --permission-mode bypassPermissions --output-format text [--model X] [--effort Y] <prompt>
-// codex:   codex exec --full-auto -C <worktreeDir> [-m X] [-c model_reasoning_effort=Y] <prompt>
+// claude:  claude --print --permission-mode bypassPermissions --verbose --output-format stream-json
+//          --include-partial-messages [--model X] [--effort Y] <prompt>
+// codex:   codex exec --json --full-auto -C <worktreeDir> [-m X] [-c model_reasoning_effort=Y] <prompt>
 //          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
 //          --dangerously-bypass-approvals-and-sandbox mode on externally
 //          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
+//          Set PIPELINE_HARNESS_TELEMETRY=off to restore the pre-#429 plain-text
+//          argv (`--output-format text` / no `--json`) for both built-in harnesses.
 // custom:  <name> <prompt>   (#40 — a user-configured reviewer CLI)
 //
 // The two built-in harnesses keep their exact invocation shapes. Any other
@@ -14,7 +17,17 @@
 // harness output. A custom CLI that cannot be spawned yields a specific, named
 // failure in the returned `HarnessResult` — never a thrown "Unknown harness".
 //
-// Captured stdout/stderr is capped at MAX_OUTPUT to bound memory.
+// #429: the built-in harnesses are invoked in a machine-readable telemetry mode
+// so `invoke()` can recover per-call cost/token usage from the CLI's own report
+// instead of an operator estimate. `parseHarnessTelemetry` turns the captured
+// JSONL back into `{ text, costUsd, usage }`; `HarnessResult.stdout` is set to
+// the recovered assistant text so every existing consumer (verdict parsing, fix
+// rounds, gates) is unaffected. `makeTelemetryForwardTransform` forwards only
+// that assistant text to the terminal as it streams in, never the raw envelope.
+//
+// Captured stdout/stderr is capped at MAX_OUTPUT to bound memory. Telemetry-mode
+// stdout capture keeps the TAIL of the stream rather than the head, because the
+// cost/usage-bearing envelope line always arrives last.
 
 import { spawn } from "node:child_process";
 import * as path from "node:path";
@@ -80,6 +93,150 @@ export function formatStderrExcerpt(stderr: string, max = 500): string {
     `\n\nCLI output:\n\`\`\`\n${trimmed.slice(0, max)}` +
     `${trimmed.length > max ? "\n…(truncated)" : ""}\n\`\`\``
   );
+}
+
+/** Per-call cost/token telemetry recovered from a built-in harness's
+ *  machine-readable output mode (#429). `usage` is the harness's own raw usage
+ *  object, handed to `buildStageAccountingRecord` unmodified — extraction into
+ *  the accounting record stays allowlist-only via the existing
+ *  `extractUsageAccounting` path, so fields outside that allowlist (session
+ *  id, rate-limit info, assistant text) are never persisted. */
+export interface HarnessTelemetry {
+  text: string | null;
+  costUsd: number | null;
+  usage: Record<string, unknown> | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseJsonLine(line: string): Record<string, unknown> | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse a captured JSONL telemetry stream from a built-in harness back into
+ * `{ text, costUsd, usage }` (#429). Pure and never throws — absent, truncated,
+ * or non-JSON output yields a null/empty result so callers can fall back to
+ * the raw captured stdout and an `unknown` cost source without failing the
+ * stage (design.md decision 3).
+ *
+ * Verified shapes (design.md — confirmed against the installed CLIs):
+ *  - claude `--output-format stream-json`: the last `{"type":"result"}` line
+ *    carries `result` (final text), `total_cost_usd`, and a `usage` object.
+ *  - codex `exec --json`: the last `item.completed` line whose `item.type` is
+ *    `"agent_message"` carries the final text; the last `turn.completed` line
+ *    carries a `usage` object with token counters and no cost field.
+ */
+export function parseHarnessTelemetry(harness: string, capturedStdout: string): HarnessTelemetry {
+  if (harness === "claude") return parseClaudeTelemetry(capturedStdout);
+  if (harness === "codex") return parseCodexTelemetry(capturedStdout);
+  return { text: null, costUsd: null, usage: null };
+}
+
+function parseClaudeTelemetry(capturedStdout: string): HarnessTelemetry {
+  const lines = capturedStdout.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const obj = parseJsonLine(lines[i]);
+    if (!obj || obj.type !== "result") continue;
+    const text = typeof obj.result === "string" ? obj.result : null;
+    const costUsd =
+      typeof obj.total_cost_usd === "number" && Number.isFinite(obj.total_cost_usd)
+        ? obj.total_cost_usd
+        : null;
+    const usage = isRecord(obj.usage) ? obj.usage : null;
+    return { text, costUsd, usage };
+  }
+  return { text: null, costUsd: null, usage: null };
+}
+
+function parseCodexTelemetry(capturedStdout: string): HarnessTelemetry {
+  const lines = capturedStdout.split("\n");
+  let text: string | null = null;
+  let usage: Record<string, unknown> | null = null;
+  for (const line of lines) {
+    const obj = parseJsonLine(line);
+    if (!obj) continue;
+    if (
+      obj.type === "item.completed" &&
+      isRecord(obj.item) &&
+      obj.item.type === "agent_message" &&
+      typeof obj.item.text === "string"
+    ) {
+      text = obj.item.text;
+    } else if (obj.type === "turn.completed" && isRecord(obj.usage)) {
+      usage = obj.usage;
+    }
+  }
+  // Codex never reports a per-call cost field (design.md — verified).
+  return { text, costUsd: null, usage };
+}
+
+/** Extract human-meaningful assistant text from one already-parsed telemetry
+ *  line, for live terminal forwarding (#429). Returns null for every line that
+ *  is not a verified assistant-text-bearing shape — envelope/metadata lines
+ *  (system, rate_limit_event, turn.completed, …) are never forwarded. */
+function extractForwardableText(harness: string, obj: Record<string, unknown>): string | null {
+  if (harness === "claude") {
+    if (obj.type !== "stream_event" || !isRecord(obj.event)) return null;
+    const event = obj.event;
+    if (
+      event.type === "content_block_delta" &&
+      isRecord(event.delta) &&
+      event.delta.type === "text_delta" &&
+      typeof event.delta.text === "string"
+    ) {
+      return event.delta.text;
+    }
+    return null;
+  }
+  if (harness === "codex") {
+    if (
+      obj.type === "item.completed" &&
+      isRecord(obj.item) &&
+      obj.item.type === "agent_message" &&
+      typeof obj.item.text === "string"
+    ) {
+      return `${obj.item.text}\n`;
+    }
+    return null;
+  }
+  return null;
+}
+
+/** Build a stateful per-call transform that buffers partial JSON lines across
+ *  chunk boundaries and forwards only the assistant text extracted by
+ *  `extractForwardableText` — raw envelope JSON is never forwarded (#429). */
+export function makeTelemetryForwardTransform(harness: string): (chunk: string) => string {
+  let buffered = "";
+  return (chunk: string): string => {
+    buffered += chunk;
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    let out = "";
+    for (const line of lines) {
+      const obj = parseJsonLine(line);
+      if (!obj) continue;
+      const text = extractForwardableText(harness, obj);
+      if (text) out += text;
+    }
+    return out;
+  };
+}
+
+/** `PIPELINE_HARNESS_TELEMETRY=off` is an escape-hatch kill-switch (#429), not
+ *  a config surface: no `pipeline.yml` key, so nothing new to validate,
+ *  document, or default-demote (design.md decision 3). */
+function harnessTelemetryEnabled(): boolean {
+  return process.env.PIPELINE_HARNESS_TELEMETRY !== "off";
 }
 
 export interface HarnessResult {
@@ -172,10 +329,16 @@ export async function invoke(
   let cmd: string;
   let args: string[];
   let custom = false;
+  // Telemetry mode is the default for both built-in harnesses (#429);
+  // PIPELINE_HARNESS_TELEMETRY=off restores the pre-#429 plain-text argv.
+  const telemetryMode =
+    harnessTelemetryEnabled() && (harness === "claude" || harness === "codex");
   if (harness === "claude") {
     cmd = "claude";
     const permMode = opts.sandbox ? "default" : "bypassPermissions";
-    args = ["--print", "--permission-mode", permMode, "--output-format", "text"];
+    args = telemetryMode
+      ? ["--print", "--permission-mode", permMode, "--verbose", "--output-format", "stream-json", "--include-partial-messages"]
+      : ["--print", "--permission-mode", permMode, "--output-format", "text"];
     if (opts.lean) {
       // Lean single-shot generation. `--tools` is variadic, so its empty value
       // ("" = disable all tools) is placed immediately before `--strict-mcp-config`
@@ -189,12 +352,9 @@ export async function invoke(
   } else if (harness === "codex") {
     cmd = "codex";
     const noSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
-    args = [
-      "exec",
-      noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto",
-      "-C",
-      worktreeDir,
-    ];
+    args = ["exec"];
+    if (telemetryMode) args.push("--json");
+    args.push(noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto", "-C", worktreeDir);
     if (opts.model) args.push("-m", opts.model);
     if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort=${opts.reasoningEffort}`);
     args.push(prompt);
@@ -218,10 +378,28 @@ export async function invoke(
         }
       : undefined,
     env: opts.env,
+    // The cost/usage-bearing envelope line always arrives last, so telemetry
+    // capture keeps the tail of the stream rather than the head (#429).
+    captureMode: telemetryMode ? "tail" : undefined,
+    transformForward: telemetryMode ? makeTelemetryForwardTransform(harness) : undefined,
   });
   const endedAt = new Date();
+
+  // Recover per-call cost/usage from the captured envelope and reconstruct the
+  // final assistant text as `stdout` (#429) — every existing consumer (verdict
+  // parsing, fix rounds, gates) sees the same `stdout` shape as plain-text mode.
+  // Parsing never throws; an unparseable envelope falls back to the raw
+  // captured output and leaves accounting at `cost_source: "unknown"`.
+  const telemetry = telemetryMode ? parseHarnessTelemetry(harness, result.stdout) : null;
+  const finalResult: HarnessResult =
+    telemetry && telemetry.text !== null ? { ...result, stdout: telemetry.text } : result;
+
   if (opts.accounting) {
     const model = opts.accounting.model ?? opts.model ?? null;
+    const usage =
+      telemetry && (telemetry.costUsd !== null || telemetry.usage !== null)
+        ? { total_cost_usd: telemetry.costUsd, usage: telemetry.usage }
+        : opts.accounting.usage;
     const record = buildStageAccountingRecord({
       runId: path.basename(opts.accounting.runDir),
       issue: opts.accounting.issue,
@@ -231,12 +409,12 @@ export async function invoke(
       model,
       startedAt: startedAt.toISOString(),
       endedAt: endedAt.toISOString(),
-      durationMs: result.duration * 1000,
+      durationMs: finalResult.duration * 1000,
       commandCount: opts.accounting.commandCount ?? 1,
       subprocessCount: opts.accounting.subprocessCount ?? 1,
-      outcome: harnessOutcome(result),
-      blockerKind: result.success ? null : "harness-failure",
-      usage: opts.accounting.usage,
+      outcome: harnessOutcome(finalResult),
+      blockerKind: finalResult.success ? null : "harness-failure",
+      usage,
       estimatedCostUsd: opts.accounting.estimatedCostUsd,
       promptChars: prompt.length,
       promptEstimatedTokens: Math.ceil(prompt.length / 4),
@@ -251,15 +429,15 @@ export async function invoke(
   // executable), surface a specific, actionable message that names the CLI —
   // never a bare "Unknown harness". The `spawn_error` flag is preserved so the
   // #39 self-review fallback still triggers in invokeReviewer.
-  if (custom && result.spawn_error) {
+  if (custom && finalResult.spawn_error) {
     return {
-      ...result,
+      ...finalResult,
       stderr:
         `reviewer CLI '${harness}' not found or not executable — ensure it is installed and on PATH\n` +
-        result.stderr,
+        finalResult.stderr,
     };
   }
-  return result;
+  return finalResult;
 }
 
 function harnessOutcome(result: HarnessResult): string {
@@ -330,6 +508,19 @@ export async function runCapped(
     // Absent by default: the child inherits process.env unchanged, matching
     // pre-#419 behavior exactly.
     env?: NodeJS.ProcessEnv;
+    // How captured stdout is bounded at MAX_OUTPUT (#429). "head" (default,
+    // unchanged pre-#429 behavior) keeps the first MAX_OUTPUT chars and stops
+    // growing. "tail" keeps the last MAX_OUTPUT chars instead — used for
+    // telemetry-mode invocations, whose cost/usage-bearing envelope line
+    // always arrives at the END of the stream and must not be dropped.
+    captureMode?: "head" | "tail";
+    // Transform applied to each stdout chunk before it is forwarded to the
+    // terminal, independent of the raw chunk accumulated into the captured
+    // buffer (#429). Used in telemetry mode to forward only the assistant
+    // text extracted from the JSONL envelope, never the raw envelope lines.
+    // Absent by default: chunks are forwarded verbatim, matching pre-#429
+    // behavior exactly.
+    transformForward?: (chunk: string) => string;
   } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
@@ -526,13 +717,20 @@ export async function runCapped(
       }, killGraceSec * 1000);
     }, timeoutSec * 1000);
 
+    const captureMode = opts.captureMode ?? "head";
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
-      if (stdoutBuf.length < MAX_OUTPUT) {
+      if (captureMode === "tail") {
+        stdoutBuf += text;
+        if (stdoutBuf.length > MAX_OUTPUT) stdoutBuf = stdoutBuf.slice(stdoutBuf.length - MAX_OUTPUT);
+      } else if (stdoutBuf.length < MAX_OUTPUT) {
         stdoutBuf += text;
         if (stdoutBuf.length > MAX_OUTPUT) stdoutBuf = stdoutBuf.slice(0, MAX_OUTPUT);
       }
-      if (stream) safeForward(fwd.stdout, text);
+      if (stream) {
+        const forwardText = opts.transformForward ? opts.transformForward(text) : text;
+        if (forwardText) safeForward(fwd.stdout, forwardText);
+      }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
