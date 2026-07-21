@@ -11,6 +11,7 @@ import {
   postComment,
   removeLabel,
 } from "../gh.ts";
+import { attestPipelineComment } from "./review-parsing.ts";
 import { getOnDiskForIssue, hasCommitsAhead, removeWorktree } from "../worktree.ts";
 import { recordRecovery } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
@@ -62,17 +63,20 @@ export async function tryAutoRecover(
     await postComment(
       cfg,
       issueNumber,
-      [
-        RECOVERY_LIMIT_MARKER,
-        "",
-        `Implementation produced no commits after ${recoveryCount} retries. ` +
-          `This issue may already be resolved on \`${cfg.base_branch}\`, or it may need manual intervention.`,
-        "",
-        "@comamitc",
-        "",
-        "---",
-        "*Automated by Claude Code Pipeline Skill*",
-      ].join("\n"),
+      attestPipelineComment(
+        "auto-recovery-limit",
+        [
+          RECOVERY_LIMIT_MARKER,
+          "",
+          `Implementation produced no commits after ${recoveryCount} retries. ` +
+            `This issue may already be resolved on \`${cfg.base_branch}\`, or it may need manual intervention.`,
+          "",
+          "@comamitc",
+          "",
+          "---",
+          "*Automated by Claude Code Pipeline Skill*",
+        ].join("\n"),
+      ),
     );
     return {
       advanced: false,
@@ -97,14 +101,17 @@ export async function tryAutoRecover(
   await postComment(
     cfg,
     issueNumber,
-    [
-      `${RECOVERY_MARKER} (${recoveryCount + 1}/${cfg.auto_recovery_max_retries})`,
-      "",
-      "Implementation failed with no commits produced. Worktree cleaned up and issue reset to **ready** for retry.",
-      "",
-      "---",
-      "*Automated by Claude Code Pipeline Skill*",
-    ].join("\n"),
+    attestPipelineComment(
+      "auto-recovery",
+      [
+        `${RECOVERY_MARKER} (${recoveryCount + 1}/${cfg.auto_recovery_max_retries})`,
+        "",
+        "Implementation failed with no commits produced. Worktree cleaned up and issue reset to **ready** for retry.",
+        "",
+        "---",
+        "*Automated by Claude Code Pipeline Skill*",
+      ].join("\n"),
+    ),
   );
 
   // Evidence bundle (#147): record the recovery event. Best-effort + gated on

@@ -47,7 +47,7 @@ import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
-import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
+import { attestPipelineComment, extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import {
   computeBranchDeveloperCommits,
@@ -257,7 +257,10 @@ export async function advanceFix(
       await postComment(
         cfg,
         issueNumber,
-        `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.`,
+        attestPipelineComment(
+          "new-human-input-warning",
+          `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.`,
+        ),
       );
     }
     await setBlocked(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");

@@ -64,6 +64,7 @@ import type {
   Stage,
 } from "../types.ts";
 import {
+  attestPipelineComment,
   classifyReview1Risk,
   computeDiffHash,
   diffFilePaths,
@@ -297,7 +298,10 @@ export async function advanceReview(
       await postCommentFn(
         cfg,
         issueNumber,
-        `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.${cfgFooter(cfg)}`,
+        attestPipelineComment(
+          "new-human-input-warning",
+          `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.${cfgFooter(cfg)}`,
+        ),
       );
     }
     await setBlockedFn(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");

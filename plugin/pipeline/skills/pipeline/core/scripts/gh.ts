@@ -8,6 +8,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { attestPipelineComment } from "./stages/review-parsing.ts";
 import {
   BLOCKED_LABEL,
   BLOCKER_RECIPES,
@@ -793,7 +794,8 @@ export async function transition(
   if (summary) {
     lines.push("", "### Summary", summary);
   }
-  const comment = lines.join("\n") + COMMENT_FOOTER + "\n" + buildAuditSentinel(effectiveRunId, toStage);
+  const rendered = lines.join("\n") + COMMENT_FOOTER + "\n" + buildAuditSentinel(effectiveRunId, toStage);
+  const comment = attestPipelineComment("stage-transition", rendered);
 
   await _editLabels(cfg, issueNumber, fromStage, toStage);
   await retryComment(() => _postComment(cfg, issueNumber, comment), 3, _sleep);
@@ -885,8 +887,9 @@ export async function setBlocked(
   const harness = getHarnessLabel(detail.labels) ?? "unassigned";
 
   const effectiveRunId = _activeRunId ?? "unknown";
-  const body = buildBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind })
+  const rendered = buildBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind })
     + "\n" + buildAuditSentinel(effectiveRunId, "blocked");
+  const body = attestPipelineComment("blocked", rendered);
 
   await _addBlockedLabel(cfg, issueNumber);
   await retryComment(() => _postComment(cfg, issueNumber, body), 3, _sleep);
@@ -1254,6 +1257,50 @@ export const PIPELINE_COMMENT_HEADERS: readonly string[] = [
   "## Pre-Planning Context",
 ];
 
+// ---------------------------------------------------------------------------
+// PIPELINE_COMMENT_KINDS — single-sourced registry (#471)
+// ---------------------------------------------------------------------------
+
+/**
+ * Single-sourced enumeration of every comment TYPE ("kind") the pipeline
+ * posts to an issue or PR, other than review verdicts (`formatReviewComment`
+ * / `formatDeltaReviewComment`), which stay on the existing `review-artifact`
+ * verification path (#264/#390) and do not need the generic attestation.
+ *
+ * Every OTHER pipeline-posted comment SHALL be attested via
+ * `attestPipelineComment(kind, body)` as the last step before posting, using
+ * the `kind` id listed here. This registry is:
+ *   - the enumeration source for the behavioral drift-guard test (renders
+ *     each kind and asserts it verifies + self-excludes from
+ *     `findUnacknowledgedComments`), and
+ *   - the target the source drift-guard test checks every `## Pipeline…`
+ *     heading literal in `core/scripts/` against.
+ *
+ * `heading` is the literal (or literal prefix, for dynamic-suffix headings)
+ * each kind's rendered body starts with — documentation for humans and the
+ * anchor the source guard matches against; it is NOT itself the attestation.
+ */
+export const PIPELINE_COMMENT_KINDS: readonly { kind: string; heading: string }[] = [
+  { kind: "stage-transition", heading: "## Pipeline: " },
+  { kind: "blocked", heading: "## Pipeline: Blocked at " },
+  { kind: "audit-repair", heading: "## Pipeline: Audit Repair" },
+  { kind: "audit-repair-blocked", heading: "## Pipeline: Blocked (audit repair)" },
+  { kind: "review-advance-severity", heading: "## Pipeline: Review " },
+  { kind: "review-ceiling", heading: "## Pipeline: Review ceiling reached" },
+  { kind: "review-ceiling-demotion", heading: "## Pipeline: Review ceiling — findings demoted and deferred" },
+  { kind: "new-human-input-warning", heading: "## Pipeline: New human input detected" },
+  { kind: "pipeline-complete", heading: "## Pipeline Complete" },
+  { kind: "auto-recovery", heading: "## Pipeline: Auto-Recovery" },
+  { kind: "auto-recovery-limit", heading: "## Pipeline: Auto-Recovery Limit" },
+  { kind: "auto-loop-continuation", heading: "## Pipeline: Auto-Loop Continuation" },
+  { kind: "auto-loop-exhausted", heading: "## Pipeline: Auto-Loop Budget Exhausted" },
+  { kind: "evidence-bundle", heading: "## Pipeline: Evidence bundle" },
+  { kind: "pre-merge-rerun-identity", heading: "## Pipeline: Re-running review — prior runner identity differs" },
+  { kind: "pre-merge-rerun-scope", heading: "## Pipeline: Re-running review — scoped override active" },
+  { kind: "pre-merge-diff-unchanged", heading: "## Pipeline: Diff unchanged since last review; verdict reused" },
+  { kind: "pre-merge-stale-review", heading: "## Pipeline: Re-running review" },
+];
+
 // Matches "## Review 1", "## Review 2", "## Review 3", ... — review rounds are
 // unbounded, so a fixed header list would miss round 3+ (#390).
 const REVIEW_ROUND_RE = /^## Review \d+\b/;
@@ -1268,6 +1315,10 @@ const PIPELINE_SENTINEL_MARKERS: readonly string[] = [
   "<!-- pipeline-blocking-keys",
   "<!-- pipeline-blocking-surfaces",
   "<!-- reviewed-sha",
+  // Generic pipeline attestation marker (#471) — any attested comment is
+  // structurally pipeline regardless of its heading, matching how the other
+  // sentinels above are treated.
+  "<!-- pipeline-attest:",
 ];
 
 const PLAN_COMMENT_HEADER = "## Implementation Plan";

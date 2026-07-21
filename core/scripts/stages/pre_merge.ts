@@ -30,6 +30,7 @@ import {
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
+  attestPipelineComment,
   computeDiffHash,
   DELTA_REVIEW_MARKER_PREFIX,
   diffFilePaths,
@@ -1165,10 +1166,13 @@ export async function enforceReviewShaGate(
           await postCommentFn(
             cfg,
             issueNumber,
-            `## Pipeline: Re-running review — prior runner identity differs\n\n` +
-              `Review comments exist from an allowlisted prior runner (not \`${actor}\`). ` +
-              `Re-running review under the current identity to establish a verified baseline ` +
-              `before proceeding to pre-merge.`,
+            attestPipelineComment(
+              "pre-merge-rerun-identity",
+              `## Pipeline: Re-running review — prior runner identity differs\n\n` +
+                `Review comments exist from an allowlisted prior runner (not \`${actor}\`). ` +
+                `Re-running review under the current identity to establish a verified baseline ` +
+                `before proceeding to pre-merge.`,
+            ),
           );
           await transitionFn(cfg, issueNumber, "pre-merge", reviewStage);
           return { advanced: true, to: reviewStage };
@@ -1215,9 +1219,12 @@ export async function enforceReviewShaGate(
       await postCommentFn(
         cfg,
         issueNumber,
-        `## Pipeline: Re-running review — scoped override active\n\n` +
-          `Active scoped override(s) may cover the ${unresolved.length} cached blocking ` +
-          `finding(s). Re-running review with live findings to apply scoped dispositions.`,
+        attestPipelineComment(
+          "pre-merge-rerun-scope",
+          `## Pipeline: Re-running review — scoped override active\n\n` +
+            `Active scoped override(s) may cover the ${unresolved.length} cached blocking ` +
+            `finding(s). Re-running review with live findings to apply scoped dispositions.`,
+        ),
       );
       await transitionFn(
         cfg,
@@ -1667,12 +1674,15 @@ export async function enforceReviewShaGate(
 /** Notice posted when the pre-merge diff-hash check finds the diff unchanged (#228). */
 export function diffUnchangedNotice(reviewedSha: string | null, headSha: string): string {
   const from = reviewedSha ? ` from \`${reviewedSha.slice(0, 7)}\`` : "";
-  return [
-    "## Pipeline: Diff unchanged since last review; verdict reused",
-    "",
-    `HEAD has moved${from} to \`${headSha.slice(0, 7)}\`, but the PR diff hash is identical to the one the last review evaluated.`,
-    "The prior review verdict is still valid; pre-merge proceeds without a re-review.",
-  ].join("\n");
+  return attestPipelineComment(
+    "pre-merge-diff-unchanged",
+    [
+      "## Pipeline: Diff unchanged since last review; verdict reused",
+      "",
+      `HEAD has moved${from} to \`${headSha.slice(0, 7)}\`, but the PR diff hash is identical to the one the last review evaluated.`,
+      "The prior review verdict is still valid; pre-merge proceeds without a re-review.",
+    ].join("\n"),
+  );
 }
 
 /** Default implementation of the `getCommitDeltaDiff` seam (#228). */
@@ -1770,13 +1780,16 @@ export function staleReviewNotice(reviewedSha: string | null, headSha: string): 
     ? `Re-running review: HEAD has moved from \`${reviewedSha.slice(0, 7)}\` to \`${newShort}\` since the last review.`
     : `Re-running review: the last review did not record the commit it evaluated, ` +
       `so its verdict cannot be verified against current HEAD (\`${newShort}\`).`;
-  return [
-    "## Pipeline: Re-running review",
-    "",
-    body,
-    "",
-    "The prior review verdict is discarded; review re-runs against the current commit before this item can advance.",
-  ].join("\n");
+  return attestPipelineComment(
+    "pre-merge-stale-review",
+    [
+      "## Pipeline: Re-running review",
+      "",
+      body,
+      "",
+      "The prior review verdict is discarded; review re-runs against the current commit before this item can advance.",
+    ].join("\n"),
+  );
 }
 
 // ---------------------------------------------------------------------------

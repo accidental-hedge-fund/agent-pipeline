@@ -28,6 +28,7 @@ import {
   type StageUpdate,
 } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
+import { attestPipelineComment } from "./stages/review-parsing.ts";
 
 /** Bundle filename written under `<stateDir>/<issue>/`. */
 export const EVIDENCE_FILE = "evidence.json";
@@ -495,18 +496,21 @@ export function formatEvidenceCommentBody(
   localBundlePath: string,
   summaryHint: string,
 ): string {
-  return [
-    "## Pipeline: Evidence bundle",
-    "",
-    `**Run ID:** \`${bundle.runId || "(none)"}\``,
-    "",
-    formatStageTimingTableMarkdown(bundle),
-    "",
-    `<sub>Local bundle path (secondary/optional): \`${localBundlePath}\` — or run \`${summaryHint}\`.</sub>`,
-    "",
-    "---",
-    "*Automated by Claude Code Pipeline Skill*",
-  ].join("\n");
+  return attestPipelineComment(
+    "evidence-bundle",
+    [
+      "## Pipeline: Evidence bundle",
+      "",
+      `**Run ID:** \`${bundle.runId || "(none)"}\``,
+      "",
+      formatStageTimingTableMarkdown(bundle),
+      "",
+      `<sub>Local bundle path (secondary/optional): \`${localBundlePath}\` — or run \`${summaryHint}\`.</sub>`,
+      "",
+      "---",
+      "*Automated by Claude Code Pipeline Skill*",
+    ].join("\n"),
+  );
 }
 
 function pad(s: string, width: number): string {

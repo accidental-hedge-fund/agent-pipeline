@@ -2,6 +2,7 @@
 // Idempotent — safe to call multiple times.
 
 import { addLabelToPr, getIssueDetail, getPrForIssue, postComment, postPrComment } from "../gh.ts";
+import { attestPipelineComment } from "./review-parsing.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import { getOnDiskForIssue, removeWorktree } from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
@@ -29,7 +30,7 @@ export async function finalize(
     const advisoryRounds = detail.comments.filter(
       (c) => c.body.startsWith("## Pipeline: Review") && c.body.includes("advanced under severity policy"),
     ).length;
-    const summary = [
+    const rawSummary = [
       FINAL_SUMMARY_MARKER,
       "",
       `- **Issue**: #${issueNumber} — ${detail.title}`,
@@ -51,6 +52,7 @@ export async function finalize(
       "---",
       cfg.marker_footer,
     ].join("\n");
+    const summary = attestPipelineComment("pipeline-complete", rawSummary);
     await postComment(cfg, issueNumber, summary);
     console.log(`[pipeline] #${issueNumber}: final summary posted`);
     // Mirror the summary onto the PR — the merge decision happens there, not on
