@@ -269,6 +269,19 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     mutatesGitHub: false,
     supportsJson: false,
   },
+
+  // papercut is agent-facing, not human-facing (#419): registered and directly
+  // invocable by name, but hidden from `--help` and the generated host
+  // pipeline:<command> surface — see dispatch in pipeline.ts and the exclusion
+  // in scripts/build.mjs.
+  papercut: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "profile", "run", "message", "since", "until", "json"]),
+    needsConfig: true,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
 };
 
 /**

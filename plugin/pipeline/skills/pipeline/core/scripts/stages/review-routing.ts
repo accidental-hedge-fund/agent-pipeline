@@ -18,8 +18,9 @@ import {
   extractSnapshotComment,
   findUnacknowledgedComments,
 } from "../issue-context-snapshot.ts";
+import * as path from "node:path";
 import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
-import { formatStderrExcerpt } from "../harness.ts";
+import { formatStderrExcerpt, papercutIdentityEnv } from "../harness.ts";
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
@@ -1040,6 +1041,13 @@ export async function invokePromptHarnessReview(
           modelSlot: "review",
         }
       : undefined,
+    env: papercutIdentityEnv(cfg, {
+      runId: opts.runDir ? path.basename(opts.runDir) : null,
+      issue: issueNumber,
+      stage: `review-${round}`,
+      harness: cfg.harnesses.reviewer,
+      model: rawModel ?? null,
+    }),
   });
 }
 

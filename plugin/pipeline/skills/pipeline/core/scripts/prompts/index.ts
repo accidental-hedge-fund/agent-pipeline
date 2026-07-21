@@ -188,7 +188,40 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     pipeline_run_id: a.pipelineRunId,
     docs_instruction: a.docsEnabled ? DOCS_INSTRUCTION_SECTION : "",
     spec_context: specContextSection(a.specContext),
+    papercut_instruction: papercutInstructionSection(a.cfg),
   });
+}
+
+/**
+ * Single-sourced papercut instruction (#419), injected into the implementing,
+ * fix, and review templates via {{papercut_instruction}} — identical text in
+ * all four renders when enabled (drift-guarded by prompt-loader.test.ts).
+ * Names the exact CLI invocation and draws the three-way distinction between
+ * a papercut (minor friction), a review finding (a defect), and a blocker
+ * (work stopped) so the agent does not misfile one as another.
+ */
+export const PAPERCUT_INSTRUCTION = `## Papercuts (Minor Friction)
+
+If you hit minor friction you worked around — a flaky command you retried, a misleading error, an undocumented setup step, a dead-end tool call — log it and continue. Do NOT stop the run for it:
+
+    pipeline papercut --run "$PIPELINE_RUN_ID" -m "<short description of the friction>"
+
+The run id is available via the \`PIPELINE_RUN_ID\` environment variable. This command is best-effort and never blocks — do not treat its exit code as significant.
+
+Do not confuse a papercut with the other two channels:
+- **A defect in the code under review** is a review finding — report it through the review verdict, not a papercut.
+- **Something that prevents you from continuing at all** is a blocker — raise it as a blocker, not a papercut.`;
+
+/**
+ * Returns "" when `cfg.papercuts.enabled` is false/absent (the default), so
+ * substituting it leaves rendered output byte-for-byte identical to
+ * pre-#419 output — each of the 4 templates places `{{papercut_instruction}}`
+ * appended directly onto a preceding token/placeholder (never on its own
+ * line), so an empty substitution leaves no stray blank line.
+ */
+function papercutInstructionSection(cfg: PipelineConfig): string {
+  if (!cfg.papercuts?.enabled) return "";
+  return `\n\n${PAPERCUT_INSTRUCTION}`;
 }
 
 /**
@@ -296,6 +329,7 @@ export function buildReviewStandardPrompt(a: BuildReviewArgs): string {
     non_blocking_guidance: NON_BLOCKING_GUIDANCE_BLOCK,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
+    papercut_instruction: papercutInstructionSection(a.cfg),
   });
 }
 
@@ -334,6 +368,7 @@ export function buildReviewAdversarialPrompt(a: BuildAdversarialArgs): string {
     non_blocking_guidance: NON_BLOCKING_GUIDANCE_BLOCK,
     schema_block: REVIEW_VERDICT_SCHEMA_BLOCK,
     diff: truncateDiff(a.diff, 50_000),
+    papercut_instruction: papercutInstructionSection(a.cfg),
   });
 }
 
@@ -375,6 +410,7 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     spec_context: specContextSection(a.specContext),
     spec_revision_instruction: fixSpecRevisionInstruction(a.specContext),
     reviewed_sha: a.reviewedSha ?? "(unknown — no reviewed SHA supplied)",
+    papercut_instruction: papercutInstructionSection(a.cfg),
   });
 }
 

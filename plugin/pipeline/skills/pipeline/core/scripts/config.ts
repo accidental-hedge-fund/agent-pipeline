@@ -215,6 +215,17 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Optional external event sink for run events (#343)."),
+  // Opt-in agent-logged friction capture (#419). When enabled, the engine adds
+  // identity env vars to harness child processes and injects a prompt
+  // instruction telling the agent to log minor friction via `pipeline
+  // papercut` instead of stopping. Absent or `enabled: false` → inert.
+  papercuts: z
+    .object({
+      enabled: z.boolean().optional().describe("When true, gate the papercut instruction into prompts and pass run/stage identity to harness child processes."),
+    })
+    .strict()
+    .optional()
+    .describe("Agent-logged minor-friction capture settings (#419)."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -723,6 +734,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
       failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
+    },
+    papercuts: {
+      enabled: fileConfig.papercuts?.enabled ?? DEFAULT_CONFIG.papercuts.enabled,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -1506,6 +1520,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const shipcheckGate = { ...d.shipcheck_gate, ...config.shipcheck_gate };
   const reviewPolicy = { ...d.review_policy, ...config.review_policy };
   const doctor = { ...d.doctor, ...config.doctor };
+  const papercuts = { ...d.papercuts, ...config.papercuts };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
 
   const optionalTop: string[] = [];
@@ -1620,6 +1635,10 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # if true, run the preflight checks before planning and abort the run on any failure`,
     `  failFast: ${yamlScalar(doctor.failFast)} # if true, stop at the first failing check instead of collecting all failures`,
+    "",
+    config.papercuts !== undefined
+      ? `papercuts: # agent-logged minor-friction capture (#419) — opt in to record friction via 'pipeline papercut' without stopping the run\n${yamlBlock(config.papercuts, 2)}`
+      : "# papercuts: # agent-logged minor-friction capture (#419) — uncomment to enable 'pipeline papercut' and its prompt instruction",
     "",
     config.auto_loop !== undefined
       ? [
@@ -1770,6 +1789,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     shipcheck_gate: { ...d.shipcheck_gate, ...config.shipcheck_gate },
     review_policy: { ...d.review_policy, ...config.review_policy },
     doctor: { ...d.doctor, ...config.doctor },
+    papercuts: { ...d.papercuts, ...config.papercuts },
     setup_command: config.setup_command,
     build_command: config.build_command,
     conventions_md_path: config.conventions_md_path,
