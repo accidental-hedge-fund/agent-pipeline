@@ -3357,7 +3357,7 @@ test("cross-round memory (#389): formatReviewComment populates blockingFindings 
   assert.equal(entry.title.length, 120, "title truncated to 120 chars");
 });
 
-test("cross-round memory (#389): formatReviewComment renders the REVERSAL-UNACKNOWLEDGED tag naming the settling round", () => {
+test("cross-round memory (#389, #464): formatReviewComment renders the REVERSAL-UNACKNOWLEDGED tag naming the settled finding and round", () => {
   const f: ReviewFinding = {
     severity: "high", title: "cap missing", file: "src/limiter.ts", category: "correctness",
     body: "b", confidence: 0.9, recommendation: "r",
@@ -3371,9 +3371,9 @@ test("cross-round memory (#389): formatReviewComment renders the REVERSAL-UNACKN
     new Set<string>(), // demoted → not in the blocking-keys set
     undefined,
     undefined,
-    new Map([[key, 2]]),
+    new Map([[key, { settledKey: "ab12cd34", settledTitle: "cap missing", settledRound: 2, matchedBy: "key" as const }]]),
   );
-  assert.match(body, /`REVERSAL-UNACKNOWLEDGED: settled in round 2`/);
+  assert.match(body, /`REVERSAL-UNACKNOWLEDGED: re-raises ab12cd34 "cap missing" settled in round 2`/);
   assert.match(body, /cap missing/, "the finding itself is still rendered, not dropped");
 });
 

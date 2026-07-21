@@ -175,15 +175,19 @@ export interface IgnoredArtifactWarningEvent extends RunEventBase {
 }
 
 /** A blocking finding was demoted to advisory because it re-raised, without an
- *  explicit `prior_round_acknowledgment`, a surface a prior round already
- *  settled (#389). Never blocks and never changes the finding's visibility —
- *  the finding is still recorded and posted, tagged `REVERSAL-UNACKNOWLEDGED`;
- *  this event is purely an audit record of the demotion. */
+ *  explicit `prior_round_acknowledgment`, a SPECIFIC finding a prior round
+ *  already settled (#389, finding-level matching #464). Never blocks and
+ *  never changes the finding's visibility — the finding is still recorded and
+ *  posted, tagged `REVERSAL-UNACKNOWLEDGED`; this event is purely an audit
+ *  record of the demotion. `settled_finding_key`/`settling_round`/`matched_by`
+ *  identify which prior finding was matched and how (#464). */
 export interface ReversalUnacknowledgedEvent extends RunEventBase {
   type: "reversal_unacknowledged";
   finding_key: string;
   surface: string;
+  settled_finding_key: string;
   settling_round: number;
+  matched_by: "key" | "title-similarity";
 }
 
 /** Agent-self-reported minor friction (#419), non-blocking. Flows through the

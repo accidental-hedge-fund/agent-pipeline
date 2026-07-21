@@ -36,7 +36,7 @@ export const REVIEW_VERDICT_SCHEMA_BLOCK = `{
             "category": "<optional: spec-divergence|correctness|security|...>",
             "spec_divergence_direction": "<optional: code-behind-spec|spec-behind-code>",
             "blocking": true | false,
-            "prior_round_acknowledgment": "<optional: required when re-raising a settled surface from the prior-round digest as blocking — name the prior round and why a new resolution, not a reversal, is warranted>"
+            "prior_round_acknowledgment": "<optional: required when re-raising a settled finding from the prior-round digest as blocking — name the prior round and why a new resolution, not a reversal, is warranted; a new, distinct defect on a previously-fixed file/surface needs no acknowledgment>"
         }
     ],
     "next_steps": ["<action item>"]

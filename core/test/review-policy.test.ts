@@ -29,6 +29,7 @@ import {
   type ReviewPolicy,
   type ScopedOverride,
 } from "../scripts/review-policy.ts";
+import type { SettledFinding } from "../scripts/review-history.ts";
 import type { ReviewFinding } from "../scripts/types.ts";
 
 function finding(over: Partial<ReviewFinding> = {}): ReviewFinding {
@@ -268,23 +269,29 @@ test("partition: advisory-confidence duplicate shares key with blocker — overr
   assert.equal(p.advisory.length, 1, "low-confidence finding remains advisory");
 });
 
-// ---- settled-surface reversal guard (#389) ----
+// ---- settled-finding reversal guard (#389, finding-level matching #464) ----
 
-test("partition: blocking finding on a settled surface without acknowledgment is demoted to advisory", () => {
+function settledFrom(f: ReviewFinding, round = 1): SettledFinding {
+  return { key: findingKey(f), surface: surfaceKey(f), title: f.title, round };
+}
+
+test("partition: blocking finding that re-raises a settled finding (same key) without acknowledgment is demoted to advisory", () => {
   const f = finding({ severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing" });
-  const settled = new Set([surfaceKey(f)!]);
+  const settled = [settledFrom(f)];
   const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
   assert.equal(p.blocking.length, 0, "unacknowledged reversal must not block");
   assert.equal(p.advisory.length, 1);
   assert.equal(p.advisory[0].reason, "reversal-unacknowledged");
+  assert.equal(p.advisory[0].reversalMatch?.matchedBy, "key");
+  assert.equal(p.advisory[0].reversalMatch?.settledKey, settled[0].key);
 });
 
-test("partition: blocking finding on a settled surface WITH a non-empty acknowledgment blocks normally", () => {
+test("partition: blocking finding that re-raises a settled finding WITH a non-empty acknowledgment blocks normally", () => {
   const f = finding({
     severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing",
     prior_round_acknowledgment: "Round 2 accepted no cap for burst traffic, but this change removed rate limiting entirely — a materially different, unaccepted risk.",
   });
-  const settled = new Set([surfaceKey(f)!]);
+  const settled = [settledFrom(f)];
   const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
   assert.equal(p.blocking.length, 1, "an acknowledged reversal blocks exactly as it would without the guard");
   assert.equal(p.advisory.length, 0);
@@ -295,31 +302,47 @@ test("partition: whitespace-only acknowledgment does not count as an acknowledgm
     severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing",
     prior_round_acknowledgment: "   ",
   });
-  const settled = new Set([surfaceKey(f)!]);
+  const settled = [settledFrom(f)];
   const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
   assert.equal(p.blocking.length, 0);
   assert.equal(p.advisory[0].reason, "reversal-unacknowledged");
 });
 
-test("partition: a finding on a surface NOT in settledSurfaces is unaffected by the guard", () => {
+test("partition: a finding on a surface not matching any settled finding is unaffected by the guard", () => {
   const f = finding({ severity: "high", file: "src/other.ts", category: "correctness", title: "unrelated" });
-  const settled = new Set(["src/limiter.ts|correctness"]); // does not match f's surface
+  const settled: SettledFinding[] = [{ key: "deadbeef", surface: "src/limiter.ts|correctness", title: "cap missing", round: 1 }];
   const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
   assert.equal(p.blocking.length, 1);
 });
 
-test("partition: omitting settledSurfaces entirely leaves partitioning unchanged (default empty set)", () => {
+test("partition: a genuinely NEW, distinct finding on a previously-settled surface blocks per policy — surface identity alone is not a match (#464, #395 mis-fire)", () => {
+  const settledEntry = finding({
+    severity: "high", file: "src/pr-visibility.ts", category: "correctness",
+    title: "Artifact copy silently swallows errors instead of surfacing them",
+  });
+  const settled = [settledFrom(settledEntry)];
+  const newDefect = finding({
+    severity: "high", confidence: 0.99, file: "src/pr-visibility.ts", category: "correctness",
+    title: "Captured artifacts are not actually PR-visible",
+  });
+  assert.notEqual(findingKey(newDefect), findingKey(settledEntry), "precondition: distinct finding, not a key repeat");
+  const p = partitionFindings([newDefect], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
+  assert.equal(p.blocking.length, 1, "a distinct new defect on the same surface must block per policy");
+  assert.equal(p.advisory.filter((a) => a.reason === "reversal-unacknowledged").length, 0);
+});
+
+test("partition: omitting settledFindings entirely leaves partitioning unchanged (default empty array)", () => {
   const f = finding({ severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing" });
   const withDefault = partitionFindings([f], DEFAULT_POLICY);
-  const withExplicitEmpty = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, new Set());
+  const withExplicitEmpty = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, []);
   assert.deepEqual(withDefault, withExplicitEmpty);
   assert.equal(withDefault.blocking.length, 1);
 });
 
-test("partition: an override still takes precedence over the settled-surface reversal guard", () => {
+test("partition: an override still takes precedence over the settled-finding reversal guard", () => {
   const f = finding({ severity: "high", file: "src/limiter.ts", category: "correctness", title: "cap missing" });
   const key = findingKey(f);
-  const settled = new Set([surfaceKey(f)!]);
+  const settled = [settledFrom(f)];
   const p = partitionFindings([f], DEFAULT_POLICY, new Map([[key, "rejected"]]), [], new Map(), null, settled);
   assert.equal(p.overridden.length, 1, "explicit override wins over the reversal guard");
   assert.equal(p.advisory.length, 0);

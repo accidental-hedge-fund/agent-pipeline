@@ -29,8 +29,7 @@ import {
 } from "../prompts/index.ts";
 import {
   buildPriorRoundDigest,
-  settledSurfaceRounds,
-  settledSurfaces,
+  settledFindings,
   type PriorRoundDigest,
 } from "../review-history.ts";
 import { getForIssue, getOnDiskForIssue } from "../worktree.ts";
@@ -49,6 +48,7 @@ import {
   severityRank,
   surfaceKey,
   type PartitionResult,
+  type ReversalMatch,
   type Review1Risk,
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
@@ -581,28 +581,36 @@ export async function advanceReview(
   // just fix entry — so a re-review at the same reviewed SHA does not re-block
   // the same already-declared tooling artifact.
   const nonReproducing = extractNonReproducingDispositions(trustedComments);
-  const settled = priorRoundsDigest ? settledSurfaces(priorRoundsDigest) : new Set<string>();
+  // The reversal-unacknowledged guard is withheld on the ceiling round itself
+  // (#464): the round-cap ceiling has its own dedicated, MORE audited handling
+  // for a recurring/unresolved finding — `demote_and_advance` creates a
+  // tracked follow-up issue and an override sentinel, a strictly more
+  // rigorous outcome than the guard's generic advisory demotion. Letting the
+  // guard fire first would silently swallow that mechanism.
+  const roundCapForGate = cfg.review_policy.max_adversarial_rounds;
+  const priorRoundCountForGate = detail.comments.filter((c) => c.body.startsWith(roundPfx)).length;
+  const atRoundCeiling = roundCapForGate > 0 && priorRoundCountForGate + 1 >= roundCapForGate;
+  const settled = priorRoundsDigest && !atRoundCeiling ? settledFindings(priorRoundsDigest) : [];
   const partition = partitionFindings(verdict.findings, effectivePol, overrides, scopes, nonReproducing, commitSha, settled);
   const blockingFindingSet = new Set<ReviewFinding>(partition.blocking);
   for (let i = 0; i < findingRecords.length; i++) {
     findingRecords[i].effective_blocking = blockingFindingSet.has(verdict.findings[i]);
   }
 
-  // Settled-surface reversal guard demotions (#389): tag the finding in the
-  // posted comment and emit one audit event per demotion.
-  const settledRounds = priorRoundsDigest ? settledSurfaceRounds(priorRoundsDigest) : new Map<string, number>();
-  const reversalDemotions = new Map<string, number>();
-  for (const { finding, reason } of partition.advisory) {
-    if (reason !== "reversal-unacknowledged") continue;
-    const surface = surfaceKey(finding);
-    const settlingRound = surface !== null ? settledRounds.get(surface) : undefined;
-    if (settlingRound === undefined) continue;
-    reversalDemotions.set(findingKey(finding), settlingRound);
+  // Settled-finding reversal guard demotions (#389, finding-level matching
+  // #464): tag the finding in the posted comment and emit one audit event
+  // per demotion, naming which specific settled finding it re-raises.
+  const reversalDemotions = new Map<string, ReversalMatch>();
+  for (const { finding, reason, reversalMatch } of partition.advisory) {
+    if (reason !== "reversal-unacknowledged" || !reversalMatch) continue;
+    reversalDemotions.set(findingKey(finding), reversalMatch);
     if (opts.runDir) {
       const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
       await appendEvent(opts.runDir, {
         schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
-        finding_key: findingKey(finding), surface, settling_round: settlingRound,
+        finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+        settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
+        matched_by: reversalMatch.matchedBy,
       }, opts.runStoreDeps).catch(() => {});
     }
   }
