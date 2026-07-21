@@ -477,6 +477,24 @@ test("matchSettledFinding: title-unavailable legacy entry cannot match by simila
   assert.equal(forcedMatch?.basis, "key");
 });
 
+test("matchSettledFinding: three-shared-domain-token pair with a distinct predicate on each side does not match despite Jaccard >= threshold (#464 review round 3)", () => {
+  // "Reject unsigned artifact manifests" vs "Unsigned artifact manifests
+  // expire" share three domain tokens (unsigned, artifact, manifest) and
+  // score 3/5 = 0.6 >= TITLE_SIMILARITY_THRESHOLD — but "reject" and "expire"
+  // are each exclusive to one side, describing distinct validation vs.
+  // lifecycle defects. Containment (one title's tokens fully inside the
+  // other's) must gate the match, not Jaccard alone.
+  const settledTitle = "Reject unsigned artifact manifests";
+  const newTitle = "Unsigned artifact manifests expire";
+  assert.ok(titleSimilarity(settledTitle, newTitle) >= TITLE_SIMILARITY_THRESHOLD, "Jaccard alone would match");
+
+  const settled: SettledFinding[] = [
+    { key: "aaaaaaaa", surface: "x.ts|correctness", title: settledTitle, round: 1 },
+  ];
+  const f = { severity: "high" as const, file: "x.ts", category: "correctness", title: newTitle };
+  assert.equal(matchSettledFinding(f, settled), null, "distinct predicate on each side must remain blocking, not auto-demoted");
+});
+
 test("matchSettledFinding: entry with no recorded surface matches only by key, never by surface", () => {
   const settled: SettledFinding[] = [{ key: "aaaaaaaa", surface: null, title: "legacy finding", round: 1 }];
   const f = { severity: "high", file: "x.ts", category: "correctness", title: "unrelated" };

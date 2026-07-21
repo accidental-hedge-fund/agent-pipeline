@@ -316,30 +316,62 @@ function titleTokens(title: string): Set<string> {
   );
 }
 
-/** Jaccard-similarity threshold at/above which two titles are treated as
- *  describing the same underlying defect (#464 review round 2). A same-surface
- *  title pair sharing only the subject/domain nouns of a defect (e.g. two
- *  titles both mentioning "malformed artifact manifests" while describing
- *  unrelated concerns — validation-time rejection vs. downstream PR
- *  observability) scores well below this threshold even after stemming;
- *  a reworded restatement or an opposite-conclusion re-litigation of the SAME
- *  point scores well above it. Raised from 0.3 after round-2 review found the
+/** Jaccard-similarity threshold at/above which two titles are, together with
+ *  `MIN_SHARED_TITLE_TOKENS` (#464 review round 3), treated as describing the
+ *  same underlying defect (#464 review round 2). A same-surface title pair
+ *  sharing only the subject/domain nouns of a defect (e.g. two titles both
+ *  mentioning "malformed artifact manifests" while describing unrelated
+ *  concerns — validation-time rejection vs. downstream PR observability)
+ *  scores well below this threshold even after stemming; a reworded
+ *  restatement or an opposite-conclusion re-litigation of the SAME point
+ *  scores well above it. Raised from 0.3 after round-2 review found the
  *  lower threshold let such vocabulary-overlap-only pairs match — see the
- *  regression tests guarding both ends of this margin. */
+ *  regression tests guarding both ends of this margin. Jaccard is a RATIO,
+ *  so it is insufficient alone: a short title pair sharing just three domain
+ *  nouns can clear it purely because the titles are short (round-3 finding —
+ *  see `MIN_SHARED_TITLE_TOKENS`). */
 export const TITLE_SIMILARITY_THRESHOLD = 0.55;
+
+/**
+ * Minimum absolute count of shared content tokens additionally required, on
+ * top of TITLE_SIMILARITY_THRESHOLD, for two titles to be treated as the same
+ * underlying defect (#464 review round 3). Jaccard alone cannot separate a
+ * short coincidental-overlap pair from a genuine reworded restatement: "Reject
+ * unsigned artifact manifests" vs. "Unsigned artifact manifests expire" (3
+ * shared domain tokens, 1 distinct predicate word EACH side — a validation
+ * defect confused with an unrelated lifecycle defect) and "Artifact copy
+ * silently swallows errors instead of surfacing them" vs. "Artifact copy
+ * errors are silently swallowed and never surfaced to the reviewer" (a true
+ * restatement of the SAME defect, with peripheral wording drift on each side)
+ * both score exactly 0.6 Jaccard — the ratio is identical. What differs is the
+ * absolute vocabulary shared: 3 tokens vs. 6. A short, coincidental
+ * domain-noun overlap cannot clear this floor; a wordier restatement clears it
+ * easily even with a couple of differing peripheral words on each side. Set
+ * from the observed corpus — known distinct-defect pairs cap out at 3 shared
+ * tokens, known restatement pairs clear at least 4 — see the regression tests
+ * guarding both sides of this margin.
+ */
+export const MIN_SHARED_TITLE_TOKENS = 4;
+
+function sharedTokenCount(ta: Set<string>, tb: Set<string>): number {
+  let intersection = 0;
+  for (const t of ta) if (tb.has(t)) intersection++;
+  return intersection;
+}
+
+function titleSimilarityTokens(ta: Set<string>, tb: Set<string>): number {
+  if (ta.size === 0 || tb.size === 0) return 0;
+  const intersection = sharedTokenCount(ta, tb);
+  const union = ta.size + tb.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
 
 /**
  * Jaccard similarity over normalized, stopword-filtered title tokens (#464).
  * Returns 0 when either title has no usable tokens. Pure, deterministic.
  */
 export function titleSimilarity(a: string, b: string): number {
-  const ta = titleTokens(a);
-  const tb = titleTokens(b);
-  if (ta.size === 0 || tb.size === 0) return 0;
-  let intersection = 0;
-  for (const t of ta) if (tb.has(t)) intersection++;
-  const union = ta.size + tb.size - intersection;
-  return union === 0 ? 0 : intersection / union;
+  return titleSimilarityTokens(titleTokens(a), titleTokens(b));
 }
 
 export type MatchBasis = "key" | "title-similarity";
@@ -356,8 +388,12 @@ export interface SettledFindingMatch {
  *      surface. When the settled entry has no recorded surface, only key
  *      equality (condition 2) can satisfy the match — surface identity alone
  *      never suffices.
- *   2. `finding`'s findingKey equals the settled entry's key, OR the
- *      normalized-title similarity between them is >= TITLE_SIMILARITY_THRESHOLD.
+ *   2. `finding`'s findingKey equals the settled entry's key, OR BOTH: the
+ *      normalized-title similarity between them is >= TITLE_SIMILARITY_THRESHOLD
+ *      AND they share at least MIN_SHARED_TITLE_TOKENS content tokens (the
+ *      absolute floor that tells a reworded restatement apart from two
+ *      distinct defects that merely share domain nouns — see that constant's
+ *      doc comment).
  *      A settled entry whose title is unrecoverable (`(title unavailable)` or
  *      empty) is eligible for the key branch only.
  * Returns the first match found (or null), and pure: no filesystem, network,
@@ -378,7 +414,12 @@ export function matchSettledFinding(
     }
     if (fKey === entry.key) return { entry, basis: "key" };
     if (fTitleUsable && isTitleUsable(entry.title)) {
-      if (titleSimilarity(finding.title ?? "", entry.title) >= TITLE_SIMILARITY_THRESHOLD) {
+      const ta = titleTokens(finding.title ?? "");
+      const tb = titleTokens(entry.title);
+      if (
+        titleSimilarityTokens(ta, tb) >= TITLE_SIMILARITY_THRESHOLD &&
+        sharedTokenCount(ta, tb) >= MIN_SHARED_TITLE_TOKENS
+      ) {
         return { entry, basis: "title-similarity" };
       }
     }
