@@ -497,8 +497,12 @@ async function writeScoreboardHtmlExport(
       await deps.writeFile(tempPath, content);
       break;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST" && attempt < HTML_EXPORT_TEMP_CREATE_ATTEMPTS) {
-        continue;
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        if (attempt < HTML_EXPORT_TEMP_CREATE_ATTEMPTS) continue;
+        // EEXIST means this invocation never created the colliding file —
+        // unlinking it would delete a pre-existing file (or symlink) some
+        // other writer owns (#427 delta finding ada9497b).
+        throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
       }
       await deps.unlink(tempPath).catch(() => {});
       throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);

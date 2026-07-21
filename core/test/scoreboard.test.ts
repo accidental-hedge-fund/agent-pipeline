@@ -1596,9 +1596,12 @@ test("runScoreboard: a pre-created file (or symlink) at the first-chosen temp na
   assert.match(written.get("/out/report.html") ?? "", /<!DOCTYPE html>/);
 });
 
-test("runScoreboard: exhausting temp-name collision retries fails clearly and cleans up the last attempted temp file (#427 review 2)", async () => {
+test("runScoreboard: exhausting temp-name collision retries fails clearly WITHOUT unlinking the colliding file it never created (#427 delta ada9497b)", async () => {
+  // Regression: EEXIST on the final attempt means the colliding path belongs
+  // to another writer — unlinking it would delete a pre-existing file (or
+  // symlink target reference) this invocation never created.
   const tempAttempts: string[] = [];
-  let unlinkedPath: string | null = null;
+  const unlinked: string[] = [];
   const deps: ScoreboardDeps = {
     readFile: async (p: string) => { throw enoent(p); },
     readdir: async () => { throw enoent(runsDir(REPO_DIR)); },
@@ -1610,14 +1613,14 @@ test("runScoreboard: exhausting temp-name collision retries fails clearly and cl
       throw err;
     },
     rename: async () => { throw new Error("rename must not be called when every write attempt collides"); },
-    unlink: async (p: string) => { unlinkedPath = p; },
+    unlink: async (p: string) => { unlinked.push(p); },
   };
   await assert.rejects(
     () => runScoreboard({ repoDir: REPO_DIR, html: "/out/report.html" }, deps),
     /cannot write HTML export to \/out\/report\.html/,
   );
   assert.equal(new Set(tempAttempts).size, tempAttempts.length, "every attempt must use a distinct name");
-  assert.equal(unlinkedPath, tempAttempts[tempAttempts.length - 1]);
+  assert.deepEqual(unlinked, [], "a collision this invocation did not create must never be unlinked");
 });
 
 test("CLI: pipeline scoreboard --html writes one complete document and exits 0, touching nothing under .agent-pipeline/runs (#427)", () => {
