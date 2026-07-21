@@ -104,11 +104,16 @@ that have uncommitted changes or a local HEAD that differs from the merged PR's
 commit. It is idempotent and prints a removed/skipped summary before exiting.
 
 `--init` also takes no number. It onboards a fresh repo in one step: ensures all
-pipeline labels via `ensurePipelineLabels` and scaffolds a commented
+pipeline labels via `ensurePipelineLabels`, scaffolds a commented
 `.github/pipeline.yml` with every key at its default (skipping the write, with a
-notice, if the file already exists). It is idempotent and additive — a normal
-`$pipeline N` run still self-creates any missing labels, so `init` is a
-convenience, not a precondition.
+notice, if the file already exists), and ensures a sentinel-delimited
+engine-managed block in `.gitignore` covering every local-only artifact
+directory the engine writes — `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
+and `.agent-pipeline/history/`. The `.gitignore` step creates the file if absent,
+appends the block if missing (preserving every pre-existing byte), or refreshes
+only the block's contents when it is present and stale. It is idempotent and
+additive — a normal `$pipeline N` run still self-creates any missing labels, so
+`init` is a convenience, not a precondition.
 
 `config sync` also takes no number. It refreshes an existing
 `.github/pipeline.yml` against the current init scaffold while preserving

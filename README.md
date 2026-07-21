@@ -652,12 +652,15 @@ Before running the pipeline for the first time on a fresh repo, run `init` to cr
 $pipeline --init    # Codex primary
 ```
 
-`init` does two things, idempotently:
+`init` does three things, idempotently:
 
 1. **Creates all pipeline labels** (`pipeline:<stage>`, `blocked`, `harness:claude`, `harness:codex`) in the target repo via `gh label create`. Labels that already exist are left untouched.
 2. **Writes `.github/pipeline.yml`** with all configurable keys at their default values. If the file already exists it is preserved and a notice is printed — `init` never clobbers an existing config.
+3. **Ensures the engine-managed artifact block in `.gitignore`** — a sentinel-delimited block listing `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, and `.agent-pipeline/history/` (see "Ignored artifact paths" below). If `.gitignore` is absent it is created; if present without the block, the block is appended and every pre-existing byte is preserved; if the block is present but stale, only the span between the sentinels is rewritten. Lines outside the sentinels are never touched.
 
-Safe to re-run: a second `init` on the same repo finds all labels present and the config file already there, and exits cleanly. A normal `/pipeline N` run still creates any missing labels as a side-effect even if you never ran `init` — `init` is additive, not a new precondition. For repos with an older existing config, run `pipeline config sync` to preview a current scaffold refresh, then `pipeline config sync --apply` to write it after validation.
+Safe to re-run: a second `init` on the same repo finds all labels present, the config file already there, and the artifact block already current, and exits cleanly. A normal `/pipeline N` run still creates any missing labels as a side-effect even if you never ran `init` — `init` is additive, not a new precondition. For repos with an older existing config, run `pipeline config sync` to preview a current scaffold refresh, then `pipeline config sync --apply` to write it after validation. Re-running `init` after an engine upgrade also refreshes the `.gitignore` artifact block to cover any newly added artifact directory.
+
+**Ignored artifact paths.** The engine writes three local-only directories under `.agent-pipeline/` that must never be committed: `.agent-pipeline/runs/` (per-run evidence bundles), `.agent-pipeline/roadmap/` (generated roadmap artifacts, delivered through a PR by `pipeline roadmap --apply`), and `.agent-pipeline/history/` (per-issue evidence history, `issue-<N>.jsonl`). `init` ensures all three are gitignored via the managed block described above; without it, the first `/pipeline N` run on a fresh repo leaves the protected branch dirty and fails `pipeline doctor`'s `worktree-clean` check.
 
 After running `init`, commit `.github/pipeline.yml` (edit as needed), add `pipeline:ready` to an issue, and start the pipeline.
 

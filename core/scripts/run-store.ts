@@ -24,6 +24,7 @@ import { stageDurationMs } from "./evidence-bundle.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
+import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -40,7 +41,7 @@ export function runIdFor(issue: number, startedAt: Date): RunId {
 
 /** Root directory that holds all run subdirectories for a repo. */
 export function runsDir(repoDir: string): string {
-  return path.join(repoDir, ".agent-pipeline", "runs");
+  return artifactSubdir(repoDir, RUNS_ARTIFACT);
 }
 
 /** Absolute path of a single run's directory. */
@@ -52,7 +53,7 @@ export function runDirPath(repoDir: string, runId: RunId): string {
  *  sibling of `runs/` under `.agent-pipeline/` — durable, reboot-safe storage,
  *  unlike the legacy `/tmp/pipeline-<repo>` state dir. */
 export function issueHistoryDir(repoDir: string): string {
-  return path.join(repoDir, ".agent-pipeline", "history");
+  return artifactSubdir(repoDir, HISTORY_ARTIFACT);
 }
 
 /** Absolute path of the append-only per-issue evidence-history JSONL. */

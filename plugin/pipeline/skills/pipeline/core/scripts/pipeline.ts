@@ -20,6 +20,7 @@ import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
+import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
@@ -1421,6 +1422,14 @@ export async function runInit(cfg: PipelineConfig): Promise<void> {
     console.log(`[pipeline] init: created .github/pipeline.yml with default configuration.`);
   } else {
     console.log(`[pipeline] init: .github/pipeline.yml already exists — skipping scaffold.`);
+  }
+  const { outcome } = ensureArtifactIgnoreBlock(cfg.repo_dir);
+  if (outcome === "created") {
+    console.log(`[pipeline] init: created .gitignore with the agent-pipeline artifact block.`);
+  } else if (outcome === "updated") {
+    console.log(`[pipeline] init: updated the agent-pipeline artifact block in .gitignore.`);
+  } else {
+    console.log(`[pipeline] init: .gitignore agent-pipeline artifact block already current.`);
   }
   console.log(`[pipeline] init: pipeline labels ensured in ${cfg.repo}.`);
 }

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import { resolveConfig, scaffoldDefaultConfig } from "../scripts/config.ts";
 import { runInit } from "../scripts/pipeline.ts";
+import { renderArtifactIgnoreBlock } from "../scripts/artifact-ignore.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -316,6 +317,107 @@ test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map at empty-
     // The commented-out block must not activate — repo_map resolves to empty-list defaults.
     assert.deepEqual(cfg.repo_map.depends_on, [], "depends_on must be empty when scaffold comments it out");
     assert.deepEqual(cfg.repo_map.depended_on_by, [], "depended_on_by must be empty when scaffold comments it out");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3.x runInit ensures the agent-pipeline .gitignore artifact block (#452)
+// ---------------------------------------------------------------------------
+
+test("runInit: no .gitignore -> creates one containing the managed artifact block", async () => {
+  const repo = makeTempRepo();
+  const binDir = makeFakeGhBin({ repoSlug: "acme/init-gitignore-create" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+
+  try {
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      profile_name: "test",
+      invocation: "$pipeline",
+      review_mode: "prompt-harness" as const,
+      marker_footer: "",
+      implementation_ready_message: "",
+      conventions_default: "CLAUDE.md",
+      domain: "test-init-gitignore",
+      repo: "acme/init-gitignore-create",
+      repo_dir: repo,
+    };
+
+    await runInit(cfg);
+
+    const gitignorePath = path.join(repo, ".gitignore");
+    assert.ok(fs.existsSync(gitignorePath), ".gitignore should exist after init");
+    assert.equal(fs.readFileSync(gitignorePath, "utf8"), renderArtifactIgnoreBlock());
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("runInit: existing .gitignore without the block -> appends it, preserving operator lines", async () => {
+  const repo = makeTempRepo();
+  const gitignorePath = path.join(repo, ".gitignore");
+  const operatorLines = "node_modules/\n*.log\n";
+  fs.writeFileSync(gitignorePath, operatorLines, "utf8");
+
+  const binDir = makeFakeGhBin({ repoSlug: "acme/init-gitignore-append" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+
+  try {
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      profile_name: "test",
+      invocation: "$pipeline",
+      review_mode: "prompt-harness" as const,
+      marker_footer: "",
+      implementation_ready_message: "",
+      conventions_default: "CLAUDE.md",
+      domain: "test-init-gitignore-append",
+      repo: "acme/init-gitignore-append",
+      repo_dir: repo,
+    };
+
+    await runInit(cfg);
+
+    const content = fs.readFileSync(gitignorePath, "utf8");
+    assert.ok(content.startsWith(operatorLines), "operator lines must be preserved byte-identical");
+    assert.ok(content.includes(renderArtifactIgnoreBlock()), "the managed block must be appended");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("runInit: second run with an already-current block is a no-op (idempotent)", async () => {
+  const repo = makeTempRepo();
+  const binDir = makeFakeGhBin({ repoSlug: "acme/init-gitignore-idempotent" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+
+  try {
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      profile_name: "test",
+      invocation: "$pipeline",
+      review_mode: "prompt-harness" as const,
+      marker_footer: "",
+      implementation_ready_message: "",
+      conventions_default: "CLAUDE.md",
+      domain: "test-init-gitignore-idempotent",
+      repo: "acme/init-gitignore-idempotent",
+      repo_dir: repo,
+    };
+
+    await runInit(cfg);
+    const gitignorePath = path.join(repo, ".gitignore");
+    const afterFirst = fs.readFileSync(gitignorePath, "utf8");
+
+    await runInit(cfg);
+    const afterSecond = fs.readFileSync(gitignorePath, "utf8");
+
+    assert.equal(afterSecond, afterFirst, "re-running init must not change an already-current .gitignore");
   } finally {
     process.env.PATH = oldPath;
   }
