@@ -9,6 +9,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import yaml from "js-yaml";
 import {
   emitPapercut as realEmitPapercut,
   runDirPath,
@@ -71,6 +72,32 @@ export function realPapercutDeps(): PapercutDeps {
     },
     log: (msg) => console.warn(msg),
   };
+}
+
+// ---------------------------------------------------------------------------
+// papercutsEnabled
+// ---------------------------------------------------------------------------
+
+/** Best-effort, gh-free check of whether `papercuts.enabled` is set in
+ *  `<repoDir>/.github/pipeline.yml`. Deliberately does not call the full
+ *  `resolveConfig()` (which shells out to `gh repo view`) — the papercut CLI
+ *  boundary must work unauthenticated and never throw. Any read/parse failure
+ *  (missing file, invalid YAML, non-object root) resolves to false, matching
+ *  the feature's documented inert-by-default contract. */
+export async function papercutsEnabled(
+  repoDir: string,
+  deps: Pick<PapercutDeps, "readFile">,
+): Promise<boolean> {
+  try {
+    const text = await deps.readFile(path.join(repoDir, ".github", "pipeline.yml"));
+    const parsed = yaml.load(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const block = (parsed as { papercuts?: unknown }).papercuts;
+    if (!block || typeof block !== "object" || Array.isArray(block)) return false;
+    return (block as { enabled?: unknown }).enabled === true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------

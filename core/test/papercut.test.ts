@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   recordPapercut,
   reportPapercuts,
+  papercutsEnabled,
   type PapercutDeps,
 } from "../scripts/stages/papercut.ts";
 
@@ -182,6 +183,56 @@ test("recordPapercut: never throws when run.json read throws a non-ENOENT error"
   );
   // Falls back to issue: 0 rather than aborting the record.
   assert.equal((emitCalls[0] as { issue: number }).issue, 0);
+});
+
+// ---------------------------------------------------------------------------
+// papercutsEnabled
+// ---------------------------------------------------------------------------
+
+test("papercutsEnabled: false when .github/pipeline.yml is absent", async () => {
+  const deps = makeDeps();
+  assert.equal(await papercutsEnabled("/repo", deps), false);
+});
+
+test("papercutsEnabled: false when the papercuts block is absent", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "base_branch: main\n" },
+  });
+  assert.equal(await papercutsEnabled("/repo", deps), false);
+});
+
+test("papercutsEnabled: false when papercuts.enabled is false", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "papercuts:\n  enabled: false\n" },
+  });
+  assert.equal(await papercutsEnabled("/repo", deps), false);
+});
+
+test("papercutsEnabled: true when papercuts.enabled is true", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "papercuts:\n  enabled: true\n" },
+  });
+  assert.equal(await papercutsEnabled("/repo", deps), true);
+});
+
+test("papercutsEnabled: false (not thrown) when the file is malformed YAML", async () => {
+  const deps = makeDeps({
+    files: { "/repo/.github/pipeline.yml": "papercuts: [oops\n" },
+  });
+  await assert.doesNotReject(async () => {
+    assert.equal(await papercutsEnabled("/repo", deps), false);
+  });
+});
+
+test("papercutsEnabled: false (not thrown) when readFile throws", async () => {
+  const deps: Pick<PapercutDeps, "readFile"> = {
+    readFile: async () => {
+      throw new Error("permission denied");
+    },
+  };
+  await assert.doesNotReject(async () => {
+    assert.equal(await papercutsEnabled("/repo", deps), false);
+  });
 });
 
 // ---------------------------------------------------------------------------

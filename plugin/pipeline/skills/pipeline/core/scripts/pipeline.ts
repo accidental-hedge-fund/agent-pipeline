@@ -77,7 +77,12 @@ import {
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
-import { recordPapercut, reportPapercuts, realPapercutDeps } from "./stages/papercut.ts";
+import {
+  recordPapercut,
+  reportPapercuts,
+  papercutsEnabled,
+  realPapercutDeps,
+} from "./stages/papercut.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
@@ -745,11 +750,14 @@ async function main(): Promise<void> {
 
   // Early papercut dispatch (#419) — agent-facing, hidden from --help (see the
   // top-level `.argument()` description string above, which intentionally
-  // omits "papercut"). No gh auth or config resolution: this must work
+  // omits "papercut"). No gh auth or full config resolution: this must work
   // unauthenticated, from inside a running stage, without ever blocking,
-  // pausing, or failing that stage. Record failures are swallowed at this CLI
-  // boundary too (belt-and-suspenders with recordPapercut's own try/catch) —
-  // the command always exits zero on the record path.
+  // pausing, or failing that stage. The record path is gated on a best-effort,
+  // gh-free `papercuts.enabled` lookup (papercutsEnabled) so the feature stays
+  // inert by default; a lookup failure also resolves to disabled. Record
+  // failures are swallowed at this CLI boundary too (belt-and-suspenders with
+  // recordPapercut's own try/catch) — the command always exits zero on the
+  // record path.
   if (numArg === "papercut") {
     const papercutStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(papercutStart) ?? papercutStart;
@@ -772,10 +780,12 @@ async function main(): Promise<void> {
       return;
     }
     try {
-      await recordPapercut(
-        { repoDir, run: opts.run ?? "", message: opts.message ?? "" },
-        deps,
-      );
+      if (await papercutsEnabled(repoDir, deps)) {
+        await recordPapercut(
+          { repoDir, run: opts.run ?? "", message: opts.message ?? "" },
+          deps,
+        );
+      }
     } catch {
       // Never propagate — recordPapercut is already a total function, this is
       // belt-and-suspenders at the CLI boundary per the spec's non-fatal contract.
