@@ -310,6 +310,50 @@ test("advance(): #464 shape — worktree misreports OpenSpec inactive but the PR
   assert.match(blockedCalls[0].reason, /finding-level-reversal-matching/);
 });
 
+test("advance(): openspec.enabled off → head-side guard is skipped even though the PR's file list still shows an active change", async (t) => {
+  const SHA_HEAD = "cccccccccccccccccccccccccccccccccccccccc";
+  const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
+  const transitions: Array<{ from: string; to: string }> = [];
+  const blockedCalls: Array<{ reason: string; label: string }> = [];
+  let getPrDiffCalled = false;
+
+  const cfgOff = { ...cfg, openspec: { enabled: "off" } } as unknown as PipelineConfig;
+
+  const deps: AdvancePreMergeDeps = {
+    getPrForIssue: async () => PR,
+    getIssueDetail: (async () => ({ comments: [{ body: reviewComment, author: "test-actor" }] })) as AdvancePreMergeDeps["getIssueDetail"],
+    getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
+    getPrCommits: async () => [],
+    getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => false,
+    // Still shows an active, unarchived change on the PR's own file list — with
+    // openspec.enabled: "off" this must never block, and the guard must not even
+    // fetch the diff.
+    getPrDiff: async () => {
+      getPrDiffCalled = true;
+      return "diff --git a/openspec/changes/finding-level-reversal-matching/proposal.md " +
+        "b/openspec/changes/finding-level-reversal-matching/proposal.md\n";
+    },
+    postComment: async () => {},
+    transition: async (_cfg, _n, from, to) => { transitions.push({ from, to }); },
+    setBlocked: (async (_cfg, _n, reason, _stage, label) => {
+      blockedCalls.push({ reason, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    getGhActor: async () => "test-actor",
+  };
+
+  let out: Awaited<ReturnType<typeof advance>> | undefined;
+  await quiet(t, async () => {
+    out = await advance(cfgOff, ISSUE, {}, deps);
+  });
+
+  assert.equal(getPrDiffCalled, false, "openspec.enabled: off must skip the head-side guard entirely");
+  assert.deepEqual(blockedCalls, [], "must not block with openspec-invalid when the integration is disabled");
+  assert.equal(out!.advanced, true);
+  assert.deepEqual(transitions, [{ from: "pre-merge", to: "visual-gate" }]);
+});
+
 // ---------------------------------------------------------------------------
 // 6. Override-resumed regression: archive step is invoked on the resumed path
 // ---------------------------------------------------------------------------

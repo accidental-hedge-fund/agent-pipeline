@@ -548,9 +548,13 @@ export async function advance(
   // for a reason not yet enumerated, pre-merge must never advance while the PR's
   // own changed-file list still carries an unarchived `openspec/changes/<id>/`
   // path it introduced. Behaves identically on a first run, an override-resumed
-  // run, a fresh process, or after the worktree has been removed.
-  const openspecGuardOutcome = await enforceOpenspecActiveChangeGuard(cfg, issueNumber, prNumber, deps);
-  if (openspecGuardOutcome) return openspecGuardOutcome;
+  // run, a fresh process, or after the worktree has been removed. Skipped when
+  // `openspec.enabled: off` explicitly disables the integration (matches
+  // maybeArchiveOpenspec's own off-mode skip above).
+  if (cfg.openspec?.enabled !== "off") {
+    const openspecGuardOutcome = await enforceOpenspecActiveChangeGuard(cfg, issueNumber, prNumber, deps);
+    if (openspecGuardOutcome) return openspecGuardOutcome;
+  }
 
   // ---- Step 0.5: early conflict detection (#95) ----
   // GitHub cannot build the pull_request merge ref for a CONFLICTING PR, so
