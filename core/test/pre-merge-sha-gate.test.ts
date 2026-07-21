@@ -13,7 +13,11 @@ import {
   diffUnchangedNotice,
   enforceReviewShaGate,
   isPipelineInternalCommit,
+  MAX_DELTA_SUPERSESSION_RETRIES,
+  PRE_MERGE_AUTOFIX_PREFIX,
+  resolveReviewedShaCurrency,
   staleReviewNotice,
+  supersededDeltaReviewNotice,
   type DeltaReviewResult,
   type RunDeltaReviewFn,
   type ShaGateDeps,
@@ -398,6 +402,65 @@ test("enforceReviewShaGate: SHA mismatch, diff changed, delta review blocks → 
   assert.deepEqual(rec.transitions, [], "must NOT route to review-2");
   assert.equal(rec.blocked.length, 1, "setBlocked called once");
   assert.match(rec.blocked[0].reason, /Pre-merge delta review found blocking findings/);
+});
+
+test("enforceReviewShaGate: head moves during block persistence → stale block self-heals and falls back to conservative re-review (#481 delta 6eadb958)", async (t) => {
+  // A push lands between the final pre-write currency check and setBlocked
+  // persisting the block. The post-write verify must clear the just-written
+  // block and route to the conservative full re-review instead of stranding a
+  // stale block for manual recovery.
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const RACE_SHA = padSha("beefca4");
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "critical",
+  };
+  const runDeltaReview: RunDeltaReviewFn = async () => ({
+    verdict: "needs-attention",
+    findings: [blockingFinding],
+    summary: "Delta review found critical issue",
+  });
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+  });
+  let headMoved = false;
+  const cleared: number[] = [];
+  const baseGetPrDetail = deps.getPrDetail!;
+  deps.getPrDetail = async (cfgArg: any, nArg: any) => {
+    const d = await baseGetPrDetail(cfgArg, nArg);
+    return headMoved ? ({ ...(d as object), head_sha: RACE_SHA } as typeof d) : d;
+  };
+  const baseGetPrCommits = deps.getPrCommits!;
+  deps.getPrCommits = async (cfgArg: any, nArg: any) => {
+    const commits = (await baseGetPrCommits(cfgArg, nArg)) as { oid: string; messageHeadline: string }[];
+    return (headMoved
+      ? [...commits, { oid: RACE_SHA, messageHeadline: "fix: address review findings" }]
+      : commits) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrCommits"]>>>;
+  };
+  deps.setBlocked = async (_cfg, _n, reason) => {
+    rec.blocked.push({ reason });
+    headMoved = true; // the racing push lands as the block is persisted
+  };
+  deps.clearBlocked = async (_cfg, n) => {
+    cleared.push(n);
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.blocked.length, 1, "the block was persisted before the race was detected");
+  assert.deepEqual(cleared, [16], "the stale block must be cleared, not stranded");
+  assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "review-2" }], "falls back to conservative full re-review");
+  assert.equal((out as { advanced?: boolean }).advanced, true, "must not report a blocked outcome after self-heal");
 });
 
 test("enforceReviewShaGate: only pipeline-internal commits → exempted before diff-hash check (5.8)", async (t) => {
@@ -1265,4 +1328,627 @@ test("enforceReviewShaGate: actor lookup failure (gh unavailable) → blocked wi
   assert.equal(rec.blocked.length, 1, "setBlocked must be called");
   assert.match(rec.blocked[0].reason, /actor/, "block reason must mention actor");
   assert.deepEqual(rec.transitions, [], "must not transition on auth failure");
+});
+
+// ---------------------------------------------------------------------------
+// resolveReviewedShaCurrency (#481) — pure tri-state predicate
+// ---------------------------------------------------------------------------
+
+function padSha(short: string): string {
+  return (short + "0".repeat(40)).slice(0, 40);
+}
+
+const BASE_SHA = padSha("b0000ba5e");
+const FIX1_SHA = padSha("6c8a163"); // #427 fix-1
+const FIX2_SHA = padSha("dba0c95"); // #427 fix-2 (head)
+const F432_FIX1_SHA = padSha("f02a973"); // #432 fix-1
+const F432_FIX2_SHA = padSha("625e304"); // #432 fix-2 (head)
+
+test("resolveReviewedShaCurrency: candidate equals head → current", async () => {
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => ({ head_sha: FIX1_SHA }) as any,
+    getPrCommits: async () => { throw new Error("must not be called when head matches"); },
+  });
+  assert.deepEqual(result, { status: "current" });
+});
+
+test("resolveReviewedShaCurrency: only pipeline-internal commits since candidate → current", async () => {
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => ({ head_sha: FIX2_SHA }) as any,
+    getPrCommits: async () => [
+      { oid: FIX1_SHA, messageHeadline: "feat: implement the thing" },
+      { oid: FIX2_SHA, messageHeadline: "chore: archive OpenSpec change(s) for #427" },
+    ] as any,
+  });
+  assert.deepEqual(result, { status: "current" });
+});
+
+test("resolveReviewedShaCurrency: a developer commit lands since candidate → superseded", async () => {
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => ({ head_sha: FIX2_SHA }) as any,
+    getPrCommits: async () => [
+      { oid: FIX1_SHA, messageHeadline: "feat: implement the thing" },
+      { oid: FIX2_SHA, messageHeadline: "fix: address review 2 findings (#427)" },
+    ] as any,
+  });
+  assert.deepEqual(result, { status: "superseded", headSha: FIX2_SHA });
+});
+
+test("resolveReviewedShaCurrency: candidate SHA absent from history (rebase/squash) → unknown", async () => {
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => ({ head_sha: FIX2_SHA }) as any,
+    getPrCommits: async () => [{ oid: FIX2_SHA, messageHeadline: "feat: rebased history" }] as any,
+  });
+  assert.deepEqual(result, { status: "unknown" });
+});
+
+test("resolveReviewedShaCurrency: new head absent from a stale commit-list read → unknown", async () => {
+  // The commit list itself can be stale (fetched before a concurrent push
+  // landed): if the reported head isn't in it, we cannot classify the commits
+  // between candidate and head — fail closed rather than assume "current".
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => ({ head_sha: FIX2_SHA }) as any,
+    getPrCommits: async () => [{ oid: BASE_SHA, messageHeadline: "feat: base" }, { oid: FIX1_SHA, messageHeadline: "feat: implement" }] as any,
+  });
+  assert.deepEqual(result, { status: "unknown" });
+});
+
+test("resolveReviewedShaCurrency: commit-list read failure → unknown", async () => {
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => ({ head_sha: FIX2_SHA }) as any,
+    getPrCommits: async () => { throw new Error("network error"); },
+  });
+  assert.deepEqual(result, { status: "unknown" });
+});
+
+test("resolveReviewedShaCurrency: PR head read failure → unknown", async () => {
+  const result = await resolveReviewedShaCurrency({} as PipelineConfig, 99, FIX1_SHA, {
+    getPrDetail: async () => { throw new Error("network error"); },
+    getPrCommits: async () => [] as any,
+  });
+  assert.deepEqual(result, { status: "unknown" });
+});
+
+// ---------------------------------------------------------------------------
+// supersededDeltaReviewNotice — pure
+// ---------------------------------------------------------------------------
+
+test("supersededDeltaReviewNotice: names both the reviewed SHA and the newer head, no blocking-keys marker", () => {
+  const notice = supersededDeltaReviewNotice(FIX1_SHA, FIX2_SHA);
+  assert.match(notice, /superseded/i);
+  assert.match(notice, new RegExp(FIX1_SHA.slice(0, 7)));
+  assert.match(notice, new RegExp(FIX2_SHA.slice(0, 7)));
+  assert.doesNotMatch(notice, /pipeline-blocking-keys/);
+  assert.doesNotMatch(notice, new RegExp(`reviewed-sha: ${FIX2_SHA}`));
+});
+
+// ---------------------------------------------------------------------------
+// enforceReviewShaGate — pre-merge delta review races a fix-round push (#481)
+// ---------------------------------------------------------------------------
+
+/** Builds a race-scenario ShaGateDeps: `head` reads FIX1 once, then FIX2 forever
+ *  after (simulating a fix-round push landing while the delta reviewer runs). */
+function makeRaceDeps(opts: {
+  blockingFindingsByCall: ReviewFinding[][];
+  finalVerdict: "approve" | "needs-attention";
+  commits: { oid: string; messageHeadline: string }[];
+  reviewedSha: string;
+}): { deps: ShaGateDeps; rec: Rec; deltaReviewCalls: () => number } {
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewComment(2, opts.reviewedSha), author: TEST_ACTOR }];
+  let getPrDetailCalls = 0;
+  let deltaReviewCalls = 0;
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      return { head_sha: getPrDetailCalls === 1 ? FIX1_SHA : FIX2_SHA } as any;
+    },
+    getPrCommits: async () => opts.commits as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => {
+      const findings = opts.blockingFindingsByCall[deltaReviewCalls] ?? [];
+      deltaReviewCalls++;
+      const isLast = deltaReviewCalls > opts.blockingFindingsByCall.length;
+      return {
+        verdict: isLast ? opts.finalVerdict : "needs-attention",
+        findings: isLast && opts.finalVerdict === "approve" ? [] : findings,
+        summary: isLast ? "delta review at the current head" : "delta review found blocking findings",
+      };
+    },
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  return { deps, rec, deltaReviewCalls: () => deltaReviewCalls };
+}
+
+test("enforceReviewShaGate: #427 replay — verdict at fix-1, head moves to fix-2 → re-review at head, no block on stale key (5.1)", async (t) => {
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "critical",
+  };
+  const { deps, rec, deltaReviewCalls } = makeRaceDeps({
+    blockingFindingsByCall: [[blockingFinding]],
+    finalVerdict: "approve",
+    reviewedSha: BASE_SHA,
+    commits: [
+      { oid: BASE_SHA, messageHeadline: "feat: implement the thing" },
+      { oid: FIX1_SHA, messageHeadline: "fix: address review 1 findings (#427)" },
+      { oid: FIX2_SHA, messageHeadline: "fix: address review 2 findings (#427)" },
+    ],
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 427, 99, deps);
+  });
+  assert.equal(out, null, "re-review at the head approves; pre-merge proceeds");
+  assert.deepEqual(rec.transitions, [], "must not route to a full review round");
+  assert.deepEqual(rec.blocked, [], "must NOT block on the stale finding");
+  assert.equal(deltaReviewCalls(), 2, "delta review must re-run once against the new head");
+  assert.equal(rec.comments.length, 2, "superseded notice + final delta-review comment");
+  assert.match(rec.comments[0], /superseded/i);
+  assert.doesNotMatch(rec.comments[0], /pipeline-blocking-keys/, "superseded verdict carries no blocking-keys marker");
+  assert.match(rec.comments[1], new RegExp(`reviewed-sha: ${FIX2_SHA}`), "final verdict recorded against the head");
+});
+
+test("enforceReviewShaGate: #432 replay — verdict at fix-1 with 5 blocking findings, head moves to fix-2 → re-review at head, no block on stale keys (5.2)", async (t) => {
+  const fiveFindings: ReviewFinding[] = Array.from({ length: 5 }, (_, i) => ({
+    file: `foo${i}.ts`,
+    title: `Blocking issue ${i}`,
+    description: "Some blocking issue found by the delta reviewer.",
+    severity: "high",
+  }));
+  const { deps, rec, deltaReviewCalls } = makeRaceDeps({
+    blockingFindingsByCall: [fiveFindings],
+    finalVerdict: "approve",
+    reviewedSha: BASE_SHA,
+    commits: [
+      { oid: BASE_SHA, messageHeadline: "feat: implement the thing" },
+      { oid: F432_FIX1_SHA, messageHeadline: "fix: address review 1 findings (#432)" },
+      { oid: F432_FIX2_SHA, messageHeadline: "fix: address review 2 findings (#432)" },
+    ],
+  });
+  // Override the race SHAs for this replay (#432 uses different fixture SHAs).
+  const racedDeps: ShaGateDeps = {
+    ...deps,
+    getPrDetail: (() => {
+      let calls = 0;
+      return async () => {
+        calls++;
+        return { head_sha: calls === 1 ? F432_FIX1_SHA : F432_FIX2_SHA } as any;
+      };
+    })(),
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 432, 99, racedDeps);
+  });
+  assert.equal(out, null, "re-review at the head approves; pre-merge proceeds");
+  assert.deepEqual(rec.transitions, [], "must not route to a full review round");
+  assert.deepEqual(rec.blocked, [], "must NOT block on the five stale findings");
+  assert.equal(deltaReviewCalls(), 2, "delta review must re-run once against the new head");
+  assert.doesNotMatch(rec.comments[0], /pipeline-blocking-keys/, "superseded verdict carries no blocking-keys marker");
+});
+
+test("enforceReviewShaGate: control — verdict recorded at the current head with unresolved blockers still blocks (5.3)", async (t) => {
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "critical",
+  };
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewComment(2, BASE_SHA), author: TEST_ACTOR }];
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    // HEAD never moves — no race — matches every call.
+    getPrDetail: async () => ({ head_sha: FIX1_SHA }) as any,
+    getPrCommits: async () => [
+      { oid: BASE_SHA, messageHeadline: "feat: implement the thing" },
+      { oid: FIX1_SHA, messageHeadline: "fix: address review 1 findings (#481)" },
+    ] as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => ({
+      verdict: "needs-attention",
+      findings: [blockingFinding],
+      summary: "delta review found a blocking issue",
+    }),
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+  );
+  assert.equal(rec.blocked.length, 1, "verdict at the head still blocks pre-merge");
+  assert.deepEqual(rec.transitions, [], "must not route to a full review round");
+});
+
+test("enforceReviewShaGate: control — only pipeline-internal commits since the verdict → still blocks (5.4)", async (t) => {
+  // Mirrors the existing #228 coverage but named for #481's explicit acceptance
+  // criterion: the internal-commit classification must be unaffected by the
+  // new supersession check.
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const blockingKey = "abc12345";
+  const priorComment = {
+    body:
+      `${DELTA_REVIEW_MARKER_PREFIX} — needs-attention (commit ${BASE_SHA.slice(0, 7)})\n\n` +
+      `<!-- pipeline-blocking-keys: ${blockingKey} -->\n\n` +
+      `<!-- reviewed-sha: ${BASE_SHA} -->`,
+    author: TEST_ACTOR,
+  };
+  const comments = [priorComment];
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => ({ head_sha: FIX1_SHA }) as any,
+    getPrCommits: async () => [
+      { oid: BASE_SHA, messageHeadline: "fix: address review 2 findings (#481)" },
+      { oid: FIX1_SHA, messageHeadline: "chore: archive OpenSpec change(s) for #481" },
+    ] as any,
+    getForIssue: async () => null,
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    getGhActor: async () => TEST_ACTOR,
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 481, 99, deps);
+  });
+  assert.equal(rec.blocked.length, 1, "archive-only commits since the verdict must not launder unresolved blockers");
+  assert.match(rec.blocked[0].reason, new RegExp(blockingKey));
+  assert.deepEqual(rec.transitions, [], "must not route to a full review round");
+});
+
+test("enforceReviewShaGate: bound test — head moves on every attempt → conservative fallback, no loop, no block (5.6)", async (t) => {
+  const FIX0_SHA = FIX1_SHA;
+  const FIX1B_SHA = FIX2_SHA;
+  const FIX2B_SHA = padSha("f1na1000");
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewComment(2, BASE_SHA), author: TEST_ACTOR }];
+  let getPrDetailCalls = 0;
+  let deltaReviewCalls = 0;
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "critical",
+  };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      // Call 1: initial head read → FIX0. Call 2: currency check for FIX0 →
+      // FIX1B (superseded). Call 3: currency check for FIX1B → FIX2B
+      // (superseded again — exceeds MAX_DELTA_SUPERSESSION_RETRIES).
+      const heads = [FIX0_SHA, FIX1B_SHA, FIX2B_SHA];
+      return { head_sha: heads[Math.min(getPrDetailCalls - 1, heads.length - 1)] } as any;
+    },
+    getPrCommits: async () => [
+      { oid: BASE_SHA, messageHeadline: "feat: implement the thing" },
+      { oid: FIX0_SHA, messageHeadline: "fix: address review 1 findings (#481)" },
+      { oid: FIX1B_SHA, messageHeadline: "fix: address review 2 findings (#481)" },
+      { oid: FIX2B_SHA, messageHeadline: "fix: address review 3 findings (#481)" },
+    ] as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => {
+      deltaReviewCalls++;
+      return { verdict: "needs-attention" as const, findings: [blockingFinding], summary: "still blocking" };
+    },
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  assert.equal(MAX_DELTA_SUPERSESSION_RETRIES, 1, "test assumes the documented bound of 1 retry");
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.deepEqual(
+    rec.transitions,
+    [{ from: "pre-merge", to: "review-2" }],
+    "exceeding the supersession bound falls back to conservative full re-review",
+  );
+  assert.deepEqual(rec.blocked, [], "must NOT block on any superseded verdict");
+  assert.equal(deltaReviewCalls, 2, "bounded to one retry attempt (two total delta-review invocations)");
+  assert.equal(rec.comments.length, 2, "one superseded notice, then the conservative stale-review notice");
+  assert.match(rec.comments[0], /superseded/i);
+  assert.doesNotMatch(rec.comments[0], /pipeline-blocking-keys/);
+});
+
+// ---------------------------------------------------------------------------
+// enforceReviewShaGate — review round-1 fix findings (#481)
+// ---------------------------------------------------------------------------
+
+test("enforceReviewShaGate: a push lands between the initial HEAD read and the exact-match reuse check → stale blocking keys do not block (Finding 1)", async (t) => {
+  // A recorded blocking verdict's reviewed-sha matches the `head` this function
+  // read at entry — the old exact-match branch trusted that frozen `head` and
+  // blocked immediately. Simulate a push landing between that read and the
+  // moment the branch acts: the first getPrDetail call (the entry-point `head`
+  // read) returns SHA_HEAD; every call after (the currency re-check, and the
+  // eventual delta-review supersession loop) returns the new push FIX2_SHA.
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [
+    { body: blockingReviewComment(2, SHA_HEAD, ["abcdef01"]), author: TEST_ACTOR },
+  ];
+  let getPrDetailCalls = 0;
+  let deltaReviewCalls = 0;
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      return { head_sha: getPrDetailCalls === 1 ? SHA_HEAD : FIX2_SHA } as any;
+    },
+    getPrCommits: async () => [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement the thing" },
+      { oid: SHA_HEAD, messageHeadline: "fix: address review 1 findings (#481)" },
+      { oid: FIX2_SHA, messageHeadline: "fix: address review 2 findings (#481)" },
+    ] as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => {
+      deltaReviewCalls++;
+      return { verdict: "approve" as const, findings: [], summary: "delta review approves at the head" };
+    },
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.equal(out, null, "delta review approves at the true head; pre-merge proceeds");
+  assert.deepEqual(rec.blocked, [], "must NOT block on the stale recorded key from the superseded exact-match verdict");
+  assert.deepEqual(rec.transitions, [], "must not route to a full review round");
+  assert.ok(deltaReviewCalls >= 1, "a delta review must run against the true head instead of trusting the stale exact match");
+});
+
+test("enforceReviewShaGate: getPrDetail fails while re-validating an exact-match verdict → fails closed to conservative re-review, does not block (Finding 1)", async (t) => {
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [
+    { body: blockingReviewComment(2, SHA_HEAD, ["abcdef01"]), author: TEST_ACTOR },
+  ];
+  let getPrDetailCalls = 0;
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      if (getPrDetailCalls === 1) return { head_sha: SHA_HEAD } as any;
+      throw new Error("network error");
+    },
+    getPrCommits: async () => [] as any,
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.deepEqual(rec.blocked, [], "must NOT block on a recorded verdict whose currency cannot be confirmed");
+  assert.deepEqual(
+    rec.transitions,
+    [{ from: "pre-merge", to: "review-2" }],
+    "an unreadable head fails closed to the conservative full re-review path",
+  );
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "review-2",
+    summary: "re-review: cannot confirm reviewed SHA currency",
+  });
+});
+
+test("enforceReviewShaGate: a push lands while the approve delta comment is being posted → falls back to conservative re-review instead of proceeding (Finding 2)", async (t) => {
+  // The currency check inside the delta-review loop confirms `targetHead` is
+  // current BEFORE `postCommentFn` runs. `postCommentFn` is itself a network
+  // call a fix-round push can land during; simulate that push by moving
+  // `getPrDetail`'s result only on the very next call, made from inside
+  // `postComment` (the delta comment post), which happens after the
+  // currency check already returned "current".
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewComment(2, SHA_REVIEWED), author: TEST_ACTOR }];
+  let getPrDetailCalls = 0;
+  let racePushed = false;
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      return { head_sha: racePushed ? FIX2_SHA : SHA_HEAD } as any;
+    },
+    getPrCommits: async () => [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement the thing" },
+      { oid: SHA_HEAD, messageHeadline: "fix: address review 1 findings (#481)" },
+      { oid: FIX2_SHA, messageHeadline: "fix: address review 2 findings (#481)" },
+    ] as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => ({ verdict: "approve" as const, findings: [], summary: "delta review approves at the head" }),
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => {
+      // The push lands while this (the delta-approval comment) is in flight.
+      racePushed = true;
+      rec.comments.push(body);
+    },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.deepEqual(
+    rec.transitions,
+    [{ from: "pre-merge", to: "review-2" }],
+    "a push landing while the approve comment is posted must not let pre-merge proceed on the stale approval",
+  );
+  assert.deepEqual(rec.blocked, [], "must not block either — routes to conservative re-review");
+});
+
+test("enforceReviewShaGate: a push lands while the initial BLOCKING delta comment is being posted → does not block on the stale verdict (Review 2 Finding 1)", async (t) => {
+  // The currency check inside the delta-review loop confirms `targetHead` is
+  // current BEFORE `postCommentFn(deltaComment)` runs. That post is itself a
+  // network call a fix-round push can land during. Prior to this fix, only
+  // the approving (`partition.blocking.length === 0`) branch re-checked HEAD
+  // after the post; a blocking verdict went straight to `setBlockedFn` with
+  // no post-comment re-validation at all.
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewComment(2, SHA_REVIEWED), author: TEST_ACTOR }];
+  let getPrDetailCalls = 0;
+  let racePushed = false;
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "high",
+  };
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      return { head_sha: racePushed ? FIX2_SHA : SHA_HEAD } as any;
+    },
+    getPrCommits: async () => [
+      { oid: SHA_REVIEWED, messageHeadline: "feat: implement the thing" },
+      { oid: SHA_HEAD, messageHeadline: "fix: address review 1 findings (#481)" },
+      { oid: FIX2_SHA, messageHeadline: "fix: address review 2 findings (#481)" },
+    ] as any,
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => ({
+      verdict: "needs-attention" as const,
+      findings: [blockingFinding],
+      summary: "delta review finds a blocking issue",
+    }),
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => {
+      // The push lands while this (the initial blocking delta) comment is in flight.
+      racePushed = true;
+      rec.comments.push(body);
+    },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.deepEqual(
+    rec.blocked,
+    [],
+    "must NOT set the issue blocked on a blocking verdict superseded while its comment was posted",
+  );
+  assert.deepEqual(
+    rec.transitions,
+    [{ from: "pre-merge", to: "review-2" }],
+    "must fall back to conservative re-review instead of trusting the stale blocking verdict",
+  );
+  assert.ok(getPrDetailCalls >= 2, "the head must be re-read after the blocking comment was posted");
+});
+
+test("enforceReviewShaGate: a push lands while the post-auto-fix BLOCKING re-review comment is being posted → does not block on the stale verdict (Review 2 Finding 1)", async (t) => {
+  // The post-auto-fix path's `reCurrency` check runs BEFORE `postCommentFn(reComment)`.
+  // Prior to this fix, only the approving branch re-confirmed HEAD after that post;
+  // a still-blocking re-review verdict went straight to `setBlockedFn` with no
+  // post-comment re-validation.
+  const rec: Rec = { comments: [], transitions: [], blocked: [] };
+  const comments = [{ body: reviewComment(2, SHA_REVIEWED), author: TEST_ACTOR }];
+  const SHA_AFTER_FIX = padSha("3333333");
+  let getPrDetailCalls = 0;
+  let racePushed = false;
+  let autoFixCalled = false;
+  let deltaReviewCalls = 0;
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Missing null check",
+    description: "New code dereferences without a null check.",
+    severity: "high",
+    category: "correctness",
+  } as any;
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () => ({ comments }) as any,
+    getPrDetail: async () => {
+      getPrDetailCalls++;
+      // Before the auto-fix push: still SHA_HEAD. After the push (and before
+      // the race): the authoritative post-fix head. After the race: the
+      // newer push that lands while the re-review comment is posted.
+      const head_sha = racePushed ? FIX2_SHA : autoFixCalled ? SHA_AFTER_FIX : SHA_HEAD;
+      return { head_sha } as any;
+    },
+    getPrCommits: async () => {
+      // The auto-fix and further-push commits only exist on the branch once
+      // those events have actually happened — mirrors real `gh` commit-list
+      // reads, which cannot see a commit before it is pushed.
+      const commits = [
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement the thing" },
+        { oid: SHA_HEAD, messageHeadline: "fix: address review 1 findings (#481)" },
+      ];
+      if (autoFixCalled) commits.push({ oid: SHA_AFTER_FIX, messageHeadline: `${PRE_MERGE_AUTOFIX_PREFIX} for #481` });
+      if (racePushed) commits.push({ oid: FIX2_SHA, messageHeadline: "fix: address review 2 findings (#481)" });
+      return commits as any;
+    },
+    getForIssue: async () => null,
+    getPrDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 1;",
+    getCommitDeltaDiff: async () => "diff --git a/foo.ts b/foo.ts\n+const x = 2;",
+    runDeltaReview: async () => {
+      deltaReviewCalls++;
+      return {
+        verdict: "needs-attention" as const,
+        findings: [blockingFinding],
+        summary: deltaReviewCalls === 1 ? "initial delta review" : "post-auto-fix re-review still blocks",
+      };
+    },
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => {
+      autoFixCalled = true;
+      return { status: "fix-committed" as const, headSha: SHA_AFTER_FIX };
+    },
+    postComment: async (_cfg, _n, body) => {
+      rec.comments.push(body);
+      // The push lands while the SECOND (post-auto-fix re-review) comment is
+      // in flight — the initial delta comment post must not trigger it.
+      if (rec.comments.length === 2) racePushed = true;
+    },
+    transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 481, 99, deps);
+  });
+  assert.deepEqual(
+    rec.blocked,
+    [],
+    "must NOT set the issue blocked on a post-auto-fix blocking verdict superseded while its comment was posted",
+  );
+  assert.deepEqual(
+    rec.transitions,
+    [{ from: "pre-merge", to: "review-2" }],
+    "must fall back to conservative re-review instead of trusting the stale post-auto-fix blocking verdict",
+  );
+  assert.equal(deltaReviewCalls, 2, "both the initial delta review and the post-auto-fix re-review ran");
 });
