@@ -177,6 +177,71 @@ test("expandPlan: base_sha is carried from the fixture, per-fixture", () => {
   assert.ok(plan.cells.filter((c) => c.fixture_id === "f2").every((c) => c.base_sha === SHA_B));
 });
 
+// ---------------------------------------------------------------------------
+// #434 review 1 finding e2de1c5f — a "params" treatment axis for per-cell
+// request-parameter overrides (temperature, seed, max_output_tokens, etc.),
+// validated against the same allowlist a committed executor's `params:` uses.
+// ---------------------------------------------------------------------------
+
+test("validateManifest: a params axis entry with an unknown key is rejected at manifest load", () => {
+  const raw = validManifestRaw({
+    treatments: { executor: ["openrouter-review"], params: [JSON.stringify({ temperatur: 0 })] },
+  });
+  assert.throws(() => validateManifest(raw, new Set(["f1"])), (err: unknown) => {
+    assert.ok(err instanceof ManifestValidationError);
+    assert.match((err as Error).message, /params/);
+    assert.match((err as Error).message, /temperatur/);
+    return true;
+  });
+});
+
+test("validateManifest: a params axis entry that is not valid JSON is rejected at manifest load", () => {
+  const raw = validManifestRaw({
+    treatments: { executor: ["openrouter-review"], params: ["not json"] },
+  });
+  assert.throws(() => validateManifest(raw, new Set(["f1"])), /not valid JSON/);
+});
+
+test("validateManifest: a valid params axis entry is accepted", () => {
+  const raw = validManifestRaw({
+    treatments: { executor: ["openrouter-review"], params: [JSON.stringify({ temperature: 0, seed: 7 })] },
+  });
+  const manifest = validateManifest(raw, new Set(["f1"]));
+  assert.deepEqual(manifest.treatments.params, [JSON.stringify({ temperature: 0, seed: 7 })]);
+});
+
+test("expandPlan: distinct params axis entries expand to distinct cells with distinct treatment.params", () => {
+  const fixtures = new Map([["f1", makeFixture("f1", SHA_A, "review")]]);
+  const manifest = validateManifest(
+    validManifestRaw({
+      treatments: {
+        executor: ["openrouter-review"],
+        params: [JSON.stringify({ temperature: 0 }), JSON.stringify({ temperature: 1 })],
+      },
+    }),
+    new Set(fixtures.keys()),
+  );
+  const plan = expandPlan(manifest, fixtures);
+  assert.equal(plan.cells.length, 2);
+  const treatmentParams = plan.cells.map((c) => c.treatment.params);
+  assert.deepEqual(treatmentParams, [{ temperature: 0 }, { temperature: 1 }]);
+  const ids = new Set(plan.cells.map((c) => c.cell_id));
+  assert.equal(ids.size, 2, "distinct params must produce distinct cell_ids, not a collision");
+});
+
+test("expandPlan: replaying the same manifest resolves the same params, byte-identical (determinism)", () => {
+  const fixtures = new Map([["f1", makeFixture("f1", SHA_A, "review")]]);
+  const manifest = validateManifest(
+    validManifestRaw({
+      treatments: { executor: ["openrouter-review"], params: [JSON.stringify({ temperature: 0, seed: 7 })] },
+    }),
+    new Set(fixtures.keys()),
+  );
+  const plan1 = expandPlan(manifest, fixtures);
+  const plan2 = expandPlan(manifest, fixtures);
+  assert.equal(JSON.stringify(plan1), JSON.stringify(plan2));
+});
+
 test("computePromptHash: differing materialized prompts produce differing hashes", () => {
   assert.notEqual(computePromptHash("prompt A"), computePromptHash("prompt B"));
   assert.equal(computePromptHash("same"), computePromptHash("same"));

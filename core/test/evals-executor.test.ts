@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { allocateCellIdentity, runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
+import { allocateCellIdentity, deriveModelEndpointOverride, runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
 import { validateManifest } from "../scripts/evals/manifest.ts";
 import type { Cell, Fixture } from "../scripts/evals/types.ts";
@@ -890,6 +890,54 @@ test("runCell: a local-CLI cell record carries execution_class 'local-cli', dist
   };
   const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
   assert.equal((result.outcome.detail as Record<string, unknown>)?.execution_class, "local-cli");
+});
+
+// ---------------------------------------------------------------------------
+// #434 review 1 finding e2de1c5f — per-cell `params` override reaches the
+// request via `deriveModelEndpointOverride` / `invokeExecutor`, without
+// mutating committed executor configuration.
+// ---------------------------------------------------------------------------
+
+test("deriveModelEndpointOverride: carries treatment.params onto the override", () => {
+  const override = deriveModelEndpointOverride({
+    executor: "openrouter-review",
+    model: "openai/gpt-5-mini",
+    effort: "high",
+    params: { temperature: 0, seed: 7 },
+  });
+  assert.deepEqual(override, { model: "openai/gpt-5-mini", effort: "high", params: { temperature: 0, seed: 7 } });
+});
+
+test("deriveModelEndpointOverride: omits params when the treatment declares none", () => {
+  const override = deriveModelEndpointOverride({ executor: "openrouter-review" });
+  assert.deepEqual(override, {});
+  assert.ok(!("params" in override));
+});
+
+test("runCell: two cells with distinct treatment.params send distinct parameter payloads, without config mutation", async () => {
+  const cfg = apiCfg();
+  const committedParamsBefore = JSON.stringify((cfg.executors as Record<string, unknown>)["openrouter-review"]);
+  const capturedOverrides: unknown[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    invokeExecutor: async (args) => {
+      capturedOverrides.push(args.override);
+      return { ok: true, result: successResult() as unknown as import("../scripts/harness.ts").HarnessResult };
+    },
+  };
+  const cellA = apiCell({
+    treatment: { executor: "openrouter-review", params: { temperature: 0 } },
+    treatment_id: "executor=openrouter-review,params={\"temperature\":0}",
+  });
+  const cellB = apiCell({
+    treatment: { executor: "openrouter-review", params: { temperature: 1 } },
+    treatment_id: "executor=openrouter-review,params={\"temperature\":1}",
+  });
+  await runCell(cfg, cellA, makeFixture(), MANIFEST, deps);
+  await runCell(cfg, cellB, makeFixture(), MANIFEST, deps);
+  assert.deepEqual(capturedOverrides, [{ params: { temperature: 0 } }, { params: { temperature: 1 } }]);
+  assert.equal(JSON.stringify((cfg.executors as Record<string, unknown>)["openrouter-review"]), committedParamsBefore);
 });
 
 test("runCell: an API treatment's endpoint provenance is carried onto the cell detail", async () => {

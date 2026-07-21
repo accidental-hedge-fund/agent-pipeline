@@ -270,6 +270,7 @@ const API_TREATMENT_STAGE_MAP: Partial<Record<EvalStageName, ModelInvokingStage>
 export function deriveModelEndpointOverride(treatment: Treatment): ModelEndpointOverride {
   return {
     ...(treatment.model !== undefined ? { model: treatment.model } : {}),
+    ...(treatment.params !== undefined ? { params: treatment.params } : {}),
     ...(treatment.effort !== undefined ? { effort: treatment.effort } : {}),
   };
 }

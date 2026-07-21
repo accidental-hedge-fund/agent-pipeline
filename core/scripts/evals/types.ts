@@ -4,6 +4,8 @@
 // an experiment harness, not a participant in the label-driven state machine
 // (openspec/changes/stage-eval-runner/design.md).
 
+import type { ModelEndpointParams } from "../types.ts";
+
 /** The six independently-invocable stage entry points, plus the end-to-end mode. */
 export const EVAL_STAGE_NAMES = [
   "planning",
@@ -106,6 +108,10 @@ export interface TreatmentAxes {
   model?: string[];
   effort?: string[];
   executor?: string[];
+  /** Each entry is a JSON-encoded `ModelEndpointParams` object (manifest axis
+   *  values are uniformly string[]; manifest.ts parses and validates each
+   *  entry against the same allowlist a committed executor's `params:` uses). */
+  params?: string[];
 }
 
 /** One concrete point in the treatment matrix, after expansion. */
@@ -115,6 +121,8 @@ export interface Treatment {
   model?: string;
   effort?: string;
   executor?: string;
+  /** Parsed from the manifest's JSON-encoded `params` axis value (#434 task 6.1). */
+  params?: ModelEndpointParams;
 }
 
 /** Execution/auth class recorded on a cell (#434 api-executor-response-provenance
