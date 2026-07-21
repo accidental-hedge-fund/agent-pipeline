@@ -15,6 +15,7 @@ import {
   transition,
 } from "../gh.ts";
 import {
+  buildNewHumanInputWarningComment,
   extractSnapshotComment,
   findUnacknowledgedComments,
 } from "../issue-context-snapshot.ts";
@@ -291,13 +292,10 @@ export async function advanceReview(
       (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),
     );
     if (!warningExists) {
-      const commentLines = unacknowledged
-        .map((c) => `- **@${c.author}** (${c.createdAt})`)
-        .join('\n');
       await postCommentFn(
         cfg,
         issueNumber,
-        `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.${cfgFooter(cfg)}`,
+        buildNewHumanInputWarningComment(unacknowledged, stage, cfgFooter(cfg)),
       );
     }
     await setBlockedFn(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");

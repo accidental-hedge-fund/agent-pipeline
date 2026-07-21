@@ -2,6 +2,7 @@
 // Imports from review-parsing.ts (codec, sentinels, helpers) and review-policy.ts.
 
 import {
+  attestPipelineComment,
   CEILING_DEMOTION_HEADING,
   DELTA_REVIEW_MARKER_PREFIX,
   encodeReviewArtifact,
@@ -313,7 +314,7 @@ export function advisoryAdvanceComment(
     );
   }
   lines.push("", cfgFooter(cfg));
-  return lines.join("\n");
+  return attestPipelineComment("review-advance-severity", lines.join("\n"));
 }
 
 /**
@@ -364,7 +365,7 @@ export function reviewCeilingComment(
     "",
     cfgFooter(cfg),
   );
-  return lines.join("\n");
+  return attestPipelineComment("review-ceiling", lines.join("\n"));
 }
 
 /**
@@ -411,7 +412,7 @@ export function reviewCeilingDemotionComment(
     "",
     `<!-- pipeline-ceiling-followup: #${followupNumber} -->`,
   );
-  return lines.join("\n");
+  return attestPipelineComment("review-ceiling-demotion", lines.join("\n"));
 }
 
 /**

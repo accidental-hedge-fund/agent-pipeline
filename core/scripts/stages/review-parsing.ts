@@ -220,8 +220,111 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   return hashReviewBody(prefix) === artifact.bodyHash;
 }
 
+// ---------------------------------------------------------------------------
+// Generic pipeline attestation (#471) — a body-binding verification marker any
+// pipeline-posted comment can carry, distinct from the strongly-typed
+// ReviewArtifact (#390/#264) which is reserved for review verdicts.
+// ---------------------------------------------------------------------------
 
+/**
+ * Generic tamper-evidence payload for a non-review pipeline comment. `kind`
+ * names the comment type (drawn from `PIPELINE_COMMENT_KINDS` in `gh.ts`);
+ * `bodyHash` is `hashReviewBody(text preceding the marker line)`.
+ */
+export interface PipelineAttestation {
+  kind: string;
+  bodyHash: string;
+}
 
+// Machine-readable generic attestation sentinel (#471). Base64url charset
+// [A-Za-z0-9_-]. Anchored full-line + global flag; last-occurrence guards
+// against injection, mirroring REVIEW_ARTIFACT_RE.
+const PIPELINE_ATTEST_RE = /^<!-- pipeline-attest: ([A-Za-z0-9_-]+) -->$/gm;
+
+/**
+ * Encode a `PipelineAttestation` as a hidden HTML-comment sentinel line.
+ * Uses base64url encoding (no padding) for safe embedding in Markdown.
+ */
+export function encodePipelineAttestation(attestation: PipelineAttestation): string {
+  const json = JSON.stringify(attestation);
+  const b64 = Buffer.from(json).toString("base64url");
+  return `<!-- pipeline-attest: ${b64} -->`;
+}
+
+/**
+ * Append a generic attestation marker to `body`, binding `kind` and the
+ * SHA-256 of `body` itself into the marker's `bodyHash`. Callers must invoke
+ * this as the LAST step before posting — any content appended afterward
+ * breaks verification (`isVerifiedPipelineAttestation`).
+ */
+export function attestPipelineComment(kind: string, body: string): string {
+  const bodyHash = hashReviewBody(body);
+  return body + "\n" + encodePipelineAttestation({ kind, bodyHash });
+}
+
+/**
+ * Decode the last `PipelineAttestation` sentinel from a comment body, or
+ * `null` when absent or malformed. Last-occurrence-wins, mirroring
+ * `extractReviewArtifact`.
+ */
+export function extractPipelineAttestation(body: string): PipelineAttestation | null {
+  PIPELINE_ATTEST_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = PIPELINE_ATTEST_RE.exec(body)) !== null) lastMatch = cur;
+  PIPELINE_ATTEST_RE.lastIndex = 0;
+  if (lastMatch === null) return null;
+  try {
+    const json = Buffer.from(lastMatch[1], "base64url").toString("utf8");
+    const obj = JSON.parse(json);
+    if (
+      typeof obj !== "object" ||
+      obj === null ||
+      typeof obj.kind !== "string" ||
+      typeof obj.bodyHash !== "string"
+    ) {
+      return null;
+    }
+    return { kind: obj.kind, bodyHash: obj.bodyHash };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `body` carries a valid, untampered generic pipeline attestation
+ * (#471): the marker decodes, it is the last occurrence, nothing follows the
+ * marker line, and its `bodyHash` matches a fresh hash of the text preceding
+ * it. Mirrors `isVerifiedPipelineReviewOutput`'s rules exactly so both
+ * verification forms have identical forgery resistance.
+ */
+export function isVerifiedPipelineAttestation(body: string): boolean {
+  const attestation = extractPipelineAttestation(body);
+  if (attestation === null) return false;
+  PIPELINE_ATTEST_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = PIPELINE_ATTEST_RE.exec(body)) !== null) lastMatch = cur;
+  PIPELINE_ATTEST_RE.lastIndex = 0;
+  if (lastMatch === null) return false;
+  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
+  const rawPrefix = body.slice(0, lastMatch.index);
+  const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
+  return hashReviewBody(prefix) === attestation.bodyHash;
+}
+
+/**
+ * True when `body` is verified pipeline output by EITHER verification form:
+ * a review verdict's `review-artifact` (round/SHA/diffHash/blockingKeys
+ * record, #264/#390) or a generic `pipeline-attest` marker (#471). This is
+ * the single predicate `findUnacknowledgedComments` uses to grant the
+ * verified-output exemption from the objection-language scan — it widens the
+ * exemption from "verified review output" to "verified pipeline output" of
+ * ANY registered kind, with no unverified/legacy fallback for either form.
+ */
+export function isVerifiedPipelineOutput(body: string): boolean {
+  return isVerifiedPipelineReviewOutput(body) || isVerifiedPipelineAttestation(body);
+}
 
 // ---------------------------------------------------------------------------
 // computeDiffHash
@@ -474,6 +577,14 @@ export function countPriorRounds(comments: { body: string }[], round: 1 | 2): nu
  * Scan issue comments for an existing `<!-- pipeline-ceiling-followup: #N -->`
  * marker, returning the recorded follow-up issue number or null when absent.
  * Only reads markers from pipeline-authored demotion comments. Last-occurrence-wins.
+ *
+ * Only the last non-empty line is trusted as the marker (a marker earlier in
+ * the body is ignored — the same forgery-resistance invariant as
+ * `extractNonReproducingDispositions`), EXCEPT that `reviewCeilingDemotionComment`
+ * now appends a generic pipeline attestation (#471) after the followup marker;
+ * when the true last line is a valid `pipeline-attest` marker, it is stripped
+ * before applying the last-line check so the followup marker underneath it is
+ * still the line that gets read.
  */
 export function extractCeilingFollowupNumber(
   comments: { author: string; body: string }[],
@@ -483,12 +594,11 @@ export function extractCeilingFollowupNumber(
   for (const c of comments) {
     if (actor === null || c.author !== actor) continue;
     if (!c.body.startsWith(CEILING_DEMOTION_HEADING)) continue;
-    const lastLine =
-      c.body
-        .split("\n")
-        .map((l) => l.trimEnd())
-        .filter((l) => l.length > 0)
-        .at(-1) ?? "";
+    const lines = c.body.split("\n").map((l) => l.trimEnd()).filter((l) => l.length > 0);
+    if (lines.length > 0 && isVerifiedPipelineAttestation(c.body)) {
+      lines.pop();
+    }
+    const lastLine = lines.at(-1) ?? "";
     const m = CEILING_FOLLOWUP_LINE_RE.exec(lastLine);
     if (m) last = Number(m[1]);
   }

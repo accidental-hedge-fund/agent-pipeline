@@ -15,7 +15,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { findUnacknowledgedComments } from "../issue-context-snapshot.ts";
+import { buildNewHumanInputWarningComment, findUnacknowledgedComments } from "../issue-context-snapshot.ts";
 import {
   buildTrustedOverrideComments,
   extractNonReproducingDispositions,
@@ -251,14 +251,7 @@ export async function advanceFix(
       (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),
     );
     if (!warningExists) {
-      const commentLines = unacknowledged
-        .map((c) => `- **@${c.author}** (${c.createdAt})`)
-        .join('\n');
-      await postComment(
-        cfg,
-        issueNumber,
-        `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.`,
-      );
+      await postComment(cfg, issueNumber, buildNewHumanInputWarningComment(unacknowledged, stage));
     }
     await setBlocked(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");
     return { advanced: false, status: "blocked", reason: "unacknowledged human input", blockerKind: "needs-human" };

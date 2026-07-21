@@ -21,6 +21,7 @@
 
 import { createHash } from "node:crypto";
 import { matchSettledFinding, type MatchBasis, type SettledFinding } from "./review-history.ts";
+import { attestPipelineComment, isVerifiedPipelineAttestation } from "./stages/review-parsing.ts";
 import type { ReviewFinding } from "./types.ts";
 
 // Severity ordering, least → most severe. A finding blocks when its severity
@@ -791,7 +792,7 @@ export function nonReproducingDispositionComment(args: {
   footer?: string;
 }): string {
   const { key, reviewedSha, fingerprint, stage, justification, timestamp, footer } = args;
-  return [
+  const rendered = [
     NON_REPRODUCING_HEADING,
     "",
     `**Finding**: \`${key}\``,
@@ -809,6 +810,7 @@ export function nonReproducingDispositionComment(args: {
     "",
     `<!-- pipeline-non-reproducing: ${key} ${reviewedSha} ${fingerprint} -->`,
   ].join("\n");
+  return attestPipelineComment("finding-does-not-reproduce", rendered);
 }
 
 /**
@@ -825,7 +827,12 @@ export function nonReproducingDispositionComment(args: {
  *
  * Security invariants (parallel to extractOverrides):
  * 1. Only comments with the `## Pipeline: Finding does not reproduce` heading are processed.
- * 2. Only the last non-empty line is parsed as the machine sentinel.
+ * 2. Only the last non-empty line is parsed as the machine sentinel, EXCEPT that
+ *    `nonReproducingDispositionComment` now appends a generic pipeline attestation
+ *    (#471) after the non-reproducing sentinel; when the true last line is a valid
+ *    `pipeline-attest` marker, it is stripped before applying the last-line check
+ *    (mirroring `extractCeilingFollowupNumber`) so the sentinel underneath it is
+ *    still the line that gets read.
  */
 export function extractNonReproducingDispositions(
   comments: { body: string }[],
@@ -833,7 +840,11 @@ export function extractNonReproducingDispositions(
   const map = new Map<string, { sha: string; fingerprint: string }[]>();
   for (const c of comments) {
     if (!c.body.startsWith(NON_REPRODUCING_HEADING)) continue;
-    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    const lines = c.body.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 0 && isVerifiedPipelineAttestation(c.body)) {
+      lines.pop();
+    }
+    const lastLine = lines.at(-1) ?? "";
     const m = NON_REPRODUCING_RE.exec(lastLine);
     if (!m) continue;
     const entry = { sha: m[2], fingerprint: m[3] };

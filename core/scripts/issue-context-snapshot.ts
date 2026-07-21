@@ -4,7 +4,7 @@
 // treat the content as context, not as instructions.
 
 import { classifyComment } from "./gh.ts";
-import { isVerifiedPipelineReviewOutput } from "./stages/review-parsing.ts";
+import { attestPipelineComment, isVerifiedPipelineOutput } from "./stages/review-parsing.ts";
 
 export const CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT = 8_000;
 
@@ -209,17 +209,18 @@ export function extractSnapshotComment<T extends { body: string }>(
  *   the pipeline actor or a `trusted_override_actors` entry) — not only scope
  *   overrides. Two things depend on trust: (1) a structurally-pipeline comment
  *   (`classifyComment` === 'pipeline') is excluded from the unacknowledged count
- *   only when it is in this list AND (it is verified, untampered pipeline review
- *   output per `isVerifiedPipelineReviewOutput`, OR it carries no scope-changing
- *   language of its own) — a pipeline-styled body from an untrusted author, or
- *   one from a trusted author that still reads as an objection and isn't a
- *   verified review artifact (e.g. a quoted reply with a real comment
- *   appended), is counted as human input (#390, #390 review 2, #390 review 1);
- *   (2) a comment in this list may act as an acknowledgement anchor, either via
- *   the `## Pipeline: Scope override` heading or, new in #390, a plain
- *   acknowledgement with no scope-changing language. Defaults to [] — fail-closed:
- *   nothing is trusted unless the caller explicitly supplies the set (e.g. when
- *   `getGhActor()` returns null).
+ *   only when it is in this list AND (it is verified, untampered pipeline output
+ *   per `isVerifiedPipelineOutput` — a review verdict's `review-artifact` OR any
+ *   OTHER pipeline comment's generic `pipeline-attest` marker (#471), OR it
+ *   carries no scope-changing language of its own) — a pipeline-styled body from
+ *   an untrusted author, or one from a trusted author that still reads as an
+ *   objection and isn't verified pipeline output (e.g. a quoted reply with a
+ *   real comment appended), is counted as human input (#390, #390 review 2,
+ *   #390 review 1, #471); (2) a comment in this list may act as an
+ *   acknowledgement anchor, either via the `## Pipeline: Scope override`
+ *   heading or, new in #390, a plain acknowledgement with no scope-changing
+ *   language. Defaults to [] — fail-closed: nothing is trusted unless the
+ *   caller explicitly supplies the set (e.g. when `getGhActor()` returns null).
  */
 export function findUnacknowledgedComments(
   comments: { author: string; body: string; createdAt: string }[],
@@ -286,28 +287,33 @@ export function findUnacknowledgedComments(
       continue;
     }
     // Structurally-pipeline comment: self-exclusion is granted only when the
-    // author is trusted AND (the body is verified, untampered pipeline review
-    // output OR it carries no scope-changing language of its own). A
-    // pipeline-styled body from anyone else is a forged heading and must still
-    // gate (#390). A trusted actor's comment that merely carries pipeline
-    // structure (e.g. a quoted reply, or a copied heading/marker) alongside a
-    // genuine objection must also still gate — trust grants self-exclusion for
-    // the pipeline's own generated output, not for human content that happens
-    // to look like it (#390 review 2). Genuine review verdicts routinely use
-    // objection language in finding bodies/recommendations, so a verified,
-    // untampered pipeline comment (`isVerifiedPipelineReviewOutput`) is exempt
-    // from that scope-language scan (#390 review 1) — appending human content
-    // after the artifact line fails verification and still falls through to it.
-    // Verified output = current-format only: the artifact's bodyHash binds
-    // the exact rendered body (#390). There is deliberately NO legacy path —
-    // three variants (structural anchor, calendar cutoff, per-thread observed
-    // boundary) each left a forgeable or stranding hole (#390 delta keys
-    // 06e32d8d, 7b445e1e, 37da0054). A historical no-bodyHash verdict with
-    // objection wording gates ONCE, and a plain acknowledgment from the
-    // trusted actor clears it permanently via the anchor mechanism above —
-    // the operator-blessed trade (option A): one ack per pre-rollout thread
-    // instead of any verifier bypass.
-    const verified = isVerifiedPipelineReviewOutput(c.body);
+    // author is trusted AND (the body is verified pipeline output OR it
+    // carries no scope-changing language of its own). A pipeline-styled body
+    // from anyone else is a forged heading and must still gate (#390). A
+    // trusted actor's comment that merely carries pipeline structure (e.g. a
+    // quoted reply, or a copied heading/marker) alongside a genuine objection
+    // must also still gate — trust grants self-exclusion for the pipeline's
+    // own generated output, not for human content that happens to look like
+    // it (#390 review 2). Genuine review verdicts routinely use objection
+    // language in finding bodies/recommendations, and other pipeline comment
+    // types (e.g. the severity-policy advance notice, #471) routinely use it
+    // in their own explanatory prose, so a VERIFIED pipeline comment —
+    // `isVerifiedPipelineOutput`, true for either a review verdict's
+    // `review-artifact` (#264/#390) or any other registered comment kind's
+    // generic `pipeline-attest` marker (#471) — is exempt from that
+    // scope-language scan (#390 review 1, #471). Appending human content
+    // after either marker fails verification and still falls through to the
+    // scan. Verified output = current-format only: the marker's bodyHash
+    // binds the exact rendered body. There is deliberately NO legacy path —
+    // three prior variants for review verdicts (structural anchor, calendar
+    // cutoff, per-thread observed boundary) each left a forgeable or
+    // stranding hole (#390 delta keys 06e32d8d, 7b445e1e, 37da0054), and the
+    // same no-bypass stance applies to every other comment kind: an
+    // unattested pipeline comment with objection wording gates ONCE, and a
+    // plain acknowledgment from the trusted actor clears it permanently via
+    // the anchor mechanism above — the operator-blessed trade (option A): one
+    // ack per pre-rollout thread instead of any verifier bypass.
+    const verified = isVerifiedPipelineOutput(c.body);
     if (
       !trustedComments.includes(c) ||
       (!verified && NEGATION_PATTERNS.some((p) => p.test(c.body)))
@@ -316,4 +322,23 @@ export function findUnacknowledgedComments(
     }
   }
   return result;
+}
+
+/**
+ * Build the "## Pipeline: New human input detected" warning body. Pure +
+ * exported so both call sites (review-routing.ts, fix.ts) share one renderer
+ * and the PIPELINE_COMMENT_KINDS drift guard exercises the real output (#471).
+ */
+export function buildNewHumanInputWarningComment(
+  unacknowledged: { author: string; createdAt: string }[],
+  stage: string,
+  footer = "",
+): string {
+  const commentLines = unacknowledged
+    .map((c) => `- **@${c.author}** (${c.createdAt})`)
+    .join('\n');
+  return attestPipelineComment(
+    "new-human-input-warning",
+    `## Pipeline: New human input detected\n\n${unacknowledged.length} human comment(s) were posted after the latest plan and have not been acknowledged:\n\n${commentLines}\n\nThe pipeline will not proceed to ${stage} until these comments are acknowledged. Either trigger a re-plan or post an explicit scope-override comment.${footer}`,
+  );
 }
