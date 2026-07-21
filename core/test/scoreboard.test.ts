@@ -9,7 +9,9 @@ import {
   formatScoreboardHuman,
   parseEstimateCosts,
   parseScoreboardBucket,
+  parseScoreboardGroupBy,
   parseScoreboardWindow,
+  resolveGroupIdentity,
   type ScoreboardDeps,
 } from "../scripts/scoreboard.ts";
 import { runsDir } from "../scripts/run-store.ts";
@@ -961,6 +963,338 @@ test("CLI: pipeline scoreboard --bucket month fails clearly with no partial outp
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /day/);
     assert.match(result.stderr, /week/);
+    assert.equal(result.stdout, "");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// --by harness|model|effort|executor grouping (#437)
+// ---------------------------------------------------------------------------
+
+function groupingFixtureFiles(): Record<string, string> {
+  const files: Record<string, string> = {};
+  addRun(files, "437-2026-07-15T00-00-00-000Z", {
+    runJson: { started_at: "2026-07-15T00:00:00Z", issue: 437 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-07-15T00:00:00Z", issue: 437, repo: "owner/repo" },
+      {
+        schema_version: 3, type: "stage_accounting", at: "2026-07-15T00:01:00Z",
+        run_id: "437-2026-07-15T00-00-00-000Z", issue: 437, stage: "review-1",
+        harness: "claude", model_slot: "review", model: "opus", effort: "high",
+        started_at: "2026-07-15T00:00:10Z", ended_at: "2026-07-15T00:00:40Z",
+        duration_ms: 30000, command_count: 1, subprocess_count: 1,
+        outcome: "success", blocker_kind: null, cost_source: "actual", cost_usd: 0.1,
+      },
+      {
+        schema_version: 3, type: "stage_accounting", at: "2026-07-15T00:02:00Z",
+        run_id: "437-2026-07-15T00-00-00-000Z", issue: 437, stage: "review-2",
+        harness: "codex", model_slot: "review", model: "sonnet", effort: "low",
+        started_at: "2026-07-15T00:01:10Z", ended_at: "2026-07-15T00:01:40Z",
+        duration_ms: 30000, command_count: 1, subprocess_count: 1,
+        outcome: "success", blocker_kind: null, cost_source: "estimated", cost_usd: 0.05,
+      },
+      {
+        // delegated stage with a recorded provider (#314)
+        schema_version: 3, type: "stage_accounting", at: "2026-07-15T00:03:00Z",
+        run_id: "437-2026-07-15T00-00-00-000Z", issue: 437, stage: "fix-1",
+        harness: "my-executor", model_slot: "fix", model: null,
+        executor_provider: "acme", executor_model: "acme-1",
+        started_at: "2026-07-15T00:02:10Z", ended_at: "2026-07-15T00:02:40Z",
+        duration_ms: 30000, command_count: 1, subprocess_count: 1,
+        outcome: "success", blocker_kind: null, cost_source: "actual", cost_usd: 0.2,
+      },
+      {
+        // delegated stage with executor evidence but no recorded provider
+        schema_version: 3, type: "stage_accounting", at: "2026-07-15T00:04:00Z",
+        run_id: "437-2026-07-15T00-00-00-000Z", issue: 437, stage: "fix-2",
+        harness: "my-executor-2", model_slot: "fix", model: null,
+        executor_model: "modelX",
+        started_at: "2026-07-15T00:03:10Z", ended_at: "2026-07-15T00:03:40Z",
+        duration_ms: 30000, command_count: 1, subprocess_count: 1,
+        outcome: "success", blocker_kind: null, cost_source: "unknown", cost_usd: null,
+      },
+      {
+        // local-harness stage with no model/effort/executor evidence at all
+        schema_version: 3, type: "stage_accounting", at: "2026-07-15T00:05:00Z",
+        run_id: "437-2026-07-15T00-00-00-000Z", issue: 437, stage: "planning",
+        harness: "claude", model_slot: "planning", model: null,
+        started_at: "2026-07-15T00:04:10Z", ended_at: "2026-07-15T00:04:40Z",
+        duration_ms: 30000, command_count: 1, subprocess_count: 1,
+        outcome: "success", blocker_kind: null, cost_source: "unknown", cost_usd: null,
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-07-15T00:10:00Z", final_state: "ready-to-deploy", elapsed_ms: 600000, pr: 437 },
+    ],
+    summaryRaw: "{not-json",
+  });
+  return files;
+}
+
+test("parseScoreboardGroupBy: null when absent, throws naming all four dimensions when unsupported, throws on repeat (#437)", () => {
+  assert.equal(parseScoreboardGroupBy(undefined), null);
+  assert.equal(parseScoreboardGroupBy([]), null);
+  assert.equal(parseScoreboardGroupBy(["harness"]), "harness");
+  assert.equal(parseScoreboardGroupBy(["model"]), "model");
+  assert.equal(parseScoreboardGroupBy(["effort"]), "effort");
+  assert.equal(parseScoreboardGroupBy(["executor"]), "executor");
+  assert.throws(() => parseScoreboardGroupBy(["team"]), /harness.*model.*effort.*executor/s);
+  assert.throws(() => parseScoreboardGroupBy(["harness", "model"]), /exactly one/);
+});
+
+test("resolveGroupIdentity: harness/model verbatim, effort/model unknown when absent, executor not-applicable vs unknown (#437)", () => {
+  const base = { harness: "claude", model: "unknown", effort: "unknown", executor_provider: null, executor_model: null } as any;
+  assert.equal(resolveGroupIdentity(base, "harness"), "claude");
+  assert.equal(resolveGroupIdentity(base, "model"), "unknown");
+  assert.equal(resolveGroupIdentity(base, "effort"), "unknown");
+  assert.equal(resolveGroupIdentity(base, "executor"), "not applicable");
+  assert.equal(resolveGroupIdentity({ ...base, executor_model: "modelX" }, "executor"), "unknown");
+  assert.equal(resolveGroupIdentity({ ...base, executor_provider: "acme", executor_model: "acme-1" }, "executor"), "acme");
+});
+
+test("buildScoreboardReport: --by harness produces one group per distinct recorded harness (#437)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["harness"] },
+    memDeps(groupingFixtureFiles()),
+  );
+  assert.equal(report.by, "harness");
+  assert.ok(report.grouping);
+  const keys = report.grouping!.groups.map((g) => g.key).sort();
+  assert.deepEqual(keys, ["claude", "codex", "my-executor", "my-executor-2"]);
+  const claude = report.grouping!.groups.find((g) => g.key === "claude")!;
+  assert.equal(claude.invocation_count, 2);
+});
+
+test("buildScoreboardReport: --by model, --by effort, --by executor share the same group entry shape (#437)", async () => {
+  const files = groupingFixtureFiles();
+  const dims = ["model", "effort", "executor"] as const;
+  for (const by of dims) {
+    const report = await buildScoreboardReport(
+      { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: [by] },
+      memDeps(files),
+    );
+    assert.equal(report.by, by);
+    assert.ok(report.grouping);
+    for (const group of report.grouping!.groups) {
+      for (const field of [
+        "key", "invocation_count", "total_duration_ms", "command_count", "subprocess_count",
+        "actual_cost_usd", "estimated_cost_usd", "unknown_cost_count",
+        "prompt_chars_total", "prompt_chars_max", "prompt_estimated_tokens_total",
+        "actual_calls", "estimated_calls", "unknown_calls", "actual_coverage",
+      ]) {
+        assert.ok(field in group, `${by} group missing ${field}`);
+      }
+    }
+  }
+});
+
+test("buildScoreboardReport: --by group sums conserve the window's cost_accounting totals (#437)", async () => {
+  for (const by of ["harness", "model", "effort", "executor"] as const) {
+    const report = await buildScoreboardReport(
+      { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: [by] },
+      memDeps(groupingFixtureFiles()),
+    );
+    const groups = report.grouping!.groups;
+    const totalInvocations = groups.reduce((sum, g) => sum + g.invocation_count, 0);
+    const totalActual = groups.reduce((sum, g) => sum + g.actual_cost_usd, 0);
+    const totalEstimated = groups.reduce((sum, g) => sum + g.estimated_cost_usd, 0);
+    assert.equal(totalInvocations, report.metrics.cost_accounting.totals.invocation_count, by);
+    assert.equal(Math.round(totalActual * 10000), Math.round(report.metrics.cost_accounting.totals.actual_cost_usd * 10000), by);
+    assert.equal(Math.round(totalEstimated * 10000), Math.round(report.metrics.cost_accounting.totals.estimated_cost_usd * 10000), by);
+  }
+});
+
+test("buildScoreboardReport: a missing model groups as unknown rather than being coerced or dropped (#437)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["model"] },
+    memDeps(groupingFixtureFiles()),
+  );
+  const unknown = report.grouping!.groups.find((g) => g.key === "unknown");
+  assert.ok(unknown, "unknown group must be present");
+  assert.equal(unknown!.invocation_count, 3);
+  assert.ok(!report.grouping!.groups.some((g) => g.key === "opus" && g.invocation_count > 1));
+});
+
+test("buildScoreboardReport: --by executor separates not-applicable and unknown, both present (#437)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["executor"] },
+    memDeps(groupingFixtureFiles()),
+  );
+  const notApplicable = report.grouping!.groups.find((g) => g.key === "not applicable");
+  const unknown = report.grouping!.groups.find((g) => g.key === "unknown");
+  assert.ok(notApplicable, "not applicable group must be present");
+  assert.ok(unknown, "unknown group must be present");
+  assert.equal(notApplicable!.invocation_count, 3);
+  assert.equal(unknown!.invocation_count, 1);
+  assert.notDeepEqual(notApplicable, unknown);
+  const acme = report.grouping!.groups.find((g) => g.key === "acme");
+  assert.ok(acme);
+  assert.deepEqual(acme!.executor_models, ["acme-1"]);
+});
+
+test("buildScoreboardReport: harness and executor identities are not conflated for a delegated record (#437)", async () => {
+  const files = groupingFixtureFiles();
+  const byHarness = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["harness"] },
+    memDeps(files),
+  );
+  const byExecutor = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["executor"] },
+    memDeps(files),
+  );
+  assert.ok(byHarness.grouping!.groups.some((g) => g.key === "my-executor"));
+  assert.ok(!byHarness.grouping!.groups.some((g) => g.key === "acme"));
+  assert.ok(byExecutor.grouping!.groups.some((g) => g.key === "acme"));
+  assert.ok(!byExecutor.grouping!.groups.some((g) => g.key === "my-executor"));
+});
+
+test("buildScoreboardReport: cost provenance is preserved per group, actual_coverage null at zero calls (#437)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["harness"] },
+    memDeps(groupingFixtureFiles()),
+  );
+  const claude = report.grouping!.groups.find((g) => g.key === "claude")!;
+  assert.equal(claude.actual_calls, 1);
+  assert.equal(claude.unknown_calls, 1);
+  assert.equal(claude.actual_coverage, 0.5);
+
+  const codex = report.grouping!.groups.find((g) => g.key === "codex")!;
+  assert.equal(codex.estimated_calls, 1);
+  assert.equal(codex.actual_coverage, 0);
+});
+
+test("buildScoreboardReport: --by harness --bucket day conserves each period's totals (#437)", async () => {
+  const report = await buildScoreboardReport(
+    {
+      repoDir: REPO_DIR, since: "2026-07-14T00:00:00Z", until: "2026-07-16T00:00:00Z",
+      by: ["harness"], bucket: "day",
+    },
+    memDeps(groupingFixtureFiles()),
+  );
+  assert.ok(report.series && report.series.length > 0);
+  for (const period of report.series!) {
+    if (!period.grouping) continue;
+    const sum = period.grouping.groups.reduce((s, g) => s + g.invocation_count, 0);
+    assert.equal(sum, period.metrics.cost_accounting.totals.invocation_count);
+  }
+  const withRecords = report.series!.find((p) => p.totals.included_runs > 0);
+  assert.ok(withRecords?.by === "harness");
+  assert.ok(withRecords?.grouping);
+});
+
+test("buildScoreboardReport: omitting --by leaves JSON key set and values unchanged, no human grouping section (#437)", async () => {
+  const files = groupingFixtureFiles();
+  const withoutBy = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z" },
+    memDeps(files),
+  );
+  assert.ok(!("by" in withoutBy));
+  assert.ok(!("grouping" in withoutBy));
+  const human = formatScoreboardHuman(withoutBy);
+  assert.ok(!human.includes("Grouped by"));
+
+  const withBy = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["harness"] },
+    memDeps(files),
+  );
+  const { by: _by, grouping: _grouping, ...withoutByStripped } = withBy;
+  assert.deepEqual(withoutByStripped, withoutBy);
+});
+
+test("formatScoreboardHuman: renders a grouping section with unknown and not applicable groups (#437)", async () => {
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["executor"] },
+    memDeps(groupingFixtureFiles()),
+  );
+  const human = formatScoreboardHuman(report);
+  assert.match(human, /Grouped by executor:/);
+  assert.match(human, /not applicable:/);
+  assert.match(human, /unknown:/);
+  assert.match(human, /acme:/);
+});
+
+test("buildScoreboardReport: pre-#437 records without an effort field group as unknown under --by effort (#437)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "437-2026-07-16T00-00-00-000Z", {
+    runJson: { started_at: "2026-07-16T00:00:00Z", issue: 437 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-07-16T00:00:00Z", issue: 437, repo: "owner/repo" },
+      {
+        schema_version: 2, type: "stage_accounting", at: "2026-07-16T00:01:00Z",
+        run_id: "437-2026-07-16T00-00-00-000Z", issue: 437, stage: "review-1",
+        harness: "claude", model_slot: "review", model: "opus",
+        started_at: "2026-07-16T00:00:10Z", ended_at: "2026-07-16T00:00:40Z",
+        duration_ms: 30000, command_count: 1, subprocess_count: 1,
+        outcome: "success", blocker_kind: null, cost_source: "actual", cost_usd: 0.1,
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-07-16T00:10:00Z", final_state: "ready-to-deploy", elapsed_ms: 600000, pr: 437 },
+    ],
+    summaryRaw: "{not-json",
+  });
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-07-01T00:00:00Z", until: "2026-07-31T00:00:00Z", by: ["effort"] },
+    memDeps(files),
+  );
+  assert.deepEqual(report.grouping!.groups.map((g) => g.key), ["unknown"]);
+});
+
+test("CLI: pipeline scoreboard --by harness --json emits a grouping object (#437)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-by-json-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--by", "harness", "--json", "--repo-path", repo],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.by, "harness");
+    assert.ok(Array.isArray(parsed.grouping.groups));
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --by team fails clearly naming all four dimensions, no partial output (#437)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-by-bad-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--by", "team", "--json", "--repo-path", repo],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /harness/);
+    assert.match(result.stderr, /model/);
+    assert.match(result.stderr, /effort/);
+    assert.match(result.stderr, /executor/);
+    assert.equal(result.stdout, "");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("CLI: pipeline scoreboard --help documents --by <dimension> (#437)", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--help"],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+  assert.match(result.stdout, /--by <dimension>/);
+  assert.match(result.stdout, /harness\|model\|effort\|executor/);
+});
+
+test("CLI: pipeline scoreboard --by harness --by model fails with a repeated-flag error, no partial output (#437)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-by-repeat-"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--by", "harness", "--by", "model", "--json", "--repo-path", repo],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /exactly one/);
     assert.equal(result.stdout, "");
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });

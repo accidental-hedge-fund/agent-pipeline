@@ -12,10 +12,64 @@ import {
   STAGE_ACCOUNTING_SCHEMA_VERSION,
   buildStageAccountingRecord,
   extractUsageAccounting,
+  sanitizeStageAccountingRecord,
 } from "../scripts/accounting.ts";
 
-test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 2 for #429 (additive — no field removed)", () => {
-  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 2);
+test("STAGE_ACCOUNTING_SCHEMA_VERSION: bumped to 3 for #437 (additive — no field removed)", () => {
+  assert.equal(STAGE_ACCOUNTING_SCHEMA_VERSION, 3);
+});
+
+test("buildStageAccountingRecord: a resolved effort is carried verbatim (#437)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 437,
+    stage: "planning",
+    harness: "claude",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+    effort: "high",
+  });
+  assert.equal(record.effort, "high");
+});
+
+test("buildStageAccountingRecord: no resolved effort omits the field, not a fabricated default (#437)", () => {
+  const record = buildStageAccountingRecord({
+    runId: "run-1",
+    issue: 437,
+    stage: "planning",
+    harness: "claude",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    endedAt: "2026-01-01T00:00:01.000Z",
+    outcome: "success",
+  });
+  assert.equal(record.effort, undefined);
+  assert.ok(!("effort" in record));
+});
+
+test("sanitizeStageAccountingRecord: a pre-#437 record shape (no effort field) still parses unchanged", () => {
+  const preChange = {
+    schema_version: 2,
+    run_id: "run-1",
+    issue: 437,
+    stage: "planning",
+    harness: "claude",
+    model_slot: null,
+    model: null,
+    started_at: "2026-01-01T00:00:00.000Z",
+    ended_at: "2026-01-01T00:00:01.000Z",
+    duration_ms: 1000,
+    command_count: 1,
+    subprocess_count: 1,
+    outcome: "success",
+    blocker_kind: null,
+    cost_source: "unknown" as const,
+    cost_usd: null,
+  };
+  const cleaned = sanitizeStageAccountingRecord(preChange);
+  assert.equal(cleaned.run_id, "run-1");
+  assert.equal(cleaned.effort, undefined);
+  assert.ok(!("effort" in cleaned));
 });
 
 test("extractUsageAccounting: codex's reasoning_output_tokens maps to the shared reasoning_tokens counter", () => {
