@@ -22,6 +22,7 @@ import {
   getPrDiff,
   getPrForIssue,
   parseChecksAggregate,
+  clearBlocked,
   postComment,
   reopenPr,
   setBlocked,
@@ -1069,6 +1070,10 @@ export interface ShaGateDeps {
   postComment?: typeof postComment;
   transition?: typeof transition;
   setBlocked?: typeof setBlocked;
+  /** Clears the blocked label when a post-write HEAD verify finds the blocking
+   *  verdict was superseded while the block was being persisted (#481 delta
+   *  finding 6eadb958 — self-heal instead of stranding a stale block). */
+  clearBlocked?: typeof clearBlocked;
   /** Looks up the issue worktree path and slug for the delta reviewer's CWD and OpenSpec context (#228). */
   getForIssue?: typeof getForIssue;
   /** Returns the authenticated GitHub username so the SHA gate only trusts
@@ -1133,6 +1138,7 @@ export async function enforceReviewShaGate(
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const clearBlockedFn = deps.clearBlocked ?? clearBlocked;
   const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const getGhActorFn = deps.getGhActor ?? getGhActor;
 
@@ -1846,6 +1852,29 @@ export async function enforceReviewShaGate(
         "pre-merge",
         "needs-human",
       );
+      // Post-write HEAD verify (#481 delta finding 6eadb958): a check before a
+      // separate write can never be airtight — a push can land between the
+      // finalCurrency read above and setBlockedFn persisting the block. GitHub
+      // offers no compare-and-swap, so instead of shrinking that window make
+      // losing the race SELF-HEALING: if the head moved while the block was
+      // being written, clear the block and fall back to the conservative full
+      // re-review rather than stranding a stale block for manual recovery.
+      const postWriteCurrency = await resolveReviewedShaCurrency(cfg, prNumber, finalBlockingHead, {
+        getPrDetail: getPrDetailFn, getPrCommits: getPrCommitsFn,
+      });
+      if (postWriteCurrency.status === "superseded") {
+        console.warn(
+          `[pipeline] #${issueNumber}: PR HEAD moved to ` +
+          `${postWriteCurrency.headSha.slice(0, 7)} while the blocking state was being ` +
+          `persisted; clearing the stale block and falling back to conservative re-review`,
+        );
+        await clearBlockedFn(cfg, issueNumber);
+        throw new Error(
+          `blocking verdict head ${finalBlockingHead.slice(0, 7)} was superseded by ` +
+          `${postWriteCurrency.headSha.slice(0, 7)} during block persistence; ` +
+          `stale block cleared — falling back to conservative re-review`,
+        );
+      }
       return {
         advanced: false,
         status: "blocked",

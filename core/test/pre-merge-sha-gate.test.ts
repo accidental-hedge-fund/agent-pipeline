@@ -404,6 +404,65 @@ test("enforceReviewShaGate: SHA mismatch, diff changed, delta review blocks → 
   assert.match(rec.blocked[0].reason, /Pre-merge delta review found blocking findings/);
 });
 
+test("enforceReviewShaGate: head moves during block persistence → stale block self-heals and falls back to conservative re-review (#481 delta 6eadb958)", async (t) => {
+  // A push lands between the final pre-write currency check and setBlocked
+  // persisting the block. The post-write verify must clear the just-written
+  // block and route to the conservative full re-review instead of stranding a
+  // stale block for manual recovery.
+  const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const RACE_SHA = padSha("beefca4");
+  const blockingFinding: ReviewFinding = {
+    file: "foo.ts",
+    title: "Unsafe cast introduced",
+    description: "New code performs an unsafe cast without validation.",
+    severity: "critical",
+  };
+  const runDeltaReview: RunDeltaReviewFn = async () => ({
+    verdict: "needs-attention",
+    findings: [blockingFinding],
+    summary: "Delta review found critical issue",
+  });
+  const { deps, rec } = makeDeps({
+    commentBody: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+    headSha: SHA_HEAD,
+    commits: [{ oid: SHA_REVIEWED, messageHeadline: "feat: implement" }, DEV_COMMIT],
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview,
+  });
+  let headMoved = false;
+  const cleared: number[] = [];
+  const baseGetPrDetail = deps.getPrDetail!;
+  deps.getPrDetail = async (cfgArg: any, nArg: any) => {
+    const d = await baseGetPrDetail(cfgArg, nArg);
+    return headMoved ? ({ ...(d as object), head_sha: RACE_SHA } as typeof d) : d;
+  };
+  const baseGetPrCommits = deps.getPrCommits!;
+  deps.getPrCommits = async (cfgArg: any, nArg: any) => {
+    const commits = (await baseGetPrCommits(cfgArg, nArg)) as { oid: string; messageHeadline: string }[];
+    return (headMoved
+      ? [...commits, { oid: RACE_SHA, messageHeadline: "fix: address review findings" }]
+      : commits) as Awaited<ReturnType<NonNullable<ShaGateDeps["getPrCommits"]>>>;
+  };
+  deps.setBlocked = async (_cfg, _n, reason) => {
+    rec.blocked.push({ reason });
+    headMoved = true; // the racing push lands as the block is persisted
+  };
+  deps.clearBlocked = async (_cfg, n) => {
+    cleared.push(n);
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.blocked.length, 1, "the block was persisted before the race was detected");
+  assert.deepEqual(cleared, [16], "the stale block must be cleared, not stranded");
+  assert.deepEqual(rec.transitions, [{ from: "pre-merge", to: "review-2" }], "falls back to conservative full re-review");
+  assert.equal((out as { advanced?: boolean }).advanced, true, "must not report a blocked outcome after self-heal");
+});
+
 test("enforceReviewShaGate: only pipeline-internal commits → exempted before diff-hash check (5.8)", async (t) => {
   let getPrDiffCalled = false;
   const { deps, rec } = makeDeps({
