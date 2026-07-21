@@ -1,0 +1,10 @@
+# Active-change allowlist for the ci:openspec default-branch hygiene guard.
+#
+# One change id per line (the directory name under openspec/changes/). Blank
+# lines and lines starting with # are ignored. Listing a change here is an
+# explicit, reviewed exemption from the "no active changes on the default
+# branch" rule — use it only for a genuinely long-lived change, not as a way
+# to silence the guard. An entry naming a change id that is not currently
+# active is an error (a stale exemption must be removed, not left in place).
+#
+# Missing or empty file means zero exemptions (strict).
