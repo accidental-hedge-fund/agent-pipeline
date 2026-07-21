@@ -591,6 +591,24 @@ export async function invokeExternalExecutor(
         timed_out: false,
       });
     }
+    const dialect = resolveDialect(definition);
+    if (dialect === "openrouter") {
+      const conflictingHeader = Object.keys(headerResult.headers).find(
+        (headerName) => headerName.toLowerCase() === "x-openrouter-metadata",
+      );
+      if (conflictingHeader) {
+        return toHarnessResult(name, definition, {
+          success: false,
+          stdout: "",
+          stderr:
+            `executor "${name}" for stage "${stage}" declares header "${conflictingHeader}", which is ` +
+            `reserved by the openrouter dialect to enable provider metadata — remove it from headers:`,
+          exit_code: -1,
+          duration: 0,
+          timed_out: false,
+        });
+      }
+    }
     Object.assign(headers, headerResult.headers);
 
     // Opt-in header for OpenRouter's router metadata (task 4.1 fix): without
@@ -599,7 +617,7 @@ export async function invokeExternalExecutor(
     // declared headers since it's a fixed, non-secret value sent on every
     // openrouter-dialect request.
     const recordedHeaders = { ...headerResult.recorded };
-    if (resolveDialect(definition) === "openrouter") {
+    if (dialect === "openrouter") {
       headers["X-OpenRouter-Metadata"] = "enabled";
       recordedHeaders["X-OpenRouter-Metadata"] = "enabled";
     }

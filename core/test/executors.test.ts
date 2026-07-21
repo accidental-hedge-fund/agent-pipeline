@@ -345,6 +345,31 @@ test("invokeExternalExecutor: openrouter dialect sends allowlisted params, reaso
   }
 });
 
+test("invokeExternalExecutor: openrouter dialect rejects a case-variant X-OpenRouter-Metadata configured header instead of silently combining it (#434)", async () => {
+  process.env.OPENROUTER_API_KEY = "or-secret";
+  try {
+    const cfg = baseCfg({
+      executors: {
+        ...baseCfg().executors,
+        "openrouter-review": {
+          ...baseCfg().executors["openrouter-review"],
+          headers: { "x-openrouter-metadata": "disabled" },
+        },
+      },
+    });
+    const a = { name: "openrouter-review", definition: cfg.executors["openrouter-review"] } as ReturnType<
+      typeof resolveStageExecutor
+    > & object;
+    const fetchImpl = (async () => fakeResponse({ choices: [{ message: { content: "ok" } }] })) as unknown as typeof fetch;
+    const result = await invokeExternalExecutor("review-1", a, "PROMPT", { timeoutSec: 5 }, { fetchImpl });
+    assert.equal(result.success, false);
+    assert.match(result.stderr, /x-openrouter-metadata/);
+    assert.match(result.stderr, /reserved/);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+  }
+});
+
 test("invokeExternalExecutor: openai dialect encodes effort via reasoning_effort (#434)", async () => {
   const cfg = baseCfg({
     executors: {
