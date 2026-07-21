@@ -92,6 +92,54 @@ When an issue at `implementing` is **not** blocked but the dispatch table is ent
 - **AND** a worktree with commits ahead of the base branch exists for the issue
 - **THEN** the dispatcher SHALL invoke the implementing-resume path rather than returning `{ status: "waiting" }`
 
+### Requirement: Stranded `planning` and `plan-review` states SHALL be restarted, not waited on
+
+The advance-loop dispatch table SHALL treat the `planning` and `plan-review` stages as crash-stranded when control reaches the dispatch (i.e. the per-issue lock is held by the current process AND no live-planning marker is found for the same repo+issue).
+
+Before performing a rollback, the dispatcher SHALL consult a repo-stable live-planning marker (`/tmp/pipeline-planning-<owner>-<repo>-<N>.live`). If the marker is present and its recorded PID is alive, a concurrent run from a different domain/worktree is actively planning the issue; the dispatcher SHALL return a `waiting` outcome rather than rolling back. If the marker is absent (or its PID is dead/stale), the issue is crash-stranded; the dispatcher SHALL roll the issue back to `ready` via a `transition()` call and restart the planning arc by calling `planningStage.advance()`, identical to the path taken when the issue is on `ready`.
+
+The `planningStage.advance()` function SHALL set the marker to the current PID before starting any label transitions, and SHALL clear the marker in a `finally` block so that crash-exit also removes the marker.
+
+The dispatcher SHALL log a one-line diagnostic before performing the rollback: `[pipeline] #N: recovered stranded planning attempt — restarting from ready`
+
+#### Scenario: stranded `planning` restarts without operator intervention
+
+- **WHEN** an issue carries `pipeline:planning` and the advance loop acquires the per-issue lock and enters the dispatch table
+- **AND** the repo-stable live-planning marker is absent (no active process)
+- **THEN** the dispatcher SHALL NOT return `{ status: "waiting" }`
+- **AND** SHALL roll the issue back to `pipeline:ready` via a `transition()` call with a message referencing the crash recovery
+- **AND** SHALL invoke `planningStage.advance()` as if the issue had been on `ready`
+- **AND** SHALL print `[pipeline] #N: recovered stranded planning attempt — restarting from ready` before the rollback
+
+#### Scenario: stranded `plan-review` is treated identically
+
+- **WHEN** an issue carries `pipeline:plan-review` and the advance loop acquires the per-issue lock and enters the dispatch table
+- **AND** the repo-stable live-planning marker is absent
+- **THEN** the dispatcher SHALL NOT return `{ status: "waiting" }`
+- **AND** SHALL roll the issue back to `pipeline:ready` via a `transition()` call
+- **AND** SHALL invoke `planningStage.advance()` to restart the full planning arc from scratch
+
+#### Scenario: concurrent planning still blocked by the lock (same domain)
+
+- **WHEN** process A holds the per-issue lock and is actively planning issue N
+- **AND** process B attempts `pipeline N` for the same issue N and same domain
+- **THEN** process B SHALL fail at lock acquisition and SHALL NOT reach the dispatch table
+- **AND** SHALL print the existing "lock held by another process" error
+
+#### Scenario: concurrent planning from a different domain is detected via the live marker
+
+- **WHEN** process A is actively planning issue N under domain `domain-A`
+- **AND** process B uses a different domain `domain-B` (different worktree basename) for the same repo and issue N, acquires its own domain-B lock, and reaches the dispatch table
+- **THEN** process B SHALL check the repo-stable live-planning marker
+- **AND** SHALL find the marker set by process A with a live PID
+- **AND** SHALL return `{ status: "waiting" }` without rolling back or starting a new planning arc
+
+#### Scenario: loop advance outcome on recovery is not `waiting`
+
+- **WHEN** the dispatch table processes a stranded `planning` or `plan-review` issue and `planningStage.advance()` succeeds
+- **THEN** the returned `Outcome` SHALL have `advanced: true`
+- **AND** the transition count SHALL increment (the run is not a 0-transition no-op)
+
 ### Requirement: Review verdict determines the next stage
 From a review stage, an `approve` verdict SHALL advance the issue (`review-1` → `review-2`, `review-2` → `pre-merge`) and a `needs-attention` verdict carrying findings SHALL route to the matching fix stage (`review-1` → `fix-1`, `review-2` → `fix-2`).
 
@@ -134,6 +182,22 @@ The `needs-human` stage SHALL be resumable by the `--override` path without the 
 - **THEN** the loop SHALL break and surface the ceiling comment, unchanged from prior behavior
 - **AND** SHALL NOT attempt to flip the label automatically
 
+### Requirement: The CLI SHALL recognize `intake` as a no-issue-number sub-command keyword
+
+The pipeline CLI dispatch block SHALL accept `intake` as a recognized positional sub-command keyword alongside `release`, `init`, `doctor`, `logs`, `path`, `config`, and `run`. When the first positional argument is the string `intake` (case-sensitive), the CLI SHALL dispatch to the intake handler without requiring an issue number and SHALL NOT advance any pipeline stage label. The string `intake` SHALL appear in the CLI help text in the sub-command listing.
+
+#### Scenario: `intake` dispatches without an issue number
+
+- **WHEN** the user runs `pipeline intake --description "..."`
+- **THEN** the CLI SHALL dispatch the intake handler
+- **AND** SHALL NOT attempt to resolve or advance any issue stage label
+- **AND** SHALL NOT exit with a "missing issue number" error
+
+#### Scenario: `intake` is listed in help text
+
+- **WHEN** the user runs `pipeline --help`
+- **THEN** the output SHALL include `intake` in the list of recognized sub-command keywords alongside peer no-issue-number modes
+
 ### Requirement: The CLI SHALL recognize `roadmap` as a no-issue-number sub-command keyword
 
 The pipeline CLI dispatch block SHALL accept `roadmap` as a recognized positional sub-command keyword alongside `intake`, `release`, `init`, `doctor`, `logs`, `path`, `config`, and `run`. When the first positional argument is the string `roadmap` (case-sensitive), the CLI SHALL dispatch to the roadmap handler without requiring an issue number and SHALL NOT advance any pipeline stage label. The string `roadmap` SHALL appear in the CLI help text in the sub-command listing.
@@ -149,6 +213,22 @@ The pipeline CLI dispatch block SHALL accept `roadmap` as a recognized positiona
 
 - **WHEN** the user runs `pipeline --help`
 - **THEN** the output SHALL include `roadmap` in the list of recognized sub-command keywords alongside peer no-issue-number modes
+
+### Requirement: The CLI SHALL recognize `sweep` as a no-issue-number sub-command keyword
+
+The pipeline CLI dispatch block SHALL accept `sweep` as a recognized positional sub-command keyword alongside `intake`, `roadmap`, `release`, `init`, `doctor`, `logs`, `path`, `config`, and `run`. When the first positional argument is the string `sweep` (case-sensitive), the CLI SHALL dispatch to the sweep handler without requiring an issue number and SHALL NOT advance any pipeline stage label. The string `sweep` SHALL appear in the CLI help text in the sub-command listing.
+
+#### Scenario: `sweep` dispatches without an issue number
+
+- **WHEN** the user runs `pipeline sweep`
+- **THEN** the CLI SHALL dispatch the sweep handler
+- **AND** SHALL NOT attempt to resolve or advance any issue stage label
+- **AND** SHALL NOT exit with a "missing issue number" error
+
+#### Scenario: `sweep` is listed in help text
+
+- **WHEN** the user runs `pipeline --help`
+- **THEN** the output SHALL include `sweep` in the list of recognized sub-command keywords alongside peer no-issue-number modes
 
 ### Requirement: The CLI SHALL recognize `triage` as a sub-command keyword that accepts an issue number
 
@@ -264,4 +344,50 @@ The pipeline CLI dispatch block SHALL accept `backfill` as a recognized position
 
 - **WHEN** the user runs an unrecognized non-digit positional such as `pipeline unknowncmd`
 - **THEN** the CLI SHALL exit non-zero with an error listing the recognized no-issue-number sub-commands, including `backfill`
+
+### Requirement: The CLI SHALL recognize `queue` as a no-issue-number sub-command keyword
+
+The pipeline CLI dispatch block SHALL accept `queue` as a recognized positional sub-command keyword alongside `intake`, `sweep`, `roadmap`, `release`, `scoreboard`, `init`, `doctor`, `logs`, `path`, `config`, and `run`. When the first positional argument is the string `queue` (case-sensitive), the CLI SHALL dispatch to the queue handler without requiring an issue number and SHALL NOT advance any pipeline stage label. The string `queue` SHALL appear in the CLI help text in the sub-command listing.
+
+#### Scenario: `queue` dispatches without an issue number
+
+- **WHEN** the user runs `pipeline queue`
+- **THEN** the CLI SHALL dispatch the queue handler
+- **AND** SHALL NOT attempt to resolve or advance any issue stage label
+- **AND** SHALL NOT exit with a "missing issue number" error
+
+#### Scenario: `queue` is listed in help text
+
+- **WHEN** the user runs `pipeline --help`
+- **THEN** the output SHALL include `queue` in the list of recognized sub-command keywords alongside peer no-issue-number modes
+
+### Requirement: Ready dispatch records planning substages separately
+
+When an issue starts at `pipeline:ready`, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or harness invocation begins. The run artifacts SHALL record separate stage lifecycle entries for `planning`, `plan-review`, and `implementing` when those substages run inside the compound planning flow. The outer `ready` dispatch SHALL NOT record one wrapper lifecycle entry whose duration covers plan review and implementation.
+
+#### Scenario: Planning label set before authoring
+- **WHEN** an issue labelled `pipeline:ready` enters the planning flow
+- **THEN** the pipeline SHALL transition it to `pipeline:planning` before invoking the planning harness
+- **AND** a planning harness failure SHALL block the issue at `planning`, not `ready`
+
+#### Scenario: Compound planning flow emits substage lifecycle
+- **WHEN** one advance invocation performs planning, plan-review, and implementation work from a `ready` issue
+- **THEN** `events.jsonl` SHALL contain separate `stage_start` and `stage_complete` pairs for `planning`, `plan-review`, and `implementing`
+- **AND** the evidence bundle SHALL contain separate stage records for those substages
+- **AND** it SHALL NOT contain a single `planning` stage record that wraps the whole compound flow
+
+### Requirement: Fix rounds enforce stale OpenSpec deltas before push
+
+When a fix round changes implementation files after the latest OpenSpec spec-delta update, and the latest structured review verdict includes `category: spec-divergence`, the pipeline SHALL block the fix round before pushing. The condition SHALL match the existing pre-merge stale-delta guard so false-positive behavior does not broaden.
+
+#### Scenario: Stale delta blocks before fix push
+- **WHEN** a fix round produces implementation changes after the latest `openspec/changes/<id>/specs/**` change
+- **AND** the latest structured review verdict contains `category: spec-divergence`
+- **THEN** the fix round SHALL set a blocker with kind `openspec-stale-delta`
+- **AND** it SHALL NOT push the branch
+
+#### Scenario: Updated delta clears fix-round guard
+- **WHEN** a fix round updates `openspec/changes/<id>/specs/**` after the latest implementation change
+- **THEN** the stale-delta guard SHALL pass
+- **AND** the fix round MAY proceed to push if all other gates pass
 

@@ -132,3 +132,240 @@ test("CI_OPENSPEC_ROOT env var overrides root directory check", () => {
     cleanup(tmp);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Default-branch active-change hygiene guard
+// ---------------------------------------------------------------------------
+
+function makeMinimalOpenspecWorkspace(tmp) {
+  mkdirSync(join(tmp, "openspec"), { recursive: true });
+  writeFileSync(join(tmp, "openspec", "project.md"), "# test project\n");
+}
+
+function makeActiveChange(tmp, id) {
+  const dir = join(tmp, "openspec", "changes", id);
+  const specDir = join(dir, "specs", "test-cap");
+  mkdirSync(specDir, { recursive: true });
+  writeFileSync(
+    join(dir, "proposal.md"),
+    [
+      `# ${id}`,
+      "",
+      "## Why",
+      "Test fixture.",
+      "",
+      "## What Changes",
+      "- Nothing real.",
+      "",
+      "## Impact",
+      "- None.",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(specDir, "spec.md"),
+    [
+      "## ADDED Requirements",
+      "",
+      `### Requirement: The ${id} fixture`,
+      "",
+      "This fixture SHALL exist for test purposes.",
+      "",
+      "#### Scenario: Fixture exists",
+      "- **WHEN** the fixture is loaded",
+      "- **THEN** it SHALL validate",
+      "",
+    ].join("\n"),
+  );
+}
+
+function makeArchive(tmp) {
+  mkdirSync(join(tmp, "openspec", "changes", "archive"), { recursive: true });
+}
+
+function writeAllowlist(tmp, lines) {
+  writeFileSync(join(tmp, "openspec", "active-allowlist.txt"), lines.join("\n") + "\n");
+}
+
+test("default-branch mode: unallowlisted active change fails and names the id", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "legacy-thing");
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.notEqual(result.status, 0, "guard must fail on an unallowlisted active change");
+    assert.ok(result.stderr.includes("legacy-thing"), "output must name the offending id");
+    assert.ok(
+      result.stderr.includes("openspec archive"),
+      "output must name the expected cleanup path",
+    );
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("default-branch mode: several unallowlisted active changes are all reported", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "one");
+    makeActiveChange(tmp, "two");
+    makeActiveChange(tmp, "three");
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.notEqual(result.status, 0);
+    for (const id of ["one", "two", "three"]) {
+      assert.ok(result.stderr.includes(id), `output must list ${id}`);
+    }
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("default-branch mode: clean default branch (only archive/) passes", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.equal(result.status, 0, `expected exit 0; stderr: ${result.stderr}`);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("pr mode: active change present does not fail", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "in-flight-change");
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "pr" });
+    assert.equal(result.status, 0, `expected exit 0 in pr mode; stderr: ${result.stderr}`);
+    assert.ok(!result.stderr.includes("in-flight-change"));
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("undetermined mode (no env, no GitHub Actions, non-default local branch) is inert", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "whatever");
+
+    // tmp is not a git repo at all, so local-branch resolution cannot determine
+    // the checked-out branch — this must fail open (inert), not fail closed.
+    const result = runGuard(tmp, {
+      OPENSPEC_HYGIENE_MODE: undefined,
+      GITHUB_EVENT_NAME: undefined,
+      GITHUB_REF: undefined,
+    });
+    assert.equal(result.status, 0, `expected inert exit 0; stderr: ${result.stderr}`);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("default-branch mode: allowlisted active change passes", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "long-lived-change");
+    writeAllowlist(tmp, ["long-lived-change"]);
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.equal(result.status, 0, `expected exit 0; stderr: ${result.stderr}`);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("default-branch mode: allowlist comments and blank lines are ignored", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "long-lived-change");
+    writeAllowlist(tmp, [
+      "# this is a comment",
+      "",
+      "long-lived-change",
+      "",
+      "# trailing comment",
+    ]);
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.equal(result.status, 0, `expected exit 0; stderr: ${result.stderr}`);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("default-branch mode: stale allowlist entry is an error", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    writeAllowlist(tmp, ["no-longer-active"]);
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.notEqual(result.status, 0, "guard must fail on a stale allowlist entry");
+    assert.ok(result.stderr.includes("no-longer-active"), "output must name the stale entry");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("default-branch mode: missing allowlist file means strict (zero exemptions)", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "legacy-thing");
+    // No active-allowlist.txt written at all.
+
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.notEqual(result.status, 0, "missing allowlist file must not exempt anything");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("no openspec/ directory is a no-op regardless of hygiene mode", () => {
+  const tmp = makeTmp();
+  try {
+    const result = runGuard(tmp, { OPENSPEC_HYGIENE_MODE: "default-branch" });
+    assert.equal(result.status, 0);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("explicit OPENSPEC_HYGIENE_MODE=default-branch overrides GitHub Actions pull_request signal", () => {
+  const tmp = makeTmp();
+  try {
+    makeMinimalOpenspecWorkspace(tmp);
+    makeArchive(tmp);
+    makeActiveChange(tmp, "legacy-thing");
+
+    const result = runGuard(tmp, {
+      OPENSPEC_HYGIENE_MODE: "default-branch",
+      GITHUB_EVENT_NAME: "pull_request",
+    });
+    assert.notEqual(
+      result.status,
+      0,
+      "explicit env override must win over the GitHub Actions environment",
+    );
+  } finally {
+    cleanup(tmp);
+  }
+});

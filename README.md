@@ -996,6 +996,8 @@ Two tiers, so you can verify the right amount before pushing and let CI run less
 
 The full `ci` gate also runs `openspec validate --all` when an `openspec/` directory is present at the repo root. A structurally invalid living spec or active change fails `npm run ci` and therefore blocks the PR in GitHub Actions. The step is a no-op when no `openspec/` directory exists, so non-OpenSpec repos and the install smoke test are unaffected.
 
+After validation, the same step runs a default-branch active-change hygiene guard: on the default branch, any directory under `openspec/changes/` other than `archive/` is an unexpected active change and fails the step, naming the offending id(s) and the expected cleanup path (pre-merge archiving, or `openspec archive <id>`). The guard is inert on pull-request branches, where an in-flight change is expected. Mode resolves from `OPENSPEC_HYGIENE_MODE` (`default-branch` | `pr` | `off`), then the GitHub Actions environment, then the locally checked-out branch, and fails open (no-op) when it can't be determined. A checked-in `openspec/active-allowlist.txt` (one change id per line, `#` comments) is the only exemption — a missing or empty file means zero exemptions.
+
 > CI runs the full gate on **every** commit (including the pipeline's OpenSpec-archive commits — the pre-merge gate depends on it) and cancels superseded runs automatically, so the cheapest way to save Actions minutes is to catch failures with `ci:fast` locally before pushing.
 
 ## Format/lint gate (optional, default off)

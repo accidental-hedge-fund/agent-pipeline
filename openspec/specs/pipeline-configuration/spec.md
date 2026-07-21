@@ -642,3 +642,68 @@ errors. When `quiet` is set, no warning SHALL be written to stderr.
 - **THEN** it SHALL NOT throw
 - **AND** it SHALL emit a warning naming the offending key and fall back to the default reviewer model
 
+### Requirement: Config sync preserves effective behavior while refreshing config structure
+The pipeline SHALL provide a config synchronization flow that refreshes an existing `.github/pipeline.yml` against the current starter structure while preserving the effective behavior of explicitly configured values.
+
+#### Scenario: Preview reports drift without writing
+- **WHEN** a repository has a valid `.github/pipeline.yml` whose structure differs from the current starter structure
+- **THEN** config sync preview SHALL report the proposed change
+- **AND** the existing file SHALL remain unchanged
+
+#### Scenario: Apply writes only a behavior-preserving candidate
+- **WHEN** config sync apply is run on a valid config
+- **THEN** the generated candidate SHALL validate successfully before it is written
+- **AND** the effective resolved config after sync SHALL preserve the existing file-configured behavior
+
+#### Scenario: Invalid existing config is not rewritten
+- **WHEN** the existing `.github/pipeline.yml` has schema errors or invalid YAML
+- **THEN** config sync SHALL report the validation problem
+- **AND** it SHALL NOT write a replacement file
+
+#### Scenario: Existing overrides are preserved
+- **WHEN** the existing config sets scalar and nested overrides
+- **THEN** the synced config SHALL preserve those overrides
+- **AND** defaults that were not explicitly configured SHALL remain defaults after sync
+
+### Requirement: Config sync surfaces unknown or unsafe differences as diagnostics
+Config sync SHALL refuse to silently migrate unknown, invalid, or behavior-changing config content. Such content SHALL be reported as diagnostics that identify what prevented a safe sync.
+
+#### Scenario: Unknown key blocks apply
+- **WHEN** the existing config contains an unknown key
+- **THEN** config sync apply SHALL fail
+- **AND** the file SHALL remain unchanged
+
+#### Scenario: Preview identifies no-op configs
+- **WHEN** the existing config already matches the synced candidate
+- **THEN** config sync preview SHALL report that the config is already current
+- **AND** no diff SHALL be printed as a required action
+
+### Requirement: The `roadmap:` config block SHALL be accepted in `.github/pipeline.yml`
+
+`PartialConfigSchema` in `config.ts` SHALL accept a `roadmap:` sub-key with fields: `include_labels` (string[], optional), `exclude_labels` (string[], optional), `score_weights` (object with optional numeric overrides for `impact`, `confidence`, `ease`, `risk_reduction`, `dep_leverage`), `hygiene_auto_apply` (boolean, default false), `pr_docs` (boolean, default true), `release_model` (`'semver' | 'continuous'`, optional, default `'semver'`). Unknown keys under `roadmap:` SHALL trigger a strict-schema parse error.
+
+#### Scenario: Valid roadmap config is accepted
+
+- **WHEN** `.github/pipeline.yml` contains `roadmap: { pr_docs: false, score_weights: { impact: 2 } }`
+- **THEN** config parsing SHALL succeed and `config.roadmap.pr_docs` SHALL be false
+
+#### Scenario: Valid `release_model` value is accepted
+
+- **WHEN** `.github/pipeline.yml` contains `roadmap: { release_model: continuous }`
+- **THEN** config parsing SHALL succeed and `config.roadmap.release_model` SHALL be `'continuous'`
+
+#### Scenario: Invalid `release_model` value is rejected
+
+- **WHEN** `.github/pipeline.yml` contains `roadmap: { release_model: train }`
+- **THEN** config parsing SHALL throw a validation error naming `roadmap.release_model` and listing the allowed values `['semver', 'continuous']`
+
+#### Scenario: Absent `release_model` defaults to semver
+
+- **WHEN** `.github/pipeline.yml` contains a `roadmap:` block with no `release_model` key
+- **THEN** `config.roadmap.release_model` SHALL equal `'semver'`
+
+#### Scenario: Unknown roadmap config key is rejected
+
+- **WHEN** `.github/pipeline.yml` contains `roadmap: { unknown_key: true }`
+- **THEN** config parsing SHALL throw a strict-schema parse error identifying `unknown_key` as unrecognized
+
