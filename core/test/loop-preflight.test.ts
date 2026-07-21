@@ -240,8 +240,11 @@ test("normalizeLoopArgs — rejects no selector and no --resume", () => {
   assert.throws(() => normalizeLoopArgs({}), LoopArgError);
 });
 
-test("normalizeLoopArgs — audit alone with neither selector nor resume is rejected", () => {
-  assert.throws(() => normalizeLoopArgs({ audit: true }), LoopArgError);
+test("normalizeLoopArgs — standalone audit (no selector, no resume) is accepted read-only", () => {
+  const args = normalizeLoopArgs({ audit: true });
+  assert.equal(args.audit, true);
+  assert.equal(args.selector, undefined);
+  assert.equal(args.resumeRunId, undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -300,4 +303,18 @@ test("runLoopPreflight — all checks pass returns the normalized args", async (
   const outcome = await runLoopPreflight({ resume: "run-abc" }, "claude", deps, ROOTS);
   assert.equal(outcome.ok, true);
   if (outcome.ok) assert.equal(outcome.args.resumeRunId, "run-abc");
+});
+
+test("runLoopPreflight — standalone audit passes through the same read-only DoctorDeps seam with no selector/resume", async () => {
+  const deps = compatibleDeps({ exec: () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }) });
+  const outcome = await runLoopPreflight({ audit: true }, "claude", deps, ROOTS);
+  assert.equal(outcome.ok, true);
+  if (outcome.ok) {
+    assert.equal(outcome.args.audit, true);
+    assert.equal(outcome.args.selector, undefined);
+    assert.equal(outcome.args.resumeRunId, undefined);
+  }
+  // DoctorDeps exposes no write primitive (exec/execCheck/fsExists/fileMtime/readTextFile
+  // are all reads), so a standalone audit run that only exercises this seam is read-only
+  // by construction — it has no lock, ledger, or GitHub-mutation call available to make.
 });

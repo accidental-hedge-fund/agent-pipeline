@@ -205,8 +205,10 @@ export interface RawLoopArgs {
 }
 
 /** Pure normalization of `pipeline:loop` arguments into exactly one selector
- *  form (or none, when resuming), rejecting a selector combined with
- *  `--resume` and requiring at least one of selector/`--resume`. No I/O. */
+ *  form (or none, when resuming or auditing), rejecting a selector combined
+ *  with `--resume` and requiring at least one of selector/`--resume`/`--audit`
+ *  (standalone `--audit` reports on the canonical run goal-loop resolves for
+ *  this repo). No I/O. */
 export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
   const label = raw.label && raw.label.length > 0 ? raw.label[raw.label.length - 1] : undefined;
   const issues = raw.issues ?? [];
@@ -235,9 +237,9 @@ export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
       `pipeline:loop --resume cannot be combined with a selector (got ${present[0][0]} and --resume)`,
     );
   }
-  if (!raw.resume && present.length === 0) {
+  if (!raw.resume && !raw.audit && present.length === 0) {
     throw new LoopArgError(
-      "pipeline:loop requires a selector (--milestone, --label, --range, --roadmap-slice, or an issue list) or --resume <run-id>",
+      "pipeline:loop requires a selector (--milestone, --label, --range, --roadmap-slice, or an issue list), --resume <run-id>, or --audit",
     );
   }
 
