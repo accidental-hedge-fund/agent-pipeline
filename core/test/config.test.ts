@@ -1148,6 +1148,109 @@ test("resolveConfig: unknown key under papercuts is rejected (strict schema)", a
   }
 });
 
+// ---- papercuts.auto_file (#421) ----
+
+test("resolveConfig: papercuts absent block resolves auto_file false", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/pc3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.papercuts.auto_file, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: papercuts.enabled true with auto_file absent defaults auto_file false and defaults the rest", async () => {
+  const repo = makeFakeRepo(`papercuts:\n  enabled: true\n`);
+  const binDir = makeFakeGh("acme/pc4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.papercuts.auto_file, false);
+    assert.equal(cfg.papercuts.auto_file_window_hours, DEFAULT_CONFIG.papercuts.auto_file_window_hours);
+    assert.equal(cfg.papercuts.auto_file_max_per_window, DEFAULT_CONFIG.papercuts.auto_file_max_per_window);
+    assert.equal(cfg.papercuts.auto_file_min_occurrences, DEFAULT_CONFIG.papercuts.auto_file_min_occurrences);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: papercuts.auto_file true with explicit window/cap/threshold resolves them", async () => {
+  const repo = makeFakeRepo(
+    `papercuts:\n  enabled: true\n  auto_file: true\n  auto_file_window_hours: 12\n  auto_file_max_per_window: 2\n  auto_file_min_occurrences: 4\n`,
+  );
+  const binDir = makeFakeGh("acme/pc5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.papercuts.auto_file, true);
+    assert.equal(cfg.papercuts.auto_file_window_hours, 12);
+    assert.equal(cfg.papercuts.auto_file_max_per_window, 2);
+    assert.equal(cfg.papercuts.auto_file_min_occurrences, 4);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: auto_file_max_per_window of zero is rejected, naming the field", async () => {
+  const repo = makeFakeRepo(`papercuts:\n  enabled: true\n  auto_file_max_per_window: 0\n`);
+  const binDir = makeFakeGh("acme/pc6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("auto_file_max_per_window"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: auto_file_max_per_window negative is rejected", async () => {
+  const repo = makeFakeRepo(`papercuts:\n  enabled: true\n  auto_file_max_per_window: -1\n`);
+  const binDir = makeFakeGh("acme/pc7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("auto_file_max_per_window"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: auto_file_min_occurrences below 2 is rejected, naming the field", async () => {
+  const repo = makeFakeRepo(`papercuts:\n  enabled: true\n  auto_file_min_occurrences: 1\n`);
+  const binDir = makeFakeGh("acme/pc8");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("auto_file_min_occurrences"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- setup_command (#174) ----
 
 test("resolveConfig: setup_command passes through from file config", async () => {

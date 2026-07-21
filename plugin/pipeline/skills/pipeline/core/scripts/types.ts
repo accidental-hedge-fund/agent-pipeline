@@ -385,6 +385,14 @@ export interface PipelineConfig {
   // instruction pointing the agent at `pipeline papercut`.
   papercuts: {
     enabled: boolean;
+    // Opt-in auto-file path (#421): default false. When true, the engine
+    // clusters recurring papercut events and files pipeline:backlog issues
+    // at run_complete and queue-batch end without a human running
+    // `pipeline improve --apply`.
+    auto_file: boolean;
+    auto_file_window_hours: number;
+    auto_file_max_per_window: number;
+    auto_file_min_occurrences: number;
   };
   // Worktree bootstrap: dependency install step (#174).
   // When set to a non-empty string, that shell command is run in the worktree
@@ -566,7 +574,13 @@ export const DEFAULT_CONFIG: Omit<
   },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
-  papercuts: { enabled: false },
+  papercuts: {
+    enabled: false,
+    auto_file: false,
+    auto_file_window_hours: 24,
+    auto_file_max_per_window: 3,
+    auto_file_min_occurrences: 3,
+  },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,
   auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] as Stage[] },

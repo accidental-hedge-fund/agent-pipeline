@@ -53,6 +53,7 @@ import { buildEventSinkDeps } from "./event-sink.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
+import { autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -884,6 +885,20 @@ export async function runAdvance(
           // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
             await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
+          }
+          // Opt-in papercut auto-file (#421): best-effort, gated on resolved
+          // config, wrapped so a failure here can never alter the run's outcome.
+          if (cfg.papercuts.enabled && cfg.papercuts.auto_file) {
+            await autoFilePapercuts(
+              {
+                repoDir: cfg.repo_dir,
+                domain: cfg.domain,
+                windowHours: cfg.papercuts.auto_file_window_hours,
+                maxPerWindow: cfg.papercuts.auto_file_max_per_window,
+                minOccurrences: cfg.papercuts.auto_file_min_occurrences,
+              },
+              realAutoFileDeps(cfg.repo_dir),
+            ).catch(() => {});
           }
           await notifyBundlePath(cfg, issueNumber, stateDir, finalized);
         } catch {

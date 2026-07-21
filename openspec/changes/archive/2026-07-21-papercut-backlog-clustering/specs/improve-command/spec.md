@@ -1,22 +1,4 @@
-# improve-command Specification
-
-## Purpose
-TBD - created by archiving change pipeline-improve-analyzer. Update Purpose after archive.
-## Requirements
-### Requirement: pipeline improve command is a read-only batch analyzer by default
-The `pipeline improve` subcommand SHALL read existing run artifacts under `.agent-pipeline/runs/` and produce a dry-run report of clustered recurring failure patterns. In dry-run mode (no flags), the command SHALL NOT create issues, modify labels, push commits, touch worktrees, or write any file. The command SHALL exit 0 after printing the report.
-
-#### Scenario: dry-run produces report without side effects
-- **WHEN** `pipeline improve` is invoked without `--apply`
-- **THEN** the command SHALL print a cluster report to stdout
-- **AND** SHALL NOT create any GitHub issues
-- **AND** SHALL NOT modify any pipeline labels, branches, PRs, worktrees, or repo files
-- **AND** SHALL exit 0
-
-#### Scenario: no run artifacts present
-- **WHEN** `.agent-pipeline/runs/` is absent or empty
-- **THEN** the command SHALL print a message indicating no run data was found
-- **AND** SHALL exit 0 without error
+## MODIFIED Requirements
 
 ### Requirement: improve command clusters recurring patterns by category
 
@@ -81,29 +63,6 @@ signal string, occurrence count, affected run IDs, and at least one evidence exc
 
 ---
 
-### Requirement: improve command normalizes signals before clustering
-Before grouping, the analyzer SHALL normalize finding titles and blocker reason strings by: converting to lowercase, removing issue/PR/SHA/line-number tokens (patterns matching `#\d+`, `[0-9a-f]{7,40}`, `:\d+`), and collapsing whitespace. Two records whose normalized strings are equal SHALL be treated as the same cluster.
-
-#### Scenario: findings differing only by line number are merged
-- **WHEN** two `review_verdict` findings have titles "Null check missing at line 42" and "Null check missing at line 107"
-- **THEN** both SHALL normalize to the same string
-- **AND** SHALL be counted as one cluster with occurrence count 2
-
-#### Scenario: findings with different normalized titles are not merged
-- **WHEN** two findings have titles that differ after normalization
-- **THEN** they SHALL be treated as distinct clusters
-
-### Requirement: improve command supports --since date windowing
-The `pipeline improve --since <ISO-date>` flag SHALL restrict analysis to run directories whose `run.json` `started_at` value is on or after the given date. Runs without a readable `run.json` SHALL still be included (the flag cannot exclude data-less runs).
-
-#### Scenario: runs before --since cutoff are excluded
-- **WHEN** `pipeline improve --since 2026-06-01` is invoked
-- **THEN** run directories with `run.json` `started_at` before 2026-06-01 SHALL NOT contribute events to any cluster
-
-#### Scenario: run without run.json is not excluded by --since
-- **WHEN** a run directory has no readable `run.json`
-- **THEN** that run's `events.jsonl` SHALL still be read regardless of `--since`
-
 ### Requirement: improve command --apply flag creates GitHub issues for top clusters
 
 When invoked with `--apply`, the analyzer SHALL create GitHub issues for the top-N clusters (default
@@ -145,33 +104,7 @@ clusters SHALL be eligible for issue creation on the same terms as every other c
 - **THEN** the cluster SHALL still appear in the printed report and in `--json` output
 - **AND** no GitHub issue SHALL be created for it
 
-### Requirement: improve command --apply never mutates pipeline state
-Regardless of flags, the `pipeline improve` command SHALL NOT modify pipeline labels, branches, PRs, worktrees, or repo files. The only permitted write operation is `gh issue create` when `--apply` is set.
-
-#### Scenario: --apply does not add labels or modify existing issues
-- **WHEN** `pipeline improve --apply` is invoked
-- **THEN** no existing GitHub issue, label, branch, PR, or file SHALL be modified
-- **AND** no pipeline label SHALL be applied to any issue or PR
-
-### Requirement: improve command supports --json output for machine consumers
-When invoked with `--json`, the analyzer SHALL emit a JSON array of cluster objects to stdout instead of the human-readable Markdown report. Each cluster object SHALL contain: `category`, `signal` (normalized string), `count` (occurrence count), `runIds` (array of run ID strings), and `excerpt` (string, ≤ 200 characters).
-
-#### Scenario: --json output is a valid JSON array
-- **WHEN** `pipeline improve --json` is invoked
-- **THEN** stdout SHALL be a valid JSON array
-- **AND** each element SHALL contain `category`, `signal`, `count`, `runIds`, and `excerpt` fields
-
-#### Scenario: --json and --apply can be combined
-- **WHEN** `pipeline improve --apply --json` is invoked
-- **THEN** the command SHALL emit the JSON cluster array AND create issues for qualifying clusters
-- **AND** each JSON cluster object SHALL include the URL of any created issue in an `issueUrl` field (or `null` if not created)
-
-### Requirement: improve command streams events.jsonl without loading all lines into memory
-The analyzer SHALL read each `events.jsonl` line-by-line and accumulate only normalized keys and their occurrence counts in memory. The analyzer SHALL NOT buffer full event records from all runs simultaneously.
-
-#### Scenario: large run corpus does not cause OOM
-- **WHEN** `.agent-pipeline/runs/` contains hundreds of run directories
-- **THEN** peak memory usage SHALL scale with the number of distinct cluster keys, not with the total number of events across all runs
+## ADDED Requirements
 
 ### Requirement: Improve clusters SHALL be isolated by category and never merged across categories
 
@@ -234,4 +167,3 @@ category, including `papercut`.
 - **WHEN** `pipeline improve --apply` processes several qualifying clusters
 - **THEN** the analyzer SHALL query the open `[pipeline-improve]` issue list exactly once and reuse
   the result for every cluster
-

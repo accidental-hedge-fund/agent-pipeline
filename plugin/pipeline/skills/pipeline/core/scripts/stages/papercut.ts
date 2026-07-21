@@ -9,6 +9,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import yaml from "js-yaml";
 import {
   emitPapercut as realEmitPapercut,
@@ -16,6 +17,18 @@ import {
   runsDir,
   type PapercutEvent,
 } from "../run-store.ts";
+import {
+  clusterPapercuts,
+  clustersToEntries,
+  proposedTitle,
+  readEventsLines,
+  realImproveDeps,
+  type ClusterAccum,
+  type ClusterEntry,
+  type OpenImproveIssue,
+} from "../improve.ts";
+import { redactSecrets, sanitize } from "../artifact-sanitize.ts";
+import { withLock } from "../lock.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -203,4 +216,191 @@ export async function reportPapercuts(
 
   results.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// autoFilePapercuts (#421)
+// ---------------------------------------------------------------------------
+
+export interface AutoFileOpts {
+  repoDir: string;
+  /** Pipeline domain (#421 finding 2) — the repository-wide lock namespace
+   *  shared by the run-finalization and queue-batch auto-file triggers, so
+   *  concurrent invocations cannot double-file or exceed the rate cap. */
+  domain: string;
+  windowHours: number;
+  maxPerWindow: number;
+  minOccurrences: number;
+}
+
+export interface AutoFileDeps {
+  /** Same lookup used by `improve --apply` (#421 D3) — one call per invocation,
+   *  returning both open and closed `[pipeline-improve]` issues. Dedup filters
+   *  to `state === "OPEN"`; the rate-window cap counts both states (#421 finding 3). */
+  listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
+  /** Create a GitHub issue with the given labels and return its URL. */
+  createIssue: (title: string, body: string, labels: string[]) => Promise<string>;
+  ghAuthCheck: () => Promise<boolean>;
+  readLines: (p: string) => AsyncIterable<string>;
+  readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
+  /** Current time in epoch ms — injectable so tests control the trailing window. */
+  now: () => number;
+  /** Repository-wide critical section (#421 finding 2) — injectable so tests
+   *  never touch the real /tmp lock file; the real impl delegates to
+   *  `withLock` from `../lock.ts`. Throws when another process holds the lock. */
+  withLock: <T>(domain: string, fn: () => Promise<T>) => Promise<T>;
+  log: (msg: string) => void;
+}
+
+export function realAutoFileDeps(repoDir: string): AutoFileDeps {
+  const improveDeps = realImproveDeps(repoDir);
+  return {
+    listOpenImproveIssues: improveDeps.listOpenImproveIssues,
+    ghAuthCheck: improveDeps.ghAuthCheck,
+    readLines: improveDeps.readLines,
+    readdir: improveDeps.readdir,
+    now: () => Date.now(),
+    withLock: (domain, fn) => withLock(domain, fn),
+    log: (msg) => console.warn(msg),
+    createIssue: async (title, body, labels) => {
+      const args = ["issue", "create", "--title", title, "--body", body];
+      for (const label of labels) args.push("--label", label);
+      const r = spawnSync("gh", args, { encoding: "utf8", cwd: repoDir });
+      if (r.status !== 0) {
+        throw new Error(`gh issue create failed: ${r.stderr?.trim() ?? "unknown error"}`);
+      }
+      return (r.stdout ?? "").trim();
+    },
+  };
+}
+
+/** Agent-reported-provenance banner + sanitized evidence detail, following
+ *  the same `sanitize(redactSecrets(...))` composition used elsewhere for
+ *  artifacts assembled from stored events (#421 D7 — belt-and-braces:
+ *  papercut messages are already screened/redacted at write time). */
+function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
+  const detail = [
+    `**Signal**: ${c.signal}`,
+    `**Occurrences**: ${c.count} (trailing ${windowHours}h window)`,
+    ``,
+    `### Affected run IDs`,
+    ...c.runIds.map((id) => `- ${id}`),
+    ``,
+    `### Evidence excerpt`,
+    "```",
+    c.excerpt,
+    "```",
+  ].join("\n");
+  return [
+    `## Agent-reported friction (auto-filed by \`pipeline\`)`,
+    ``,
+    `_This issue was filed automatically by the pipeline from agent-reported friction ` +
+      `(\`pipeline papercut\`). The content below is agent-reported, not human-authored ` +
+      `or human-verified — verify independently before acting._`,
+    ``,
+    sanitize(redactSecrets(detail)),
+  ].join("\n");
+}
+
+/** Cluster in-window `papercut` events across every run under `.agent-pipeline/runs/`
+ *  and file one `pipeline:backlog` issue per qualifying, not-already-tracked cluster,
+ *  up to the per-window rate cap. Total: every failure (unauthenticated gh, unreadable
+ *  run artifacts, a throwing issue-creation call) is caught, logged as a non-fatal
+ *  warning, and swallowed — this function can never fail a run, a stage, or a batch. */
+export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+  try {
+    const authed = await deps.ghAuthCheck();
+    if (!authed) {
+      deps.log("[pipeline] papercut auto-file: skipped (gh not authenticated)");
+      return;
+    }
+
+    const dir = runsDir(opts.repoDir);
+    let entries: Array<{ name: string; isDirectory(): boolean }>;
+    try {
+      entries = await deps.readdir(dir);
+    } catch {
+      return;
+    }
+
+    const windowMs = opts.windowHours * 60 * 60 * 1000;
+    const cutoffMs = deps.now() - windowMs;
+
+    const clusters = new Map<string, ClusterAccum>();
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const runId = entry.name;
+      const eventsPath = path.join(dir, runId, "events.jsonl");
+      for await (const event of readEventsLines(eventsPath, deps)) {
+        if ((event as { type?: unknown }).type !== "papercut") continue;
+        const at = typeof event["at"] === "string" ? Date.parse(event["at"] as string) : NaN;
+        if (!Number.isFinite(at) || at < cutoffMs) continue;
+        clusterPapercuts(event, runId, clusters);
+      }
+    }
+
+    const allEntries = clustersToEntries(clusters, Number.MAX_SAFE_INTEGER);
+    const qualifying = allEntries.filter((c) => c.count >= opts.minOccurrences);
+    if (qualifying.length === 0) return;
+
+    // Concurrency (#421 finding 2): the dedup lookup, cap calculation, and issue
+    // creation below must be a single critical section shared by every trigger
+    // (run-finalization and queue-batch) — otherwise two concurrent invocations
+    // can observe the same empty snapshot and both file past the cap, or file
+    // duplicate titles before either issue is visible to the other. withLock
+    // throws if another process holds the lock; the outer catch below swallows
+    // that (this invocation simply skips filing — a later trigger will retry).
+    await deps.withLock(opts.domain, async () => {
+      // Dedup (#421 D3) — same lookup applyIssues() uses, called once per invocation.
+      const openIssues = await deps.listOpenImproveIssues();
+      const byTitle = new Map(openIssues.filter((i) => i.state === "OPEN").map((i) => [i.title, i]));
+
+      const toFile: ClusterEntry[] = [];
+      for (const c of qualifying) {
+        const title = proposedTitle(c);
+        if (byTitle.has(title)) {
+          deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
+          continue;
+        }
+        toFile.push(c);
+      }
+      if (toFile.length === 0) return;
+
+      // Rate cap (#421 D4, finding 3) — count pipeline:backlog + [pipeline-improve]
+      // issues created inside the trailing window, including closed ones: an
+      // auto-filed issue closed during the window must still count toward the cap.
+      const filedInWindow = openIssues.filter((i) => {
+        if (!i.labels.includes("pipeline:backlog")) return false;
+        const createdMs = Date.parse(i.createdAt);
+        return Number.isFinite(createdMs) && createdMs >= cutoffMs;
+      }).length;
+      let remaining = Math.max(0, opts.maxPerWindow - filedInWindow);
+
+      for (const c of toFile) {
+        const title = proposedTitle(c);
+        // Re-check byTitle (#421 finding 4): two qualifying clusters whose signals
+        // differ only past the 60-char truncation in proposedTitle() must not both
+        // file an issue for the same title within one invocation.
+        if (byTitle.has(title)) {
+          deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
+          continue;
+        }
+        if (remaining <= 0) {
+          deps.log(`[pipeline] papercut auto-file: deferred (rate cap) — ${title}`);
+          continue;
+        }
+        try {
+          const body = buildAutoFileBody(c, opts.windowHours);
+          const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
+          deps.log(`[pipeline] papercut auto-file: created ${url}`);
+          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"] });
+          remaining--;
+        } catch (err) {
+          deps.log(`[pipeline] papercut auto-file: create failed (non-fatal): ${(err as Error).message}`);
+        }
+      }
+    });
+  } catch (err) {
+    deps.log(`[pipeline] papercut auto-file failed (non-fatal): ${(err as Error).message}`);
+  }
 }
