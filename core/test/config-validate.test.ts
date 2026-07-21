@@ -291,15 +291,15 @@ test("validateConfig: bad eval_gate.mode enum → error with rigorGating:true", 
 // 5.8 validateConfig: inert-model warning
 // ---------------------------------------------------------------------------
 
-test("validateConfig: models.review set while reviewer=codex → no warning (codex honors -m)", () => {
+test("validateConfig: models.review set to a codex-plausible model while reviewer=codex → no warning (codex honors -m) (#454)", () => {
   const deps = makeDeps(
-    'models:\n  review: "claude-opus-4-8"\n',
+    'models:\n  review: "gpt-5.6-terra"\n',
     { implementer: "claude", reviewer: "codex" },
   );
   const result = validateConfig("/fake-repo", deps);
   assert.equal(result.valid, true);
   const d = result.diagnostics.find((x) => x.path === "models.review");
-  assert.equal(d, undefined, "no warning when reviewer is codex");
+  assert.equal(d, undefined, "no warning when reviewer is codex and the model is not a Claude-only alias");
 });
 
 test("validateConfig: models.review set while reviewer is a custom CLI → warning, valid:true", () => {
@@ -434,13 +434,58 @@ test("validateConfig: review_harness overrides profile reviewer for inert-model 
 test("validateConfig: review_harness overrides profile reviewer — no warning when review_harness=codex", () => {
   // Profile says reviewer=claude, but file overrides it to codex → models.review is honored via -m → no warning
   const deps = makeDeps(
-    "review_harness: codex\nmodels:\n  review: \"claude-opus-4-8\"\n",
+    "review_harness: codex\nmodels:\n  review: \"gpt-5.6-terra\"\n",
     { implementer: "codex", reviewer: "claude" },
   );
   const result = validateConfig("/fake-repo", deps);
   assert.equal(result.valid, true);
   const d = result.diagnostics.find((x) => x.path === "models.review");
   assert.equal(d, undefined, "no inert warning when review_harness overrides reviewer to codex");
+});
+
+// ---------------------------------------------------------------------------
+// 5.14 validateConfig: reviewer-model alias guard (#454) — error, not warning
+// ---------------------------------------------------------------------------
+
+test("validateConfig: models.review Claude alias + codex reviewer is a severity-error diagnostic, not a warning, and exits invalid", () => {
+  const deps = makeDeps(
+    "models:\n  review: sonnet\n",
+    { implementer: "codex", reviewer: "codex" },
+  );
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "models.review");
+  assert.ok(d, `expected an error diagnostic for models.review, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.match(d!.message, /sonnet/);
+  assert.match(d!.message, /codex/);
+  assert.match(d!.message, /auto/);
+  const warnings = result.diagnostics.filter((x) => x.path === "models.review" && x.severity === "warning");
+  assert.deepEqual(warnings, [], "the same key must not also carry a contradictory inert-alias warning");
+});
+
+test("validateConfig: review_harness.model Claude alias + codex reviewer command is a severity-error diagnostic on review_harness.model", () => {
+  const deps = makeDeps(
+    "review_harness:\n  command: codex\n  model: opus\n",
+    { implementer: "codex", reviewer: "claude" },
+  );
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_harness.model");
+  assert.ok(d, `expected an error diagnostic for review_harness.model, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.match(d!.message, /opus/);
+});
+
+test("validateConfig: models.review 'auto' + codex reviewer produces no diagnostic and exits valid", () => {
+  const deps = makeDeps(
+    "models:\n  review: auto\n",
+    { implementer: "codex", reviewer: "codex" },
+  );
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+  const d = result.diagnostics.find((x) => x.path === "models.review");
+  assert.equal(d, undefined);
 });
 
 test("validateConfig: review_harness overrides profile reviewer — warning when review_harness is a custom CLI", () => {
