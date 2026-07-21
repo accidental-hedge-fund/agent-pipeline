@@ -9,8 +9,8 @@ The host packaging SHALL expose each in-scope pipeline operation as its own
 discoverable `pipeline:<command>` command entry, rather than as a flag on a single
 `/pipeline` command. The in-scope operation set SHALL be exactly: `status`,
 `unblock`, `override`, `summary`, `doctor`, `init`, `cleanup`, `intake`, `sweep`,
-`triage`, `merge`, `release`, `roadmap`, `logs`. On the Claude host these entries
-SHALL be invocable as `/pipeline:<command>`; on the Codex host they SHALL be
+`triage`, `merge`, `release`, `roadmap`, `logs`, `loop`. On the Claude host these
+entries SHALL be invocable as `/pipeline:<command>`; on the Codex host they SHALL be
 invocable as `$pipeline:<command>`. Each entry SHALL appear in that host's
 command/skill discovery surface.
 
@@ -20,8 +20,8 @@ command/skill discovery surface.
 - **THEN** it SHALL contain a `pipeline:status`, `pipeline:unblock`,
   `pipeline:override`, `pipeline:summary`, `pipeline:doctor`, `pipeline:init`,
   `pipeline:cleanup`, `pipeline:intake`, `pipeline:sweep`, `pipeline:triage`,
-  `pipeline:merge`, `pipeline:release`, `pipeline:roadmap`, and `pipeline:logs`
-  entry
+  `pipeline:merge`, `pipeline:release`, `pipeline:roadmap`, `pipeline:logs`, and
+  `pipeline:loop` entry
 - **AND** no in-scope operation SHALL be reachable only as a flag on the base
   `/pipeline` command
 
@@ -31,6 +31,14 @@ command/skill discovery surface.
 - **THEN** `pipeline:status` (and each other in-scope entry) SHALL be listed as a
   named command with its own description, without the developer needing to know
   any flag syntax
+
+#### Scenario: The loop entry is generated from the same single source
+
+- **WHEN** `loop` is present in the single-source operation list and
+  `scripts/build.mjs` is run
+- **THEN** the Claude `commands/` surface SHALL gain `pipeline:loop.md` and the Codex
+  overlay SHALL gain the matching agent entry
+- **AND** the `plugin/` mirror SHALL regenerate to match
 
 ---
 
@@ -69,6 +77,13 @@ label-ensure + config scaffold; `pipeline:cleanup` → merged-worktree sweep; an
 `pipeline:<intake|sweep|triage|merge|release|roadmap|logs>` → the existing
 identically-named keyword sub-command.
 
+`pipeline:loop` is the single documented exception: it is a **delegating** entry
+rather than a CLI forward. It SHALL normalize its arguments and run the deterministic
+loop preflight in the pipeline CLI, then hand off durable orchestration to the
+installed goal-loop skill. It SHALL NOT be expected to map onto a `pipeline <op>`
+keyword sub-command, and the host-surface drift guard SHALL account for it as a
+delegating entry.
+
 #### Scenario: Host entry runs the same operation as the underlying command
 
 - **WHEN** `/pipeline:status 42` is invoked
@@ -83,7 +98,12 @@ identically-named keyword sub-command.
   pre-existing `pipeline summary <run-id>` exact-run selector SHALL remain
   available and unchanged for run-id selection
 
----
+#### Scenario: The loop entry delegates instead of forwarding
+
+- **WHEN** `/pipeline:loop --milestone v2` is invoked
+- **THEN** the deterministic loop preflight SHALL run in the pipeline CLI
+- **AND** durable orchestration SHALL be carried out by the installed goal-loop skill,
+  not by a `pipeline loop` keyword sub-command owning its own state
 
 ### Requirement: The advance loop SHALL remain the default invocation, unchanged
 
