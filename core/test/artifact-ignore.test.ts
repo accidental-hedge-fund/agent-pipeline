@@ -5,6 +5,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   ARTIFACT_CONTRACT,
   RUNS_ARTIFACT,
@@ -162,6 +165,31 @@ test("ensureArtifactIgnoreBlock: block present and stale -> rewrites only the se
   // No duplicate block: exactly one opening sentinel.
   const openCount = written.split("# >>> agent-pipeline artifacts").length - 1;
   assert.equal(openCount, 1, "the block must not be duplicated");
+});
+
+test("ensureArtifactIgnoreBlock: non-ENOENT read error (default fs impl) propagates instead of clobbering operator content", { skip: process.getuid?.() === 0 }, () => {
+  // Exercises the real defaultReadFile (no injected readFile): a write-only
+  // (chmod 200) .gitignore raises EACCES on read while a write would still
+  // succeed. Regression for #452 review finding — a non-ENOENT read failure
+  // must throw, not fall through to the create-new-.gitignore path, which
+  // would silently overwrite operator-authored content.
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-ignore-test-"));
+  const gitignorePath = path.join(repoDir, ".gitignore");
+  const operatorContent = "secret-operator-content\n";
+  fs.writeFileSync(gitignorePath, operatorContent, "utf8");
+  fs.chmodSync(gitignorePath, 0o200);
+  try {
+    assert.throws(() => ensureArtifactIgnoreBlock(repoDir), /EACCES/);
+    fs.chmodSync(gitignorePath, 0o644);
+    assert.equal(
+      fs.readFileSync(gitignorePath, "utf8"),
+      operatorContent,
+      "operator content must survive a non-ENOENT read failure",
+    );
+  } finally {
+    fs.chmodSync(gitignorePath, 0o644);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });
 
 test("ensureArtifactIgnoreBlock: operator already hand-ignores a contract path outside the block -> left untouched, block still lists it", () => {

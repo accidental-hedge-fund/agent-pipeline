@@ -103,8 +103,9 @@ export interface EnsureArtifactIgnoreResult {
 const defaultReadFile = (fp: string): string | null => {
   try {
     return fs.readFileSync(fp, "utf8");
-  } catch {
-    return null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+    throw err;
   }
 };
 
