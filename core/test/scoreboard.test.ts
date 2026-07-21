@@ -12,6 +12,7 @@ import {
   parseScoreboardBucket,
   parseScoreboardGroupBy,
   parseScoreboardWindow,
+  realScoreboardDeps,
   renderScoreboardHtml,
   resolveGroupIdentity,
   runScoreboard,
@@ -1545,6 +1546,78 @@ test("runScoreboard: a failure during the initial write removes the temp file an
   );
   assert.ok(unlinkedPath, "the temp file must be removed when the initial write fails");
   assert.equal(written.get("/out/report.html"), "pre-existing content", "the existing destination must be left unchanged");
+});
+
+test("realScoreboardDeps.writeFile: refuses to write through a pre-created symlink at the temp path (#427 review 2)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-scoreboard-html-symlink-"));
+  try {
+    const sentinel = path.join(dir, "sentinel.txt");
+    fs.writeFileSync(sentinel, "unrelated pipeline-writable content");
+    const tempPath = path.join(dir, ".report.html.tmp-attacker-guessed");
+    fs.symlinkSync(sentinel, tempPath);
+    await assert.rejects(
+      () => realScoreboardDeps().writeFile(tempPath, "<html></html>"),
+      /EEXIST/,
+    );
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "unrelated pipeline-writable content");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runScoreboard: a pre-created file (or symlink) at the first-chosen temp name is never opened — export retries under a fresh name and the destination still lands correctly (#427 review 2)", async () => {
+  const tempAttempts: string[] = [];
+  const written = new Map<string, string>();
+  let renamedFrom: string | null = null;
+  const deps: ScoreboardDeps = {
+    readFile: async (p: string) => { throw enoent(p); },
+    readdir: async () => { throw enoent(runsDir(REPO_DIR)); },
+    log: () => {},
+    writeFile: async (p: string, content: string) => {
+      tempAttempts.push(p);
+      if (tempAttempts.length < 3) {
+        const err = new Error(`EEXIST: file already exists, open '${p}'`) as NodeJS.ErrnoException;
+        err.code = "EEXIST";
+        throw err;
+      }
+      written.set(p, content);
+    },
+    rename: async (from: string, to: string) => {
+      renamedFrom = from;
+      written.set(to, written.get(from)!);
+      written.delete(from);
+    },
+    unlink: async (p: string) => { written.delete(p); },
+  };
+  await runScoreboard({ repoDir: REPO_DIR, html: "/out/report.html" }, deps);
+  assert.equal(tempAttempts.length, 3, "the first two colliding names must be abandoned, not opened");
+  assert.equal(new Set(tempAttempts).size, 3, "each retry must use a distinct unpredictable name");
+  assert.equal(renamedFrom, tempAttempts[2]);
+  assert.match(written.get("/out/report.html") ?? "", /<!DOCTYPE html>/);
+});
+
+test("runScoreboard: exhausting temp-name collision retries fails clearly and cleans up the last attempted temp file (#427 review 2)", async () => {
+  const tempAttempts: string[] = [];
+  let unlinkedPath: string | null = null;
+  const deps: ScoreboardDeps = {
+    readFile: async (p: string) => { throw enoent(p); },
+    readdir: async () => { throw enoent(runsDir(REPO_DIR)); },
+    log: () => {},
+    writeFile: async (p: string) => {
+      tempAttempts.push(p);
+      const err = new Error(`EEXIST: file already exists, open '${p}'`) as NodeJS.ErrnoException;
+      err.code = "EEXIST";
+      throw err;
+    },
+    rename: async () => { throw new Error("rename must not be called when every write attempt collides"); },
+    unlink: async (p: string) => { unlinkedPath = p; },
+  };
+  await assert.rejects(
+    () => runScoreboard({ repoDir: REPO_DIR, html: "/out/report.html" }, deps),
+    /cannot write HTML export to \/out\/report\.html/,
+  );
+  assert.equal(new Set(tempAttempts).size, tempAttempts.length, "every attempt must use a distinct name");
+  assert.equal(unlinkedPath, tempAttempts[tempAttempts.length - 1]);
 });
 
 test("CLI: pipeline scoreboard --html writes one complete document and exits 0, touching nothing under .agent-pipeline/runs (#427)", () => {

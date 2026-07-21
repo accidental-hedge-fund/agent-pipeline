@@ -5,6 +5,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { runsDir } from "./run-store.ts";
 
 type JsonRecord = Record<string, unknown>;
@@ -197,8 +198,10 @@ export interface ScoreboardDeps {
   readFile: (p: string) => Promise<string>;
   readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
   log: (msg: string) => void;
-  /** Write seam for the `--html` export (#427): write, then rename onto the
-   *  destination, so a mid-write failure never leaves a partial destination file. */
+  /** Write seam for the `--html` export (#427): exclusively creates `p` (fails
+   *  rather than following a pre-existing path, symlink or otherwise), then
+   *  renamed onto the destination, so a mid-write failure never leaves a
+   *  partial destination file. */
   writeFile: (p: string, content: string) => Promise<void>;
   rename: (from: string, to: string) => Promise<void>;
   unlink: (p: string) => Promise<void>;
@@ -212,7 +215,7 @@ export function realScoreboardDeps(): ScoreboardDeps {
       return entries as Array<{ name: string; isDirectory(): boolean }>;
     },
     log: (msg) => process.stdout.write(`${msg}\n`),
-    writeFile: (p, content) => fsp.writeFile(p, content, "utf8"),
+    writeFile: (p, content) => fsp.writeFile(p, content, { encoding: "utf8", flag: "wx" }),
     rename: (from, to) => fsp.rename(from, to),
     unlink: (p) => fsp.unlink(p),
   };
@@ -467,24 +470,39 @@ export async function runScoreboard(
   }
 }
 
+const HTML_EXPORT_TEMP_CREATE_ATTEMPTS = 5;
+
 /** Atomic write for the `--html` export (#427): the full document is rendered
- *  in memory before any write occurs, then written to a temporary sibling in
- *  the destination's own directory and renamed onto the destination. An
- *  invalid or unwritable destination (missing parent dir, destination is a
- *  directory, unwritable directory) fails the write/rename step and leaves no
- *  temp file behind — never creates missing parent directories. */
+ *  in memory before any write occurs, then exclusively created under an
+ *  unpredictable temporary name in the destination's own directory and
+ *  renamed onto the destination. `writeFile` opens with `wx` (create-exclusive),
+ *  so a pre-created path at the temp name — including a symlink planted by
+ *  another local actor — is never opened or followed; a collision (or a
+ *  same-process race on the same name) surfaces as EEXIST and is retried under
+ *  a fresh random name. An invalid or unwritable destination (missing parent
+ *  dir, destination is a directory, unwritable directory) fails the
+ *  write/rename step and leaves no temp file behind — never creates missing
+ *  parent directories. */
 async function writeScoreboardHtmlExport(
   destPath: string,
   content: string,
   deps: Pick<ScoreboardDeps, "writeFile" | "rename" | "unlink">,
 ): Promise<void> {
   const dir = path.dirname(destPath);
-  const tempPath = path.join(dir, `.${path.basename(destPath)}.tmp-${process.pid}-${Date.now()}`);
-  try {
-    await deps.writeFile(tempPath, content);
-  } catch (err) {
-    await deps.unlink(tempPath).catch(() => {});
-    throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
+  const base = path.basename(destPath);
+  let tempPath = "";
+  for (let attempt = 1; ; attempt++) {
+    tempPath = path.join(dir, `.${base}.tmp-${crypto.randomBytes(12).toString("hex")}`);
+    try {
+      await deps.writeFile(tempPath, content);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST" && attempt < HTML_EXPORT_TEMP_CREATE_ATTEMPTS) {
+        continue;
+      }
+      await deps.unlink(tempPath).catch(() => {});
+      throw new Error(`cannot write HTML export to ${destPath}: ${(err as Error).message}`);
+    }
   }
   try {
     await deps.rename(tempPath, destPath);
