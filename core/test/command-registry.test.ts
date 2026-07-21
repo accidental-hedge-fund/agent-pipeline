@@ -287,3 +287,36 @@ test("command-registry: a genuinely unsupported flag on a profile-free command i
   const cmd = fakeCmdWithCliFlag("bogus");
   assert.deepEqual(validateFlags(entry, cmd), ["bogus"]);
 });
+
+// ---------------------------------------------------------------------------
+// papercut (#419) — registered, agent-facing, hidden from --help
+// ---------------------------------------------------------------------------
+
+test("command-registry: papercut is registered with needsIssueNumber:false and needsGhAuth:false", () => {
+  const entry = COMMAND_REGISTRY.papercut;
+  assert.ok(entry !== undefined);
+  assert.equal(entry.needsIssueNumber, false);
+  assert.equal(entry.needsGhAuth, false);
+  assert.equal(entry.mutatesGitHub, false);
+  assert.equal(entry.supportsJson, true);
+  for (const flag of ["repoPath", "profile", "run", "message", "since", "until", "json"]) {
+    assert.ok(
+      (entry.allowedFlags as Set<string>).has(flag) || UNIVERSAL_FLAGS.has(flag),
+      `papercut.allowedFlags should include "${flag}"`,
+    );
+  }
+});
+
+test("command-registry: lookupCommand('papercut') returns the papercut entry", () => {
+  const entry = lookupCommand("papercut");
+  assert.equal(entry, COMMAND_REGISTRY.papercut);
+});
+
+test("pipeline --help output contains no papercut entry", async () => {
+  const { buildCmd } = await import("../scripts/pipeline.ts");
+  const help = buildCmd().helpInformation();
+  assert.ok(
+    !/\bpapercut\b/.test(help),
+    `--help output should not mention "papercut":\n${help}`,
+  );
+});

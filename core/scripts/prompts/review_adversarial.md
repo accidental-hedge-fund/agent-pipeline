@@ -67,7 +67,7 @@ If the change looks safe, say so directly and return no findings.
 
 {{confidence_calibration}}
 
-{{non_blocking_guidance}}
+{{non_blocking_guidance}}{{papercut_instruction}}
 
 ## Calibration Examples
 

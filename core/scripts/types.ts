@@ -379,6 +379,13 @@ export interface PipelineConfig {
     runOnStart: boolean;
     failFast: boolean;
   };
+  // Agent-logged minor-friction capture (#419). Opt-in; default disabled so
+  // existing runs are unchanged. When enabled, the engine passes run/stage
+  // identity env vars to harness child processes and injects a prompt
+  // instruction pointing the agent at `pipeline papercut`.
+  papercuts: {
+    enabled: boolean;
+  };
   // Worktree bootstrap: dependency install step (#174).
   // When set to a non-empty string, that shell command is run in the worktree
   // instead of auto-detection. When set to "" the install step is skipped
@@ -559,6 +566,7 @@ export const DEFAULT_CONFIG: Omit<
   },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3 },
   doctor: { runOnStart: false, failFast: false },
+  papercuts: { enabled: false },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,
   auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] as Stage[] },

@@ -882,3 +882,72 @@ test("invoke(): threads opts.accounting into runCapped's timeoutEvent context �
   assert.equal(timeoutEvents.length, 1, "invoke() must thread accounting into runCapped's timeoutEvent");
   assert.equal(timeoutEvents[0].stage, "review-1");
 });
+
+// ---------------------------------------------------------------------------
+// papercut identity env (#419) — opts.env merges into the child's environment
+// only when explicitly supplied; absent opts.env is a byte-for-byte no-op.
+// ---------------------------------------------------------------------------
+
+test("runCapped: opts.env is merged into the spawned child's environment when supplied", async () => {
+  let capturedEnv: NodeJS.ProcessEnv | undefined;
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 123456,
+    kill: () => true,
+  });
+  const spawnFn = ((cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    capturedEnv = options.env;
+    setImmediate(() => fakeChild.emit("close", 0));
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  await runCapped("unused", [], tmpRoot, 30, false, "test", {
+    spawnFn,
+    env: { PIPELINE_RUN_ID: "419-x", PIPELINE_STAGE: "implementing" },
+  });
+
+  assert.ok(capturedEnv, "spawn options.env must be set when opts.env is supplied");
+  assert.equal(capturedEnv!.PIPELINE_RUN_ID, "419-x");
+  assert.equal(capturedEnv!.PIPELINE_STAGE, "implementing");
+  // process.env is still inherited underneath the additions.
+  assert.equal(capturedEnv!.PATH, process.env.PATH);
+});
+
+test("runCapped: no opts.env → spawn options carry no env key at all (byte-for-byte no-op on the default path)", async () => {
+  let capturedOptions: { env?: NodeJS.ProcessEnv } | undefined;
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 123457,
+    kill: () => true,
+  });
+  const spawnFn = ((cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    capturedOptions = options;
+    setImmediate(() => fakeChild.emit("close", 0));
+    return fakeChild;
+  }) as unknown as typeof import("node:child_process").spawn;
+
+  await runCapped("unused", [], tmpRoot, 30, false, "test", { spawnFn });
+
+  assert.equal(
+    "env" in (capturedOptions ?? {}),
+    false,
+    "spawn options must not carry an env key when opts.env is absent — the child inherits process.env exactly as before #419",
+  );
+});
+
+test("invoke(): opts.env reaches the real spawned child's environment end-to-end", async () => {
+  const cli = makeScript("print-run-id", `printf '%s' "$PIPELINE_RUN_ID"`);
+  const result = await invoke(cli, tmpRoot, "prompt", {
+    stream: false,
+    env: { PIPELINE_RUN_ID: "419-real" },
+  });
+  assert.equal(result.stdout, "419-real");
+});
+
+test("invoke(): no opts.env → the real spawned child sees no PIPELINE_RUN_ID (default path unchanged)", async () => {
+  const cli = makeScript("print-run-id-absent", `printf '%s' "${"$"}{PIPELINE_RUN_ID:-<unset>}"`);
+  const result = await invoke(cli, tmpRoot, "prompt", { stream: false });
+  assert.equal(result.stdout, "<unset>");
+});

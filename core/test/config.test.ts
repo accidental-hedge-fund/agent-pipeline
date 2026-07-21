@@ -1100,6 +1100,54 @@ test("resolveConfig: non-boolean doctor.runOnStart is rejected", async () => {
   }
 });
 
+// ---- papercuts block (#419) ----
+
+test("resolveConfig: papercuts defaults to disabled when block is absent", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/pc0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.papercuts.enabled, DEFAULT_CONFIG.papercuts.enabled);
+    assert.equal(cfg.papercuts.enabled, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: papercuts.enabled: true resolves enabled", async () => {
+  const repo = makeFakeRepo(`papercuts:\n  enabled: true\n`);
+  const binDir = makeFakeGh("acme/pc1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.papercuts.enabled, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under papercuts is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`papercuts:\n  rateLimit: 5\n`);
+  const binDir = makeFakeGh("acme/pc2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("rateLimit"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- setup_command (#174) ----
 
 test("resolveConfig: setup_command passes through from file config", async () => {

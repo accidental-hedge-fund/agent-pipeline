@@ -26,7 +26,8 @@ import {
   nonReproducingDispositionComment,
   type ScopedOverride,
 } from "../review-policy.ts";
-import { invoke } from "../harness.ts";
+import * as path from "node:path";
+import { invoke, papercutIdentityEnv } from "../harness.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
@@ -452,6 +453,13 @@ export async function advanceFix(
           model,
         }
       : undefined,
+    env: papercutIdentityEnv(cfg, {
+      runId: opts.runDir ? path.basename(opts.runDir) : null,
+      issue: issueNumber,
+      stage,
+      harness,
+      model,
+    }),
   });
 
   if (!result.success) {
