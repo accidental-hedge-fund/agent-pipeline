@@ -162,6 +162,16 @@ export interface HarnessTimeoutEvent extends RunEventBase {
   stage: string;
   timeout_sec: number;
 }
+/** Advisory warning (#445): a harness commit step left a gitignored file
+ *  uncommitted that is referenced by name in the committed diff. Never blocks
+ *  and never changes stage advance/blocking semantics — purely informational
+ *  so the exclusion is diagnosed at the stage that caused it instead of at a
+ *  downstream CI failure. */
+export interface IgnoredArtifactWarningEvent extends RunEventBase {
+  type: "ignored_artifact_warning";
+  stage: string;
+  files: Array<{ path: string; source: string | null; line: number | null; pattern: string | null }>;
+}
 
 export type { HumanInterventionEvent };
 
@@ -181,6 +191,7 @@ export type RunEvent =
   | GhMetricsSummaryEvent
   | StageAccountingEvent
   | HarnessTimeoutEvent
+  | IgnoredArtifactWarningEvent
   | HumanInterventionEvent;
 
 // ---------------------------------------------------------------------------

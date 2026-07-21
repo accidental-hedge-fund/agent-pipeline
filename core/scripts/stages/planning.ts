@@ -56,6 +56,7 @@ import { runTestGate } from "../testgate.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
 import { setLivePlanningMarker, clearLivePlanningMarker, isLivePlanningActive } from "../lock.ts";
@@ -750,6 +751,24 @@ export async function runPlanningPhases(
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return { advanced: false, status: "blocked", reason: implCheck.reason };
     }
+  }
+
+  // #445: advisory-only — warn when the implementing commit(s) left a
+  // gitignored, change-referenced artifact uncommitted. Never blocks.
+  if (implHeadBefore) {
+    const implHeadAfter = (
+      await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+    ).stdout.trim();
+    await detectIgnoredArtifacts(wt.path, implHeadBefore, implHeadAfter, {
+      emitEvent: (files) =>
+        opts.runDir
+          ? appendEvent(
+              opts.runDir,
+              { schema_version: RUN_SCHEMA_VERSION, type: "ignored_artifact_warning", at: nowIso(), stage: "implementing", files },
+              opts.runStoreDeps,
+            ).catch(() => {})
+          : undefined,
+    });
   }
 
   // ---- Build PR body and hand off to post-implementation steps ----
