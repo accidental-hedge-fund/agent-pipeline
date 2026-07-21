@@ -57,6 +57,14 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
   }
 
   const experimentId = requireString("experiment_id");
+  // The id becomes a path segment under output_dir (delta finding 7282029b):
+  // separators or ".." would let writes escape <output_dir>/<experiment-id>/.
+  if (/[/\\]/.test(experimentId) || experimentId.includes("..")) {
+    throw new ManifestValidationError(
+      "experiment_id",
+      "must be a single path-safe segment (no path separators or '..')",
+    );
+  }
 
   const fixtureIds = obj.fixture_ids;
   if (!Array.isArray(fixtureIds) || fixtureIds.length === 0 || fixtureIds.some((f) => typeof f !== "string")) {
@@ -111,9 +119,7 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
   if (timeout <= 0) {
     throw new ManifestValidationError("timeout", "must be a positive number of seconds");
   }
-  const outputDir = typeof obj.output_dir === "string" && obj.output_dir.length > 0
-    ? obj.output_dir
-    : ".agent-pipeline/evals";
+  const outputDir = requireString("output_dir");
 
   return {
     schema_version: schemaVersion,

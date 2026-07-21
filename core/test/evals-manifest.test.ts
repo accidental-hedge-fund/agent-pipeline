@@ -68,6 +68,28 @@ test("validateManifest: missing required field is rejected by name", () => {
   });
 });
 
+test("validateManifest: missing output_dir is rejected by name, not defaulted (delta daf35a2c)", () => {
+  const raw = validManifestRaw();
+  delete raw.output_dir;
+  assert.throws(() => validateManifest(raw, new Set(["f1"])), (err: unknown) => {
+    assert.ok(err instanceof ManifestValidationError);
+    assert.match((err as Error).message, /"output_dir"/);
+    return true;
+  });
+});
+
+test("validateManifest: experiment_id with path separators or '..' is rejected (delta 7282029b)", () => {
+  for (const id of ["../evil", "a/b", "a\\b", "..", "x/../y"]) {
+    const raw = validManifestRaw();
+    raw.experiment_id = id;
+    assert.throws(() => validateManifest(raw, new Set(["f1"])), (err: unknown) => {
+      assert.ok(err instanceof ManifestValidationError, `expected rejection for ${JSON.stringify(id)}`);
+      assert.match((err as Error).message, /"experiment_id"/);
+      return true;
+    });
+  }
+});
+
 test("validateManifest: unknown mode is rejected", () => {
   const raw = validManifestRaw({ mode: "bogus-stage" });
   assert.throws(() => validateManifest(raw, new Set(["f1"])), /mode/);
