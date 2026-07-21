@@ -75,7 +75,7 @@ const AgentSystemExecutorSchema = z
 // rejected at parse time rather than passed through as an untyped record.
 const OpenRouterSortSchema = z.union([
   z.enum(["price", "throughput", "latency"]),
-  z.object({ by: z.string(), partition: z.enum(["model", "none"]).optional() }).strict(),
+  z.object({ by: z.enum(["price", "throughput", "latency"]), partition: z.enum(["model", "none"]).optional() }).strict(),
 ]);
 
 const OpenRouterThroughputLatencySchema = z.union([

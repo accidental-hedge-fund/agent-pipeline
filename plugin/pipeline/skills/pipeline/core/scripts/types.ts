@@ -110,7 +110,7 @@ export interface OpenRouterProviderPreferences {
   only?: string[];
   ignore?: string[];
   quantizations?: ("int4" | "int8" | "fp4" | "fp6" | "fp8" | "fp16" | "bf16" | "fp32" | "unknown")[];
-  sort?: "price" | "throughput" | "latency" | { by: string; partition?: "model" | "none" };
+  sort?: "price" | "throughput" | "latency" | { by: "price" | "throughput" | "latency"; partition?: "model" | "none" };
   preferred_min_throughput?: number | { p50?: number; p75?: number; p90?: number; p99?: number };
   preferred_max_latency?: number | { p50?: number; p75?: number; p90?: number; p99?: number };
   max_price?: { prompt?: number; completion?: number; request?: number; image?: number };

@@ -3403,6 +3403,47 @@ test("resolveConfig: fully-typed provider-routing preferences are accepted (#434
   assert.deepEqual(cfg.executors["openrouter-review"].params?.provider?.order, ["openai", "anthropic"]);
 });
 
+test("resolveConfig: object-form provider sort with an undocumented mode is rejected at parse time (#434 delta 8b3c0429)", async () => {
+  await expectInvalidConfig(
+    [
+      "executors:",
+      "  openrouter-review:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    dialect: openrouter",
+      "    params:",
+      "      provider:",
+      "        sort:",
+      "          by: typo",
+      "",
+    ].join("\n"),
+    "acme/exec20",
+    /sort/,
+  );
+});
+
+test("resolveConfig: object-form provider sort with a documented mode and partition is accepted (#434 delta 8b3c0429)", async () => {
+  const cfg = (await resolveWithConfig(
+    [
+      "executors:",
+      "  openrouter-review:",
+      "    type: model-endpoint",
+      "    base_url: https://openrouter.ai/api/v1",
+      "    model: openai/gpt-5",
+      "    dialect: openrouter",
+      "    params:",
+      "      provider:",
+      "        sort:",
+      "          by: throughput",
+      "          partition: model",
+      "",
+    ].join("\n"),
+    "acme/exec21",
+  )) as { executors: Record<string, { params?: { provider?: { sort?: { by?: string } } } }> };
+  assert.equal(cfg.executors["openrouter-review"].params?.provider?.sort?.by, "throughput");
+});
+
 test("resolveConfig: headers declaring content-type is rejected at parse time (#434)", async () => {
   await expectInvalidConfig(
     `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    headers:\n      content-type: "text/plain"\n`,
