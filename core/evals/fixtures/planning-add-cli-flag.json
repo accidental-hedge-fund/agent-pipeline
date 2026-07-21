@@ -1,0 +1,17 @@
+{
+  "fixture_id": "planning-add-cli-flag",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Add a `--dry-run` flag to `pipeline doctor` that prints the checks it would run without executing any of them.",
+  "stage_entry_artifacts": {
+    "planning": {
+      "issue_title": "Add --dry-run flag to pipeline doctor",
+      "issue_body": "pipeline doctor always executes its full check suite. Add a --dry-run flag that lists the checks it would run, in order, without running them."
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "grader_refs": [],
+  "category": "cli-feature",
+  "risk": "low",
+  "provenance": "synthetic"
+}

@@ -1,0 +1,17 @@
+{
+  "fixture_id": "shipcheck-scoreboard-html",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Verify this change is ready to ship: re-run checks and confirm no regressions.",
+  "stage_entry_artifacts": {
+    "shipcheck": {
+      "pr_diff_summary": "Adds a self-contained HTML export to `pipeline scoreboard` (core/scripts/scoreboard-html.ts, new).",
+      "ci_status": "passing"
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "grader_refs": [],
+  "category": "release-verification",
+  "risk": "low",
+  "provenance": "synthetic"
+}

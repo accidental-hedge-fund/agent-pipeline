@@ -36,6 +36,11 @@ export const HISTORY_ARTIFACT: ArtifactContractEntry = {
   comment: "Per-issue evidence history (issue-<N>.jsonl); local-only, never committed.",
 };
 
+export const EVALS_ARTIFACT: ArtifactContractEntry = {
+  name: "evals",
+  comment: "Stage-eval-runner experiment output (manifest/plan/runs/failures); local-only, never committed.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory the engine writes.
  *  No other module SHALL independently define an `.agent-pipeline/` artifact
  *  directory path — derive it from an entry here instead. */
@@ -43,6 +48,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   RUNS_ARTIFACT,
   ROADMAP_ARTIFACT,
   HISTORY_ARTIFACT,
+  EVALS_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */

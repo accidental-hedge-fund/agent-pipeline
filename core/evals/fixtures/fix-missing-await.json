@@ -1,0 +1,17 @@
+{
+  "fixture_id": "fix-missing-await",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Resolve this review finding with a minimal, surgical diff.",
+  "stage_entry_artifacts": {
+    "fix": {
+      "finding": "core/scripts/worktree.ts:612 — removeFn(cfg, issueNumber, slug) is called without awaiting its promise, so the worktree removal can race the subsequent `git worktree add`.",
+      "severity": "block"
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "grader_refs": [],
+  "category": "review-fix-application",
+  "risk": "medium",
+  "provenance": "synthetic"
+}
