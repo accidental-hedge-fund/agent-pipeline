@@ -161,22 +161,32 @@ export interface CellExecutionDeps {
    *  pass (exit 0) / fail per check name. Only invoked when the fixture
    *  declares at least one public or hidden check (grading needs the result;
    *  a fixture declaring none never triggers this, so existing callers that
-   *  inject no fake are unaffected). */
-  runChecks?: (args: { worktreeDir: string; checks: string[] }) => Promise<Record<string, boolean>>;
+   *  inject no fake are unaffected). `deadlineMs` is the cell's remaining
+   *  budget at the time checks start — implementations must cap execution to
+   *  it rather than each check's own fixed ceiling. */
+  runChecks?: (args: { worktreeDir: string; checks: string[]; deadlineMs: number }) => Promise<Record<string, boolean>>;
   /** Report the repository-relative paths that differ from `baseSha` in the
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
 }
 
-async function defaultRunChecks(args: { worktreeDir: string; checks: string[] }): Promise<Record<string, boolean>> {
+async function defaultRunChecks(
+  args: { worktreeDir: string; checks: string[]; deadlineMs: number },
+): Promise<Record<string, boolean>> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   const results: Record<string, boolean> = {};
+  const deadline = Date.now() + args.deadlineMs;
   for (const check of args.checks) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      results[check] = false;
+      continue;
+    }
     try {
-      await execFileAsync("sh", ["-c", check], { cwd: args.worktreeDir, timeout: 300_000 });
+      await execFileAsync("sh", ["-c", check], { cwd: args.worktreeDir, timeout: Math.min(300_000, remainingMs) });
       results[check] = true;
     } catch {
       results[check] = false;
@@ -432,8 +442,39 @@ export async function runCell(
     const detail: Record<string, unknown> = { stages: stageDetails };
     const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
     if (allChecks.length > 0) {
+      // Checks run against the cell's remaining budget, not a fresh ceiling
+      // of their own (review 1 finding 4e04eddd) — a cell whose treatment
+      // already consumed the deadline must not spend further unbounded time
+      // in checks and still come back `completed`.
+      const remainingForChecks = cellDeadlineMs - Date.now();
+      if (remainingForChecks <= 0) {
+        return {
+          outcome: {
+            result_class: "timeout",
+            error: `cell exceeded its ${manifest.timeout}s per-cell timeout before checks could start`,
+          },
+          materializedPrompt,
+          effectiveConfig,
+          ghRefusals: recorder.refusals,
+        };
+      }
       const runChecksFn = deps.runChecks ?? defaultRunChecks;
-      detail.checks = await runChecksFn({ worktreeDir: identity.worktreePath, checks: allChecks });
+      detail.checks = await runChecksFn({
+        worktreeDir: identity.worktreePath,
+        checks: allChecks,
+        deadlineMs: remainingForChecks,
+      });
+      if (Date.now() > cellDeadlineMs) {
+        return {
+          outcome: {
+            result_class: "timeout",
+            error: `cell exceeded its ${manifest.timeout}s per-cell timeout while running checks`,
+          },
+          materializedPrompt,
+          effectiveConfig,
+          ghRefusals: recorder.refusals,
+        };
+      }
     }
     if (fixture.allowed_change_paths !== undefined) {
       const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
