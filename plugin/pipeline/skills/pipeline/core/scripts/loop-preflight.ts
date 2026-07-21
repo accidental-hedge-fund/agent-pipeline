@@ -50,17 +50,26 @@ export interface GoalLoopDiscovery {
 }
 
 /** Candidate install roots for the goal-loop skill, honoring the same
- *  CLAUDE_CONFIG_DIR / CODEX_HOME overrides scripts/install.mjs already uses. */
-export function goalLoopDiscoveryRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+ *  CLAUDE_CONFIG_DIR / CODEX_HOME overrides scripts/install.mjs already uses.
+ *
+ *  When `engine` is given (the `pipeline:loop` facade always knows its active
+ *  engine), discovery is scoped to that engine's own host store — plus the
+ *  shared `~/.agents` install — so a stale install under the *other* host can
+ *  neither mask an incompatible active install nor block a compatible one
+ *  (#451 review 2, finding 1). Doctor and the installer don't know which host
+ *  is invoking them, so they call this with no `engine` and keep the prior
+ *  host-agnostic order (Claude, then Codex, then shared). */
+export function goalLoopDiscoveryRoots(engine?: LoopEngine, env: NodeJS.ProcessEnv = process.env): string[] {
   const home = homedir();
   const claudeBase = env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : path.join(home, ".claude");
   const codexBase = env.CODEX_HOME ? path.resolve(env.CODEX_HOME) : path.join(home, ".codex");
   const agentsBase = path.join(home, ".agents");
-  return [
-    path.join(claudeBase, "skills", "goal-loop"),
-    path.join(codexBase, "skills", "goal-loop"),
-    path.join(agentsBase, "skills", "goal-loop"),
-  ];
+  const claudeRoot = path.join(claudeBase, "skills", "goal-loop");
+  const codexRoot = path.join(codexBase, "skills", "goal-loop");
+  const sharedRoot = path.join(agentsBase, "skills", "goal-loop");
+  if (engine === "claude") return [claudeRoot, sharedRoot];
+  if (engine === "codex") return [codexRoot, sharedRoot];
+  return [claudeRoot, codexRoot, sharedRoot];
 }
 
 function extractSchemaConstant(statePy: string, constName: string): string | null {
@@ -179,7 +188,6 @@ export async function checkNativeGoalCapability(deps: DoctorDeps, engine: LoopEn
 export type LoopSelector =
   | { type: "milestone"; value: string }
   | { type: "label"; value: string }
-  | { type: "range"; value: string }
   | { type: "roadmap-slice"; value: string }
   | { type: "work-list"; value: string[] };
 
@@ -194,7 +202,8 @@ export class LoopArgError extends Error {}
 export interface RawLoopArgs {
   milestone?: string;
   /** May be repeated by Commander's collectRepeatable; only one label selector
-   *  is accepted at a time. */
+   *  is accepted at a time — a second occurrence is a hard error, not a
+   *  silent override, since it would otherwise run an unintended backlog. */
   label?: string[];
   range?: string;
   roadmapSlice?: string;
@@ -204,13 +213,39 @@ export interface RawLoopArgs {
   audit?: boolean;
 }
 
+const RANGE_RE = /^(\d+)-(\d+)$/;
+
+/** Expands a validated `<start>-<end>` range into the inclusive list of issue
+ *  numbers it denotes — the required `work-list` normalization target (#451
+ *  review 2, finding 3: the active spec has no standalone `range` selector
+ *  type). */
+function expandRange(range: string): string[] {
+  const match = RANGE_RE.exec(range);
+  if (!match) {
+    throw new LoopArgError(`pipeline:loop: --range must be "<start>-<end>", got "${range}"`);
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (start > end) {
+    throw new LoopArgError(`pipeline:loop: --range start must be <= end, got "${range}"`);
+  }
+  const issues: string[] = [];
+  for (let n = start; n <= end; n++) issues.push(String(n));
+  return issues;
+}
+
 /** Pure normalization of `pipeline:loop` arguments into exactly one selector
  *  form (or none, when resuming or auditing), rejecting a selector combined
  *  with `--resume` and requiring at least one of selector/`--resume`/`--audit`
  *  (standalone `--audit` reports on the canonical run goal-loop resolves for
  *  this repo). No I/O. */
 export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
-  const label = raw.label && raw.label.length > 0 ? raw.label[raw.label.length - 1] : undefined;
+  if (raw.label && raw.label.length > 1) {
+    throw new LoopArgError(
+      `pipeline:loop accepts only one --label selector at a time — got ${raw.label.join(", ")}`,
+    );
+  }
+  const label = raw.label && raw.label.length > 0 ? raw.label[0] : undefined;
   const issues = raw.issues ?? [];
   for (const issue of issues) {
     if (!/^\d+$/.test(issue)) {
@@ -221,7 +256,7 @@ export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
   const selectorCandidates: Array<[string, LoopSelector | undefined]> = [
     ["--milestone", raw.milestone ? { type: "milestone", value: raw.milestone } : undefined],
     ["--label", label ? { type: "label", value: label } : undefined],
-    ["--range", raw.range ? { type: "range", value: raw.range } : undefined],
+    ["--range", raw.range ? { type: "work-list", value: expandRange(raw.range) } : undefined],
     ["--roadmap-slice", raw.roadmapSlice ? { type: "roadmap-slice", value: raw.roadmapSlice } : undefined],
     ["issue list", issues.length > 0 ? { type: "work-list", value: issues } : undefined],
   ];
@@ -264,7 +299,7 @@ export async function runLoopPreflight(
   raw: RawLoopArgs,
   engine: LoopEngine,
   deps: DoctorDeps,
-  roots: string[] = goalLoopDiscoveryRoots(),
+  roots: string[] = goalLoopDiscoveryRoots(engine),
 ): Promise<LoopPreflightOutcome> {
   let args: LoopArgs;
   try {

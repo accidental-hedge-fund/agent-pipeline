@@ -12,6 +12,7 @@ import {
   checkLoopContractCoherence,
   checkNativeGoalCapability,
   discoverGoalLoop,
+  goalLoopDiscoveryRoots,
   normalizeLoopArgs,
   runLoopPreflight,
   LoopArgError,
@@ -83,6 +84,52 @@ test("discoverGoalLoop — falls back to the second candidate root", async () =>
   });
   const result = await discoverGoalLoop(deps, ROOTS);
   assert.equal(result?.root, ROOTS[1]);
+});
+
+// ---------------------------------------------------------------------------
+// goalLoopDiscoveryRoots — engine-aware discovery (#451 review 2, finding 1)
+// ---------------------------------------------------------------------------
+
+test("goalLoopDiscoveryRoots — with no engine, checks both hosts (Claude first)", () => {
+  const roots = goalLoopDiscoveryRoots(undefined, {});
+  assert.equal(roots.length, 3);
+  assert.match(roots[0], /\.claude[/\\]skills[/\\]goal-loop$/);
+  assert.match(roots[1], /\.codex[/\\]skills[/\\]goal-loop$/);
+});
+
+test("goalLoopDiscoveryRoots — claude engine only discovers the Claude store (plus shared)", () => {
+  const roots = goalLoopDiscoveryRoots("claude", {});
+  assert.equal(roots.length, 2);
+  assert.ok(roots.every((r) => !/\.codex[/\\]skills[/\\]goal-loop$/.test(r)));
+  assert.match(roots[0], /\.claude[/\\]skills[/\\]goal-loop$/);
+});
+
+test("goalLoopDiscoveryRoots — codex engine only discovers the Codex store (plus shared)", () => {
+  const roots = goalLoopDiscoveryRoots("codex", {});
+  assert.equal(roots.length, 2);
+  assert.ok(roots.every((r) => !/\.claude[/\\]skills[/\\]goal-loop$/.test(r)));
+  assert.match(roots[0], /\.codex[/\\]skills[/\\]goal-loop$/);
+});
+
+test("runLoopPreflight — codex engine does not fall back to a stale Claude-only install", async () => {
+  // A compatible install exists ONLY under the Claude root; the active engine is codex.
+  // Per finding 1, this must fail closed (goal-loop undiscoverable for codex) rather
+  // than silently validating the unrelated Claude install.
+  const env = { CLAUDE_CONFIG_DIR: "/home/user/.claude", CODEX_HOME: "/home/user/.codex" } as NodeJS.ProcessEnv;
+  const claudeRoot = "/home/user/.claude/skills/goal-loop";
+  const deps = fakeDeps({
+    fsExists: (p) => p === `${claudeRoot}/.goal-loop-manifest.json`,
+    readTextFile: (p) => {
+      if (p === `${claudeRoot}/.goal-loop-manifest.json`) return MANIFEST_OK;
+      if (p === `${claudeRoot}/state.py`) return STATE_PY_OK;
+      return null;
+    },
+  });
+  const codexRoots = goalLoopDiscoveryRoots("codex", env);
+  assert.ok(!codexRoots.includes(claudeRoot), "codex-scoped roots must not include the Claude store");
+  const outcome = await runLoopPreflight({ milestone: "v2" }, "codex", deps, codexRoots);
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) assert.equal(outcome.failedCheck, "loop:contract-coherence");
 });
 
 // ---------------------------------------------------------------------------
@@ -191,9 +238,21 @@ test("normalizeLoopArgs — label selector", () => {
   assert.deepEqual(args.selector, { type: "label", value: "backlog" });
 });
 
-test("normalizeLoopArgs — range selector", () => {
-  const args = normalizeLoopArgs({ range: "400-420" });
-  assert.deepEqual(args.selector, { type: "range", value: "400-420" });
+test("normalizeLoopArgs — range selector normalizes to work-list", () => {
+  const args = normalizeLoopArgs({ range: "418-420" });
+  assert.deepEqual(args.selector, { type: "work-list", value: ["418", "419", "420"] });
+});
+
+test("normalizeLoopArgs — rejects a malformed range", () => {
+  assert.throws(() => normalizeLoopArgs({ range: "not-a-range" }), LoopArgError);
+});
+
+test("normalizeLoopArgs — rejects a range whose start exceeds its end", () => {
+  assert.throws(() => normalizeLoopArgs({ range: "420-418" }), LoopArgError);
+});
+
+test("normalizeLoopArgs — rejects a repeated --label selector", () => {
+  assert.throws(() => normalizeLoopArgs({ label: ["security", "backlog"] }), LoopArgError);
 });
 
 test("normalizeLoopArgs — roadmap-slice selector", () => {
