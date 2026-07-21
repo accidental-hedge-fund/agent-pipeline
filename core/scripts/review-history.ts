@@ -295,20 +295,38 @@ const TITLE_STOPWORDS = new Set([
   "after", "before", "without", "within", "since", "up", "down", "out", "off",
 ]);
 
+/** Strips common inflectional suffixes so wording variants of the same
+ *  content word (e.g. "returns"/"return", "swallowed"/"swallows") collapse to
+ *  one token before overlap is computed (#464 review round 2). Deliberately
+ *  minimal — it must not merge distinct content words. */
+function stem(token: string): string {
+  if (token.length > 4 && token.endsWith("ing")) return token.slice(0, -3);
+  if (token.length > 4 && token.endsWith("ed")) return token.slice(0, -2);
+  if (token.length > 3 && token.endsWith("es")) return token.slice(0, -2);
+  if (token.length > 3 && token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1);
+  return token;
+}
+
 function titleTokens(title: string): Set<string> {
   return new Set(
     normalizeTitle(title)
       .split(/\s+/)
-      .filter((t) => t.length > 0 && !TITLE_STOPWORDS.has(t)),
+      .filter((t) => t.length > 0 && !TITLE_STOPWORDS.has(t))
+      .map(stem),
   );
 }
 
 /** Jaccard-similarity threshold at/above which two titles are treated as
- *  describing the same underlying defect (#464). Tuned so a reworded
- *  restatement or an opposite-conclusion re-litigation of the SAME point
- *  (shared nouns/subject) matches, while two titles about genuinely distinct
- *  defects on the same file/category (near-zero token overlap) do not. */
-export const TITLE_SIMILARITY_THRESHOLD = 0.3;
+ *  describing the same underlying defect (#464 review round 2). A same-surface
+ *  title pair sharing only the subject/domain nouns of a defect (e.g. two
+ *  titles both mentioning "malformed artifact manifests" while describing
+ *  unrelated concerns — validation-time rejection vs. downstream PR
+ *  observability) scores well below this threshold even after stemming;
+ *  a reworded restatement or an opposite-conclusion re-litigation of the SAME
+ *  point scores well above it. Raised from 0.3 after round-2 review found the
+ *  lower threshold let such vocabulary-overlap-only pairs match — see the
+ *  regression tests guarding both ends of this margin. */
+export const TITLE_SIMILARITY_THRESHOLD = 0.55;
 
 /**
  * Jaccard similarity over normalized, stopword-filtered title tokens (#464).

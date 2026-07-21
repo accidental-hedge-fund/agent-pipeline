@@ -429,6 +429,15 @@ test("titleSimilarity: the #395 mis-fire pair (distinct defects, same file) is b
   assert.ok(titleSimilarity(settledTitle, newTitle) < TITLE_SIMILARITY_THRESHOLD);
 });
 
+test("titleSimilarity: overlapping artifact/validation vocabulary describing distinct defects is below threshold (#464 review round 2)", () => {
+  // Both titles share "malformed artifact manifests" (three tokens), but one
+  // is about validation-time rejection and the other about downstream PR
+  // observability — genuinely distinct defects, not a reworded restatement.
+  const settledTitle = "Reject malformed artifact manifests";
+  const newTitle = "Malformed artifact manifests are not reported to the PR";
+  assert.ok(titleSimilarity(settledTitle, newTitle) < TITLE_SIMILARITY_THRESHOLD);
+});
+
 test("titleSimilarity: empty or unusable title yields 0", () => {
   assert.equal(titleSimilarity("", "something"), 0);
   assert.equal(titleSimilarity("something", ""), 0);
@@ -604,7 +613,7 @@ test("castrecall-#5-style cap-reversal history: round-3 prompt marks round-1/rou
   // opposite way, same surface, no acknowledgment of the round-2 decision.
   const capRemovalFinding: ReviewFinding = {
     severity: "high",
-    title: "The cap on concurrent retries that limits the connection pool should be removed since it throttles legitimate bursty traffic",
+    title: "The cap on concurrent retries that exhausts legitimate bursty traffic on the connection pool should be removed",
     file: "src/limiter.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "remove the cap",
   };
   assert.notEqual(findingKey(capRemovalFinding), capKey, "precondition: a genuinely different finding, not an exact-key repeat");
@@ -732,4 +741,30 @@ test("#464 mis-fire replay variant: the same fixture's finding, reworded to genu
   );
   assert.equal(partition.blocking.length, 0, "a true re-raise without acknowledgment must not block");
   assert.equal(partition.advisory[0]?.reason, "reversal-unacknowledged");
+});
+
+test("#464 review round 2: a distinct defect sharing only artifact/validation vocabulary with a settled finding remains blocking", () => {
+  // The settled finding is about rejecting malformed manifests at
+  // validation time. The new finding shares three tokens ("malformed
+  // artifact manifests") but is about a different concern entirely —
+  // downstream PR observability — not a re-raise.
+  const rejectFinding: ReviewFinding = {
+    severity: "high", title: "Reject malformed artifact manifests",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", confidence: 0.9, recommendation: "reject",
+  };
+  const round1 = formatReviewComment(
+    cfg, verdict([rejectFinding], SHA_1), 2, "codex", new Set([findingKey(rejectFinding)]),
+  );
+  const digest = buildPriorRoundDigest([{ author: "pipeline-bot", body: round1 }], { actor: "pipeline-bot" });
+  const settled = settledFindings(digest);
+
+  const prVisibilityFinding: ReviewFinding = {
+    severity: "high", confidence: 0.96, title: "Malformed artifact manifests are not reported to the PR",
+    file: "src/visual-gate/artifacts.ts", category: "correctness", body: "b", recommendation: "attach to the PR",
+  };
+  const partition = partitionFindings(
+    [prVisibilityFinding], { block_threshold: "low", min_confidence: 0 }, new Map(), [], new Map(), null, settled,
+  );
+  assert.equal(partition.blocking.length, 1, "distinct defect with overlapping vocabulary must block per policy");
+  assert.equal(partition.advisory.filter((a) => a.reason === "reversal-unacknowledged").length, 0);
 });
