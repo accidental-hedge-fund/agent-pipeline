@@ -30,14 +30,17 @@
 // cost/usage-bearing envelope line always arrives last.
 
 import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import { resolveAdapter } from "./harness-adapters/index.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
-import type { AdapterProbe } from "./harness-adapters/types.ts";
+import { MAX_ARG_STRLEN, type AdapterProbe } from "./harness-adapters/types.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
+
+export { MAX_ARG_STRLEN };
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
 
@@ -151,6 +154,13 @@ export interface HarnessResult {
   duration: number; // seconds
   timed_out: boolean;
   spawn_error?: boolean; // true when the process could not be spawned at all
+  // True when spawn_error is specifically the pre-spawn oversize-argv refusal
+  // (#492) — an argv element exceeded MAX_ARG_STRLEN, so the process was never
+  // spawned at all. Distinguishes "this invocation cannot succeed as shaped"
+  // from a transient/environmental spawn error such as a missing CLI, even
+  // though both set spawn_error: true (so the #39 self-review fallback, which
+  // only checks spawn_error, still applies).
+  oversize_argv?: boolean;
   // True when the output-capture stream (stdout/stderr) errored before a clean
   // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
   // Distinct from spawn_error: the process itself started successfully.
@@ -213,6 +223,16 @@ export interface InvokeOptions {
    * accept neither flag.
    */
   reasoningEffort?: string;
+  /**
+   * Prompt-delivery channel for an unregistered (custom reviewer, #40) harness
+   * name. Ignored for "claude"/"codex" and any other registered adapter, whose
+   * own `buildInvocation()` declares its channel. Defaults to `"argv"` — the
+   * prompt as a single positional argument, byte-for-byte the pre-#492
+   * behavior. `"stdin"` spawns the CLI with no prompt positional and writes
+   * the prompt to its standard input instead (#492 — `review_harness`'s
+   * opt-in stdin selection).
+   */
+  promptDelivery?: "argv" | "stdin";
   accounting?: {
     runDir: string;
     runStoreDeps?: RunStoreDeps;
@@ -243,13 +263,15 @@ export async function invoke(
 
   // #431: dispatch through the adapter registry rather than branching on
   // harness names. A name with no registered adapter takes the unregistered
-  // custom-reviewer-CLI path (#40) verbatim: `<cmd> <prompt>`.
+  // custom-reviewer-CLI path (#40) verbatim: `<cmd> <prompt>` by default.
   const adapter = resolveAdapter(harness);
   let cmd: string;
   let args: string[];
   let cwd: string;
   let captureMode: "head" | "tail" | undefined;
   let transformForward: ((chunk: string) => string) | undefined;
+  let stdinPayload: string | undefined;
+  let promptFile: { path: string; content: string } | undefined;
   const custom = adapter === null;
   if (adapter) {
     const inv = adapter.buildInvocation({
@@ -266,31 +288,50 @@ export async function invoke(
     cwd = inv.cwd;
     captureMode = inv.captureMode;
     transformForward = inv.transformForward;
+    if (inv.promptDelivery === "stdin") stdinPayload = inv.stdinPayload;
+    if (inv.promptDelivery === "file") promptFile = inv.promptFile;
   } else {
-    // A user-configured reviewer CLI (`review_harness`, #40). Invoke it with the
-    // prompt as a single positional argument; its stdout is the verdict output
-    // (parsed by parseStructuredVerdict, exactly like a built-in reviewer).
+    // A user-configured reviewer CLI (`review_harness`, #40). Its
+    // prompt-delivery channel defaults to the positional argument (#492 —
+    // byte-for-byte the pre-#492 shape); an operator whose CLI reads stdin can
+    // opt in via review_harness.prompt_delivery: stdin.
     cmd = harness;
-    args = [prompt];
     cwd = worktreeDir;
+    if (opts.promptDelivery === "stdin") {
+      args = [];
+      stdinPayload = prompt;
+    } else {
+      args = [prompt];
+    }
   }
 
+  // #492: materialize a file-channel prompt under the managed worktree root
+  // before spawn; always removed after the call completes, spawn or not.
+  if (promptFile) await fs.writeFile(promptFile.path, promptFile.content, "utf8");
+
   const startedAt = new Date();
-  const result = await runCapped(cmd, args, cwd, timeoutSec, stream, harness, {
-    killProcessGroup: true,
-    timeoutEvent: opts.accounting
-      ? {
-          runDir: opts.accounting.runDir,
-          runStoreDeps: opts.accounting.runStoreDeps,
-          stage: opts.accounting.stage,
-        }
-      : undefined,
-    env: opts.env,
-    // The cost/usage-bearing envelope line always arrives last, so telemetry
-    // capture keeps the tail of the stream rather than the head (#429).
-    captureMode,
-    transformForward,
-  });
+  let result: HarnessResult;
+  try {
+    result = await runCapped(cmd, args, cwd, timeoutSec, stream, harness, {
+      killProcessGroup: true,
+      timeoutEvent: opts.accounting
+        ? {
+            runDir: opts.accounting.runDir,
+            runStoreDeps: opts.accounting.runStoreDeps,
+            stage: opts.accounting.stage,
+          }
+        : undefined,
+      env: opts.env,
+      // The cost/usage-bearing envelope line always arrives last, so telemetry
+      // capture keeps the tail of the stream rather than the head (#429).
+      captureMode,
+      transformForward,
+      stdinPayload,
+    });
+  } finally {
+    // Remove exactly the file this call created (#492), spawn or not.
+    if (promptFile) await fs.rm(promptFile.path, { force: true });
+  }
   const endedAt = new Date();
 
   // Recover per-call cost/usage from the captured envelope and reconstruct the
@@ -367,6 +408,16 @@ export async function invoke(
       record,
       opts.accounting.runStoreDeps,
     ).catch(() => {});
+  }
+  // #492: an oversize-argv refusal is a distinct, actionable failure — the CLI
+  // WAS found, the prompt was simply too large for a positional argument. Name
+  // the review_harness remedy instead of the "not found" message below, which
+  // would be misleading here.
+  if (custom && finalResult.oversize_argv) {
+    return {
+      ...finalResult,
+      stderr: `${finalResult.stderr}\nRemedy: set review_harness.prompt_delivery: stdin for '${harness}' if it reads its prompt from standard input.`,
+    };
   }
   // When a configured reviewer CLI cannot be spawned at all (ENOENT / not
   // executable), surface a specific, actionable message that names the CLI —
@@ -464,9 +515,42 @@ export async function runCapped(
     // Absent by default: chunks are forwarded verbatim, matching pre-#429
     // behavior exactly.
     transformForward?: (chunk: string) => string;
+    // Payload to write to the child's standard input, then end the stream
+    // (#492). When present, stdio[0] becomes "pipe" instead of "ignore" —
+    // this is the ONLY condition under which the child's stdin is opened, so
+    // every existing caller with no stdin payload keeps stdin: "ignore"
+    // byte-for-byte.
+    stdinPayload?: string;
   } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
+
+  // #492: pre-spawn oversize-argv guard. Linux's execve() rejects a single
+  // argv element larger than MAX_ARG_STRLEN with E2BIG; left unguarded, that
+  // surfaces a few seconds later as a bare spawn_error that reads as
+  // transient (missing CLI, permissions) when it is neither — retrying the
+  // same invocation can never succeed. Refuse before spawning with a named,
+  // actionable failure instead.
+  for (const arg of args) {
+    const byteLength = Buffer.byteLength(arg, "utf8");
+    if (byteLength <= MAX_ARG_STRLEN) continue;
+    return Promise.resolve({
+      success: false,
+      stdout: "",
+      stderr:
+        `[harness ${label}] argument exceeds the OS per-argument limit: this invocation would pass ` +
+        `a ${byteLength}-byte argument, but a single command-line argument cannot exceed ` +
+        `${MAX_ARG_STRLEN} bytes (Linux MAX_ARG_STRLEN). This is not a transient failure — retrying ` +
+        `the same invocation cannot succeed. Deliver this payload via standard input or a file ` +
+        `instead of a positional argument.`,
+      exit_code: -1,
+      duration: 0,
+      timed_out: false,
+      spawn_error: true,
+      oversize_argv: true,
+    });
+  }
+
   return new Promise<HarnessResult>((resolvePromise) => {
     const killProcessGroup = opts.killProcessGroup ?? false;
     // Grace period (seconds) between SIGTERM and SIGKILL on timeout. Configurable
@@ -485,7 +569,9 @@ export async function runCapped(
     try {
       child = spawnImpl(cmd, args, {
         cwd,
-        stdio: ["ignore", "pipe", "pipe"],
+        // #492: stdin is opened only when this invocation carries a stdin
+        // payload — every other caller keeps stdin: "ignore" byte-for-byte.
+        stdio: [opts.stdinPayload !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
         // detached creates a new process group so we can kill all descendants on timeout
         ...(killProcessGroup ? { detached: true } : {}),
         // Merge in caller-supplied env additions (#419) on top of the inherited
@@ -546,6 +632,15 @@ export async function runCapped(
       }
     };
 
+    // A stdin write/EPIPE failure (#492) is a diagnostic, like a forward-stream
+    // failure — never let it masquerade as a gate/verdict outcome; the command's
+    // own exit code (or lack of one) still drives the result.
+    let stdinNote = "";
+    const onStdinError = (err: Error) => {
+      if (stdinNote) return;
+      stdinNote = `[harness ${label}] stdin write error (diagnostic; command outcome unaffected): ${err.message}`;
+    };
+
     const settle = (result: HarnessResult) => {
       if (settled) return;
       settled = true;
@@ -557,10 +652,11 @@ export async function runCapped(
         fwd.stdout.off("error", onForwardError);
         fwd.stderr.off("error", onForwardError);
       }
-      if (forwardNote) {
+      const notes = [forwardNote, stdinNote].filter(Boolean).join("\n");
+      if (notes) {
         result = {
           ...result,
-          stderr: result.stderr ? `${result.stderr}\n${forwardNote}` : forwardNote,
+          stderr: result.stderr ? `${result.stderr}\n${notes}` : notes,
         };
       }
       resolvePromise(result);
@@ -683,6 +779,13 @@ export async function runCapped(
       }
       if (stream) safeForward(fwd.stderr, text);
     });
+
+    // #492: write the stdin payload and end the stream now that stdout/stderr
+    // readers are attached, so nothing can be missed before the write.
+    if (opts.stdinPayload !== undefined && child.stdin) {
+      child.stdin.on("error", onStdinError);
+      child.stdin.end(opts.stdinPayload, "utf8");
+    }
 
     // A capture stream erroring mid-run (e.g. the pipe breaking before the
     // process exit is observed) is a tooling failure, not a genuine test

@@ -1,12 +1,19 @@
-// claude adapter — reproduces the pre-adapter argv byte-for-byte (#431 task 2.1).
+// claude adapter — reproduces the pre-adapter argv byte-for-byte apart from
+// prompt delivery (#431 task 2.1; #492 moved the prompt off argv).
 //
 // claude: claude --print --permission-mode bypassPermissions --verbose
 //         --output-format stream-json --include-partial-messages
-//         [--tools "" --strict-mcp-config] [--model X] [--effort Y] <prompt>
+//         [--tools "" --strict-mcp-config] [--model X] [--effort Y]
+//         (prompt delivered on stdin, not as a positional)
 //
 // #429: telemetry mode (`--verbose --output-format stream-json
 // --include-partial-messages`) is the default; PIPELINE_HARNESS_TELEMETRY=off
 // restores the pre-#429 plain-text argv (`--output-format text`).
+//
+// #492: `claude --print` reads the prompt from stdin when no positional
+// prompt is given (verified locally: `printf '…' | claude --print
+// --output-format text` returns the model's reply) — MAX_ARG_STRLEN can never
+// be hit for this adapter, regardless of prompt size.
 
 import {
   EMPTY_TELEMETRY,
@@ -129,13 +136,14 @@ export const claudeAdapter: HarnessAdapter = {
     }
     if (ctx.model) args.push("--model", ctx.model);
     if (ctx.effort) args.push("--effort", ctx.effort);
-    args.push(ctx.prompt);
     return {
       cmd: "claude",
       args,
       cwd: ctx.worktreeDir,
       captureMode: telemetryMode ? "tail" : undefined,
       transformForward: telemetryMode ? makeClaudeForwardTransform() : undefined,
+      promptDelivery: "stdin",
+      stdinPayload: ctx.prompt,
     };
   },
 

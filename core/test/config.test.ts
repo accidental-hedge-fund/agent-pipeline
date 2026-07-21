@@ -57,7 +57,7 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerModelWasAuto: false, reviewerEffort: undefined });
+    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerModelWasAuto: false, reviewerEffort: undefined, reviewerPromptDelivery: "argv" });
     assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
     process.env.PATH = oldPath;
@@ -3046,6 +3046,66 @@ test("resolveConfig: review_harness (string shorthand) leaves reviewerModel/revi
     assert.equal(cfg.harnesses.reviewer, "claude");
     assert.equal(cfg.harnesses.reviewerModel, undefined);
     assert.equal(cfg.harnesses.reviewerEffort, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+// ---- review_harness.prompt_delivery (#492) ----
+
+test("resolveConfig: structured review_harness with prompt_delivery: stdin resolves reviewerPromptDelivery to 'stdin'", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: my-reviewer\n  prompt_delivery: stdin\n`);
+  const binDir = makeFakeGh("acme/rhpromptdelivery1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewerPromptDelivery, "stdin");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: structured review_harness without prompt_delivery defaults reviewerPromptDelivery to 'argv' (byte-for-byte the pre-#492 default)", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: my-reviewer\n  model: auto\n`);
+  const binDir = makeFakeGh("acme/rhpromptdelivery2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewerPromptDelivery, "argv");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness (string shorthand) resolves reviewerPromptDelivery to 'argv'", async () => {
+  const repo = makeFakeRepo(`review_harness: my-reviewer\n`);
+  const binDir = makeFakeGh("acme/rhpromptdelivery3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewerPromptDelivery, "argv");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_harness.prompt_delivery rejects a value other than argv/stdin (strict enum)", async () => {
+  const repo = makeFakeRepo(`review_harness:\n  command: my-reviewer\n  prompt_delivery: file\n`);
+  const binDir = makeFakeGh("acme/rhpromptdelivery4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => /Invalid .*pipeline\.yml/.test(err.message),
+    );
   } finally {
     process.env.PATH = oldPath;
   }

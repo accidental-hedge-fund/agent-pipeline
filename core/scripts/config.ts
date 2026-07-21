@@ -398,11 +398,17 @@ const PartialConfigSchema = z.object({
           command: z.string().describe("Reviewer CLI command (profile default when the whole review_harness key is absent)."),
           model: modelOrAuto.optional().describe("Model override for the reviewer, or \"auto\"."),
           effort: modelOrAuto.optional().describe("Reasoning-effort override for the reviewer, or \"auto\" (resolved round-aware: review-1 Iterative, review-2/plan-review Definitive)."),
+          // #492: prompt-delivery channel for a custom reviewer CLI. Default
+          // (absent, or "argv") stays the pre-#492 `<cmd> <prompt>` positional
+          // shape byte-for-byte; "stdin" opts a CLI that reads its prompt from
+          // standard input into that channel instead, which also sidesteps
+          // the MAX_ARG_STRLEN per-argument limit for arbitrarily large prompts.
+          prompt_delivery: z.enum(["argv", "stdin"]).optional().describe("How the prompt reaches this custom reviewer CLI: \"argv\" (default) as a positional argument, or \"stdin\" written to standard input (avoids the OS per-argument size limit)."),
         })
         .strict(),
     ])
     .optional()
-    .describe("Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort? } for independent reviewer model/effort control."),
+    .describe("Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control."),
   conventions_md_path: z.string().optional().describe("Repo-root-relative path to the conventions file embedded in stage prompts."),
   domain_name: z.string().optional().describe("Human-readable project name used in prompts and logs."),
   domain_description: z.string().optional().describe("Short description of this repository for prompt context."),
@@ -759,6 +765,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   const reviewerCommand = typeof reviewHarnessCfg === "string" ? reviewHarnessCfg : reviewHarnessCfg?.command;
   const reviewerModelRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.model : undefined;
   const reviewerEffortRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.effort : undefined;
+  // #492: defaults to "argv" — the pre-#492 `<cmd> <prompt>` positional shape.
+  const reviewerPromptDelivery =
+    typeof reviewHarnessCfg === "object" ? (reviewHarnessCfg.prompt_delivery ?? "argv") : "argv";
   const implementerHarness = profile.harnesses.implementer;
 
   const merged: PipelineConfig = {
@@ -802,6 +811,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       reviewerModel: expandAutoModel(reviewerModelRaw, "review-2", "claude"),
       reviewerModelWasAuto: reviewerModelRaw === "auto",
       reviewerEffort: reviewerEffortRaw,
+      reviewerPromptDelivery,
     },
     models: {
       planning: expandAutoModel(fileConfig.models?.planning, "planning", implementerHarness) ?? DEFAULT_CONFIG.models.planning,
@@ -1680,17 +1690,18 @@ function renderEffortLines(effort: PartialConfig["effort"]): string {
  *  structured `{ command, model?, effort? }` form (#366). */
 function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]): string {
   if (reviewHarness === undefined) {
-    return "# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)";
+    return "# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort/prompt-delivery control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)\n#   prompt_delivery: argv # or \"stdin\" if the CLI reads its prompt from standard input (avoids the OS per-argument size limit)";
   }
   if (typeof reviewHarness === "string") {
     return `review_harness: ${yamlScalar(reviewHarness)} # override the reviewer CLI for the review step`;
   }
   const lines = [
-    "review_harness: # override the reviewer CLI, and optionally its model/effort (#366)",
+    "review_harness: # override the reviewer CLI, and optionally its model/effort/prompt-delivery (#366, #492)",
     `  command: ${yamlScalar(reviewHarness.command)}`,
   ];
   if (reviewHarness.model !== undefined) lines.push(`  model: ${yamlScalar(reviewHarness.model)} # or "auto"`);
   if (reviewHarness.effort !== undefined) lines.push(`  effort: ${yamlScalar(reviewHarness.effort)} # or "auto" (round-aware: review-1 Iterative, review-2/plan-review Definitive)`);
+  if (reviewHarness.prompt_delivery !== undefined) lines.push(`  prompt_delivery: ${yamlScalar(reviewHarness.prompt_delivery)} # "argv" (default) or "stdin"`);
   return lines.join("\n");
 }
 

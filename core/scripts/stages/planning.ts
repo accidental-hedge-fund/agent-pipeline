@@ -605,6 +605,7 @@ export async function runPlanningPhases(
             model: planReviewModel,
             reasoningEffort: planReviewEffort,
             accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
+            promptDelivery: cfg.harnesses.reviewerPromptDelivery,
           });
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out

@@ -1,7 +1,7 @@
 // grok adapter — Grok Build CLI (#431 task 3). Argv verified on-machine
 // against an installed `grok 0.2.93 (f00f9631)` (design.md decision 4):
 //
-//   grok --single <PROMPT> --cwd <CWD> --output-format plain --verbatim
+//   grok --prompt-file <PATH> --cwd <CWD> --output-format plain --verbatim
 //        --permission-mode <mode> [-m <model>] [--reasoning-effort <effort>]
 //
 // `--output-format json/streaming-json` exist but their payload SCHEMA is not
@@ -12,7 +12,14 @@
 // third-party reviewer CLI already received. `parseTelemetry` degrades to
 // nulls, same as no telemetry data at all — cost stays `cost_source:
 // "unknown"`, unchanged from today's custom-CLI accounting.
+//
+// #492: `grok --help` documents `--prompt-file <PATH>` ("Single-turn prompt
+// from a file") — the prompt no longer needs to fit in a single argv element.
+// `runCapped`/`invoke()` materialize the file under the managed worktree root
+// before spawn and remove it after the call completes.
 
+import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import {
   EMPTY_TELEMETRY,
   type AdapterCapabilities,
@@ -40,9 +47,12 @@ export const grokAdapter: HarnessAdapter = {
   capabilities: CAPABILITIES,
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
+    // Pipeline-owned prompt file under the managed worktree root — the runner
+    // materializes it before spawn and removes exactly this file afterward.
+    const promptFilePath = path.join(ctx.worktreeDir, `.pipeline-prompt-${randomUUID()}.txt`);
     const args = [
-      "--single",
-      ctx.prompt,
+      "--prompt-file",
+      promptFilePath,
       "--cwd",
       ctx.worktreeDir,
       "--output-format",
@@ -53,7 +63,13 @@ export const grokAdapter: HarnessAdapter = {
     ];
     if (ctx.model) args.push("-m", ctx.model);
     if (ctx.effort) args.push("--reasoning-effort", ctx.effort);
-    return { cmd: "grok", args, cwd: ctx.worktreeDir };
+    return {
+      cmd: "grok",
+      args,
+      cwd: ctx.worktreeDir,
+      promptDelivery: "file",
+      promptFile: { path: promptFilePath, content: ctx.prompt },
+    };
   },
 
   async preflight(deps: AdapterPreflightDeps, _req: AdapterRequest): Promise<AdapterPreflightResult> {

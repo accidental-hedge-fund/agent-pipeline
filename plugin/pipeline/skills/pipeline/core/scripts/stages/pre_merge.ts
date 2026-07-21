@@ -2014,6 +2014,8 @@ async function defaultRunDeltaReview(
             modelSlot: "review",
           }
         : undefined,
+      // #492: opt-in prompt-delivery channel for a custom reviewer CLI.
+      promptDelivery: cfg.harnesses.reviewerPromptDelivery,
     },
   );
   if (!invocation.result.success) {

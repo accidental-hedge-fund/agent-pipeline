@@ -50,11 +50,13 @@ Golden rule 5. Verified at proposal time:
 | `claude` | stdin (drop the positional) | `printf '…' \| claude --print --output-format text` returns the model's reply locally |
 | `codex` | stdin with the documented `-` sentinel | `codex exec --help`: "Initial instructions … If not provided as an argument (or if `-` is used), instructions are read from stdin" |
 | `grok` | file via `--prompt-file <PATH>` | `grok --help` lists `--prompt-file <PATH>` — "Single-turn prompt from a file" |
-| `pi` | to be read from `pi --help` at implementation time | CLI not installed on the authoring machine; not guessed |
-| `opencode` | to be read from `opencode run --help` at implementation time | same |
+| `pi` | argv (no alternative documented) | `npx --yes @mariozechner/pi-coding-agent --help` (implementation time, CLI not installed locally): the `-p`/`--print` message positional has no stdin/file alternative; `@file` arguments attach file content alongside a message, they do not replace it |
+| `opencode` | argv (no alternative documented) | `npx --yes opencode-ai@latest run --help` (implementation time, CLI not installed locally): the `message` positional has no stdin/file alternative; `-f/--file` attaches a file alongside the message, it does not replace it |
 
 Any adapter whose CLI documents neither a stdin nor a file channel keeps `argv` and relies on
-decision 4; that limitation is recorded in this file when implementation confirms it.
+decision 4. Confirmed for `pi` and `opencode` at implementation time (#492): neither CLI's headless
+interface documents a channel other than the positional message argument, so both adapters declare
+`promptDelivery: "argv"` explicitly and are protected only by the pre-spawn oversize guard.
 
 ### 3. `runCapped` opens stdin only when there is a payload
 

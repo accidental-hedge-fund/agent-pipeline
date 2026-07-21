@@ -784,24 +784,27 @@ By default the review step runs on the profile's cross-harness reviewer (`codex`
 review_harness: my-reviewer          # any CLI on your PATH
 ```
 
-When set, every review round (plan-review, review-1, review-2) invokes `my-reviewer` in place of the profile reviewer. The pipeline calls it as `my-reviewer "<prompt>"` — the JSON-returning verdict prompt is passed as a single positional argument — and reads the CLI's **stdout** as the review output. A custom reviewer must therefore:
+When set, every review round (plan-review, review-1, review-2) invokes `my-reviewer` in place of the profile reviewer. By default the pipeline calls it as `my-reviewer "<prompt>"` — the JSON-returning verdict prompt is passed as a single positional argument — and reads the CLI's **stdout** as the review output. A custom reviewer must therefore:
 
-- **Read the prompt from its first positional argument** and run the requested review.
+- **Read the prompt from its first positional argument** (or from stdin — see `prompt_delivery` below) and run the requested review.
 - **Print a fenced JSON verdict block on stdout** matching the schema the pipeline gates on — `{"verdict": "approve" | "needs-attention", "summary": …, "findings": […], "next_steps": […]}` (the same `{{schema_block}}` a built-in reviewer returns; see `core/scripts/review-schema.ts`). Findings drive the severity policy exactly as with a built-in reviewer.
 - **Be an installed/authenticated CLI** — no API key is introduced; like `claude`/`codex`, the reviewer brings its own auth.
 
 If the configured CLI is **not installed or not executable**, the review step fails with a specific, named reason (`reviewer CLI 'my-reviewer' not found or not executable — ensure it is installed and on PATH`) and the [same-harness fallback](#prerequisites) applies — the implementing harness reviews instead, prominently labeled. When `review_harness` is absent, the profile's reviewer is used unchanged.
 
-`review_harness` also accepts a structured form to control the reviewer's model and reasoning effort independently of `models.review`/`effort.review`:
+`review_harness` also accepts a structured form to control the reviewer's model, reasoning effort, and prompt-delivery channel independently of `models.review`/`effort.review`:
 
 ```yaml
 review_harness:
   command: claude
   model: auto           # or an explicit alias, e.g. claude-fable-5
   effort: auto           # or an explicit level, e.g. high
+  prompt_delivery: stdin # optional: "argv" (default) or "stdin"
 ```
 
-`model`/`effort` here take precedence over `models.review`/`effort.review` when set. `"auto"` resolves round-aware: plan-review and review-2 are classified Adversarial/Definitive (`max`), review-1 is Adversarial/Iterative (`high`) — see "Auto model/effort routing" below. The bare string shorthand (`review_harness: my-reviewer`) is unchanged and leaves the reviewer's model/effort sourced from `models.review`/`effort.review`.
+`model`/`effort` here take precedence over `models.review`/`effort.review` when set. `"auto"` resolves round-aware: plan-review and review-2 are classified Adversarial/Definitive (`max`), review-1 is Adversarial/Iterative (`high`) — see "Auto model/effort routing" below. The bare string shorthand (`review_harness: my-reviewer`) is unchanged and leaves the reviewer's model/effort/prompt-delivery sourced from `models.review`/`effort.review`/the `argv` default.
+
+**`prompt_delivery`** (default `argv`): a review prompt built from a large diff can exceed Linux's `MAX_ARG_STRLEN` (131,072 bytes) — the maximum size of a single command-line argument. On the default `argv` delivery, a prompt over that size is refused **before spawning** with a named error stating the limit, the measured prompt size, and this setting as the remedy — never a bare, transient-looking spawn failure. If your custom reviewer CLI reads its prompt from standard input, set `prompt_delivery: stdin` to sidestep the limit entirely: the CLI is spawned with no prompt positional and the full prompt is written to its stdin instead, regardless of size.
 
 ### Auto model/effort routing (`auto`)
 
