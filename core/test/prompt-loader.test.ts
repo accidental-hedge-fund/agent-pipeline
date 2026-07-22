@@ -10,6 +10,7 @@ import {
   _testing,
   buildEvalFixPrompt,
   buildFixPrompt,
+  buildFixResumptionPreamble,
   buildImplementingPrompt,
   buildIntakePrompt,
   buildPlanningOpenspecPrompt,
@@ -1482,6 +1483,26 @@ test("review prompts: both embed the non-blocking guidance block byte-for-byte (
     assert.match(out, /blocking.*false|false.*blocking/i, `${name} prompt must document the blocking:false field`);
     assert.match(out, /[Oo]ut-of-scope|pre-existing|[Ii]nformational/, `${name} prompt must describe when to mark non-blocking`);
   }
+});
+
+// #486: fix-crash resumption preamble drift test — bites if the instruction to
+// resume (rather than discard) a crashed attempt's uncommitted work is weakened
+// or removed from buildFixResumptionPreamble.
+test("fix resumption preamble: states in-progress work exists, lists changed paths, and forbids discard/reset/restart (#486)", () => {
+  const out = buildFixResumptionPreamble(" M core/scripts/service.ts\n?? core/test/service.test.ts\n", 2);
+  assert.match(out, /crashed/i, "preamble must state that a previous attempt crashed");
+  assert.match(out, /UNCOMMITTED, in-progress work/, "preamble must call out the work as uncommitted and in-progress");
+  assert.match(out, /`core\/scripts\/service\.ts`/, "preamble must list the changed paths");
+  assert.match(out, /`core\/test\/service\.test\.ts`/, "preamble must list the changed paths");
+  assert.match(out, /COMPLETE it/, "preamble must instruct the harness to complete the work");
+  assert.match(out, /Do NOT discard it/i, "preamble must forbid discarding the work");
+  assert.match(out, /git checkout/, "preamble must forbid git checkout on the in-progress work");
+  assert.match(out, /git restore/, "preamble must forbid git restore on the in-progress work");
+  assert.match(out, /git clean/, "preamble must forbid git clean on the in-progress work");
+  assert.match(out, /restart the fix from scratch/i, "preamble must forbid restarting the fix from scratch");
+});
+test("fix resumption preamble: clean worktree → empty string, so the retry prompt stays byte-identical to the first attempt's (#486)", () => {
+  assert.equal(buildFixResumptionPreamble("", 2), "");
 });
 
 // #235: surgical-fix discipline drift tests — each assertion bites if the corresponding

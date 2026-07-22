@@ -163,6 +163,24 @@ export interface HarnessTimeoutEvent extends RunEventBase {
   stage: string;
   timeout_sec: number;
 }
+/** A fix-stage harness crashed (non-zero exit, not a timeout) and was retried
+ *  in place with its in-progress worktree work preserved (#486). One event
+ *  per retry actually invoked — not emitted for the initial attempt, and not
+ *  emitted for a crash that exhausts the retry cap/budget without a further
+ *  retry (that path's `human_intervention`/blocked-label events already
+ *  cover it). `attempt`/`max_attempts` are 1-indexed total-attempt counts
+ *  (e.g. `attempt: 2, max_attempts: 3` means retry 1 of up to 2 additional
+ *  attempts). `exit_code`/`remaining_budget_sec`/`worktree_dirty` describe
+ *  the crashed attempt that triggered this retry and the retry about to run. */
+export interface FixHarnessRecoveryEvent extends RunEventBase {
+  type: "fix_harness_recovery";
+  stage: string;
+  attempt: number;
+  max_attempts: number;
+  exit_code: number;
+  remaining_budget_sec: number;
+  worktree_dirty: boolean;
+}
 /** Advisory warning (#445): a harness commit step left a gitignored file
  *  uncommitted that is referenced by name in the committed diff. Never blocks
  *  and never changes stage advance/blocking semantics — purely informational
@@ -221,6 +239,7 @@ export type RunEvent =
   | GhMetricsSummaryEvent
   | StageAccountingEvent
   | HarnessTimeoutEvent
+  | FixHarnessRecoveryEvent
   | IgnoredArtifactWarningEvent
   | PapercutEvent
   | ReversalUnacknowledgedEvent

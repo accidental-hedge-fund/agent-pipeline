@@ -27,10 +27,10 @@ import {
   type ScopedOverride,
 } from "../review-policy.ts";
 import * as path from "node:path";
-import { invoke, papercutIdentityEnv } from "../harness.ts";
+import { invoke, papercutIdentityEnv, type HarnessResult } from "../harness.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
-import { buildFixPrompt } from "../prompts/index.ts";
+import { buildFixPrompt, buildFixResumptionPreamble } from "../prompts/index.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
@@ -43,7 +43,7 @@ import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
-import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
+import { makePromptRecord, recordPrompt, recordRecovery } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -127,6 +127,25 @@ export interface AdvanceFixDeps {
    * inject a fake so no real git fetch/subprocess runs.
    */
   verifyCommitOnRemote?: (wtPath: string, branch: string, sha: string) => Promise<boolean>;
+  /**
+   * Fix-harness-crash recovery seam (#486): injectable clock, worktree-status,
+   * and harness-invocation functions for the crash-retry loop
+   * ({@link runFixHarnessWithCrashRecovery}). Absent fields fall back to the
+   * real `Date.now`, `git status --porcelain`, and the production `invoke()`
+   * call respectively. Tests inject all three so the loop is driven entirely
+   * through fakes — no real subprocess, git, or network call.
+   */
+  fixCrashRecovery?: FixCrashRecoveryDeps;
+}
+
+/** Injectable seams for {@link runFixHarnessWithCrashRecovery} — see {@link AdvanceFixDeps.fixCrashRecovery}. */
+export interface FixCrashRecoveryDeps {
+  /** Monotonic-ish wall-clock reader (ms), used to track budget consumed across attempts. */
+  now?: () => number;
+  /** `git status --porcelain` output for the worktree ("" when clean). */
+  worktreeStatus?: (wtPath: string) => Promise<string>;
+  /** Invokes the fix harness once for the given (possibly preamble-prefixed) prompt and per-attempt timeout. */
+  invokeHarness?: (prompt: string, timeoutSec: number, attempt: number) => Promise<HarnessResult>;
 }
 
 /**
@@ -139,6 +158,189 @@ export interface AdvanceFixDeps {
  */
 export function fixHarnessFailureOutcome(reason: string): Outcome {
   return { advanced: false, status: "blocked", reason, blockerKind: "harness-failure" };
+}
+
+// ---------------------------------------------------------------------------
+// Fix-harness-crash recovery (#486) — bounded, budget-aware, work-preserving
+// retry of a crashed fix-stage harness invocation.
+// ---------------------------------------------------------------------------
+
+/** Floor below which a retry is not attempted, even if the cap allows another attempt (#486). */
+export const MIN_RETRY_BUDGET_SEC = 60;
+
+/**
+ * A fix-harness result is a **crash** (as opposed to a timeout or success) when
+ * the process exited non-zero without the stage budget being exhausted. Only a
+ * crash is retried; a timeout means the stage budget was actually spent doing
+ * work and is left to #398. Fail closed: any result that cannot be classified
+ * as a crash (i.e. `timed_out === true`, or `success === true`) is not a crash.
+ */
+export function isFixHarnessCrash(result: Pick<HarnessResult, "success" | "timed_out">): boolean {
+  return result.success === false && result.timed_out !== true;
+}
+
+/** Remaining fix-round wall-clock budget after `elapsedSec` has been spent, never negative. */
+export function remainingFixBudgetSec(fixTimeoutSec: number, elapsedSec: number): number {
+  return Math.max(0, fixTimeoutSec - elapsedSec);
+}
+
+/** Decision from {@link shouldRetryFixHarness} — whether to invoke another attempt. */
+export type FixRetryDecision =
+  | { retry: true; timeoutSec: number }
+  | { retry: false; reason?: string };
+
+/**
+ * Whether a crashed fix-harness attempt should be retried, and if so with what
+ * per-attempt timeout. `attempt` is the 1-indexed attempt that just completed
+ * (1 = the initial, non-retry invocation). Retrying stops when: the result was
+ * not a crash, the retry cap (`maxRetries` additional attempts) is exhausted,
+ * or the remaining stage budget falls below {@link MIN_RETRY_BUDGET_SEC}.
+ *
+ * The cap-exhausted case returns no `reason` — with `maxRetries: 0` this keeps
+ * a crash's block reason byte-identical to today's (#486 acceptance: retries
+ * disabled reproduces today's single-shot behavior exactly). The budget-floor
+ * case DOES return a reason, since the caller must surface budget exhaustion
+ * even when it is hit on the very first attempt.
+ */
+export function shouldRetryFixHarness(opts: {
+  crash: boolean;
+  attempt: number;
+  maxRetries: number;
+  remainingSec: number;
+}): FixRetryDecision {
+  if (!opts.crash) return { retry: false };
+  if (opts.attempt > opts.maxRetries) return { retry: false };
+  if (opts.remainingSec < MIN_RETRY_BUDGET_SEC) {
+    return {
+      retry: false,
+      reason:
+        `remaining stage budget (${opts.remainingSec.toFixed(0)}s) is below the ` +
+        `${MIN_RETRY_BUDGET_SEC}s minimum retry floor`,
+    };
+  }
+  return { retry: true, timeoutSec: opts.remainingSec };
+}
+
+/**
+ * Builds the block reason for a fix-harness failure, naming the attempt count
+ * and any exhaustion reason when a retry loop ran (#486). A single-attempt
+ * failure (no retries configured, or the failure was a timeout) returns
+ * exactly today's `exit <code>` / `timed out after <N>s` string, unchanged.
+ */
+export function fixHarnessCrashBlockReason(
+  result: Pick<HarnessResult, "timed_out" | "exit_code" | "duration">,
+  attempts: number,
+  exhaustionReason?: string,
+): string {
+  const base = result.timed_out
+    ? `timed out after ${result.duration.toFixed(0)}s`
+    : `exit ${result.exit_code}`;
+  if (attempts <= 1 && !exhaustionReason) return base;
+  const attemptsNote = attempts > 1 ? ` after ${attempts} attempts` : "";
+  const budgetNote = exhaustionReason ? ` (${exhaustionReason})` : "";
+  return `${base}${attemptsNote}${budgetNote}`;
+}
+
+async function defaultFixWorktreeStatus(wtPath: string): Promise<string> {
+  // ignoreFailure: a failing `git status` reads as clean → no preamble, the
+  // retry prompt stays byte-identical to the first attempt's (never worse).
+  const res = await gitInWorktree(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
+  return res.stdout;
+}
+
+/** Result of {@link runFixHarnessWithCrashRecovery}. */
+export interface FixCrashRecoveryOutcome {
+  result: HarnessResult;
+  /** Total number of harness invocations made (1 = no retry occurred). */
+  attempts: number;
+  /** Set only when a crash ended the loop without a further retry being possible. */
+  exhaustionReason?: string;
+}
+
+/**
+ * Bounded retry loop around a fix-harness invocation (#486). Retries only a
+ * crash (see {@link isFixHarnessCrash}), capped at `maxRetries` additional
+ * attempts and bounded by the fix round's remaining wall-clock budget (see
+ * {@link shouldRetryFixHarness}). Before each retry, prefixes the base prompt
+ * with a resumption preamble when the worktree is dirty (uncommitted work from
+ * the crashed attempt), and records a `fix_harness_recovery` event + evidence
+ * `RecoveryRecord` for that retry. Issues no git command itself — the crashed
+ * attempt's uncommitted work is left exactly as the harness left it.
+ */
+export async function runFixHarnessWithCrashRecovery(args: {
+  issueNumber: number;
+  stage: Stage;
+  wtPath: string;
+  basePrompt: string;
+  fixTimeoutSec: number;
+  maxRetries: number;
+  invokeHarness: (prompt: string, timeoutSec: number, attempt: number) => Promise<HarnessResult>;
+  now: () => number;
+  worktreeStatus: (wtPath: string) => Promise<string>;
+  runDir?: string;
+  runStoreDeps?: RunStoreDeps;
+  stateDir?: string;
+}): Promise<FixCrashRecoveryOutcome> {
+  let attempt = 1;
+  let elapsedSec = 0;
+  let currentPrompt = args.basePrompt;
+
+  for (;;) {
+    const timeoutSec = remainingFixBudgetSec(args.fixTimeoutSec, elapsedSec);
+    const start = args.now();
+    const result = await args.invokeHarness(currentPrompt, timeoutSec, attempt);
+    elapsedSec += (args.now() - start) / 1000;
+
+    if (result.success || !isFixHarnessCrash(result)) {
+      return { result, attempts: attempt };
+    }
+
+    const decision = shouldRetryFixHarness({
+      crash: true,
+      attempt,
+      maxRetries: args.maxRetries,
+      remainingSec: remainingFixBudgetSec(args.fixTimeoutSec, elapsedSec),
+    });
+    if (!decision.retry) {
+      return { result, attempts: attempt, exhaustionReason: decision.reason };
+    }
+
+    const status = await args.worktreeStatus(args.wtPath);
+    const dirty = status.trim().length > 0;
+    const nextAttempt = attempt + 1;
+    const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+
+    // Recording is best-effort and gated on runDir/stateDir being configured
+    // (#486), so unit tests produce no filesystem side effects.
+    if (args.runDir) {
+      await appendEvent(
+        args.runDir,
+        {
+          schema_version: RUN_SCHEMA_VERSION,
+          type: "fix_harness_recovery",
+          at,
+          stage: args.stage,
+          attempt: nextAttempt,
+          max_attempts: args.maxRetries + 1,
+          exit_code: result.exit_code,
+          remaining_budget_sec: Math.round(decision.timeoutSec),
+          worktree_dirty: dirty,
+        },
+        args.runStoreDeps,
+      ).catch(() => {});
+    }
+    if (args.stateDir) {
+      await recordRecovery(args.stateDir, args.issueNumber, {
+        trigger: "fix-harness-crash",
+        round: nextAttempt,
+        at,
+      }).catch(() => {});
+    }
+
+    const preamble = buildFixResumptionPreamble(status, nextAttempt);
+    currentPrompt = preamble ? preamble + args.basePrompt : args.basePrompt;
+    attempt = nextAttempt;
+  }
 }
 
 /** Decision from {@link decideExternalCommitAdvance} — either advance to the round's next stage, or fall through to the existing no-commits block. */
@@ -431,34 +633,62 @@ export async function advanceFix(
     },
     opts.executorHttpDeps,
   );
-  const result = delegated ?? await invoke(harness, wt.path, prompt, {
-    timeoutSec: cfg.fix_timeout,
-    model,
-    reasoningEffort: cfg.effort?.fix,
-    sandbox: cfg.harness_sandbox,
-    accounting: opts.runDir
-      ? {
-          runDir: opts.runDir,
-          runStoreDeps: opts.runStoreDeps,
-          issue: issueNumber,
-          stage,
-          modelSlot: "fix",
-          model,
-        }
-      : undefined,
-    env: papercutIdentityEnv(cfg, {
-      runId: opts.runDir ? path.basename(opts.runDir) : null,
-      issue: issueNumber,
-      stage,
-      harness,
+  const defaultInvokeFixHarness = (attemptPrompt: string, timeoutSec: number) =>
+    invoke(harness, wt.path, attemptPrompt, {
+      timeoutSec,
       model,
-    }),
-  });
+      reasoningEffort: cfg.effort?.fix,
+      sandbox: cfg.harness_sandbox,
+      accounting: opts.runDir
+        ? {
+            runDir: opts.runDir,
+            runStoreDeps: opts.runStoreDeps,
+            issue: issueNumber,
+            stage,
+            modelSlot: "fix",
+            model,
+          }
+        : undefined,
+      env: papercutIdentityEnv(cfg, {
+        runId: opts.runDir ? path.basename(opts.runDir) : null,
+        issue: issueNumber,
+        stage,
+        harness,
+        model,
+      }),
+    });
+
+  // #486: a crashed (non-timeout) harness invocation is retried, up to
+  // cfg.auto_recovery_max_retries additional attempts, bounded by the fix
+  // round's remaining wall-clock budget. The delegated (external stage
+  // executor) result path is unchanged — retry is local-`invoke()`-only.
+  let result: HarnessResult;
+  let attemptsMade = 1;
+  let exhaustionReason: string | undefined;
+  if (delegated) {
+    result = delegated;
+  } else {
+    const recovery = await runFixHarnessWithCrashRecovery({
+      issueNumber,
+      stage,
+      wtPath: wt.path,
+      basePrompt: prompt,
+      fixTimeoutSec: cfg.fix_timeout,
+      maxRetries: cfg.auto_recovery_max_retries,
+      invokeHarness: deps.fixCrashRecovery?.invokeHarness ?? defaultInvokeFixHarness,
+      now: deps.fixCrashRecovery?.now ?? Date.now,
+      worktreeStatus: deps.fixCrashRecovery?.worktreeStatus ?? defaultFixWorktreeStatus,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+      stateDir: opts.stateDir,
+    });
+    result = recovery.result;
+    attemptsMade = recovery.attempts;
+    exhaustionReason = recovery.exhaustionReason;
+  }
 
   if (!result.success) {
-    const reason = result.timed_out
-      ? `timed out after ${result.duration.toFixed(0)}s`
-      : `exit ${result.exit_code}`;
+    const reason = fixHarnessCrashBlockReason(result, attemptsMade, exhaustionReason);
     await setBlocked(cfg, issueNumber, `Fix harness (${harness}) failed: ${reason}`, stage, "harness-failure");
     return fixHarnessFailureOutcome(reason);
   }

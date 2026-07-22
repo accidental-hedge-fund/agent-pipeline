@@ -440,6 +440,46 @@ export function buildFixPrompt(a: BuildFixArgs): string {
   });
 }
 
+/**
+ * Extracts the working-tree path(s) from a `git status --porcelain` line for
+ * display in {@link buildFixResumptionPreamble}. Handles the rename/copy form
+ * (`XY src -> dst`, shown as `src -> dst`) and the plain `XY path` form.
+ */
+function porcelainDisplayPath(line: string): string | null {
+  const pathPart = line.slice(3).trim();
+  return pathPart || null;
+}
+
+/**
+ * Resumption preamble prefixed onto a retried fix-round prompt (#486) when a
+ * prior attempt of the SAME round crashed leaving uncommitted work in the
+ * worktree. Directs the harness to review and complete that work rather than
+ * discard, reset, or restart it — the crashed attempt's draft is often
+ * substantially correct, and the whole point of the fix-crash-recovery retry
+ * is to preserve it. Returns `""` for a clean worktree so a clean-worktree
+ * retry's prompt stays byte-identical to the first attempt's (#486 design D5).
+ */
+export function buildFixResumptionPreamble(porcelainStatus: string, attempt: number): string {
+  const lines = porcelainStatus.split("\n").map((l) => l.trimEnd()).filter((l) => l.length > 0);
+  if (lines.length === 0) return "";
+  const paths = lines.map(porcelainDisplayPath).filter((p): p is string => p !== null);
+  return [
+    "## Resuming a crashed fix attempt",
+    "",
+    `A previous attempt of this fix round crashed before finishing (this is retry attempt ${attempt}). ` +
+      "The following paths in this worktree hold its UNCOMMITTED, in-progress work:",
+    "",
+    ...paths.map((p) => `- \`${p}\``),
+    "",
+    "Review that work, correct anything that is wrong, and COMPLETE it — commit it as this round's " +
+      "fix. Do NOT discard it, do NOT run `git checkout`, `git restore`, or `git clean` on it, and do " +
+      "NOT restart the fix from scratch.",
+    "",
+    "---",
+    "",
+  ].join("\n");
+}
+
 export interface BuildTestFixArgs {
   /** Used to embed the target repo's conventions via {@link readConventions} (#108),
    * mirroring {@link buildImplementingPrompt} so the test-fix editing round is

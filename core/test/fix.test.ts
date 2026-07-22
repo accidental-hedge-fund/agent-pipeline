@@ -24,11 +24,21 @@ import {
   filterOverridesAfterReview,
   filterToBlockingFindings,
   findTriggeringReviewComment,
+  fixHarnessCrashBlockReason,
   isCommitOnRemote,
+  isFixHarnessCrash,
+  MIN_RETRY_BUDGET_SEC,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
+  remainingFixBudgetSec,
   resolveFixCommitGateMode,
+  runFixHarnessWithCrashRecovery,
+  shouldRetryFixHarness,
 } from "../scripts/stages/fix.ts";
+import { buildFixResumptionPreamble } from "../scripts/prompts/index.ts";
+import { bundlePath } from "../scripts/evidence-bundle.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
+import type { HarnessResult } from "../scripts/harness.ts";
 
 const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
@@ -1627,5 +1637,400 @@ test("advanceFix: gates.source \"build\" (from a format-gate build-fold failure)
     "needs-human";
   assert.equal(blockerKind, "build-failed", "source:\"build\" must map to blockerKind build-failed, not needs-human");
   void fakeGates;
+});
+
+// ---------------------------------------------------------------------------
+// #486: fix-harness-crash recovery — bounded, budget-aware, work-preserving
+// retry of a crashed fix-stage harness invocation.
+// ---------------------------------------------------------------------------
+
+function crashResult(overrides: Partial<HarnessResult> = {}): HarnessResult {
+  return {
+    success: false,
+    stdout: "",
+    stderr: "",
+    exit_code: 1,
+    duration: 1,
+    timed_out: false,
+    ...overrides,
+  };
+}
+
+function timeoutResult(overrides: Partial<HarnessResult> = {}): HarnessResult {
+  return {
+    success: false,
+    stdout: "",
+    stderr: "",
+    exit_code: -1,
+    duration: 2400,
+    timed_out: true,
+    ...overrides,
+  };
+}
+
+function successResult(overrides: Partial<HarnessResult> = {}): HarnessResult {
+  return {
+    success: true,
+    stdout: "",
+    stderr: "",
+    exit_code: 0,
+    duration: 1,
+    timed_out: false,
+    ...overrides,
+  };
+}
+
+function memRunStoreDepsForRecovery() {
+  const appends = new Map<string, string[]>();
+  const deps: RunStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async (p, data) => {
+      if (!appends.has(p)) appends.set(p, []);
+      appends.get(p)!.push(data);
+    },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+  };
+  const eventsPath = (runDir: string) => join(runDir, "events.jsonl");
+  const readEvents = (runDir: string): unknown[] =>
+    (appends.get(eventsPath(runDir)) ?? [])
+      .flatMap((chunk) => chunk.split("\n"))
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  return { deps, readEvents };
+}
+
+test("isFixHarnessCrash: success=false + timed_out=false → crash", () => {
+  assert.equal(isFixHarnessCrash({ success: false, timed_out: false }), true);
+});
+test("isFixHarnessCrash: success=false + timed_out=true → not a crash (it's a timeout)", () => {
+  assert.equal(isFixHarnessCrash({ success: false, timed_out: true }), false);
+});
+test("isFixHarnessCrash: success=true → not a crash", () => {
+  assert.equal(isFixHarnessCrash({ success: true, timed_out: false }), false);
+});
+
+test("remainingFixBudgetSec: subtracts elapsed from the fix timeout, never negative", () => {
+  assert.equal(remainingFixBudgetSec(2400, 780), 1620);
+  assert.equal(remainingFixBudgetSec(100, 250), 0);
+});
+
+test("shouldRetryFixHarness: not a crash → no retry, no reason", () => {
+  const d = shouldRetryFixHarness({ crash: false, attempt: 1, maxRetries: 2, remainingSec: 2000 });
+  assert.equal(d.retry, false);
+  assert.equal((d as { reason?: string }).reason, undefined);
+});
+test("shouldRetryFixHarness: cap exhausted → no retry, no reason (keeps maxRetries:0 block reason unchanged)", () => {
+  const d = shouldRetryFixHarness({ crash: true, attempt: 1, maxRetries: 0, remainingSec: 2000 });
+  assert.equal(d.retry, false);
+  assert.equal((d as { reason?: string }).reason, undefined);
+});
+test("shouldRetryFixHarness: remaining budget below the floor → no retry, reason names budget exhaustion", () => {
+  const d = shouldRetryFixHarness({ crash: true, attempt: 1, maxRetries: 2, remainingSec: 45 });
+  assert.equal(d.retry, false);
+  assert.match((d as { reason?: string }).reason ?? "", /45s.*below.*60s minimum retry floor/);
+});
+test("shouldRetryFixHarness: crash, cap and budget both allow → retry with remaining budget as timeoutSec", () => {
+  const d = shouldRetryFixHarness({ crash: true, attempt: 1, maxRetries: 2, remainingSec: 1620 });
+  assert.deepEqual(d, { retry: true, timeoutSec: 1620 });
+});
+test("MIN_RETRY_BUDGET_SEC is 60", () => {
+  assert.equal(MIN_RETRY_BUDGET_SEC, 60);
+});
+
+test("fixHarnessCrashBlockReason: single attempt, no exhaustion reason → today's plain reason, unchanged", () => {
+  assert.equal(fixHarnessCrashBlockReason(crashResult({ exit_code: 1 }), 1), "exit 1");
+  assert.equal(fixHarnessCrashBlockReason(timeoutResult({ duration: 2400 }), 1), "timed out after 2400s");
+});
+test("fixHarnessCrashBlockReason: multiple attempts (cap exhausted) → names the attempt count", () => {
+  assert.equal(fixHarnessCrashBlockReason(crashResult({ exit_code: 1 }), 3), "exit 1 after 3 attempts");
+});
+test("fixHarnessCrashBlockReason: budget exhaustion note is appended even on a single attempt", () => {
+  const reason = fixHarnessCrashBlockReason(crashResult({ exit_code: 1 }), 1, "remaining stage budget (45s) is below the 60s minimum retry floor");
+  assert.equal(reason, "exit 1 (remaining stage budget (45s) is below the 60s minimum retry floor)");
+});
+
+test("buildFixResumptionPreamble: clean worktree → empty string (retry prompt stays byte-identical)", () => {
+  assert.equal(buildFixResumptionPreamble("", 2), "");
+  assert.equal(buildFixResumptionPreamble("   \n  ", 2), "");
+});
+test("buildFixResumptionPreamble: dirty worktree → states in-progress work exists, lists paths, forbids discard/reset/restart", () => {
+  const status = " M core/scripts/service.ts\n?? core/test/service.test.ts\n";
+  const preamble = buildFixResumptionPreamble(status, 2);
+  assert.match(preamble, /previous attempt.*crashed/i);
+  assert.match(preamble, /UNCOMMITTED, in-progress work/);
+  assert.match(preamble, /`core\/scripts\/service\.ts`/);
+  assert.match(preamble, /`core\/test\/service\.test\.ts`/);
+  assert.match(preamble, /do not discard/i);
+  assert.match(preamble, /git checkout.*git restore.*git clean/i);
+  assert.match(preamble, /not restart the fix from scratch/i);
+});
+
+test("runFixHarnessWithCrashRecovery: crash then success → 2 invocations, no exhaustion, advances via the second attempt's result", async () => {
+  const calls: Array<{ prompt: string; timeoutSec: number; attempt: number }> = [];
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 2,
+    invokeHarness: async (prompt, timeoutSec, attempt) => {
+      calls.push({ prompt, timeoutSec, attempt });
+      return attempt === 1 ? crashResult() : successResult();
+    },
+    now: () => 0,
+    worktreeStatus: async () => "",
+    runDir: undefined,
+    stateDir: undefined,
+  });
+  assert.equal(calls.length, 2, "expected exactly one retry (2 total invocations)");
+  assert.equal(outcome.attempts, 2);
+  assert.equal(outcome.result.success, true);
+  assert.equal(outcome.exhaustionReason, undefined);
+});
+
+test("runFixHarnessWithCrashRecovery: crash on every attempt → exactly 1 + maxRetries invocations, then the unchanged harness-failure block", async () => {
+  const calls: number[] = [];
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 2,
+    invokeHarness: async (_prompt, _timeoutSec, attempt) => {
+      calls.push(attempt);
+      return crashResult();
+    },
+    now: () => 0,
+    worktreeStatus: async () => "",
+  });
+  assert.deepEqual(calls, [1, 2, 3], "expected exactly 3 invocations (1 initial + 2 retries)");
+  assert.equal(outcome.attempts, 3);
+  assert.equal(outcome.result.success, false);
+  const reason = fixHarnessCrashBlockReason(outcome.result, outcome.attempts, outcome.exhaustionReason);
+  assert.equal(reason, "exit 1 after 3 attempts");
+});
+
+test("runFixHarnessWithCrashRecovery: harness timeout is not retried — exactly one invocation, today's timeout reason", async () => {
+  const calls: number[] = [];
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 2,
+    invokeHarness: async (_prompt, _timeoutSec, attempt) => {
+      calls.push(attempt);
+      return timeoutResult({ duration: 2400 });
+    },
+    now: () => 0,
+    worktreeStatus: async () => "",
+  });
+  assert.deepEqual(calls, [1]);
+  assert.equal(outcome.attempts, 1);
+  const reason = fixHarnessCrashBlockReason(outcome.result, outcome.attempts, outcome.exhaustionReason);
+  assert.equal(reason, "timed out after 2400s");
+});
+
+test("runFixHarnessWithCrashRecovery: auto_recovery_max_retries 0 reproduces today's single-shot behavior exactly", async () => {
+  const calls: number[] = [];
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 0,
+    invokeHarness: async (_prompt, _timeoutSec, attempt) => {
+      calls.push(attempt);
+      return crashResult();
+    },
+    now: () => 0,
+    worktreeStatus: async () => "",
+  });
+  assert.deepEqual(calls, [1]);
+  assert.equal(outcome.attempts, 1);
+  const reason = fixHarnessCrashBlockReason(outcome.result, outcome.attempts, outcome.exhaustionReason);
+  assert.equal(reason, "exit 1", "must be byte-identical to today's pre-#486 block reason");
+});
+
+test("runFixHarnessWithCrashRecovery: each retry receives the remaining stage budget as timeoutSec (fake clock)", async () => {
+  const timeouts: number[] = [];
+  let clock = 0;
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 2,
+    invokeHarness: async (_prompt, timeoutSec, attempt) => {
+      timeouts.push(timeoutSec);
+      clock += 780_000; // 780s per attempt, in ms
+      return attempt === 2 ? successResult() : crashResult();
+    },
+    now: () => clock,
+    worktreeStatus: async () => "",
+  });
+  assert.equal(timeouts[0], 2400, "first attempt gets the full fix_timeout");
+  assert.equal(timeouts[1], 1620, "retry gets fix_timeout minus elapsed wall-clock (2400 - 780)");
+  assert.equal(outcome.attempts, 2);
+});
+
+test("runFixHarnessWithCrashRecovery: remaining budget below the retry floor → no retry invoked, blocks on budget exhaustion", async () => {
+  const calls: number[] = [];
+  let clock = 0;
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 100,
+    maxRetries: 2,
+    invokeHarness: async (_prompt, _timeoutSec, attempt) => {
+      calls.push(attempt);
+      clock += 50_000; // 50s consumed, leaving 50s < the 60s floor
+      return crashResult();
+    },
+    now: () => clock,
+    worktreeStatus: async () => "",
+  });
+  assert.deepEqual(calls, [1], "no retry should be invoked once remaining budget is below the floor");
+  assert.match(outcome.exhaustionReason ?? "", /below the 60s minimum retry floor/);
+});
+
+test("runFixHarnessWithCrashRecovery: dirty worktree → retry prompt carries the resumption preamble", async () => {
+  const prompts: string[] = [];
+  await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 1,
+    invokeHarness: async (prompt, _timeoutSec, attempt) => {
+      prompts.push(prompt);
+      return attempt === 1 ? crashResult() : successResult();
+    },
+    now: () => 0,
+    worktreeStatus: async () => " M core/scripts/service.ts\n",
+  });
+  assert.equal(prompts[0], "BASE PROMPT");
+  assert.notEqual(prompts[1], "BASE PROMPT");
+  assert.match(prompts[1], /Resuming a crashed fix attempt/);
+  assert.match(prompts[1], /core\/scripts\/service\.ts/);
+  assert.ok(prompts[1].endsWith("BASE PROMPT"), "the base prompt must still be present verbatim, after the preamble");
+});
+
+test("runFixHarnessWithCrashRecovery: clean worktree → retry prompt is byte-identical to the first attempt's", async () => {
+  const prompts: string[] = [];
+  await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 1,
+    invokeHarness: async (prompt, _timeoutSec, attempt) => {
+      prompts.push(prompt);
+      return attempt === 1 ? crashResult() : successResult();
+    },
+    now: () => 0,
+    worktreeStatus: async () => "",
+  });
+  assert.equal(prompts.length, 2);
+  assert.equal(prompts[0], prompts[1]);
+  assert.equal(prompts[1], "BASE PROMPT");
+});
+
+test("runFixHarnessWithCrashRecovery: issues no destructive git call and does not touch worktree status except via the read-only status seam", async () => {
+  const statusCalls: string[] = [];
+  await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 2,
+    invokeHarness: async (_prompt, _timeoutSec, attempt) =>
+      attempt < 3 ? crashResult() : successResult(),
+    now: () => 0,
+    worktreeStatus: async (wtPath) => {
+      statusCalls.push(wtPath);
+      return " M core/scripts/service.ts\n";
+    },
+  });
+  // The loop's only worktree interaction is the injected read-only status seam
+  // (no gitReset/gitRestore/gitCheckout/gitClean/removeWorktree seam exists on
+  // FixCrashRecoveryDeps at all — the loop has no way to issue one).
+  assert.equal(statusCalls.length, 2, "status checked once per retry decision");
+  assert.deepEqual(new Set(statusCalls), new Set(["/wt"]));
+});
+
+test("runFixHarnessWithCrashRecovery: no runDir/stateDir configured → no filesystem writes", async () => {
+  const outcome = await runFixHarnessWithCrashRecovery({
+    issueNumber: 486,
+    stage: "fix-2",
+    wtPath: "/wt",
+    basePrompt: "BASE PROMPT",
+    fixTimeoutSec: 2400,
+    maxRetries: 1,
+    invokeHarness: async (_prompt, _timeoutSec, attempt) =>
+      attempt === 1 ? crashResult() : successResult(),
+    now: () => 0,
+    worktreeStatus: async () => "",
+    // runDir/stateDir intentionally omitted
+  });
+  assert.equal(outcome.attempts, 2);
+});
+
+test("runFixHarnessWithCrashRecovery: records one fix_harness_recovery event and one RecoveryRecord per retry", async () => {
+  const { deps, readEvents } = memRunStoreDepsForRecovery();
+  const runDir = "/run/486";
+  const stateDir = await mkdtemp(join(tmpdir(), "fix-recovery-evidence-"));
+  try {
+    const outcome = await runFixHarnessWithCrashRecovery({
+      issueNumber: 486,
+      stage: "fix-2",
+      wtPath: "/wt",
+      basePrompt: "BASE PROMPT",
+      fixTimeoutSec: 2400,
+      maxRetries: 2,
+      invokeHarness: async (_prompt, _timeoutSec, attempt) =>
+        attempt < 3 ? crashResult({ exit_code: 1 }) : successResult(),
+      now: () => 0,
+      worktreeStatus: async () => " M core/scripts/service.ts\n",
+      runDir,
+      runStoreDeps: deps,
+      stateDir,
+    });
+    assert.equal(outcome.attempts, 3);
+
+    const events = readEvents(runDir) as Array<Record<string, unknown>>;
+    const recoveryEvents = events.filter((e) => e.type === "fix_harness_recovery");
+    assert.equal(recoveryEvents.length, 2, "one event per retry actually invoked (attempts 2 and 3)");
+    assert.deepEqual(recoveryEvents.map((e) => e.attempt), [2, 3]);
+    for (const e of recoveryEvents) {
+      assert.equal(e.stage, "fix-2");
+      assert.equal(e.max_attempts, 3);
+      assert.equal(e.exit_code, 1);
+      assert.equal(typeof e.remaining_budget_sec, "number");
+      assert.equal(e.worktree_dirty, true);
+    }
+
+    const bundleRaw = await readFile(bundlePath(stateDir, 486), "utf8");
+    const bundle = JSON.parse(bundleRaw);
+    const recoveries = (bundle.recoveries ?? []).filter((r: { trigger: string }) => r.trigger === "fix-harness-crash");
+    assert.equal(recoveries.length, 2);
+    assert.deepEqual(recoveries.map((r: { round: number }) => r.round), [2, 3]);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
 });
 
