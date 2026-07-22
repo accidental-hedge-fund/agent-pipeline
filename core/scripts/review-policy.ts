@@ -611,13 +611,22 @@ export const OVERRIDE_HEADING = "## Pipeline: Finding override";
  *
  * Security invariants (parallel to extractScopedOverrides, #229 Finding 3):
  * 1. Only comments with the `## Pipeline: Finding override` heading are processed.
- * 2. Only the last non-empty line is parsed as the machine sentinel.
+ * 2. Only the last non-empty line is parsed as the machine sentinel, EXCEPT that
+ *    `overrideComment` now appends a generic pipeline attestation (#471/#484) after
+ *    the override sentinel; when the true last line is a valid `pipeline-attest`
+ *    marker, it is stripped before applying the last-line check (mirroring
+ *    `extractNonReproducingDispositions`) so the sentinel underneath it is still
+ *    the line that gets read.
  */
 export function extractOverrides(comments: { body: string }[]): Map<string, string> {
   const map = new Map<string, string>();
   for (const c of comments) {
     if (!c.body.startsWith(OVERRIDE_HEADING)) continue;
-    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    const lines = c.body.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 0 && isVerifiedPipelineAttestation(c.body)) {
+      lines.pop();
+    }
+    const lastLine = lines.at(-1) ?? "";
     const m = OVERRIDE_RE.exec(lastLine);
     if (m) map.set(m[1], m[2].trim());
   }
@@ -644,7 +653,11 @@ export const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
  *    text that could embed sentinel-shaped lines.
  * 2. Only the last non-empty line of each qualifying comment is parsed as the machine
  *    sentinel — free-form reason text in the comment body cannot inject additional
- *    scope records even if it contains a sentinel-shaped line.
+ *    scope records even if it contains a sentinel-shaped line. `scopedOverrideComment`
+ *    now appends a generic pipeline attestation (#471/#484) after that sentinel; when
+ *    the true last line is a valid `pipeline-attest` marker, it is stripped first
+ *    (mirroring `extractNonReproducingDispositions`) so the sentinel underneath it is
+ *    still the line that gets read.
  */
 export function extractScopedOverrides(comments: { body: string }[]): ScopedOverride[] {
   const map = new Map<string, ScopedOverride>(); // key: "${type}:${value}" → last wins
@@ -652,7 +665,11 @@ export function extractScopedOverrides(comments: { body: string }[]): ScopedOver
     if (!c.body.startsWith(SCOPE_OVERRIDE_HEADING)) continue;
     // Only examine the last non-empty line — scopedOverrideComment always places the
     // machine sentinel there; free-form reason text earlier in the body is ignored.
-    const lastLine = c.body.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    const lines = c.body.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 0 && isVerifiedPipelineAttestation(c.body)) {
+      lines.pop();
+    }
+    const lastLine = lines.at(-1) ?? "";
     SCOPE_OVERRIDE_RE.lastIndex = 0;
     const m = SCOPE_OVERRIDE_RE.exec(lastLine);
     if (!m) continue;
@@ -706,7 +723,7 @@ export function overrideComment(args: {
   footer?: string;
 }): string {
   const { key, disposition, reason, stage, timestamp, footer } = args;
-  return [
+  const rendered = [
     "## Pipeline: Finding override",
     "",
     `**Finding**: \`${key}\``,
@@ -721,6 +738,7 @@ export function overrideComment(args: {
     "",
     `<!-- pipeline-override: ${key} ${disposition} -->`,
   ].join("\n");
+  return attestPipelineComment("finding-override", rendered);
 }
 
 /**
@@ -744,7 +762,7 @@ export function scopedOverrideComment(args: {
   // escape HTML comment close sequences so reason text cannot contain a sentinel-shaped
   // line or close the comment early (#229 Finding 2).
   const safeReason = reason.replace(/[\r\n]/g, " ").replace(/-->/g, "—>");
-  return [
+  const rendered = [
     "## Pipeline: Scope override",
     "",
     `**Scope**: \`${scopeType}:${scopeValue}\``,
@@ -759,6 +777,7 @@ export function scopedOverrideComment(args: {
     "",
     `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${safeReason} -->`,
   ].join("\n");
+  return attestPipelineComment("scope-override", rendered);
 }
 
 // ---------------------------------------------------------------------------

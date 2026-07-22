@@ -8,7 +8,11 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { attestPipelineComment } from "./stages/review-parsing.ts";
+import {
+  attestPipelineComment,
+  extractPipelineAttestation,
+  isVerifiedPipelineAttestation,
+} from "./stages/review-parsing.ts";
 import {
   BLOCKED_LABEL,
   BLOCKER_RECIPES,
@@ -1327,12 +1331,20 @@ export type PipelineCommentVerification = "pipeline-attest" | "review-artifact" 
  * `literal.startsWith(heading)` check, so a genuinely new, unattested
  * `## Pipeline: <something new>` comment type cannot silently hide behind the
  * transition prefix and pass the guard (#471 review 1).
+ *
+ * `operatorSurface: true` marks a kind the engine renders in DIRECT RESPONSE
+ * to an operator CLI invocation, wrapping operator-supplied free text
+ * (`pipeline unblock`, `pipeline override`) (#484). These three kinds are the
+ * only ones an operator has, by construction, already been heard on — see
+ * `isVerifiedOperatorSurfaceComment` and `findUnacknowledgedComments`' anchor
+ * rule.
  */
 export const PIPELINE_COMMENT_KINDS: readonly {
   kind: string;
   heading: string;
   verify: PipelineCommentVerification;
   exactOnly?: boolean;
+  operatorSurface?: boolean;
   reason?: string;
 }[] = [
   { kind: "stage-transition", heading: "## Pipeline: ", verify: "pipeline-attest", exactOnly: true },
@@ -1367,35 +1379,28 @@ export const PIPELINE_COMMENT_KINDS: readonly {
     heading: "## Pre-Planning Context",
     verify: "exempt",
     reason:
-      "Wraps untrusted human comment excerpts (buildContextSnapshot output) inline, posted BEFORE the plan " +
-      "anchor so it is never in findUnacknowledgedComments' scan window. Attesting the wrapper would " +
-      "immunize the embedded human excerpts it carries, same rationale as 'Unblocked' below.",
+      "Wraps THIRD-PARTY human comment excerpts (buildContextSnapshot output) inline — not operator-authored " +
+      "free text — posted BEFORE the plan anchor so it is never in findUnacknowledgedComments' scan window. " +
+      "Attesting the wrapper would immunize the embedded human excerpts it carries; unlike the operator-surface " +
+      "kinds below, the embedded text here was never a direct response to a CLI invocation the operator issued.",
   },
   {
     kind: "unblocked",
     heading: "## Pipeline: Unblocked",
-    verify: "exempt",
-    reason:
-      "Embeds the human operator's verbatim --unblock answer text inline. Attesting the whole body would " +
-      "immunize genuine embedded human objection language from the NEGATION_PATTERNS scan — the exact " +
-      "forgery/bypass hole #390 and #471 close. Deliberately left unattested so embedded objection wording " +
-      "still gates via the existing no-negation-language branch.",
+    verify: "pipeline-attest",
+    operatorSurface: true,
   },
   {
     kind: "finding-override",
     heading: "## Pipeline: Finding override",
-    verify: "exempt",
-    reason:
-      "Posted by the human operator directly via the `--override` CLI workflow (audited disposition), " +
-      "not constructed/posted anywhere in core/scripts/ — not an engine-posted comment.",
+    verify: "pipeline-attest",
+    operatorSurface: true,
   },
   {
     kind: "scope-override",
     heading: "## Pipeline: Scope override",
-    verify: "exempt",
-    reason:
-      "Posted by the human operator directly via the `--override`/scope-override workflow, " +
-      "not constructed/posted anywhere in core/scripts/ — not an engine-posted comment.",
+    verify: "pipeline-attest",
+    operatorSurface: true,
   },
   {
     kind: "finding-does-not-reproduce",
@@ -1412,6 +1417,30 @@ export const PIPELINE_COMMENT_KINDS: readonly {
       "recognize ANY pipeline comment for human/pipeline triage — not itself a distinct posted comment type.",
   },
 ];
+
+// Kinds the engine renders in direct response to an operator CLI invocation
+// (`pipeline unblock`, `pipeline override`), derived from the registry so
+// there is exactly one place marking them (#484).
+const OPERATOR_SURFACE_KINDS: ReadonlySet<string> = new Set(
+  PIPELINE_COMMENT_KINDS.filter((e) => e.operatorSurface).map((e) => e.kind),
+);
+
+/**
+ * True when `body` is a verified, untampered `pipeline-attest` comment whose
+ * attested `kind` is one of the operator-surface kinds (#484) — i.e. it was
+ * rendered by the engine in direct response to an operator CLI invocation,
+ * not merely styled to look like one. Kind membership is read from the
+ * attestation PAYLOAD, never from a heading literal, so a forged heading with
+ * a copied marker for a different (non-operator-surface) kind does not
+ * qualify. Callers must still check comment authorship/trust separately —
+ * this predicate answers only "is this verified operator-surface output",
+ * not "is this trustworthy" (trust is a property of who posted it).
+ */
+export function isVerifiedOperatorSurfaceComment(body: string): boolean {
+  const attestation = extractPipelineAttestation(body);
+  if (attestation === null || !OPERATOR_SURFACE_KINDS.has(attestation.kind)) return false;
+  return isVerifiedPipelineAttestation(body);
+}
 
 // Matches "## Review 1", "## Review 2", "## Review 3", ... — review rounds are
 // unbounded, so a fixed header list would miss round 3+ (#390).

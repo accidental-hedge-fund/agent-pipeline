@@ -36,6 +36,7 @@ import {
   type AdvanceReviewDeps,
 } from "../scripts/stages/review.ts";
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
+import { buildUnblockedComment } from "../scripts/pipeline.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
@@ -3684,19 +3685,14 @@ test("advanceReview: scope override after plan dismisses prior human comment —
   // "operator" is a trusted actor via trusted_override_actors (#318 fix c5825398).
   const cfgWithOperator = { ...cfg, trusted_override_actors: ["operator"] } as unknown as PipelineConfig;
   const { deps, rec } = makeDeps([APPROVE]);
-  const scopeOverrideBody = [
-    "## Pipeline: Scope override",
-    "",
-    "**Scope**: `category:testing`",
-    "**Disposition**: defer",
-    "**Stage**: review-1",
-    "**Recorded at**: 2026-01-04T00:00:00Z",
-    "",
-    "### Reason",
-    "Out of scope for this PR.",
-    "",
-    "<!-- pipeline-override-scope: category:testing defer | Out of scope -->",
-  ].join("\n");
+  const scopeOverrideBody = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "testing",
+    disposition: "defer",
+    reason: "Out of scope for this PR.",
+    stage: "review-1",
+    timestamp: "2026-01-04T00:00:00Z",
+  });
 
   deps.getIssueDetail = async () =>
     ({
@@ -3714,6 +3710,41 @@ test("advanceReview: scope override after plan dismisses prior human comment —
   });
   assert.equal(outcome.advanced, true, "scope override must allow the stage to proceed past the human-input gate");
   assert.equal(rec.blocked.length, 0, "setBlocked must NOT be called when scope override is present");
+});
+
+test("advanceReview: resuming after `pipeline unblock` does not re-block on the unblock comment itself (#484)", async (t) => {
+  // Regression for #484: the operator's own `## Pipeline: Unblocked` comment
+  // (posted by `pipeline unblock`, embedding a verbatim answer with
+  // change-request wording) must not itself be counted as unacknowledged human
+  // input, and must not re-trigger the "New human input detected" warning or a
+  // fresh block, on the very next stage boundary the operator resumed into.
+  const cfgWithOperator = { ...cfg, trusted_override_actors: ["operator"] } as unknown as PipelineConfig;
+  const { deps, rec } = makeDeps([APPROVE]);
+  const unblockedBody = buildUnblockedComment({
+    stage: "review-1",
+    ts: "2026-01-03T00:00:00Z",
+    answer: "don't retry the call — batch it instead",
+  });
+
+  deps.getIssueDetail = async () =>
+    ({
+      ...detailWithComments([]),
+      comments: [
+        { author: TEST_ACTOR, body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+        { author: "alice", body: "Please also handle Y.", createdAt: "2026-01-02T00:00:00Z" },
+        { author: "operator", body: unblockedBody, createdAt: "2026-01-03T00:00:00Z" },
+      ],
+    }) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgWithOperator, 1, 1, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, true, "the unblock comment must not re-block the resumed stage");
+  assert.equal(rec.blocked.length, 0, "setBlocked must NOT be called after a genuine unblock");
+  assert.ok(
+    !rec.comments.some((c) => c.startsWith("## Pipeline: New human input detected")),
+    "no new-human-input warning must be posted on top of the operator's own unblock comment",
+  );
 });
 
 test("advanceReview: dry-run skips postComment and setBlocked for unacknowledged human input (#318 fix 937b9d25)", async (t) => {
