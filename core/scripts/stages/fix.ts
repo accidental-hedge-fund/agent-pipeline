@@ -22,14 +22,22 @@ import {
   extractOverrides,
   extractScopedOverrides,
   findingPayloadFingerprint,
+  humanDecisionComment,
   matchFindingScope,
+  neutralizeSentinelText,
   nonReproducingDispositionComment,
   type ScopedOverride,
 } from "../review-policy.ts";
 import * as path from "node:path";
-import { invoke, papercutIdentityEnv } from "../harness.ts";
+import { invoke, papercutIdentityEnv, type HarnessResult } from "../harness.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
-import { branchName, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
+import {
+  branchName,
+  getOnDiskForIssue,
+  gitInWorktree,
+  reattachIfDetached,
+  renderWorktreeStateSection,
+} from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
@@ -43,7 +51,7 @@ import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import type { ValidateResult } from "../openspec.ts";
-import { makePromptRecord, recordPrompt } from "../evidence-bundle.ts";
+import { makePromptRecord, recordPrompt, recordRecovery } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -127,6 +135,155 @@ export interface AdvanceFixDeps {
    * inject a fake so no real git fetch/subprocess runs.
    */
   verifyCommitOnRemote?: (wtPath: string, branch: string, sha: string) => Promise<boolean>;
+  /**
+   * Injectable per-attempt fix-harness invoker for the crash-retry loop
+   * (#486). Defaults to the production `invokeStageExecutor` → `invoke`
+   * fallback wired inside `advanceFix`. Tests inject a fake so the retry loop
+   * is exercised with no real harness, executor HTTP, or subprocess call.
+   */
+  invokeFixHarnessAttempt?: (prompt: string, timeoutSec: number) => Promise<HarnessResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Fix-harness crash-retry loop (#486) — exported for direct unit testing
+// ---------------------------------------------------------------------------
+
+/** Minimum remaining `fix_timeout` budget (seconds) considered usable for
+ *  another retry attempt. At or below this floor, the pipeline blocks instead
+ *  of starting a doomed retry. */
+export const FIX_RETRY_MIN_BUDGET_SEC = 60;
+
+/** One fix-harness invocation attempt within a retry sequence. */
+export interface FixHarnessAttempt {
+  /** 1-indexed attempt number (1 = the original, non-retried invocation). */
+  attempt: number;
+  timeoutSec: number;
+  result: HarnessResult;
+}
+
+export interface FixHarnessRetryResult {
+  /** Every attempt made, in order. Always has at least one entry. */
+  attempts: FixHarnessAttempt[];
+  /** The last attempt's result — success, or the final failure. */
+  finalResult: HarnessResult;
+  /** True when the loop stopped because remaining `fix_timeout` budget fell
+   *  at/below `FIX_RETRY_MIN_BUDGET_SEC`, rather than because the retry cap
+   *  was reached. */
+  budgetExhausted: boolean;
+}
+
+export interface FixHarnessRetryOpts {
+  /** `cfg.auto_recovery_max_retries` — additional attempts beyond the first. */
+  maxRetries: number;
+  /** `cfg.fix_timeout` — the full per-round budget in seconds. */
+  fixTimeoutSec: number;
+  /** Attempt 1's prompt, byte-identical to the pre-#486 prompt. */
+  basePrompt: string;
+  /** Invoke the harness for one attempt with the given (possibly
+   *  retry-addendum-prefixed) prompt and timeout budget. */
+  invokeAttempt: (prompt: string, timeoutSec: number) => Promise<HarnessResult>;
+  /** Called with the composed prompt immediately before each attempt's
+   *  invocation (including attempt 1) — used to record the prompt in the
+   *  evidence bundle. */
+  onBeforeAttempt?: (attempt: number, timeoutSec: number, prompt: string) => Promise<void> | void;
+  /** Called once per retry (attempt >= 2), after the prior attempt failed and
+   *  before this attempt is invoked — used to append the retry event /
+   *  evidence-bundle recovery record. Never called for attempt 1, and never
+   *  called when budget exhaustion prevents the retry from starting. */
+  onRetryScheduled?: (attempt: number, limit: number, reason: string) => Promise<void> | void;
+  /** Monotonic clock used to measure each attempt's wall-clock elapsed time,
+   *  independent of `result.duration` (#486 review 2). Defaults to
+   *  `performance.now()`, which (unlike `Date.now()`) cannot move backward
+   *  under NTP/clock adjustments, so a stalled attempt can never be debited
+   *  zero elapsed time. Tests inject a fake to make elapsed time
+   *  deterministic. */
+  nowMs?: () => number;
+}
+
+/**
+ * Retry a fix-round harness invocation in place (same worktree, same prompt
+ * plus a retry addendum) up to `maxRetries` additional times, honoring the
+ * remaining `fix_timeout` budget across attempts (#486). Never touches git or
+ * the worktree itself — purely orchestrates `invokeAttempt` calls — so it is
+ * directly unit-testable with a fake invoker and no gh/git/network seam.
+ */
+export async function invokeFixHarnessWithRetry(
+  opts: FixHarnessRetryOpts,
+): Promise<FixHarnessRetryResult> {
+  const attempts: FixHarnessAttempt[] = [];
+  let consumedSec = 0;
+  let priorReason: string | null = null;
+  const totalAttemptsCap = 1 + Math.max(0, opts.maxRetries);
+
+  for (let attemptNum = 1; ; attemptNum++) {
+    let timeoutSec: number;
+    if (attemptNum === 1) {
+      timeoutSec = opts.fixTimeoutSec;
+    } else {
+      timeoutSec = Math.max(0, opts.fixTimeoutSec - consumedSec);
+      if (timeoutSec <= FIX_RETRY_MIN_BUDGET_SEC) {
+        return {
+          attempts,
+          finalResult: attempts[attempts.length - 1].result,
+          budgetExhausted: true,
+        };
+      }
+      if (opts.onRetryScheduled) {
+        await opts.onRetryScheduled(attemptNum, opts.maxRetries, priorReason!);
+      }
+    }
+
+    const prompt = attemptNum === 1
+      ? opts.basePrompt
+      : buildFixRetryPreamble(attemptNum, opts.maxRetries, priorReason!) + opts.basePrompt;
+    if (opts.onBeforeAttempt) await opts.onBeforeAttempt(attemptNum, timeoutSec, prompt);
+
+    const nowMs = opts.nowMs ?? (() => performance.now());
+    const attemptStartMs = nowMs();
+    const result = await opts.invokeAttempt(prompt, timeoutSec);
+    const elapsedSec = Math.max(0, (nowMs() - attemptStartMs) / 1000);
+    // #486 review 2: a delegated executor can report a missing, stale, or
+    // underreported `duration` while still consuming real wall time. Debit
+    // the larger of the locally measured elapsed time and the validated
+    // reported duration so the retry budget can never be underspent.
+    const reportedSec = Number.isFinite(result.duration) && result.duration >= 0
+      ? result.duration
+      : 0;
+    const debitSec = Math.max(elapsedSec, reportedSec);
+    attempts.push({ attempt: attemptNum, timeoutSec, result });
+    consumedSec += debitSec;
+
+    if (result.success) {
+      return { attempts, finalResult: result, budgetExhausted: false };
+    }
+    priorReason = result.timed_out
+      ? `timed out after ${debitSec.toFixed(0)}s`
+      : `exit ${result.exit_code}`;
+    if (attemptNum >= totalAttemptsCap) {
+      return { attempts, finalResult: result, budgetExhausted: false };
+    }
+  }
+}
+
+/**
+ * Build the retry-addendum prepended to a fix prompt on attempt >= 2 (#486).
+ * Tells the harness a prior attempt of this same fix round crashed, that its
+ * uncommitted work is still present in the worktree, and that it must be
+ * reviewed and completed rather than discarded or restarted. Exported for
+ * direct unit testing.
+ */
+export function buildFixRetryPreamble(attempt: number, limit: number, priorReason: string): string {
+  return [
+    "## Prior Attempt Crashed — Resume, Do Not Restart",
+    "",
+    `A previous attempt of this fix round (attempt ${attempt - 1} of ${limit + 1}) terminated ` +
+      `abnormally: ${priorReason}.`,
+    "Any uncommitted changes it left in this worktree are still present. Review that work and " +
+      "COMPLETE it — do NOT discard it, and do NOT restart from scratch.",
+    "",
+    "---",
+    "",
+  ].join("\n");
 }
 
 /**
@@ -406,61 +563,118 @@ export async function advanceFix(
     // A does-not-reproduce declaration must exactly match this value.
     reviewedSha: headBefore,
   });
-  if (opts.stateDir) {
-    await recordPrompt(
-      opts.stateDir,
-      issueNumber,
-      stage,
-      makePromptRecord(`fix-${round}`, harness, prompt),
-    ).catch(() => {});
-  }
   const model = opts.model ?? cfg.models.fix;
   // External stage executor delegation (#314): fix-1/fix-2 are
   // execution-environment stages — only an `agent-system` executor can be
   // assigned here (config.ts rejects a `model-endpoint` assignment at parse
   // time), so no model-endpoint branching is needed at this call site.
-  const delegated = await invokeStageExecutor(
-    stage as "fix-1" | "fix-2",
-    cfg,
-    prompt,
-    {
-      timeoutSec: cfg.fix_timeout,
-      accounting: opts.runDir
-        ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage, modelSlot: "fix" }
-        : undefined,
-    },
-    opts.executorHttpDeps,
-  );
-  const result = delegated ?? await invoke(harness, wt.path, prompt, {
-    timeoutSec: cfg.fix_timeout,
-    model,
-    reasoningEffort: cfg.effort?.fix,
-    sandbox: cfg.harness_sandbox,
-    accounting: opts.runDir
-      ? {
-          runDir: opts.runDir,
-          runStoreDeps: opts.runStoreDeps,
-          issue: issueNumber,
-          stage,
-          modelSlot: "fix",
-          model,
-        }
-      : undefined,
-    env: papercutIdentityEnv(cfg, {
-      runId: opts.runDir ? path.basename(opts.runDir) : null,
-      issue: issueNumber,
-      stage,
-      harness,
+  const invokeAttempt = async (attemptPrompt: string, timeoutSec: number): Promise<HarnessResult> => {
+    const delegated = await invokeStageExecutor(
+      stage as "fix-1" | "fix-2",
+      cfg,
+      attemptPrompt,
+      {
+        timeoutSec,
+        accounting: opts.runDir
+          ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage, modelSlot: "fix" }
+          : undefined,
+      },
+      opts.executorHttpDeps,
+    );
+    return delegated ?? await invoke(harness, wt.path, attemptPrompt, {
+      timeoutSec,
       model,
-    }),
-  });
+      reasoningEffort: cfg.effort?.fix,
+      sandbox: cfg.harness_sandbox,
+      accounting: opts.runDir
+        ? {
+            runDir: opts.runDir,
+            runStoreDeps: opts.runStoreDeps,
+            issue: issueNumber,
+            stage,
+            modelSlot: "fix",
+            model,
+          }
+        : undefined,
+      env: papercutIdentityEnv(cfg, {
+        runId: opts.runDir ? path.basename(opts.runDir) : null,
+        issue: issueNumber,
+        stage,
+        harness,
+        model,
+      }),
+    });
+  };
 
+  // Crash-retry loop (#486): a fix-harness invocation that exits non-zero or
+  // times out is retried in place, up to cfg.auto_recovery_max_retries
+  // additional times, within the remaining fix_timeout budget — never
+  // touching git/the worktree, so a crashed attempt's uncommitted work is
+  // exactly what the retry inherits.
+  const retryResult = await invokeFixHarnessWithRetry({
+    maxRetries: cfg.auto_recovery_max_retries,
+    fixTimeoutSec: cfg.fix_timeout,
+    basePrompt: prompt,
+    invokeAttempt: deps.invokeFixHarnessAttempt ?? invokeAttempt,
+    onBeforeAttempt: async (attempt, _timeoutSec, attemptPrompt) => {
+      if (!opts.stateDir) return;
+      const kind = attempt === 1 ? `fix-${round}` : `fix-${round}-retry-${attempt}`;
+      await recordPrompt(
+        opts.stateDir,
+        issueNumber,
+        stage,
+        makePromptRecord(kind, harness, attemptPrompt),
+      ).catch(() => {});
+    },
+    onRetryScheduled: async (attempt, limit, reason) => {
+      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+      if (opts.runDir) {
+        await appendEvent(
+          opts.runDir,
+          { schema_version: RUN_SCHEMA_VERSION, type: "fix_harness_retry", at, stage, attempt, limit, reason },
+          opts.runStoreDeps,
+        ).catch(() => {});
+      }
+      if (opts.stateDir) {
+        await recordRecovery(opts.stateDir, issueNumber, {
+          trigger: `fix-harness-crash-retry: ${reason}`,
+          round: attempt,
+          at,
+        }).catch(() => {});
+      }
+    },
+  });
+  const result = retryResult.finalResult;
+
+  // Retries exhausted (cap reached, or remaining budget fell at/below the
+  // usable floor). Before the terminal block, attempt salvage of whatever
+  // uncommitted work the crashed attempts left behind (#486) — the same
+  // salvage path used by the success-but-no-commit case below — instead of
+  // abandoning a near-complete diff to a human.
+  let crashSalvaged = false;
   if (!result.success) {
-    const reason = result.timed_out
+    const finalReason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    await setBlocked(cfg, issueNumber, `Fix harness (${harness}) failed: ${reason}`, stage, "harness-failure");
-    return fixHarnessFailureOutcome(reason);
+    const salvaged = await trySalvageUncommittedWork(
+      wt.path,
+      issueNumber,
+      pipelineRunId,
+      fixSalvageStageLabel(round, issueNumber),
+    );
+    if (!salvaged) {
+      const attemptsNote = retryResult.attempts.length > 1
+        ? ` after ${retryResult.attempts.length} attempts`
+        : "";
+      const budgetNote = retryResult.budgetExhausted
+        ? " The remaining fix_timeout budget was exhausted before another retry could be attempted."
+        : "";
+      const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}`;
+      const reason = await appendWorktreeStateDisclosure(wt.path, baseReason);
+      await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
+      return fixHarnessFailureOutcome(finalReason);
+    }
+    crashSalvaged = true;
   }
 
   // Set when the no-new-commits path (#349) decides the reviewed SHA is stale
@@ -474,8 +688,12 @@ export async function advanceFix(
   // blocked fix run still blocks, exactly as before #349.
   let commitGateMode: "external" | "harness" = "harness";
 
+  // Recomputed post-salvage when crashSalvaged: reflects the salvage commit,
+  // so the headBefore === headAfter branch below (the #131 success-but-no-commit
+  // path) is correctly skipped — the crash-retry salvage already produced the
+  // commit that path exists to create.
   let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
-  if (headBefore && headAfter && headBefore === headAfter) {
+  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter) {
     // #131: the harness reported success without committing — salvage real
     // uncommitted work into a commit instead of discarding it. A clean
     // worktree (nothing salvaged) keeps the existing block path.
@@ -517,6 +735,61 @@ export async function advanceFix(
         );
         commitGateMode = resolveFixCommitGateMode(decision, verifiedOnRemote);
       } else {
+        // #473: before the #391 does-not-reproduce carve-out, check whether the
+        // harness declared that one or more invoked blocking findings require a
+        // human decision — a durable product/authority/external-dependency
+        // impasse, never a code fix and never a claim the finding's condition
+        // does not exist. Evaluated first so a round mixing both outcomes always
+        // parks rather than advancing. Fails closed: any malformed, stale, or
+        // unmatched declaration is simply not accepted here and falls through to
+        // the does-not-reproduce check and then the existing no-commits block.
+        const humanDecisionDeclarations = parseHumanDecisionDeclarations(result.stdout ?? "");
+        const acceptedHumanDecisions = decideHumanDecisionPark(
+          invokedIdentities,
+          humanDecisionDeclarations,
+          headAfter,
+        );
+        if (acceptedHumanDecisions.length > 0) {
+          const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          for (const decl of acceptedHumanDecisions) {
+            await postComment(
+              cfg,
+              issueNumber,
+              humanDecisionComment({
+                category: decl.category,
+                key: decl.key,
+                fingerprint: decl.fingerprint,
+                reviewedSha: decl.reviewedSha,
+                request: decl.request,
+                stage,
+                timestamp,
+                footer: cfg.marker_footer,
+              }),
+            );
+          }
+          const categories = [...new Set(acceptedHumanDecisions.map((d) => d.category))].join(", ");
+          // #473 review-2 finding a64f2252cd2dbd0a: neutralize the harness-provided
+          // request here too — it is copied into the blocker reason passed to
+          // setBlocked, a distinct sink from the evidence comment above, and an
+          // unsanitized request could otherwise forge a trusted override/
+          // non-reproducing sentinel in the pipeline-authored blocked comment.
+          const requests = acceptedHumanDecisions
+            .map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`)
+            .join("; ");
+          const humanDecisionMsg =
+            `${stage}: the fix harness produced no new commits and declared ` +
+            `${acceptedHumanDecisions.length} blocking finding(s) require a human decision ` +
+            `(${categories}) at the reviewed SHA (${headAfter}) — ${requests}. This does not ` +
+            `resolve or advance the item.`;
+          const humanDecisionReason = await appendWorktreeStateDisclosure(wt.path, humanDecisionMsg);
+          await setBlocked(cfg, issueNumber, humanDecisionReason, stage, "human-decision-required");
+          return {
+            advanced: false,
+            status: "blocked",
+            reason: humanDecisionMsg,
+            blockerKind: "human-decision-required",
+          };
+        }
         // #391: before blocking, check whether the harness declared every
         // invoked blocking finding non-reproducing at the reviewed SHA — a
         // correctly-determined no-op (a tooling artifact / non-issue), not a
@@ -565,7 +838,8 @@ export async function advanceFix(
           return { advanced: true, from: stage, to: dnrDecision.to, summary: "no reproducible findings" };
         }
         const noCommitsMsg = `${stage} reported success but produced no new commits.`;
-        await setBlocked(cfg, issueNumber, noCommitsMsg, stage, "no-commits");
+        const noCommitsReason = await appendWorktreeStateDisclosure(wt.path, noCommitsMsg);
+        await setBlocked(cfg, issueNumber, noCommitsReason, stage, "no-commits");
         return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
       }
     } else {
@@ -852,6 +1126,23 @@ export async function enforceExternalCommitGate(
   deps: VerifyDeps = {},
 ): Promise<VerifyResult> {
   return verifyHarnessCommits(wtPath, reviewSha, {}, deps);
+}
+
+/**
+ * Append a worktree-state disclosure section (#486) to a blocker `reason`,
+ * derived from `git status --short` in `wtPath`. Degrades gracefully: a
+ * failed status read or a clean worktree returns `reason` unchanged — the
+ * blocker is always posted, disclosure is purely additive.
+ */
+async function appendWorktreeStateDisclosure(wtPath: string, reason: string): Promise<string> {
+  try {
+    const statusResult = await gitInWorktree(wtPath, ["status", "--short"], { ignoreFailure: true });
+    if (statusResult.code !== 0) return reason;
+    const section = renderWorktreeStateSection(statusResult.stdout);
+    return section ? `${reason}\n\n${section}` : reason;
+  } catch {
+    return reason;
+  }
 }
 
 // ---- pure helpers ----
@@ -1410,6 +1701,85 @@ export function decideDoesNotReproduceAdvance(
     return { advance: true, to: round === 1 ? "review-2" : "pre-merge", covered };
   }
   return { advance: false, missing };
+}
+
+// ---------------------------------------------------------------------------
+// Needs-human-decision harness declarations (#473) — exported for direct unit
+// testing. Mirrors the does-not-reproduce declaration seam above, but this
+// outcome NEVER advances the item: it parks the round with a dedicated
+// blocker kind instead. Evaluated on the no-commit path BEFORE the #391
+// does-not-reproduce advance, so a mixed round always parks.
+// ---------------------------------------------------------------------------
+
+/** The closed category set a needs-human-decision declaration may carry. */
+export const HUMAN_DECISION_CATEGORIES = [
+  "product-decision",
+  "authority",
+  "external-dependency",
+] as const;
+export type HumanDecisionCategory = (typeof HUMAN_DECISION_CATEGORIES)[number];
+
+export interface HumanDecisionDeclaration {
+  category: HumanDecisionCategory;
+  key: string;
+  /** Verbatim render-time finding fingerprint, mirroring
+   *  {@link DoesNotReproduceDeclaration.fingerprint}. */
+  fingerprint: string;
+  reviewedSha: string;
+  request: string;
+}
+
+// Anchored full-line + global; category is a literal alternation over the
+// closed set so an unknown category never matches. Mirrors
+// DOES_NOT_REPRODUCE_RE's "identity SHA | text" shape.
+const HUMAN_DECISION_RE =
+  /^<!-- pipeline-needs-human-decision: (product-decision|authority|external-dependency) ([0-9a-f]{8}) ([0-9a-f]{16}) ([0-9a-fA-F]{40}) \| (.+?) -->$/gm;
+
+/**
+ * Parse needs-human-decision declarations from raw fix-harness stdout (#473).
+ * Pure text scan — never validates a declaration against the invoked blocking
+ * set, the current HEAD, or a non-empty decision request (see
+ * {@link decideHumanDecisionPark} for that). Malformed, multi-line, or absent
+ * declarations, and declarations carrying a category outside the closed set,
+ * yield [].
+ */
+export function parseHumanDecisionDeclarations(stdout: string): HumanDecisionDeclaration[] {
+  const out: HumanDecisionDeclaration[] = [];
+  HUMAN_DECISION_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = HUMAN_DECISION_RE.exec(stdout)) !== null) {
+    out.push({
+      category: m[1] as HumanDecisionCategory,
+      key: m[2],
+      fingerprint: m[3],
+      reviewedSha: m[4],
+      request: m[5].trim(),
+    });
+  }
+  HUMAN_DECISION_RE.lastIndex = 0;
+  return out;
+}
+
+/**
+ * #473: accept a needs-human-decision declaration only when its (key,
+ * fingerprint) identity matches a finding actually rendered into this
+ * round's fix prompt, its reviewed SHA equals `currentHead`, and its decision
+ * request is a non-empty single line. Returns the accepted declarations —
+ * any non-empty result means the round parks; no ranking or "to" stage is
+ * computed since this outcome never advances.
+ */
+export function decideHumanDecisionPark(
+  renderedIdentities: FindingSummary[],
+  declarations: HumanDecisionDeclaration[],
+  currentHead: string,
+): HumanDecisionDeclaration[] {
+  return declarations.filter((decl) => {
+    if (decl.request.trim().length === 0) return false;
+    if (!currentHead || decl.reviewedSha !== currentHead) return false;
+    return renderedIdentities.some(
+      (s) => s.key === decl.key && s.fingerprint !== null && s.fingerprint === decl.fingerprint,
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------

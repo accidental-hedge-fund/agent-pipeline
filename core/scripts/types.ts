@@ -263,6 +263,7 @@ export const BLOCKER_KINDS = [
   "worktree-setup-failed",
   "build-failed",
   "design-gate-failed",
+  "human-decision-required",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -381,6 +382,16 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "record or challenge verdict after its bounded re-ask, or the reviewer " +
     "harness is unavailable (see the error above). Investigate and fix the " +
     "root cause, remove the `blocked` label, then re-run `$pipeline {{N}}`.",
+  "human-decision-required":
+    "The fix harness determined that the correct next step is a human " +
+    "product decision, an authority it lacks, or an unavailable external " +
+    "capability — not a code change. Read the recorded decision request(s) " +
+    "above, make the decision, and either fix the underlying blocker and " +
+    "remove the `blocked` label to re-run `$pipeline {{N}}`, or record an " +
+    "audited disposition with " +
+    '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past ' +
+    "it (the key comes from the review comment; `--override` clears the " +
+    "label and resumes automatically).",
 };
 
 // ---------------------------------------------------------------------------
@@ -1302,6 +1313,16 @@ export interface RecoveryRecord {
   at: string;
 }
 
+/** One detected mid-run engine-identity transition (#450): the on-disk engine
+ *  version and/or template fingerprint diverged from what this run pinned at
+ *  start. Advisory only — recorded for attribution, never changes the run. */
+export interface EngineDriftRecord {
+  at: string;
+  stage: string;
+  pinned: { version: string; root: string; templates_fingerprint: string };
+  observed: { version: string; root: string; templates_fingerprint: string };
+}
+
 // ---------------------------------------------------------------------------
 // Auto-merge eligibility gate (#306) — types for the deterministic policy
 // envelope + LLM risk judge that classifies PRs as eligible or needs-human.
@@ -1381,6 +1402,10 @@ export interface EvidenceBundle {
    *  gate's final outcome. Present for every run that reaches `design-gate`;
    *  untriggered runs carry only `trigger` and `outcome: null`. */
   designInterrogation?: DesignGateState;
+  /** Mid-run engine-identity drift transitions detected at stage boundaries
+   *  (#450). Additive and optional; absent for pre-#450 bundles and for runs
+   *  where the engine identity never changed. */
+  engineDrifts?: EngineDriftRecord[];
 }
 
 // ---------------------------------------------------------------------------

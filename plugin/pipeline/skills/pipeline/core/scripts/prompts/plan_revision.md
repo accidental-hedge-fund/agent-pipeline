@@ -19,13 +19,10 @@ Secondary harness plan-review feedback:
 {{human_feedback}}{{spec_context}}
 Revise the implementation plan before coding. Incorporate valid feedback, resolve conflicts explicitly, and keep the plan surgical.
 
-Before the revised plan, output a `## Feedback Incorporated` section that lists every piece of reviewer feedback and its disposition:
+Before the revised plan, output a `## Feedback Incorporated` section that lists every piece of reviewer feedback and its disposition. Write this section as plain Markdown in your response body — do NOT wrap it in a code fence, and the `## Feedback Incorporated` header MUST appear exactly once in your output. Use one bullet per item, shaped like this:
 
-```
-## Feedback Incorporated
 - [ADDRESSED] <brief description of what was changed>
 - [DEFERRED] <brief description> — reason: <why it was not incorporated>
-```
 
 Every reviewer feedback item MUST appear as either `[ADDRESSED]` or `[DEFERRED]`. Do not omit items.
 

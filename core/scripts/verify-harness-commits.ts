@@ -285,26 +285,42 @@ export async function verifyHarnessCommits(
  *   top-level items (numbered or bulleted) detected in the feedback.
  */
 export function verifyPlanRevisionOutput(stdout: string, feedback?: string): VerifyResult {
-  // 1. Locate the ## Feedback Incorporated section header.
-  const headerMatch = /^##\s+Feedback\s+Incorporated\b/im.exec(stdout);
-  if (!headerMatch) {
+  // 0. Neutralise code-fence delimiter lines so fenced content is scanned like
+  //    ordinary text — models routinely wrap the acknowledgement section (and,
+  //    when copying the prompt's format example verbatim, a *duplicated*
+  //    header) inside a code fence.
+  const cleaned = stdout.replace(/^[ \t]{0,3}(`{3,}|~{3,}).*$/gm, "");
+
+  // 1. Locate every ## Feedback Incorporated header occurrence — not just the
+  //    first — since a duplicated header inside a fence would otherwise be
+  //    mistaken for the "next section" boundary and truncate the real one.
+  const headerMatches = [...cleaned.matchAll(/^##\s+Feedback\s+Incorporated\b/gim)];
+  if (headerMatches.length === 0) {
     return {
       ok: false,
       reason: "Plan revision output is missing required ## Feedback Incorporated section",
     };
   }
 
-  // 2. Extract section content: from after the header to the next level-2 section or end.
-  const afterHeader = stdout.slice(headerMatch.index + headerMatch[0].length);
-  const nextSection = afterHeader.search(/^##\s/m);
-  const sectionContent = nextSection >= 0 ? afterHeader.slice(0, nextSection) : afterHeader;
-
-  // 3. Require tagged bullet lines within the section (not just anywhere in stdout).
+  // 2. For each header occurrence, extract its candidate section: from after
+  //    the header to the next level-2 section or end. Require tagged bullet
+  //    lines within a candidate section (not just anywhere in stdout).
   //    Tolerate a leading bullet and markdown emphasis around the tag — models
-  //    routinely render it as "- **[ADDRESSED]**" or "* _[DEFERRED]_". The match
-  //    stays anchored to line-start so prose mentions of "[ADDRESSED]" don't count.
-  const taggedItems = sectionContent.match(/^[\s>*_-]*\[(ADDRESSED|DEFERRED)\]/gim) ?? [];
-  if (taggedItems.length === 0) {
+  //    routinely render it as "- **[ADDRESSED]**" or "* _[DEFERRED]_". The
+  //    match stays anchored to line-start so prose mentions of "[ADDRESSED]"
+  //    don't count. The requirement is satisfied if ANY occurrence's section
+  //    has tagged items; the advisory coverage count is the max across
+  //    occurrences so a duplicated header doesn't double-count the same bullets.
+  let maxTaggedCount = 0;
+  for (const headerMatch of headerMatches) {
+    const afterHeader = cleaned.slice(headerMatch.index + headerMatch[0].length);
+    const nextSection = afterHeader.search(/^##\s/m);
+    const sectionContent = nextSection >= 0 ? afterHeader.slice(0, nextSection) : afterHeader;
+    const taggedItems = sectionContent.match(/^[\s>*_-]*\[(ADDRESSED|DEFERRED)\]/gim) ?? [];
+    maxTaggedCount = Math.max(maxTaggedCount, taggedItems.length);
+  }
+
+  if (maxTaggedCount === 0) {
     return {
       ok: false,
       reason:
@@ -312,7 +328,7 @@ export function verifyPlanRevisionOutput(stdout: string, feedback?: string): Ver
     };
   }
 
-  // 4. When feedback is provided, a coverage shortfall is ADVISORY (not a block).
+  // 3. When feedback is provided, a coverage shortfall is ADVISORY (not a block).
   //    `countTopLevelItems` is heuristic — it counts every bullet in the reviewer
   //    feedback, including non-actionable "Risks / Checks" lines — so hard-blocking
   //    on it false-blocks revisions that legitimately acknowledge only the
@@ -321,11 +337,11 @@ export function verifyPlanRevisionOutput(stdout: string, feedback?: string): Ver
   //    warning for the operator, not a blocker.
   if (feedback) {
     const feedbackCount = countTopLevelItems(feedback);
-    if (feedbackCount > 0 && taggedItems.length < feedbackCount) {
+    if (feedbackCount > 0 && maxTaggedCount < feedbackCount) {
       return {
         ok: true,
         warning:
-          `Plan revision tags ${taggedItems.length} of ${feedbackCount} detected feedback bullets — confirm each required change was addressed (advisory; some bullets may be non-actionable notes)`,
+          `Plan revision tags ${maxTaggedCount} of ${feedbackCount} detected feedback bullets — confirm each required change was addressed (advisory; some bullets may be non-actionable notes)`,
       };
     }
   }

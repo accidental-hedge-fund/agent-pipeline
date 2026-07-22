@@ -12,7 +12,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk, reattachIfDetached, removeWorktreeForIssue } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, resolveManagedRoots, listOnDisk, reattachIfDetached, removeWorktreeForIssue, renderWorktreeStateSection, writeManagedMarker, hasManagedMarker } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps, RemoveWorktreeDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -153,6 +153,99 @@ test("parseWorktreePorcelain: pipeline-named dir on non-pipeline branch is ignor
     [],
     "a pipeline-named dir on a non-pipeline branch must not be matched by the path fallback",
   );
+});
+
+// ---------------------------------------------------------------------------
+// resolveManagedRoots — cross-checkout managed root set (#472)
+// ---------------------------------------------------------------------------
+
+test("resolveManagedRoots: every registered checkout contributes a root", () => {
+  const stdout = [
+    "worktree /repo",
+    "HEAD 1111111111111111111111111111111111111111",
+    "branch refs/heads/main",
+    "",
+    "worktree /orchestration",
+    "HEAD 2222222222222222222222222222222222222222",
+    "branch refs/heads/orchestration-main",
+    "",
+  ].join("\n");
+  assert.deepEqual(
+    new Set(resolveManagedRoots(stdout, ".worktrees")),
+    new Set(["/repo/.worktrees", "/orchestration/.worktrees"]),
+  );
+});
+
+test("resolveManagedRoots: independent of which checkout is cfg.repo_dir", () => {
+  const stdout = [
+    "worktree /repo",
+    "HEAD 1111111111111111111111111111111111111111",
+    "branch refs/heads/main",
+    "",
+    "worktree /orchestration",
+    "HEAD 2222222222222222222222222222222222222222",
+    "branch refs/heads/orchestration-main",
+    "",
+  ].join("\n");
+  // The porcelain output is identical regardless of invoking checkout — the
+  // resolver never even sees cfg.repo_dir, only the listing.
+  const first = resolveManagedRoots(stdout, ".worktrees");
+  const second = resolveManagedRoots(stdout, ".worktrees");
+  assert.deepEqual(new Set(first), new Set(second));
+});
+
+test("resolveManagedRoots: single-checkout repository yields exactly one root", () => {
+  const stdout = [
+    "worktree /repo",
+    "HEAD 1111111111111111111111111111111111111111",
+    "branch refs/heads/main",
+    "",
+  ].join("\n");
+  assert.deepEqual(resolveManagedRoots(stdout, ".worktrees"), ["/repo/.worktrees"]);
+});
+
+test("resolveManagedRoots: absolute worktree_root collapses to one root", () => {
+  const stdout = [
+    "worktree /repo",
+    "HEAD 1111111111111111111111111111111111111111",
+    "branch refs/heads/main",
+    "",
+    "worktree /orchestration",
+    "HEAD 2222222222222222222222222222222222222222",
+    "branch refs/heads/orchestration-main",
+    "",
+  ].join("\n");
+  assert.deepEqual(resolveManagedRoots(stdout, "/abs/.worktrees"), ["/abs/.worktrees"]);
+});
+
+// ---------------------------------------------------------------------------
+// parseWorktreePorcelain — cross-checkout root set matching (#472)
+// ---------------------------------------------------------------------------
+
+test("parseWorktreePorcelain: a worktree under a linked checkout's root is managed", () => {
+  const stdout = [
+    "worktree /orchestration/.worktrees/pipeline-7-fix-thing",
+    "HEAD 3333333333333333333333333333333333333333",
+    "branch refs/heads/pipeline/7-fix-thing",
+    "",
+  ].join("\n");
+  const recs = parseWorktreePorcelain(stdout, ["/repo/.worktrees", "/orchestration/.worktrees"]);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].issueNumber, 7);
+  assert.equal(recs[0].slug, "fix-thing");
+  assert.equal(recs[0].underManagedRoot, true);
+});
+
+test("parseWorktreePorcelain: a developer checkout of a pipeline branch outside every root is not managed", () => {
+  const stdout = [
+    "worktree /home/dev/scratch",
+    "HEAD 3333333333333333333333333333333333333333",
+    "branch refs/heads/pipeline/7-fix-thing",
+    "",
+  ].join("\n");
+  const recs = parseWorktreePorcelain(stdout, ["/repo/.worktrees", "/orchestration/.worktrees"]);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].underManagedRoot, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -1696,6 +1789,77 @@ test("realWriteNodeModulesExclude: idempotent — duplicate entry not added (#18
 });
 
 // ---------------------------------------------------------------------------
+// writeManagedMarker / hasManagedMarker — cross-checkout ownership proof
+// (#472 review-2 finding 578ebd21)
+// ---------------------------------------------------------------------------
+
+test("writeManagedMarker + hasManagedMarker: real linked worktree — marker survives in the per-worktree gitdir, not the working tree", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-marker-"));
+  try {
+    const mainRepo = path.join(tmp, "main-repo");
+    const linkedWt = path.join(tmp, "linked-wt");
+
+    await execFileAsync("git", ["init", mainRepo]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.email", "test@pipeline.test"]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.name", "Pipeline Test"]);
+    await fs.promises.writeFile(path.join(mainRepo, "README.md"), "test\n");
+    await execFileAsync("git", ["-C", mainRepo, "add", "README.md"]);
+    await execFileAsync("git", ["-C", mainRepo, "commit", "-m", "initial"]);
+    await execFileAsync("git", ["-C", mainRepo, "worktree", "add", linkedWt]);
+
+    assert.equal(await hasManagedMarker(linkedWt), false, "no marker before it is written");
+
+    await writeManagedMarker(linkedWt);
+
+    assert.equal(await hasManagedMarker(linkedWt), true);
+
+    // The marker lives in the per-worktree gitdir, not the working tree —
+    // it must not show up as an untracked file in `git status`.
+    const { stdout } = await execFileAsync("git", ["-C", linkedWt, "status", "--porcelain"]);
+    assert.equal(stdout.trim(), "", `marker must not appear as untracked; git status:\n${stdout}`);
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("hasManagedMarker: worktree directory absent → false, no throw", async () => {
+  assert.equal(await hasManagedMarker("/nonexistent/pipeline-wt-marker-test"), false);
+});
+
+test("createWorktree: real linked worktree — writeManagedMarker default is invoked so a later cross-checkout removal can verify ownership", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-marker-createwt-"));
+  try {
+    const mainRepo = path.join(tmp, "main-repo");
+    await execFileAsync("git", ["init", mainRepo]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.email", "test@pipeline.test"]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.name", "Pipeline Test"]);
+    await fs.promises.writeFile(path.join(mainRepo, "README.md"), "test\n");
+    await execFileAsync("git", ["-C", mainRepo, "add", "README.md"]);
+    await execFileAsync("git", ["-C", mainRepo, "commit", "-m", "initial"]);
+    await execFileAsync("git", ["-C", mainRepo, "branch", "-m", "main"]);
+    // createWorktree fetches `origin/<base_branch>` for real; point origin at
+    // this same repo so the fetch succeeds without a network remote.
+    await execFileAsync("git", ["-C", mainRepo, "remote", "add", "origin", mainRepo]);
+
+    const cfg = { ...makeCreateCfg(), repo_dir: mainRepo, base_branch: "main" };
+    const wtPath = path.join(mainRepo, ".worktrees", "pipeline-99-marker-test");
+
+    const deps: CreateWorktreeDeps = {
+      listActive: async () => [],
+      existsSync: (p: string) => fs.existsSync(p),
+      mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
+      ...noopMutexDeps,
+    };
+    const result = await createWorktree(cfg, 99, "marker-test", deps);
+
+    assert.equal(result.path, wtPath);
+    assert.equal(await hasManagedMarker(wtPath), true, "createWorktree must stamp the ownership marker by default");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // review-2 finding 1: reclaim must not force-delete worktrees outside the
 // managed root (#223)
 //
@@ -1860,6 +2024,48 @@ test("sweep: linked-launch — sibling worktree with underManagedRoot:true is a 
 });
 
 // ---------------------------------------------------------------------------
+// Cross-checkout sweep — a worktree registered under a DIFFERENT checkout's
+// managed root (not merely a linked-launch sibling under the main root) is
+// still recognized as managed, but only swept when its merged-PR precondition
+// holds (#472).
+// ---------------------------------------------------------------------------
+
+test("sweep: cross-checkout worktree (registered under a different checkout's root) is swept only when merged", async () => {
+  const cfg = makeCfg();
+  const rec: WorktreeRecord = {
+    path: "/orchestration/.worktrees/pipeline-7-fix-thing",
+    branch: "pipeline/7-fix-thing",
+    issueNumber: 7,
+    slug: "fix-thing",
+    underManagedRoot: true,
+  };
+
+  const removeCalls: WorktreeRecord[] = [];
+  const merged: Partial<SweepDeps> = {
+    listOnDisk: async () => [rec],
+    getPrMergeState: async () => ({ merged: true, prNumber: 7, headSha: "deadbeef" }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "deadbeef",
+    pathExists: () => true,
+    removeWorktree: async () => { removeCalls.push(rec); return { ok: true as const }; },
+  };
+  const mergedResult = await sweepMergedWorktrees(cfg, merged);
+  assert.equal(removeCalls.length, 1, "merged cross-checkout worktree must be swept");
+  assert.equal(mergedResult.removed.length, 1);
+
+  const openPrDeps: Partial<SweepDeps> = {
+    listOnDisk: async () => [rec],
+    getPrMergeState: async () => ({ merged: false }),
+    hasDirtyWorkdir: async () => false,
+    getWorktreeHeadSha: async () => "deadbeef",
+    pathExists: () => true,
+    removeWorktree: async () => { throw new Error("must not be called for an open PR"); },
+  };
+  const openResult = await sweepMergedWorktrees(cfg, openPrDeps);
+  assert.equal(openResult.removed.length, 0, "cross-checkout worktree with an open PR must not be swept");
+});
+
+// ---------------------------------------------------------------------------
 // Regression: detached worktree with local-only branch commits (#296)
 //
 // When a pipeline worktree is detached at a pushed commit (HEAD is clean),
@@ -1905,4 +2111,43 @@ test("removeWorktreeForIssue: detached worktree at pushed HEAD but branch ref ah
   assert.equal(removeCalled, false, "removeWorktree must NOT be called when branch has local-only commits");
   assert.equal(result.removed, false);
   assert.match(result.error ?? "", /local-only commits/, "error must mention local-only commits");
+});
+
+// ---------------------------------------------------------------------------
+// renderWorktreeStateSection (#486) — blocker-worktree-disclosure
+// ---------------------------------------------------------------------------
+
+test("renderWorktreeStateSection: empty input → no section", () => {
+  assert.equal(renderWorktreeStateSection(""), null);
+  assert.equal(renderWorktreeStateSection("\n\n"), null);
+});
+
+test("renderWorktreeStateSection: staged/unstaged/untracked counts match entries", () => {
+  const status = [
+    "M  staged-file.ts",
+    " M unstaged-file.ts",
+    "MM both-file.ts",
+    "?? untracked-file.ts",
+  ].join("\n");
+  const section = renderWorktreeStateSection(status);
+  assert.ok(section, "expected a rendered section for a dirty worktree");
+  // 2 staged (staged-file.ts, both-file.ts), 2 unstaged (unstaged-file.ts, both-file.ts), 1 untracked
+  assert.match(section!, /2 staged/);
+  assert.match(section!, /2 unstaged/);
+  assert.match(section!, /1 untracked/);
+  assert.match(section!, /staged-file\.ts/);
+  assert.match(section!, /unstaged-file\.ts/);
+  assert.match(section!, /both-file\.ts/);
+  assert.match(section!, /untracked-file\.ts/);
+});
+
+test("renderWorktreeStateSection: long file lists are truncated deterministically with an omitted-count note", () => {
+  const lines = Array.from({ length: 15 }, (_, i) => `?? file-${i}.ts`);
+  const section = renderWorktreeStateSection(lines.join("\n"));
+  assert.ok(section);
+  assert.match(section!, /15 untracked/);
+  // Only the first 10 files are listed verbatim.
+  assert.match(section!, /file-9\.ts/);
+  assert.doesNotMatch(section!, /file-10\.ts/);
+  assert.match(section!, /and 5 more/);
 });

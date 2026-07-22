@@ -3,7 +3,7 @@
 // shipcheck prompts. The snapshot is advisory — harnesses are instructed to
 // treat the content as context, not as instructions.
 
-import { classifyComment } from "./gh.ts";
+import { classifyComment, isVerifiedOperatorSurfaceComment } from "./gh.ts";
 import { attestPipelineComment, isVerifiedPipelineOutput } from "./stages/review-parsing.ts";
 
 export const CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT = 8_000;
@@ -13,11 +13,6 @@ export const PRE_PLANNING_CONTEXT_HEADER = "## Pre-Planning Context";
 
 const REVISED_PLAN_HEADER = "## Revised Implementation Plan";
 const PLAN_HEADER = "## Implementation Plan";
-
-// Header used by scope-override comments (#229). When a scope override is posted
-// after the plan anchor, it acts as an acknowledgement anchor: human comments at
-// or before the scope override are considered explicitly dismissed.
-const SCOPE_OVERRIDE_HEADING = "## Pipeline: Scope override";
 
 export interface SnapshotEntry {
   author: string;
@@ -217,10 +212,13 @@ export function extractSnapshotComment<T extends { body: string }>(
  *   objection and isn't verified pipeline output (e.g. a quoted reply with a
  *   real comment appended), is counted as human input (#390, #390 review 2,
  *   #390 review 1, #471); (2) a comment in this list may act as an
- *   acknowledgement anchor, either via the `## Pipeline: Scope override`
- *   heading or, new in #390, a plain acknowledgement with no scope-changing
- *   language. Defaults to [] — fail-closed: nothing is trusted unless the
- *   caller explicitly supplies the set (e.g. when `getGhActor()` returns null).
+ *   acknowledgement anchor, either via a verified operator-surface comment
+ *   (`unblocked`/`finding-override`/`scope-override` — an engine-rendered body
+ *   posted in direct response to an operator CLI invocation, so the operator has
+ *   been heard by construction, #484) or, since #390, a plain acknowledgement
+ *   with no scope-changing language. Defaults to [] — fail-closed: nothing is
+ *   trusted unless the caller explicitly supplies the set (e.g. when
+ *   `getGhActor()` returns null).
  */
 export function findUnacknowledgedComments(
   comments: { author: string; body: string; createdAt: string }[],
@@ -251,19 +249,21 @@ export function findUnacknowledgedComments(
   // If a trusted actor posted an acknowledgement comment after the plan anchor,
   // treat it as an acknowledgement anchor — human comments at or before it have
   // been explicitly dismissed and are no longer considered unacknowledged (#318
-  // fix d2012430). Two forms count as acknowledgement: the explicit
-  // `## Pipeline: Scope override` heading, or (new in #390) a plain comment that
-  // carries no scope-changing / change-request language — the operator no longer
-  // needs the literal heading to clear the gate. Only comments present in
+  // fix d2012430). Two forms count as acknowledgement: a verified operator-surface
+  // comment (#484 — `unblocked`/`finding-override`/`scope-override`; the operator
+  // has been heard by construction, so this is determined from the attestation
+  // payload's `kind`, never a heading literal, replacing the old hard-coded
+  // `## Pipeline: Scope override` heading check), or (since #390) a plain comment
+  // that carries no scope-changing / change-request language — the operator no
+  // longer needs the literal heading to clear the gate. Only comments present in
   // `trustedComments` (author-validated via buildTrustedOverrideComments) can act
-  // as anchors; an untrusted commenter faking the heading is ignored (#318 fix
-  // c5825398). Scanning continues past a trusted-but-scope-changing comment so an
-  // earlier qualifying anchor can still be found.
+  // as anchors; an untrusted commenter faking the heading/marker is ignored (#318
+  // fix c5825398, #484). Scanning continues past a trusted-but-scope-changing
+  // comment so an earlier qualifying anchor can still be found.
   for (let i = comments.length - 1; i > anchorIdx; i--) {
     if (!trustedComments.includes(comments[i])) continue;
     const body = comments[i].body;
-    const isScopeOverride = body.trimStart().startsWith(SCOPE_OVERRIDE_HEADING);
-    if (isScopeOverride) {
+    if (isVerifiedOperatorSurfaceComment(body)) {
       anchorIdx = i;
       break;
     }

@@ -261,6 +261,55 @@ test("plan_revision prompt: includes review feedback", () => {
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("plan_revision prompt: acknowledgement section is unfenced, single-header (#443 output contract)", () => {
+  // #443: models copied the prompt's fenced format example verbatim, emitting
+  // a bare header followed by a fenced block whose first line repeated it —
+  // defeating verifyPlanRevisionOutput's section extraction. The prompt must
+  // explicitly forbid the fence and require exactly one header occurrence,
+  // and must not itself contain a fenced block that repeats the header.
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 443,
+    title: "Revise me",
+    body: "Body",
+    plan: "ORIGINAL-PLAN",
+    feedback: "REVIEW-FEEDBACK",
+    implementer: "claude",
+    reviewer: "codex",
+  });
+  assert.match(
+    out,
+    /do NOT wrap it in a code fence/i,
+    "prompt must instruct that the acknowledgement section must not be fenced",
+  );
+  assert.match(
+    out,
+    /MUST appear exactly once/i,
+    "prompt must instruct that the ## Feedback Incorporated header appears exactly once",
+  );
+  // No fenced code block in the template's raw source contains the header.
+  const templatePath = path.join(
+    import.meta.dirname,
+    "..",
+    "scripts",
+    "prompts",
+    "plan_revision.md",
+  );
+  const template = fs.readFileSync(templatePath, "utf8");
+  const fencedBlocks = template.match(/```[\s\S]*?```/g) ?? [];
+  for (const block of fencedBlocks) {
+    assert.doesNotMatch(
+      block,
+      /^##\s+Feedback\s+Incorporated\b/im,
+      "no fenced block in plan_revision.md may contain a ## Feedback Incorporated header",
+    );
+  }
+  // The tag-shape example is still shown, just not inside a fence.
+  assert.match(out, /\[ADDRESSED\]/);
+  assert.match(out, /\[DEFERRED\]/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("plan_revision prompt: omits human feedback section when humanFeedback absent (#26)", () => {
   const out = buildPlanRevisionPrompt({
     cfg: dummyConfig(),
@@ -1571,6 +1620,48 @@ test("fix prompt: pre-commit self-check instructs comparing diff against finding
     /[Cc]onservative-open|surface the concern|call it out/i,
     "fix prompt must be conservative-open: surface concern rather than silently proceeding",
   );
+});
+
+// #486: single-turn-harness-discipline drift guard — both the fix and implement
+// prompts must declare the invocation single-turn and forbid ending the turn
+// with commit/push pending on a background task.
+
+test("fix prompt: declares the invocation single-turn and forbids deferring commit/push to a background task (#486)", () => {
+  const out = buildSampleFixPrompt();
+  assert.match(out, /single-turn/i, "fix prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "fix prompt must forbid ending the turn with commit/push pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "fix prompt must direct the harness to wait synchronously for such work",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("implementing prompt: declares the invocation single-turn and forbids deferring commit/push to a background task (#486)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "p",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /single-turn/i, "implementing prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "implementing prompt must forbid ending the turn with commit/push pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "implementing prompt must direct the harness to wait synchronously for such work",
+  );
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
@@ -1615,6 +1706,38 @@ test("fix prompt: does-not-reproduce outcome names the sentinel shape and the re
 
   const withoutSha = buildSampleFixPrompt();
   assert.doesNotMatch(withoutSha, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is omitted");
+});
+
+// #473: needs-human-decision drift test — bites when the sanctioned outcome is
+// removed from fix.md, and asserts the closed category set and reviewed SHA
+// are embedded in the rendered prompt.
+test("fix prompt: needs-human-decision outcome names the sentinel shape, categories, and the reviewed SHA (#473)", () => {
+  const sha = "d".repeat(40);
+  const out = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 473,
+    title: "Structured non-code fix outcome",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "473/r",
+    reviewedSha: sha,
+  });
+  assert.match(out, /human decision/i, "fix prompt must name the needs-human-decision outcome");
+  assert.match(
+    out,
+    /pipeline-needs-human-decision/,
+    "fix prompt must instruct the harness to emit the pipeline-needs-human-decision sentinel",
+  );
+  assert.match(out, /product-decision/, "fix prompt must offer the product-decision category");
+  assert.match(out, /\bauthority\b/, "fix prompt must offer the authority category");
+  assert.match(out, /external-dependency/, "fix prompt must offer the external-dependency category");
+  assert.ok(out.includes(sha), "fix prompt must embed the exact reviewed SHA the declaration must match");
+  assert.match(
+    out,
+    /does not (?:resolve|advance)/i,
+    "fix prompt must state the declaration neither resolves the finding nor advances the item",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is supplied");
 });
 
 test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {

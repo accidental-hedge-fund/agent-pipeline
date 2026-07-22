@@ -13,7 +13,7 @@ import {
   CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT,
 } from "../scripts/issue-context-snapshot.ts";
 import { classifyComment } from "../scripts/gh.ts";
-import { buildTrustedOverrideComments } from "../scripts/review-policy.ts";
+import { buildTrustedOverrideComments, scopedOverrideComment } from "../scripts/review-policy.ts";
 import { formatDeltaReviewComment } from "../scripts/stages/review-rendering.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -385,19 +385,14 @@ test("findUnacknowledgedComments: mix of human and pipeline after plan → only 
 test("findUnacknowledgedComments: scope override after plan acts as ack anchor — prior human comment dismissed (#318 d2012430)", () => {
   // Scenario: human posted a concern after the plan; operator responded with a
   // scope override to explicitly dismiss it. The gate must NOT re-block.
-  const scopeOverrideBody = [
-    "## Pipeline: Scope override",
-    "",
-    "**Scope**: `category:testing`",
-    "**Disposition**: defer",
-    "**Stage**: review-1",
-    "**Recorded at**: 2026-01-04T00:00:00Z",
-    "",
-    "### Reason",
-    "Out of scope for this change.",
-    "",
-    "<!-- pipeline-override-scope: category:testing defer | Out of scope -->",
-  ].join("\n");
+  const scopeOverrideBody = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "testing",
+    disposition: "defer",
+    reason: "Out of scope for this change.",
+    stage: "review-1",
+    timestamp: "2026-01-04T00:00:00Z",
+  });
 
   const comments = [
     makeComment("bot", "## Revised Implementation Plan\n\nDo X.", ts(0)),
@@ -412,7 +407,14 @@ test("findUnacknowledgedComments: scope override after plan acts as ack anchor �
 });
 
 test("findUnacknowledgedComments: scope override only dismisses comments before it — new human comment after scope override still unacknowledged (#318 d2012430)", () => {
-  const scopeOverrideBody = "## Pipeline: Scope override\n\n<!-- pipeline-override-scope: category:testing defer | reason -->";
+  const scopeOverrideBody = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "testing",
+    disposition: "defer",
+    reason: "reason",
+    stage: "review-1",
+    timestamp: ts(2),
+  });
   const comments = [
     makeComment("bot", "## Implementation Plan\n\nplan", ts(0)),
     makeComment("alice", "Old concern", ts(1)),
@@ -457,11 +459,14 @@ test("findUnacknowledgedComments: trusted scope-override author acts as ack anch
   // Scenario: a trusted operator posts a genuine scope-override comment.
   // The caller (review-routing / fix) has pre-filtered via
   // buildTrustedOverrideComments and passes only the operator's comment.
-  const scopeOverrideBody = [
-    "## Pipeline: Scope override",
-    "",
-    "<!-- pipeline-override-scope: category:testing defer | Out of scope -->",
-  ].join("\n");
+  const scopeOverrideBody = scopedOverrideComment({
+    scopeType: "category",
+    scopeValue: "testing",
+    disposition: "defer",
+    reason: "Out of scope",
+    stage: "review-1",
+    timestamp: ts(2),
+  });
 
   const comments = [
     makeComment("bot", "## Implementation Plan\n\nplan", ts(0)),

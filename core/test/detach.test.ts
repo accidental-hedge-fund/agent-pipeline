@@ -530,6 +530,111 @@ test("handleRunSubcommand: detach pointer resolves a nested --repo-path to the r
   }
 });
 
+// ---------------------------------------------------------------------------
+// 10. #485 regression: detached launch validates the repo BEFORE creating any
+//    artifact. Previously `findGitRoot(start) ?? start` silently fell back to
+//    the raw cwd, so a launch from a non-repo directory created the wrapper
+//    dir + run-store pointer before the inner process refused with exit 2.
+// ---------------------------------------------------------------------------
+
+test("handleRunSubcommand: detach from a non-repo dir exits 2, never calls spawnDetached, prints no 'started' message", async (t) => {
+  const logged: string[] = [];
+  const errored: string[] = [];
+  t.mock.method(console, "log", (msg: string) => logged.push(msg));
+  t.mock.method(console, "error", (msg: string) => errored.push(msg));
+  let spawnCalled = false;
+  const savedExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await handleRunSubcommand("99", { detach: true }, {
+      spawnDetached: async () => { spawnCalled = true; return { runDir: "/tmp/x", pid: 1 }; },
+      findGitRoot: () => null,
+      cwd: () => "/tmp/definitely-not-a-repo-485",
+    });
+    assert.equal(process.exitCode, 2);
+    assert.equal(spawnCalled, false, "spawnDetached must never be called when repo resolution fails");
+    assert.ok(!logged.some((l) => l.includes("detached run started")), "must not report a run started");
+    assert.ok(
+      errored.some((l) => l.includes("no git repo found at or above /tmp/definitely-not-a-repo-485")),
+      `expected refusal message; got ${JSON.stringify(errored)}`,
+    );
+  } finally {
+    process.exitCode = savedExitCode;
+  }
+});
+
+test("handleRunSubcommand: detach from a non-repo dir writes NOTHING to disk (write-free refusal)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "non-repo-"));
+  const before = fs.readdirSync(tmp);
+  const savedExitCode = process.exitCode;
+  try {
+    await handleRunSubcommand("99", { detach: true }, {
+      spawnDetached: async () => { throw new Error("spawnDetached must not be called"); },
+      findGitRoot: () => null,
+      cwd: () => tmp,
+    });
+    const after = fs.readdirSync(tmp);
+    assert.deepEqual(after, before, `launch dir must be unchanged; got ${JSON.stringify(after)}`);
+  } finally {
+    process.exitCode = savedExitCode;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("handleRunSubcommand: detach with --repo-path at a non-repo dir refuses, naming the resolved --repo-path (not cwd)", async () => {
+  const savedExitCode = process.exitCode;
+  process.exitCode = undefined;
+  const errored: string[] = [];
+  const origError = console.error;
+  console.error = (msg: string) => errored.push(msg);
+  try {
+    await handleRunSubcommand("99", { detach: true, repoPath: "/some/non/repo/path" }, {
+      spawnDetached: async () => { throw new Error("spawnDetached must not be called"); },
+      findGitRoot: () => null,
+      cwd: () => "/totally/different/cwd",
+    });
+    assert.equal(process.exitCode, 2);
+    assert.ok(
+      errored.some((l) => l.includes("/some/non/repo/path") && !l.includes("/totally/different/cwd")),
+      `expected refusal naming --repo-path, not cwd; got ${JSON.stringify(errored)}`,
+    );
+  } finally {
+    console.error = origError;
+    process.exitCode = savedExitCode;
+  }
+});
+
+test("handleRunSubcommand: detach run-store dir is pinned at the resolved git root when launched from a subdirectory", async () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "repo-root-"));
+  fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+  const subdir = path.join(repoRoot, "nested", "dir");
+  fs.mkdirSync(subdir, { recursive: true });
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-"));
+  try {
+    const savedExitCode = process.exitCode;
+    process.exitCode = undefined;
+    let capturedArgs: string[] = [];
+    await handleRunSubcommand("99", { detach: true }, {
+      spawnDetached: async (_issue, pipelineArgs) => {
+        capturedArgs = pipelineArgs;
+        return { runDir: wrapperDir, pid: 42 };
+      },
+      cwd: () => subdir,
+    });
+    process.exitCode = savedExitCode;
+    const pointer = JSON.parse(fs.readFileSync(path.join(wrapperDir, "run-store.json"), "utf8"));
+    assert.ok(
+      String(pointer.run_store_dir).startsWith(path.join(repoRoot, ".agent-pipeline")),
+      `run store must be pinned at <repoRoot>/.agent-pipeline; got ${pointer.run_store_dir}`,
+    );
+    // --run-id / lifecycle forwarding is unchanged by the resolution reorder.
+    assert.ok(capturedArgs.includes("--run-id"), "must still forward --run-id");
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+    fs.rmSync(wrapperDir, { recursive: true, force: true });
+  }
+});
+
 test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetached", async () => {
   let capturedArgs: string[] = [];
   const deps: RunSubcommandDeps = {
@@ -537,6 +642,10 @@ test("handleRunSubcommand: detach forwards --repo-path and --base to spawnDetach
       capturedArgs = pipelineArgs;
       return { runDir: "/tmp/fake-run", pid: 42 };
     },
+    // The forwarding behavior under test is independent of repo resolution — fake it
+    // resolved so this doesn't need a real git checkout at the fixture path.
+    findGitRoot: (start) => start,
+    cwd: () => "/path/to/repo",
   };
   const opts: CliOpts = { detach: true, repoPath: "/path/to/repo", base: "main" };
   await handleRunSubcommand("99", opts, deps);

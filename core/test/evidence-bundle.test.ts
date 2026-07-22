@@ -18,6 +18,7 @@ import {
   patchBundleIdentity,
   readBundle,
   recordCommand,
+  recordEngineDrift,
   recordOverride,
   recordPrompt,
   recordRecovery,
@@ -368,6 +369,31 @@ test("recordRecovery: appends a recovery event", async () => {
   await recordRecovery(STATE, ISSUE, { trigger: "no-commits", round: 1, at: "2026-06-14T21:05:00Z" }, deps);
   const b = readState(files);
   assert.deepEqual(b.recoveries, [{ trigger: "no-commits", round: 1, at: "2026-06-14T21:05:00Z" }]);
+});
+
+test("recordEngineDrift: appends a drift transition to engineDrifts (#450)", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  const drift = {
+    at: "2026-07-21T04:47:00Z",
+    stage: "fix-1",
+    pinned: { version: "1.15.1", root: "/opt/core", templates_fingerprint: "aaa" },
+    observed: { version: "1.15.2", root: "/opt/core", templates_fingerprint: "bbb" },
+  };
+  await recordEngineDrift(STATE, ISSUE, drift, deps);
+  const b = readState(files);
+  assert.deepEqual(b.engineDrifts, [drift]);
+});
+
+test("recordEngineDrift: multiple transitions accumulate in order", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: [] }, deps);
+  const first = { at: "t1", stage: "fix-1", pinned: { version: "1.0.0", root: "/r", templates_fingerprint: "a" }, observed: { version: "1.0.1", root: "/r", templates_fingerprint: "b" } };
+  const second = { at: "t2", stage: "review-2", pinned: { version: "1.0.0", root: "/r", templates_fingerprint: "a" }, observed: { version: "1.0.2", root: "/r", templates_fingerprint: "c" } };
+  await recordEngineDrift(STATE, ISSUE, first, deps);
+  await recordEngineDrift(STATE, ISSUE, second, deps);
+  const b = readState(files);
+  assert.deepEqual(b.engineDrifts, [first, second]);
 });
 
 // ---------------------------------------------------------------------------

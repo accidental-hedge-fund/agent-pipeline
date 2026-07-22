@@ -14,8 +14,48 @@ import type { PipelineConfig } from "../types.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
+export type TemplateSnapshot = Record<string, string>;
+export type ReadTemplatesFn = () => TemplateSnapshot;
+
+/** Enumerate every `*.md` file next to this module and read it in full. This
+ *  is the ONLY place a prompt template is read from the filesystem — it runs
+ *  once, at module initialization (see `templateSnapshot` below), so a file
+ *  under `prompts/` edited or replaced after the process starts (e.g. by a
+ *  mid-run skill update, #450) can never reach a prompt this process builds. */
+const defaultReadTemplates: ReadTemplatesFn = () => {
+  const snapshot: TemplateSnapshot = {};
+  for (const entry of fs.readdirSync(here, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".md")) {
+      const name = entry.name.slice(0, -".md".length);
+      snapshot[name] = fs.readFileSync(path.join(here, entry.name), "utf8");
+    }
+  }
+  return snapshot;
+};
+
+// Pinned at module initialization — read once, before any prompt is built (#450).
+let templateSnapshot: TemplateSnapshot = defaultReadTemplates();
+
+/** Read-only view of the pinned template snapshot, e.g. for fingerprinting
+ *  (see `engine-identity.ts`). Never triggers a filesystem read. */
+export function getTemplateSnapshot(): Readonly<TemplateSnapshot> {
+  return templateSnapshot;
+}
+
+/** Test-only: repopulate the pinned snapshot from a custom seam (a fake map,
+ *  or a counting wrapper around `defaultReadTemplates`) so tests can assert
+ *  deterministic content and exact invocation counts without depending on the
+ *  real files on disk. Defaults to a genuine re-read when no seam is given. */
+export function __resetTemplateSnapshotForTests(readTemplates: ReadTemplatesFn = defaultReadTemplates): void {
+  templateSnapshot = readTemplates();
+}
+
 function loadTemplate(name: string): string {
-  return fs.readFileSync(path.join(here, `${name}.md`), "utf8");
+  const content = templateSnapshot[name];
+  if (content === undefined) {
+    throw new Error(`Unknown prompt template "${name}" (not present in the pinned snapshot).`);
+  }
+  return content;
 }
 
 export function substitute(template: string, vars: Record<string, string>): string {

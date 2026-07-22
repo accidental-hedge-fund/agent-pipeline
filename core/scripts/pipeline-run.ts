@@ -32,6 +32,7 @@ import {
   formatEvidenceCommentBody,
   markNotified,
   patchBundleIdentity,
+  recordEngineDrift,
   recordOverride,
   recordRecovery,
   recordStage,
@@ -43,6 +44,7 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   startTerminalLogTee,
@@ -50,6 +52,12 @@ import {
   type TerminalLogTee,
 } from "./run-store.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
+import {
+  isEngineDriftTransition,
+  probeEngineIdentity,
+  resolvePinnedEngineIdentity,
+  type EngineIdentity,
+} from "./engine-identity.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
@@ -238,6 +246,12 @@ export function canAutoLoopContinue(
 /** IO seam for {@link runAdvance}: inject a fake clock for wall-clock budgeting in tests. */
 export interface AdvanceDeps {
   now?: () => number;
+  /** Seam over `resolvePinnedEngineIdentity` (#450) — the identity captured
+   *  once at run start and written into `run.json`. */
+  resolvePinnedEngineIdentity?: () => EngineIdentity | null;
+  /** Seam over `probeEngineIdentity` (#450) — re-read at each stage boundary
+   *  and compared against the pinned identity to detect mid-run drift. */
+  probeEngineIdentity?: () => EngineIdentity | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +532,10 @@ export async function runAdvance(
     // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
     let runDir: string | undefined;
     let terminalTee: TerminalLogTee | undefined;
+    // Engine identity this run is pinned to (#450) — resolved once at run start
+    // and compared against the on-disk identity at each stage boundary below.
+    let pinnedEngine: EngineIdentity | undefined;
+    let lastObservedEngine: EngineIdentity | undefined;
     const eventSinkDeps = buildEventSinkDeps(cfg);
     const runStoreDeps: RunStoreDeps = {
       ...defaultRunStoreDeps,
@@ -539,8 +557,20 @@ export async function runAdvance(
       if (opts.jsonEvents) {
         runStoreDeps.stdoutWrite = process.stdout.write.bind(process.stdout) as (s: string) => void;
       }
+      // Resumed dispatch (#450): reuse the engine identity already recorded in
+      // this run's run.json when it exists, rather than re-resolving the
+      // current on-disk identity — initRunDir below is idempotent and will NOT
+      // overwrite an existing run.json, so pinnedEngine must match what was
+      // actually written or drift checks would compare the current identity to
+      // itself and silently suppress a real drift event.
+      pinnedEngine = await resolveRunEngineIdentity(
+        runDir,
+        () => (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)() ?? undefined,
+        runStoreDeps,
+      );
+      lastObservedEngine = pinnedEngine;
       await initRunDir(
-        { runDir, runId, issue: issueNumber, repo: cfg.repo, profile: opts.profile ?? null, startedAt: runStartedAtIso },
+        { runDir, runId, issue: issueNumber, repo: cfg.repo, profile: opts.profile ?? null, startedAt: runStartedAtIso, engine: pinnedEngine },
         runStoreDeps,
       ).catch(() => {});
       // Start the terminal.log tee (directory exists after initRunDir).
@@ -552,6 +582,42 @@ export async function runAdvance(
         }
       } catch {
         /* non-fatal — run continues without tee */
+      }
+    }
+
+    // Mid-run engine drift (#450): re-probe the on-disk engine identity at each
+    // stage boundary and compare it to the identity this run pinned at start.
+    // Advisory only — never blocks, retries, or changes a stage outcome; a
+    // failed probe (or the absence of a pinned identity, e.g. a pre-#450 run
+    // directory) is silently treated as "no drift". Only state TRANSITIONS are
+    // recorded (compared against the last-observed identity, not the pinned one
+    // on every call), so a single update mid-run produces exactly one event.
+    async function checkEngineDrift(stageName: string): Promise<void> {
+      if (!pinnedEngine || !runDir) return;
+      const observed = (deps.probeEngineIdentity ?? probeEngineIdentity)();
+      if (!observed) return;
+      const last = lastObservedEngine ?? pinnedEngine;
+      const drifted = isEngineDriftTransition(last, observed);
+      lastObservedEngine = observed;
+      if (!drifted) return;
+      const at = evidenceTimestamp();
+      console.warn(
+        `[pipeline] #${issueNumber}: engine drift detected at ${stageName} — pinned ${pinnedEngine.version} ` +
+          `(${pinnedEngine.templates_fingerprint.slice(0, 12)}) vs on-disk ${observed.version} ` +
+          `(${observed.templates_fingerprint.slice(0, 12)}). This run continues against its pinned snapshot.`,
+      );
+      await appendEvent(
+        runDir,
+        { schema_version: RUN_SCHEMA_VERSION, type: "engine_drift", at, stage: stageName, pinned: pinnedEngine, observed },
+        runStoreDeps,
+      ).catch(() => {});
+      if (stateDir) {
+        await recordEngineDrift(stateDir, issueNumber, {
+          at,
+          stage: stageName,
+          pinned: pinnedEngine,
+          observed,
+        }).catch(() => {});
       }
     }
 
@@ -624,6 +690,7 @@ export async function runAdvance(
         break;
       }
       finalStage = stage;
+      await checkEngineDrift(evidenceStageName(stage));
 
       // Reconcile audit comments (#259): if a prior run's label write succeeded but its
       // comment post failed, the sentinel is missing. Detect and repair the gap.
