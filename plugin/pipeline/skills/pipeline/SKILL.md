@@ -178,7 +178,15 @@ command's binary. It prints a per-check pass/fail/warn summary with one-line
 remediation on each failure or warning and exits `0` (all pass or warn) / `1`
 (any fail). A stale install (`install:version-freshness`) only **warns** — it
 never fails the preflight; run `npx github:accidental-hedge-fund/agent-pipeline
-update` to refresh it. Opt in to run the preflight at the start of a real run
+update` to refresh it. `update` refuses (non-zero exit, no file copied) while a
+`/tmp/pipeline-*.lock` is held by a live pipeline run — updating underneath an
+in-flight run used to swap the code/templates it reads out from under it
+mid-run (#450). The refusal names every blocking lock path and PID; retry once
+those runs finish, or pass `--force` to override (prints the same details as a
+warning and proceeds). A run in progress is unaffected either way — it already
+pinned its own template snapshot and engine identity at start, and reports any
+detected drift as an `engine_drift` event without changing its outcome. Opt in
+to run the preflight at the start of a real run
 with `doctor.runOnStart: true` or `--doctor`: a failing check aborts **before
 planning**, so no tokens are spent, while a warning prints but does not abort.
 `--fail-fast` (or `doctor.failFast: true`) stops at the first failure. The

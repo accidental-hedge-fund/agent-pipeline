@@ -228,6 +228,62 @@ test("initRunDir: second call with same run-id is idempotent (run.json and event
 });
 
 // ---------------------------------------------------------------------------
+// Engine identity (#450) — run.json's pinned `engine` object
+// ---------------------------------------------------------------------------
+
+test("initRunDir: writes the engine identity when supplied", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      engine: { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "deadbeef" },
+    },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.deepEqual(meta.engine, { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "deadbeef" });
+});
+
+test("initRunDir: omits the engine field (rather than failing the run) when not supplied", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.equal("engine" in meta, false);
+  // The rest of the identity metadata is unaffected.
+  assert.equal(meta.run_id, runId);
+  assert.equal(meta.repo, "owner/repo");
+});
+
+test("initRunDir: re-entering the dispatch loop for the same run-id does not refresh the pinned engine identity", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const firstEngine = { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "aaa" };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine: firstEngine },
+    deps,
+  );
+  const runJsonAfterFirst = readFile(RUN_JSON);
+
+  // Simulate the engine having changed on disk by the second call.
+  const secondEngine = { version: "1.22.0", root: "/opt/pipeline/core", templates_fingerprint: "bbb" };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine: secondEngine },
+    deps,
+  );
+  assert.equal(readFile(RUN_JSON), runJsonAfterFirst, "run.json — including its pinned engine object — must not be rewritten on re-entry");
+});
+
+// ---------------------------------------------------------------------------
 // 4.2 — appendEvent
 // ---------------------------------------------------------------------------
 

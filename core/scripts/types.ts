@@ -1302,6 +1302,16 @@ export interface RecoveryRecord {
   at: string;
 }
 
+/** One detected mid-run engine-identity transition (#450): the on-disk engine
+ *  version and/or template fingerprint diverged from what this run pinned at
+ *  start. Advisory only — recorded for attribution, never changes the run. */
+export interface EngineDriftRecord {
+  at: string;
+  stage: string;
+  pinned: { version: string; root: string; templates_fingerprint: string };
+  observed: { version: string; root: string; templates_fingerprint: string };
+}
+
 // ---------------------------------------------------------------------------
 // Auto-merge eligibility gate (#306) — types for the deterministic policy
 // envelope + LLM risk judge that classifies PRs as eligible or needs-human.
@@ -1381,6 +1391,10 @@ export interface EvidenceBundle {
    *  gate's final outcome. Present for every run that reaches `design-gate`;
    *  untriggered runs carry only `trigger` and `outcome: null`. */
   designInterrogation?: DesignGateState;
+  /** Mid-run engine-identity drift transitions detected at stage boundaries
+   *  (#450). Additive and optional; absent for pre-#450 bundles and for runs
+   *  where the engine identity never changed. */
+  engineDrifts?: EngineDriftRecord[];
 }
 
 // ---------------------------------------------------------------------------

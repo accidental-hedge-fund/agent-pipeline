@@ -214,6 +214,18 @@ export interface PapercutEvent extends RunEventBase {
   message: string;
 }
 
+/** Mid-run engine drift (#450): the on-disk engine version and/or template
+ *  fingerprint no longer match the identity this run was pinned to at start —
+ *  most likely an `install.mjs update` landed while this process was still
+ *  running. Advisory only: the run continues against its pinned snapshot;
+ *  this event exists so the discrepancy is attributable after the fact. */
+export interface EngineDriftEvent extends RunEventBase {
+  type: "engine_drift";
+  stage: string;
+  pinned: RunEngineIdentity;
+  observed: RunEngineIdentity;
+}
+
 export type { HumanInterventionEvent };
 
 export type RunEvent =
@@ -236,6 +248,7 @@ export type RunEvent =
   | IgnoredArtifactWarningEvent
   | PapercutEvent
   | ReversalUnacknowledgedEvent
+  | EngineDriftEvent
   | HumanInterventionEvent;
 
 // ---------------------------------------------------------------------------
@@ -293,6 +306,15 @@ function nowIso(): string {
 // initRunDir
 // ---------------------------------------------------------------------------
 
+/** Identity of the engine snapshot a run is pinned to (#450): the engine
+ *  version, its resolved root path, and a fingerprint of the pinned prompt-
+ *  template set. Captured once at run start; omitted when resolution fails. */
+export interface RunEngineIdentity {
+  version: string;
+  root: string;
+  templates_fingerprint: string;
+}
+
 export interface RunMeta {
   schema_version: number;
   run_id: RunId;
@@ -300,6 +322,9 @@ export interface RunMeta {
   repo: string;
   profile: string | null;
   started_at: string;
+  /** Omitted when the engine identity cannot be resolved at run-directory
+   *  creation (e.g. missing/malformed package.json) — the run still starts. */
+  engine?: RunEngineIdentity;
 }
 
 export interface InitRunDirOpts {
@@ -309,6 +334,7 @@ export interface InitRunDirOpts {
   repo: string;
   profile: string | null;
   startedAt: string;
+  engine?: RunEngineIdentity;
 }
 
 /** Create the run directory, write run.json, append run_start to events.jsonl.
@@ -340,6 +366,7 @@ export async function initRunDir(
       repo: opts.repo,
       profile: opts.profile,
       started_at: opts.startedAt,
+      ...(opts.engine ? { engine: opts.engine } : {}),
     };
     await deps.writeFile(
       path.join(opts.runDir, "run.json"),

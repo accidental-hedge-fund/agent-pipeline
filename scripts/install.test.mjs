@@ -8,12 +8,14 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 import {
@@ -33,6 +35,9 @@ import {
   promptDeps,
   installDep,
   printDepSummary,
+  parseArgs,
+  findLiveRunLocks,
+  formatLiveRunMessage,
 } from "./install.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1094,5 +1099,211 @@ test("checkLoopCoherence: unsupported contract schema → ok:false naming both s
   } finally {
     delete process.env.CLAUDE_CONFIG_DIR;
     cleanup(claudeTmp);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Live-run deferral (#450) — findLiveRunLocks / formatLiveRunMessage (pure)
+// and the wired installer guard (subprocess, real CLAUDE_CONFIG_DIR + TMPDIR).
+// ---------------------------------------------------------------------------
+
+test("parseArgs: --force sets force:true, otherwise false", () => {
+  assert.equal(parseArgs(["node", "install.mjs", "update", "--force"]).force, true);
+  assert.equal(parseArgs(["node", "install.mjs", "update"]).force, false);
+});
+
+test("findLiveRunLocks: reports a lock whose PID is live (fakes only, no real I/O)", () => {
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "12345",
+    isPidLive: (pid) => pid === 12345,
+  });
+  assert.deepEqual(live, [{ path: "/tmp/pipeline-lyric-utils-420.lock", pid: 12345 }]);
+});
+
+test("findLiveRunLocks: a stale (dead) PID does not block", () => {
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "99999",
+    isPidLive: () => false,
+  });
+  assert.deepEqual(live, []);
+});
+
+test("findLiveRunLocks: unparseable lock contents are treated as stale, not live", () => {
+  let liveCalled = false;
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "not-a-pid",
+    isPidLive: () => { liveCalled = true; return true; },
+  });
+  assert.deepEqual(live, []);
+  assert.equal(liveCalled, false, "isPidLive must not be consulted for unparseable contents");
+});
+
+test("findLiveRunLocks: an unreadable lock file is treated as stale", () => {
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => null,
+    isPidLive: () => true,
+  });
+  assert.deepEqual(live, []);
+});
+
+test("findLiveRunLocks: no locks present → []", () => {
+  assert.deepEqual(findLiveRunLocks({ listLocks: () => [], readLock: () => null, isPidLive: () => true }), []);
+});
+
+test("findLiveRunLocks: multiple live locks are all reported", () => {
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-a-1.lock", "/tmp/pipeline-b-2.lock"],
+    readLock: (p) => (p.includes("a-1") ? "111" : "222"),
+    isPidLive: () => true,
+  });
+  assert.deepEqual(live, [
+    { path: "/tmp/pipeline-a-1.lock", pid: 111 },
+    { path: "/tmp/pipeline-b-2.lock", pid: 222 },
+  ]);
+});
+
+test("formatLiveRunMessage: refusal names every blocking lock path and PID, and mentions --force", () => {
+  const msg = formatLiveRunMessage(
+    [{ path: "/tmp/pipeline-a-1.lock", pid: 111 }, { path: "/tmp/pipeline-b-2.lock", pid: 222 }],
+    { asWarning: false },
+  );
+  assert.match(msg, /\/tmp\/pipeline-a-1\.lock/);
+  assert.match(msg, /111/);
+  assert.match(msg, /\/tmp\/pipeline-b-2\.lock/);
+  assert.match(msg, /222/);
+  assert.match(msg, /--force/);
+});
+
+test("formatLiveRunMessage: warning form names the overridden locks", () => {
+  const msg = formatLiveRunMessage([{ path: "/tmp/pipeline-a-1.lock", pid: 111 }], { asWarning: true });
+  assert.match(msg, /\/tmp\/pipeline-a-1\.lock/);
+  assert.match(msg, /111/);
+});
+
+// ---------------------------------------------------------------------------
+// Wired guard — real CLI subprocess, fabricated "existing install" (no real
+// npm ci / core copy needed to exercise the pre-copy refusal path) and an
+// isolated TMPDIR so the scan never touches the real /tmp.
+// ---------------------------------------------------------------------------
+
+const INSTALL_SCRIPT = fileURLToPath(new URL("./install.mjs", import.meta.url));
+
+function stubExistingCoreInstall(claudeConfigDir) {
+  const dest = join(claudeConfigDir, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, MANAGED_MARKER), "");
+  writeFileSync(join(dest, "sentinel.txt"), "before-update");
+  return dest;
+}
+
+function runInstaller(args, env) {
+  return spawnSync(process.execPath, [INSTALL_SCRIPT, ...args], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+}
+
+test("install update: refuses and copies nothing when a lock is held by a live PID", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const dest = stubExistingCoreInstall(claudeTmp);
+    const lockPath = join(lockTmp, "pipeline-lyric-utils-420.lock");
+    // This test process's own PID is guaranteed live for the duration of the test.
+    writeFileSync(lockPath, String(process.pid));
+
+    const result = runInstaller(["update", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.notEqual(result.status, 0, "installer must exit non-zero when a live lock blocks the update");
+    const output = `${result.stdout}${result.stderr}`;
+    assert.match(output, /pipeline-lyric-utils-420\.lock/);
+    assert.match(output, new RegExp(String(process.pid)));
+    assert.equal(
+      readFileSync(join(dest, "sentinel.txt"), "utf8"),
+      "before-update",
+      "refusal must leave the previously installed core byte-identical — no file copied",
+    );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update --force: proceeds despite a live lock and warns about it", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    stubExistingCoreInstall(claudeTmp);
+    const lockPath = join(lockTmp, "pipeline-lyric-utils-420.lock");
+    writeFileSync(lockPath, String(process.pid));
+
+    const result = runInstaller(["update", "--host", "claude", "--force"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, `--force must still complete the update: ${result.stderr}`);
+    const output = `${result.stdout}${result.stderr}`;
+    assert.match(output, /pipeline-lyric-utils-420\.lock/);
+    assert.match(output, new RegExp(String(process.pid)));
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update: a stale lock (dead PID) does not block the update", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    stubExistingCoreInstall(claudeTmp);
+    // Spawn and immediately reap a short-lived child so its PID is guaranteed dead.
+    const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    const deadPid = dead.pid;
+    writeFileSync(join(lockTmp, "pipeline-lyric-utils-420.lock"), String(deadPid));
+
+    const result = runInstaller(["update", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, `a stale lock must not block the update: ${result.stderr}`);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update: a first install onto a host with no existing core is not guarded", () => {
+  const claudeTmp = makeTmp(); // no ~/.claude/skills/pipeline present at all
+  const lockTmp = makeTmp();
+  try {
+    writeFileSync(join(lockTmp, "pipeline-lyric-utils-420.lock"), String(process.pid));
+
+    const result = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, `first install must not be guarded by an unrelated live lock: ${result.stderr}`);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
   }
 });

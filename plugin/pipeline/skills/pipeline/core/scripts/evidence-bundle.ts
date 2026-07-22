@@ -18,6 +18,7 @@ import * as path from "node:path";
 import {
   EVIDENCE_SCHEMA_VERSION,
   type CommandRecord,
+  type EngineDriftRecord,
   type EvidenceBundle,
   type OverrideRecord,
   type PromptRecord,
@@ -358,6 +359,18 @@ export async function recordRecovery(
 ): Promise<void> {
   const bundle = await loadForUpdate(stateDir, issue, deps);
   bundle.recoveries.push(recovery);
+  await writeBundle(stateDir, issue, bundle, deps);
+}
+
+/** Append a mid-run engine-drift transition (#450). */
+export async function recordEngineDrift(
+  stateDir: string,
+  issue: number,
+  drift: EngineDriftRecord,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  bundle.engineDrifts = [...(bundle.engineDrifts ?? []), drift];
   await writeBundle(stateDir, issue, bundle, deps);
 }
 

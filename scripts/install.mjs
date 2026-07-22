@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -24,7 +25,7 @@ import {
   writeFileSync,
   chmodSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -97,12 +98,14 @@ function parseArgs(argv) {
   let host = "all";
   let dryRun = false;
   let yesDeps = false;
+  let force = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--host") host = args[++i];
     else if (args[i] === "--dry-run") dryRun = true;
     else if (args[i] === "--yes-deps") yesDeps = true;
+    else if (args[i] === "--force") force = true;
   }
-  return { verb, host, dryRun, yesDeps };
+  return { verb, host, dryRun, yesDeps, force };
 }
 
 function selectedHosts(hostArg) {
@@ -196,6 +199,89 @@ async function checkLoopCoherence() {
   }
   log(`  ✓ loop:contract-coherence: ${result.detail}`);
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Live-run deferral (#450) — refuse to overwrite an installed core while a
+// pipeline run holds a lock, unless --force. Mirrors PipelineLock's liveness
+// semantics (core/scripts/lock.ts): a signalable PID is live, ESRCH is stale,
+// EPERM (exists but not signalable by us) is treated conservatively as live.
+// ---------------------------------------------------------------------------
+
+/** List `/tmp/pipeline-*.lock` file paths. Pure I/O seam; unit tests inject a fake. */
+function listPipelineLocks() {
+  let entries;
+  try {
+    entries = readdirSync(tmpdir());
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((name) => /^pipeline-.*\.lock$/.test(name))
+    .map((name) => join(tmpdir(), name));
+}
+
+/** Read a lock file's contents (raw PID text), or null if unreadable. */
+function readLockFile(lockPath) {
+  try {
+    return readFileSync(lockPath, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Probe whether `pid` is a live, signalable process — same semantics as
+ *  `PipelineLock.handleExistingLock` in core/scripts/lock.ts. */
+function isPidLiveDefault(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err.code === "ESRCH") return false;
+    if (err.code === "EPERM") return true; // exists, can't signal → conservative
+    return false;
+  }
+}
+
+// Default seams for findLiveRunLocks. Named per-field so tests can override
+// exactly one.
+const defaultLockSeams = {
+  listLocks: listPipelineLocks,
+  readLock: readLockFile,
+  isPidLive: isPidLiveDefault,
+};
+
+/** Pure scan: returns the subset of `/tmp/pipeline-*.lock` files that are held
+ *  by a live PID, as `{ path, pid }`. A lock with unparseable contents (no
+ *  integer PID) is treated as stale, not live — mirrors PipelineLock's garbage-
+ *  contents handling. Performs no real filesystem/process-signal call when
+ *  `listLocks`/`readLock`/`isPidLive` are all overridden (unit-test seam). */
+function findLiveRunLocks({
+  listLocks = defaultLockSeams.listLocks,
+  readLock = defaultLockSeams.readLock,
+  isPidLive = defaultLockSeams.isPidLive,
+} = {}) {
+  const live = [];
+  for (const lockPath of listLocks()) {
+    const raw = readLock(lockPath);
+    if (raw === null) continue; // unreadable → treat as stale
+    const pid = Number.parseInt(raw, 10);
+    if (!Number.isFinite(pid) || pid <= 0) continue; // unparseable → stale
+    if (isPidLive(pid)) live.push({ path: lockPath, pid });
+  }
+  return live;
+}
+
+/** Format the refusal/warning message naming every blocking lock and the remedy. */
+function formatLiveRunMessage(liveLocks, { asWarning }) {
+  const lines = liveLocks.map((l) => `    ${l.path} (pid ${l.pid})`);
+  const header = asWarning
+    ? "A pipeline run is in progress — updating would swap files underneath it. Proceeding anyway (--force):"
+    : "A pipeline run is in progress — updating would swap files underneath it. Blocking locks:";
+  const footer = asWarning
+    ? ""
+    : "\n  Retry after those runs finish, or re-run with --force to override.";
+  return `${header}\n${lines.join("\n")}${footer}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -789,13 +875,31 @@ function printDepSummary(results) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { verb, host, dryRun, yesDeps } = parseArgs(process.argv);
+  const { verb, host, dryRun, yesDeps, force } = parseArgs(process.argv);
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
     preflight();
     const loopCheck = await checkLoopCoherence();
     if (!loopCheck.ok) fail(loopCheck.message);
+
+    // Live-run deferral (#450): only guards a host that already has an
+    // installed core — a first install onto a fresh host has nothing to race.
+    // Skipped under --dry-run, which never copies a file anyway.
+    if (!dryRun) {
+      const anyExistingInstall = hosts.some((h) => existsSync(join(HOSTS[h].skillsDir(), "pipeline")));
+      if (anyExistingInstall) {
+        const liveLocks = findLiveRunLocks();
+        if (liveLocks.length > 0) {
+          if (force) {
+            warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
+          } else {
+            fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
+          }
+        }
+      }
+    }
+
     log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
     for (const h of hosts) {
       if (h === "claude") {
@@ -852,6 +956,9 @@ export {
   promptDeps,
   installDep,
   printDepSummary,
+  parseArgs,
+  findLiveRunLocks,
+  formatLiveRunMessage,
 };
 
 // ESM main guard — tolerates bin symlinks by resolving both paths before comparing.
