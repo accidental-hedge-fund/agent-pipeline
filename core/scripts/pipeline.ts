@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Command, Option } from "commander";
-import { resolveConfig, resolveReleaseConfig, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
+import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
 import { spawnDetached } from "./detach.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
@@ -104,7 +104,7 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
-import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type RawLoopArgs } from "./loop-preflight.ts";
+import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
@@ -386,7 +386,21 @@ export async function runLoopCommand(
     audit: opts.audit,
   };
 
-  const outcome: LoopPreflightOutcome = await deps.runLoopPreflight(raw, engine, realDoctorDeps());
+  // Read only the loop.native_goal_attestation key, gh-free (design.md
+  // decision 4) — resolveLoopNativeGoalAttestation never shells out, unlike
+  // resolveConfig(), so this command stays zero-gh-call on every path.
+  const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+  const repoDir = findGitRoot(startDir) ?? startDir;
+  let attestation: NativeGoalAttestation;
+  try {
+    attestation = resolveLoopNativeGoalAttestation(repoDir);
+  } catch (err) {
+    console.error(`pipeline loop: native-goal — ${(err as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const outcome: LoopPreflightOutcome = await deps.runLoopPreflight(raw, engine, realDoctorDeps(), undefined, attestation);
   if (!outcome.ok) {
     console.error(`pipeline loop: ${outcome.failedCheck} — ${outcome.detail}`);
     if (outcome.remediation) console.error(`  → ${outcome.remediation}`);

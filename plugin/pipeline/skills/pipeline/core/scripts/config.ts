@@ -377,6 +377,21 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Deterministic preflight capability check settings."),
+  // `pipeline:loop` native-goal capability attestation (#506). Optional;
+  // absent/"auto" leaves automatic detection (--help marker, then version
+  // floor) unchanged. "available"/"unavailable" is an explicit operator
+  // assertion that overrides detection in either direction — see design.md
+  // decision 1 and 4 of openspec/changes/loop-native-goal-probe.
+  loop: z
+    .object({
+      native_goal_attestation: z
+        .enum(["auto", "available", "unavailable"])
+        .optional()
+        .describe("Operator attestation of the active engine's native /goal capability: \"auto\" (default) detects automatically; \"available\"/\"unavailable\" overrides detection."),
+    })
+    .strict()
+    .optional()
+    .describe("pipeline:loop settings (#506)."),
   // Optional external event sink (#343). Opt-in; unconfigured behavior (local
   // events.jsonl only) is unchanged. `command` names an operator-controlled
   // forwarder that receives each event's JSON line on stdin; `mode` selects
@@ -948,6 +963,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
       failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
     },
+    loop: {
+      native_goal_attestation:
+        fileConfig.loop?.native_goal_attestation ?? DEFAULT_CONFIG.loop.native_goal_attestation,
+    },
     papercuts: {
       enabled: fileConfig.papercuts?.enabled ?? DEFAULT_CONFIG.papercuts.enabled,
       auto_file: fileConfig.papercuts?.auto_file ?? DEFAULT_CONFIG.papercuts.auto_file,
@@ -1175,6 +1194,29 @@ export function resolveReleaseConfig(
     intake_effort: intakeEffort,
     intake_timeout: intakeTimeout,
   };
+}
+
+/**
+ * Resolve just `loop.native_goal_attestation` from `.github/pipeline.yml`,
+ * with no `gh` call — mirrors {@link resolveReleaseConfig}'s gh-free pattern.
+ * `pipeline:loop` preflight (loop-preflight.ts) must stay read-only and make
+ * zero external calls before its checks pass, so it cannot go through
+ * `resolveConfig()` (which always shells out to `gh repo view`).
+ */
+export function resolveLoopNativeGoalAttestation(repoDir: string): "auto" | "available" | "unavailable" {
+  const configPath = path.join(repoDir, ".github", "pipeline.yml");
+  if (!fs.existsSync(configPath)) return DEFAULT_CONFIG.loop.native_goal_attestation;
+  const text = fs.readFileSync(configPath, "utf8");
+  const parsed = yaml.load(text);
+  if (!parsed || typeof parsed !== "object") return DEFAULT_CONFIG.loop.native_goal_attestation;
+  const result = PartialConfigSchema.safeParse(parsed);
+  if (!result.success) {
+    const errors = flattenIssues(result.error.issues)
+      .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+      .join("; ");
+    throw new Error(`Invalid ${configPath}: ${errors}`);
+  }
+  return result.data.loop?.native_goal_attestation ?? DEFAULT_CONFIG.loop.native_goal_attestation;
 }
 
 /**
@@ -1768,6 +1810,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const shipcheckGate = { ...d.shipcheck_gate, ...config.shipcheck_gate };
   const reviewPolicy = { ...d.review_policy, ...config.review_policy };
   const doctor = { ...d.doctor, ...config.doctor };
+  const loopCfg = { ...d.loop, ...config.loop };
   const papercuts = { ...d.papercuts, ...config.papercuts };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
 
@@ -1893,6 +1936,13 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # if true, run the preflight checks before planning and abort the run on any failure`,
     `  failFast: ${yamlScalar(doctor.failFast)} # if true, stop at the first failing check instead of collecting all failures`,
+    "",
+    config.loop !== undefined
+      ? `loop: # pipeline:loop native-goal capability attestation (#506)\n${yamlBlock(config.loop, 2)}`
+      : [
+        "# loop: # pipeline:loop native-goal capability attestation (#506) — uncomment to override automatic detection",
+        `#   native_goal_attestation: ${yamlScalar(loopCfg.native_goal_attestation)} # auto (default): detect via --help marker / version floor | available|unavailable: explicit operator override`,
+      ].join("\n"),
     "",
     config.papercuts !== undefined
       ? `papercuts: # agent-logged minor-friction capture (#419) — opt in to record friction via 'pipeline papercut' without stopping the run\n${yamlBlock(config.papercuts, 2)}`
@@ -2055,6 +2105,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     shipcheck_gate: { ...d.shipcheck_gate, ...config.shipcheck_gate },
     review_policy: { ...d.review_policy, ...config.review_policy },
     doctor: { ...d.doctor, ...config.doctor },
+    loop: { ...d.loop, ...config.loop },
     papercuts: { ...d.papercuts, ...config.papercuts },
     setup_command: config.setup_command,
     build_command: config.build_command,

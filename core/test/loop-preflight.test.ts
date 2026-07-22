@@ -224,6 +224,155 @@ test("checkNativeGoalCapability — fails when the binary itself is unavailable"
 });
 
 // ---------------------------------------------------------------------------
+// checkNativeGoalCapability — #506 regression: version-floor detection
+// ---------------------------------------------------------------------------
+
+function execByArgs(fn: (args: string[]) => ExecResult): FakeOverrides["exec"] {
+  return (_file, args) => fn(args);
+}
+
+test("checkNativeGoalCapability — #506 regression: claude 2.1.216 with no --help marker still passes on the version floor", async () => {
+  // This is exactly the reproduction from #506: --help advertises nothing,
+  // yet a native /goal run had completed on this host. The pre-#506-fix
+  // probe (a bare --help grep) returns "fail" here — that is the bug.
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "2.1.216 (Claude Code)", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude");
+  assert.equal(r.status, "pass");
+});
+
+test("checkNativeGoalCapability — a version below the documented floor fails closed", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "2.1.215 (Claude Code)", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude");
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /claude/);
+});
+
+test("checkNativeGoalCapability — an engine with no known native goal mode fails closed even with a high version", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: codex [options]\n", stderr: "" }
+        : { ok: true, stdout: "codex-cli 99.0.0", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "codex");
+  assert.equal(r.status, "fail");
+  assert.match(r.remediation ?? "", /no native goal mode is known for codex/);
+});
+
+test("checkNativeGoalCapability — empty --version output fails closed", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude");
+  assert.equal(r.status, "fail");
+});
+
+test("checkNativeGoalCapability — an unparseable version string fails closed rather than assuming recent enough", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "claude-nightly-build", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude");
+  assert.equal(r.status, "fail");
+});
+
+test("checkNativeGoalCapability — a positive --help marker passes even below the documented version floor", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n  /goal   run autonomous goal mode\n", stderr: "" }
+        : { ok: true, stdout: "0.0.1", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude");
+  assert.equal(r.status, "pass");
+});
+
+test("checkNativeGoalCapability — below-floor remediation names the detected version and required floor", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "2.0.0 (Claude Code)", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude");
+  assert.equal(r.status, "fail");
+  assert.match(r.remediation ?? "", /2\.0\.0 \(Claude Code\)/);
+  assert.match(r.remediation ?? "", /2\.1\.216/);
+  assert.match(r.remediation ?? "", /native_goal_attestation/);
+});
+
+test("checkNativeGoalCapability — no-known-floor remediation does not claim an update will help", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: codex [options]\n", stderr: "" }
+        : { ok: true, stdout: "codex-cli 0.144.6", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "codex");
+  assert.equal(r.status, "fail");
+  assert.doesNotMatch(r.remediation ?? "", /update codex/i);
+  assert.match(r.remediation ?? "", /native_goal_attestation/);
+});
+
+// ---------------------------------------------------------------------------
+// checkNativeGoalCapability — operator attestation (#506)
+// ---------------------------------------------------------------------------
+
+test("checkNativeGoalCapability — attestation 'available' overrides a failing detection", async () => {
+  const deps = fakeDeps({ exec: () => ({ ok: false, stdout: "", stderr: "not found" }) });
+  const r = await checkNativeGoalCapability(deps, "codex", "available");
+  assert.equal(r.status, "pass");
+});
+
+test("checkNativeGoalCapability — attestation 'unavailable' overrides a passing detection", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "2.1.216 (Claude Code)", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude", "unavailable");
+  assert.equal(r.status, "fail");
+  assert.match(r.remediation ?? "", /native_goal_attestation/);
+});
+
+test("checkNativeGoalCapability — attestation 'auto' (the default) preserves automatic detection", async () => {
+  const deps = fakeDeps({
+    exec: execByArgs((args) =>
+      args[0] === "--help"
+        ? { ok: true, stdout: "Usage: claude [options]\n", stderr: "" }
+        : { ok: true, stdout: "2.1.216 (Claude Code)", stderr: "" },
+    ),
+  });
+  const r = await checkNativeGoalCapability(deps, "claude", "auto");
+  assert.equal(r.status, "pass");
+});
+
+// ---------------------------------------------------------------------------
 // normalizeLoopArgs — pure argument normalization
 // ---------------------------------------------------------------------------
 
@@ -420,6 +569,12 @@ test("runLoopPreflight — all checks pass returns the normalized args", async (
   const outcome = await runLoopPreflight({ resume: "run-abc" }, "claude", deps, ROOTS);
   assert.equal(outcome.ok, true);
   if (outcome.ok) assert.equal(outcome.args.resumeRunId, "run-abc");
+});
+
+test("runLoopPreflight — threads the attestation argument through to the native-goal check", async () => {
+  const deps = compatibleDeps({ exec: () => ({ ok: false, stdout: "", stderr: "not found" }) });
+  const outcome = await runLoopPreflight({ milestone: "v2" }, "codex", deps, ROOTS, "available");
+  assert.equal(outcome.ok, true);
 });
 
 test("runLoopPreflight — standalone audit passes through the same read-only DoctorDeps seam with no selector/resume", async () => {

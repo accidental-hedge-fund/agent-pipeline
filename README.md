@@ -681,6 +681,19 @@ checked by the installer), then a check that the active engine's built-in autono
 a non-durable substitute loop when either check fails. `/goal-loop` and `$goal-loop`
 remain fully functional, undeprecated aliases for the same durable runs.
 
+**Native-`/goal` detection (#506).** `/goal` is an interactive slash command, not a CLI
+flag — it never appears in `<engine> --help`, so absence of a marker there is not
+evidence the capability is missing. The check resolves, in order: (1) an operator
+attestation — `loop.native_goal_attestation: available | unavailable` in
+`.github/pipeline.yml` — which overrides everything else in either direction; (2) a
+positive goal-mode marker in `--help`, accepted but never required; (3) a documented
+per-engine minimum version compared against `<engine> --version` (claude: `2.1.216`,
+verified 2026-07-22 by a completed native run — see `loop-preflight.ts` for the evidence
+and codex's current "no known native goal mode" status). Absent the key, `auto`
+(automatic detection) applies and existing configs are unaffected. A failure names the
+detected version, the required floor (or that none is known for that engine), and the
+attestation key.
+
 See `openspec/changes/pipeline-loop-facade/design.md` for the convergence ADR (why a
 facade now, not a merged codebase) and the engine-neutral `pipeline/loop-execution@1`
 contract between the loop orchestrator and per-item Pipeline execution.
