@@ -22,6 +22,7 @@ import {
 } from "../scripts/review-policy.ts";
 import { buildDeltaReviewPrompt, buildReviewAdversarialPrompt } from "../scripts/prompts/index.ts";
 import {
+  defaultReadHeadFiles,
   enforceReviewShaGate,
   type DeltaReviewResult,
   type ReadHeadFilesFn,
@@ -31,6 +32,9 @@ import {
 import { computeDiffHash } from "../scripts/stages/review.ts";
 import { formatReviewComment } from "../scripts/stages/review-rendering.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../scripts/types.ts";
+import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function dummyConfig(): PipelineConfig {
   return {
@@ -104,6 +108,21 @@ test("settledFindingsVerification: deduplicated by key — the latest settling r
   assert.equal(entries[0].disposition, "overridden");
 });
 
+test("settledFindingsVerification: a finding reopened after settlement is excluded, not presumed resolved (#496 finding ee13fdf1)", () => {
+  const digest: PriorRoundDigest = {
+    rounds: [
+      { round: 1, reviewedSha: null, entries: [
+        { key: "aaaaaaaa", surface: "a.ts|correctness", severity: "high", title: "A", resolution: "resolved-by-fix", rejectedAlternatives: [] },
+      ] },
+      { round: 2, reviewedSha: null, entries: [
+        { key: "aaaaaaaa", surface: "a.ts|correctness", severity: "high", title: "A", resolution: "still-open", rejectedAlternatives: [] },
+      ] },
+    ],
+  };
+  const entries = settledFindingsVerification(digest);
+  assert.deepEqual(entries, [], "the round-2 still-open entry must overwrite the stale round-1 resolved-by-fix entry");
+});
+
 test("settledFindingsVerification: ordered ascending by key, deterministic", () => {
   const digest: PriorRoundDigest = {
     rounds: [{ round: 1, reviewedSha: null, entries: [
@@ -128,6 +147,36 @@ test("settledFindingsSurfaceFiles: distinct file paths, ascending, deduplicated"
 
 test("settledFindingsSurfaceFiles: empty entries yields no files", () => {
   assert.deepEqual(settledFindingsSurfaceFiles([]), []);
+});
+
+// ---------------------------------------------------------------------------
+// defaultReadHeadFiles: worktree-root escape guard (#496 finding cdd406db)
+// ---------------------------------------------------------------------------
+
+test("defaultReadHeadFiles: a surface escaping the worktree root is rendered not-present, never read from disk", async () => {
+  const worktree = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-wt-"));
+  const outside = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-outside-"));
+  try {
+    await writeFile(join(outside, "secret.txt"), "outside-secret-content", "utf8");
+    await mkdir(join(worktree, "core"), { recursive: true });
+    await writeFile(join(worktree, "core", "in-scope.ts"), "in-scope-content", "utf8");
+
+    const relativeEscape = join("..", join(outside, "secret.txt").slice(1));
+    const results = await defaultReadHeadFiles(worktree, [
+      "../../.ssh/id_rsa",
+      relativeEscape,
+      "core/in-scope.ts",
+    ]);
+
+    assert.equal(results.length, 3);
+    assert.deepEqual(results[0], { path: "../../.ssh/id_rsa", content: "", truncated: false, present: false });
+    assert.equal(results[1].present, false, "an escaping relative path must not be read");
+    assert.equal(results[1].content, "");
+    assert.deepEqual(results[2], { path: "core/in-scope.ts", content: "in-scope-content", truncated: false, present: true });
+  } finally {
+    await rm(worktree, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

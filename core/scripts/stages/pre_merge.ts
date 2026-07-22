@@ -1086,18 +1086,45 @@ export const HEAD_FILE_PER_FILE_CAP = 8_000;
 /** Total byte cap across all injected HEAD files (#496 design.md Decision 3). */
 export const HEAD_FILE_TOTAL_CAP = 24_000;
 
+/**
+ * Resolves `p` (a surface's file component, sourced from untrusted prior
+ * review history) against `worktreePath` and returns the resolved path only
+ * if it stays within the worktree root (#496 finding cdd406db) — an absolute
+ * path or a `..`-escaping surface like `../../.ssh/id_rsa` returns `null` so
+ * the caller renders it as not-present rather than reading outside the
+ * managed worktree.
+ */
+function resolveWithinWorktree(worktreePath: string, p: string): string | null {
+  if (typeof worktreePath !== "string" || typeof p !== "string") return null;
+  if (path.isAbsolute(p)) return null;
+  const normalized = path.normalize(p);
+  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) return null;
+  const root = path.resolve(worktreePath);
+  const resolved = path.resolve(root, normalized);
+  const rel = path.relative(root, resolved);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return resolved;
+}
+
 /** Default implementation of the `readHeadFiles` seam (#496): reads each
  *  requested path from `worktreePath` on disk, bounded by
  *  {@link HEAD_FILE_PER_FILE_CAP} and {@link HEAD_FILE_TOTAL_CAP}. A missing
  *  or unreadable file yields `present: false` rather than throwing or being
- *  omitted (design.md Decision 3 — a deleted file is itself evidence). */
-async function defaultReadHeadFiles(worktreePath: string, paths: string[]): Promise<HeadFileState[]> {
+ *  omitted (design.md Decision 3 — a deleted file is itself evidence). A path
+ *  that resolves outside `worktreePath` is rejected the same way, without
+ *  being read (#496 finding cdd406db). */
+export async function defaultReadHeadFiles(worktreePath: string, paths: string[]): Promise<HeadFileState[]> {
   const results: HeadFileState[] = [];
   let totalUsed = 0;
   for (const p of paths) {
+    const resolvedPath = resolveWithinWorktree(worktreePath, p);
+    if (resolvedPath === null) {
+      results.push({ path: p, content: "", truncated: false, present: false });
+      continue;
+    }
     let raw: string;
     try {
-      raw = await fs.promises.readFile(path.join(worktreePath, p), "utf8");
+      raw = await fs.promises.readFile(resolvedPath, "utf8");
     } catch {
       results.push({ path: p, content: "", truncated: false, present: false });
       continue;

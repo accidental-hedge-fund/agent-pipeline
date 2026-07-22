@@ -308,20 +308,27 @@ export interface SettledFindingVerification {
 
 /**
  * Derive the delta review's resolved-finding verification entries from the
- * digest (#496 tasks 1.1): every digest entry whose resolution is
- * `resolved-by-fix` or `overridden`, deduplicated by finding key (latest
- * settling round wins), ordered ascending by key for a deterministic,
- * drift-guardable render. Pure — no I/O.
+ * digest (#496 tasks 1.1): the LATEST digest entry for each finding key
+ * (regardless of that entry's own resolution — a later `still-open` entry
+ * must overwrite an earlier settled one, or a finding reopened after
+ * settlement would still be presumed resolved, see #496 finding ee13fdf1),
+ * retaining only those keys whose latest resolution is `resolved-by-fix` or
+ * `overridden`, ordered ascending by key for a deterministic, drift-guardable
+ * render. Pure — no I/O.
  */
 export function settledFindingsVerification(digest: PriorRoundDigest): SettledFindingVerification[] {
-  const byKey = new Map<string, SettledFindingVerification>();
+  const latestByKey = new Map<string, { entry: DigestEntry; round: number }>();
   for (const r of digest.rounds) {
     for (const e of r.entries) {
-      if (e.resolution !== "resolved-by-fix" && e.resolution !== "overridden") continue;
-      byKey.set(e.key, { key: e.key, surface: e.surface, title: e.title, round: r.round, disposition: e.resolution });
+      latestByKey.set(e.key, { entry: e, round: r.round });
     }
   }
-  return [...byKey.values()].sort((a, b) => a.key.localeCompare(b.key));
+  const out: SettledFindingVerification[] = [];
+  for (const { entry: e, round } of latestByKey.values()) {
+    if (e.resolution !== "resolved-by-fix" && e.resolution !== "overridden") continue;
+    out.push({ key: e.key, surface: e.surface, title: e.title, round, disposition: e.resolution });
+  }
+  return out.sort((a, b) => a.key.localeCompare(b.key));
 }
 
 /**
