@@ -261,6 +261,55 @@ test("plan_revision prompt: includes review feedback", () => {
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+test("plan_revision prompt: acknowledgement section is unfenced, single-header (#443 output contract)", () => {
+  // #443: models copied the prompt's fenced format example verbatim, emitting
+  // a bare header followed by a fenced block whose first line repeated it —
+  // defeating verifyPlanRevisionOutput's section extraction. The prompt must
+  // explicitly forbid the fence and require exactly one header occurrence,
+  // and must not itself contain a fenced block that repeats the header.
+  const out = buildPlanRevisionPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 443,
+    title: "Revise me",
+    body: "Body",
+    plan: "ORIGINAL-PLAN",
+    feedback: "REVIEW-FEEDBACK",
+    implementer: "claude",
+    reviewer: "codex",
+  });
+  assert.match(
+    out,
+    /do NOT wrap it in a code fence/i,
+    "prompt must instruct that the acknowledgement section must not be fenced",
+  );
+  assert.match(
+    out,
+    /MUST appear exactly once/i,
+    "prompt must instruct that the ## Feedback Incorporated header appears exactly once",
+  );
+  // No fenced code block in the template's raw source contains the header.
+  const templatePath = path.join(
+    import.meta.dirname,
+    "..",
+    "scripts",
+    "prompts",
+    "plan_revision.md",
+  );
+  const template = fs.readFileSync(templatePath, "utf8");
+  const fencedBlocks = template.match(/```[\s\S]*?```/g) ?? [];
+  for (const block of fencedBlocks) {
+    assert.doesNotMatch(
+      block,
+      /^##\s+Feedback\s+Incorporated\b/im,
+      "no fenced block in plan_revision.md may contain a ## Feedback Incorporated header",
+    );
+  }
+  // The tag-shape example is still shown, just not inside a fence.
+  assert.match(out, /\[ADDRESSED\]/);
+  assert.match(out, /\[DEFERRED\]/);
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
 test("plan_revision prompt: omits human feedback section when humanFeedback absent (#26)", () => {
   const out = buildPlanRevisionPrompt({
     cfg: dummyConfig(),

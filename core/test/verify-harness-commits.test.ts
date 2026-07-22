@@ -506,6 +506,128 @@ test("verifyPlanRevisionOutput: with feedback — no detectable items in feedbac
 });
 
 // ---------------------------------------------------------------------------
+// verifyPlanRevisionOutput — fenced / duplicated-header tolerance (#443)
+// ---------------------------------------------------------------------------
+
+test("verifyPlanRevisionOutput: no acknowledgement section at all → blocked (lyric-utils#658, attempt 1)", () => {
+  // Reconstruction of the first observed lyric-utils#658 failure: the harness
+  // omitted the ## Feedback Incorporated section outright.
+  const stdout = [
+    "## Summary",
+    "Revised the plan to address the reviewer's feedback.",
+    "",
+    "## Revised Plan",
+    "### Approach",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("## Feedback Incorporated"));
+});
+
+test("verifyPlanRevisionOutput: bare header + fenced duplicated header with 11 tagged items → accepted (lyric-utils#658, attempt 2)", () => {
+  // Reconstruction of the second observed lyric-utils#658 failure: the model
+  // copied the prompt's fenced example verbatim, producing a bare header
+  // followed by a fence whose first line repeats the header. This is the
+  // exact shape that defeated the pre-fix validator (cuts the section at the
+  // fenced duplicate header, leaving zero visible tagged items).
+  const items = Array.from(
+    { length: 11 },
+    (_, i) => `- [ADDRESSED] Feedback item ${i + 1} was addressed`,
+  );
+  const stdout = [
+    "## Feedback Incorporated",
+    "```",
+    "## Feedback Incorporated",
+    ...items,
+    "```",
+    "",
+    "## Revised Plan",
+    "### Approach",
+    "...",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
+test("verifyPlanRevisionOutput: fenced section under a single (non-duplicated) header → accepted", () => {
+  const stdout = [
+    "## Feedback Incorporated",
+    "```",
+    "- [ADDRESSED] Fixed the trailer check",
+    "- [DEFERRED] Refactor the docs prompt — reason: out of scope",
+    "```",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
+test("verifyPlanRevisionOutput: header present but no tagged items anywhere, fenced variant → blocked", () => {
+  const stdout = [
+    "## Feedback Incorporated",
+    "```",
+    "## Feedback Incorporated",
+    "Considered all feedback carefully.",
+    "```",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("[ADDRESSED]"));
+});
+
+test("verifyPlanRevisionOutput: prose mention of [ADDRESSED] outside any section still doesn't satisfy the gate, fence-neutralised", () => {
+  const stdout = [
+    "## Summary",
+    "```",
+    "I [ADDRESSED] everything already, see below.",
+    "```",
+    "",
+    "## Feedback Incorporated",
+    "Considered all feedback carefully.",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("[ADDRESSED]"));
+});
+
+test("verifyPlanRevisionOutput: duplicated three-item acknowledgement reports coverage of three, not six", () => {
+  const feedback = [
+    "**1.** Add commit format check",
+    "**2.** Add trailer validation",
+    "**3.** Tighten docs path check",
+    "**4.** Add a regression test",
+  ].join("\n");
+  const items = [
+    "- [ADDRESSED] commit format (#1)",
+    "- [ADDRESSED] trailer validation (#2)",
+    "- [DEFERRED] docs path check (#3) — reason: separate PR",
+  ];
+  const stdout = [
+    "## Feedback Incorporated",
+    "```",
+    "## Feedback Incorporated",
+    ...items,
+    "```",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout, feedback);
+  assert.equal(result.ok, true);
+  assert.ok(
+    "warning" in result && (result.warning ?? "").includes("3 of 4"),
+    `expected coverage of 3 (not 6, doubled across the duplicated header), got: ${JSON.stringify(result)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // verifyHarnessCommits — node_modules commit scan (#180)
 // ---------------------------------------------------------------------------
 
