@@ -1756,6 +1756,47 @@ test("invokeFixHarnessWithRetry: an underreported duration is debited using meas
   assert.equal(result.budgetExhausted, true, "measured elapsed time, not the underreported duration, must drive budget exhaustion");
 });
 
+test("invokeFixHarnessWithRetry: default clock is monotonic, so a backward-jumping Date.now cannot zero out the debit for a zero-duration failed attempt", async () => {
+  // #486 review 1: Date.now() is not monotonic. If NTP/VM-resume/manual
+  // correction rolls the wall clock backward while the executor underreports
+  // duration: 0, a Date.now()-based elapsed measurement clamps to zero,
+  // letting the failed attempt escape the retry budget for free. The default
+  // clock must be performance.now() (monotonic), which is unaffected by
+  // Date.now() being tampered with. No `nowMs` override is passed here so
+  // this exercises the real default.
+  const realDateNow = Date.now;
+  let dateNowCalls = 0;
+  // Simulate a rollback: the second Date.now() read returns an earlier
+  // timestamp than the first, as Date.now() would under a clock correction.
+  Date.now = () => {
+    dateNowCalls++;
+    return dateNowCalls === 1 ? 10_000_000 : 0;
+  };
+  try {
+    const timeouts: number[] = [];
+    const result = await invokeFixHarnessWithRetry({
+      maxRetries: 1,
+      fixTimeoutSec: 100,
+      basePrompt: "BASE-PROMPT",
+      invokeAttempt: async (_prompt, timeoutSec) => {
+        timeouts.push(timeoutSec);
+        // Real wall-clock delay the executor underreports as duration: 0.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return harnessResult({ exit_code: 1, duration: 0 });
+      },
+    });
+    assert.equal(timeouts[0], 100);
+    assert.ok(
+      timeouts[1] < 100,
+      "the real ~50ms elapsed must be debited even though the tampered Date.now() rolled backward; " +
+        "under the old Date.now()-based default this would clamp to 0 and leave the residual budget at exactly 100",
+    );
+    assert.equal(result.budgetExhausted, false);
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
 test("invokeFixHarnessWithRetry: remaining budget at/below the floor blocks without another invocation", async () => {
   let calls = 0;
   const result = await invokeFixHarnessWithRetry({
