@@ -1408,6 +1408,11 @@ export const PIPELINE_COMMENT_KINDS: readonly {
     verify: "pipeline-attest",
   },
   {
+    kind: "needs-human-decision",
+    heading: "## Pipeline: Human decision required",
+    verify: "pipeline-attest",
+  },
+  {
     kind: "pipeline-classifier-prefix",
     heading: "## Pipeline:",
     verify: "exempt",

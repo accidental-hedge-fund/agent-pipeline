@@ -66,6 +66,19 @@ Rules for this declaration:
 - Emit one declaration per non-reproducing finding. You may still commit fixes for the other assigned findings in the same round.
 - This is a distinct, sanctioned outcome from silently making no change — the pipeline recognizes a valid declaration and does NOT treat it as a failed fix round.
 
+## Needs-Human-Decision Outcome (if applicable)
+
+If an assigned blocking finding correctly requires a **human decision** rather than a code change — the fix needs a product decision, requires an authority you do not have, or depends on an external capability that is not available to you — do NOT invent a workaround, do NOT commit a no-op change, and do NOT declare it does-not-reproduce (that outcome is only for a finding whose described condition genuinely does not exist in the code — see above). Instead, declare it using the finding's `override-key` AND its `finding-fingerprint` (both shown above each finding — the fingerprint is the hidden `<!-- finding-fingerprint: ... -->` marker) by emitting exactly one line per such finding, formatted precisely as:
+
+    <!-- pipeline-needs-human-decision: <category> <override-key> <finding-fingerprint> {{reviewed_sha}} | <one-line decision request> -->
+
+Rules for this declaration:
+- `<category>` MUST be exactly one of: `product-decision` (a product/scope call only a human can make), `authority` (the fix requires permissions or sign-off you do not have), or `external-dependency` (the fix depends on a capability, service, or interface that does not currently exist or is not accessible to you).
+- The `finding-fingerprint` MUST be copied verbatim from the marker shown directly above the finding you are declaring — never guessed or reused from a different finding.
+- The reviewed SHA in the declaration MUST be exactly `{{reviewed_sha}}` — a declaration against any other SHA is ignored.
+- The decision request MUST be a single line (no line breaks) stating exactly what decision is needed and from whom.
+- This declaration does not resolve the finding, does not suppress it, and does not advance this item to the next review, pre-merge, or ready-to-deploy stage. The finding remains blocking until a human records an audited disposition through the normal unblock/override flow. Use this outcome only when the finding genuinely cannot be resolved by any code change — never to defer a finding you simply haven't gotten to yet.
+
 ## Review Findings
 
 {{review_findings}}

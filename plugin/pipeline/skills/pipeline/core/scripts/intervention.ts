@@ -206,6 +206,7 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
     case "openspec-stale-delta":
     case "no-pull-request":
     case "needs-human":
+    case "human-decision-required":
       return "product-judgment-required";
     default:
       return "unknown";

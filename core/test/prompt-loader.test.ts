@@ -1708,6 +1708,38 @@ test("fix prompt: does-not-reproduce outcome names the sentinel shape and the re
   assert.doesNotMatch(withoutSha, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is omitted");
 });
 
+// #473: needs-human-decision drift test — bites when the sanctioned outcome is
+// removed from fix.md, and asserts the closed category set and reviewed SHA
+// are embedded in the rendered prompt.
+test("fix prompt: needs-human-decision outcome names the sentinel shape, categories, and the reviewed SHA (#473)", () => {
+  const sha = "d".repeat(40);
+  const out = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 473,
+    title: "Structured non-code fix outcome",
+    reviewFindings: "f",
+    fixRound: 1,
+    pipelineRunId: "473/r",
+    reviewedSha: sha,
+  });
+  assert.match(out, /human decision/i, "fix prompt must name the needs-human-decision outcome");
+  assert.match(
+    out,
+    /pipeline-needs-human-decision/,
+    "fix prompt must instruct the harness to emit the pipeline-needs-human-decision sentinel",
+  );
+  assert.match(out, /product-decision/, "fix prompt must offer the product-decision category");
+  assert.match(out, /\bauthority\b/, "fix prompt must offer the authority category");
+  assert.match(out, /external-dependency/, "fix prompt must offer the external-dependency category");
+  assert.ok(out.includes(sha), "fix prompt must embed the exact reviewed SHA the declaration must match");
+  assert.match(
+    out,
+    /does not (?:resolve|advance)/i,
+    "fix prompt must state the declaration neither resolves the finding nor advances the item",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is supplied");
+});
+
 test("readConventions: a large early cap-crossing section is represented amid many later compact sections (#19 review-ceiling-5)", () => {
   // Regression for the round-5 finding: a budget loop that appends later compact
   // sections first could consume the budget and leave a large early cap-crossing

@@ -832,6 +832,80 @@ export function nonReproducingDispositionComment(args: {
   return attestPipelineComment("finding-does-not-reproduce", rendered);
 }
 
+// ---------------------------------------------------------------------------
+// Needs-human-decision outcome (#473) — a bounded, machine-readable outcome
+// for a no-commit fix round whose correct result is a human product/authority
+// decision, not a code change. Distinct heading and sentinel from both
+// `overrideComment` (an unconditional human clearance) and
+// `nonReproducingDispositionComment` (a claim the finding's condition does not
+// exist): this comment records that the finding remains open and blocking,
+// and posts durable evidence for the human decision it is waiting on. Nothing
+// reads its sentinel back to suppress or disposition the finding (#473 5.2).
+// ---------------------------------------------------------------------------
+
+const HUMAN_DECISION_HEADING = "## Pipeline: Human decision required";
+
+/**
+ * Neutralize untrusted harness-provided text before it is embedded as plain
+ * text in any pipeline-authored sink (comment body or blocker reason): strip
+ * newlines and HTML comment delimiters so this text cannot form a literal
+ * `<!-- ... -->` marker that a later run's sentinel extractors could mistake
+ * for a trusted override/non-reproducing/human-decision disposition (#473
+ * review-2 finding a64f2252cd2dbd0a — every sink that renders this text must
+ * use this same neutralization, not just the evidence comment).
+ */
+export function neutralizeSentinelText(text: string): string {
+  return text
+    .replace(/[\r\n]/g, " ")
+    .replace(/<!--/g, "<!—")
+    .replace(/-->/g, "—>");
+}
+
+/**
+ * The audited needs-human-decision evidence comment (#473). Carries the
+ * decision category, the one-line decision request, the finding's identity,
+ * the reviewed SHA, and the stage — readable by a human and by the audit
+ * trail. Posting this comment never resolves or suppresses the finding it
+ * names.
+ */
+export function humanDecisionComment(args: {
+  category: "product-decision" | "authority" | "external-dependency";
+  key: string;
+  fingerprint: string;
+  reviewedSha: string;
+  request: string;
+  stage: string;
+  timestamp: string;
+  footer?: string;
+}): string {
+  const { category, key, fingerprint, reviewedSha, request, stage, timestamp, footer } = args;
+  // Sanitize the harness-provided request before embedding it as plain text in the
+  // attested comment (#473 review-1 finding b48e383e).
+  const safeRequest = neutralizeSentinelText(request);
+  const rendered = [
+    HUMAN_DECISION_HEADING,
+    "",
+    `**Finding**: \`${key}\``,
+    `**Category**: ${category}`,
+    `**Reviewed SHA**: \`${reviewedSha}\``,
+    `**Stage**: ${stage}`,
+    `**Recorded at**: ${timestamp}`,
+    "",
+    "### Decision needed",
+    safeRequest,
+    "",
+    "This outcome does NOT resolve or suppress the finding above, and does NOT " +
+      "advance this item. The fix harness determined that the correct next step is a " +
+      "human decision, not a code change. Resume through the existing `--unblock` / " +
+      "`--override` flow once the decision is made.",
+    "",
+    (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
+    "",
+    `<!-- pipeline-human-decision: ${key} ${fingerprint} ${reviewedSha} -->`,
+  ].join("\n");
+  return attestPipelineComment("needs-human-decision", rendered);
+}
+
 /**
  * Collect active non-reproducing dispositions from trusted-author comments as
  * key → `{ sha, fingerprint }[]` (every disposition recorded under that coarse

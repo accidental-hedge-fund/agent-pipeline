@@ -22,7 +22,9 @@ import {
   extractOverrides,
   extractScopedOverrides,
   findingPayloadFingerprint,
+  humanDecisionComment,
   matchFindingScope,
+  neutralizeSentinelText,
   nonReproducingDispositionComment,
   type ScopedOverride,
 } from "../review-policy.ts";
@@ -733,6 +735,61 @@ export async function advanceFix(
         );
         commitGateMode = resolveFixCommitGateMode(decision, verifiedOnRemote);
       } else {
+        // #473: before the #391 does-not-reproduce carve-out, check whether the
+        // harness declared that one or more invoked blocking findings require a
+        // human decision — a durable product/authority/external-dependency
+        // impasse, never a code fix and never a claim the finding's condition
+        // does not exist. Evaluated first so a round mixing both outcomes always
+        // parks rather than advancing. Fails closed: any malformed, stale, or
+        // unmatched declaration is simply not accepted here and falls through to
+        // the does-not-reproduce check and then the existing no-commits block.
+        const humanDecisionDeclarations = parseHumanDecisionDeclarations(result.stdout ?? "");
+        const acceptedHumanDecisions = decideHumanDecisionPark(
+          invokedIdentities,
+          humanDecisionDeclarations,
+          headAfter,
+        );
+        if (acceptedHumanDecisions.length > 0) {
+          const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          for (const decl of acceptedHumanDecisions) {
+            await postComment(
+              cfg,
+              issueNumber,
+              humanDecisionComment({
+                category: decl.category,
+                key: decl.key,
+                fingerprint: decl.fingerprint,
+                reviewedSha: decl.reviewedSha,
+                request: decl.request,
+                stage,
+                timestamp,
+                footer: cfg.marker_footer,
+              }),
+            );
+          }
+          const categories = [...new Set(acceptedHumanDecisions.map((d) => d.category))].join(", ");
+          // #473 review-2 finding a64f2252cd2dbd0a: neutralize the harness-provided
+          // request here too — it is copied into the blocker reason passed to
+          // setBlocked, a distinct sink from the evidence comment above, and an
+          // unsanitized request could otherwise forge a trusted override/
+          // non-reproducing sentinel in the pipeline-authored blocked comment.
+          const requests = acceptedHumanDecisions
+            .map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`)
+            .join("; ");
+          const humanDecisionMsg =
+            `${stage}: the fix harness produced no new commits and declared ` +
+            `${acceptedHumanDecisions.length} blocking finding(s) require a human decision ` +
+            `(${categories}) at the reviewed SHA (${headAfter}) — ${requests}. This does not ` +
+            `resolve or advance the item.`;
+          const humanDecisionReason = await appendWorktreeStateDisclosure(wt.path, humanDecisionMsg);
+          await setBlocked(cfg, issueNumber, humanDecisionReason, stage, "human-decision-required");
+          return {
+            advanced: false,
+            status: "blocked",
+            reason: humanDecisionMsg,
+            blockerKind: "human-decision-required",
+          };
+        }
         // #391: before blocking, check whether the harness declared every
         // invoked blocking finding non-reproducing at the reviewed SHA — a
         // correctly-determined no-op (a tooling artifact / non-issue), not a
@@ -1644,6 +1701,85 @@ export function decideDoesNotReproduceAdvance(
     return { advance: true, to: round === 1 ? "review-2" : "pre-merge", covered };
   }
   return { advance: false, missing };
+}
+
+// ---------------------------------------------------------------------------
+// Needs-human-decision harness declarations (#473) — exported for direct unit
+// testing. Mirrors the does-not-reproduce declaration seam above, but this
+// outcome NEVER advances the item: it parks the round with a dedicated
+// blocker kind instead. Evaluated on the no-commit path BEFORE the #391
+// does-not-reproduce advance, so a mixed round always parks.
+// ---------------------------------------------------------------------------
+
+/** The closed category set a needs-human-decision declaration may carry. */
+export const HUMAN_DECISION_CATEGORIES = [
+  "product-decision",
+  "authority",
+  "external-dependency",
+] as const;
+export type HumanDecisionCategory = (typeof HUMAN_DECISION_CATEGORIES)[number];
+
+export interface HumanDecisionDeclaration {
+  category: HumanDecisionCategory;
+  key: string;
+  /** Verbatim render-time finding fingerprint, mirroring
+   *  {@link DoesNotReproduceDeclaration.fingerprint}. */
+  fingerprint: string;
+  reviewedSha: string;
+  request: string;
+}
+
+// Anchored full-line + global; category is a literal alternation over the
+// closed set so an unknown category never matches. Mirrors
+// DOES_NOT_REPRODUCE_RE's "identity SHA | text" shape.
+const HUMAN_DECISION_RE =
+  /^<!-- pipeline-needs-human-decision: (product-decision|authority|external-dependency) ([0-9a-f]{8}) ([0-9a-f]{16}) ([0-9a-fA-F]{40}) \| (.+?) -->$/gm;
+
+/**
+ * Parse needs-human-decision declarations from raw fix-harness stdout (#473).
+ * Pure text scan — never validates a declaration against the invoked blocking
+ * set, the current HEAD, or a non-empty decision request (see
+ * {@link decideHumanDecisionPark} for that). Malformed, multi-line, or absent
+ * declarations, and declarations carrying a category outside the closed set,
+ * yield [].
+ */
+export function parseHumanDecisionDeclarations(stdout: string): HumanDecisionDeclaration[] {
+  const out: HumanDecisionDeclaration[] = [];
+  HUMAN_DECISION_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = HUMAN_DECISION_RE.exec(stdout)) !== null) {
+    out.push({
+      category: m[1] as HumanDecisionCategory,
+      key: m[2],
+      fingerprint: m[3],
+      reviewedSha: m[4],
+      request: m[5].trim(),
+    });
+  }
+  HUMAN_DECISION_RE.lastIndex = 0;
+  return out;
+}
+
+/**
+ * #473: accept a needs-human-decision declaration only when its (key,
+ * fingerprint) identity matches a finding actually rendered into this
+ * round's fix prompt, its reviewed SHA equals `currentHead`, and its decision
+ * request is a non-empty single line. Returns the accepted declarations —
+ * any non-empty result means the round parks; no ranking or "to" stage is
+ * computed since this outcome never advances.
+ */
+export function decideHumanDecisionPark(
+  renderedIdentities: FindingSummary[],
+  declarations: HumanDecisionDeclaration[],
+  currentHead: string,
+): HumanDecisionDeclaration[] {
+  return declarations.filter((decl) => {
+    if (decl.request.trim().length === 0) return false;
+    if (!currentHead || decl.reviewedSha !== currentHead) return false;
+    return renderedIdentities.some(
+      (s) => s.key === decl.key && s.fingerprint !== null && s.fingerprint === decl.fingerprint,
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
