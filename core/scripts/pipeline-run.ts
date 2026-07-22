@@ -44,6 +44,7 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   startTerminalLogTee,
@@ -556,7 +557,17 @@ export async function runAdvance(
       if (opts.jsonEvents) {
         runStoreDeps.stdoutWrite = process.stdout.write.bind(process.stdout) as (s: string) => void;
       }
-      pinnedEngine = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)() ?? undefined;
+      // Resumed dispatch (#450): reuse the engine identity already recorded in
+      // this run's run.json when it exists, rather than re-resolving the
+      // current on-disk identity — initRunDir below is idempotent and will NOT
+      // overwrite an existing run.json, so pinnedEngine must match what was
+      // actually written or drift checks would compare the current identity to
+      // itself and silently suppress a real drift event.
+      pinnedEngine = await resolveRunEngineIdentity(
+        runDir,
+        () => (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)() ?? undefined,
+        runStoreDeps,
+      );
       lastObservedEngine = pinnedEngine;
       await initRunDir(
         { runDir, runId, issue: issueNumber, repo: cfg.repo, profile: opts.profile ?? null, startedAt: runStartedAtIso, engine: pinnedEngine },

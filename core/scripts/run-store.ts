@@ -395,6 +395,28 @@ export async function initRunDir(
   }
 }
 
+/** Resolve the engine identity a dispatch should pin, respecting `initRunDir`'s
+ *  written-once contract (#450): when `runDir/run.json` already exists (a
+ *  resumed dispatch re-entering the same run-id), reuse the identity already
+ *  recorded there rather than re-resolving the current on-disk identity —
+ *  `initRunDir` will not overwrite an existing run.json, so a freshly-resolved
+ *  identity would silently diverge from what was actually written and suppress
+ *  drift detection against the original pin. `resolveFresh` is only invoked
+ *  when no run.json exists yet (first init for this run-id). */
+export async function resolveRunEngineIdentity(
+  runDir: string,
+  resolveFresh: () => RunEngineIdentity | undefined,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<RunEngineIdentity | undefined> {
+  try {
+    const raw = await deps.readFile(path.join(runDir, "run.json"));
+    const meta = JSON.parse(raw) as { engine?: RunEngineIdentity };
+    return meta.engine;
+  } catch {
+    return resolveFresh();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // appendEvent
 // ---------------------------------------------------------------------------
