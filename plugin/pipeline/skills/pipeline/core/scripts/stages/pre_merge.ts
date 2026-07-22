@@ -1822,6 +1822,7 @@ export async function enforceReviewShaGate(
       const evidenceResult = applySettledSurfaceEvidenceRule(partition.blocking, settledVerification, headFiles);
       partition.blocking = evidenceResult.blocking;
       for (const { finding, match } of evidenceResult.demoted) {
+        partition.advisory.push({ finding, reason: "settled-surface-unverified", unverifiedSurfaceMatch: match });
         unverifiedSurfaceDemotions.set(findingKey(finding), match);
         if (deps.runDir) {
           const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
@@ -2003,6 +2004,7 @@ export async function enforceReviewShaGate(
             const reEvidenceResult = applySettledSurfaceEvidenceRule(rePartition.blocking, reSettledVerification, reHeadFiles);
             rePartition.blocking = reEvidenceResult.blocking;
             for (const { finding, match } of reEvidenceResult.demoted) {
+              rePartition.advisory.push({ finding, reason: "settled-surface-unverified", unverifiedSurfaceMatch: match });
               reUnverifiedSurfaceDemotions.set(findingKey(finding), match);
               if (deps.runDir) {
                 const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");

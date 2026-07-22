@@ -379,19 +379,25 @@ function normalizeForEvidenceMatch(s: string): string {
 }
 
 /**
- * True when `text` (a finding's body/recommendation/acknowledgment, joined)
- * quotes at least one line of `headFiles`' content — the mechanical proxy for
+ * True when `text` (a finding's body) quotes at least one line of
+ * `matchedFile`'s content within `headFiles` — the mechanical proxy for
  * "cites evidence drawn from the current file state" (#496). Deliberately a
  * literal-substring check, not semantic understanding: design.md accepts that
  * a reviewer could satisfy it by pasting a token file reference, since the
  * rule's job is only to raise the floor from "assume persistence" to "look at
- * the file", not to certify comprehension.
+ * the file", not to certify comprehension. Bound to `matchedFile` — the
+ * finding's own (matched) settled surface — so a citation from an unrelated
+ * injected file cannot satisfy evidence for a different surface (#496 finding
+ * 594c736a).
  */
-export function citesHeadFileEvidence(text: string, headFiles: HeadFileState[]): boolean {
+export function citesHeadFileEvidence(text: string, headFiles: HeadFileState[], matchedFile: string): boolean {
   const normalizedText = normalizeForEvidenceMatch(text);
   if (!normalizedText) return false;
+  const normalizedMatchedFile = normalizeFile(matchedFile);
+  if (!normalizedMatchedFile) return false;
   for (const file of headFiles) {
     if (!file.present) continue;
+    if (normalizeFile(file.path) !== normalizedMatchedFile) continue;
     for (const rawLine of file.content.split("\n")) {
       const line = normalizeForEvidenceMatch(rawLine);
       if (line.length < HEAD_EVIDENCE_MIN_QUOTE_LENGTH) continue;
@@ -456,8 +462,10 @@ export function applySettledSurfaceEvidenceRule(
       stillBlocking.push(f);
       continue;
     }
-    const text = [f.body, f.recommendation, f.prior_round_acknowledgment].filter(Boolean).join("\n");
-    if (citesHeadFileEvidence(text, headFiles) || citesAbsentHeadFile(f, headFiles)) {
+    // Evidence must come from the finding body itself, not the recommendation
+    // or prior-round acknowledgment (#496 finding 594c736a) — those can quote
+    // boilerplate the reviewer did not draw from the supplied HEAD state.
+    if (citesHeadFileEvidence(f.body ?? "", headFiles, f.file ?? "") || citesAbsentHeadFile(f, headFiles)) {
       stillBlocking.push(f);
       continue;
     }
@@ -471,8 +479,9 @@ export interface PartitionResult {
   blocking: ReviewFinding[];
   /** Below the severity threshold or confidence floor — recorded, not blocking.
    *  `reversalMatch` is present iff `reason === "reversal-unacknowledged"`.
-   *  `alternativeMatch` is present iff `reason === "settled-alternative-reinstated"`. */
-  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch; alternativeMatch?: AlternativeReinstatementMatch }[];
+   *  `alternativeMatch` is present iff `reason === "settled-alternative-reinstated"`.
+   *  `unverifiedSurfaceMatch` is present iff `reason === "settled-surface-unverified"`. */
+  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch; alternativeMatch?: AlternativeReinstatementMatch; unverifiedSurfaceMatch?: UnverifiedSettledSurfaceMatch }[];
   /** Operator-dispositioned via a `pipeline-override` or `pipeline-override-scope`
    *  sentinel — not blocking. Discriminated by `kind`. */
   overridden: OverriddenEntry[];

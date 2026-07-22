@@ -382,7 +382,7 @@ test("citesHeadFileEvidence: quoting a line from the supplied file counts as evi
     { path: "src/a.ts", content: "function scanEnginesOnly(engines) {\n  return engines.map(scan);\n}", truncated: false, present: true },
   ];
   const text = "Looking at the code, `function scanEnginesOnly(engines) {` already scopes discovery per engine.";
-  assert.ok(citesHeadFileEvidence(text, headFiles));
+  assert.ok(citesHeadFileEvidence(text, headFiles, "src/a.ts"));
 });
 
 test("citesHeadFileEvidence: narrow-delta-scope rationale alone is not evidence", () => {
@@ -390,12 +390,39 @@ test("citesHeadFileEvidence: narrow-delta-scope rationale alone is not evidence"
     { path: "src/a.ts", content: "function scanEnginesOnly(engines) {\n  return engines.map(scan);\n}", truncated: false, present: true },
   ];
   const text = "This narrow delta's commits do not address this finding, so it remains unresolved.";
-  assert.equal(citesHeadFileEvidence(text, headFiles), false);
+  assert.equal(citesHeadFileEvidence(text, headFiles, "src/a.ts"), false);
 });
 
 test("citesHeadFileEvidence: a not-present file contributes no evidence", () => {
   const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false }];
-  assert.equal(citesHeadFileEvidence("any text", headFiles), false);
+  assert.equal(citesHeadFileEvidence("any text", headFiles, "src/a.ts"), false);
+});
+
+test("citesHeadFileEvidence: a citation quoting a DIFFERENT file's content does not satisfy evidence for the matched surface (#496 finding 594c736a)", () => {
+  const headFiles: HeadFileState[] = [
+    { path: "src/a.ts", content: "function scanEnginesOnly(engines) {\n  return engines.map(scan);\n}", truncated: false, present: true },
+    { path: "src/b.ts", content: "import { scanEnginesOnly } from './a';\nexport const unrelatedBoilerplateLine = 1;", truncated: false, present: true },
+  ];
+  const text = "See `import { scanEnginesOnly } from './a';` in the imports.";
+  assert.equal(citesHeadFileEvidence(text, headFiles, "src/a.ts"), false, "quoting b.ts must not satisfy evidence for a.ts's surface");
+});
+
+test("applySettledSurfaceEvidenceRule: a citation confined to recommendation/prior_round_acknowledgment does not satisfy evidence (#496 finding 594c736a)", () => {
+  const settled: SettledFindingVerification[] = [
+    { key: "aaaaaaaa", surface: "src/a.ts|correctness", title: "Prior fix in src/a.ts", round: 1, disposition: "resolved-by-fix" },
+  ];
+  const headFiles: HeadFileState[] = [
+    { path: "src/a.ts", content: "function scanEnginesOnly(engines) {\n  return engines.map(scan);\n}", truncated: false, present: true },
+  ];
+  const f: ReviewFinding = {
+    severity: "high", title: "Prior fix in src/a.ts", body: "This narrow delta does not address the finding.",
+    file: "src/a.ts", category: "correctness", confidence: 0.9,
+    recommendation: "See `function scanEnginesOnly(engines) {` above.",
+    prior_round_acknowledgment: "`function scanEnginesOnly(engines) {` — this delta's commits do not touch it.",
+  };
+  const result = applySettledSurfaceEvidenceRule([f], settled, headFiles);
+  assert.deepEqual(result.blocking, [], "quotes confined to recommendation/acknowledgment must not count as body evidence");
+  assert.equal(result.demoted.length, 1);
 });
 
 test("applySettledSurfaceEvidenceRule: no-op when there is no settled history", () => {
