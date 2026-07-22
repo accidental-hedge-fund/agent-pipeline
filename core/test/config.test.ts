@@ -2142,6 +2142,28 @@ test("resolveReleaseConfig: returns intake_timeout — default when unset, pipel
   assert.equal(over.intake_timeout, 123, "intake_timeout in pipeline.yml must override");
 });
 
+test("resolveLoopNativeGoalAttestation: defaults to 'auto' when absent, parses an explicit value, rejects an unknown value (#506)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+  // resolveLoopNativeGoalAttestation does not shell out to gh, so no fake gh is needed.
+  assert.equal(
+    cfgMod.resolveLoopNativeGoalAttestation(makeFakeRepo(null)),
+    "auto",
+    "absent config defaults to automatic detection",
+  );
+  assert.equal(
+    cfgMod.resolveLoopNativeGoalAttestation(makeFakeRepo("loop:\n  native_goal_attestation: available\n")),
+    "available",
+  );
+  assert.equal(
+    cfgMod.resolveLoopNativeGoalAttestation(makeFakeRepo("loop:\n  native_goal_attestation: unavailable\n")),
+    "unavailable",
+  );
+  assert.throws(
+    () => cfgMod.resolveLoopNativeGoalAttestation(makeFakeRepo("loop:\n  native_goal_attestation: sometimes\n")),
+    /native_goal_attestation/,
+  );
+});
+
 // #154 regression: `doctor --is-ok` is a zero-output 0/1 polling gate, but config
 // resolution runs first and can emit non-fatal warnings (e.g. an inert models.*
 // alias under the default codex implementer). resolveConfig({ quiet: true }) must

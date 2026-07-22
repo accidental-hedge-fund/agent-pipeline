@@ -6,9 +6,26 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { runLoopCommand, buildCmd, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
 import type { LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
 import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
+
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "loop-command-test-"));
+
+/** A repo with no gh reachable — resolveLoopNativeGoalAttestation only ever
+ *  reads `.github/pipeline.yml` off disk, so no fake `gh` stub is needed. */
+function makeFakeRepo(content: string | null): string {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
+  fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+  if (content !== null) {
+    fs.mkdirSync(path.join(dir, ".github"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".github", "pipeline.yml"), content);
+  }
+  return dir;
+}
 
 async function withCapturedConsole(fn: () => Promise<void>): Promise<{ out: string[]; err: string[] }> {
   const out: string[] = [];
@@ -67,6 +84,41 @@ test("runLoopCommand — success prints a JSON handoff envelope and exits 0", as
   assert.deepEqual(parsed.selector, { type: "milestone", value: "v2" });
   assert.equal(parsed.resume_run_id, null);
   assert.equal(parsed.audit, false);
+});
+
+test("runLoopCommand — an invalid loop.native_goal_attestation value fails closed before the preflight runs (#506)", async () => {
+  let calls = 0;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () => {
+      calls++;
+      return { ok: true, args: { selector: undefined, resumeRunId: undefined, audit: true } } satisfies LoopPreflightOutcome;
+    },
+  };
+  const repoPath = makeFakeRepo("loop:\n  native_goal_attestation: sometimes\n");
+  process.exitCode = undefined;
+  const { err } = await withCapturedConsole(() =>
+    runLoopCommand({ audit: true, repoPath } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  process.exitCode = 0;
+  assert.equal(calls, 0, "preflight must not run when the attestation config itself is invalid");
+  assert.match(err.join("\n"), /native_goal_attestation/);
+});
+
+test("runLoopCommand — threads the resolved attestation from pipeline.yml into runLoopPreflight (#506)", async () => {
+  let receivedAttestation: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async (_raw, _engine, _doctorDeps, _roots, attestation) => {
+      receivedAttestation = attestation;
+      return { ok: true, args: { selector: undefined, resumeRunId: undefined, audit: true } } satisfies LoopPreflightOutcome;
+    },
+  };
+  const repoPath = makeFakeRepo("loop:\n  native_goal_attestation: available\n");
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({ audit: true, repoPath } as CliOpts, [], deps));
+  assert.equal(process.exitCode, 0);
+  process.exitCode = 0;
+  assert.equal(receivedAttestation, "available");
 });
 
 test("runLoopCommand — engine defaults to codex when --profile is absent (matches the CLI's own default)", async () => {

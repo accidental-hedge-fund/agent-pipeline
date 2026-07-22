@@ -159,25 +159,132 @@ export async function checkLoopContractCoherence(
 }
 
 // ---------------------------------------------------------------------------
-// Native `/goal` autonomous-mode capability check
+// Native `/goal` autonomous-mode capability check (#506)
+//
+// `/goal` is an interactive slash command, not a CLI flag: it is structurally
+// absent from `<bin> --help` on every real Claude Code build, so a `--help`
+// grep can only ever accept (a positive marker means something advertises the
+// capability); its ABSENCE is not evidence of absence and must never fail the
+// probe on its own (design.md decision 1). Resolution order: operator
+// attestation (config, authoritative both ways) -> positive `--help` marker
+// (additive-only) -> documented per-engine version floor -> fail closed.
 // ---------------------------------------------------------------------------
 
 const NATIVE_GOAL_MARKER = /\/goal\b|\bgoal[\s-]?mode\b/i;
 
-/** Best-effort capability probe: the engine binary's own `--help` output is
- *  asked whether it advertises a built-in autonomous goal mode. Deliberately
- *  does not guess at an undocumented internal file or API — it introspects
- *  the installed CLI the same way a user would (`<bin> --help`). */
-export async function checkNativeGoalCapability(deps: DoctorDeps, engine: LoopEngine): Promise<CheckResult> {
-  const bin = engine === "claude" ? "claude" : "codex";
-  const res = await deps.exec(bin, ["--help"]);
-  if (res.ok && NATIVE_GOAL_MARKER.test(res.stdout)) {
-    return pass(`${engine}'s built-in /goal autonomous mode is available`);
+export const NATIVE_GOAL_ATTESTATION_CONFIG_KEY = "loop.native_goal_attestation";
+
+export type NativeGoalAttestation = "auto" | "available" | "unavailable";
+
+interface EngineFloor {
+  /** Lowest version we have positive evidence for — not the lowest that might
+   *  work. Raising this bar reintroduces false negatives; lowering it without
+   *  evidence risks a false positive, which is worse (a run that starts and
+   *  cannot finish durably). */
+  floor: string;
+  verifiedOn: string;
+  note: string;
+}
+
+/** Per-engine version floor table (design.md decision 2). `null` means no
+ *  native goal mode is known for that engine at any version — represented
+ *  explicitly rather than guessed, so the probe fails closed instead of
+ *  silently passing an engine we have no evidence for. */
+const NATIVE_GOAL_VERSION_FLOOR: Record<LoopEngine, EngineFloor | null> = {
+  // Evidence (#506 reproduction, 2026-07-22): `claude --version` reported
+  // "2.1.216 (Claude Code)"; `claude --help | grep -i goal` returned nothing;
+  // a native six-milestone `/goal` run had completed on the same host the
+  // previous day (2026-07-21).
+  claude: {
+    floor: "2.1.216",
+    verifiedOn: "2026-07-22",
+    note: "lowest version with a confirmed completed native /goal run (#506)",
+  },
+  // Evidence (2026-07-22): `codex --version` reported "codex-cli 0.144.6" with
+  // no known native autonomous goal-mode equivalent at that or any version.
+  codex: null,
+};
+
+/** Extracts the first `major.minor.patch` run from a version string (e.g.
+ *  `"2.1.216 (Claude Code)"` -> `[2, 1, 216]`, `"codex-cli 0.144.6"` ->
+ *  `[0, 144, 6]`). Returns null when no such run is present — callers must
+ *  treat that as fail-closed, never as "recent enough" (design.md decision 3). */
+function parseVersion(raw: string): [number, number, number] | null {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(raw);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** Numeric, component-wise comparison; pre-release/build suffixes are already
+ *  dropped by {@link parseVersion}. Returns true when `version >= floor`. */
+function versionAtLeast(version: [number, number, number], floor: [number, number, number]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (version[i] > floor[i]) return true;
+    if (version[i] < floor[i]) return false;
   }
+  return true;
+}
+
+function remediationFor(engine: LoopEngine, bin: string, detectedVersion: string | null): string {
+  const engineFloor = NATIVE_GOAL_VERSION_FLOOR[engine];
+  const versionPart = detectedVersion
+    ? `detected ${bin} version "${detectedVersion}"`
+    : `${bin}'s version could not be read`;
+  const floorPart = engineFloor
+    ? `the required floor is ${engineFloor.floor} or above`
+    : `no native goal mode is known for ${bin} at any version`;
+  return (
+    `${versionPart}; ${floorPart}. Set "${NATIVE_GOAL_ATTESTATION_CONFIG_KEY}" to "available" in ` +
+    `.github/pipeline.yml if this host has native /goal support despite this check, or "unavailable" ` +
+    "to make the refusal explicit. pipeline:loop refuses to fall back to a non-durable or " +
+    "manually-supervised loop."
+  );
+}
+
+/** Capability probe built on signals that actually carry slash-command
+ *  availability (#506) — never on `--help` absence. Resolution order:
+ *  operator attestation -> positive `--help` marker -> version floor -> fail
+ *  closed. Deliberately does not start an engine session or read undocumented
+ *  engine-internal files (design.md non-goals). */
+export async function checkNativeGoalCapability(
+  deps: DoctorDeps,
+  engine: LoopEngine,
+  attestation: NativeGoalAttestation = "auto",
+): Promise<CheckResult> {
+  const bin = engine === "claude" ? "claude" : "codex";
+
+  if (attestation === "available") {
+    return pass(`${engine}'s built-in /goal autonomous mode is asserted available by operator attestation`);
+  }
+  if (attestation === "unavailable") {
+    return fail(
+      `${engine}'s built-in /goal autonomous mode is asserted unavailable by operator attestation`,
+      `"${NATIVE_GOAL_ATTESTATION_CONFIG_KEY}" is set to "unavailable" in .github/pipeline.yml. ` +
+        `Set it to "auto" or "available" if ${bin} does support native /goal.`,
+    );
+  }
+
+  const helpRes = await deps.exec(bin, ["--help"]);
+  if (helpRes.ok && NATIVE_GOAL_MARKER.test(helpRes.stdout)) {
+    return pass(`${engine}'s built-in /goal autonomous mode is advertised in ${bin} --help`);
+  }
+
+  const versionRes = await deps.exec(bin, ["--version"]);
+  const detectedVersion = versionRes.ok ? versionRes.stdout.trim() : null;
+  const engineFloor = NATIVE_GOAL_VERSION_FLOOR[engine];
+  const parsedVersion = detectedVersion ? parseVersion(detectedVersion) : null;
+  const parsedFloor = engineFloor ? parseVersion(engineFloor.floor) : null;
+
+  if (parsedVersion && parsedFloor && versionAtLeast(parsedVersion, parsedFloor)) {
+    return pass(
+      `${engine}'s built-in /goal autonomous mode is available (detected version ${detectedVersion} ` +
+        `>= documented floor ${engineFloor!.floor}, verified ${engineFloor!.verifiedOn}: ${engineFloor!.note})`,
+    );
+  }
+
   return fail(
     `${engine}'s built-in /goal autonomous mode was not detected`,
-    `Update ${bin} to a version with native /goal support before running pipeline:loop — ` +
-      "it refuses to fall back to a non-durable or manually-supervised loop.",
+    remediationFor(engine, bin, detectedVersion),
   );
 }
 
@@ -316,6 +423,7 @@ export async function runLoopPreflight(
   engine: LoopEngine,
   deps: DoctorDeps,
   roots: string[] = goalLoopDiscoveryRoots(engine),
+  attestation: NativeGoalAttestation = "auto",
 ): Promise<LoopPreflightOutcome> {
   let args: LoopArgs;
   try {
@@ -340,7 +448,7 @@ export async function runLoopPreflight(
   // support must still be able to audit (#451 delta finding ac3bdbd2).
   const auditOnly = args.audit && args.selector === undefined && args.resumeRunId === undefined;
   if (!auditOnly) {
-    const nativeGoal = await checkNativeGoalCapability(deps, engine);
+    const nativeGoal = await checkNativeGoalCapability(deps, engine, attestation);
     if (nativeGoal.status === "fail") {
       return { ok: false, failedCheck: "native-goal", detail: nativeGoal.detail, remediation: nativeGoal.remediation };
     }

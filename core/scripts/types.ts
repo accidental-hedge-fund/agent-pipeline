@@ -859,6 +859,13 @@ export interface PipelineConfig {
   // today (every stage runs through the local claude/codex harness).
   executors: Record<string, ExecutorDefinition>;
   stage_executors: Partial<Record<ModelInvokingStage, string>>;
+  // `pipeline:loop` native-goal capability attestation (#506). "auto" (default):
+  // detect via the --help marker / version-floor probe. "available"/"unavailable":
+  // an explicit, repo-reviewable operator assertion that overrides detection in
+  // either direction (design.md decision 1 and 4).
+  loop: {
+    native_goal_attestation: "auto" | "available" | "unavailable";
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -944,6 +951,7 @@ export const DEFAULT_CONFIG: Omit<
   repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
   executors: {} as Record<string, ExecutorDefinition>,
   stage_executors: {} as Partial<Record<ModelInvokingStage, string>>,
+  loop: { native_goal_attestation: "auto" as const },
 };
 
 // ---------------------------------------------------------------------------

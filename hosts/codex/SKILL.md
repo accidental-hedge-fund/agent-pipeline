@@ -119,6 +119,16 @@ schema ids are outside this skill's supported set, or when Codex's built-in
 autonomous `/goal` mode is unavailable — there is no non-durable fallback loop.
 `$goal-loop` remains a fully functional, undeprecated alias for the same runs.
 
+The native-`/goal` check never treats an absent marker in `codex --help` as
+evidence the capability is missing (a native goal mode is a slash command, not
+a CLI flag). It resolves an operator attestation
+(`loop.native_goal_attestation: available | unavailable` in
+`.github/pipeline.yml`, overriding everything else) first, then a positive
+`--help` marker, then a documented version floor against `codex --version` —
+codex currently has no documented floor (no known native goal mode), so it
+fails closed on detection alone and needs an `available` attestation to run
+(#506).
+
 `--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
 worktrees under `worktree_root` whose PR is already merged, removing the worktree
 and deleting its local branch (the remote branch is never touched). It only

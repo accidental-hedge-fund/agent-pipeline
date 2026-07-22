@@ -129,6 +129,14 @@ built-in autonomous `/goal` mode is unavailable — there is no non-durable
 fallback loop. `/goal-loop` remains a fully functional, undeprecated alias for
 the same runs.
 
+The native-`/goal` check never treats an absent marker in `claude --help` as
+evidence the capability is missing (`/goal` is a slash command, not a CLI
+flag). It resolves an operator attestation (`loop.native_goal_attestation:
+available | unavailable` in `.github/pipeline.yml`, overriding everything
+else) first, then a positive `--help` marker, then a documented version floor
+against `claude --version`. A failure names the detected version, the
+required floor, and the attestation key (#506).
+
 `--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
 worktrees under `worktree_root` whose PR is already merged, removing the worktree
 and deleting its local branch (the remote branch is never touched). It only
