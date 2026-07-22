@@ -63,6 +63,10 @@ A finding should answer:
 Enumerate EVERY material finding at or above the severity bar in this pass — do not hold secondary issues back for a later round. A complete first pass lets the fix resolve everything at once and converge in a single round; dripping findings one-per-round is a primary cause of non-converging review loops. Do not dilute serious issues with filler.
 If the change looks safe, say so directly and return no findings.
 
+## Rejected Alternatives
+
+When a finding's `recommendation` requires removing or replacing an existing design (not merely adjusting it), you MUST name the specific alternative being ruled out in that finding's `rejected_alternatives` field. This is what lets a later round recognize when a recommendation would put back a design a settled finding already required removed — even if it is re-argued under a new framing.
+
 {{severity_rubric}}
 
 {{confidence_calibration}}

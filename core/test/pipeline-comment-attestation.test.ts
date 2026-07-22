@@ -49,10 +49,13 @@ import {
 } from "../scripts/stages/review-parsing.ts";
 import {
   advisoryAdvanceComment,
+  deltaRoundCeilingComment,
+  deltaRoundCeilingDemotionComment,
   formatDeltaReviewComment,
   formatReviewComment,
   reviewCeilingComment,
   reviewCeilingDemotionComment,
+  type DeltaCeilingFinding,
 } from "../scripts/stages/review-rendering.ts";
 import {
   diffUnchangedNotice,
@@ -229,6 +232,9 @@ test("#471/#429 regression: advisoryAdvanceComment is attested and does not gate
 // ---------------------------------------------------------------------------
 
 const CEILING_PARTITION: PartitionResult = { blocking: [makeFinding()], advisory: [], overridden: [] };
+const DELTA_CEILING_FINDINGS: DeltaCeilingFinding[] = [
+  { key: "abcd1234", surface: "src/x.ts|correctness", severity: "medium", title: "test finding" },
+];
 
 // One real-renderer invocation per "pipeline-attest" kind, using minimal
 // representative arguments. If a builder stops calling attestPipelineComment,
@@ -251,6 +257,8 @@ const KIND_RENDERERS: Record<string, () => string> = {
   "review-advance-severity": () => advisoryAdvanceComment(advanceCfg, 1, "codex", EMPTY_PARTITION),
   "review-ceiling": () => reviewCeilingComment(advanceCfg, 1, "codex", CEILING_PARTITION, 3, []),
   "review-ceiling-demotion": () => reviewCeilingDemotionComment(advanceCfg, 1, "codex", CEILING_PARTITION, 3, [], 999),
+  "delta-round-ceiling": () => deltaRoundCeilingComment(advanceCfg, 4, 4, "park", DELTA_CEILING_FINDINGS),
+  "delta-round-ceiling-demotion": () => deltaRoundCeilingDemotionComment(advanceCfg, 4, 4, DELTA_CEILING_FINDINGS, 999),
   "new-human-input-warning": () =>
     buildNewHumanInputWarningComment([{ author: "human1", createdAt: ts(0) }], "review-1"),
   "pipeline-complete": () => buildPipelineCompleteComment(advanceCfg, 471, "Some issue", "PR #1", 0),

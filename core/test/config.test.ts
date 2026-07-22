@@ -462,6 +462,37 @@ test("resolveConfig: review_policy.max_adversarial_rounds override merges", asyn
   }
 });
 
+test("resolveConfig: review_policy.max_delta_rounds defaults to 4", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/rp-delta-default");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_policy.max_delta_rounds, DEFAULT_CONFIG.review_policy.max_delta_rounds);
+    assert.equal(cfg.review_policy.max_delta_rounds, 4);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_policy.max_delta_rounds override merges", async () => {
+  const repo = makeFakeRepo(`review_policy:\n  max_delta_rounds: 2\n`);
+  const binDir = makeFakeGh("acme/rp-delta-cap");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_policy.max_delta_rounds, 2);
+    // untouched fields keep their defaults
+    assert.equal(cfg.review_policy.max_adversarial_rounds, 3);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: review_policy block_threshold + min_confidence override merge", async () => {
   const repo = makeFakeRepo(`review_policy:\n  block_threshold: high\n  min_confidence: 0.7\n`);
   const binDir = makeFakeGh("acme/rp1");

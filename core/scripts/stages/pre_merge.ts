@@ -11,7 +11,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  addIssueComment,
   closePr,
+  createIssue,
   getGhActor,
   getHeadCheckRunCount,
   getSuccessfulCheckRunCount,
@@ -32,28 +34,43 @@ import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDe
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   attestPipelineComment,
+  buildDeltaFollowupIssueBody,
+  buildDeltaFollowupUpdateComment,
   computeDiffHash,
   DELTA_REVIEW_MARKER_PREFIX,
+  deltaRoundCeilingComment,
+  deltaRoundCeilingDemotionComment,
   diffFilePaths,
   extractBlockingKeysFromComment,
   extractBlockingKeysMarker,
+  extractCeilingFollowupNumber,
   extractDiffHashFromComment,
   extractReviewArtifact,
   findLatestReviewCommentBody,
   formatDeltaReviewComment,
   extractReviewedSha,
   parseStructuredVerdict,
+  type DeltaCeilingFinding,
 } from "./review.ts";
 import {
   buildTrustedOverrideComments,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  overrideComment,
   partitionFindings,
+  severityRank,
   surfaceKey,
+  type AlternativeReinstatementMatch,
   type ReversalMatch,
 } from "../review-policy.ts";
-import { buildPriorRoundDigest, settledFindings, type PriorRoundDigest } from "../review-history.ts";
+import {
+  buildPriorRoundDigest,
+  countDeltaRounds,
+  detectSuspectedChurn,
+  settledFindings,
+  type PriorRoundDigest,
+} from "../review-history.ts";
 import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { buildDeltaReviewPrompt, buildFixPrompt } from "../prompts/index.ts";
@@ -1102,6 +1119,12 @@ export interface ShaGateDeps {
    * view) before proceeding. Production default: `defaultGetRemoteHead`.
    */
   getRemoteHead?: (cwd: string, branch: string) => Promise<string | null>;
+  /** Files the single tracked follow-up issue at the pre-merge delta-round
+   *  ceiling under `ceiling_action: demote_and_advance` (#483). Mirrors the
+   *  review-2 ceiling's seam. */
+  createIssue?: (title: string, body: string, labels: string[]) => Promise<number>;
+  /** Appends to an existing delta-round-ceiling follow-up issue on re-entry (#483). */
+  addIssueComment?: (issueNumber: number, body: string) => Promise<void>;
 }
 
 /** `git ls-remote origin refs/heads/<branch>` from `cwd`; null on any failure. */
@@ -1135,6 +1158,8 @@ export async function enforceReviewShaGate(
   const getCommitDeltaDiffFn = deps.getCommitDeltaDiff ?? defaultGetCommitDeltaDiff;
   const runDeltaReviewFn = deps.runDeltaReview ?? defaultRunDeltaReview;
   const getRemoteHeadFn = deps.getRemoteHead ?? defaultGetRemoteHead;
+  const createIssueFn = deps.createIssue ?? ((title: string, body: string, labels: string[]) => createIssue(cfg, title, body, labels));
+  const addIssueCommentFn = deps.addIssueComment ?? ((issueNum: number, body: string) => addIssueComment(cfg, issueNum, body));
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
@@ -1442,6 +1467,116 @@ export async function enforceReviewShaGate(
         return null;
       }
 
+      // Pre-merge delta-round ceiling (#483): the diff changed and the prior
+      // verdict is stale, so a delta review would normally run — but bound how
+      // many times that can happen per item. Computed BEFORE invoking the
+      // reviewer, purely from the durable delta-review comment thread, so this
+      // check never depends on run-local state.
+      const deltaRoundCount = countDeltaRounds(detail.comments, {
+        actor, trustedOverrideActors: cfg.trusted_override_actors,
+      });
+      const deltaRoundCap = cfg.review_policy.max_delta_rounds;
+      if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap) {
+        if (deps.runDir) {
+          const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          await appendEvent(deps.runDir, {
+            schema_version: RUN_SCHEMA_VERSION, type: "delta_round_ceiling", at,
+            observed: deltaRoundCount, cap: deltaRoundCap, ceiling_action: cfg.review_policy.ceiling_action,
+          }, deps.runStoreDeps).catch(() => {});
+        }
+
+        // Reconstruct the outstanding blocking delta findings from the last
+        // trusted delta-review comment — no reviewer invocation happens at the
+        // ceiling, so there is no fresh ReviewFinding to partition. Filter out
+        // any key since overridden by a trusted operator disposition.
+        const lastDeltaComment = trustedComments
+          .filter((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
+          .at(-1);
+        const lastDeltaArtifact = lastDeltaComment ? extractReviewArtifact(lastDeltaComment.body) : null;
+        const rawOutstanding: DeltaCeilingFinding[] = lastDeltaArtifact?.blockingFindings
+          ? lastDeltaArtifact.blockingFindings.map((f) => ({
+              key: f.key, surface: f.surface, severity: f.severity, title: f.title,
+            }))
+          : [...(lastDeltaComment ? (extractBlockingKeysMarker(lastDeltaComment.body) ?? new Set<string>()) : new Set<string>())]
+              .map((key) => ({ key, surface: null, severity: "unknown", title: "(title unavailable)" }));
+        const currentOverrides = extractOverrides(trustedOverrideComments);
+        const outstanding = rawOutstanding.filter((f) => !currentOverrides.has(f.key));
+
+        if (outstanding.length === 0) {
+          // Every previously-recorded blocking key is now overridden (or the
+          // last delta round left nothing blocking) — nothing to disposition;
+          // proceed as if the gate passed.
+          console.log(
+            `[pipeline] #${issueNumber}: pre-merge delta-round ceiling reached (${deltaRoundCount}/${deltaRoundCap}) ` +
+            `with no outstanding blocking findings; proceeding`,
+          );
+          return null;
+        }
+
+        const highOrCritical = outstanding.filter((f) => severityRank(f.severity) >= severityRank("high"));
+        const belowHigh = outstanding.filter((f) => severityRank(f.severity) < severityRank("high"));
+        const shouldDemote =
+          cfg.review_policy.ceiling_action === "demote_and_advance" &&
+          highOrCritical.length === 0 &&
+          belowHigh.length > 0;
+
+        if (!shouldDemote) {
+          await postCommentFn(
+            cfg, issueNumber,
+            deltaRoundCeilingComment(cfg, deltaRoundCount, deltaRoundCap, cfg.review_policy.ceiling_action, outstanding),
+          );
+          await setBlockedFn(
+            cfg, issueNumber,
+            `Pre-merge delta review reached the ${deltaRoundCap}-round ceiling with ${outstanding.length} ` +
+              `unresolved blocking finding(s).`,
+            "pre-merge", "needs-human",
+          );
+          return {
+            advanced: false,
+            status: "blocked",
+            reason: `pre-merge delta-round ceiling: ${outstanding.length} unresolved blocking finding(s)`,
+          };
+        }
+
+        const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
+        let followupNumber: number;
+        if (existingFollowup !== null) {
+          followupNumber = existingFollowup;
+          await addIssueCommentFn(followupNumber, buildDeltaFollowupUpdateComment(issueNumber, deltaRoundCount, belowHigh));
+        } else {
+          followupNumber = await createIssueFn(
+            `[Deferred] Pre-merge delta review ceiling findings from #${issueNumber}`,
+            buildDeltaFollowupIssueBody(issueNumber, belowHigh),
+            [],
+          );
+        }
+
+        await postCommentFn(
+          cfg, issueNumber,
+          deltaRoundCeilingDemotionComment(cfg, deltaRoundCount, deltaRoundCap, belowHigh, followupNumber),
+        );
+
+        const ceilingTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        for (const f of belowHigh) {
+          const disposition = `deferred-#${followupNumber}`;
+          const body = overrideComment({
+            key: f.key,
+            disposition,
+            reason: `auto-demoted at pre-merge delta-round ceiling (round ${deltaRoundCount}/${deltaRoundCap}); deferred to #${followupNumber}`,
+            stage: "pre-merge",
+            timestamp: ceilingTimestamp,
+            footer: cfg.marker_footer,
+          });
+          await postCommentFn(cfg, issueNumber, body);
+        }
+
+        console.log(
+          `[pipeline] #${issueNumber}: pre-merge delta-round ceiling (${deltaRoundCount}/${deltaRoundCap}); ` +
+          `${belowHigh.length} below-high finding(s) demoted, advancing (follow-up #${followupNumber})`,
+        );
+        return null;
+      }
+
       // Resolve worktree and spec context for the delta reviewer (Finding 3): the
       // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
       // can inspect PR-branch files, and must receive OpenSpec context for any
@@ -1472,6 +1607,14 @@ export async function enforceReviewShaGate(
       let deltaSpecContext = deltaWt
         ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
         : "";
+
+      if (deps.runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(deps.runDir, {
+          schema_version: RUN_SCHEMA_VERSION, type: "delta_round", at,
+          round: deltaRoundCount + 1, cap: deltaRoundCap,
+        }, deps.runStoreDeps).catch(() => {});
+      }
 
       let deltaResult: DeltaReviewResult;
       let priorRoundsDigest: PriorRoundDigest;
@@ -1532,18 +1675,47 @@ export async function enforceReviewShaGate(
       const settled = settledFindings(priorRoundsDigest);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled);
       const reversalDemotions = new Map<string, ReversalMatch>();
-      for (const { finding, reason, reversalMatch } of partition.advisory) {
-        if (reason !== "reversal-unacknowledged" || !reversalMatch) continue;
-        reversalDemotions.set(findingKey(finding), reversalMatch);
-        if (deps.runDir) {
-          const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-          await appendEvent(deps.runDir, {
-            schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
-            finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
-            settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
-            matched_by: reversalMatch.matchedBy,
-          }, deps.runStoreDeps).catch(() => {});
+      const alternativeDemotions = new Map<string, AlternativeReinstatementMatch>();
+      for (const { finding, reason, reversalMatch, alternativeMatch } of partition.advisory) {
+        if (reason === "reversal-unacknowledged" && reversalMatch) {
+          reversalDemotions.set(findingKey(finding), reversalMatch);
+          if (deps.runDir) {
+            const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+            await appendEvent(deps.runDir, {
+              schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+              finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+              settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
+              matched_by: reversalMatch.matchedBy,
+            }, deps.runStoreDeps).catch(() => {});
+          }
+          continue;
         }
+        if (reason === "settled-alternative-reinstated" && alternativeMatch) {
+          alternativeDemotions.set(findingKey(finding), alternativeMatch);
+          if (deps.runDir) {
+            const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+            await appendEvent(deps.runDir, {
+              schema_version: RUN_SCHEMA_VERSION, type: "settled_alternative_reinstated", at,
+              finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+              settled_finding_key: alternativeMatch.settledKey, settling_round: alternativeMatch.settledRound,
+              matched_alternative: alternativeMatch.matchedAlternative,
+            }, deps.runStoreDeps).catch(() => {});
+          }
+        }
+      }
+
+      // Confidence-trend churn detector (#483): audit-only — labels the posted
+      // comment and emits one event, never alters the blocking partition above.
+      const churn = detectSuspectedChurn(partition.blocking, priorRoundsDigest);
+      if (churn.suspected && deps.runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(deps.runDir, {
+          schema_version: RUN_SCHEMA_VERSION, type: "delta_churn_suspected", at,
+          round: deltaRoundCount + 1,
+          axes: churn.axes.map((a) => ({
+            surface: a.surface, prior_max_confidence: a.priorMaxConfidence, new_confidence: a.newConfidence,
+          })),
+        }, deps.runStoreDeps).catch(() => {});
       }
 
       const newHash = computeDiffHash(currentDiff);
@@ -1571,6 +1743,8 @@ export async function enforceReviewShaGate(
         blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
         newHash,
         reversalDemotions,
+        alternativeDemotions,
+        churn,
       );
       // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
       // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).

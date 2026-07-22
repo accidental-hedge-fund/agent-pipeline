@@ -20,7 +20,7 @@
 // pre-#17 behavior exactly: every finding blocks.
 
 import { createHash } from "node:crypto";
-import { matchSettledFinding, type MatchBasis, type SettledFinding } from "./review-history.ts";
+import { matchSettledAlternative, matchSettledFinding, type MatchBasis, type SettledFinding } from "./review-history.ts";
 import { attestPipelineComment, isVerifiedPipelineAttestation } from "./stages/review-parsing.ts";
 import type { ReviewFinding } from "./types.ts";
 
@@ -316,12 +316,24 @@ export interface ReversalMatch {
   matchedBy: MatchBasis;
 }
 
+/**
+ * Audit detail for a `settled-alternative-reinstated` demotion (#483): which
+ * settled finding's rejected alternative the demoted finding's recommendation
+ * reinstated, and the round that settled it.
+ */
+export interface AlternativeReinstatementMatch {
+  settledKey: string;
+  settledRound: number;
+  matchedAlternative: string;
+}
+
 export interface PartitionResult {
   /** Findings that block: at/above threshold, at/above confidence, not overridden. */
   blocking: ReviewFinding[];
   /** Below the severity threshold or confidence floor — recorded, not blocking.
-   *  `reversalMatch` is present iff `reason === "reversal-unacknowledged"`. */
-  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch }[];
+   *  `reversalMatch` is present iff `reason === "reversal-unacknowledged"`.
+   *  `alternativeMatch` is present iff `reason === "settled-alternative-reinstated"`. */
+  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch; alternativeMatch?: AlternativeReinstatementMatch }[];
   /** Operator-dispositioned via a `pipeline-override` or `pipeline-override-scope`
    *  sentinel — not blocking. Discriminated by `kind`. */
   overridden: OverriddenEntry[];
@@ -557,6 +569,26 @@ export function partitionFindings(
             settledTitle: match.entry.title,
             settledRound: match.entry.round,
             matchedBy: match.basis,
+          },
+        });
+        continue;
+      }
+
+      // 5. Settled-alternative reinstatement guard (#483): independent of the
+      // reversal guard above (a different axis — recommendation vs. rejected
+      // alternative, not title/key) — catches a later round re-raising a
+      // settled trade-off under a NEW finding key and a re-framed title, which
+      // the key/title-similarity guard above cannot see (fuseiq-core#95 round
+      // 5 vs round 2).
+      const altMatch = matchSettledAlternative(f, settledFindingsList);
+      if (altMatch) {
+        result.advisory.push({
+          finding: f,
+          reason: "settled-alternative-reinstated",
+          alternativeMatch: {
+            settledKey: altMatch.entry.key,
+            settledRound: altMatch.entry.round,
+            matchedAlternative: altMatch.matchedAlternative,
           },
         });
         continue;

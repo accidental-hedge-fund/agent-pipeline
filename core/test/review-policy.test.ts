@@ -271,8 +271,8 @@ test("partition: advisory-confidence duplicate shares key with blocker — overr
 
 // ---- settled-finding reversal guard (#389, finding-level matching #464) ----
 
-function settledFrom(f: ReviewFinding, round = 1): SettledFinding {
-  return { key: findingKey(f), surface: surfaceKey(f), title: f.title, round };
+function settledFrom(f: ReviewFinding, round = 1, rejectedAlternatives: string[] = []): SettledFinding {
+  return { key: findingKey(f), surface: surfaceKey(f), title: f.title, round, rejectedAlternatives };
 }
 
 test("partition: blocking finding that re-raises a settled finding (same key) without acknowledgment is demoted to advisory", () => {
@@ -310,7 +310,7 @@ test("partition: whitespace-only acknowledgment does not count as an acknowledgm
 
 test("partition: a finding on a surface not matching any settled finding is unaffected by the guard", () => {
   const f = finding({ severity: "high", file: "src/other.ts", category: "correctness", title: "unrelated" });
-  const settled: SettledFinding[] = [{ key: "deadbeef", surface: "src/limiter.ts|correctness", title: "cap missing", round: 1 }];
+  const settled: SettledFinding[] = [{ key: "deadbeef", surface: "src/limiter.ts|correctness", title: "cap missing", round: 1, rejectedAlternatives: [] }];
   const p = partitionFindings([f], DEFAULT_POLICY, new Map(), [], new Map(), null, settled);
   assert.equal(p.blocking.length, 1);
 });
