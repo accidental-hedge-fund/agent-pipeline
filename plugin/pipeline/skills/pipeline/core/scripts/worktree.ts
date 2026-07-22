@@ -509,6 +509,8 @@ export interface CreateWorktreeDeps {
   lstatPath?: (p: string) => Promise<{ isSymbolicLink(): boolean } | null>;
   /** Remove the file or symlink at the given path. */
   unlinkPath?: (p: string) => Promise<void>;
+  /** Stamp the worktree as pipeline-owned (see {@link writeManagedMarker}). */
+  writeManagedMarker?: (worktreePath: string) => Promise<void>;
 }
 
 export async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
@@ -561,6 +563,51 @@ export async function realWriteNodeModulesExclude(worktreePath: string): Promise
   }
 }
 
+/** Resolve the per-worktree Git admin directory (`<commondir>/worktrees/<name>`
+ *  for a linked worktree, or the `.git` directory itself for the main
+ *  checkout). Distinct from the COMMON git dir resolved in
+ *  {@link realWriteNodeModulesExclude} — this is unique per worktree, which is
+ *  what makes it a suitable home for a per-worktree ownership marker: it lives
+ *  outside the working tree (invisible to `git status`) and is deleted
+ *  automatically when the worktree is deregistered. Returns null when the
+ *  worktree directory (and therefore its `.git` marker) is already gone. */
+async function resolvePerWorktreeGitDir(worktreePath: string): Promise<string | null> {
+  const gitMarker = path.join(worktreePath, ".git");
+  const stat = await fs.promises.stat(gitMarker).catch((e: NodeJS.ErrnoException) => {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  });
+  if (stat === null) return null;
+  if (stat.isFile()) {
+    const content = await fs.promises.readFile(gitMarker, "utf8");
+    const match = content.match(/^gitdir:\s*(.+)$/m);
+    if (!match) throw new Error(`Malformed .git file at ${gitMarker}: ${content.slice(0, 80)}`);
+    return path.resolve(worktreePath, match[1].trim());
+  }
+  return gitMarker;
+}
+
+const PIPELINE_MANAGED_MARKER_FILE = "pipeline-managed";
+
+/** Stamp `worktreePath` as created by `createWorktree`, so a later removal
+ *  from a *different* linked checkout (#472) can verify the worktree is
+ *  actually pipeline-owned rather than merely sitting under a Git-registered
+ *  checkout's `.worktrees` directory by coincidence (review-2 finding
+ *  578ebd21: registration + path placement + branch naming do not by
+ *  themselves establish that Pipeline created a worktree). */
+export async function writeManagedMarker(worktreePath: string): Promise<void> {
+  const gitDir = await resolvePerWorktreeGitDir(worktreePath);
+  if (gitDir === null) return;
+  await fs.promises.writeFile(path.join(gitDir, PIPELINE_MANAGED_MARKER_FILE), "");
+}
+
+/** Check the marker written by {@link writeManagedMarker}. */
+export async function hasManagedMarker(worktreePath: string): Promise<boolean> {
+  const gitDir = await resolvePerWorktreeGitDir(worktreePath);
+  if (gitDir === null) return false;
+  return fs.existsSync(path.join(gitDir, PIPELINE_MANAGED_MARKER_FILE));
+}
+
 async function realLstatPath(p: string): Promise<{ isSymbolicLink(): boolean } | null> {
   try {
     return await fs.promises.lstat(p);
@@ -594,6 +641,7 @@ export async function createWorktree(
   const writeNodeModulesExcludeFn = deps.writeNodeModulesExclude ?? realWriteNodeModulesExclude;
   const lstatPathFn = deps.lstatPath ?? realLstatPath;
   const unlinkPathFn = deps.unlinkPath ?? realUnlinkPath;
+  const writeManagedMarkerFn = deps.writeManagedMarker ?? writeManagedMarker;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
@@ -741,6 +789,9 @@ export async function createWorktree(
         // Bootstrap: write node_modules to .git/info/exclude so `git add` never
         // stages a node_modules entry regardless of type (dir, symlink, file).
         await writeNodeModulesExcludeFn(wtPath);
+        // Stamp ownership so a cross-checkout removal (#472) can prove this
+        // worktree was actually created by the pipeline (review-2 finding 578ebd21).
+        await writeManagedMarkerFn(wtPath);
         // Remove a pre-existing node_modules symlink — left by a prior aborted run
         // that symlinked the primary checkout's deps without committing the exclude.
         const nmPath = path.join(wtPath, "node_modules");
@@ -969,6 +1020,10 @@ export interface RemoveWorktreeDeps {
    *  - null              → git/network/auth/stale-ref error (hard block, not bypassed by --force)
    *  worktreePath is null for stale registrations (path no longer on disk). */
   hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string | null, branch: string) => Promise<boolean | "unverifiable" | null>;
+  /** Check the ownership marker written by {@link writeManagedMarker}. Consulted
+   *  only for a candidate discovered under a *different* checkout's managed root
+   *  (cross-checkout removal, #472) — see {@link removeWorktreeForIssue}. */
+  hasManagedMarker?: (worktreePath: string) => Promise<boolean>;
 }
 
 /** Returns:
@@ -1134,6 +1189,34 @@ export async function removeWorktreeForIssue(
   const worktreeP = rec.path;
 
   const pathOnDisk = existsFn(worktreeP);
+
+  // Cross-checkout ownership gate (review-2 finding 578ebd21): a Git-registered
+  // checkout other than this invocation's own repo_dir is not, by itself, proof
+  // that Pipeline created a worktree under that checkout's managed root — a
+  // developer could have a linked checkout of the same repo with its own
+  // unrelated `.worktrees/pipeline-<N>-<slug>` nested worktree. Require the
+  // ownership marker createWorktree stamps before allowing a *cross-checkout*
+  // removal. This does not change same-checkout behavior (the pre-#472 trust
+  // boundary), matching "existing removal safety behavior SHALL be preserved
+  // for cross-checkout records" — the marker check is new, additive safety,
+  // not a change to the existing dirty/local-commits/force semantics below.
+  const legacyRootForCrossCheckCheck = path.resolve(cfg.repo_dir, cfg.worktree_root);
+  const isCrossCheckout = path.resolve(path.dirname(worktreeP)) !== legacyRootForCrossCheckCheck;
+  if (isCrossCheckout && pathOnDisk) {
+    const hasMarkerFn = deps.hasManagedMarker ?? hasManagedMarker;
+    if (!(await hasMarkerFn(worktreeP))) {
+      return {
+        removed: false,
+        dirty: false,
+        branch,
+        worktree: worktreeP,
+        error:
+          `worktree at ${worktreeP} is registered under a linked checkout's managed root but carries no ` +
+          "pipeline ownership marker; refusing cross-checkout removal (remove it explicitly with " +
+          "`git worktree remove` if you own it, or run the pipeline's --remove-worktree from that checkout).",
+      };
+    }
+  }
 
   let dirty = false;
   if (pathOnDisk) {

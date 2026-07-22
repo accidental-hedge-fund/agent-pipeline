@@ -16,7 +16,7 @@ The pipeline SHALL accept a `--remove-worktree` flag on `pipeline N` invocations
 - **AND** the process exits zero
 
 #### Scenario: Worktree created from a linked checkout is removed from the primary checkout
-- **WHEN** a Pipeline worktree for issue N was created from a linked checkout and is registered at `<linked>/<worktree_root>/pipeline-N-<slug>` on branch `pipeline/N-<slug>`
+- **WHEN** a Pipeline worktree for issue N was created from a linked checkout (and therefore carries the pipeline ownership marker per the requirement below) and is registered at `<linked>/<worktree_root>/pipeline-N-<slug>` on branch `pipeline/N-<slug>`
 - **AND** the operator invokes `pipeline N --remove-worktree` from the primary checkout of the same Git common directory
 - **THEN** that worktree SHALL be resolved and removed
 - **AND** the reported `worktree` path SHALL be `<linked>/<worktree_root>/pipeline-N-<slug>`
@@ -85,3 +85,27 @@ Resolving a worktree through the managed-root set SHALL NOT change any subsequen
 #### Scenario: Single-checkout behavior is unchanged
 - **WHEN** the repository has exactly one registered checkout
 - **THEN** every removal outcome (clean removal, dirty-without-force, dirty-with-force, stale registration, not-found) SHALL return the same result object as before this change
+
+---
+
+### Requirement: A cross-checkout removal candidate SHALL require proof of pipeline ownership
+Git registration, path placement under a managed root, and branch naming alone SHALL NOT be treated as proof that the pipeline created a worktree found under a *different* checkout's managed root than the one `--remove-worktree` was invoked from — a developer's own linked checkout of the same Git common directory can independently register a nested worktree matching the same path and branch conventions by coincidence. `createWorktree` SHALL stamp every worktree it creates with a durable, per-worktree ownership marker stored outside the working tree (so it is invisible to `git status` and is removed automatically when the worktree is deregistered). Before removing an on-disk candidate whose managed root differs from the invoking checkout's own root, the pipeline SHALL verify this marker is present and SHALL refuse the removal — invoking no `git worktree remove` or `git branch -D` — when it is absent. This gate SHALL NOT apply to a candidate under the invoking checkout's own managed root, preserving pre-existing single-checkout trust and behavior exactly.
+
+#### Scenario: Cross-checkout worktree without the ownership marker is refused
+- **WHEN** a worktree matching issue N's branch and directory-naming convention is registered under a linked checkout's managed root, other than the invoking checkout's own root
+- **AND** that worktree was not created by `createWorktree` and therefore carries no ownership marker
+- **AND** the operator invokes `pipeline N --remove-worktree` from a different checkout
+- **THEN** the removal SHALL be refused
+- **AND** neither `git worktree remove` nor `git branch -D` SHALL be invoked
+- **AND** the error SHALL name the worktree path and state that no pipeline ownership marker was found
+- **AND** the process exits non-zero
+
+#### Scenario: A cross-checkout worktree created by the pipeline carries the marker and is removed
+- **WHEN** `createWorktree` created the worktree for issue N from a linked checkout
+- **AND** the operator invokes `pipeline N --remove-worktree` from a different checkout of the same Git common directory
+- **THEN** the ownership marker SHALL be present
+- **AND** the removal SHALL proceed exactly as described in "Worktree created from a linked checkout is removed from the primary checkout"
+
+#### Scenario: The ownership gate does not apply to a same-checkout candidate
+- **WHEN** the matched worktree's managed root is the invoking checkout's own root
+- **THEN** the pipeline SHALL NOT consult the ownership marker before proceeding to the existing dirty/local-commits/force checks

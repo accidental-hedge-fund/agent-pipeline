@@ -288,6 +288,7 @@ test("removeWorktreeForIssue: worktree registered under a linked checkout's root
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
     hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => true, // createWorktree stamped this worktree (#472 review-2 finding 578ebd21)
   };
 
   const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
@@ -313,12 +314,64 @@ test("removeWorktreeForIssue: same cross-checkout worktree resolves identically 
     removeWorktree: async () => {},
     pathExists: () => true,
     hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => true,
   };
 
   const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
 
   assert.equal(result.removed, true);
   assert.equal(result.worktree, "/orchestration/.worktrees/pipeline-7-fix-thing");
+});
+
+test("removeWorktreeForIssue: cross-checkout worktree with no pipeline ownership marker is refused (#472 review-2 finding 578ebd21)", async () => {
+  const cfg = makeCfg();
+  const rec: WorktreeRecord = {
+    path: "/orchestration/.worktrees/pipeline-7-fix-thing",
+    branch: "pipeline/7-fix-thing",
+    issueNumber: 7,
+    slug: "fix-thing",
+    underManagedRoot: true,
+  };
+  let removeCalled = false;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => false, // a developer-created nested worktree, not pipeline-owned
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
+
+  assert.equal(result.removed, false);
+  assert.equal(removeCalled, false);
+  assert.match(result.error ?? "", /ownership marker/);
+});
+
+test("removeWorktreeForIssue: same-checkout worktree is removed without consulting the ownership marker", async () => {
+  const cfg = makeCfg(); // cfg.repo_dir === "/repo"
+  const rec: WorktreeRecord = {
+    path: "/repo/.worktrees/pipeline-7-fix-thing",
+    branch: "pipeline/7-fix-thing",
+    issueNumber: 7,
+    slug: "fix-thing",
+    underManagedRoot: true,
+  };
+  let markerChecked = false;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => {},
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => { markerChecked = true; return false; },
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
+
+  assert.equal(result.removed, true);
+  assert.equal(markerChecked, false, "same-checkout removal must not depend on the marker gate");
 });
 
 test("removeWorktreeForIssue: an unregistered directory that merely looks like pipeline-N-<slug> is never selected (#472)", async () => {
@@ -361,6 +414,7 @@ test("removeWorktreeForIssue: cross-checkout record — dirty without --force bl
     removeWorktree: async () => { removeCalled = true; },
     pathExists: () => true,
     hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => true,
   };
 
   const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
@@ -386,6 +440,7 @@ test("removeWorktreeForIssue: cross-checkout record — local-only commits block
     removeWorktree: async () => {},
     pathExists: () => true,
     hasLocalOnlyCommits: async () => true,
+    hasManagedMarker: async () => true,
   };
 
   const result = await removeWorktreeForIssue(cfg, 7, { force: true }, deps);

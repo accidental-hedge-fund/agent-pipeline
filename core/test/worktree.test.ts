@@ -12,7 +12,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, resolveManagedRoots, listOnDisk, reattachIfDetached, removeWorktreeForIssue, renderWorktreeStateSection } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, resolveManagedRoots, listOnDisk, reattachIfDetached, removeWorktreeForIssue, renderWorktreeStateSection, writeManagedMarker, hasManagedMarker } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps, RemoveWorktreeDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -1783,6 +1783,77 @@ test("realWriteNodeModulesExclude: idempotent — duplicate entry not added (#18
     const content = await fs.promises.readFile(path.join(gitInfoDir, "exclude"), "utf8");
     const lines = content.split("\n").filter((l) => l.trim() === "node_modules");
     assert.equal(lines.length, 1, "node_modules must appear exactly once");
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// writeManagedMarker / hasManagedMarker — cross-checkout ownership proof
+// (#472 review-2 finding 578ebd21)
+// ---------------------------------------------------------------------------
+
+test("writeManagedMarker + hasManagedMarker: real linked worktree — marker survives in the per-worktree gitdir, not the working tree", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-marker-"));
+  try {
+    const mainRepo = path.join(tmp, "main-repo");
+    const linkedWt = path.join(tmp, "linked-wt");
+
+    await execFileAsync("git", ["init", mainRepo]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.email", "test@pipeline.test"]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.name", "Pipeline Test"]);
+    await fs.promises.writeFile(path.join(mainRepo, "README.md"), "test\n");
+    await execFileAsync("git", ["-C", mainRepo, "add", "README.md"]);
+    await execFileAsync("git", ["-C", mainRepo, "commit", "-m", "initial"]);
+    await execFileAsync("git", ["-C", mainRepo, "worktree", "add", linkedWt]);
+
+    assert.equal(await hasManagedMarker(linkedWt), false, "no marker before it is written");
+
+    await writeManagedMarker(linkedWt);
+
+    assert.equal(await hasManagedMarker(linkedWt), true);
+
+    // The marker lives in the per-worktree gitdir, not the working tree —
+    // it must not show up as an untracked file in `git status`.
+    const { stdout } = await execFileAsync("git", ["-C", linkedWt, "status", "--porcelain"]);
+    assert.equal(stdout.trim(), "", `marker must not appear as untracked; git status:\n${stdout}`);
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("hasManagedMarker: worktree directory absent → false, no throw", async () => {
+  assert.equal(await hasManagedMarker("/nonexistent/pipeline-wt-marker-test"), false);
+});
+
+test("createWorktree: real linked worktree — writeManagedMarker default is invoked so a later cross-checkout removal can verify ownership", async () => {
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pipeline-wt-marker-createwt-"));
+  try {
+    const mainRepo = path.join(tmp, "main-repo");
+    await execFileAsync("git", ["init", mainRepo]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.email", "test@pipeline.test"]);
+    await execFileAsync("git", ["-C", mainRepo, "config", "user.name", "Pipeline Test"]);
+    await fs.promises.writeFile(path.join(mainRepo, "README.md"), "test\n");
+    await execFileAsync("git", ["-C", mainRepo, "add", "README.md"]);
+    await execFileAsync("git", ["-C", mainRepo, "commit", "-m", "initial"]);
+    await execFileAsync("git", ["-C", mainRepo, "branch", "-m", "main"]);
+    // createWorktree fetches `origin/<base_branch>` for real; point origin at
+    // this same repo so the fetch succeeds without a network remote.
+    await execFileAsync("git", ["-C", mainRepo, "remote", "add", "origin", mainRepo]);
+
+    const cfg = { ...makeCreateCfg(), repo_dir: mainRepo, base_branch: "main" };
+    const wtPath = path.join(mainRepo, ".worktrees", "pipeline-99-marker-test");
+
+    const deps: CreateWorktreeDeps = {
+      listActive: async () => [],
+      existsSync: (p: string) => fs.existsSync(p),
+      mkdirSync: (p, opts) => fs.mkdirSync(p, opts),
+      ...noopMutexDeps,
+    };
+    const result = await createWorktree(cfg, 99, "marker-test", deps);
+
+    assert.equal(result.path, wtPath);
+    assert.equal(await hasManagedMarker(wtPath), true, "createWorktree must stamp the ownership marker by default");
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }
