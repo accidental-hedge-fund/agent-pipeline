@@ -608,6 +608,15 @@ export async function hasManagedMarker(worktreePath: string): Promise<boolean> {
   return fs.existsSync(path.join(gitDir, PIPELINE_MANAGED_MARKER_FILE));
 }
 
+/** Resolve the exact on-disk marker path for a worktree, for the explicit
+ *  operator adoption hint in cross-checkout refusals (#472 delta 38f7a75e).
+ *  Null when the per-worktree git dir cannot be resolved. */
+export async function managedMarkerPath(worktreePath: string): Promise<string | null> {
+  const gitDir = await resolvePerWorktreeGitDir(worktreePath);
+  if (gitDir === null) return null;
+  return path.join(gitDir, PIPELINE_MANAGED_MARKER_FILE);
+}
+
 async function realLstatPath(p: string): Promise<{ isSymbolicLink(): boolean } | null> {
   try {
     return await fs.promises.lstat(p);
@@ -1024,10 +1033,6 @@ export interface RemoveWorktreeDeps {
    *  only for a candidate discovered under a *different* checkout's managed root
    *  (cross-checkout removal, #472) — see {@link removeWorktreeForIssue}. */
   hasManagedMarker?: (worktreePath: string) => Promise<boolean>;
-  /** Stamp the ownership marker during legacy adoption (#472 delta bcee1979):
-   *  a pre-marker worktree whose git-registered branch matches the pipeline's
-   *  own `pipeline/<N>-<slug>` naming is adopted as pipeline-managed. */
-  writeManagedMarker?: (worktreePath: string) => Promise<void>;
 }
 
 /** Returns:
@@ -1209,33 +1214,31 @@ export async function removeWorktreeForIssue(
   if (isCrossCheckout && pathOnDisk) {
     const hasMarkerFn = deps.hasManagedMarker ?? hasManagedMarker;
     if (!(await hasMarkerFn(worktreeP))) {
-      // Legacy adoption (#472 delta finding bcee1979): every worktree created
-      // before marker stamping shipped lacks the marker, including the exact
-      // stranded cross-checkout worktrees this change repairs. Adopt a
-      // marker-less candidate as pipeline-managed only on git-registered
-      // provenance the engine itself always creates and a developer checkout
-      // plausibly never does: the worktree's OWN registered branch (from
-      // `git worktree list`, not the directory name) must equal the canonical
-      // `pipeline/<N>-<slug>` for this issue and slug. On adoption, stamp the
-      // durable marker, then continue into the unchanged dirty/local-commit
-      // safety flow below — adoption grants candidacy, never removal.
-      const canonicalBranch = branchName(issueNumber, rec.slug);
-      const adoptable = rec.branch !== null && rec.branch !== undefined && rec.branch === canonicalBranch;
-      if (!adoptable) {
-        return {
-          removed: false,
-          dirty: false,
-          branch,
-          worktree: worktreeP,
-          error:
-            `worktree at ${worktreeP} is registered under a linked checkout's managed root but carries no ` +
-            "pipeline ownership marker and its registered branch does not match the pipeline's " +
-            `\`${canonicalBranch}\` naming; refusing cross-checkout removal (remove it explicitly with ` +
-            "`git worktree remove` if you own it, or run the pipeline's --remove-worktree from that checkout).",
-        };
-      }
-      const writeMarkerFn = deps.writeManagedMarker ?? writeManagedMarker;
-      await writeMarkerFn(worktreeP);
+      // Fail closed for every marker-less cross-checkout candidate (#472
+      // delta findings bcee1979 + 38f7a75e): Git registration, managed-root
+      // placement, and even the canonical `pipeline/<N>-<slug>` branch name
+      // establish location and identity but NOT ownership — the branch
+      // namespace is not exclusive, so automatic adoption could delete a
+      // developer-owned worktree. Legacy recovery is an explicit, audited,
+      // stamp-only operator step performed in a SEPARATE invocation: the
+      // refusal names the exact marker path to create, and only a subsequent
+      // --remove-worktree (which then sees the marker and runs the unchanged
+      // dirty/local-commit safety flow) may remove anything.
+      const markerPath = await managedMarkerPath(worktreeP);
+      const adoptHint =
+        markerPath !== null
+          ? `If YOU created it via the pipeline before ownership markers existed, adopt it explicitly ` +
+            `(stamp-only, nothing is removed): \`touch "${markerPath}"\` — then re-run --remove-worktree.`
+          : "If you own it, remove it explicitly with `git worktree remove`.";
+      return {
+        removed: false,
+        dirty: false,
+        branch,
+        worktree: worktreeP,
+        error:
+          `worktree at ${worktreeP} is registered under a linked checkout's managed root but carries no ` +
+          `pipeline ownership marker; refusing cross-checkout removal. ${adoptHint}`,
+      };
     }
   }
 
