@@ -6,16 +6,21 @@
 
 The `implementing.md` and `fix.md` prompt templates SHALL state that the harness invocation is
 single-turn: there is no subsequent turn in which deferred work can complete. Each prompt SHALL
-instruct the harness never to end its turn while required work — in particular committing and
-pushing — depends on a background task, and to wait synchronously for such a task instead of
-deferring to a notification it will never receive.
+instruct the harness never to end its turn while required work depends on a background task, and
+to wait synchronously for such a task instead of deferring to a notification it will never
+receive. `fix.md` SHALL apply this to both committing and pushing, consistent with the fix stage
+pushing its own commits. `implementing.md` SHALL apply this to committing only, consistent with
+its existing instruction that the implementing stage does not push — the pipeline pushes after
+review.
 
 #### Scenario: Both prompts contain the single-turn discipline
 
 - **WHEN** the prompt templates are loaded
 - **THEN** `implementing.md` and `fix.md` SHALL each contain text stating the invocation is
   single-turn
-- **AND** SHALL each forbid ending the turn with commit or push pending on a background task
+- **AND** `fix.md` SHALL forbid ending the turn with commit or push pending on a background task
+- **AND** `implementing.md` SHALL forbid ending the turn with commit pending on a background task,
+  without directing it to push
 - **AND** SHALL each direct the harness to wait synchronously for such work
 
 #### Scenario: Discipline is drift-guarded
