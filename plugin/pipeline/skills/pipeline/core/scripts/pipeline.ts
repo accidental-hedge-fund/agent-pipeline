@@ -2343,17 +2343,21 @@ export async function runLogs(
 // `pipeline run <N>` subcommand handler
 // ---------------------------------------------------------------------------
 
-/** IO seam for tests — override spawnDetached without touching the real filesystem. */
+/** IO seam for tests — override spawnDetached / git-root resolution without touching the
+ *  real filesystem, git, or a subprocess. */
 export interface RunSubcommandDeps {
   spawnDetached: typeof spawnDetached;
+  findGitRoot: typeof findGitRoot;
+  cwd: () => string;
 }
-const defaultRunSubcommandDeps: RunSubcommandDeps = { spawnDetached };
+const defaultRunSubcommandDeps: RunSubcommandDeps = { spawnDetached, findGitRoot, cwd: () => process.cwd() };
 
 export async function handleRunSubcommand(
   numStr: string,
   opts: CliOpts,
-  deps: RunSubcommandDeps = defaultRunSubcommandDeps,
+  partialDeps: Partial<RunSubcommandDeps> = {},
 ): Promise<void> {
+  const deps: RunSubcommandDeps = { ...defaultRunSubcommandDeps, ...partialDeps };
   const number = Number.parseInt(numStr ?? "", 10);
   if (!Number.isFinite(number) || number <= 0) {
     console.error(`pipeline run: <number> argument is required and must be a positive integer`);
@@ -2362,17 +2366,27 @@ export async function handleRunSubcommand(
   }
 
   if (opts.detach) {
+    // Resolve the repo BEFORE creating any artifact (#485). A detached launch used to
+    // compute `findGitRoot(start) ?? start` — silently falling back to an unvalidated
+    // cwd — then create the wrapper dir, log, and run-store pointer, only to have the
+    // inner process fail with exit 2 after the damage was done. Fail here instead, with
+    // the same message/exit code the inner `resolveConfig` uses, before any write.
+    const runStoreStart = opts.repoPath ? path.resolve(opts.repoPath) : deps.cwd();
+    const repoDir = deps.findGitRoot(runStoreStart);
+    if (!repoDir) {
+      console.error(
+        `pipeline: no git repo found at or above ${runStoreStart}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exitCode = 2;
+      return;
+    }
+
     // Pre-allocate the #155 run-store run id here so the detached caller is given the
     // SAME `.agent-pipeline/runs/<run-id>` the inner run will use. Without this the
     // detached launch exposed only the wrapper dir (pipeline.log/sentinel.json), and a
     // desktop consumer could not find the structured event log without guessing —
     // reintroducing the competing artifact format the #155 contract avoids (#155).
     const runStoreRunId = runIdFor(number, new Date());
-    // Resolve the repo dir with the SAME git-root semantics resolveConfig uses for the
-    // inner run (findGitRoot of the start path), so a nested --repo-path still points the
-    // pointer at <repo-root>/.agent-pipeline/runs/... and not a checkout subdirectory (#155).
-    const runStoreStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
-    const repoDir = findGitRoot(runStoreStart) ?? runStoreStart;
     const runStoreDir = runDirPath(repoDir, runStoreRunId);
 
     // Forward all launch-shaping options so the inner pipeline process respects
