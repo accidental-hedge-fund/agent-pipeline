@@ -323,11 +323,11 @@ test("removeWorktreeForIssue: same cross-checkout worktree resolves identically 
   assert.equal(result.worktree, "/orchestration/.worktrees/pipeline-7-fix-thing");
 });
 
-test("removeWorktreeForIssue: cross-checkout worktree with no pipeline ownership marker is refused (#472 review-2 finding 578ebd21)", async () => {
+test("removeWorktreeForIssue: cross-checkout worktree with no marker and a NON-pipeline branch is refused (#472 review-2 finding 578ebd21)", async () => {
   const cfg = makeCfg();
   const rec: WorktreeRecord = {
     path: "/orchestration/.worktrees/pipeline-7-fix-thing",
-    branch: "pipeline/7-fix-thing",
+    branch: "feature/developer-owned", // directory shape mimics ours; branch provenance does not
     issueNumber: 7,
     slug: "fix-thing",
     underManagedRoot: true,
@@ -347,6 +347,66 @@ test("removeWorktreeForIssue: cross-checkout worktree with no pipeline ownership
   assert.equal(result.removed, false);
   assert.equal(removeCalled, false);
   assert.match(result.error ?? "", /ownership marker/);
+});
+
+test("removeWorktreeForIssue: pre-marker legacy worktree with the canonical pipeline branch is adopted, stamped, and removable (#472 delta bcee1979)", async () => {
+  // Rollout compatibility: every worktree created before marker stamping lacks
+  // the marker — including the stranded cross-checkout incident class #472
+  // repairs. Git-registered branch identity (`pipeline/<N>-<slug>`) is the
+  // adoption provenance; the marker is stamped durably before the normal
+  // safety flow runs.
+  const cfg = makeCfg();
+  const rec: WorktreeRecord = {
+    path: "/orchestration/.worktrees/pipeline-7-fix-thing",
+    branch: "pipeline/7-fix-thing",
+    issueNumber: 7,
+    slug: "fix-thing",
+    underManagedRoot: true,
+  };
+  let removeCalled = false;
+  let markerWritten: string | null = null;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => false, // pre-marker legacy worktree
+    writeManagedMarker: async (p) => { markerWritten = p; },
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
+
+  assert.equal(result.removed, true);
+  assert.ok(removeCalled);
+  assert.equal(markerWritten, "/orchestration/.worktrees/pipeline-7-fix-thing", "adoption must stamp the durable marker");
+});
+
+test("removeWorktreeForIssue: adopted legacy worktree still runs the dirty safety flow — adoption grants candidacy, not removal (#472 delta bcee1979)", async () => {
+  const cfg = makeCfg();
+  const rec: WorktreeRecord = {
+    path: "/orchestration/.worktrees/pipeline-7-fix-thing",
+    branch: "pipeline/7-fix-thing",
+    issueNumber: 7,
+    slug: "fix-thing",
+    underManagedRoot: true,
+  };
+  let removeCalled = false;
+  const deps: RemoveWorktreeDeps = {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => true, // dirty — the safety flow must still refuse
+    removeWorktree: async () => { removeCalled = true; },
+    pathExists: () => true,
+    hasLocalOnlyCommits: async () => false,
+    hasManagedMarker: async () => false,
+    writeManagedMarker: async () => {},
+  };
+
+  const result = await removeWorktreeForIssue(cfg, 7, {}, deps);
+
+  assert.equal(result.removed, false);
+  assert.equal(result.dirty, true);
+  assert.equal(removeCalled, false);
 });
 
 test("removeWorktreeForIssue: same-checkout worktree is removed without consulting the ownership marker", async () => {
