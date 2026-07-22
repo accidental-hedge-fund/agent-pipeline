@@ -25,6 +25,9 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
        Pipeline-Run: {{pipeline_run_id}}
 7. Do NOT push — the pipeline handles pushing after review.
 {{docs_instruction}}{{papercut_instruction}}{{design_gate_instruction}}
+## Single-Turn Invocation (required)
+This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit, before ending the turn. A notification that arrives after your turn ends will never reach you. Per instruction 7 above, do NOT push — the pipeline handles pushing after review.
+
 ## Important
 - Keep changes minimal and focused on the issue scope.
 - Do not make migrations, infra changes, or product-scope expansions unless the issue/plan actually calls for them.

@@ -1169,6 +1169,64 @@ export function parseDirtyWorkdir(statusOutput: string): boolean {
   return statusOutput.trim().length > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Worktree-state blocker disclosure (#486)
+// ---------------------------------------------------------------------------
+
+/** Max number of changed paths listed verbatim in a worktree-state section
+ *  before the remainder is summarized as "…and N more". */
+const WORKTREE_STATE_FILE_LIMIT = 10;
+
+/**
+ * Render a `git status --short` porcelain listing into a Markdown section
+ * describing recoverable worktree state — staged/unstaged/untracked counts
+ * plus a bounded, deterministic file list. Returns `null` for empty input
+ * (clean worktree — the caller omits the section entirely). Pure and
+ * exported for direct unit testing (#486).
+ */
+export function renderWorktreeStateSection(shortStatus: string): string | null {
+  const lines = shortStatus
+    .split("\n")
+    .map((l) => l.replace(/\r$/, ""))
+    .filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+
+  let staged = 0;
+  let unstaged = 0;
+  let untracked = 0;
+  const paths: string[] = [];
+  for (const line of lines) {
+    const code = line.slice(0, 2);
+    const filePath = line.slice(3).trim() || line.trim();
+    if (code === "??") {
+      untracked++;
+    } else {
+      if (code[0] !== undefined && code[0] !== " ") staged++;
+      if (code[1] !== undefined && code[1] !== " ") unstaged++;
+    }
+    paths.push(filePath);
+  }
+
+  const counts: string[] = [];
+  if (staged > 0) counts.push(`${staged} staged`);
+  if (unstaged > 0) counts.push(`${unstaged} unstaged`);
+  if (untracked > 0) counts.push(`${untracked} untracked`);
+
+  const shown = paths.slice(0, WORKTREE_STATE_FILE_LIMIT);
+  const omitted = paths.length - shown.length;
+  const fileListLines = shown.map((p) => `- \`${p}\``);
+  if (omitted > 0) fileListLines.push(`- …and ${omitted} more`);
+
+  return [
+    "### Worktree state (recoverable work)",
+    "",
+    `${counts.join(", ")} (${paths.length} ${paths.length === 1 ? "entry" : "entries"} total) — this may be ` +
+      "in-progress work worth reviewing before it is discarded.",
+    "",
+    ...fileListLines,
+  ].join("\n");
+}
+
 /** Pure — exposed for unit tests. Fail-closed: a non-zero exit code (e.g. index lock,
  *  permission error) is treated as dirty so the worktree is never silently removed. */
 export function isDirtyResult(code: number, stdout: string): boolean {

@@ -45,6 +45,10 @@ Before committing or pushing:
 
 This self-check is a targeted scan of your own changes against the findings you were given — it is not a full re-review (the SHA-gate re-review handles that on push).
 
+## Single-Turn Invocation (required)
+
+This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing or pushing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit and push, before ending the turn. A notification that arrives after your turn ends will never reach you.
+
 ## Injectable-Dep Rule (required)
 
 Any code path you add or modify that calls an external CLI or API (`gh`, `git`, network, auth) MUST go through an injectable dep — never call the module-level function directly when a seam already exists on the `Deps` type. If no seam exists, add one. Tests that only pass because local auth is active are NOT passing tests — they will fail in CI. Every new or modified test must cover the unauthenticated/no-network path and prove it fails without the injected fake.

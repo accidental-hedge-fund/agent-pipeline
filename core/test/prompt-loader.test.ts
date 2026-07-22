@@ -1571,6 +1571,48 @@ test("fix prompt: pre-commit self-check instructs comparing diff against finding
     /[Cc]onservative-open|surface the concern|call it out/i,
     "fix prompt must be conservative-open: surface concern rather than silently proceeding",
   );
+});
+
+// #486: single-turn-harness-discipline drift guard — both the fix and implement
+// prompts must declare the invocation single-turn and forbid ending the turn
+// with commit/push pending on a background task.
+
+test("fix prompt: declares the invocation single-turn and forbids deferring commit/push to a background task (#486)", () => {
+  const out = buildSampleFixPrompt();
+  assert.match(out, /single-turn/i, "fix prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "fix prompt must forbid ending the turn with commit/push pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "fix prompt must direct the harness to wait synchronously for such work",
+  );
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("implementing prompt: declares the invocation single-turn and forbids deferring commit/push to a background task (#486)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "p",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /single-turn/i, "implementing prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "implementing prompt must forbid ending the turn with commit/push pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "implementing prompt must direct the harness to wait synchronously for such work",
+  );
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 

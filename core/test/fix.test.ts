@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  buildFixRetryPreamble,
   computeEffectiveBlockingSet,
   decideDoesNotReproduceAdvance,
   decideExternalCommitAdvance,
@@ -24,11 +25,14 @@ import {
   filterOverridesAfterReview,
   filterToBlockingFindings,
   findTriggeringReviewComment,
+  FIX_RETRY_MIN_BUDGET_SEC,
+  invokeFixHarnessWithRetry,
   isCommitOnRemote,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
   resolveFixCommitGateMode,
 } from "../scripts/stages/fix.ts";
+import type { HarnessResult } from "../scripts/harness.ts";
 
 const execFileAsync = promisify(execFile);
 import { formatReviewComment } from "../scripts/stages/review.ts";
@@ -1629,3 +1633,300 @@ test("advanceFix: gates.source \"build\" (from a format-gate build-fold failure)
   void fakeGates;
 });
 
+
+// ---------------------------------------------------------------------------
+// invokeFixHarnessWithRetry / buildFixRetryPreamble (#486 fix-harness-crash-retry)
+// ---------------------------------------------------------------------------
+
+function harnessResult(overrides: Partial<HarnessResult> = {}): HarnessResult {
+  return {
+    success: false,
+    stdout: "",
+    stderr: "",
+    exit_code: 1,
+    duration: 10,
+    timed_out: false,
+    ...overrides,
+  };
+}
+
+test("invokeFixHarnessWithRetry: persistently crashing harness with maxRetries=2 is invoked exactly 3 times, then blocks", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1 });
+    },
+  });
+  assert.equal(calls, 3, "expected exactly cap+1 = 3 invocations");
+  assert.equal(result.attempts.length, 3);
+  assert.equal(result.finalResult.success, false);
+  assert.equal(result.budgetExhausted, false);
+});
+
+// Regression test (#486 acceptance criteria: "regression tests bite"): with the
+// retry loop removed, this test would observe exactly one invocation and fail
+// the assert.equal(calls, 3) above — proving the loop is exercised, not a no-op.
+test("invokeFixHarnessWithRetry: maxRetries=0 → exactly one invocation, no retry", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 0,
+    fixTimeoutSec: 1200,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1 });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.finalResult.success, false);
+});
+
+test("invokeFixHarnessWithRetry: fail then succeed → two invocations, success result returned", async () => {
+  let calls = 0;
+  const prompts: string[] = [];
+  const timeouts: number[] = [];
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 1200,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async (prompt, timeoutSec) => {
+      calls++;
+      prompts.push(prompt);
+      timeouts.push(timeoutSec);
+      if (calls === 1) return harnessResult({ exit_code: 1, duration: 30 });
+      return harnessResult({ success: true, exit_code: 0, duration: 5 });
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.finalResult.success, true);
+  assert.equal(result.attempts.length, 2);
+  // Attempt 1's prompt is byte-identical to the base prompt (no addendum).
+  assert.equal(prompts[0], "BASE-PROMPT");
+  // Attempt 2 carries the retry addendum, prepended to the same base prompt.
+  assert.match(prompts[1], /Prior Attempt Crashed/);
+  assert.ok(prompts[1].endsWith("BASE-PROMPT"));
+});
+
+test("invokeFixHarnessWithRetry: second attempt's timeoutSec is the residual budget, not fix_timeout", async () => {
+  const timeouts: number[] = [];
+  await invokeFixHarnessWithRetry({
+    maxRetries: 1,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async (_prompt, timeoutSec) => {
+      timeouts.push(timeoutSec);
+      if (timeouts.length === 1) return harnessResult({ exit_code: 1, duration: 780 });
+      return harnessResult({ success: true, exit_code: 0, duration: 1 });
+    },
+  });
+  assert.equal(timeouts[0], 2400, "attempt 1 gets the full fix_timeout");
+  assert.equal(timeouts[1], 2400 - 780, "attempt 2 gets the residual, not fix_timeout again");
+  assert.notEqual(timeouts[1], 2400);
+});
+
+test("invokeFixHarnessWithRetry: an underreported duration is debited using measured wall-clock elapsed time instead", async () => {
+  // #486 review 2: a delegated executor can report a missing/stale/underreported
+  // `duration` while still consuming real wall time. The retry budget must be
+  // debited by the larger of the measured elapsed time and the reported duration.
+  const timeouts: number[] = [];
+  let clockMs = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 1,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    nowMs: () => clockMs,
+    invokeAttempt: async (_prompt, timeoutSec) => {
+      timeouts.push(timeoutSec);
+      // The executor consumes 2350s of real wall time but reports duration: 0.
+      clockMs += 2350 * 1000;
+      return harnessResult({ exit_code: 1, duration: 0 });
+    },
+  });
+  assert.equal(timeouts[0], 2400);
+  assert.equal(
+    timeouts.length,
+    1,
+    "the measured 2350s elapsed should leave only 50s remaining, below the retry floor, so no second attempt is made",
+  );
+  assert.equal(result.budgetExhausted, true, "measured elapsed time, not the underreported duration, must drive budget exhaustion");
+});
+
+test("invokeFixHarnessWithRetry: default clock is monotonic, so a backward-jumping Date.now cannot zero out the debit for a zero-duration failed attempt", async () => {
+  // #486 review 1: Date.now() is not monotonic. If NTP/VM-resume/manual
+  // correction rolls the wall clock backward while the executor underreports
+  // duration: 0, a Date.now()-based elapsed measurement clamps to zero,
+  // letting the failed attempt escape the retry budget for free. The default
+  // clock must be performance.now() (monotonic), which is unaffected by
+  // Date.now() being tampered with. No `nowMs` override is passed here so
+  // this exercises the real default.
+  const realDateNow = Date.now;
+  let dateNowCalls = 0;
+  // Simulate a rollback: the second Date.now() read returns an earlier
+  // timestamp than the first, as Date.now() would under a clock correction.
+  Date.now = () => {
+    dateNowCalls++;
+    return dateNowCalls === 1 ? 10_000_000 : 0;
+  };
+  try {
+    const timeouts: number[] = [];
+    const result = await invokeFixHarnessWithRetry({
+      maxRetries: 1,
+      fixTimeoutSec: 100,
+      basePrompt: "BASE-PROMPT",
+      invokeAttempt: async (_prompt, timeoutSec) => {
+        timeouts.push(timeoutSec);
+        // Real wall-clock delay the executor underreports as duration: 0.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return harnessResult({ exit_code: 1, duration: 0 });
+      },
+    });
+    assert.equal(timeouts[0], 100);
+    assert.ok(
+      timeouts[1] < 100,
+      "the real ~50ms elapsed must be debited even though the tampered Date.now() rolled backward; " +
+        "under the old Date.now()-based default this would clamp to 0 and leave the residual budget at exactly 100",
+    );
+    assert.equal(result.budgetExhausted, false);
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test("invokeFixHarnessWithRetry: remaining budget at/below the floor blocks without another invocation", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      // First (and only) attempt consumes all but a sliver of the budget.
+      return harnessResult({ exit_code: 1, duration: 2400 - FIX_RETRY_MIN_BUDGET_SEC + 5 });
+    },
+  });
+  assert.equal(calls, 1, "no second invocation should be made once residual budget is at/below the floor");
+  assert.equal(result.budgetExhausted, true);
+  assert.equal(result.finalResult.success, false);
+});
+
+test("invokeFixHarnessWithRetry: a timed-out attempt is retried within the residual budget", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 1,
+    fixTimeoutSec: 1200,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      if (calls === 1) return harnessResult({ timed_out: true, exit_code: -1, duration: 100 });
+      return harnessResult({ success: true, exit_code: 0, duration: 5 });
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.finalResult.success, true);
+});
+
+test("invokeFixHarnessWithRetry: onRetryScheduled fires once per retry with attempt/limit/reason, never for attempt 1", async () => {
+  const scheduled: { attempt: number; limit: number; reason: string }[] = [];
+  await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => harnessResult({ exit_code: 1, duration: 10 }),
+    onRetryScheduled: (attempt, limit, reason) => {
+      scheduled.push({ attempt, limit, reason });
+    },
+  });
+  assert.equal(scheduled.length, 2, "two retries (attempts 2 and 3) for maxRetries=2");
+  assert.deepEqual(scheduled.map((s) => s.attempt), [2, 3]);
+  assert.ok(scheduled.every((s) => s.limit === 2));
+  assert.ok(scheduled.every((s) => /exit 1/.test(s.reason)));
+});
+
+test("invokeFixHarnessWithRetry: onBeforeAttempt fires for every attempt including the first, with the composed prompt", async () => {
+  const seen: { attempt: number; prompt: string }[] = [];
+  let calls = 0;
+  await invokeFixHarnessWithRetry({
+    maxRetries: 1,
+    fixTimeoutSec: 1200,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      if (calls === 1) return harnessResult({ exit_code: 1, duration: 10 });
+      return harnessResult({ success: true, exit_code: 0, duration: 1 });
+    },
+    onBeforeAttempt: (attempt, _timeoutSec, prompt) => {
+      seen.push({ attempt, prompt });
+    },
+  });
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].prompt, "BASE-PROMPT");
+  assert.match(seen[1].prompt, /Prior Attempt Crashed/);
+});
+
+test("buildFixRetryPreamble: references the prior attempt's failure reason and instructs review/complete, not discard/restart", () => {
+  const out = buildFixRetryPreamble(2, 2, "exit 1");
+  assert.match(out, /exit 1/);
+  assert.match(out, /present|still present/i);
+  assert.match(out, /COMPLETE|complete/);
+  assert.match(out, /do NOT discard|not discard/i);
+  assert.match(out, /do NOT restart|not restart/i);
+});
+
+// ---------------------------------------------------------------------------
+// Crash-retry loop wiring in advanceFix (#486) — source pins for the parts of
+// the wiring with no injectable seam (advanceFix calls gh.ts functions
+// directly — see the pre-existing "advanceFix wiring order (#391)" note above
+// for why full end-to-end advanceFix tests are not yet possible here).
+// ---------------------------------------------------------------------------
+
+test("advanceFix source pin: no destructive git/worktree call anywhere in fix.ts (crash-retry path never resets/cleans/discards work) (#486)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  assert.doesNotMatch(src, /removeWorktree/, "fix.ts must never call removeWorktree");
+  assert.doesNotMatch(src, /"reset"|'reset'/, "fix.ts must never issue a git reset");
+  assert.doesNotMatch(src, /"clean"|'clean'/, "fix.ts must never issue a git clean");
+  assert.doesNotMatch(src, /checkout\s+--/, "fix.ts must never issue a git checkout --");
+  assert.doesNotMatch(src, /"restore"|'restore'/, "fix.ts must never issue a working-tree git restore");
+});
+
+test("advanceFix source pin: on retry exhaustion, salvage is attempted before the terminal harness-failure block (#486)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const retryIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(");
+  const salvageIdx = src.indexOf("const salvaged = await trySalvageUncommittedWork(", retryIdx);
+  const blockIdx = src.indexOf('await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");', retryIdx);
+  assert.ok(retryIdx !== -1 && salvageIdx !== -1 && blockIdx !== -1);
+  assert.ok(retryIdx < salvageIdx, "the retry loop must run before salvage is attempted");
+  assert.ok(salvageIdx < blockIdx, "salvage must be attempted before the terminal harness-failure block");
+});
+
+test("advanceFix source pin: a crash-retry salvage falls through the SAME downstream gates as a harness commit, skipping the #131 no-commit branch (#486)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const crashSalvagedSetIdx = src.indexOf("crashSalvaged = true;");
+  const skipGuardIdx = src.indexOf("if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter) {");
+  const commitGateIdx = src.indexOf("Verify fix-round commit message format (#68)", skipGuardIdx);
+  assert.ok(crashSalvagedSetIdx !== -1, "expected crashSalvaged to be set on a successful crash-retry salvage");
+  assert.ok(skipGuardIdx !== -1, "expected the #131 no-commit branch to be gated on !crashSalvaged");
+  assert.ok(crashSalvagedSetIdx < skipGuardIdx, "crashSalvaged must be set before the guard that reads it");
+  assert.ok(skipGuardIdx < commitGateIdx, "the commit-message gate must still run after the crash-salvage fallthrough");
+});
+
+test("advanceFix source pin: an exhausted-retry harness-failure block includes the worktree-state disclosure (#486)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  assert.match(src, /appendWorktreeStateDisclosure\(wt\.path, baseReason\)/);
+  assert.match(src, /appendWorktreeStateDisclosure\(wt\.path, noCommitsMsg\)/);
+});
+
+test("advanceFix source pin: retry-event/recovery recording is best-effort — an event-write throw cannot propagate (#486)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const onRetryIdx = src.indexOf("onRetryScheduled: async (attempt, limit, reason) => {");
+  assert.ok(onRetryIdx !== -1);
+  const onRetryBlock = src.slice(onRetryIdx, onRetryIdx + 600);
+  const appendEventCall = onRetryBlock.match(/await appendEvent\([\s\S]*?\)\.catch\(\(\) => \{\}\);/);
+  const recordRecoveryCall = onRetryBlock.match(/await recordRecovery\([\s\S]*?\)\.catch\(\(\) => \{\}\);/);
+  assert.ok(appendEventCall, "retry appendEvent call must be .catch()-wrapped (best-effort)");
+  assert.ok(recordRecoveryCall, "retry recordRecovery call must be .catch()-wrapped (best-effort)");
+});
