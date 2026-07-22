@@ -395,6 +395,15 @@ test("blockerKindToInterventionKind: specific mappings are stable", () => {
   assert.equal(blockerKindToInterventionKind("push-failed"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("no-commits"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("build-failed"), "test-build-failure");
+  assert.equal(blockerKindToInterventionKind("human-decision-required"), "product-judgment-required");
+});
+
+// #473: a needs-human-decision park must classify as a product-judgment
+// intervention, not a test/build failure — the whole point of this blocker
+// kind is to stop it from being discarded as "test-build-failure".
+test("blockerKindToInterventionKind: human-decision-required is product-judgment-required, never test-build-failure (#473)", () => {
+  assert.equal(blockerKindToInterventionKind("human-decision-required"), "product-judgment-required");
+  assert.notEqual(blockerKindToInterventionKind("human-decision-required"), "test-build-failure");
 });
 
 // ---------------------------------------------------------------------------

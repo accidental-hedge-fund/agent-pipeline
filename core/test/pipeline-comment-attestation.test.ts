@@ -27,6 +27,7 @@ import {
 } from "../scripts/issue-context-snapshot.ts";
 import {
   buildTrustedOverrideComments,
+  humanDecisionComment,
   nonReproducingDispositionComment,
   overrideComment,
   scopedOverrideComment,
@@ -269,6 +270,16 @@ const KIND_RENDERERS: Record<string, () => string> = {
       fingerprint: "b".repeat(16),
       stage: "fix-1",
       justification: "does not reproduce at this SHA",
+      timestamp: ts(0),
+    }),
+  "needs-human-decision": () =>
+    humanDecisionComment({
+      category: "product-decision",
+      key: "abcd1234",
+      fingerprint: "b".repeat(16),
+      reviewedSha: "a".repeat(40),
+      request: "should we drop this API instead of enforcing it?",
+      stage: "fix-1",
       timestamp: ts(0),
     }),
   unblocked: () =>

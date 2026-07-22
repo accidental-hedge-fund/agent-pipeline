@@ -15,6 +15,7 @@ import {
   computeEffectiveBlockingSet,
   decideDoesNotReproduceAdvance,
   decideExternalCommitAdvance,
+  decideHumanDecisionPark,
   enforceFixOpenspecConsistency,
   enforceFixCommitGate,
   enforceExternalCommitGate,
@@ -30,6 +31,7 @@ import {
   isCommitOnRemote,
   parseDoesNotReproduceDeclarations,
   parseFindingSummaries,
+  parseHumanDecisionDeclarations,
   resolveFixCommitGateMode,
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
@@ -44,6 +46,7 @@ import {
   extractScopedOverrides,
   findingKey,
   findingPayloadFingerprint,
+  humanDecisionComment,
   nonReproducingDispositionComment,
   overrideComment,
   scopedOverrideComment,
@@ -1287,6 +1290,156 @@ test("decideDoesNotReproduceAdvance: a key shared by two distinct findings requi
   );
   assert.equal(full.advance, true, "declaring both distinct findings under the shared key must advance");
   assert.ok(full.advance && full.covered.size === 2);
+});
+
+// ---------------------------------------------------------------------------
+// parseHumanDecisionDeclarations / decideHumanDecisionPark (#473)
+// ---------------------------------------------------------------------------
+
+test("parseHumanDecisionDeclarations: parses a single well-formed product-decision declaration", () => {
+  const stdout =
+    `Some harness prose.\n<!-- pipeline-needs-human-decision: product-decision ${keyA} ${FP_A} ${SHA_R391_A} | should we drop this API? -->\nmore prose`;
+  const decls = parseHumanDecisionDeclarations(stdout);
+  assert.equal(decls.length, 1);
+  assert.deepEqual(decls[0], {
+    category: "product-decision", key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A,
+    request: "should we drop this API?",
+  });
+});
+
+test("parseHumanDecisionDeclarations: parses each of the three sanctioned categories", () => {
+  const stdout = [
+    `<!-- pipeline-needs-human-decision: product-decision ${keyA} ${FP_A} ${SHA_R391_A} | product call needed -->`,
+    `<!-- pipeline-needs-human-decision: authority ${keyA} ${FP_A} ${SHA_R391_A} | need admin sign-off -->`,
+    `<!-- pipeline-needs-human-decision: external-dependency ${keyA} ${FP_A} ${SHA_R391_A} | vendor API not available -->`,
+  ].join("\n");
+  const decls = parseHumanDecisionDeclarations(stdout);
+  assert.deepEqual(decls.map((d) => d.category), ["product-decision", "authority", "external-dependency"]);
+});
+
+test("parseHumanDecisionDeclarations: parses multiple declarations for distinct findings", () => {
+  const stdout = [
+    `<!-- pipeline-needs-human-decision: product-decision ${keyA} ${FP_A} ${SHA_R391_A} | decide A -->`,
+    `<!-- pipeline-needs-human-decision: authority ${keyB} ${FP_B} ${SHA_R391_A} | decide B -->`,
+  ].join("\n");
+  const decls = parseHumanDecisionDeclarations(stdout);
+  assert.equal(decls.length, 2);
+  assert.deepEqual(decls.map((d) => d.key).sort(), [keyA, keyB].sort());
+});
+
+test("parseHumanDecisionDeclarations: unknown category, bad identity lengths, missing pipe, and multi-line are all ignored", () => {
+  const stdout = [
+    `<!-- pipeline-needs-human-decision: not-a-category ${keyA} ${FP_A} ${SHA_R391_A} | reason -->`,
+    "<!-- pipeline-needs-human-decision: product-decision shortkey " + FP_A + " " + SHA_R391_A + " | reason -->",
+    "<!-- pipeline-needs-human-decision: product-decision " + keyA + " tooshortfp " + SHA_R391_A + " | reason -->",
+    "<!-- pipeline-needs-human-decision: product-decision " + keyA + " " + FP_A + " tooshortsha | reason -->",
+    "<!-- pipeline-needs-human-decision: product-decision " + keyA + " " + FP_A + " " + SHA_R391_A + " no pipe here -->",
+    "plain prose mentioning pipeline-needs-human-decision without the sentinel shape",
+  ].join("\n");
+  assert.deepEqual(parseHumanDecisionDeclarations(stdout), []);
+});
+
+test("parseHumanDecisionDeclarations: empty/absent → []", () => {
+  assert.deepEqual(parseHumanDecisionDeclarations(""), []);
+  assert.deepEqual(parseHumanDecisionDeclarations("no sentinel here at all"), []);
+});
+
+test("decideHumanDecisionPark: valid declaration matching a rendered finding at the current HEAD is accepted", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ category: "product-decision" as const, key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, request: "decide A" }];
+  const accepted = decideHumanDecisionPark(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A);
+  assert.equal(accepted.length, 1);
+  assert.equal(accepted[0].key, keyA);
+});
+
+test("decideHumanDecisionPark: unmatched (key, fingerprint) identity is not accepted", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ category: "authority" as const, key: keyB, fingerprint: FP_B, reviewedSha: SHA_R391_A, request: "decide B" }];
+  const accepted = decideHumanDecisionPark(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A);
+  assert.deepEqual(accepted, []);
+});
+
+test("decideHumanDecisionPark: stale reviewed SHA is not accepted", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ category: "external-dependency" as const, key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_B, request: "decide A" }];
+  const accepted = decideHumanDecisionPark(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A);
+  assert.deepEqual(accepted, []);
+});
+
+test("decideHumanDecisionPark: empty or whitespace-only decision request is not accepted", () => {
+  const summaries = parseFindingSummaries(twoFindingReview());
+  const decls = [{ category: "product-decision" as const, key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, request: "   " }];
+  const accepted = decideHumanDecisionPark(summaries.filter((x) => x.key === keyA), decls, SHA_R391_A);
+  assert.deepEqual(accepted, []);
+});
+
+test("decideHumanDecisionPark: empty invoked set → nothing accepted", () => {
+  const decls = [{ category: "product-decision" as const, key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A, request: "decide A" }];
+  assert.deepEqual(decideHumanDecisionPark([], decls, SHA_R391_A), []);
+});
+
+// ---------------------------------------------------------------------------
+// review-policy.ts: humanDecisionComment sentinel (#473)
+// ---------------------------------------------------------------------------
+
+test("humanDecisionComment: carries category, request, key, fingerprint, reviewed SHA, and stage", () => {
+  const body = humanDecisionComment({
+    category: "product-decision", key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A,
+    request: "should we drop this API?", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+  });
+  assert.match(body, /## Pipeline: Human decision required/);
+  assert.match(body, /product-decision/);
+  assert.match(body, /should we drop this API\?/);
+  assert.match(body, new RegExp(keyA));
+  assert.match(body, new RegExp(FP_A));
+  assert.match(body, new RegExp(SHA_R391_A));
+  assert.match(body, /fix-1/);
+});
+
+test("humanDecisionComment sentinel is distinct from the override and non-reproducing sentinels", () => {
+  const humanDecision = humanDecisionComment({
+    category: "authority", key: keyA, fingerprint: FP_A, reviewedSha: SHA_R391_A,
+    request: "need sign-off", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+  });
+  const override = overrideComment({
+    key: keyA, disposition: "rejected", reason: "human decision", stage: "fix-1", timestamp: "2026-07-01T00:00:00Z",
+  });
+  const nonRepro = nonReproducingDispositionComment({
+    key: keyA, reviewedSha: SHA_R391_A, fingerprint: FP_A, stage: "fix-1", justification: "j", timestamp: "2026-07-01T00:00:00Z",
+  });
+  assert.doesNotMatch(humanDecision, /pipeline-override:/);
+  assert.doesNotMatch(humanDecision, /pipeline-non-reproducing:/);
+  assert.equal(extractOverrides([{ body: humanDecision }]).size, 0);
+  assert.equal(extractNonReproducingDispositions([{ body: humanDecision }]).size, 0);
+  assert.doesNotMatch(override, /pipeline-needs-human-decision:/);
+  assert.doesNotMatch(nonRepro, /pipeline-needs-human-decision:/);
+});
+
+// ---------------------------------------------------------------------------
+// advanceFix wiring order (#473): the needs-human-decision park must be
+// evaluated before the #391 does-not-reproduce advance and before the
+// no-commits block, so a round carrying either outcome (or a mix of both)
+// never falls through to a successful advance.
+// ---------------------------------------------------------------------------
+
+test("advanceFix source pin: the needs-human-decision park is evaluated before the does-not-reproduce carve-out and the no-commits block", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const humanDecisionIdx = src.indexOf("decideHumanDecisionPark(\n          invokedIdentities,");
+  const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedIdentities,");
+  const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
+  assert.ok(humanDecisionIdx !== -1, "expected the needs-human-decision park decision call to exist");
+  assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
+  assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
+  assert.ok(humanDecisionIdx < dnrIdx, "the needs-human-decision park must be evaluated before the does-not-reproduce carve-out");
+  assert.ok(dnrIdx < noCommitsIdx, "the does-not-reproduce carve-out must be evaluated before the no-commits block");
+});
+
+test("advanceFix source pin: an accepted needs-human-decision park blocks with the dedicated blocker kind, not no-commits", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const humanDecisionBlockIdx = src.indexOf('"human-decision-required"');
+  const returnIdx = src.indexOf('blockerKind: "human-decision-required"', humanDecisionBlockIdx);
+  assert.ok(humanDecisionBlockIdx !== -1, "expected the human-decision-required blocker kind to be used");
+  assert.ok(returnIdx !== -1, "expected advanceFix to return blockerKind: \"human-decision-required\" on an accepted park");
 });
 
 // ---------------------------------------------------------------------------

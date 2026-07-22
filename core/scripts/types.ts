@@ -263,6 +263,7 @@ export const BLOCKER_KINDS = [
   "worktree-setup-failed",
   "build-failed",
   "design-gate-failed",
+  "human-decision-required",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -381,6 +382,16 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "record or challenge verdict after its bounded re-ask, or the reviewer " +
     "harness is unavailable (see the error above). Investigate and fix the " +
     "root cause, remove the `blocked` label, then re-run `$pipeline {{N}}`.",
+  "human-decision-required":
+    "The fix harness determined that the correct next step is a human " +
+    "product decision, an authority it lacks, or an unavailable external " +
+    "capability — not a code change. Read the recorded decision request(s) " +
+    "above, make the decision, and either fix the underlying blocker and " +
+    "remove the `blocked` label to re-run `$pipeline {{N}}`, or record an " +
+    "audited disposition with " +
+    '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past ' +
+    "it (the key comes from the review comment; `--override` clears the " +
+    "label and resumes automatically).",
 };
 
 // ---------------------------------------------------------------------------
