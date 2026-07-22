@@ -189,6 +189,10 @@ export interface FixHarnessRetryOpts {
    *  evidence-bundle recovery record. Never called for attempt 1, and never
    *  called when budget exhaustion prevents the retry from starting. */
   onRetryScheduled?: (attempt: number, limit: number, reason: string) => Promise<void> | void;
+  /** Monotonic-ish clock used to measure each attempt's wall-clock elapsed
+   *  time, independent of `result.duration` (#486 review 2). Defaults to
+   *  `Date.now`; tests inject a fake to make elapsed time deterministic. */
+  nowMs?: () => number;
 }
 
 /**
@@ -229,15 +233,26 @@ export async function invokeFixHarnessWithRetry(
       : buildFixRetryPreamble(attemptNum, opts.maxRetries, priorReason!) + opts.basePrompt;
     if (opts.onBeforeAttempt) await opts.onBeforeAttempt(attemptNum, timeoutSec, prompt);
 
+    const nowMs = opts.nowMs ?? Date.now;
+    const attemptStartMs = nowMs();
     const result = await opts.invokeAttempt(prompt, timeoutSec);
+    const elapsedSec = Math.max(0, (nowMs() - attemptStartMs) / 1000);
+    // #486 review 2: a delegated executor can report a missing, stale, or
+    // underreported `duration` while still consuming real wall time. Debit
+    // the larger of the locally measured elapsed time and the validated
+    // reported duration so the retry budget can never be underspent.
+    const reportedSec = Number.isFinite(result.duration) && result.duration >= 0
+      ? result.duration
+      : 0;
+    const debitSec = Math.max(elapsedSec, reportedSec);
     attempts.push({ attempt: attemptNum, timeoutSec, result });
-    consumedSec += result.duration;
+    consumedSec += debitSec;
 
     if (result.success) {
       return { attempts, finalResult: result, budgetExhausted: false };
     }
     priorReason = result.timed_out
-      ? `timed out after ${result.duration.toFixed(0)}s`
+      ? `timed out after ${debitSec.toFixed(0)}s`
       : `exit ${result.exit_code}`;
     if (attemptNum >= totalAttemptsCap) {
       return { attempts, finalResult: result, budgetExhausted: false };

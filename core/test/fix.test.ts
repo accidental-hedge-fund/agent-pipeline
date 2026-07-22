@@ -1729,6 +1729,33 @@ test("invokeFixHarnessWithRetry: second attempt's timeoutSec is the residual bud
   assert.notEqual(timeouts[1], 2400);
 });
 
+test("invokeFixHarnessWithRetry: an underreported duration is debited using measured wall-clock elapsed time instead", async () => {
+  // #486 review 2: a delegated executor can report a missing/stale/underreported
+  // `duration` while still consuming real wall time. The retry budget must be
+  // debited by the larger of the measured elapsed time and the reported duration.
+  const timeouts: number[] = [];
+  let clockMs = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 1,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    nowMs: () => clockMs,
+    invokeAttempt: async (_prompt, timeoutSec) => {
+      timeouts.push(timeoutSec);
+      // The executor consumes 2350s of real wall time but reports duration: 0.
+      clockMs += 2350 * 1000;
+      return harnessResult({ exit_code: 1, duration: 0 });
+    },
+  });
+  assert.equal(timeouts[0], 2400);
+  assert.equal(
+    timeouts.length,
+    1,
+    "the measured 2350s elapsed should leave only 50s remaining, below the retry floor, so no second attempt is made",
+  );
+  assert.equal(result.budgetExhausted, true, "measured elapsed time, not the underreported duration, must drive budget exhaustion");
+});
+
 test("invokeFixHarnessWithRetry: remaining budget at/below the floor blocks without another invocation", async () => {
   let calls = 0;
   const result = await invokeFixHarnessWithRetry({
