@@ -25,6 +25,8 @@ import {
   requireToken,
   getStatus,
   type LoopStoreDeps,
+  defaultLoopStoreDeps,
+  LEGACY_PIPELINE_STATE_HOME_ENV,
 } from "../scripts/loop/store.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, LoopError, type LoopContract, type LoopLedger } from "../scripts/loop/types.ts";
 
@@ -77,6 +79,18 @@ function fakeDeps(overrides: Partial<LoopStoreDeps> = {}): { deps: LoopStoreDeps
       files.set(p, existing + line + "\n");
     },
     async mkdirp() {},
+    async renameDirExclusive(from, to) {
+      const fromPrefix = from + "/";
+      const published = [...files.keys()].some((k) => k === to || k.startsWith(to + "/"));
+      if (published) return false;
+      for (const k of [...files.keys()]) {
+        if (k.startsWith(fromPrefix)) {
+          files.set(to + "/" + k.slice(fromPrefix.length), files.get(k)!);
+          files.delete(k);
+        }
+      }
+      return true;
+    },
     async listDir(p) {
       const prefix = p + "/";
       return [...files.keys()].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length).split("/")[0]);
@@ -222,19 +236,26 @@ test("initRun: a crash between mkdirp and the exclusive create does not permanen
   assert.ok(files.has(`${dir}/ledger.json`));
 });
 
-test("initRun completes a stranded partial init (contract exists, ledger missing) instead of refusing forever", async () => {
+test("initRun never completes a foreign partial state — atomic publication makes stranded inits impossible on the canonical path (#508 delta 92d2ec8f)", async () => {
+  // Under stage-then-rename publication, a crash before publish leaves only an
+  // unpublished staging directory: the run id itself never appears partially
+  // initialized, so a retry with the SAME run id simply initializes fresh.
   const { deps, files } = fakeDeps();
   const dir = runDir(deps, "run-1");
-  await deps.mkdirp(dir);
-  // Simulate a prior initRun that won the exclusive contract create but
-  // crashed before the ledger/event were written — run identity is
-  // canonical, so a retry must complete this run id rather than refuse it.
-  await deps.createFileExclusive(`${dir}/contract.json`, JSON.stringify(testContract(), null, 2));
   await initRun(deps, testContract(), testLedger());
+  assert.ok(files.has(`${dir}/contract.json`));
   assert.ok(files.has(`${dir}/ledger.json`));
   const events = await readEvents(deps, "run-1");
   assert.equal(events.length, 1);
   assert.equal(events[0].kind, "run_initialized");
+  // An externally hand-crafted contract-only directory (impossible for the
+  // engine to produce) is refused — the old completion path let a second
+  // request's ledger complete a first request's contract (the corruption
+  // 92d2ec8f names), so init must never adopt foreign partial state.
+  const { deps: deps2 } = fakeDeps();
+  const dir2 = runDir(deps2, "run-x");
+  await deps2.createFileExclusive(`${dir2}/contract.json`, JSON.stringify(testContract("run-x"), null, 2));
+  await assert.rejects(() => initRun(deps2, testContract("run-x"), testLedger("run-x")), /already exists/);
 });
 
 test("readContract / readLedger round-trip", async () => {
@@ -530,4 +551,71 @@ test("status of an unknown run fails naming the run id, without creating one", a
   const before = files.size;
   await assert.rejects(() => getStatus(deps, "ghost"), /ghost/);
   assert.equal(files.size, before);
+});
+
+// ---------------------------------------------------------------------------
+// #508 pre-merge delta findings bc212827 / 5668c55c / 92d2ec8f
+// ---------------------------------------------------------------------------
+
+test("resolveStateHome: legacy PIPELINE_STATE_HOME is honored as a migration fallback (#508 delta 5668c55c)", () => {
+  const legacyOnly = resolveStateHome({ env: { PIPELINE_STATE_HOME: "/legacy-home" } as NodeJS.ProcessEnv, hostname: () => "h" });
+  assert.equal(legacyOnly, "/legacy-home");
+  const both = resolveStateHome({
+    env: { PIPELINE_STATE_HOME: "/legacy-home", AGENT_PIPELINE_STATE_HOME: "/new-home" } as NodeJS.ProcessEnv,
+    hostname: () => "h",
+  });
+  assert.equal(both, "/new-home", "the new variable must take precedence");
+});
+
+test("initRun: a concurrent initializer cannot interleave records — the loser reports conflict and the winner's run stays coherent (#508 delta 92d2ec8f)", async () => {
+  const { deps, files } = fakeDeps();
+  const contractA = testContract("run-race");
+  const contractB = { ...testContract("run-race"), canonical_hash: "hash-B" };
+  const ledgerA = testLedger("run-race");
+  const ledgerB = { ...testLedger("run-race"), consecutive_blocked: 7 };
+
+  // Initializer B completes fully in the window after A staged its contract
+  // but before A publishes: with atomic publication, B publishes first and A's
+  // exclusive rename must fail.
+  const baseWrite = deps.writeFileAtomic.bind(deps);
+  let interleaved = false;
+  deps.writeFileAtomic = async (p, content) => {
+    await baseWrite(p, content);
+    if (!interleaved && p.includes(".init-") && p.endsWith("/ledger.json")) {
+      interleaved = true;
+      await initRun({ ...deps, writeFileAtomic: baseWrite }, contractB, ledgerB);
+    }
+  };
+
+  await assert.rejects(() => initRun(deps, contractA, ledgerA), /initialized concurrently|already exists/);
+
+  const publishedContract = [...files.entries()].find(([k]) => k.endsWith("run-race/contract.json"));
+  const publishedLedger = [...files.entries()].find(([k]) => k.endsWith("run-race/ledger.json"));
+  assert.ok(publishedContract && publishedLedger, "exactly the winner's run must be published");
+  assert.equal(JSON.parse(publishedContract![1]).canonical_hash, "hash-B", "contract must be the winner's");
+  assert.equal(JSON.parse(publishedLedger![1]).consecutive_blocked, 7, "ledger must be the winner's — no cross-request mixing");
+});
+
+test("defaultLoopStoreDeps: real-fs lock lifecycle — acquire, release via compare-and-delete, mismatch preserved (#508 delta bc212827)", async () => {
+  const os = await import("node:os");
+  const fsMod = await import("node:fs");
+  const pathMod = await import("node:path");
+  const stateHome = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "loop-store-real-"));
+  try {
+    const deps = defaultLoopStoreDeps({ AGENT_PIPELINE_STATE_HOME: stateHome } as NodeJS.ProcessEnv);
+    await initRun(deps, testContract("real-run"), testLedger("real-run"));
+    const acquired = await acquireLock(deps, "real-run", "claude");
+    assert.ok("token" in acquired && acquired.token, "lock must be acquired through the real factory");
+    await releaseLock(deps, "real-run", (acquired as { token: string }).token);
+    const lockFile = pathMod.join(stateHome, "runs", "real-run", "lock.json");
+    assert.equal(fsMod.existsSync(lockFile), false, "release must remove the lock via removeFileIfMatches");
+
+    // Mismatch branch: a superseded record must be preserved, not deleted.
+    fsMod.writeFileSync(lockFile, "{\"foreign\":true}");
+    const removed = await deps.removeFileIfMatches(lockFile, "something-else");
+    assert.equal(removed, false);
+    assert.equal(fsMod.readFileSync(lockFile, "utf8"), "{\"foreign\":true}", "a non-matching record must survive");
+  } finally {
+    fsMod.rmSync(stateHome, { recursive: true, force: true });
+  }
 });

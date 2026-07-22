@@ -7,6 +7,9 @@
 // ShaGateDeps convention (see core/scripts/stages/*.ts): unit tests inject an
 // in-memory fake and make no real filesystem, process, or network call.
 
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import {
@@ -21,6 +24,11 @@ import {
 } from "./types.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
+
+/** The variable's former name, honored as a migration fallback so runs stored
+ *  under the previously documented override remain resumable (#508 delta
+ *  finding 5668c55c). AGENT_PIPELINE_STATE_HOME always takes precedence. */
+export const LEGACY_PIPELINE_STATE_HOME_ENV = "PIPELINE_STATE_HOME";
 
 /** Injectable I/O seam for the durable loop store. All paths are absolute. */
 export interface LoopStoreDeps {
@@ -51,6 +59,12 @@ export interface LoopStoreDeps {
    *  the file if absent. MUST NOT rewrite existing bytes. */
   appendLine(p: string, line: string): Promise<void>;
   mkdirp(p: string): Promise<void>;
+  /** Atomically move directory `from` to `to`. Returns `true` on success and
+   *  `false` when `to` already exists — publication is exclusive: exactly one
+   *  concurrent initializer's staged run directory can become the run
+   *  directory (#508 delta finding 92d2ec8f). Callers never create `to`
+   *  directly, so an existing `to` is always a previously published run. */
+  renameDirExclusive(from: string, to: string): Promise<boolean>;
   listDir(p: string): Promise<string[]>;
   /** True when a process with this pid is alive on the current host. */
   isPidAlive(pid: number): Promise<boolean>;
@@ -71,6 +85,7 @@ export interface LoopStoreDeps {
 export function resolveStateHome(deps: Pick<LoopStoreDeps, "env" | "hostname">): string {
   const env = deps.env;
   if (env[PIPELINE_STATE_HOME_ENV]) return path.resolve(env[PIPELINE_STATE_HOME_ENV]!);
+  if (env[LEGACY_PIPELINE_STATE_HOME_ENV]) return path.resolve(env[LEGACY_PIPELINE_STATE_HOME_ENV]!);
   if (env.XDG_STATE_HOME) return path.join(path.resolve(env.XDG_STATE_HOME), "agent-pipeline", "loop");
   return path.join(homedir(), ".local", "state", "agent-pipeline", "loop");
 }
@@ -135,23 +150,32 @@ export async function runExists(deps: LoopStoreDeps, runId: string): Promise<boo
  *  refusing that run id forever. */
 export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledger: LoopLedger): Promise<void> {
   const dir = runDir(deps, contract.run_id);
-  await deps.mkdirp(dir);
-  const created = await deps.createFileExclusive(contractPath(dir), JSON.stringify(contract, null, 2));
-  if (!created) {
-    const ledgerExists = await deps.fsExists(ledgerPath(dir));
-    if (ledgerExists) {
-      throw new LoopError(
-        "conflict",
-        `loop run "${contract.run_id}" already exists — resume it instead of re-initializing`,
-      );
-    }
-    // Contract marker exists but the ledger never landed — complete the
-    // stranded init below instead of refusing.
+  if (await deps.fsExists(contractPath(dir))) {
+    throw new LoopError(
+      "conflict",
+      `loop run "${contract.run_id}" already exists — resume it instead of re-initializing`,
+    );
   }
-  await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(ledger, null, 2));
-  const eventsAlreadyWritten = await deps.readTextFile(eventsPath(dir));
-  if (!eventsAlreadyWritten) {
-    await appendEventUnchecked(deps, contract.run_id, "run_initialized", { run_id: contract.run_id, engine: contract.engine });
+  // Atomic publication (#508 delta finding 92d2ec8f): the complete run —
+  // contract, ledger, and initialization event — is staged in a sibling
+  // directory and published with one exclusive directory rename. A run id
+  // either appears fully initialized or not at all, so two concurrent
+  // initializers can never interleave records from different requests: the
+  // rename loser observes the winner's published run and reports conflict.
+  const staging = `${dir}.init-${deps.uuid()}`;
+  await deps.mkdirp(staging);
+  await deps.writeFileAtomic(contractPath(staging), JSON.stringify(contract, null, 2));
+  await deps.writeFileAtomic(ledgerPath(staging), JSON.stringify(ledger, null, 2));
+  await appendLog(deps, eventsPath(staging), "run_initialized", { run_id: contract.run_id, engine: contract.engine });
+  const published = await deps.renameDirExclusive(staging, dir);
+  if (!published) {
+    await deps.removeFile(contractPath(staging));
+    await deps.removeFile(ledgerPath(staging));
+    await deps.removeFile(eventsPath(staging));
+    throw new LoopError(
+      "conflict",
+      `loop run "${contract.run_id}" was initialized concurrently — resume it instead of re-initializing`,
+    );
   }
 }
 
@@ -422,6 +446,135 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
     lock: { holder: lock, staleness },
     last_reconciliation: ledger.last_reconciliation,
     event_count: events.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Production dependencies (#508 delta finding bc212827): the single real-fs
+// implementation of every LoopStoreDeps seam, so no caller can construct a
+// partial object that misses a newer method under type stripping (there is no
+// tsc gate — a missing method surfaces only at runtime).
+// ---------------------------------------------------------------------------
+
+/** Real-filesystem LoopStoreDeps. All mutating primitives match their seam
+ *  contracts: exclusive create via O_EXCL, atomic whole-document writes via
+ *  temp+fsync+rename, exclusive directory publication, and compare-and-delete
+ *  via the exclusive rename-claim protocol established for the installer's
+ *  update lock (#450): exactly one concurrent caller claims the file, the
+ *  claimed bytes are verified before discard, and a non-matching claim is
+ *  restored via link — atomic and EEXIST-failing, so a record written after
+ *  the claim is never clobbered. */
+export function defaultLoopStoreDeps(env: NodeJS.ProcessEnv = process.env): LoopStoreDeps {
+  return {
+    async fsExists(p) {
+      return fs.existsSync(p);
+    },
+    async readTextFile(p) {
+      try {
+        return await fs.promises.readFile(p, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+    },
+    async writeFileAtomic(p, content) {
+      const tmp = path.join(path.dirname(p), `.${path.basename(p)}.${crypto.randomUUID()}.tmp`);
+      const fh = await fs.promises.open(tmp, "wx");
+      try {
+        await fh.writeFile(content, "utf8");
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      try {
+        await fs.promises.rename(tmp, p);
+      } catch (err) {
+        await fs.promises.rm(tmp, { force: true });
+        throw err;
+      }
+    },
+    async createFileExclusive(p, content) {
+      let fh;
+      try {
+        fh = await fs.promises.open(p, "wx");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw err;
+      }
+      try {
+        await fh.writeFile(content, "utf8");
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      return true;
+    },
+    async removeFile(p) {
+      await fs.promises.rm(p, { force: true });
+    },
+    async removeFileIfMatches(p, expectedContent) {
+      const claim = `${p}.claim-${crypto.randomUUID()}`;
+      try {
+        await fs.promises.rename(p, claim);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw err;
+      }
+      let claimed: string | null;
+      try {
+        claimed = await fs.promises.readFile(claim, "utf8");
+      } catch {
+        claimed = null;
+      }
+      if (claimed === expectedContent) {
+        await fs.promises.rm(claim, { force: true });
+        return true;
+      }
+      try {
+        await fs.promises.link(claim, p); // EEXIST: a newer record landed; keep it
+      } catch {
+        // best-effort restore; the newer record (if any) is authoritative
+      }
+      await fs.promises.rm(claim, { force: true });
+      return false;
+    },
+    async appendLine(p, line) {
+      await fs.promises.appendFile(p, `${line}\n`, "utf8");
+    },
+    async mkdirp(p) {
+      await fs.promises.mkdir(p, { recursive: true });
+    },
+    async listDir(p) {
+      try {
+        return await fs.promises.readdir(p);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw err;
+      }
+    },
+    async renameDirExclusive(from, to) {
+      try {
+        await fs.promises.rename(from, to);
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EEXIST" || code === "ENOTEMPTY" || code === "ENOTDIR") return false;
+        throw err;
+      }
+    },
+    async isPidAlive(pid) {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    hostname: () => os.hostname(),
+    pid: () => process.pid,
+    now: () => new Date(),
+    uuid: () => crypto.randomUUID(),
+    env,
   };
 }
 
