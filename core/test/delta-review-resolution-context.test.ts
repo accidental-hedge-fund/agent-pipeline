@@ -174,14 +174,17 @@ test("defaultReadHeadFiles: non-string surfaces from untrusted history are rejec
     asked.push(args[1]);
     return { stdout: "tree-content", stderr: "", code: 0 };
   }) as typeof import("../scripts/worktree.ts").gitInWorktree;
-  const malformed = [null, 42, { file: "x" }, "core/ok.ts"] as unknown as string[];
+  // { toString: null } cannot be coerced via String(): primitive conversion
+  // calls toString/valueOf and, finding a non-callable toString, throws
+  // TypeError — the guard must reject without ever coercing (#496 finding 49da0f1a7403d6f4).
+  const malformed = [null, 42, { file: "x" }, { toString: null }, "core/ok.ts"] as unknown as string[];
   const results = await defaultReadHeadFiles("/wt", "abc1234", malformed, gitFn);
-  assert.equal(results.length, 4);
-  for (const r of results.slice(0, 3)) {
+  assert.equal(results.length, 5);
+  for (const r of results.slice(0, 4)) {
     assert.equal(r.present, false);
     assert.equal(r.absenceReason, "rejected");
   }
-  assert.equal(results[3].present, true);
+  assert.equal(results[4].present, true);
   assert.deepEqual(asked, ["abc1234:core/ok.ts"], "only the valid string path may reach git");
 });
 
