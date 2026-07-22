@@ -365,6 +365,7 @@ const PartialConfigSchema = z.object({
       risk_proportional: z.boolean().optional().describe("When true and review-1 approved with zero findings (low-risk), review-2 evaluates findings against a raised effective threshold (stricter of configured and 'high'), so medium/low findings advise rather than block. Default false — review-2 blocking unchanged."),
       ceiling_action: z.enum(["park", "demote_and_advance"]).optional().describe("Action at the max_adversarial_rounds round-budget ceiling. park (default): hard-park at needs-human. demote_and_advance: auto-demote below-high findings to advisory, file a follow-up issue, and advance to pre-merge. High/critical findings always park regardless."),
       surface_recurrence_rounds: z.number().int().min(0).optional().describe("Consecutive-round threshold N for the (file + category) surface-recurrence guard (#234). When N same-surface new-key blocking findings appear in N consecutive rounds, the guard fires and routes the cluster through ceiling_action. 0 disables the guard. Default 3."),
+      max_delta_rounds: z.number().int().positive().optional().describe("Cap on pre-merge delta review rounds per item (#483), counted durably from the issue's delta-review comment thread. Independent of max_adversarial_rounds. At the ceiling, ceiling_action disposes of the item's outstanding blocking delta findings instead of running another delta review. Default 4."),
     })
     .strict()
     .optional()
@@ -958,6 +959,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       surface_recurrence_rounds:
         fileConfig.review_policy?.surface_recurrence_rounds ??
         DEFAULT_CONFIG.review_policy.surface_recurrence_rounds,
+      max_delta_rounds:
+        fileConfig.review_policy?.max_delta_rounds ??
+        DEFAULT_CONFIG.review_policy.max_delta_rounds,
     },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
@@ -1351,6 +1355,7 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_policy.risk_proportional",
   "review_policy.ceiling_action",
   "review_policy.surface_recurrence_rounds",
+  "review_policy.max_delta_rounds",
   "steps.plan_review",
   "steps.standard_review",
   "steps.adversarial_review",
@@ -1931,6 +1936,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `  block_threshold: ${yamlScalar(reviewPolicy.block_threshold)} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)`,
     `  min_confidence: ${yamlScalar(reviewPolicy.min_confidence)} # 0..1 — findings below this confidence advise, not block`,
     `  max_adversarial_rounds: ${yamlScalar(reviewPolicy.max_adversarial_rounds)} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human`,
+    `  max_delta_rounds: ${yamlScalar(reviewPolicy.max_delta_rounds)} # cap pre-merge delta review rounds per item (#483), counted from the issue's delta-review comment thread; independent of max_adversarial_rounds`,
     ...reviewPolicyOptional,
     "",
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",

@@ -48,6 +48,7 @@ import {
   partitionFindings,
   severityRank,
   surfaceKey,
+  type AlternativeReinstatementMatch,
   type PartitionResult,
   type ReversalMatch,
   type Review1Risk,
@@ -590,17 +591,35 @@ export async function advanceReview(
   // #464): tag the finding in the posted comment and emit one audit event
   // per demotion, naming which specific settled finding it re-raises.
   const reversalDemotions = new Map<string, ReversalMatch>();
-  for (const { finding, reason, reversalMatch } of partition.advisory) {
-    if (reason !== "reversal-unacknowledged" || !reversalMatch) continue;
-    reversalDemotions.set(findingKey(finding), reversalMatch);
-    if (opts.runDir) {
-      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-      await appendEvent(opts.runDir, {
-        schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
-        finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
-        settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
-        matched_by: reversalMatch.matchedBy,
-      }, opts.runStoreDeps).catch(() => {});
+  const alternativeDemotions = new Map<string, AlternativeReinstatementMatch>();
+  for (const { finding, reason, reversalMatch, alternativeMatch } of partition.advisory) {
+    if (reason === "reversal-unacknowledged" && reversalMatch) {
+      reversalDemotions.set(findingKey(finding), reversalMatch);
+      if (opts.runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(opts.runDir, {
+          schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+          finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+          settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
+          matched_by: reversalMatch.matchedBy,
+        }, opts.runStoreDeps).catch(() => {});
+      }
+      continue;
+    }
+    // Settled-alternative reinstatement demotions (#483): tag the finding in
+    // the posted comment and emit one audit event per demotion, naming the
+    // settled finding whose rejected alternative it reinstates.
+    if (reason === "settled-alternative-reinstated" && alternativeMatch) {
+      alternativeDemotions.set(findingKey(finding), alternativeMatch);
+      if (opts.runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(opts.runDir, {
+          schema_version: RUN_SCHEMA_VERSION, type: "settled_alternative_reinstated", at,
+          finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+          settled_finding_key: alternativeMatch.settledKey, settling_round: alternativeMatch.settledRound,
+          matched_alternative: alternativeMatch.matchedAlternative,
+        }, opts.runStoreDeps).catch(() => {});
+      }
     }
   }
   if (opts.stateDir) {
@@ -622,7 +641,7 @@ export async function advanceReview(
   const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
   if (partition.blocking.length === 0) {
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions)));
     const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     if (partition.advisory.length || partition.overridden.length) {
@@ -648,7 +667,7 @@ export async function advanceReview(
     };
   }
 
-  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions)));
+  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions)));
 
   const priorRoundComments = detail.comments.filter((c) => c.body.startsWith(roundPfx));
   const roundCap = cfg.review_policy.max_adversarial_rounds;

@@ -226,6 +226,50 @@ export interface EngineDriftEvent extends RunEventBase {
   observed: RunEngineIdentity;
 }
 
+/** A blocking finding was demoted to advisory because its `recommendation`
+ *  reinstates a design alternative a settled finding's `rejected_alternatives`
+ *  already required removed (#483) — the escape neither `matchSettledFinding`
+ *  (key/title axis) nor a re-framed axis catches. Never blocks and never
+ *  changes the finding's visibility — it is still recorded and posted, tagged
+ *  `SETTLED-ALTERNATIVE-REINSTATED`; this event is purely an audit record. */
+export interface SettledAlternativeReinstatedEvent extends RunEventBase {
+  type: "settled_alternative_reinstated";
+  finding_key: string;
+  surface: string;
+  settled_finding_key: string;
+  settling_round: number;
+  matched_alternative: string;
+}
+
+/** One pre-merge delta review round ran (#483). `round` is the 1-based round
+ *  number for this item (the durable count observed BEFORE this round, plus
+ *  one); `cap` is the configured `review_policy.max_delta_rounds`. */
+export interface DeltaRoundEvent extends RunEventBase {
+  type: "delta_round";
+  round: number;
+  cap: number;
+}
+
+/** The pre-merge item's durable delta-round count reached
+ *  `review_policy.max_delta_rounds` (#483): no further delta review runs, and
+ *  `ceiling_action` disposed of the outstanding blocking delta findings. */
+export interface DeltaRoundCeilingEvent extends RunEventBase {
+  type: "delta_round_ceiling";
+  observed: number;
+  cap: number;
+  ceiling_action: "park" | "demote_and_advance";
+}
+
+/** A pre-merge delta round's blocking findings all sat on settled axes at
+ *  confidence strictly below each axis's prior maximum (#483) — flagged as
+ *  suspected churn, audit-only (never changes the round's blocking
+ *  disposition on its own). */
+export interface DeltaChurnSuspectedEvent extends RunEventBase {
+  type: "delta_churn_suspected";
+  round: number;
+  axes: { surface: string; prior_max_confidence: number; new_confidence: number }[];
+}
+
 export type { HumanInterventionEvent };
 
 export type RunEvent =
@@ -248,6 +292,10 @@ export type RunEvent =
   | IgnoredArtifactWarningEvent
   | PapercutEvent
   | ReversalUnacknowledgedEvent
+  | SettledAlternativeReinstatedEvent
+  | DeltaRoundEvent
+  | DeltaRoundCeilingEvent
+  | DeltaChurnSuspectedEvent
   | EngineDriftEvent
   | HumanInterventionEvent;
 
@@ -660,6 +708,9 @@ export async function finalizeRun(
   // if the read fails, arrays stay empty.
   let interventions: HumanInterventionEvent[] = [];
   let accountingRecords: StageAccountingRecord[] = [];
+  let deltaRoundEvents: DeltaRoundEvent[] = [];
+  let deltaCeilingEvents: DeltaRoundCeilingEvent[] = [];
+  let deltaChurnEvents: DeltaChurnSuspectedEvent[] = [];
   if (deps.summaryEvents) {
     interventions = deps.summaryEvents.filter(
       (e): e is HumanInterventionEvent => e.type === "human_intervention",
@@ -667,6 +718,9 @@ export async function finalizeRun(
     accountingRecords = deps.summaryEvents
       .filter((e): e is StageAccountingEvent => e.type === "stage_accounting")
       .map((e) => sanitizeStageAccountingRecord(e));
+    deltaRoundEvents = deps.summaryEvents.filter((e): e is DeltaRoundEvent => e.type === "delta_round");
+    deltaCeilingEvents = deps.summaryEvents.filter((e): e is DeltaRoundCeilingEvent => e.type === "delta_round_ceiling");
+    deltaChurnEvents = deps.summaryEvents.filter((e): e is DeltaChurnSuspectedEvent => e.type === "delta_churn_suspected");
   } else {
     try {
       const eventsForSummary = await readEvents(runDir, deps);
@@ -676,9 +730,29 @@ export async function finalizeRun(
       accountingRecords = eventsForSummary
         .filter((e): e is StageAccountingEvent => e.type === "stage_accounting")
         .map((e) => sanitizeStageAccountingRecord(e));
+      deltaRoundEvents = eventsForSummary.filter((e): e is DeltaRoundEvent => e.type === "delta_round");
+      deltaCeilingEvents = eventsForSummary.filter((e): e is DeltaRoundCeilingEvent => e.type === "delta_round_ceiling");
+      deltaChurnEvents = eventsForSummary.filter((e): e is DeltaChurnSuspectedEvent => e.type === "delta_churn_suspected");
     } catch {
       // Non-fatal: missing or unreadable events.jsonl → empty arrays
     }
+  }
+  if (deltaRoundEvents.length > 0 || deltaCeilingEvents.length > 0) {
+    const lastRound = deltaRoundEvents[deltaRoundEvents.length - 1];
+    const lastCeiling = deltaCeilingEvents[deltaCeilingEvents.length - 1];
+    bundle.deltaRounds = {
+      count: lastRound?.round ?? lastCeiling?.observed ?? 0,
+      cap: lastRound?.cap ?? lastCeiling?.cap ?? 0,
+      ceiling: lastCeiling
+        ? { observed: lastCeiling.observed, ceilingAction: lastCeiling.ceiling_action }
+        : undefined,
+      churnRounds: deltaChurnEvents.map((e) => ({
+        round: e.round,
+        axes: e.axes.map((a) => ({
+          surface: a.surface, priorMaxConfidence: a.prior_max_confidence, newConfidence: a.new_confidence,
+        })),
+      })),
+    };
   }
 
   // Serialize bundle — same sanitization as evidence-bundle.ts writeBundle.

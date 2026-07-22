@@ -494,7 +494,7 @@ test("review_adversarial: digest section is injected for round 2 when prior roun
         round: 1,
         reviewedSha: "a".repeat(40),
         entries: [
-          { key: "ab12cd34", surface: "src/x.ts|correctness", severity: "high", title: "Missing cap", resolution: "resolved-by-fix" as const },
+          { key: "ab12cd34", surface: "src/x.ts|correctness", severity: "high", title: "Missing cap", resolution: "resolved-by-fix" as const, rejectedAlternatives: [] as string[] },
         ],
       },
     ],
@@ -523,7 +523,7 @@ test("buildDeltaReviewPrompt: digest section present when priorRoundsDigest is s
         round: 1,
         reviewedSha: "b".repeat(40),
         entries: [
-          { key: "ef56gh78", surface: "src/y.ts|security", severity: "critical", title: "Auth bypass", resolution: "overridden" as const, overrideReason: "rejected", overrideRound: 1 },
+          { key: "ef56gh78", surface: "src/y.ts|security", severity: "critical", title: "Auth bypass", resolution: "overridden" as const, overrideReason: "rejected", overrideRound: 1, rejectedAlternatives: [] as string[] },
         ],
       },
     ],
@@ -558,6 +558,12 @@ test("review_adversarial: enumerate-all replaces the old one-finding-at-a-time i
   const out = buildReviewAdversarialPrompt({ cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "d" });
   assert.match(out, /Enumerate EVERY material finding/);
   assert.doesNotMatch(out, /Prefer one strong finding/);
+});
+
+test("review_adversarial: instructs naming the rejected alternative when a recommendation removes/replaces a design (#483)", () => {
+  const out = buildReviewAdversarialPrompt({ cfg: dummyConfig(), issueNumber: 7, title: "T", body: "B", diff: "d" });
+  assert.match(out, /rejected_alternatives/);
+  assert.match(out, /removing or replacing an existing design/i);
 });
 
 // #57 prompt-craft helpers: build both review prompts with the same dummy inputs.

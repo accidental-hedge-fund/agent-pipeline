@@ -616,6 +616,22 @@ export function formatSummary(bundle: EvidenceBundle): string {
     }
   }
 
+  if (bundle.deltaRounds) {
+    const dr = bundle.deltaRounds;
+    lines.push("");
+    lines.push("Pre-merge delta rounds:");
+    lines.push(`  count: ${dr.count}  cap: ${dr.cap}`);
+    if (dr.ceiling) {
+      lines.push(`  ceiling reached: observed ${dr.ceiling.observed}, action ${dr.ceiling.ceilingAction}`);
+    }
+    if (dr.churnRounds.length) {
+      lines.push("  suspected churn:");
+      for (const c of dr.churnRounds) {
+        lines.push(`    round ${c.round}: ${c.axes.map((a) => `${a.surface} (${a.priorMaxConfidence}→${a.newConfidence})`).join(", ")}`);
+      }
+    }
+  }
+
   if (bundle.designInterrogation) {
     const di = bundle.designInterrogation;
     lines.push("");

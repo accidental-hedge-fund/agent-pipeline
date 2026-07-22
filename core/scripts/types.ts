@@ -718,6 +718,13 @@ export interface PipelineConfig {
     // guard (#234). When N consecutive rounds each raise a new-key blocking finding
     // on the same (file + category) surface, the guard fires. 0 disables the guard.
     surface_recurrence_rounds: number;
+    // Cap on pre-merge delta review rounds per item (#483), counted durably from
+    // the issue's delta-review comment thread — independent of
+    // `max_adversarial_rounds`, which never bounds delta rounds and is never
+    // consumed by them. At the ceiling, `ceiling_action` (above) disposes of the
+    // item's outstanding blocking delta findings instead of running another
+    // delta review. No "unbounded" sentinel — must be a positive integer.
+    max_delta_rounds: number;
   };
   // Doctor / preflight (#146). Opt-in, deterministic capability check that runs
   // before any autonomous work. `runOnStart` (default false) makes the checks run
@@ -939,7 +946,7 @@ export const DEFAULT_CONFIG: Omit<
     rubric_path: ".github/shipcheck-rubric.md",
     block_on_partial: false,
   },
-  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3 },
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3, max_delta_rounds: 4 },
   doctor: { runOnStart: false, failFast: false },
   papercuts: {
     enabled: false,
@@ -1070,6 +1077,14 @@ export interface ReviewFinding {
   // reason "reversal-unacknowledged" (see partitionFindings). Ignored when the
   // finding's surface is not settled or no digest was supplied.
   prior_round_acknowledgment?: string;
+  // Rejected-alternative registry (#483): populated when this finding's
+  // `recommendation` requires removing or replacing an existing design — names
+  // the alternative(s) being ruled out. Rides the durable `blockingFindings`
+  // artifact extension into the prior-round digest so a LATER round's
+  // recommendation can be checked against what an earlier, now-settled round
+  // required removed, even under a fresh finding key and a re-worded title
+  // (the escape `matchSettledFinding`'s key/title axis cannot see).
+  rejected_alternatives?: string[];
 }
 
 export interface ReviewVerdict {
@@ -1406,6 +1421,30 @@ export interface EvidenceBundle {
    *  (#450). Additive and optional; absent for pre-#450 bundles and for runs
    *  where the engine identity never changed. */
   engineDrifts?: EngineDriftRecord[];
+  /** Pre-merge delta-round accounting (#483), derived from `delta_round` /
+   *  `delta_round_ceiling` / `delta_churn_suspected` events. Absent when the
+   *  run performed no pre-merge delta rounds. */
+  deltaRounds?: DeltaRoundAccounting;
+}
+
+/** Pre-merge delta-round accounting (#483): the item's durable delta-round
+ *  count, the configured cap, the ceiling disposition when the cap was
+ *  reached, and any rounds flagged as suspected churn. */
+export interface DeltaRoundAccounting {
+  /** Highest observed delta-round number across the run's `delta_round` events. */
+  count: number;
+  /** The configured `review_policy.max_delta_rounds` at the time these rounds ran. */
+  cap: number;
+  /** Present only when a `delta_round_ceiling` event was recorded this run. */
+  ceiling?: {
+    observed: number;
+    ceilingAction: "park" | "demote_and_advance";
+  };
+  /** One entry per round flagged suspected churn, in event order. */
+  churnRounds: {
+    round: number;
+    axes: { surface: string; priorMaxConfidence: number; newConfidence: number }[];
+  }[];
 }
 
 // ---------------------------------------------------------------------------

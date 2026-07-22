@@ -1354,6 +1354,8 @@ export const PIPELINE_COMMENT_KINDS: readonly {
   { kind: "review-advance-severity", heading: "## Pipeline: Review ", verify: "pipeline-attest" },
   { kind: "review-ceiling", heading: "## Pipeline: Review ceiling reached — human decision required", verify: "pipeline-attest" },
   { kind: "review-ceiling-demotion", heading: "## Pipeline: Review ceiling — findings demoted and deferred", verify: "pipeline-attest" },
+  { kind: "delta-round-ceiling", heading: "## Pipeline: Pre-merge delta round ceiling reached — human decision required", verify: "pipeline-attest" },
+  { kind: "delta-round-ceiling-demotion", heading: "## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred", verify: "pipeline-attest" },
   { kind: "new-human-input-warning", heading: "## Pipeline: New human input detected", verify: "pipeline-attest" },
   { kind: "pipeline-complete", heading: "## Pipeline Complete", verify: "pipeline-attest" },
   { kind: "auto-recovery", heading: "## Pipeline: Auto-Recovery", verify: "pipeline-attest" },
