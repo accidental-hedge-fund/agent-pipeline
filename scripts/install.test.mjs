@@ -40,6 +40,7 @@ import {
   formatLiveRunMessage,
   acquireUpdateLock,
   releaseUpdateLock,
+  verifyUpdateLockOwnership,
 } from "./install.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1436,50 @@ test("acquireUpdateLock: a live fresh lock captured mid-reclaim is restored, not
     assert.equal(acquired, false, "a live holder's lock must be reported as held");
     assert.equal(readFileSync(lockPath, "utf8"), "424242", "the live holder's lock must be restored intact");
     assert.equal(existsSync(lockPath + ".reclaim-" + process.pid), false, "no reclaim residue may remain");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("acquireUpdateLock: restore of a captured live lock never clobbers a third acquirer (#450 delta f8bda4a3)", () => {
+  // While the captured live lock sits at the reclaim path, a third installer
+  // acquires lockPath. The link-based restore must fail EEXIST and leave the
+  // third acquirer's lock intact; the displaced holder is caught by
+  // verifyUpdateLockOwnership before it copies anything.
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-update-lock-test-"));
+  const lockPath = join(dir, "update.lock");
+  try {
+    writeFileSync(lockPath, "424242"); // the captured "live" racer's lock
+    let calls = 0;
+    const isPidLive = (pid) => {
+      calls++;
+      if (calls === 1) return false; // stale observation window
+      if (calls === 2) {
+        // Claimed-content re-verification: simulate the third installer
+        // acquiring lockPath while the captured lock is off-path.
+        writeFileSync(lockPath, "777777");
+        return true; // captured holder is live -> restore branch
+      }
+      return true;
+    };
+    const acquired = acquireUpdateLock(lockPath, isPidLive);
+    assert.equal(acquired, false, "the reclaimer must report the lock as held");
+    assert.equal(readFileSync(lockPath, "utf8"), "777777", "the third acquirer's lock must never be clobbered");
+    assert.equal(existsSync(lockPath + ".reclaim-" + process.pid), false, "no reclaim residue may remain");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("verifyUpdateLockOwnership: true only when the lock carries this process pid (#450 delta f8bda4a3)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-update-lock-test-"));
+  const lockPath = join(dir, "update.lock");
+  try {
+    assert.equal(verifyUpdateLockOwnership(lockPath), false, "missing lock -> not owned");
+    writeFileSync(lockPath, "424242");
+    assert.equal(verifyUpdateLockOwnership(lockPath), false, "foreign pid -> not owned");
+    writeFileSync(lockPath, String(process.pid));
+    assert.equal(verifyUpdateLockOwnership(lockPath), true, "own pid -> owned");
   } finally {
     cleanup(dir);
   }

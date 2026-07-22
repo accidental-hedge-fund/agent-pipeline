@@ -25,6 +25,7 @@ import {
   renameSync,
   rmSync,
   unlinkSync,
+  linkSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
@@ -337,15 +338,22 @@ function acquireUpdateLock(lockPath = UPDATE_LOCK_PATH, isPidLive = isPidLiveDef
       const claimedRaw = readLockFile(claimPath);
       const claimedPid = claimedRaw ? Number.parseInt(claimedRaw, 10) : NaN;
       if (Number.isFinite(claimedPid) && claimedPid > 0 && isPidLive(claimedPid)) {
-        // We captured a live holder's fresh lock — give it back.
+        // We captured a live holder's fresh lock — give it back via link, not
+        // rename: link is atomic and FAILS with EEXIST instead of replacing,
+        // so a third installer that acquired while lockPath was vacant is
+        // never clobbered (#450 delta finding f8bda4a3). If link loses to
+        // such a third acquirer, the captured holder's ownership is decided
+        // by the pre-copy ownership verification every installer performs
+        // (verifyUpdateLockOwnership below) before touching any file.
         try {
-          renameSync(claimPath, lockPath);
+          linkSync(claimPath, lockPath);
         } catch {
-          try {
-            unlinkSync(claimPath);
-          } catch {
-            // best-effort cleanup; the live holder re-checks before copying
-          }
+          // EEXIST: a third installer legitimately owns lockPath now.
+        }
+        try {
+          unlinkSync(claimPath);
+        } catch {
+          // best-effort cleanup
         }
         return false;
       }
@@ -357,6 +365,16 @@ function acquireUpdateLock(lockPath = UPDATE_LOCK_PATH, isPidLive = isPidLiveDef
       // loop: contend on a fresh exclusive "wx" acquire
     }
   }
+}
+
+/** Re-read the update lock and confirm this process still owns it. Run
+ *  immediately before the copy section: an installer whose freshly acquired
+ *  lock was displaced during a concurrent stale-reclaim (#450 delta findings
+ *  99d25184/f8bda4a3) observes foreign or missing content here and backs off
+ *  instead of copying without exclusivity. */
+function verifyUpdateLockOwnership(lockPath = UPDATE_LOCK_PATH) {
+  const raw = readLockFile(lockPath);
+  return raw !== null && Number.parseInt(raw, 10) === process.pid;
 }
 
 function releaseUpdateLock(lockPath = UPDATE_LOCK_PATH) {
@@ -977,6 +995,12 @@ async function main() {
         fail("Another install/update is already in progress. Retry once it finishes.");
       }
       holdingUpdateLock = true;
+      // Pre-copy ownership verification (#450 delta f8bda4a3): a concurrent
+      // stale-reclaim can displace a freshly acquired lock; confirm the lock
+      // still carries our pid before any file is touched.
+      if (!verifyUpdateLockOwnership()) {
+        fail("Another install/update displaced the update lock. Retry once it finishes.");
+      }
       const liveLocks = findLiveRunLocks();
       if (liveLocks.length > 0) {
         if (force) {
@@ -1053,6 +1077,7 @@ export {
   formatLiveRunMessage,
   acquireUpdateLock,
   releaseUpdateLock,
+  verifyUpdateLockOwnership,
   UPDATE_LOCK_PATH,
 };
 
