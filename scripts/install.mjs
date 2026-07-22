@@ -302,11 +302,21 @@ const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
 
 /** Acquire the installer's exclusive update lock. Returns false if another
  *  live installer instance already holds it. Reclaims a stale lock (dead
- *  PID) using the same liveness semantics as the run-lock scan. */
-function acquireUpdateLock() {
+ *  PID) using the same liveness semantics as the run-lock scan.
+ *
+ *  Stale reclamation is ownership-safe (#450 delta finding 99d25184): an
+ *  unconditional unlink of the shared pathname would let two racing
+ *  installers both observe the same stale pid, with the slower unlink
+ *  deleting the faster racer's freshly acquired lock. Instead the observed
+ *  stale file is claimed exclusively via atomic rename — exactly one racer's
+ *  rename succeeds, the other loses with ENOENT and re-evaluates — and the
+ *  claimed content is re-verified before being discarded: if a LIVE holder's
+ *  fresh lock was captured (it replaced the stale file between our read and
+ *  our rename), it is renamed back and the lock is reported as held. */
+function acquireUpdateLock(lockPath = UPDATE_LOCK_PATH, isPidLive = isPidLiveDefault) {
   for (;;) {
     try {
-      const fd = openSync(UPDATE_LOCK_PATH, "wx");
+      const fd = openSync(lockPath, "wx");
       try {
         writeFileSync(fd, String(process.pid));
       } finally {
@@ -315,21 +325,43 @@ function acquireUpdateLock() {
       return true;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
-      const raw = readLockFile(UPDATE_LOCK_PATH);
+      const raw = readLockFile(lockPath);
       const pid = raw ? Number.parseInt(raw, 10) : NaN;
-      if (Number.isFinite(pid) && pid > 0 && isPidLiveDefault(pid)) return false;
+      if (Number.isFinite(pid) && pid > 0 && isPidLive(pid)) return false;
+      const claimPath = `${lockPath}.reclaim-${process.pid}`;
       try {
-        unlinkSync(UPDATE_LOCK_PATH);
+        renameSync(lockPath, claimPath);
       } catch {
-        // lost the reclaim race — loop and retry
+        continue; // lost the reclaim race — re-evaluate from the top
       }
+      const claimedRaw = readLockFile(claimPath);
+      const claimedPid = claimedRaw ? Number.parseInt(claimedRaw, 10) : NaN;
+      if (Number.isFinite(claimedPid) && claimedPid > 0 && isPidLive(claimedPid)) {
+        // We captured a live holder's fresh lock — give it back.
+        try {
+          renameSync(claimPath, lockPath);
+        } catch {
+          try {
+            unlinkSync(claimPath);
+          } catch {
+            // best-effort cleanup; the live holder re-checks before copying
+          }
+        }
+        return false;
+      }
+      try {
+        unlinkSync(claimPath); // ours exclusively — safe to discard
+      } catch {
+        // best-effort cleanup
+      }
+      // loop: contend on a fresh exclusive "wx" acquire
     }
   }
 }
 
-function releaseUpdateLock() {
+function releaseUpdateLock(lockPath = UPDATE_LOCK_PATH) {
   try {
-    unlinkSync(UPDATE_LOCK_PATH);
+    unlinkSync(lockPath);
   } catch {
     // already gone
   }

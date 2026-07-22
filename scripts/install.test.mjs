@@ -38,6 +38,8 @@ import {
   parseArgs,
   findLiveRunLocks,
   formatLiveRunMessage,
+  acquireUpdateLock,
+  releaseUpdateLock,
 } from "./install.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1395,5 +1397,45 @@ test("install update: a stale update lock (dead PID) does not block, and the loc
   } finally {
     cleanup(claudeTmp);
     cleanup(lockTmp);
+  }
+});
+
+test("acquireUpdateLock: stale (dead-pid) lock is reclaimed ownership-safely and re-acquired (#450 delta 99d25184)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-update-lock-test-"));
+  const lockPath = join(dir, "update.lock");
+  try {
+    writeFileSync(lockPath, "999999");
+    const acquired = acquireUpdateLock(lockPath, () => false); // holder is dead
+    assert.equal(acquired, true, "a dead holder's lock must be reclaimed");
+    assert.equal(readFileSync(lockPath, "utf8"), String(process.pid), "the fresh lock must carry our pid");
+    assert.equal(existsSync(lockPath + ".reclaim-" + process.pid), false, "no reclaim residue may remain");
+  } finally {
+    releaseUpdateLock(lockPath);
+    cleanup(dir);
+  }
+});
+
+test("acquireUpdateLock: a live fresh lock captured mid-reclaim is restored, not deleted (#450 delta 99d25184)", () => {
+  // Simulates the race the delta review named: the stale holder we observed is
+  // replaced by ANOTHER installer's fresh live lock between our liveness read
+  // and our claim. The claimed content re-verification must hand the lock
+  // back and report it as held — never discard it.
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-update-lock-test-"));
+  const lockPath = join(dir, "update.lock");
+  try {
+    writeFileSync(lockPath, "424242"); // the fresh racer's lock, live
+    let calls = 0;
+    const isPidLive = () => {
+      calls++;
+      // First liveness read simulates the STALE observation window; every
+      // later read tells the truth: the current holder is live.
+      return calls > 1;
+    };
+    const acquired = acquireUpdateLock(lockPath, isPidLive);
+    assert.equal(acquired, false, "a live holder's lock must be reported as held");
+    assert.equal(readFileSync(lockPath, "utf8"), "424242", "the live holder's lock must be restored intact");
+    assert.equal(existsSync(lockPath + ".reclaim-" + process.pid), false, "no reclaim residue may remain");
+  } finally {
+    cleanup(dir);
   }
 });
