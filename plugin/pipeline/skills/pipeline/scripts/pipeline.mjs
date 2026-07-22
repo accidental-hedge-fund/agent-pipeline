@@ -9,11 +9,57 @@
 //   2. Provision dependencies on first run (idempotent `npm ci` into core/).
 //   3. Exec the shared core with this host's profile baked in.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
 const PROFILE = "claude";
+
+// Update-lock reservation (#450 round 2) — mirrors scripts/install.mjs's
+// acquireUpdateLock()/findLiveRunLocks(). Filed under the same pipeline-*.lock
+// naming the installer's live-run scan already matches, so no scan-side change
+// is needed. Held for the full lifetime of the engine subprocess (this shim
+// process stays alive across the blocking spawnSync below), so an installer
+// that starts anytime during the run observes it.
+const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
+const STARTING_LOCK_PATH = join(tmpdir(), `pipeline-starting-${process.pid}.lock`);
+
+function updateInProgress() {
+  return existsSync(UPDATE_LOCK_PATH);
+}
+
+// Reserve a run slot, then re-check the update lock. This closes the window
+// where an installer's live-run scan runs before our reservation is on disk:
+// if the installer had already acquired its update lock (which it holds
+// across its own scan and the whole copy) by the time we recheck, we back off
+// here instead of loading a possibly mixed old/new engine tree.
+function reserveRunSlot() {
+  if (updateInProgress()) return false;
+  try {
+    const fd = openSync(STARTING_LOCK_PATH, "wx");
+    try {
+      writeFileSync(fd, String(process.pid));
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  if (updateInProgress()) {
+    releaseRunSlot();
+    return false;
+  }
+  return true;
+}
+
+function releaseRunSlot() {
+  try {
+    unlinkSync(STARTING_LOCK_PATH);
+  } catch {
+    // already gone
+  }
+}
 
 const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
 if (!Number.isFinite(nodeMajor) || nodeMajor < 24) {
@@ -138,9 +184,18 @@ if (!existsSync(join(coreDir, "node_modules"))) {
   }
 }
 
+if (!reserveRunSlot()) {
+  console.error(
+    "pipeline: an install/update is in progress — starting now risks loading a mixed " +
+      "old/new engine. Retry in a moment.",
+  );
+  process.exit(1);
+}
+
 const passthrough = process.argv.slice(2);
 const args = ["--experimental-strip-types", entry, ...passthrough];
 if (!passthrough.includes("--profile")) args.push("--profile", PROFILE);
 
 const run = spawnSync(process.execPath, args, { stdio: "inherit" });
+releaseRunSlot();
 process.exit(run.status ?? 1);

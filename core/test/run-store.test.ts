@@ -20,6 +20,7 @@ import {
   latestSummaryForIssue,
   listRunIds,
   readEvents,
+  resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   runsDir,
@@ -225,6 +226,117 @@ test("initRunDir: second call with same run-id is idempotent (run.json and event
   await initRunDir(opts, deps);
   assert.equal(readFile(RUN_JSON), runJsonAfterFirst, "run.json must not be modified on second init");
   assert.equal(readFile(EVENTS_JSONL), eventsAfterFirst, "events.jsonl must not gain a second run_start on re-init");
+});
+
+// ---------------------------------------------------------------------------
+// Engine identity (#450) — run.json's pinned `engine` object
+// ---------------------------------------------------------------------------
+
+test("initRunDir: writes the engine identity when supplied", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      engine: { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "deadbeef" },
+    },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.deepEqual(meta.engine, { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "deadbeef" });
+});
+
+test("initRunDir: omits the engine field (rather than failing the run) when not supplied", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.equal("engine" in meta, false);
+  // The rest of the identity metadata is unaffected.
+  assert.equal(meta.run_id, runId);
+  assert.equal(meta.repo, "owner/repo");
+});
+
+test("initRunDir: re-entering the dispatch loop for the same run-id does not refresh the pinned engine identity", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const firstEngine = { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "aaa" };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine: firstEngine },
+    deps,
+  );
+  const runJsonAfterFirst = readFile(RUN_JSON);
+
+  // Simulate the engine having changed on disk by the second call.
+  const secondEngine = { version: "1.22.0", root: "/opt/pipeline/core", templates_fingerprint: "bbb" };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine: secondEngine },
+    deps,
+  );
+  assert.equal(readFile(RUN_JSON), runJsonAfterFirst, "run.json — including its pinned engine object — must not be rewritten on re-entry");
+});
+
+test("resolveRunEngineIdentity: reuses the pinned identity from an existing run.json instead of resolving fresh (#450)", async () => {
+  const { deps } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const pinnedEngine = { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "aaa" };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine: pinnedEngine },
+    deps,
+  );
+
+  let resolveFreshCalled = false;
+  const freshEngine = { version: "1.22.0", root: "/opt/pipeline/core", templates_fingerprint: "bbb" };
+  const result = await resolveRunEngineIdentity(
+    RUN_DIR,
+    () => {
+      resolveFreshCalled = true;
+      return freshEngine;
+    },
+    deps,
+  );
+
+  assert.deepEqual(result, pinnedEngine, "resumed dispatch must reuse the identity already written to run.json");
+  assert.equal(resolveFreshCalled, false, "resolveFresh must not be invoked when run.json already exists");
+});
+
+test("resolveRunEngineIdentity: resolves fresh only when no run.json exists yet (first init)", async () => {
+  const { deps } = memRunStore();
+  const freshEngine = { version: "1.22.0", root: "/opt/pipeline/core", templates_fingerprint: "bbb" };
+
+  const result = await resolveRunEngineIdentity(RUN_DIR, () => freshEngine, deps);
+
+  assert.deepEqual(result, freshEngine);
+});
+
+test("resolveRunEngineIdentity: an existing run.json with no recorded engine stays unpinned (does not fall back to resolveFresh)", async () => {
+  const { deps } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO },
+    deps,
+  );
+
+  let resolveFreshCalled = false;
+  const result = await resolveRunEngineIdentity(
+    RUN_DIR,
+    () => {
+      resolveFreshCalled = true;
+      return { version: "1.22.0", root: "/opt/pipeline/core", templates_fingerprint: "bbb" };
+    },
+    deps,
+  );
+
+  assert.equal(result, undefined);
+  assert.equal(resolveFreshCalled, false);
 });
 
 // ---------------------------------------------------------------------------

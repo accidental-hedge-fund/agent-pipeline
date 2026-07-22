@@ -13,18 +13,23 @@
 // Honors CLAUDE_CONFIG_DIR and CODEX_HOME for non-default install locations.
 
 import {
+  closeSync,
   cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
+  linkSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -97,12 +102,14 @@ function parseArgs(argv) {
   let host = "all";
   let dryRun = false;
   let yesDeps = false;
+  let force = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--host") host = args[++i];
     else if (args[i] === "--dry-run") dryRun = true;
     else if (args[i] === "--yes-deps") yesDeps = true;
+    else if (args[i] === "--force") force = true;
   }
-  return { verb, host, dryRun, yesDeps };
+  return { verb, host, dryRun, yesDeps, force };
 }
 
 function selectedHosts(hostArg) {
@@ -196,6 +203,191 @@ async function checkLoopCoherence() {
   }
   log(`  ✓ loop:contract-coherence: ${result.detail}`);
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Live-run deferral (#450) — refuse to overwrite an installed core while a
+// pipeline run holds a lock, unless --force. Mirrors PipelineLock's liveness
+// semantics (core/scripts/lock.ts): a signalable PID is live, ESRCH is stale,
+// EPERM (exists but not signalable by us) is treated conservatively as live.
+// ---------------------------------------------------------------------------
+
+/** List `/tmp/pipeline-*.lock` file paths. Pure I/O seam; unit tests inject a fake. */
+function listPipelineLocks() {
+  let entries;
+  try {
+    entries = readdirSync(tmpdir());
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((name) => /^pipeline-.*\.lock$/.test(name))
+    .map((name) => join(tmpdir(), name));
+}
+
+/** Read a lock file's contents (raw PID text), or null if unreadable. */
+function readLockFile(lockPath) {
+  try {
+    return readFileSync(lockPath, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Probe whether `pid` is a live, signalable process — same semantics as
+ *  `PipelineLock.handleExistingLock` in core/scripts/lock.ts. */
+function isPidLiveDefault(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err.code === "ESRCH") return false;
+    if (err.code === "EPERM") return true; // exists, can't signal → conservative
+    return false;
+  }
+}
+
+// Default seams for findLiveRunLocks. Named per-field so tests can override
+// exactly one.
+const defaultLockSeams = {
+  listLocks: listPipelineLocks,
+  readLock: readLockFile,
+  isPidLive: isPidLiveDefault,
+};
+
+/** Pure scan: returns the subset of `/tmp/pipeline-*.lock` files that are held
+ *  by a live PID, as `{ path, pid }`. A lock with unparseable contents (no
+ *  integer PID) is treated as stale, not live — mirrors PipelineLock's garbage-
+ *  contents handling. Performs no real filesystem/process-signal call when
+ *  `listLocks`/`readLock`/`isPidLive` are all overridden (unit-test seam). */
+function findLiveRunLocks({
+  listLocks = defaultLockSeams.listLocks,
+  readLock = defaultLockSeams.readLock,
+  isPidLive = defaultLockSeams.isPidLive,
+} = {}) {
+  const live = [];
+  for (const lockPath of listLocks()) {
+    const raw = readLock(lockPath);
+    if (raw === null) continue; // unreadable → treat as stale
+    const pid = Number.parseInt(raw, 10);
+    if (!Number.isFinite(pid) || pid <= 0) continue; // unparseable → stale
+    if (isPidLive(pid)) live.push({ path: lockPath, pid });
+  }
+  return live;
+}
+
+/** Format the refusal/warning message naming every blocking lock and the remedy. */
+function formatLiveRunMessage(liveLocks, { asWarning }) {
+  const lines = liveLocks.map((l) => `    ${l.path} (pid ${l.pid})`);
+  const header = asWarning
+    ? "A pipeline run is in progress — updating would swap files underneath it. Proceeding anyway (--force):"
+    : "A pipeline run is in progress — updating would swap files underneath it. Blocking locks:";
+  const footer = asWarning
+    ? ""
+    : "\n  Retry after those runs finish, or re-run with --force to override.";
+  return `${header}\n${lines.join("\n")}${footer}`;
+}
+
+// ---------------------------------------------------------------------------
+// Update lock (#450 round 2) — closes the TOCTOU between the live-run scan
+// above and the copy. The installer holds this lock across the scan AND the
+// entire copy; the launcher shim (hosts/_shared/entry.template.mjs) reserves
+// a pipeline-*.lock-shaped slot and re-checks this lock immediately before it
+// loads any engine module. Either the reservation lands on disk before the
+// installer's scan (so the scan sees it and refuses) or the update lock is
+// still held when the shim re-checks (so the shim backs off before loading
+// anything) — a run starting in between can no longer slip through both.
+// ---------------------------------------------------------------------------
+
+const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
+
+/** Acquire the installer's exclusive update lock. Returns false if another
+ *  live installer instance already holds it. Reclaims a stale lock (dead
+ *  PID) using the same liveness semantics as the run-lock scan.
+ *
+ *  Stale reclamation is ownership-safe (#450 delta finding 99d25184): an
+ *  unconditional unlink of the shared pathname would let two racing
+ *  installers both observe the same stale pid, with the slower unlink
+ *  deleting the faster racer's freshly acquired lock. Instead the observed
+ *  stale file is claimed exclusively via atomic rename — exactly one racer's
+ *  rename succeeds, the other loses with ENOENT and re-evaluates — and the
+ *  claimed content is re-verified before being discarded: if a LIVE holder's
+ *  fresh lock was captured (it replaced the stale file between our read and
+ *  our rename), it is renamed back and the lock is reported as held. */
+function acquireUpdateLock(lockPath = UPDATE_LOCK_PATH, isPidLive = isPidLiveDefault) {
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeFileSync(fd, String(process.pid));
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      const raw = readLockFile(lockPath);
+      const pid = raw ? Number.parseInt(raw, 10) : NaN;
+      if (Number.isFinite(pid) && pid > 0 && isPidLive(pid)) return false;
+      const claimPath = `${lockPath}.reclaim-${process.pid}`;
+      try {
+        renameSync(lockPath, claimPath);
+      } catch {
+        continue; // lost the reclaim race — re-evaluate from the top
+      }
+      const claimedRaw = readLockFile(claimPath);
+      const claimedPid = claimedRaw ? Number.parseInt(claimedRaw, 10) : NaN;
+      if (Number.isFinite(claimedPid) && claimedPid > 0 && isPidLive(claimedPid)) {
+        // We captured a live holder's fresh lock — give it back via link, not
+        // rename: link is atomic and FAILS with EEXIST instead of replacing,
+        // so a third installer that acquired while lockPath was vacant is
+        // never clobbered (#450 delta finding f8bda4a3). If link loses to
+        // such a third acquirer, the captured holder's ownership is decided
+        // by the pre-copy ownership verification every installer performs
+        // (verifyUpdateLockOwnership below) before touching any file.
+        try {
+          linkSync(claimPath, lockPath);
+        } catch {
+          // EEXIST: a third installer legitimately owns lockPath now.
+        }
+        try {
+          unlinkSync(claimPath);
+        } catch {
+          // best-effort cleanup
+        }
+        return false;
+      }
+      try {
+        unlinkSync(claimPath); // ours exclusively — safe to discard
+      } catch {
+        // best-effort cleanup
+      }
+      // loop: contend on a fresh exclusive "wx" acquire
+    }
+  }
+}
+
+/** Re-read the update lock and confirm this process still owns it. Run
+ *  immediately before the copy section: an installer whose freshly acquired
+ *  lock was displaced during a concurrent stale-reclaim (#450 delta findings
+ *  99d25184/f8bda4a3) observes foreign or missing content here and backs off
+ *  instead of copying without exclusivity. */
+function verifyUpdateLockOwnership(lockPath = UPDATE_LOCK_PATH) {
+  const raw = readLockFile(lockPath);
+  return raw !== null && Number.parseInt(raw, 10) === process.pid;
+}
+
+/** Release the update lock ONLY if this process still owns it (#450 delta
+ *  finding cd279865): cleanup paths run on every exit, including after a
+ *  failed ownership verification — unconditionally unlinking here would
+ *  delete a third installer's legitimately held lock. */
+function releaseUpdateLock(lockPath = UPDATE_LOCK_PATH) {
+  try {
+    if (!verifyUpdateLockOwnership(lockPath)) return;
+    unlinkSync(lockPath);
+  } catch {
+    // already gone
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,26 +981,61 @@ function printDepSummary(results) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { verb, host, dryRun, yesDeps } = parseArgs(process.argv);
+  const { verb, host, dryRun, yesDeps, force } = parseArgs(process.argv);
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
     preflight();
     const loopCheck = await checkLoopCoherence();
     if (!loopCheck.ok) fail(loopCheck.message);
-    log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
-    for (const h of hosts) {
-      if (h === "claude") {
-        const { shadowing, dest } = detectPersonalSkill(h);
-        if (shadowing) {
-          const action = await offerRelocation(dest, claudeBase(), dryRun);
-          if (action === "skip") {
-            log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
-            continue;
-          }
+
+    // Live-run deferral (#450): only guards a host that already has an
+    // installed core — a first install onto a fresh host has nothing to race.
+    // Skipped under --dry-run, which never copies a file anyway.
+    const anyExistingInstall =
+      !dryRun && hosts.some((h) => existsSync(join(HOSTS[h].skillsDir(), "pipeline")));
+    let holdingUpdateLock = false;
+    if (anyExistingInstall) {
+      if (!acquireUpdateLock()) {
+        fail("Another install/update is already in progress. Retry once it finishes.");
+      }
+      // Pre-copy ownership verification (#450 delta f8bda4a3/cd279865): a
+      // concurrent stale-reclaim can displace a freshly acquired lock. Confirm
+      // the lock still carries our pid BEFORE marking it held — a failed
+      // verification must exit without cleanup releasing a lock now owned by
+      // a different installer (releaseUpdateLock is ownership-guarded too).
+      if (!verifyUpdateLockOwnership()) {
+        fail("Another install/update displaced the update lock. Retry once it finishes.");
+      }
+      holdingUpdateLock = true;
+      const liveLocks = findLiveRunLocks();
+      if (liveLocks.length > 0) {
+        if (force) {
+          warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
+        } else {
+          releaseUpdateLock();
+          fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
         }
       }
-      installHost(h, dryRun);
+    }
+
+    try {
+      log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
+      for (const h of hosts) {
+        if (h === "claude") {
+          const { shadowing, dest } = detectPersonalSkill(h);
+          if (shadowing) {
+            const action = await offerRelocation(dest, claudeBase(), dryRun);
+            if (action === "skip") {
+              log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
+              continue;
+            }
+          }
+        }
+        installHost(h, dryRun);
+      }
+    } finally {
+      if (holdingUpdateLock) releaseUpdateLock();
     }
 
     // Dependency-prompting phase: run after core install, never blocks completion.
@@ -852,6 +1079,13 @@ export {
   promptDeps,
   installDep,
   printDepSummary,
+  parseArgs,
+  findLiveRunLocks,
+  formatLiveRunMessage,
+  acquireUpdateLock,
+  releaseUpdateLock,
+  verifyUpdateLockOwnership,
+  UPDATE_LOCK_PATH,
 };
 
 // ESM main guard — tolerates bin symlinks by resolving both paths before comparing.

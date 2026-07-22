@@ -36,10 +36,14 @@ try {
   run([shimScript, "--help"], env);
   // `update` refreshes the installed skill in place; running it twice must be
   // a net no-op (no error, shim still runs) — the documented remediation for
-  // a stale install:version-freshness warning.
-  run([installScript, "update", "--host", "claude"], env);
+  // a stale install:version-freshness warning. --force: this smoke test's
+  // CLAUDE_CONFIG_DIR is an isolated sandbox, not a real install, but the
+  // live-run lock scan (#450) is host-wide (any /tmp/pipeline-*.lock), so it
+  // correctly — and, here, irrelevantly — sees this very CI/pipeline process's
+  // own lock. --force is the documented override for exactly that case.
+  run([installScript, "update", "--host", "claude", "--force"], env);
   run([shimScript, "--help"], env);
-  run([installScript, "update", "--host", "claude"], env);
+  run([installScript, "update", "--host", "claude", "--force"], env);
   run([shimScript, "--help"], env);
   run([installScript, "uninstall", "--host", "claude"], env);
 } finally {
