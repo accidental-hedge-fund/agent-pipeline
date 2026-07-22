@@ -170,7 +170,7 @@ test("defaultReadHeadFiles: a surface escaping the worktree root is rendered not
     ]);
 
     assert.equal(results.length, 3);
-    assert.deepEqual(results[0], { path: "../../.ssh/id_rsa", content: "", truncated: false, present: false });
+    assert.deepEqual(results[0], { path: "../../.ssh/id_rsa", content: "", truncated: false, present: false, absenceReason: "rejected" });
     assert.equal(results[1].present, false, "an escaping relative path must not be read");
     assert.equal(results[1].content, "");
     assert.deepEqual(results[2], { path: "core/in-scope.ts", content: "in-scope-content", truncated: false, present: true });
@@ -193,9 +193,22 @@ test("defaultReadHeadFiles: a symlink whose settled path points outside the work
     assert.equal(results.length, 1);
     assert.equal(results[0].present, false, "a symlink escaping the worktree root must not be followed");
     assert.equal(results[0].content, "", "outside-secret-content must never be read into the result");
+    assert.equal(results[0].absenceReason, "rejected", "an escape must not be reported as verified deletion evidence");
   } finally {
     await rm(worktree, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("defaultReadHeadFiles: a genuinely absent file (never existed) is reported not-found, distinct from a rejected escape (#496 finding 73a71b80)", async () => {
+  const worktree = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-notfound-wt-"));
+  try {
+    const results = await defaultReadHeadFiles(worktree, ["src/never-existed.ts"]);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].present, false);
+    assert.equal(results[0].absenceReason, "not-found", "an in-worktree path that just doesn't exist is verified deletion evidence");
+  } finally {
+    await rm(worktree, { recursive: true, force: true });
   }
 });
 
@@ -384,17 +397,27 @@ test("applySettledSurfaceEvidenceRule: no-op when there is no settled history", 
 });
 
 test("citesAbsentHeadFile: an explicit not-present state for the finding's own file counts as evidence (#496 finding d0603bbc)", () => {
-  const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false }];
+  const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "not-found" }];
   assert.equal(citesAbsentHeadFile({ file: "src/a.ts" }, headFiles), true);
 });
 
 test("citesAbsentHeadFile: a not-present state for a DIFFERENT file does not count as evidence", () => {
-  const headFiles: HeadFileState[] = [{ path: "src/other.ts", content: "", truncated: false, present: false }];
+  const headFiles: HeadFileState[] = [{ path: "src/other.ts", content: "", truncated: false, present: false, absenceReason: "not-found" }];
   assert.equal(citesAbsentHeadFile({ file: "src/a.ts" }, headFiles), false);
 });
 
 test("citesAbsentHeadFile: a PRESENT state for the finding's file does not count (must be explicitly absent)", () => {
   const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "still here", truncated: false, present: true }];
+  assert.equal(citesAbsentHeadFile({ file: "src/a.ts" }, headFiles), false);
+});
+
+test("citesAbsentHeadFile: an UNREADABLE absence (read error other than ENOENT) does not count as evidence (#496 finding 73a71b80)", () => {
+  const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "unreadable" }];
+  assert.equal(citesAbsentHeadFile({ file: "src/a.ts" }, headFiles), false);
+});
+
+test("citesAbsentHeadFile: a REJECTED path (out-of-worktree or symlink escape) does not count as evidence (#496 finding 73a71b80)", () => {
+  const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "rejected" }];
   assert.equal(citesAbsentHeadFile({ file: "src/a.ts" }, headFiles), false);
 });
 
@@ -406,10 +429,28 @@ test("applySettledSurfaceEvidenceRule: a settled finding's file deleted at HEAD 
     severity: "high", title: "Regression: fix was reverted", body: "The fix no longer exists.",
     file: "src/a.ts", category: "correctness", confidence: 0.9, recommendation: "restore the fix",
   };
-  const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false }];
+  const headFiles: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "not-found" }];
   const result = applySettledSurfaceEvidenceRule([f], settled, headFiles);
   assert.deepEqual(result.blocking, [f], "an absent settled-surface file must not be silently skipped as unverifiable");
   assert.deepEqual(result.demoted, []);
+});
+
+test("applySettledSurfaceEvidenceRule: a re-raised finding whose surface file failed to read (not verified deletion) is demoted, not retained as blocking (#496 finding 73a71b80)", () => {
+  const settled: SettledFindingVerification[] = [
+    { key: "aaaaaaaa", surface: "src/a.ts|correctness", title: "Prior fix in src/a.ts", round: 1, disposition: "resolved-by-fix" },
+  ];
+  const f: ReviewFinding = {
+    severity: "high", title: "Prior fix in src/a.ts", body: "This still applies.",
+    file: "src/a.ts", category: "correctness", confidence: 0.9, recommendation: "re-apply the fix",
+    prior_round_acknowledgment: "This delta does not touch src/a.ts.",
+  };
+  const unreadable: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "unreadable" }];
+  const rejected: HeadFileState[] = [{ path: "src/a.ts", content: "", truncated: false, present: false, absenceReason: "rejected" }];
+  for (const headFiles of [unreadable, rejected]) {
+    const result = applySettledSurfaceEvidenceRule([f], settled, headFiles);
+    assert.deepEqual(result.blocking, [], "evidence collection failure must not keep the finding blocking");
+    assert.equal(result.demoted.length, 1);
+  }
 });
 
 // ---------------------------------------------------------------------------

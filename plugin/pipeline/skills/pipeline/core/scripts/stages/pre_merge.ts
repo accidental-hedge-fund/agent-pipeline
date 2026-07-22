@@ -1106,26 +1106,41 @@ function resolveWithinWorktree(worktreePath: string, p: string): string | null {
   return resolved;
 }
 
+/** Discriminated result of {@link realpathWithinWorktree} (#496 finding
+ *  73a71b80): callers need to tell a genuinely absent file (`"not-found"` —
+ *  citable deletion evidence) apart from an indeterminate one (`"unreadable"`
+ *  or `"rejected"`), which the prior boolean-ish `string | null` return
+ *  collapsed into a single case. */
+type RealpathResult = { ok: true; path: string } | { ok: false; reason: "not-found" | "unreadable" | "rejected" };
+
 /**
  * Canonicalizes `resolvedPath` (already lexically confirmed within
  * `worktreePath` by {@link resolveWithinWorktree}) via `realpath` and
  * verifies the canonical target still resolves beneath the worktree root
  * (#496 finding 702a99fc) — a symlink at `resolvedPath` or any of its parent
- * components that points outside the worktree returns `null` instead of the
- * symlink's target, so such a path is rendered not-present rather than read.
+ * components that points outside the worktree is reported `"rejected"`
+ * instead of the symlink's target, so such a path is rendered not-present
+ * rather than read. A `resolvedPath` that simply does not exist on disk is
+ * reported `"not-found"`, distinct from a `"rejected"` escape or an
+ * `"unreadable"` realpath failure for another reason (e.g. permissions).
  */
-async function realpathWithinWorktree(worktreePath: string, resolvedPath: string): Promise<string | null> {
+async function realpathWithinWorktree(worktreePath: string, resolvedPath: string): Promise<RealpathResult> {
   let realRoot: string;
   let realCandidate: string;
   try {
     realRoot = await fs.promises.realpath(path.resolve(worktreePath));
-    realCandidate = await fs.promises.realpath(resolvedPath);
   } catch {
-    return null;
+    return { ok: false, reason: "unreadable" };
+  }
+  try {
+    realCandidate = await fs.promises.realpath(resolvedPath);
+  } catch (err) {
+    const reason = (err as NodeJS.ErrnoException)?.code === "ENOENT" ? "not-found" : "unreadable";
+    return { ok: false, reason };
   }
   const rel = path.relative(realRoot, realCandidate);
-  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  return realCandidate;
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return { ok: false, reason: "rejected" };
+  return { ok: true, path: realCandidate };
 }
 
 /** Default implementation of the `readHeadFiles` seam (#496): reads each
@@ -1143,19 +1158,20 @@ export async function defaultReadHeadFiles(worktreePath: string, paths: string[]
   for (const p of paths) {
     const resolvedPath = resolveWithinWorktree(worktreePath, p);
     if (resolvedPath === null) {
-      results.push({ path: p, content: "", truncated: false, present: false });
+      results.push({ path: p, content: "", truncated: false, present: false, absenceReason: "rejected" });
       continue;
     }
-    const realPath = await realpathWithinWorktree(worktreePath, resolvedPath);
-    if (realPath === null) {
-      results.push({ path: p, content: "", truncated: false, present: false });
+    const realpathResult = await realpathWithinWorktree(worktreePath, resolvedPath);
+    if (!realpathResult.ok) {
+      results.push({ path: p, content: "", truncated: false, present: false, absenceReason: realpathResult.reason });
       continue;
     }
     let raw: string;
     try {
-      raw = await fs.promises.readFile(realPath, "utf8");
-    } catch {
-      results.push({ path: p, content: "", truncated: false, present: false });
+      raw = await fs.promises.readFile(realpathResult.path, "utf8");
+    } catch (err) {
+      const absenceReason = (err as NodeJS.ErrnoException)?.code === "ENOENT" ? "not-found" : "unreadable";
+      results.push({ path: p, content: "", truncated: false, present: false, absenceReason });
       continue;
     }
     let content = raw;

@@ -351,12 +351,21 @@ export function settledFindingsSurfaceFiles(entries: SettledFindingVerification[
 /** One file's content at the reviewed head, read via the `readHeadFiles` seam
  *  (#496 task 2.1). `present: false` means the file does not exist (or could
  *  not be read) at the reviewed head — rendered as an explicit note, never
- *  silently omitted (design.md Decision 3). */
+ *  silently omitted (design.md Decision 3). `absenceReason` (set only when
+ *  `present` is false) distinguishes a verified-absent file (`"not-found"` —
+ *  genuine ENOENT, the mechanical proxy for "deleted") from an indeterminate
+ *  one (`"unreadable"` — a read error other than ENOENT, e.g. a permission
+ *  failure — or `"rejected"` — a path that was refused before any read was
+ *  attempted, e.g. it resolves outside the worktree or escapes it via a
+ *  symlink). Only `"not-found"` may be treated as citable deletion evidence
+ *  (#496 finding 73a71b80): an unreadable or rejected path is not a fact about
+ *  the file's existence and must stay unverifiable. */
 export interface HeadFileState {
   path: string;
   content: string;
   truncated: boolean;
   present: boolean;
+  absenceReason?: "not-found" | "unreadable" | "rejected";
 }
 
 const RESOLVED_FINDING_HEADER =

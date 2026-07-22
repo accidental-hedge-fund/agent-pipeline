@@ -402,18 +402,26 @@ export function citesHeadFileEvidence(text: string, headFiles: HeadFileState[]):
 }
 
 /**
- * True when `headFiles` supplies an explicit not-present state for the file
- * named by `finding`'s surface (#496 finding d0603bbc): a settled finding's
- * fix can consist of deleting the file that carried the defect, so the
- * file's documented absence at HEAD is itself citable evidence — the same
- * status {@link defaultReadHeadFiles} reports for a deleted or unreadable
- * file (design.md Decision 3) — and must not be silently skipped the way
- * {@link citesHeadFileEvidence} skips every non-present entry.
+ * True when `headFiles` supplies a *verified* not-present state — genuine
+ * ENOENT, `absenceReason === "not-found"` — for the file named by `finding`'s
+ * surface (#496 finding d0603bbc): a settled finding's fix can consist of
+ * deleting the file that carried the defect, so the file's documented
+ * deletion at HEAD is itself citable evidence. An `"unreadable"` or
+ * `"rejected"` absence (a read error, an out-of-worktree path, or a symlink
+ * escape — none of which assert the file does not exist) does NOT count: it
+ * is indeterminate, not evidence, and must fall through to
+ * {@link applySettledSurfaceEvidenceRule}'s demotion like any other
+ * unverified re-assertion (#496 finding 73a71b80).
  */
-export function citesAbsentHeadFile(finding: Pick<ReviewFinding, "file">, headFiles: HeadFileState[]): boolean {
+export function citesAbsentHeadFile(
+  finding: Pick<ReviewFinding, "file">,
+  headFiles: HeadFileState[],
+): boolean {
   const findingFile = normalizeFile(finding.file);
   if (!findingFile) return false;
-  return headFiles.some((file) => !file.present && normalizeFile(file.path) === findingFile);
+  return headFiles.some(
+    (file) => !file.present && file.absenceReason === "not-found" && normalizeFile(file.path) === findingFile,
+  );
 }
 
 /** One finding demoted by {@link applySettledSurfaceEvidenceRule}. */
