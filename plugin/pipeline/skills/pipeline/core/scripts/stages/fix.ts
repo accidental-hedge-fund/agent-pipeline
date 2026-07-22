@@ -24,6 +24,7 @@ import {
   findingPayloadFingerprint,
   humanDecisionComment,
   matchFindingScope,
+  neutralizeSentinelText,
   nonReproducingDispositionComment,
   type ScopedOverride,
 } from "../review-policy.ts";
@@ -767,7 +768,14 @@ export async function advanceFix(
             );
           }
           const categories = [...new Set(acceptedHumanDecisions.map((d) => d.category))].join(", ");
-          const requests = acceptedHumanDecisions.map((d) => `\`${d.key}\`: ${d.request}`).join("; ");
+          // #473 review-2 finding a64f2252cd2dbd0a: neutralize the harness-provided
+          // request here too — it is copied into the blocker reason passed to
+          // setBlocked, a distinct sink from the evidence comment above, and an
+          // unsanitized request could otherwise forge a trusted override/
+          // non-reproducing sentinel in the pipeline-authored blocked comment.
+          const requests = acceptedHumanDecisions
+            .map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`)
+            .join("; ");
           const humanDecisionMsg =
             `${stage}: the fix harness produced no new commits and declared ` +
             `${acceptedHumanDecisions.length} blocking finding(s) require a human decision ` +

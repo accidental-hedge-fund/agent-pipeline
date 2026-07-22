@@ -846,6 +846,22 @@ export function nonReproducingDispositionComment(args: {
 const HUMAN_DECISION_HEADING = "## Pipeline: Human decision required";
 
 /**
+ * Neutralize untrusted harness-provided text before it is embedded as plain
+ * text in any pipeline-authored sink (comment body or blocker reason): strip
+ * newlines and HTML comment delimiters so this text cannot form a literal
+ * `<!-- ... -->` marker that a later run's sentinel extractors could mistake
+ * for a trusted override/non-reproducing/human-decision disposition (#473
+ * review-2 finding a64f2252cd2dbd0a — every sink that renders this text must
+ * use this same neutralization, not just the evidence comment).
+ */
+export function neutralizeSentinelText(text: string): string {
+  return text
+    .replace(/[\r\n]/g, " ")
+    .replace(/<!--/g, "<!—")
+    .replace(/-->/g, "—>");
+}
+
+/**
  * The audited needs-human-decision evidence comment (#473). Carries the
  * decision category, the one-line decision request, the finding's identity,
  * the reviewed SHA, and the stage — readable by a human and by the audit
@@ -864,14 +880,8 @@ export function humanDecisionComment(args: {
 }): string {
   const { category, key, fingerprint, reviewedSha, request, stage, timestamp, footer } = args;
   // Sanitize the harness-provided request before embedding it as plain text in the
-  // attested comment: strip newlines and neutralize HTML comment delimiters so this
-  // untrusted text cannot form a literal `<!-- ... -->` marker that a later run's
-  // sentinel extractors could mistake for a trusted override/non-reproducing
-  // disposition (#473 review-1 finding b48e383e), mirroring `safeReason` below.
-  const safeRequest = request
-    .replace(/[\r\n]/g, " ")
-    .replace(/<!--/g, "<!—")
-    .replace(/-->/g, "—>");
+  // attested comment (#473 review-1 finding b48e383e).
+  const safeRequest = neutralizeSentinelText(request);
   const rendered = [
     HUMAN_DECISION_HEADING,
     "",
