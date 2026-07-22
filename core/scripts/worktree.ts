@@ -263,6 +263,26 @@ export interface WorktreeRecord {
   underManagedRoot?: boolean;
 }
 
+/** Derive the set of pipeline-managed worktree roots from `git worktree list
+ *  --porcelain` output: one `path.resolve(<checkout>, worktreeRoot)` per
+ *  registered checkout (`worktree <path>` line), de-duplicated. This listing
+ *  is common-dir-wide, so it is identical regardless of which linked checkout
+ *  invoked `git`, and the resulting root set is therefore independent of
+ *  which checkout is `cfg.repo_dir` (#472). An absolute `worktreeRoot`
+ *  resolves to itself for every checkout, so the set collapses to one root.
+ *
+ *  Pure (no I/O) so it is unit-testable without real git. */
+export function resolveManagedRoots(porcelainStdout: string, worktreeRoot: string): string[] {
+  const roots = new Set<string>();
+  for (const line of porcelainStdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      const checkout = line.slice("worktree ".length).trim();
+      roots.add(path.resolve(checkout, worktreeRoot));
+    }
+  }
+  return [...roots];
+}
+
 /** Parse `git worktree list --porcelain` output into pipeline worktree records.
  *
  *  A worktree is identified by issue + slug from its `pipeline/<N>-<slug>`
@@ -270,15 +290,21 @@ export interface WorktreeRecord {
  *  — git emits no `branch` line for a detached HEAD, which happens while a
  *  stage checks out a specific SHA inside the worktree (e.g. the review→fix
  *  handoff) — we fall back to deriving the identity from the on-disk directory
- *  name `pipeline-<N>-<slug>` under the configured worktree root. Without that
- *  fallback a present, git-registered worktree is invisible the moment it is
- *  not on its branch, so the fix stage's {@link getForIssue} falsely reports
- *  "No worktree found" and blocks a converging run (#223).
+ *  name `pipeline-<N>-<slug>` under one of the configured worktree roots.
+ *  Without that fallback a present, git-registered worktree is invisible the
+ *  moment it is not on its branch, so the fix stage's {@link getForIssue}
+ *  falsely reports "No worktree found" and blocks a converging run (#223).
+ *
+ *  `worktreeRoots` accepts either a single root (legacy call sites) or the
+ *  full managed-root set from {@link resolveManagedRoots} — a record is
+ *  `underManagedRoot: true` when its parent directory equals ANY root in the
+ *  set, so a worktree created under a linked checkout's root is recognized
+ *  regardless of which checkout is doing the listing (#472).
  *
  *  Pure (no I/O) so the parsing + matching is unit-testable without real git. */
 export function parseWorktreePorcelain(
   stdout: string,
-  worktreeRootAbs: string,
+  worktreeRoots: string | string[],
 ): WorktreeRecord[] {
   const records: WorktreeRecord[] = [];
   let current: WorktreeRecord | null = null;
@@ -295,11 +321,15 @@ export function parseWorktreePorcelain(
   }
   if (current?.path) records.push(current);
 
-  const root = path.resolve(worktreeRootAbs);
+  const roots = new Set(
+    (Array.isArray(worktreeRoots) ? worktreeRoots : [worktreeRoots]).map((r) => path.resolve(r)),
+  );
   const pipelineRecords: WorktreeRecord[] = [];
   for (const rec of records) {
     let issueNumber: number | undefined;
     let slug: string | undefined;
+    const parentDir = path.resolve(path.dirname(rec.path));
+    const underRoot = roots.has(parentDir);
 
     // Prefer the branch when the worktree is on its pipeline branch.
     const branchMatch = rec.branch?.startsWith("pipeline/")
@@ -308,7 +338,7 @@ export function parseWorktreePorcelain(
     if (branchMatch) {
       issueNumber = Number.parseInt(branchMatch[1], 10);
       slug = branchMatch[2];
-    } else if (rec.branch === undefined && path.resolve(path.dirname(rec.path)) === root) {
+    } else if (rec.branch === undefined && underRoot) {
       // Off-branch (detached) fallback: only for records with NO branch line in
       // the porcelain output (rec.branch === undefined). A worktree that IS on a
       // branch but not a pipeline/* branch must NOT be matched by directory name —
@@ -323,11 +353,11 @@ export function parseWorktreePorcelain(
     if (issueNumber !== undefined && slug !== undefined) {
       rec.issueNumber = issueNumber;
       rec.slug = slug;
-      // Mark whether the path is directly under the managed worktree root so
-      // callers can guard destructive operations (reclaim, sweep) to managed
-      // paths without recomputing the root from cfg.repo_dir (wrong for linked
-      // launches).
-      rec.underManagedRoot = path.resolve(path.dirname(rec.path)) === root;
+      // Mark whether the path is directly under any managed worktree root so
+      // callers can guard destructive operations (reclaim, sweep, removal) to
+      // managed paths without recomputing a single root from cfg.repo_dir
+      // (wrong for linked launches, and wrong across linked checkouts).
+      rec.underManagedRoot = underRoot;
       pipelineRecords.push(rec);
     }
   }
@@ -350,17 +380,13 @@ export interface ListOnDiskDeps {
 export async function listOnDisk(cfg: PipelineConfig, deps: ListOnDiskDeps = {}): Promise<WorktreeRecord[]> {
   const gitFn = deps.gitCmd ?? git;
   const { stdout } = await gitFn(cfg, cfg.repo_dir, ["worktree", "list", "--porcelain"]);
-  // Derive the pipeline worktree root from the FIRST "worktree <path>" line —
-  // git always lists the main (non-linked) worktree first. Using cfg.repo_dir
-  // directly is wrong when the CLI is launched from a linked worktree: cfg.repo_dir
-  // would be the linked worktree path, so path.resolve(cfg.repo_dir, cfg.worktree_root)
-  // would point to a non-existent nested .worktrees rather than the repo-level one,
-  // causing detached sibling worktrees to fall through the off-branch guard (#223).
-  const firstWorktreeLine = stdout.split("\n").find((l) => l.startsWith("worktree "));
-  const mainRepoRoot = firstWorktreeLine
-    ? firstWorktreeLine.slice("worktree ".length).trim()
-    : cfg.repo_dir;
-  return parseWorktreePorcelain(stdout, path.resolve(mainRepoRoot, cfg.worktree_root));
+  // Resolve managed roots from EVERY registered checkout, not just the main
+  // one — this listing is common-dir-wide, so it is identical from any linked
+  // checkout, and a worktree created under a different linked checkout's root
+  // is therefore still recognized as managed (#472; previously #223 fixed
+  // only the "launched from a linked worktree" half of this).
+  const roots = resolveManagedRoots(stdout, cfg.worktree_root);
+  return parseWorktreePorcelain(stdout, roots);
 }
 
 /** Worktrees backing issues that are still in-flight — open on GitHub AND
@@ -1063,20 +1089,44 @@ export async function removeWorktreeForIssue(
   const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
 
   const records = await listFn(cfg);
-  const root = path.resolve(cfg.repo_dir, cfg.worktree_root);
-  const rec = records.find((r) => {
-    if (r.issueNumber !== issueNumber || !r.slug) return false;
-    if (r.underManagedRoot !== undefined) return r.underManagedRoot;
-    return r.path === root || r.path.startsWith(root + path.sep);
-  });
+  // Legacy fallback for records with no underManagedRoot (test-injected, or a
+  // caller-supplied listOnDisk that predates #472's root-set classification):
+  // treat cfg.repo_dir's own root as managed, matching pre-#472 behavior.
+  const legacyRoot = path.resolve(cfg.repo_dir, cfg.worktree_root);
+  const isManaged = (r: WorktreeRecord): boolean =>
+    r.underManagedRoot !== undefined
+      ? r.underManagedRoot
+      : r.path === legacyRoot || r.path.startsWith(legacyRoot + path.sep);
 
-  if (!rec || !rec.slug) {
+  const matches = records.filter((r) => r.issueNumber === issueNumber && !!r.slug && isManaged(r));
+
+  if (matches.length > 1) {
+    const candidates = matches.map((r) => r.path).join(", ");
     return {
       removed: false,
       dirty: false,
       branch: null,
       worktree: null,
-      error: `no worktree found for issue #${issueNumber}`,
+      error:
+        `ambiguous: multiple managed worktrees found for issue #${issueNumber}: ${candidates}. ` +
+        "Remove the intended worktree explicitly (e.g. `git worktree remove <path>`).",
+    };
+  }
+
+  const rec = matches[0];
+  if (!rec || !rec.slug) {
+    // Best-effort diagnostic: name the configured root plus every managed
+    // root already observed among on-disk records, without an extra git call.
+    const searchedRoots = new Set<string>([legacyRoot]);
+    for (const r of records) {
+      if (r.underManagedRoot === true) searchedRoots.add(path.resolve(path.dirname(r.path)));
+    }
+    return {
+      removed: false,
+      dirty: false,
+      branch: null,
+      worktree: null,
+      error: `no worktree found for issue #${issueNumber} (searched managed roots: ${[...searchedRoots].join(", ")})`,
     };
   }
 
