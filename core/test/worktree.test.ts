@@ -12,7 +12,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk, reattachIfDetached, removeWorktreeForIssue } from "../scripts/worktree.ts";
+import { parseDirtyWorkdir, isDirtyResult, sweepMergedWorktrees, createWorktree, acquireWorktreeMutex, realWriteNodeModulesExclude, parseWorktreePorcelain, listOnDisk, reattachIfDetached, removeWorktreeForIssue, renderWorktreeStateSection } from "../scripts/worktree.ts";
 import type { WorktreeRecord, SweepDeps, CreateWorktreeDeps, AcquireWorktreeMutexDeps, ListOnDiskDeps, RemoveWorktreeDeps } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -1905,4 +1905,43 @@ test("removeWorktreeForIssue: detached worktree at pushed HEAD but branch ref ah
   assert.equal(removeCalled, false, "removeWorktree must NOT be called when branch has local-only commits");
   assert.equal(result.removed, false);
   assert.match(result.error ?? "", /local-only commits/, "error must mention local-only commits");
+});
+
+// ---------------------------------------------------------------------------
+// renderWorktreeStateSection (#486) — blocker-worktree-disclosure
+// ---------------------------------------------------------------------------
+
+test("renderWorktreeStateSection: empty input → no section", () => {
+  assert.equal(renderWorktreeStateSection(""), null);
+  assert.equal(renderWorktreeStateSection("\n\n"), null);
+});
+
+test("renderWorktreeStateSection: staged/unstaged/untracked counts match entries", () => {
+  const status = [
+    "M  staged-file.ts",
+    " M unstaged-file.ts",
+    "MM both-file.ts",
+    "?? untracked-file.ts",
+  ].join("\n");
+  const section = renderWorktreeStateSection(status);
+  assert.ok(section, "expected a rendered section for a dirty worktree");
+  // 2 staged (staged-file.ts, both-file.ts), 2 unstaged (unstaged-file.ts, both-file.ts), 1 untracked
+  assert.match(section!, /2 staged/);
+  assert.match(section!, /2 unstaged/);
+  assert.match(section!, /1 untracked/);
+  assert.match(section!, /staged-file\.ts/);
+  assert.match(section!, /unstaged-file\.ts/);
+  assert.match(section!, /both-file\.ts/);
+  assert.match(section!, /untracked-file\.ts/);
+});
+
+test("renderWorktreeStateSection: long file lists are truncated deterministically with an omitted-count note", () => {
+  const lines = Array.from({ length: 15 }, (_, i) => `?? file-${i}.ts`);
+  const section = renderWorktreeStateSection(lines.join("\n"));
+  assert.ok(section);
+  assert.match(section!, /15 untracked/);
+  // Only the first 10 files are listed verbatim.
+  assert.match(section!, /file-9\.ts/);
+  assert.doesNotMatch(section!, /file-10\.ts/);
+  assert.match(section!, /and 5 more/);
 });

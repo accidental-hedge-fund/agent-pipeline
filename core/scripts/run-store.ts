@@ -163,6 +163,17 @@ export interface HarnessTimeoutEvent extends RunEventBase {
   stage: string;
   timeout_sec: number;
 }
+/** A fix-round harness invocation failed (crash or timeout) and is being
+ *  retried in place, worktree preserved (#486). `attempt` is the about-to-run
+ *  attempt's 1-indexed number (>= 2); `limit` is `auto_recovery_max_retries`;
+ *  `reason` is the failure that triggered this retry. */
+export interface FixHarnessRetryEvent extends RunEventBase {
+  type: "fix_harness_retry";
+  stage: string;
+  attempt: number;
+  limit: number;
+  reason: string;
+}
 /** Advisory warning (#445): a harness commit step left a gitignored file
  *  uncommitted that is referenced by name in the committed diff. Never blocks
  *  and never changes stage advance/blocking semantics — purely informational
@@ -221,6 +232,7 @@ export type RunEvent =
   | GhMetricsSummaryEvent
   | StageAccountingEvent
   | HarnessTimeoutEvent
+  | FixHarnessRetryEvent
   | IgnoredArtifactWarningEvent
   | PapercutEvent
   | ReversalUnacknowledgedEvent
