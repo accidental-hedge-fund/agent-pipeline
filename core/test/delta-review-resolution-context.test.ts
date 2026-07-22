@@ -168,6 +168,23 @@ test("defaultReadHeadFiles: a traversal-shaped surface is rejected without ever 
   assert.deepEqual(asked, ["abc1234:core/in-scope.ts"], "only the in-scope path may reach git, pinned to the reviewed tree");
 });
 
+test("defaultReadHeadFiles: non-string surfaces from untrusted history are rejected, never thrown on (#496 delta cdd406db round 2)", async () => {
+  const asked: string[] = [];
+  const gitFn = (async (_cwd: string, args: string[]) => {
+    asked.push(args[1]);
+    return { stdout: "tree-content", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+  const malformed = [null, 42, { file: "x" }, "core/ok.ts"] as unknown as string[];
+  const results = await defaultReadHeadFiles("/wt", "abc1234", malformed, gitFn);
+  assert.equal(results.length, 4);
+  for (const r of results.slice(0, 3)) {
+    assert.equal(r.present, false);
+    assert.equal(r.absenceReason, "rejected");
+  }
+  assert.equal(results[3].present, true);
+  assert.deepEqual(asked, ["abc1234:core/ok.ts"], "only the valid string path may reach git");
+});
+
 test("defaultReadHeadFiles: content comes from the immutable reviewed tree, never the mutable worktree filesystem (#496 delta finding 8f981a57)", async () => {
   // The read is `git show <sha>:<path>` against the object store: a concurrent
   // writer swapping the on-disk file (or a parent) for an escaping symlink

@@ -1107,6 +1107,13 @@ export async function defaultReadHeadFiles(
   const results: HeadFileState[] = [];
   let totalUsed = 0;
   for (const p of paths) {
+    // Runtime string guard (#496 delta finding cdd406db round 2): surfaces
+    // originate in untrusted prior-review history and types are stripped at
+    // runtime — a non-string value must render as rejected, never throw.
+    if (typeof p !== "string") {
+      results.push({ path: String(p), content: "", truncated: false, present: false, absenceReason: "rejected" });
+      continue;
+    }
     const rel = path.posix.normalize(p.split(path.sep).join(path.posix.sep));
     if (rel === "" || rel === "." || rel.startsWith("..") || path.posix.isAbsolute(rel)) {
       results.push({ path: p, content: "", truncated: false, present: false, absenceReason: "rejected" });
