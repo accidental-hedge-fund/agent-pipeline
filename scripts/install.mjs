@@ -13,15 +13,18 @@
 // Honors CLAUDE_CONFIG_DIR and CODEX_HOME for non-default install locations.
 
 import {
+  closeSync,
   cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
@@ -282,6 +285,54 @@ function formatLiveRunMessage(liveLocks, { asWarning }) {
     ? ""
     : "\n  Retry after those runs finish, or re-run with --force to override.";
   return `${header}\n${lines.join("\n")}${footer}`;
+}
+
+// ---------------------------------------------------------------------------
+// Update lock (#450 round 2) — closes the TOCTOU between the live-run scan
+// above and the copy. The installer holds this lock across the scan AND the
+// entire copy; the launcher shim (hosts/_shared/entry.template.mjs) reserves
+// a pipeline-*.lock-shaped slot and re-checks this lock immediately before it
+// loads any engine module. Either the reservation lands on disk before the
+// installer's scan (so the scan sees it and refuses) or the update lock is
+// still held when the shim re-checks (so the shim backs off before loading
+// anything) — a run starting in between can no longer slip through both.
+// ---------------------------------------------------------------------------
+
+const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
+
+/** Acquire the installer's exclusive update lock. Returns false if another
+ *  live installer instance already holds it. Reclaims a stale lock (dead
+ *  PID) using the same liveness semantics as the run-lock scan. */
+function acquireUpdateLock() {
+  for (;;) {
+    try {
+      const fd = openSync(UPDATE_LOCK_PATH, "wx");
+      try {
+        writeFileSync(fd, String(process.pid));
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      const raw = readLockFile(UPDATE_LOCK_PATH);
+      const pid = raw ? Number.parseInt(raw, 10) : NaN;
+      if (Number.isFinite(pid) && pid > 0 && isPidLiveDefault(pid)) return false;
+      try {
+        unlinkSync(UPDATE_LOCK_PATH);
+      } catch {
+        // lost the reclaim race — loop and retry
+      }
+    }
+  }
+}
+
+function releaseUpdateLock() {
+  try {
+    unlinkSync(UPDATE_LOCK_PATH);
+  } catch {
+    // already gone
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -886,33 +937,42 @@ async function main() {
     // Live-run deferral (#450): only guards a host that already has an
     // installed core — a first install onto a fresh host has nothing to race.
     // Skipped under --dry-run, which never copies a file anyway.
-    if (!dryRun) {
-      const anyExistingInstall = hosts.some((h) => existsSync(join(HOSTS[h].skillsDir(), "pipeline")));
-      if (anyExistingInstall) {
-        const liveLocks = findLiveRunLocks();
-        if (liveLocks.length > 0) {
-          if (force) {
-            warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
-          } else {
-            fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
-          }
+    const anyExistingInstall =
+      !dryRun && hosts.some((h) => existsSync(join(HOSTS[h].skillsDir(), "pipeline")));
+    let holdingUpdateLock = false;
+    if (anyExistingInstall) {
+      if (!acquireUpdateLock()) {
+        fail("Another install/update is already in progress. Retry once it finishes.");
+      }
+      holdingUpdateLock = true;
+      const liveLocks = findLiveRunLocks();
+      if (liveLocks.length > 0) {
+        if (force) {
+          warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
+        } else {
+          releaseUpdateLock();
+          fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
         }
       }
     }
 
-    log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
-    for (const h of hosts) {
-      if (h === "claude") {
-        const { shadowing, dest } = detectPersonalSkill(h);
-        if (shadowing) {
-          const action = await offerRelocation(dest, claudeBase(), dryRun);
-          if (action === "skip") {
-            log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
-            continue;
+    try {
+      log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
+      for (const h of hosts) {
+        if (h === "claude") {
+          const { shadowing, dest } = detectPersonalSkill(h);
+          if (shadowing) {
+            const action = await offerRelocation(dest, claudeBase(), dryRun);
+            if (action === "skip") {
+              log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
+              continue;
+            }
           }
         }
+        installHost(h, dryRun);
       }
-      installHost(h, dryRun);
+    } finally {
+      if (holdingUpdateLock) releaseUpdateLock();
     }
 
     // Dependency-prompting phase: run after core install, never blocks completion.
@@ -959,6 +1019,9 @@ export {
   parseArgs,
   findLiveRunLocks,
   formatLiveRunMessage,
+  acquireUpdateLock,
+  releaseUpdateLock,
+  UPDATE_LOCK_PATH,
 };
 
 // ESM main guard — tolerates bin symlinks by resolving both paths before comparing.

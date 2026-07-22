@@ -76,6 +76,46 @@ the same blocking-lock details as a warning rather than an error.
 - **WHEN** a forced update overrides a live lock
 - **THEN** the output SHALL warn, naming each overridden lock path and PID
 
+### Requirement: The scan and the copy SHALL be one critical section, so a run cannot start unobserved between them
+
+The installer SHALL hold a single exclusive update lock across both the live-run scan and the entire
+copy, so a run cannot start in the gap between the scan completing and the copy beginning without
+being caught on one side of the race. The launcher SHALL reserve a lock-file-shaped slot — matching
+the same naming pattern the live-run scan already recognizes — before it spawns the engine
+subprocess, and SHALL re-check the update lock immediately afterward, backing off before loading any
+engine module if the update lock is held at that point.
+
+#### Scenario: A run's reservation lands before the installer's scan
+
+- **WHEN** the launcher's reservation is written to disk before the installer's live-run scan runs
+- **THEN** the scan SHALL observe it and refuse the update exactly as it would any other live lock
+
+#### Scenario: A run's reservation lands after the installer's scan but before the copy completes
+
+- **WHEN** the launcher creates its reservation while the installer's update lock is already held
+- **THEN** the launcher's re-check of the update lock SHALL observe it as held
+- **AND** the launcher SHALL back off and SHALL NOT spawn the engine subprocess
+
+#### Scenario: A second installer instance cannot proceed while the update lock is held
+
+- **WHEN** an update lock is already held by a live process
+- **THEN** a second installer invocation SHALL refuse to proceed rather than racing the first
+
+#### Scenario: A stale update lock does not block
+
+- **WHEN** the update lock file's recorded PID belongs to no live process
+- **THEN** the installer SHALL reclaim the lock and proceed normally
+
+#### Scenario: The update lock is always released
+
+- **WHEN** an install/update completes, is refused, or is overridden with `--force`
+- **THEN** the update lock file SHALL NOT remain on disk afterward
+
+#### Scenario: A refused or completed run leaves no dangling reservation
+
+- **WHEN** the launcher backs off because the update lock is held, or the engine subprocess exits
+- **THEN** its `pipeline-starting-<pid>.lock` reservation SHALL be removed
+
 ### Requirement: The live-run scan SHALL be a pure, injectable, tested function
 
 The scan SHALL be exposed as a function taking lock-file discovery and PID-liveness seams, so tests

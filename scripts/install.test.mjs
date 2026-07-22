@@ -1307,3 +1307,93 @@ test("install update: a first install onto a host with no existing core is not g
     cleanup(lockTmp);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Update lock (#450 round 2) — closes the TOCTOU between the scan above and
+// the copy. Covers: (a) a shim-shaped reservation lock is caught by the same
+// scan a real run's lock would be, (b) two installer instances can't proceed
+// concurrently, (c) a stale update lock (dead PID) never blocks, (d) the lock
+// is always cleaned up afterward.
+// ---------------------------------------------------------------------------
+
+test("install update: a shim-style pipeline-starting-<pid>.lock blocks the update like any other live lock", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const dest = stubExistingCoreInstall(claudeTmp);
+    // Same filename shape the launcher shim reserves before loading the engine.
+    writeFileSync(join(lockTmp, `pipeline-starting-${process.pid}.lock`), String(process.pid));
+
+    const result = runInstaller(["update", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.notEqual(result.status, 0, "a live shim reservation must block the update");
+    assert.equal(
+      readFileSync(join(dest, "sentinel.txt"), "utf8"),
+      "before-update",
+      "a blocked update must copy no file",
+    );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update: refuses when another installer instance already holds the update lock", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const dest = stubExistingCoreInstall(claudeTmp);
+    writeFileSync(join(lockTmp, ".pipeline-installer-update.lock"), String(process.pid));
+
+    const result = runInstaller(["update", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.notEqual(result.status, 0, "a live update lock held by another installer must block this one");
+    const output = `${result.stdout}${result.stderr}`;
+    assert.match(output, /already in progress/i);
+    assert.equal(
+      readFileSync(join(dest, "sentinel.txt"), "utf8"),
+      "before-update",
+      "a blocked update must copy no file",
+    );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update: a stale update lock (dead PID) does not block, and the lock is cleaned up after", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    stubExistingCoreInstall(claudeTmp);
+    const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    writeFileSync(join(lockTmp, ".pipeline-installer-update.lock"), String(dead.pid));
+
+    const result = runInstaller(["update", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, `a stale update lock must not block the update: ${result.stderr}`);
+    assert.equal(
+      existsSync(join(lockTmp, ".pipeline-installer-update.lock")),
+      false,
+      "the update lock must not be left behind after a completed update",
+    );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});

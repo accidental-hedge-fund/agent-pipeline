@@ -50,6 +50,13 @@
       present; on live locks, print the paths/PIDs plus the remedy and exit non-zero.
 - [ ] 5.4 With `--force`, print the same details as a warning and proceed.
 - [ ] 5.5 Leave the first-install (no existing core) and `uninstall` paths unguarded.
+- [x] 5.6 Add an installer-held update lock (`acquireUpdateLock`/`releaseUpdateLock`) acquired
+      before the live-lock scan and held across the whole copy, so the scan and the copy are one
+      critical section instead of two independently-timed steps.
+- [x] 5.7 Have the launcher shim (`hosts/_shared/entry.template.mjs`) reserve a
+      `pipeline-starting-<pid>.lock` slot — matching the scan's existing `pipeline-*.lock` pattern —
+      and re-check the update lock immediately before spawning the engine subprocess, closing the
+      TOCTOU between the installer's scan and its copy (round-2 review finding).
 
 ## 6. Tests
 
@@ -65,6 +72,10 @@
 - [ ] 6.6 Installer tests: live lock ⇒ refusal with no copy and named paths/PIDs; stale/unparseable
       lock ⇒ proceed; `--force` ⇒ proceed with warning.
 - [ ] 6.7 Prove both regression tests bite by reverting each behavior locally.
+- [x] 6.8 Update-lock/shim tests: a shim-shaped `pipeline-starting-<pid>.lock` blocks an update like
+      any other live lock; a second installer instance is refused while the update lock is held; a
+      stale update lock (dead PID) never blocks and is cleaned up; the shim refuses to spawn the
+      engine while the update lock is held and never leaves a dangling reservation.
 
 ## 7. Docs, mirror, gate
 
