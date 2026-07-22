@@ -1851,3 +1851,14 @@ test("advanceFix source pin: an exhausted-retry harness-failure block includes t
   assert.match(src, /appendWorktreeStateDisclosure\(wt\.path, baseReason\)/);
   assert.match(src, /appendWorktreeStateDisclosure\(wt\.path, noCommitsMsg\)/);
 });
+
+test("advanceFix source pin: retry-event/recovery recording is best-effort — an event-write throw cannot propagate (#486)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const onRetryIdx = src.indexOf("onRetryScheduled: async (attempt, limit, reason) => {");
+  assert.ok(onRetryIdx !== -1);
+  const onRetryBlock = src.slice(onRetryIdx, onRetryIdx + 600);
+  const appendEventCall = onRetryBlock.match(/await appendEvent\([\s\S]*?\)\.catch\(\(\) => \{\}\);/);
+  const recordRecoveryCall = onRetryBlock.match(/await recordRecovery\([\s\S]*?\)\.catch\(\(\) => \{\}\);/);
+  assert.ok(appendEventCall, "retry appendEvent call must be .catch()-wrapped (best-effort)");
+  assert.ok(recordRecoveryCall, "retry recordRecovery call must be .catch()-wrapped (best-effort)");
+});
