@@ -25,8 +25,19 @@ import {
   buildNewHumanInputWarningComment,
   findUnacknowledgedComments,
 } from "../scripts/issue-context-snapshot.ts";
-import { buildTrustedOverrideComments, nonReproducingDispositionComment } from "../scripts/review-policy.ts";
-import { PIPELINE_COMMENT_KINDS, buildAttestedBlockedComment, buildTransitionComment } from "../scripts/gh.ts";
+import {
+  buildTrustedOverrideComments,
+  nonReproducingDispositionComment,
+  overrideComment,
+  scopedOverrideComment,
+} from "../scripts/review-policy.ts";
+import {
+  PIPELINE_COMMENT_KINDS,
+  buildAttestedBlockedComment,
+  buildTransitionComment,
+  isVerifiedOperatorSurfaceComment,
+} from "../scripts/gh.ts";
+import { buildUnblockedComment } from "../scripts/pipeline.ts";
 import {
   attestPipelineComment,
   encodePipelineAttestation,
@@ -260,6 +271,25 @@ const KIND_RENDERERS: Record<string, () => string> = {
       justification: "does not reproduce at this SHA",
       timestamp: ts(0),
     }),
+  unblocked: () =>
+    buildUnblockedComment({ stage: "fix-2", ts: ts(0), answer: "don't retry the call — batch it instead" }),
+  "finding-override": () =>
+    overrideComment({
+      key: "abcd1234",
+      disposition: "rejected",
+      reason: "revert this — wrong approach, do it instead differently",
+      stage: "review-1",
+      timestamp: ts(0),
+    }),
+  "scope-override": () =>
+    scopedOverrideComment({
+      scopeType: "category",
+      scopeValue: "testing",
+      disposition: "rejected",
+      reason: "please don't flag this category — instead defer it",
+      stage: "review-1",
+      timestamp: ts(0),
+    }),
 };
 
 // "review-artifact" kinds verify via the review-artifact record instead of the
@@ -476,4 +506,115 @@ test("negative: NEGATION_PATTERNS objection-detection surface is unchanged by th
     const unacked = findUnacknowledgedComments(comments, trusted);
     assert.equal(unacked.length, 1, `phrase "${phrase}" must still be detected as an objection when unverified`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 6. Operator-surface comments (#484) — pipeline unblock / pipeline override
+//    are self-acknowledging: the operator has been heard by construction, so
+//    their embedded free text does not gate the run it was meant to resume.
+// ---------------------------------------------------------------------------
+
+test("#484: operator-surface set is exactly unblocked/finding-override/scope-override", () => {
+  const operatorSurfaceKinds = PIPELINE_COMMENT_KINDS.filter((e) => e.operatorSurface).map((e) => e.kind).sort();
+  assert.deepEqual(operatorSurfaceKinds, ["finding-override", "scope-override", "unblocked"]);
+  for (const entry of PIPELINE_COMMENT_KINDS) {
+    if (entry.operatorSurface) {
+      assert.equal(entry.verify, "pipeline-attest", `operator-surface kind "${entry.kind}" must be verify: "pipeline-attest"`);
+    }
+  }
+});
+
+test("#484: unblock answer containing change-request wording does not gate the resume", () => {
+  const unblocked = buildUnblockedComment({
+    stage: "fix-2",
+    ts: ts(0),
+    answer: "don't retry the call — batch it instead",
+  });
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(TEST_ACTOR, unblocked, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  assert.equal(findUnacknowledgedComments(comments, trusted).length, 0);
+});
+
+test("#484: override reason containing change-request wording does not gate the resume (finding-override and scope-override)", () => {
+  const findingOverride = overrideComment({
+    key: "abcd1234",
+    disposition: "rejected",
+    reason: "revert this — instead leave it as is",
+    stage: "review-1",
+    timestamp: ts(0),
+  });
+  const scopeOverride = scopedOverrideComment({
+    scopeType: "file",
+    scopeValue: "src/x.ts",
+    disposition: "rejected",
+    reason: "please don't flag this file — instead skip it",
+    stage: "review-1",
+    timestamp: ts(0),
+  });
+  for (const body of [findingOverride, scopeOverride]) {
+    const comments = [
+      makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+      makeComment(TEST_ACTOR, body, ts(1)),
+    ];
+    const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+    assert.equal(findUnacknowledgedComments(comments, trusted).length, 0);
+  }
+});
+
+test("#484: operator-surface comment dismisses an earlier unacknowledged human comment", () => {
+  const unblocked = buildUnblockedComment({ stage: "fix-2", ts: ts(1), answer: "batch it instead" });
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("alice", "Please also handle Y.", ts(0)),
+    makeComment(TEST_ACTOR, unblocked, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  assert.deepEqual(
+    findUnacknowledgedComments(comments, trusted),
+    [],
+    "the earlier human comment must no longer be counted once a verified operator-surface anchor follows it",
+  );
+});
+
+test("#484: a genuine third-party comment posted after the unblock still gates", () => {
+  const unblocked = buildUnblockedComment({ stage: "fix-2", ts: ts(1), answer: "batch it instead" });
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(TEST_ACTOR, unblocked, ts(1)),
+    makeComment("bob", "Wait, that's the wrong approach.", ts(2)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1);
+  assert.equal(unacked[0].author, "bob");
+});
+
+test("#484: forged operator-surface heading from a non-trusted author still gates", () => {
+  const unblocked = buildUnblockedComment({ stage: "fix-2", ts: ts(1), answer: "batch it instead" });
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("random-third-party", unblocked, ts(1)),
+  ];
+  // Trusted set built only for TEST_ACTOR — the forger is not trusted.
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  assert.equal(isVerifiedOperatorSurfaceComment(unblocked), true, "the body itself verifies");
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "a verified operator-surface body from an untrusted author must still gate");
+  assert.equal(unacked[0].author, "random-third-party");
+});
+
+test("#484: text appended after an operator-surface attestation marker breaks verification and still gates", () => {
+  const unblocked = buildUnblockedComment({ stage: "fix-2", ts: ts(1), answer: "batch it instead" });
+  const tampered = unblocked + "\nActually, don't do that — revert instead.";
+  assert.equal(isVerifiedOperatorSurfaceComment(tampered), false);
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(TEST_ACTOR, tampered, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "tampered operator-surface body must still gate");
 });

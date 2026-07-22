@@ -41,6 +41,7 @@ import {
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
+import { attestPipelineComment } from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
 import {
@@ -2533,6 +2534,34 @@ async function appendBlockerCleared(
   ).catch(() => {});
 }
 
+/**
+ * Build the "## Pipeline: Unblocked" comment body, attested via the generic
+ * `pipeline-attest` marker (#484). Pure + exported so the PIPELINE_COMMENT_KINDS
+ * drift guard exercises the real renderer, and so a verified, trusted-actor
+ * instance of this comment can act as an operator-surface acknowledgement
+ * anchor in `findUnacknowledgedComments` regardless of the operator's verbatim
+ * answer text (e.g. "don't retry — batch it instead").
+ */
+export function buildUnblockedComment(args: {
+  stage: string;
+  ts: string;
+  answer: string;
+}): string {
+  const rendered = [
+    "## Pipeline: Unblocked",
+    "",
+    `**Stage**: ${args.stage}`,
+    `**Unblocked at**: ${args.ts}`,
+    "",
+    "### Human input",
+    args.answer,
+    "",
+    "---",
+    "*Automated by Claude Code Pipeline Skill*",
+  ].join("\n");
+  return attestPipelineComment("unblocked", rendered);
+}
+
 async function runUnblock(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -2546,18 +2575,7 @@ async function runUnblock(
   }
   const stage = pickStage(detail.labels) ?? "(unknown)";
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-  const body = [
-    "## Pipeline: Unblocked",
-    "",
-    `**Stage**: ${stage}`,
-    `**Unblocked at**: ${ts}`,
-    "",
-    "### Human input",
-    answer,
-    "",
-    "---",
-    "*Automated by Claude Code Pipeline Skill*",
-  ].join("\n");
+  const body = buildUnblockedComment({ stage, ts, answer });
   await postComment(cfg, issueNumber, body);
   await clearBlocked(cfg, issueNumber);
   await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
