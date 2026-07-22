@@ -1657,7 +1657,7 @@ export async function runRemoveWorktree(
   }
 
   // Failure paths
-  if (result.error?.includes("no worktree found")) {
+  if (result.error?.includes("no worktree found") || result.error?.startsWith("ambiguous:")) {
     console.error(`pipeline: #${issueNumber}: ${result.error}`);
   } else if (result.dirty && !opts.force) {
     console.error(`pipeline: #${issueNumber}: ${result.error}`);
