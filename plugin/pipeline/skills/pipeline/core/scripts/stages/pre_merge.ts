@@ -1106,13 +1106,37 @@ function resolveWithinWorktree(worktreePath: string, p: string): string | null {
   return resolved;
 }
 
+/**
+ * Canonicalizes `resolvedPath` (already lexically confirmed within
+ * `worktreePath` by {@link resolveWithinWorktree}) via `realpath` and
+ * verifies the canonical target still resolves beneath the worktree root
+ * (#496 finding 702a99fc) — a symlink at `resolvedPath` or any of its parent
+ * components that points outside the worktree returns `null` instead of the
+ * symlink's target, so such a path is rendered not-present rather than read.
+ */
+async function realpathWithinWorktree(worktreePath: string, resolvedPath: string): Promise<string | null> {
+  let realRoot: string;
+  let realCandidate: string;
+  try {
+    realRoot = await fs.promises.realpath(path.resolve(worktreePath));
+    realCandidate = await fs.promises.realpath(resolvedPath);
+  } catch {
+    return null;
+  }
+  const rel = path.relative(realRoot, realCandidate);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return realCandidate;
+}
+
 /** Default implementation of the `readHeadFiles` seam (#496): reads each
  *  requested path from `worktreePath` on disk, bounded by
  *  {@link HEAD_FILE_PER_FILE_CAP} and {@link HEAD_FILE_TOTAL_CAP}. A missing
  *  or unreadable file yields `present: false` rather than throwing or being
  *  omitted (design.md Decision 3 — a deleted file is itself evidence). A path
  *  that resolves outside `worktreePath` is rejected the same way, without
- *  being read (#496 finding cdd406db). */
+ *  being read (#496 finding cdd406db), as is a path that resolves inside the
+ *  worktree lexically but whose realpath (following symlinks) escapes it
+ *  (#496 finding 702a99fc). */
 export async function defaultReadHeadFiles(worktreePath: string, paths: string[]): Promise<HeadFileState[]> {
   const results: HeadFileState[] = [];
   let totalUsed = 0;
@@ -1122,9 +1146,14 @@ export async function defaultReadHeadFiles(worktreePath: string, paths: string[]
       results.push({ path: p, content: "", truncated: false, present: false });
       continue;
     }
+    const realPath = await realpathWithinWorktree(worktreePath, resolvedPath);
+    if (realPath === null) {
+      results.push({ path: p, content: "", truncated: false, present: false });
+      continue;
+    }
     let raw: string;
     try {
-      raw = await fs.promises.readFile(resolvedPath, "utf8");
+      raw = await fs.promises.readFile(realPath, "utf8");
     } catch {
       results.push({ path: p, content: "", truncated: false, present: false });
       continue;

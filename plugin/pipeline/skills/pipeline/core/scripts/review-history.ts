@@ -374,6 +374,26 @@ const RESOLVED_FINDING_HEADER =
   "cannot verify persistence against the file content supplied below, do NOT raise the finding as blocking " +
   "— a genuine regression you CAN verify against that content still blocks normally.";
 
+/** Sanitizes a `HeadFileState.path` (sourced from untrusted prior review
+ *  history, #496 finding bb2b1f5b) before every prompt interpolation,
+ *  including the not-present branch: strips injection patterns and the
+ *  evidence-wrapper tag, and neutralizes backticks/newlines that could break
+ *  out of the inline code span the path is rendered inside. */
+function sanitizeHeadFilePathForPrompt(p: string): string {
+  return sanitizeBriefForPrompt(p)
+    .replace(/<\/?\s*untrusted-external-evidence\b[^>]*>/gi, "[REDACTED]")
+    .replace(/[`\r\n]/g, " ");
+}
+
+/** Picks a fence at least one backtick longer than the longest backtick run
+ *  in `content` (#496 finding bb2b1f5b) so embedded content cannot close the
+ *  code block early. */
+function pickCodeFence(content: string): string {
+  const runs = content.match(/`+/g) ?? [];
+  const longest = runs.reduce((max, run) => Math.max(max, run.length), 0);
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 /**
  * Render the delta review's resolved-finding verification section (#496 task
  * 3.1/3.2): the settled-finding list plus the HEAD content of the files their
@@ -393,13 +413,15 @@ export function renderResolvedFindingVerification(
   });
 
   const fileBlocks = headFiles.map((f) => {
-    if (!f.present) return `### \`${f.path}\`\n\n(file not present at HEAD)`;
+    const safePath = sanitizeHeadFilePathForPrompt(f.path);
+    if (!f.present) return `### \`${safePath}\`\n\n(file not present at HEAD)`;
     const note = f.truncated ? " (truncated)" : "";
     const safeContent = sanitizeBriefForPrompt(f.content).replace(
       /<\/?\s*untrusted-external-evidence\b[^>]*>/gi,
       "[REDACTED]",
     );
-    return `### \`${f.path}\`${note}\n\n\`\`\`\n${safeContent}\n\`\`\``;
+    const fence = pickCodeFence(safeContent);
+    return `### \`${safePath}\`${note}\n\n${fence}\n${safeContent}\n${fence}`;
   });
 
   const safeFindingLines = findingLines

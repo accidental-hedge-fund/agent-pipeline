@@ -401,6 +401,21 @@ export function citesHeadFileEvidence(text: string, headFiles: HeadFileState[]):
   return false;
 }
 
+/**
+ * True when `headFiles` supplies an explicit not-present state for the file
+ * named by `finding`'s surface (#496 finding d0603bbc): a settled finding's
+ * fix can consist of deleting the file that carried the defect, so the
+ * file's documented absence at HEAD is itself citable evidence — the same
+ * status {@link defaultReadHeadFiles} reports for a deleted or unreadable
+ * file (design.md Decision 3) — and must not be silently skipped the way
+ * {@link citesHeadFileEvidence} skips every non-present entry.
+ */
+export function citesAbsentHeadFile(finding: Pick<ReviewFinding, "file">, headFiles: HeadFileState[]): boolean {
+  const findingFile = normalizeFile(finding.file);
+  if (!findingFile) return false;
+  return headFiles.some((file) => !file.present && normalizeFile(file.path) === findingFile);
+}
+
 /** One finding demoted by {@link applySettledSurfaceEvidenceRule}. */
 export interface SettledSurfaceDemotion {
   finding: ReviewFinding;
@@ -434,7 +449,7 @@ export function applySettledSurfaceEvidenceRule(
       continue;
     }
     const text = [f.body, f.recommendation, f.prior_round_acknowledgment].filter(Boolean).join("\n");
-    if (citesHeadFileEvidence(text, headFiles)) {
+    if (citesHeadFileEvidence(text, headFiles) || citesAbsentHeadFile(f, headFiles)) {
       stillBlocking.push(f);
       continue;
     }
