@@ -85,23 +85,23 @@ Out of scope:
 
 ## Acceptance criteria
 
-- [ ] `pipeline <N> --detach` invoked from a directory with no git repo at or above it exits
+- [x] `pipeline <N> --detach` invoked from a directory with no git repo at or above it exits
       **2** and prints `no git repo found at or above <dir>. Run from inside a checkout, or
       pass --repo-path.` — it does not print "detached run started".
-- [ ] That refusal creates **nothing**: the launch directory is byte-for-byte unchanged (no
+- [x] That refusal creates **nothing**: the launch directory is byte-for-byte unchanged (no
       `.agent-pipeline/`), no `~/.pipeline/runs/<N>/<ts>/` wrapper directory, no
       `pipeline.log`, no `sentinel.json`, no `run-store.json`, and no per-issue lock file.
-- [ ] `spawnDetached` is never called when repo resolution fails (asserted through the
+- [x] `spawnDetached` is never called when repo resolution fails (asserted through the
       `RunSubcommandDeps` seam, so no process is ever spawned in the test).
-- [ ] `pipeline run <N> --detach` (the alias) exhibits identical refusal behavior.
-- [ ] `--repo-path <dir>` pointing at a non-repo directory refuses the same way, naming the
+- [x] `pipeline run <N> --detach` (the alias) exhibits identical refusal behavior.
+- [x] `--repo-path <dir>` pointing at a non-repo directory refuses the same way, naming the
       resolved `--repo-path` value in the error, not the cwd.
-- [ ] When the repo resolves, the pinned run-store directory is
+- [x] When the repo resolves, the pinned run-store directory is
       `<git-root>/.agent-pipeline/runs/<run-id>`; a launch from a subdirectory of a repo pins
       the run store at the repo root, and no code path derives it from an unvalidated cwd.
-- [ ] Existing detached-launch behavior is otherwise unchanged: successful launches still
+- [x] Existing detached-launch behavior is otherwise unchanged: successful launches still
       print the wrapper dir on stdout, still write `run-store.json`, still forward
       `--run-id`/`--json-events`/lifecycle flags, and still exit 0.
-- [ ] `core/test/` contains a regression test that fails on the pre-fix code (launcher exits
+- [x] `core/test/` contains a regression test that fails on the pre-fix code (launcher exits
       0 and creates a wrapper dir) and passes after.
-- [ ] `npm run ci` passes from the repo root with the `plugin/` mirror in sync.
+- [x] `npm run ci` passes from the repo root with the `plugin/` mirror in sync.
