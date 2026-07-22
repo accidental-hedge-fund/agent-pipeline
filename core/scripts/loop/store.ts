@@ -20,7 +20,7 @@ import {
   type LoopLockRecord,
 } from "./types.ts";
 
-export const PIPELINE_STATE_HOME_ENV = "PIPELINE_STATE_HOME";
+export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
 
 /** Injectable I/O seam for the durable loop store. All paths are absolute. */
 export interface LoopStoreDeps {
@@ -36,9 +36,17 @@ export interface LoopStoreDeps {
    *  atomic against concurrent callers — this is the store's sole exclusivity
    *  primitive for lock acquisition and run initialization. */
   createFileExclusive(p: string, content: string): Promise<boolean>;
-  /** Removes `p` if it exists. Used to release/recover a lock so a subsequent
-   *  {@link createFileExclusive} can succeed. A no-op when `p` is absent. */
+  /** Removes `p` if it exists. A no-op when `p` is absent. Lock release and
+   *  recovery use {@link removeFileIfMatches} instead, so a stale-lock
+   *  observation can never delete a record it did not itself last read. */
   removeFile(p: string): Promise<void>;
+  /** Removes `p` only if its current content is byte-identical to
+   *  `expectedContent`; otherwise leaves `p` untouched. Returns `true` when it
+   *  removed the file, `false` when `p` was absent or had already changed.
+   *  MUST be atomic against a concurrent write/remove of `p` — this is the
+   *  store's compare-and-delete primitive for lock recovery/release, so a
+   *  holder can never remove a lock record it did not itself last observe. */
+  removeFileIfMatches(p: string, expectedContent: string): Promise<boolean>;
   /** Append `line` (without trailing newline) as a new line to `p`, creating
    *  the file if absent. MUST NOT rewrite existing bytes. */
   appendLine(p: string, line: string): Promise<void>;
@@ -67,8 +75,25 @@ export function resolveStateHome(deps: Pick<LoopStoreDeps, "env" | "hostname">):
   return path.join(homedir(), ".local", "state", "agent-pipeline", "loop");
 }
 
+// Run ids are used as a bare path segment under `<state-home>/runs/`. Reject
+// anything that could traverse out of that root (path separators, ".", "..")
+// before it ever reaches a filesystem call.
+const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
+
+function assertSafeRunId(runId: string): void {
+  if (!SAFE_RUN_ID.test(runId) || runId === "." || runId === ".." || runId.includes("..")) {
+    throw new LoopError("validation", `invalid run id "${runId}": must be a bare name with no path separators or ".."`);
+  }
+}
+
 export function runDir(deps: Pick<LoopStoreDeps, "env" | "hostname">, runId: string): string {
-  return path.join(resolveStateHome(deps), "runs", runId);
+  assertSafeRunId(runId);
+  const root = path.join(resolveStateHome(deps), "runs");
+  const dir = path.join(root, runId);
+  if (!(dir + path.sep).startsWith(root + path.sep)) {
+    throw new LoopError("validation", `invalid run id "${runId}": resolves outside the runs root`);
+  }
+  return dir;
 }
 
 function contractPath(dir: string): string {
@@ -96,24 +121,38 @@ export async function runExists(deps: LoopStoreDeps, runId: string): Promise<boo
 }
 
 /** Initializes a fresh run directory with the given contract + seeded ledger.
- *  Refuses (LoopError "conflict") when the run's contract already exists —
- *  never overwrites. The contract's exclusive creation is the concurrency
- *  gate: concurrent initRun calls both `mkdirp` (idempotent) but only one can
- *  win the exclusive create, so a crash between mkdirp and the exclusive
- *  create never permanently wedges the run id — a later caller still wins
- *  the gate cleanly. */
+ *  Refuses (LoopError "conflict") when the run already has a ledger — never
+ *  overwrites a genuinely initialized run. The contract's exclusive creation
+ *  is the concurrency gate: concurrent initRun calls both `mkdirp` (idempotent)
+ *  but only one can win the exclusive create, so a crash between mkdirp and
+ *  the exclusive create never permanently wedges the run id — a later caller
+ *  still wins the gate cleanly.
+ *
+ *  A run id is canonical, so a caller cannot fall back to a different id if a
+ *  prior attempt won the contract-creation gate but crashed before the
+ *  ledger/event were written. initRun therefore treats "contract exists, no
+ *  ledger yet" as a stranded partial init and completes it — rather than
+ *  refusing that run id forever. */
 export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledger: LoopLedger): Promise<void> {
   const dir = runDir(deps, contract.run_id);
   await deps.mkdirp(dir);
   const created = await deps.createFileExclusive(contractPath(dir), JSON.stringify(contract, null, 2));
   if (!created) {
-    throw new LoopError(
-      "conflict",
-      `loop run "${contract.run_id}" already exists — resume it instead of re-initializing`,
-    );
+    const ledgerExists = await deps.fsExists(ledgerPath(dir));
+    if (ledgerExists) {
+      throw new LoopError(
+        "conflict",
+        `loop run "${contract.run_id}" already exists — resume it instead of re-initializing`,
+      );
+    }
+    // Contract marker exists but the ledger never landed — complete the
+    // stranded init below instead of refusing.
   }
   await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(ledger, null, 2));
-  await appendEventUnchecked(deps, contract.run_id, "run_initialized", { run_id: contract.run_id, engine: contract.engine });
+  const eventsAlreadyWritten = await deps.readTextFile(eventsPath(dir));
+  if (!eventsAlreadyWritten) {
+    await appendEventUnchecked(deps, contract.run_id, "run_initialized", { run_id: contract.run_id, engine: contract.engine });
+  }
 }
 
 export async function readContract(deps: LoopStoreDeps, runId: string): Promise<LoopContract> {
@@ -158,17 +197,30 @@ async function nextSeq(deps: LoopStoreDeps, logPath: string): Promise<number> {
   return lines.length;
 }
 
+// Reservation + write for a given log path must not interleave: two
+// concurrent appendLog calls for the same path would otherwise both read the
+// same nextSeq before either commits, producing duplicate sequence numbers.
+// This chain serializes append calls per log path within this process (the
+// single-engine-lock-holder invariant means only one process ever appends to
+// a given run's logs at a time, so per-process serialization is sufficient).
+const appendQueues = new Map<string, Promise<unknown>>();
+
 async function appendLog(
   deps: LoopStoreDeps,
   logPath: string,
   kind: string,
   data: unknown,
 ): Promise<LoopEvent | LoopDecision> {
-  const seq = await nextSeq(deps, logPath);
-  const record = { seq, time: deps.now().toISOString(), kind, data };
-  await deps.appendLine(logPath, JSON.stringify(record));
-  nextSeqCache.set(logPath, seq + 1);
-  return record;
+  const prior = appendQueues.get(logPath) ?? Promise.resolve();
+  const task = prior.catch(() => {}).then(async () => {
+    const seq = await nextSeq(deps, logPath);
+    const record = { seq, time: deps.now().toISOString(), kind, data };
+    await deps.appendLine(logPath, JSON.stringify(record));
+    nextSeqCache.set(logPath, seq + 1);
+    return record;
+  });
+  appendQueues.set(logPath, task);
+  return task;
 }
 
 /** Appends an event without requiring a lock token. Reserved for the store's
@@ -276,14 +328,27 @@ export async function requireToken(deps: LoopStoreDeps, runId: string, token: st
   return lock;
 }
 
+/** Releases the lock. Uses compare-and-delete against the exact record this
+ *  call observed, so a holder can never remove a lock that a concurrent
+ *  recovery has already superseded (see {@link recoverLock}). */
 export async function releaseLock(deps: LoopStoreDeps, runId: string, token: string): Promise<void> {
-  await requireToken(deps, runId, token);
-  await deps.removeFile(lockPath(runDir(deps, runId)));
+  const lock = await requireToken(deps, runId, token);
+  const removed = await deps.removeFileIfMatches(lockPath(runDir(deps, runId)), JSON.stringify(lock, null, 2));
+  if (!removed) {
+    throw new LoopError("lock", `loop run "${runId}": lock was already superseded by another holder`);
+  }
 }
 
 /** Recovers (removes) a stale lock. Refuses without `force` unless staleness
  *  is `stale_same_host_dead_pid`. Never transfers the token — the recovering
- *  caller must acquire a fresh lock afterward. Records a recovery event. */
+ *  caller must acquire a fresh lock afterward. Records a recovery event.
+ *
+ *  Uses compare-and-delete against the exact lock record this call classified
+ *  as stale (see {@link LoopStoreDeps.removeFileIfMatches}): if a concurrent
+ *  recovery already removed and a new holder already re-acquired the lock,
+ *  this call's removal is a no-op instead of deleting the new holder's lock —
+ *  closing the ABA race where two racing recoveries could otherwise strip a
+ *  lock that a third engine had already legitimately acquired. */
 export async function recoverLock(
   deps: LoopStoreDeps,
   runId: string,
@@ -299,7 +364,8 @@ export async function recoverLock(
       `loop run "${runId}": lock held by ${lock.engine} pid ${lock.pid} on ${lock.hostname} is not verifiably stale — refusing recovery without force`,
     );
   }
-  await deps.removeFile(lockPath(runDir(deps, runId)));
+  const removed = await deps.removeFileIfMatches(lockPath(runDir(deps, runId)), JSON.stringify(lock, null, 2));
+  if (!removed) return; // superseded by a concurrent recovery — nothing left to recover
   await appendEventUnchecked(deps, runId, "lock_recovered", {
     previous_holder: { engine: lock.engine, pid: lock.pid, hostname: lock.hostname },
     reason: force && staleness !== "stale_same_host_dead_pid" ? `${reason} (forced)` : reason,

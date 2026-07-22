@@ -36,15 +36,15 @@ let fakeDepsCounter = 0;
 
 /** The store keeps an in-process next-sequence cache keyed by absolute log
  *  path (store.ts's `nextSeqCache`) — each fakeDeps() call gets its own
- *  PIPELINE_STATE_HOME so distinct tests never collide on the same cache
- *  entry despite reusing run id "run-1". */
+ *  AGENT_PIPELINE_STATE_HOME so distinct tests never collide on the same
+ *  cache entry despite reusing run id "run-1". */
 function fakeDeps(overrides: Partial<LoopStoreDeps> = {}): { deps: LoopStoreDeps; files: Map<string, string>; writes: string[] } {
   const files = new Map<string, string>();
   const writes: string[] = [];
   let clock = new Date("2026-07-22T00:00:00.000Z").getTime();
   let uuidCounter = 0;
   const alivePids = new Set<number>([111]);
-  const isolatedEnv = { PIPELINE_STATE_HOME: `/state-${fakeDepsCounter++}` };
+  const isolatedEnv = { AGENT_PIPELINE_STATE_HOME: `/state-${fakeDepsCounter++}` };
 
   const deps: LoopStoreDeps = {
     async fsExists(p) {
@@ -65,6 +65,11 @@ function fakeDeps(overrides: Partial<LoopStoreDeps> = {}): { deps: LoopStoreDeps
     },
     async removeFile(p) {
       files.delete(p);
+    },
+    async removeFileIfMatches(p, expectedContent) {
+      if (files.get(p) !== expectedContent) return false;
+      files.delete(p);
+      return true;
     },
     async appendLine(p, line) {
       writes.push(p);
@@ -131,7 +136,7 @@ function testLedger(runId = "run-1"): LoopLedger {
 // ---------------------------------------------------------------------------
 
 test("resolveStateHome: explicit override wins", () => {
-  const { deps } = fakeDeps({ env: { PIPELINE_STATE_HOME: "/custom/home" } });
+  const { deps } = fakeDeps({ env: { AGENT_PIPELINE_STATE_HOME: "/custom/home" } });
   assert.equal(resolveStateHome(deps), "/custom/home");
 });
 
@@ -143,6 +148,27 @@ test("resolveStateHome: falls back to XDG_STATE_HOME", () => {
 test("resolveStateHome: falls back to home-relative default", () => {
   const { deps } = fakeDeps({ env: {} });
   assert.ok(resolveStateHome(deps).endsWith("/.local/state/agent-pipeline/loop"));
+});
+
+// ---------------------------------------------------------------------------
+// Run id validation — must never escape <state-home>/runs
+// ---------------------------------------------------------------------------
+
+test("runDir refuses a run id that would traverse outside the runs root", () => {
+  const { deps } = fakeDeps();
+  for (const bad of ["../../../goal-loop/runs/victim", "..", ".", "a/b", "a\\b", ""]) {
+    assert.throws(() => runDir(deps, bad), (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "validation");
+      return true;
+    });
+  }
+});
+
+test("initRun refuses a malicious run id before creating anything", async () => {
+  const { deps, files } = fakeDeps();
+  await assert.rejects(() => initRun(deps, testContract("../../etc/victim"), testLedger("../../etc/victim")));
+  assert.equal(files.size, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -194,6 +220,21 @@ test("initRun: a crash between mkdirp and the exclusive create does not permanen
   await initRun(deps, testContract(), testLedger());
   assert.ok(files.has(`${dir}/contract.json`));
   assert.ok(files.has(`${dir}/ledger.json`));
+});
+
+test("initRun completes a stranded partial init (contract exists, ledger missing) instead of refusing forever", async () => {
+  const { deps, files } = fakeDeps();
+  const dir = runDir(deps, "run-1");
+  await deps.mkdirp(dir);
+  // Simulate a prior initRun that won the exclusive contract create but
+  // crashed before the ledger/event were written — run identity is
+  // canonical, so a retry must complete this run id rather than refuse it.
+  await deps.createFileExclusive(`${dir}/contract.json`, JSON.stringify(testContract(), null, 2));
+  await initRun(deps, testContract(), testLedger());
+  assert.ok(files.has(`${dir}/ledger.json`));
+  const events = await readEvents(deps, "run-1");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, "run_initialized");
 });
 
 test("readContract / readLedger round-trip", async () => {
@@ -269,6 +310,19 @@ test("appending a log never rewrites prior bytes", async () => {
   const after = files.get(`${dir}/events.jsonl`)!;
   assert.ok(after.startsWith(before));
   assert.equal(after.split("\n").filter((l) => l.length > 0).length, before.split("\n").filter((l) => l.length > 0).length + 1);
+});
+
+test("concurrent appendEvent calls under one valid holder never produce duplicate sequence numbers", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract(), testLedger()); // seq 0: run_initialized
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await Promise.all(
+    Array.from({ length: 10 }, (_, i) => appendEvent(deps, "run-1", token, `e${i}`, { i })),
+  );
+  const events = await readEvents(deps, "run-1");
+  assert.equal(events.length, 11);
+  const seqs = events.map((e) => e.seq).sort((a, b) => a - b);
+  assert.deepEqual(seqs, Array.from({ length: 11 }, (_, i) => i));
 });
 
 test("decisions log is independent of the events log sequence", async () => {
@@ -398,6 +452,29 @@ test("recoverLock: recovers a dead same-host holder, emits an event, and invalid
   await assert.rejects(() => requireToken(deps, "run-1", oldToken));
   const fresh = await acquireLock(deps, "run-1", "codex");
   assert.notEqual(fresh.token, oldToken);
+});
+
+test("recoverLock: a second stale recovery of an already-superseded lock does not strip the new holder (ABA race)", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract(), testLedger());
+  await acquireLock(deps, "run-1", "claude"); // L1, dead
+  const deadDeps = { ...deps, isPidAlive: async () => false };
+
+  // Two recoveries both observe L1 as stale before either removes it.
+  const l1 = await readLock(deadDeps, "run-1");
+  const staleness1 = await classifyStaleness(deadDeps, l1!);
+  assert.equal(staleness1, "stale_same_host_dead_pid");
+
+  // First recovery actually runs, removes L1, and a fresh holder acquires L2.
+  await recoverLock(deadDeps, "run-1", "recovery-1");
+  const { token: l2Token } = await acquireLock(deps, "run-1", "codex"); // L2, alive by default fake
+
+  // Second recovery resumes with its stale L1 snapshot and must not remove L2.
+  const removed = await deadDeps.removeFileIfMatches(`${runDir(deadDeps, "run-1")}/lock.json`, JSON.stringify(l1, null, 2));
+  assert.equal(removed, false);
+  const stillLocked = await readLock(deps, "run-1");
+  assert.ok(stillLocked);
+  assert.equal(stillLocked!.token, l2Token);
 });
 
 test("recoverLock: a cross-host lock is never auto-recovered without force", async () => {
