@@ -57,6 +57,15 @@ function fakeDeps(overrides: Partial<LoopStoreDeps> = {}): { deps: LoopStoreDeps
       writes.push(p);
       files.set(p, content);
     },
+    async createFileExclusive(p, content) {
+      if (files.has(p)) return false;
+      writes.push(p);
+      files.set(p, content);
+      return true;
+    },
+    async removeFile(p) {
+      files.delete(p);
+    },
     async appendLine(p, line) {
       writes.push(p);
       const existing = files.get(p) ?? "";
@@ -161,6 +170,32 @@ test("initRun refuses when the run directory already exists (conflict)", async (
   });
 });
 
+test("initRun: two racing initializations of the same run id, exactly one succeeds", async () => {
+  const { deps, files } = fakeDeps();
+  const results = await Promise.allSettled([
+    initRun(deps, testContract(), testLedger()),
+    initRun(deps, testContract(), testLedger()),
+  ]);
+  const fulfilled = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected");
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.ok((rejected[0] as PromiseRejectedResult).reason instanceof LoopError);
+  assert.equal((rejected[0] as PromiseRejectedResult).reason.loopFailureClass, "conflict");
+  const dir = runDir(deps, "run-1");
+  assert.ok(files.has(`${dir}/contract.json`));
+  assert.ok(files.has(`${dir}/ledger.json`));
+});
+
+test("initRun: a crash between mkdirp and the exclusive create does not permanently wedge the run id", async () => {
+  const { deps, files } = fakeDeps();
+  const dir = runDir(deps, "run-1");
+  await deps.mkdirp(dir); // simulate a prior process that created the dir but never wrote contract.json
+  await initRun(deps, testContract(), testLedger());
+  assert.ok(files.has(`${dir}/contract.json`));
+  assert.ok(files.has(`${dir}/ledger.json`));
+});
+
 test("readContract / readLedger round-trip", async () => {
   const { deps } = fakeDeps();
   await initRun(deps, testContract(), testLedger());
@@ -185,11 +220,29 @@ test("runExists reflects presence", async () => {
 test("writeLedger overwrites atomically and is readable back", async () => {
   const { deps } = fakeDeps();
   await initRun(deps, testContract(), testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
   const ledger = await readLedger(deps, "run-1");
   ledger.items["100"].state = "in_progress";
-  await writeLedger(deps, ledger);
+  await writeLedger(deps, ledger, token);
   const reread = await readLedger(deps, "run-1");
   assert.equal(reread.items["100"].state, "in_progress");
+});
+
+test("writeLedger refuses an absent or mismatched token", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract(), testLedger());
+  const ledger = await readLedger(deps, "run-1");
+  await assert.rejects(() => writeLedger(deps, ledger, "no-such-token"), (err: unknown) => {
+    assert.ok(err instanceof LoopError);
+    assert.equal(err.loopFailureClass, "lock");
+    return true;
+  });
+  await acquireLock(deps, "run-1", "claude");
+  await assert.rejects(() => writeLedger(deps, ledger, "wrong-token"), (err: unknown) => {
+    assert.ok(err instanceof LoopError);
+    assert.equal(err.loopFailureClass, "lock");
+    return true;
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -199,8 +252,9 @@ test("writeLedger overwrites atomically and is readable back", async () => {
 test("events get dense 0-based sequence numbers", async () => {
   const { deps } = fakeDeps();
   await initRun(deps, testContract(), testLedger()); // seq 0: run_initialized
-  await appendEvent(deps, "run-1", "a", {});
-  await appendEvent(deps, "run-1", "b", {});
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await appendEvent(deps, "run-1", token, "a", {});
+  await appendEvent(deps, "run-1", token, "b", {});
   const events = await readEvents(deps, "run-1");
   assert.deepEqual(events.map((e) => e.seq), [0, 1, 2]);
 });
@@ -208,9 +262,10 @@ test("events get dense 0-based sequence numbers", async () => {
 test("appending a log never rewrites prior bytes", async () => {
   const { deps, files } = fakeDeps();
   await initRun(deps, testContract(), testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
   const dir = runDir(deps, "run-1");
   const before = files.get(`${dir}/events.jsonl`)!;
-  await appendEvent(deps, "run-1", "next", { x: 1 });
+  await appendEvent(deps, "run-1", token, "next", { x: 1 });
   const after = files.get(`${dir}/events.jsonl`)!;
   assert.ok(after.startsWith(before));
   assert.equal(after.split("\n").filter((l) => l.length > 0).length, before.split("\n").filter((l) => l.length > 0).length + 1);
@@ -219,11 +274,29 @@ test("appending a log never rewrites prior bytes", async () => {
 test("decisions log is independent of the events log sequence", async () => {
   const { deps } = fakeDeps();
   await initRun(deps, testContract(), testLedger());
-  await appendEvent(deps, "run-1", "e1", {});
-  await appendDecision(deps, "run-1", "d1", {});
-  await appendDecision(deps, "run-1", "d2", {});
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await appendEvent(deps, "run-1", token, "e1", {});
+  await appendDecision(deps, "run-1", token, "d1", {});
+  await appendDecision(deps, "run-1", token, "d2", {});
   const decisions = await readDecisions(deps, "run-1");
   assert.deepEqual(decisions.map((d) => d.seq), [0, 1]);
+});
+
+test("appendEvent and appendDecision refuse an absent or mismatched token", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract(), testLedger());
+  await assert.rejects(() => appendEvent(deps, "run-1", "no-such-token", "a", {}), (err: unknown) => {
+    assert.ok(err instanceof LoopError);
+    assert.equal(err.loopFailureClass, "lock");
+    return true;
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await assert.rejects(() => appendDecision(deps, "run-1", "wrong-token", "d", {}), (err: unknown) => {
+    assert.ok(err instanceof LoopError);
+    assert.equal(err.loopFailureClass, "lock");
+    return true;
+  });
+  await appendEvent(deps, "run-1", token, "a", {});
 });
 
 // ---------------------------------------------------------------------------
@@ -241,6 +314,22 @@ test("acquireLock returns a token and a second acquisition is refused naming the
     assert.match((err as Error).message, /claude pid 111/);
     return true;
   });
+});
+
+test("acquireLock: two racing acquisitions that both observe no lock, exactly one succeeds", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract(), testLedger());
+  // Both callers observe "no lock" before either writes — createFileExclusive
+  // is the only thing that can arbitrate between them.
+  assert.equal(await readLock(deps, "run-1"), null);
+  assert.equal(await readLock(deps, "run-1"), null);
+  const results = await Promise.allSettled([acquireLock(deps, "run-1", "claude"), acquireLock(deps, "run-1", "codex")]);
+  const fulfilled = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected");
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.ok((rejected[0] as PromiseRejectedResult).reason instanceof LoopError);
+  assert.equal((rejected[0] as PromiseRejectedResult).reason.loopFailureClass, "lock");
 });
 
 test("requireToken refuses a mismatched or absent token, naming the holder", async () => {

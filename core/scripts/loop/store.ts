@@ -30,6 +30,15 @@ export interface LoopStoreDeps {
    *  flushed, then renamed into place. Implementations MUST NOT leave a
    *  partially-written `p` visible to a concurrent reader. */
   writeFileAtomic(p: string, content: string): Promise<void>;
+  /** Creates `p` with `content` only if it does not already exist (e.g. `open`
+   *  with `O_EXCL`). Returns `true` when this call created the file, `false`
+   *  when `p` already existed (in which case `p` is left untouched). MUST be
+   *  atomic against concurrent callers — this is the store's sole exclusivity
+   *  primitive for lock acquisition and run initialization. */
+  createFileExclusive(p: string, content: string): Promise<boolean>;
+  /** Removes `p` if it exists. Used to release/recover a lock so a subsequent
+   *  {@link createFileExclusive} can succeed. A no-op when `p` is absent. */
+  removeFile(p: string): Promise<void>;
   /** Append `line` (without trailing newline) as a new line to `p`, creating
    *  the file if absent. MUST NOT rewrite existing bytes. */
   appendLine(p: string, line: string): Promise<void>;
@@ -83,24 +92,28 @@ function decisionsPath(dir: string): string {
 // ---------------------------------------------------------------------------
 
 export async function runExists(deps: LoopStoreDeps, runId: string): Promise<boolean> {
-  return deps.fsExists(runDir(deps, runId));
+  return deps.fsExists(contractPath(runDir(deps, runId)));
 }
 
 /** Initializes a fresh run directory with the given contract + seeded ledger.
- *  Refuses (LoopError "conflict") when the run directory already exists —
- *  never overwrites. */
+ *  Refuses (LoopError "conflict") when the run's contract already exists —
+ *  never overwrites. The contract's exclusive creation is the concurrency
+ *  gate: concurrent initRun calls both `mkdirp` (idempotent) but only one can
+ *  win the exclusive create, so a crash between mkdirp and the exclusive
+ *  create never permanently wedges the run id — a later caller still wins
+ *  the gate cleanly. */
 export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledger: LoopLedger): Promise<void> {
   const dir = runDir(deps, contract.run_id);
-  if (await deps.fsExists(dir)) {
+  await deps.mkdirp(dir);
+  const created = await deps.createFileExclusive(contractPath(dir), JSON.stringify(contract, null, 2));
+  if (!created) {
     throw new LoopError(
       "conflict",
       `loop run "${contract.run_id}" already exists — resume it instead of re-initializing`,
     );
   }
-  await deps.mkdirp(dir);
-  await deps.writeFileAtomic(contractPath(dir), JSON.stringify(contract, null, 2));
   await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(ledger, null, 2));
-  await appendEvent(deps, contract.run_id, "run_initialized", { run_id: contract.run_id, engine: contract.engine });
+  await appendEventUnchecked(deps, contract.run_id, "run_initialized", { run_id: contract.run_id, engine: contract.engine });
 }
 
 export async function readContract(deps: LoopStoreDeps, runId: string): Promise<LoopContract> {
@@ -121,7 +134,10 @@ export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<Lo
   return JSON.parse(text) as LoopLedger;
 }
 
-export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger): Promise<void> {
+/** Overwrites the run's ledger. Requires the current lock holder's `token` —
+ *  refuses (LoopError "lock") when it is absent or mismatched. */
+export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token: string): Promise<void> {
+  await requireToken(deps, ledger.run_id, token);
   const dir = runDir(deps, ledger.run_id);
   await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(ledger, null, 2));
 }
@@ -155,16 +171,31 @@ async function appendLog(
   return record;
 }
 
-export async function appendEvent(deps: LoopStoreDeps, runId: string, kind: string, data: unknown): Promise<LoopEvent> {
+/** Appends an event without requiring a lock token. Reserved for the store's
+ *  own narrowly-scoped lifecycle records (run init, lock recovery) that occur
+ *  when no holder token exists yet. Every other caller MUST use
+ *  {@link appendEvent}. */
+async function appendEventUnchecked(deps: LoopStoreDeps, runId: string, kind: string, data: unknown): Promise<LoopEvent> {
   return (await appendLog(deps, eventsPath(runDir(deps, runId)), kind, data)) as LoopEvent;
 }
 
+/** Appends an event. Requires the current lock holder's `token` — refuses
+ *  (LoopError "lock") when it is absent or mismatched. */
+export async function appendEvent(deps: LoopStoreDeps, runId: string, token: string, kind: string, data: unknown): Promise<LoopEvent> {
+  await requireToken(deps, runId, token);
+  return appendEventUnchecked(deps, runId, kind, data);
+}
+
+/** Appends a decision. Requires the current lock holder's `token` — refuses
+ *  (LoopError "lock") when it is absent or mismatched. */
 export async function appendDecision(
   deps: LoopStoreDeps,
   runId: string,
+  token: string,
   kind: string,
   data: unknown,
 ): Promise<LoopDecision> {
+  await requireToken(deps, runId, token);
   return (await appendLog(deps, decisionsPath(runDir(deps, runId)), kind, data)) as LoopDecision;
 }
 
@@ -196,9 +227,9 @@ export interface LockAcquireResult {
 
 export type LockStaleness = "not_stale" | "stale_same_host_dead_pid" | "unverifiable_cross_host";
 
-/** An empty lock file (written by release/recover) reads back as "no lock" —
- *  release and recovery overwrite with "" rather than deleting, so the same
- *  atomic-write primitive covers every lock state transition. */
+/** Release and recovery remove `lock.json` entirely (see {@link releaseLock},
+ *  {@link recoverLock}), so a subsequent {@link acquireLock} can win the
+ *  exclusive-create gate. An absent file reads back as "no lock". */
 export async function readLock(deps: LoopStoreDeps, runId: string): Promise<LoopLockRecord | null> {
   const text = await deps.readTextFile(lockPath(runDir(deps, runId)));
   return text ? (JSON.parse(text) as LoopLockRecord) : null;
@@ -210,18 +241,12 @@ export async function classifyStaleness(deps: LoopStoreDeps, lock: LoopLockRecor
   return alive ? "not_stale" : "stale_same_host_dead_pid";
 }
 
-/** Acquires the run's exclusive lock. Refuses (LoopError "lock") when a
- *  non-stale lock is already held, naming the holder. Exclusive-create
- *  semantics: a caller MUST check {@link readLock} is empty (or stale +
- *  explicitly recovered) before calling this — see {@link recoverLock}. */
+/** Acquires the run's exclusive lock via {@link LoopStoreDeps.createFileExclusive}
+ *  — of two concurrent acquisitions, exactly one wins the exclusive create and
+ *  the other observes the file already exists and refuses (LoopError "lock"),
+ *  naming the holder. A stale lock must be explicitly recovered first — see
+ *  {@link recoverLock}. */
 export async function acquireLock(deps: LoopStoreDeps, runId: string, engine: LoopLockRecord["engine"]): Promise<LockAcquireResult> {
-  const existing = await readLock(deps, runId);
-  if (existing) {
-    throw new LoopError(
-      "lock",
-      `loop run "${runId}" is already locked by ${existing.engine} pid ${existing.pid} on ${existing.hostname} (acquired ${existing.acquired_at})`,
-    );
-  }
   const token = deps.uuid();
   const record: LoopLockRecord = {
     engine,
@@ -231,7 +256,14 @@ export async function acquireLock(deps: LoopStoreDeps, runId: string, engine: Lo
     token,
     run_id: runId,
   };
-  await deps.writeFileAtomic(lockPath(runDir(deps, runId)), JSON.stringify(record, null, 2));
+  const created = await deps.createFileExclusive(lockPath(runDir(deps, runId)), JSON.stringify(record, null, 2));
+  if (!created) {
+    const existing = await readLock(deps, runId);
+    const holder = existing
+      ? `${existing.engine} pid ${existing.pid} on ${existing.hostname} (acquired ${existing.acquired_at})`
+      : "an existing holder";
+    throw new LoopError("lock", `loop run "${runId}" is already locked by ${holder}`);
+  }
   return { token, record };
 }
 
@@ -246,8 +278,7 @@ export async function requireToken(deps: LoopStoreDeps, runId: string, token: st
 
 export async function releaseLock(deps: LoopStoreDeps, runId: string, token: string): Promise<void> {
   await requireToken(deps, runId, token);
-  await deps.writeFileAtomic(lockPath(runDir(deps, runId)), "");
-  // An empty lock file reads back as null via JSON.parse guard in readLock.
+  await deps.removeFile(lockPath(runDir(deps, runId)));
 }
 
 /** Recovers (removes) a stale lock. Refuses without `force` unless staleness
@@ -268,8 +299,8 @@ export async function recoverLock(
       `loop run "${runId}": lock held by ${lock.engine} pid ${lock.pid} on ${lock.hostname} is not verifiably stale — refusing recovery without force`,
     );
   }
-  await deps.writeFileAtomic(lockPath(runDir(deps, runId)), "");
-  await appendEvent(deps, runId, "lock_recovered", {
+  await deps.removeFile(lockPath(runDir(deps, runId)));
+  await appendEventUnchecked(deps, runId, "lock_recovered", {
     previous_holder: { engine: lock.engine, pid: lock.pid, hostname: lock.hostname },
     reason: force && staleness !== "stale_same_host_dead_pid" ? `${reason} (forced)` : reason,
   });
