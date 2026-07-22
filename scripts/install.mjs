@@ -377,8 +377,13 @@ function verifyUpdateLockOwnership(lockPath = UPDATE_LOCK_PATH) {
   return raw !== null && Number.parseInt(raw, 10) === process.pid;
 }
 
+/** Release the update lock ONLY if this process still owns it (#450 delta
+ *  finding cd279865): cleanup paths run on every exit, including after a
+ *  failed ownership verification — unconditionally unlinking here would
+ *  delete a third installer's legitimately held lock. */
 function releaseUpdateLock(lockPath = UPDATE_LOCK_PATH) {
   try {
+    if (!verifyUpdateLockOwnership(lockPath)) return;
     unlinkSync(lockPath);
   } catch {
     // already gone
@@ -994,13 +999,15 @@ async function main() {
       if (!acquireUpdateLock()) {
         fail("Another install/update is already in progress. Retry once it finishes.");
       }
-      holdingUpdateLock = true;
-      // Pre-copy ownership verification (#450 delta f8bda4a3): a concurrent
-      // stale-reclaim can displace a freshly acquired lock; confirm the lock
-      // still carries our pid before any file is touched.
+      // Pre-copy ownership verification (#450 delta f8bda4a3/cd279865): a
+      // concurrent stale-reclaim can displace a freshly acquired lock. Confirm
+      // the lock still carries our pid BEFORE marking it held — a failed
+      // verification must exit without cleanup releasing a lock now owned by
+      // a different installer (releaseUpdateLock is ownership-guarded too).
       if (!verifyUpdateLockOwnership()) {
         fail("Another install/update displaced the update lock. Retry once it finishes.");
       }
+      holdingUpdateLock = true;
       const liveLocks = findLiveRunLocks();
       if (liveLocks.length > 0) {
         if (force) {

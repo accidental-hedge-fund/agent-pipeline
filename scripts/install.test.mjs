@@ -1484,3 +1484,19 @@ test("verifyUpdateLockOwnership: true only when the lock carries this process pi
     cleanup(dir);
   }
 });
+
+test("releaseUpdateLock: refuses to release a lock owned by another process (#450 delta cd279865)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-update-lock-test-"));
+  const lockPath = join(dir, "update.lock");
+  try {
+    writeFileSync(lockPath, "777777"); // a third installer's lock
+    releaseUpdateLock(lockPath);
+    assert.equal(existsSync(lockPath), true, "a foreign lock must survive cleanup");
+    assert.equal(readFileSync(lockPath, "utf8"), "777777", "the foreign lock content must be untouched");
+    writeFileSync(lockPath, String(process.pid));
+    releaseUpdateLock(lockPath);
+    assert.equal(existsSync(lockPath), false, "an owned lock must be released");
+  } finally {
+    cleanup(dir);
+  }
+});
