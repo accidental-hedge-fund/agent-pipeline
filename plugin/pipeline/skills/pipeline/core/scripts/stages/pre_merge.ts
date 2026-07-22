@@ -1077,7 +1077,7 @@ export type RunDeltaReviewFn = (
  * verification context's evidence surface. Returns one entry per requested
  * `path`, in the same order, so unit tests can assert deterministically.
  */
-export type ReadHeadFilesFn = (worktreePath: string, paths: string[]) => Promise<HeadFileState[]>;
+export type ReadHeadFilesFn = (worktreePath: string, treeSha: string, paths: string[]) => Promise<HeadFileState[]>;
 
 /** Per-file byte cap for the HEAD file-state injection (#496 design.md
  *  Decision 3), next to the existing 50KB diff cap so the total prompt
@@ -1086,95 +1086,42 @@ export const HEAD_FILE_PER_FILE_CAP = 8_000;
 /** Total byte cap across all injected HEAD files (#496 design.md Decision 3). */
 export const HEAD_FILE_TOTAL_CAP = 24_000;
 
-/**
- * Resolves `p` (a surface's file component, sourced from untrusted prior
- * review history) against `worktreePath` and returns the resolved path only
- * if it stays within the worktree root (#496 finding cdd406db) — an absolute
- * path or a `..`-escaping surface like `../../.ssh/id_rsa` returns `null` so
- * the caller renders it as not-present rather than reading outside the
- * managed worktree.
- */
-function resolveWithinWorktree(worktreePath: string, p: string): string | null {
-  if (typeof worktreePath !== "string" || typeof p !== "string") return null;
-  if (path.isAbsolute(p)) return null;
-  const normalized = path.normalize(p);
-  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) return null;
-  const root = path.resolve(worktreePath);
-  const resolved = path.resolve(root, normalized);
-  const rel = path.relative(root, resolved);
-  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  return resolved;
-}
-
-/** Discriminated result of {@link realpathWithinWorktree} (#496 finding
- *  73a71b80): callers need to tell a genuinely absent file (`"not-found"` —
- *  citable deletion evidence) apart from an indeterminate one (`"unreadable"`
- *  or `"rejected"`), which the prior boolean-ish `string | null` return
- *  collapsed into a single case. */
-type RealpathResult = { ok: true; path: string } | { ok: false; reason: "not-found" | "unreadable" | "rejected" };
-
-/**
- * Canonicalizes `resolvedPath` (already lexically confirmed within
- * `worktreePath` by {@link resolveWithinWorktree}) via `realpath` and
- * verifies the canonical target still resolves beneath the worktree root
- * (#496 finding 702a99fc) — a symlink at `resolvedPath` or any of its parent
- * components that points outside the worktree is reported `"rejected"`
- * instead of the symlink's target, so such a path is rendered not-present
- * rather than read. A `resolvedPath` that simply does not exist on disk is
- * reported `"not-found"`, distinct from a `"rejected"` escape or an
- * `"unreadable"` realpath failure for another reason (e.g. permissions).
- */
-async function realpathWithinWorktree(worktreePath: string, resolvedPath: string): Promise<RealpathResult> {
-  let realRoot: string;
-  let realCandidate: string;
-  try {
-    realRoot = await fs.promises.realpath(path.resolve(worktreePath));
-  } catch {
-    return { ok: false, reason: "unreadable" };
-  }
-  try {
-    realCandidate = await fs.promises.realpath(resolvedPath);
-  } catch (err) {
-    const reason = (err as NodeJS.ErrnoException)?.code === "ENOENT" ? "not-found" : "unreadable";
-    return { ok: false, reason };
-  }
-  const rel = path.relative(realRoot, realCandidate);
-  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return { ok: false, reason: "rejected" };
-  return { ok: true, path: realCandidate };
-}
-
 /** Default implementation of the `readHeadFiles` seam (#496): reads each
- *  requested path from `worktreePath` on disk, bounded by
- *  {@link HEAD_FILE_PER_FILE_CAP} and {@link HEAD_FILE_TOTAL_CAP}. A missing
- *  or unreadable file yields `present: false` rather than throwing or being
- *  omitted (design.md Decision 3 — a deleted file is itself evidence). A path
- *  that resolves outside `worktreePath` is rejected the same way, without
- *  being read (#496 finding cdd406db), as is a path that resolves inside the
- *  worktree lexically but whose realpath (following symlinks) escapes it
- *  (#496 finding 702a99fc). */
-export async function defaultReadHeadFiles(worktreePath: string, paths: string[]): Promise<HeadFileState[]> {
+ *  requested path from the IMMUTABLE reviewed Git tree (`git show
+ *  <treeSha>:<path>`), never from the mutable worktree filesystem — so no
+ *  concurrent writer, symlink swap, or validation-to-read race can inject
+ *  external content or fake deletion evidence (#496 delta finding 8f981a57);
+ *  the object store is the security boundary. Bounded by
+ *  {@link HEAD_FILE_PER_FILE_CAP} and {@link HEAD_FILE_TOTAL_CAP}. A path
+ *  absent from the tree yields `present: false` with `"not-found"` — citable
+ *  deletion evidence (design.md Decision 3). A traversal-shaped path is
+ *  `"rejected"` without ever reaching git (#496 finding cdd406db); symlinks
+ *  in the tree are blobs of link text, not followed (#496 finding 702a99fc).
+ */
+export async function defaultReadHeadFiles(
+  worktreePath: string,
+  treeSha: string,
+  paths: string[],
+  gitFn: typeof gitInWorktree = gitInWorktree,
+): Promise<HeadFileState[]> {
   const results: HeadFileState[] = [];
   let totalUsed = 0;
   for (const p of paths) {
-    const resolvedPath = resolveWithinWorktree(worktreePath, p);
-    if (resolvedPath === null) {
+    const rel = path.posix.normalize(p.split(path.sep).join(path.posix.sep));
+    if (rel === "" || rel === "." || rel.startsWith("..") || path.posix.isAbsolute(rel)) {
       results.push({ path: p, content: "", truncated: false, present: false, absenceReason: "rejected" });
       continue;
     }
-    const realpathResult = await realpathWithinWorktree(worktreePath, resolvedPath);
-    if (!realpathResult.ok) {
-      results.push({ path: p, content: "", truncated: false, present: false, absenceReason: realpathResult.reason });
-      continue;
-    }
-    let raw: string;
-    try {
-      raw = await fs.promises.readFile(realpathResult.path, "utf8");
-    } catch (err) {
-      const absenceReason = (err as NodeJS.ErrnoException)?.code === "ENOENT" ? "not-found" : "unreadable";
+    const shown = await gitFn(worktreePath, ["show", `${treeSha}:${rel}`], { ignoreFailure: true });
+    if (shown.code !== 0) {
+      const absenceReason =
+        /does not exist|exists on disk, but not in|invalid object name|not a valid object name/i.test(shown.stderr)
+          ? "not-found"
+          : "unreadable";
       results.push({ path: p, content: "", truncated: false, present: false, absenceReason });
       continue;
     }
-    let content = raw;
+    let content = shown.stdout;
     let truncated = false;
     if (content.length > HEAD_FILE_PER_FILE_CAP) {
       content = content.slice(0, HEAD_FILE_PER_FILE_CAP);
@@ -1772,7 +1719,7 @@ export async function enforceReviewShaGate(
         // Decision 5) — the delta prompt stays byte-identical to before #496.
         settledVerification = settledFindingsVerification(priorRoundsDigest);
         headFiles = settledVerification.length > 0
-          ? await readHeadFilesFn(deltaWorktreePath, settledFindingsSurfaceFiles(settledVerification))
+          ? await readHeadFilesFn(deltaWorktreePath, targetHead, settledFindingsSurfaceFiles(settledVerification))
           : [];
         deltaResult = await runDeltaReviewFn(
           cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
@@ -2029,7 +1976,7 @@ export async function enforceReviewShaGate(
             const reSettled = settledFindings(reReviewDigest);
             const reSettledVerification = settledFindingsVerification(reReviewDigest);
             const reHeadFiles = reSettledVerification.length > 0
-              ? await readHeadFilesFn(deltaWorktreePath, settledFindingsSurfaceFiles(reSettledVerification))
+              ? await readHeadFilesFn(deltaWorktreePath, newPrHead, settledFindingsSurfaceFiles(reSettledVerification))
               : [];
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,

@@ -154,62 +154,51 @@ test("settledFindingsSurfaceFiles: empty entries yields no files", () => {
 // defaultReadHeadFiles: worktree-root escape guard (#496 finding cdd406db)
 // ---------------------------------------------------------------------------
 
-test("defaultReadHeadFiles: a surface escaping the worktree root is rendered not-present, never read from disk", async () => {
-  const worktree = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-wt-"));
-  const outside = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-outside-"));
+test("defaultReadHeadFiles: a traversal-shaped surface is rejected without ever reaching git (#496 finding cdd406db)", async () => {
+  const asked: string[] = [];
+  const gitFn = (async (_cwd: string, args: string[]) => {
+    asked.push(args[1]);
+    return { stdout: "tree-content", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+  const results = await defaultReadHeadFiles("/wt", "abc1234", ["../../.ssh/id_rsa", "/etc/passwd", "core/in-scope.ts"], gitFn);
+  assert.equal(results.length, 3);
+  assert.deepEqual(results[0], { path: "../../.ssh/id_rsa", content: "", truncated: false, present: false, absenceReason: "rejected" });
+  assert.deepEqual(results[1], { path: "/etc/passwd", content: "", truncated: false, present: false, absenceReason: "rejected" });
+  assert.deepEqual(results[2], { path: "core/in-scope.ts", content: "tree-content", truncated: false, present: true });
+  assert.deepEqual(asked, ["abc1234:core/in-scope.ts"], "only the in-scope path may reach git, pinned to the reviewed tree");
+});
+
+test("defaultReadHeadFiles: content comes from the immutable reviewed tree, never the mutable worktree filesystem (#496 delta finding 8f981a57)", async () => {
+  // The read is `git show <sha>:<path>` against the object store: a concurrent
+  // writer swapping the on-disk file (or a parent) for an escaping symlink
+  // after validation cannot alter what the reviewer sees, because no
+  // filesystem read ever occurs — there is no validation-to-read window.
+  const worktree = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-immutable-"));
   try {
-    await writeFile(join(outside, "secret.txt"), "outside-secret-content", "utf8");
     await mkdir(join(worktree, "core"), { recursive: true });
-    await writeFile(join(worktree, "core", "in-scope.ts"), "in-scope-content", "utf8");
-
-    const relativeEscape = join("..", join(outside, "secret.txt").slice(1));
-    const results = await defaultReadHeadFiles(worktree, [
-      "../../.ssh/id_rsa",
-      relativeEscape,
-      "core/in-scope.ts",
-    ]);
-
-    assert.equal(results.length, 3);
-    assert.deepEqual(results[0], { path: "../../.ssh/id_rsa", content: "", truncated: false, present: false, absenceReason: "rejected" });
-    assert.equal(results[1].present, false, "an escaping relative path must not be read");
-    assert.equal(results[1].content, "");
-    assert.deepEqual(results[2], { path: "core/in-scope.ts", content: "in-scope-content", truncated: false, present: true });
+    await writeFile(join(worktree, "core", "settled.ts"), "MUTATED-DISK-CONTENT", "utf8");
+    const gitFn = (async (_cwd: string, _args: string[]) => ({ stdout: "REVIEWED-TREE-CONTENT", stderr: "", code: 0 })) as typeof import("../scripts/worktree.ts").gitInWorktree;
+    const results = await defaultReadHeadFiles(worktree, "abc1234", ["core/settled.ts"], gitFn);
+    assert.equal(results[0].present, true);
+    assert.equal(results[0].content, "REVIEWED-TREE-CONTENT", "the reviewed tree blob is authoritative");
+    assert.ok(!results[0].content.includes("MUTATED-DISK-CONTENT"), "disk content must never enter the result");
   } finally {
     await rm(worktree, { recursive: true, force: true });
-    await rm(outside, { recursive: true, force: true });
   }
 });
 
-test("defaultReadHeadFiles: a symlink whose settled path points outside the worktree is rendered not-present, never followed (#496 finding 702a99fc)", async () => {
-  const worktree = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-symlink-wt-"));
-  const outside = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-symlink-outside-"));
-  try {
-    await writeFile(join(outside, "secret.txt"), "outside-secret-content", "utf8");
-    await mkdir(join(worktree, "core"), { recursive: true });
-    await symlink(join(outside, "secret.txt"), join(worktree, "core", "settled.ts"));
-
-    const results = await defaultReadHeadFiles(worktree, ["core/settled.ts"]);
-
-    assert.equal(results.length, 1);
-    assert.equal(results[0].present, false, "a symlink escaping the worktree root must not be followed");
-    assert.equal(results[0].content, "", "outside-secret-content must never be read into the result");
-    assert.equal(results[0].absenceReason, "rejected", "an escape must not be reported as verified deletion evidence");
-  } finally {
-    await rm(worktree, { recursive: true, force: true });
-    await rm(outside, { recursive: true, force: true });
-  }
-});
-
-test("defaultReadHeadFiles: a genuinely absent file (never existed) is reported not-found, distinct from a rejected escape (#496 finding 73a71b80)", async () => {
-  const worktree = await mkdtemp(join(tmpdir(), "pipeline-readheadfiles-notfound-wt-"));
-  try {
-    const results = await defaultReadHeadFiles(worktree, ["src/never-existed.ts"]);
-    assert.equal(results.length, 1);
-    assert.equal(results[0].present, false);
-    assert.equal(results[0].absenceReason, "not-found", "an in-worktree path that just doesn't exist is verified deletion evidence");
-  } finally {
-    await rm(worktree, { recursive: true, force: true });
-  }
+test("defaultReadHeadFiles: a path absent from the reviewed tree is reported not-found — citable deletion evidence (#496 finding 73a71b80)", async () => {
+  const gitFn = (async (_cwd: string, args: string[]) => ({
+    stdout: "",
+    stderr: `fatal: path 'src/never-existed.ts' does not exist in 'abc1234'`,
+    code: 128,
+  })) as typeof import("../scripts/worktree.ts").gitInWorktree;
+  const results = await defaultReadHeadFiles("/wt", "abc1234", ["src/never-existed.ts"], gitFn);
+  assert.equal(results[0].present, false);
+  assert.equal(results[0].absenceReason, "not-found");
+  const gitFail = (async () => ({ stdout: "", stderr: "fatal: unable to read tree", code: 128 })) as typeof import("../scripts/worktree.ts").gitInWorktree;
+  const failed = await defaultReadHeadFiles("/wt", "abc1234", ["a.ts"], gitFail);
+  assert.equal(failed[0].absenceReason, "unreadable", "an indeterminate git failure must not masquerade as deletion evidence");
 });
 
 // ---------------------------------------------------------------------------
@@ -568,9 +557,9 @@ test("enforceReviewShaGate: a settled finding re-asserted with narrow-delta rati
   };
   const round2Comment = formatReviewComment(formatCfg, round2Verdict, 2, "codex", new Set([oldKey]), oldHash);
 
-  let readHeadFilesCalledWith: { worktreePath: string; paths: string[] } | null = null;
-  const readHeadFiles: ReadHeadFilesFn = async (worktreePath, paths) => {
-    readHeadFilesCalledWith = { worktreePath, paths };
+  let readHeadFilesCalledWith: { worktreePath: string; treeSha: string; paths: string[] } | null = null;
+  const readHeadFiles: ReadHeadFilesFn = async (worktreePath, treeSha, paths) => {
+    readHeadFilesCalledWith = { worktreePath, treeSha, paths };
     return paths.map((p) => ({ path: p, content: "unrelated content that does not resolve anything", truncated: false, present: true }));
   };
 
@@ -620,6 +609,7 @@ test("enforceReviewShaGate: a settled finding re-asserted with narrow-delta rati
   });
 
   assert.equal(readHeadFilesCalledWith?.worktreePath, "/fake/worktree");
+  assert.equal(readHeadFilesCalledWith?.treeSha, SHA_HEAD, "reads must be pinned to the reviewed head tree (#496 delta 8f981a57)");
   assert.deepEqual(readHeadFilesCalledWith?.paths, ["foo.ts"]);
   assert.ok(accountingSeen?.settledFindingsVerification?.some((e) => e.surface === "foo.ts|correctness"), "settled verification reached runDeltaReview");
   assert.ok(accountingSeen?.headFiles?.some((f) => f.path === "foo.ts" && f.present), "HEAD file content reached runDeltaReview");
