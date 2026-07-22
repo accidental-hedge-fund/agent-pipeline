@@ -863,6 +863,15 @@ export function humanDecisionComment(args: {
   footer?: string;
 }): string {
   const { category, key, fingerprint, reviewedSha, request, stage, timestamp, footer } = args;
+  // Sanitize the harness-provided request before embedding it as plain text in the
+  // attested comment: strip newlines and neutralize HTML comment delimiters so this
+  // untrusted text cannot form a literal `<!-- ... -->` marker that a later run's
+  // sentinel extractors could mistake for a trusted override/non-reproducing
+  // disposition (#473 review-1 finding b48e383e), mirroring `safeReason` below.
+  const safeRequest = request
+    .replace(/[\r\n]/g, " ")
+    .replace(/<!--/g, "<!—")
+    .replace(/-->/g, "—>");
   const rendered = [
     HUMAN_DECISION_HEADING,
     "",
@@ -873,7 +882,7 @@ export function humanDecisionComment(args: {
     `**Recorded at**: ${timestamp}`,
     "",
     "### Decision needed",
-    request,
+    safeRequest,
     "",
     "This outcome does NOT resolve or suppress the finding above, and does NOT " +
       "advance this item. The fix harness determined that the correct next step is a " +
