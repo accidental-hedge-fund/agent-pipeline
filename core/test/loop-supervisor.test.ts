@@ -910,3 +910,65 @@ test("runSupervisorCycle: without a concurrency policy, getChangedFiles is never
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "ready");
 });
+
+// ---------------------------------------------------------------------------
+// #530 review 1 findings 01db9f2b / 507013f5 — a failed/rejected concurrent
+// sibling must never strand an already-completed sibling's outcome unpersisted.
+// ---------------------------------------------------------------------------
+
+test("runSupervisorCycle: a failed concurrent sibling does not strand an already-succeeded sibling's outcome", async () => {
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes((itemId) => (itemId === "100" ? "bogus_outcome" : "ready_to_deploy"));
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.deepEqual(new Set(calls.map((c) => c.item_id)), new Set(["100", "200"]), "both independent items were dispatched");
+  assert.equal(result.stop?.reason, "run_fatal", "the failed item's block records the run_fatal stop");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked", "the failing item is durably blocked, not silently re-dispatchable");
+  assert.equal(
+    finalLedger.items["200"].state,
+    "ready",
+    "the sibling's already-completed ready_to_deploy outcome is preserved, not stranded in_progress",
+  );
+
+  const events = await readEvents(deps, "run-1");
+  assert.ok(events.some((e: any) => e.kind === "loop_item_transitioned" && e.data?.item_id === "200" && e.data?.to === "ready"));
+});
+
+test("runSupervisorCycle: a rejected concurrent dispatch is durably classified failed and never discards a successful sibling", async () => {
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem: baseDispatchItem } = coordinatedFakes();
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    if (request.item_id === "100") throw new Error("simulated transport failure");
+    return baseDispatchItem(request);
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(result.stop?.reason, "run_fatal");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked", "the rejected dispatch is classified failed and blocked, not silently dropped");
+  assert.equal(finalLedger.items["100"].evidence_fingerprint !== undefined, true);
+  assert.equal(finalLedger.items["200"].state, "ready", "the successful sibling's outcome survives the sibling's rejected dispatch");
+});

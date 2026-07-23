@@ -306,9 +306,10 @@ export async function runSupervisorCycle(
 
   // Dispatch every admitted item concurrently through the unchanged, per-item
   // `pipeline/loop-execution@1` contract — each item is driven against its own managed worktree
-  // by that seam exactly as it already is today. With exactly one active item this `Promise.all`
-  // is equivalent to a single awaited call, including error propagation, so the serialized
-  // default's behavior (including a thrown `dispatchItem` rejection) is unchanged.
+  // by that seam exactly as it already is today. `Promise.allSettled` (not `Promise.all`) is
+  // deliberate (#530 review 1 finding 01db9f2b): a rejected dispatch must never discard a
+  // concurrently-completed sibling's response, so every item's outcome — success or rejection —
+  // is classified below rather than the whole cycle throwing on the first rejection.
   const buildRequest = (itemId: string): LoopExecutionRequest => ({
     schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
     item_id: itemId,
@@ -318,9 +319,31 @@ export async function runSupervisorCycle(
     done_definition: contract.done_definition,
     run_id: runId,
   });
-  const responses = await Promise.all(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
-  const rawOutcomeByItem = new Map(activeItemIds.map((itemId, i) => [itemId, responses[i].outcome]));
-  const outcomeByItem = new Map(activeItemIds.map((itemId, i) => [itemId, normalizeLoopOutcome(responses[i].outcome)]));
+  const settled = await Promise.allSettled(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
+
+  // With exactly one active item — the serialized default — a rejection is rethrown synchronously
+  // rather than durably reclassified "failed": the durable-run-independent-scheduler spec requires
+  // the serialized default's observable behavior to be byte-identical to the pre-#530 behavior
+  // (`Promise.all` on a single-element array propagates its rejection the same way), which existing
+  // crash-recovery callers already depend on. Reclassification below exists only to protect a
+  // sibling's outcome when concurrency is actually in effect — there is no sibling to protect here.
+  if (activeItemIds.length === 1 && settled[0].status === "rejected") {
+    throw settled[0].reason;
+  }
+
+  const rawOutcomeByItem = new Map<string, unknown>();
+  const outcomeByItem = new Map<string, ReturnType<typeof normalizeLoopOutcome>>();
+  const dispatchErrorByItem = new Map<string, string>();
+  activeItemIds.forEach((itemId, i) => {
+    const result = settled[i];
+    if (result.status === "fulfilled") {
+      rawOutcomeByItem.set(itemId, result.value.outcome);
+      outcomeByItem.set(itemId, normalizeLoopOutcome(result.value.outcome));
+    } else {
+      dispatchErrorByItem.set(itemId, result.reason instanceof Error ? result.reason.message : String(result.reason));
+      outcomeByItem.set(itemId, "failed");
+    }
+  });
 
   // Changed-file-overlap parking (#530 task 4): a post-run safety net over declared ownership,
   // meaningful only when more than one item actually ran concurrently this cycle and the caller
@@ -345,15 +368,52 @@ export async function runSupervisorCycle(
     }
   }
 
+  // Pass 1 — persist every outcome that can never itself set a terminal run stop
+  // (ready_to_deploy, abandoned) for EVERY dispatched item first. transitionItem and
+  // abandonInProgressItem never write `ledger.stop`, so this pass always completes in full
+  // regardless of what pass 2 below does — a sibling's already-completed independent result is
+  // never stranded unpersisted behind another item's block-induced stop (#530 review 1 findings
+  // 01db9f2b, 507013f5).
   for (const itemId of activeItemIds) {
-    // A prior item in this same cycle may have already recorded a terminal run stop (e.g. a
-    // run-fatal block) — every subsequent transition/block call refuses once `ledger.stop` is
-    // set, so further processing this cycle is skipped rather than crashing. The still-in_progress
-    // remainder is untouched; a stopped run never dispatches again, so this causes no duplicate
-    // work (loop-supervisor's `if (ledger.stop) return` at the top of the next cycle).
-    if (ledger.stop) break;
-
+    if (parkedItemIds.has(itemId)) continue;
     const outcome = outcomeByItem.get(itemId)!;
+    if (outcome !== "ready_to_deploy" && outcome !== "abandoned") continue;
+    const nextAction = ledger.last_reconciliation?.next_actions[itemId] ?? null;
+
+    if (outcome === "ready_to_deploy") {
+      ledger = await transitionItem(deps.store, deps.observe, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        to: "ready",
+        note: "pipeline/loop-execution@1 reported ready_to_deploy",
+      });
+    } else {
+      ledger = await abandonInProgressItem(deps.store, runId, token, itemId, engine);
+    }
+
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: itemId,
+      action: "dispatch_item",
+      outcome,
+      next_action: nextAction,
+      progress: "progress",
+    });
+  }
+
+  // Pass 2 — items requiring a block-family mutation (parked, blocked_needs_human, failed), which
+  // may record a terminal run stop. A prior item in this pass may already have recorded one — every
+  // subsequent block/classify call refuses once `ledger.stop` is set, so further processing this
+  // cycle is skipped rather than crashing. The still-in_progress remainder is untouched; a stopped
+  // run never dispatches again, so this causes no duplicate work (loop-supervisor's
+  // `if (ledger.stop) return` at the top of the next cycle) — and, unlike before this fix, it can no
+  // longer strand a pass-1 item's outcome, since pass 1 has already fully persisted by this point.
+  for (const itemId of activeItemIds) {
+    if (ledger.stop) break;
+    const outcome = outcomeByItem.get(itemId)!;
+    if (!parkedItemIds.has(itemId) && (outcome === "ready_to_deploy" || outcome === "abandoned")) continue;
+
     const nextAction = ledger.last_reconciliation?.next_actions[itemId] ?? null;
 
     if (parkedItemIds.has(itemId)) {
@@ -365,17 +425,6 @@ export async function runSupervisorCycle(
         blockerClass: "workflow-state",
         evidence: "parked for replan: observed changed-file overlap with a concurrently-run item",
       });
-    } else if (outcome === "ready_to_deploy") {
-      ledger = await transitionItem(deps.store, deps.observe, contract, {
-        runId,
-        token,
-        itemId,
-        engine,
-        to: "ready",
-        note: "pipeline/loop-execution@1 reported ready_to_deploy",
-      });
-    } else if (outcome === "abandoned") {
-      ledger = await abandonInProgressItem(deps.store, runId, token, itemId, engine);
     } else if (outcome === "blocked_needs_human") {
       ledger = await classifyAndBlockItem(deps.store, contract, {
         runId,
@@ -386,18 +435,20 @@ export async function runSupervisorCycle(
         evidence: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId}`,
       });
     } else {
-      // "failed" — either reported directly or normalized from an outcome
-      // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Recorded as
-      // a blocked item under the workflow-engine-defect class so it is never
-      // silently re-dispatched: that class's default policy is run_fatal,
-      // stopping the run immediately.
+      // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome
+      // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Recorded as a blocked item
+      // under the workflow-engine-defect class so it is never silently re-dispatched: that
+      // class's default policy is run_fatal, stopping the run immediately.
+      const dispatchError = dispatchErrorByItem.get(itemId);
       ledger = await blockItem(deps.store, contract, {
         runId,
         token,
         itemId,
         engine,
         blockerClass: "workflow-engine-defect",
-        evidence: `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`,
+        evidence: dispatchError
+          ? `pipeline/loop-execution@1 dispatch rejected for item ${itemId}: ${dispatchError}`
+          : `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`,
       });
     }
 
