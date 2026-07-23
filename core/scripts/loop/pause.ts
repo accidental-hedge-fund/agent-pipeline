@@ -57,6 +57,13 @@ async function enterHold(
   to: "paused" | "waiting",
   request?: LoopHumanInputRequest,
 ): Promise<LoopLedger> {
+  const lock = await requireToken(deps, input.runId, input.token);
+  if (lock.engine !== input.engine) {
+    throw new LoopError(
+      "validation",
+      `hold transition names engine "${input.engine}", which does not match the current lock holder engine "${lock.engine}"`,
+    );
+  }
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
@@ -173,6 +180,13 @@ export interface AbandonHoldInput {
 /** Transitions a `paused` or `waiting` item to `abandoned`. Refuses (LoopError "validation") any
  *  other current state, naming both states. */
 export async function abandonHold(deps: LoopStoreDeps, input: AbandonHoldInput): Promise<LoopLedger> {
+  const lock = await requireToken(deps, input.runId, input.token);
+  if (lock.engine !== input.engine) {
+    throw new LoopError(
+      "validation",
+      `abandonHold names engine "${input.engine}", which does not match the current lock holder engine "${lock.engine}"`,
+    );
+  }
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
@@ -281,6 +295,13 @@ export interface ResumeHoldInput {
  *  its hold. On success, appends an attributed decision to the run's decision log and clears the
  *  outstanding request. */
 export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): Promise<LoopLedger> {
+  const lock = await requireToken(deps, input.runId, input.token);
+  if (lock.engine !== input.engine) {
+    throw new LoopError(
+      "validation",
+      `resumeHold names engine "${input.engine}", which does not match the current lock holder engine "${lock.engine}"`,
+    );
+  }
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
@@ -356,9 +377,10 @@ export interface RecordAmendmentResult {
   amendment: LoopAuthorityAmendment;
 }
 
-/** Records an audited authority amendment naming exactly one gate, optionally scoped to one
- *  item. Refuses (LoopError "validation") an amendment with no gate, an unknown gate, or more
- *  than one gate — no amendment is recorded and durable state is unchanged. */
+/** Records an audited authority amendment naming exactly one gate, scoped to exactly one item.
+ *  Refuses (LoopError "validation") an amendment with no gate, an unknown gate, more than one
+ *  gate, or no `scope_item_id` (a broad/un-scoped grant) — no amendment is recorded and durable
+ *  state is unchanged. */
 export async function recordAuthorityAmendment(deps: LoopStoreDeps, input: RecordAmendmentInput): Promise<RecordAmendmentResult> {
   if (Array.isArray(input.gate)) {
     throw new LoopError("validation", `an authority amendment must name exactly one gate, not a list`);
@@ -369,6 +391,9 @@ export async function recordAuthorityAmendment(deps: LoopStoreDeps, input: Recor
   if (!isLoopAuthorityGate(input.gate)) {
     throw new LoopError("validation", `an authority amendment names unknown gate "${String(input.gate)}"`);
   }
+  if (!input.scope_item_id || input.scope_item_id.trim() === "") {
+    throw new LoopError("validation", `an authority amendment must name a scope_item_id — a broad, un-scoped grant is refused`);
+  }
 
   const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
   const amendment: LoopAuthorityAmendment = {
@@ -378,10 +403,13 @@ export async function recordAuthorityAmendment(deps: LoopStoreDeps, input: Recor
     reason: input.reason,
     time: deps.now().toISOString(),
   };
-  ledger.authority_amendments.push(amendment);
 
-  await writeLedger(deps, ledger, input.token);
+  // Decision logged before the amendment is durably active in the ledger: if appendDecision
+  // fails, the ledger write below never runs, so an amendment can never become active without
+  // its audited decision (finding 639c2bbb).
   await appendDecision(deps, input.runId, input.token, "loop_authority_amendment", { ...amendment });
+  ledger.authority_amendments.push(amendment);
+  await writeLedger(deps, ledger, input.token);
   return { ledger, amendment };
 }
 
@@ -400,7 +428,7 @@ export function authorizeGatedTransition(
   const ledger = upgradeLedgerForPauseAuthority(ledgerInput);
   const granted =
     authorityGrants.includes(gate) ||
-    ledger.authority_amendments.some((a) => a.gate === gate && (a.scope_item_id === undefined || a.scope_item_id === itemId));
+    ledger.authority_amendments.some((a) => a.gate === gate && a.scope_item_id === itemId);
   if (!granted) {
     throw new LoopError(
       "authority",

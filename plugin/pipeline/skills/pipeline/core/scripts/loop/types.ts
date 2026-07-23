@@ -64,11 +64,12 @@ export interface LoopHumanInputRequest {
   requested_at: string;
 }
 
-/** A scoped, audited widening of exactly one authority gate — optionally narrowed to one item.
- *  Recorded via the decision log (`appendDecision`); never widens any other gate or item. */
+/** A scoped, audited widening of exactly one authority gate, narrowed to exactly one item — a
+ *  broad/un-scoped grant is refused. Recorded via the decision log (`appendDecision`); never
+ *  widens any other gate or item. */
 export interface LoopAuthorityAmendment {
   gate: LoopAuthorityGate;
-  scope_item_id?: string;
+  scope_item_id: string;
   actor: string;
   reason: string;
   time: string;

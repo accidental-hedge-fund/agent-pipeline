@@ -97,14 +97,15 @@ or stale mandate evidence SHALL still be refused under those mandate failure cla
 
 The engine SHALL permit an authority grant to be amended after compile time only through an
 audited amendment that appends an attributed decision to the run's decision log naming exactly one
-authority gate (`push_pr`, `merge`, `release`, or `deploy`), an optional single item id as its
-scope, a human actor reference, a reason, and the time. The amendment SHALL be persisted durably
-and honored on later gated transitions, but SHALL authorize a gated transition only when both the
-gate and the scope match: an amendment scoped to one item SHALL NOT authorize the gate on any other
+authority gate (`push_pr`, `merge`, `release`, or `deploy`), a single item id as its scope, a human
+actor reference, a reason, and the time. The amendment SHALL be persisted durably and honored on
+later gated transitions, but SHALL authorize a gated transition only when both the gate and the
+scope match exactly: an amendment scoped to one item SHALL NOT authorize the gate on any other
 item, and an amendment for one gate SHALL NOT authorize any other gate. An amendment that names no
-gate, an unknown gate, or more than one gate SHALL be refused as a validation failure. An authority
-amendment SHALL NOT bypass the engine's directly-verified-evidence requirement for a gated
-transition — a transition covered by an amendment but supplying no evidence SHALL still be refused.
+gate, an unknown gate, more than one gate, or no scope item id SHALL be refused as a validation
+failure — a broad/un-scoped amendment SHALL NOT be recorded. An authority amendment SHALL NOT
+bypass the engine's directly-verified-evidence requirement for a gated transition — a transition
+covered by an amendment but supplying no evidence SHALL still be refused.
 
 #### Scenario: A scoped amendment authorizes exactly its gate and item
 
@@ -128,7 +129,7 @@ transition — a transition covered by an amendment but supplying no evidence SH
 
 #### Scenario: A malformed amendment is refused
 
-- **WHEN** an amendment names no gate, an unknown gate, or more than one gate
+- **WHEN** an amendment names no gate, an unknown gate, more than one gate, or no scope item id
 - **THEN** it SHALL be refused as a validation failure
 - **AND** no amendment SHALL be recorded and durable state SHALL be unchanged
 

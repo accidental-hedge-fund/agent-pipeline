@@ -190,6 +190,16 @@ test("waitItem: an in_progress item enters waiting carrying the request, no budg
   assert.ok(req!.request_id.length > 0);
 });
 
+test("pauseItem: an engine that does not match the current lock holder is refused, leaving state unchanged", async () => {
+  const { deps, token } = await setup(); // lock is held by "claude"
+  await assert.rejects(
+    () => pauseItem(deps, { runId: "run-1", token, itemId: "100", engine: "codex" }),
+    (err: unknown) => assertClass(err, "validation"),
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress", "no spoofed-engine hold was recorded");
+});
+
 test("pauseItem/waitItem: only an in_progress item may enter a hold — refused naming both states, leaving state unchanged", async () => {
   const { deps, token } = await setup();
   await assert.rejects(
@@ -286,9 +296,41 @@ test("abandonHold: an illegal transition out of a hold is refused naming both st
   assert.equal(ledger.items["100"].state, "in_progress");
 });
 
+test("abandonHold: an engine that does not match the current lock holder is refused, leaving the hold intact", async () => {
+  const { deps, token } = await setup(); // lock is held by "claude"
+  await pauseItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude" });
+  await assert.rejects(
+    () => abandonHold(deps, { runId: "run-1", token, itemId: "100", engine: "codex" }),
+    (err: unknown) => assertClass(err, "validation"),
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "paused", "no spoofed-engine abandon was recorded");
+});
+
 // ---------------------------------------------------------------------------
 // Audited, fail-closed resume.
 // ---------------------------------------------------------------------------
+
+test("resumeHold: an engine that does not match the current lock holder is refused, leaving the hold intact", async () => {
+  const { deps, token } = await setup(); // lock is held by "claude"
+  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  await assert.rejects(
+    () =>
+      resumeHold(deps, {
+        runId: "run-1",
+        token, // still claude's token — a spoofed "codex" claim on it must be refused
+        itemId: "100",
+        engine: "codex",
+        actor: "human:bob",
+        response: { value: "go" },
+        pipeline_preflight: PREFLIGHT_OK,
+        native_goal: { engine: "codex", run_id: "run-1", status: "active", checked_at: "2026-07-23T00:00:00.000Z" },
+      }),
+    (err: unknown) => assertClass(err, "validation"),
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "waiting", "no spoofed-engine resume was recorded");
+});
 
 test("resumeHold: a satisfying, evidenced resume advances waiting -> in_progress and clears the request", async () => {
   const { deps, token } = await setup();
@@ -508,6 +550,27 @@ test("recordAuthorityAmendment: a malformed amendment (no gate, unknown gate, or
   assert.equal(decisions.length, 0);
 });
 
+test("recordAuthorityAmendment: a decision-log append failure leaves the ledger without an active amendment", async () => {
+  const { deps, files } = fakeDeps({
+    async appendLine(p, line) {
+      if (p.endsWith("decisions.jsonl")) throw new Error("simulated decision-log append failure");
+      const existing = files.get(p) ?? "";
+      files.set(p, existing + line + "\n");
+    },
+  });
+  const contract = testContract();
+  await initRun(deps, contract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await assert.rejects(
+    () => recordAuthorityAmendment(deps, { runId: "run-1", token, gate: "merge", scope_item_id: "100", actor: "human:alice", reason: "x" }),
+    /simulated decision-log append failure/,
+  );
+
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal((ledger.authority_amendments ?? []).length, 0, "no unaudited amendment was left active");
+});
+
 test("authorizeGatedTransition: a scoped amendment authorizes exactly its gate and item", async () => {
   const { deps, token } = await setup();
   const { ledger } = await recordAuthorityAmendment(deps, { runId: "run-1", token, gate: "merge", scope_item_id: "100", actor: "human:alice", reason: "x" });
@@ -529,11 +592,16 @@ test("authorizeGatedTransition: an amendment does not widen to other gates", asy
   );
 });
 
-test("authorizeGatedTransition: an unscoped amendment authorizes the gate for any item", async () => {
+test("recordAuthorityAmendment: a broad/un-scoped amendment (no scope_item_id) is refused — nothing recorded", async () => {
   const { deps, token } = await setup();
-  const { ledger } = await recordAuthorityAmendment(deps, { runId: "run-1", token, gate: "deploy", actor: "human:alice", reason: "x" });
-  assert.doesNotThrow(() => authorizeGatedTransition([], ledger, "deploy", "100", "evidence"));
-  assert.doesNotThrow(() => authorizeGatedTransition([], ledger, "deploy", "200", "evidence"));
+  await assert.rejects(
+    () => recordAuthorityAmendment(deps, { runId: "run-1", token, gate: "deploy", actor: "human:alice", reason: "x" }),
+    (err: unknown) => assertClass(err, "validation"),
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal((ledger.authority_amendments ?? []).length, 0);
+  const decisions = await readDecisions(deps, "run-1");
+  assert.equal(decisions.length, 0);
 });
 
 test("authorizeGatedTransition: a compile-time grant authorizes independently of any amendment", async () => {
