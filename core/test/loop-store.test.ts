@@ -726,6 +726,16 @@ test("readDurableRunBlockerOccurrences: an unreadable/malformed ledger is skippe
   assert.equal(occurrences[0].runId, "run-good");
 });
 
+test("readDurableRunBlockerOccurrences: a missing/unreadable runs root (e.g. pipeline:loop never ran) yields no occurrences, not a thrown error", async () => {
+  const { deps } = fakeDeps({
+    listDir: async () => {
+      throw Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+    },
+  });
+  const occurrences = await readDurableRunBlockerOccurrences(deps);
+  assert.deepEqual(occurrences, []);
+});
+
 test("readDurableRunBlockerOccurrences: performs zero writes, zero lock acquisition", async () => {
   const { deps, files, writes } = fakeDeps();
   await seedLedger(deps, files, "run-1", {

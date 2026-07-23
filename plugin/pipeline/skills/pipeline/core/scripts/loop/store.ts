@@ -343,7 +343,12 @@ export async function readDurableRunBlockerOccurrences(
   deps: Pick<LoopStoreDeps, "listDir" | "readTextFile" | "env" | "hostname">,
 ): Promise<DurableBlockerOccurrence[]> {
   const root = path.join(resolveStateHome(deps), "runs");
-  const runIds = [...new Set(await deps.listDir(root))];
+  let runIds: string[];
+  try {
+    runIds = [...new Set(await deps.listDir(root))];
+  } catch {
+    return []; // no runs root (e.g. pipeline:loop never ran on this host) — no durable evidence, not fatal
+  }
   const out: DurableBlockerOccurrence[] = [];
 
   for (const runId of runIds) {
