@@ -143,6 +143,30 @@ else) first, then a positive `--help` marker, then a documented version floor
 against `claude --version`. A failure names the detected version, the
 required floor, and the attestation key (#506).
 
+#### Bootstrapping a durable run: native `/goal` then `/pipeline:loop`
+
+Starting a durable run is an **operator-owned, two-step bootstrap** performed
+inside a Claude Code session:
+
+1. Run `/goal` to enter Claude Code's built-in autonomous mode.
+2. Inside that `/goal` session, invoke `/pipeline:loop …` to start the durable
+   run.
+
+This skill does **not** detect whether `/goal` is active — the native-`/goal`
+check above only probes the *capability* (attestation, `--help` marker,
+version floor), not live session state. This skill does **not** invoke or
+re-enter `/goal` itself; entering `/goal` is the operator's action, taken
+before `/pipeline:loop` is ever run. And this skill does **not** control the
+native `/goal` session's lifecycle: `/goal` is the outer autonomous driver,
+`/pipeline:loop` is the durable workload it runs inside that driver.
+
+Native completion is likewise a **host/user action**. `/pipeline:loop` reports
+its own terminal done and reconciliation conditions from the durable loop
+engine (see `--audit` above); ending the native `/goal` session afterward is
+something the operator or Claude Code's `/goal` mode does, not something this
+skill performs. Consistent with the pipeline never merging, this skill neither
+ends the `/goal` session nor merges once a run reports done.
+
 `--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
 worktrees under `worktree_root` whose PR is already merged, removing the worktree
 and deleting its local branch (the remote branch is never touched). It only
