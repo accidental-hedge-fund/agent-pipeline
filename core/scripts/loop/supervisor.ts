@@ -439,6 +439,13 @@ export interface DriveSupervisorInput {
   consecutiveNoProgressLimit?: number;
   /** Override for tests; production uses {@link MAX_CYCLES_SAFETY}. */
   maxCyclesSafety?: number;
+  /** Optional pause: stop after driving at most this many cycles and return
+   *  with no terminal condition recorded (unlike `maxCyclesSafety`, reaching
+   *  this cap is not itself a stop — it releases the lock and returns so a
+   *  caller can resume later through the real `driveSupervisor({ resume:
+   *  true })` entry point, e.g. to inspect intermediate state between two
+   *  live cycles). */
+  maxCycles?: number;
 }
 
 export interface DriveSupervisorResult {
@@ -510,6 +517,10 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       }
       if (result.allDone) {
         allDone = true;
+        break;
+      }
+
+      if (input.maxCycles !== undefined && cycles >= input.maxCycles) {
         break;
       }
 
