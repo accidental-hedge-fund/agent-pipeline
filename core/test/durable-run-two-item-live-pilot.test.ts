@@ -14,7 +14,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  attachSupervisor,
   driveSupervisor,
   runSupervisorCycle,
   type SupervisorDeps,
@@ -170,12 +169,25 @@ function pilotLedger(): LoopLedger {
  *  dispatch outcome sequence (crash-after-recording-a-recoverable-blocker,
  *  then succeed) and a `merged` flag the test flips to model the human
  *  merging A's PR (design.md decision 4 — the pilot only observes it). */
+/** One entry per external write a real `pipeline/loop-execution@1` dispatch
+ *  performs (PR creation, ready-label write) — the mutation boundary the
+ *  no-duplicate-external-action invariant (5.1) guards. Recorded independently
+ *  of `calls` (which only tracks dispatch invocations, not what a dispatch
+ *  externally mutated), so a duplicate dispatch that skipped its writes, or a
+ *  single dispatch that wrote twice, is distinguishable from a clean replay. */
+interface MutationRecord {
+  kind: "pr_create" | "label_write";
+  item: string;
+  pr: number;
+}
+
 function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
   let aDispatchCount = 0;
   let aDispatched = false;
   let bDispatched = false;
   let aMerged = false;
   const calls: string[] = [];
+  const mutations: MutationRecord[] = [];
 
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
@@ -235,6 +247,8 @@ function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
         throw new Error("simulated crash: dispatch process terminated after recording the blocker");
       }
       aDispatched = true;
+      mutations.push({ kind: "pr_create", item: ITEM_A, pr: PR_A });
+      mutations.push({ kind: "label_write", item: ITEM_A, pr: PR_A });
       const response: LoopExecutionResponse = {
         schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
         item_id: ITEM_A,
@@ -246,6 +260,8 @@ function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
     }
     if (request.item_id === ITEM_B) {
       bDispatched = true;
+      mutations.push({ kind: "pr_create", item: ITEM_B, pr: PR_B });
+      mutations.push({ kind: "label_write", item: ITEM_B, pr: PR_B });
       const response: LoopExecutionResponse = {
         schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
         item_id: ITEM_B,
@@ -258,7 +274,7 @@ function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
     throw new Error(`pilot fixture invariant: unexpected dispatch for item ${request.item_id}`);
   };
 
-  return { observe, dispatchItem, calls, setAMerged: (v: boolean) => { aMerged = v; } };
+  return { observe, dispatchItem, calls, mutations, setAMerged: (v: boolean) => { aMerged = v; } };
 }
 
 async function setup(contract: LoopContract, ledger: LoopLedger) {
@@ -279,12 +295,13 @@ interface PilotEvidenceBundle {
   actionEvidence: Awaited<ReturnType<typeof readActionEvidence>>;
   reconciliations: Array<{ seq: number; time: string; data: unknown }>;
   mergeObservation: { itemId: string; identity: unknown } | null;
+  mutations: MutationRecord[];
   terminal: { stop: LoopLedger["stop"]; allItemsDone: boolean };
 }
 
 const DONE_STATES = new Set(["ready", "merged", "released", "deployed", "abandoned", "skipped"]);
 
-async function buildPilotEvidenceBundle(deps: LoopStoreDeps, runId: string): Promise<PilotEvidenceBundle> {
+async function buildPilotEvidenceBundle(deps: LoopStoreDeps, runId: string, mutations: MutationRecord[]): Promise<PilotEvidenceBundle> {
   const ledger = await readLedger(deps, runId);
   const actionEvidence = await readActionEvidence(deps, runId);
   const events = await readEvents(deps, runId);
@@ -297,6 +314,7 @@ async function buildPilotEvidenceBundle(deps: LoopStoreDeps, runId: string): Pro
     actionEvidence,
     reconciliations,
     mergeObservation: aIdentity ? { itemId: ITEM_A, identity: aIdentity } : null,
+    mutations: [...mutations],
     terminal: {
       stop: ledger.stop,
       allItemsDone: Object.values(ledger.items).every((i) => DONE_STATES.has(i.state)),
@@ -314,7 +332,7 @@ test(
     const contract = pilotContract();
     const ledger = pilotLedger();
     const deps = await setup(contract, ledger);
-    const { observe, dispatchItem, calls, setAMerged } = pilotFakes(deps, contract);
+    const { observe, dispatchItem, calls, mutations, setAMerged } = pilotFakes(deps, contract);
 
     // --- 2.1: drive item A into a blocked transition carrying a recoverable
     // DurableBlockerClass; the dispatch "crashes" right after recording it. ---
@@ -354,31 +372,28 @@ test(
     assert.equal(statuses[ITEM_A], "pending");
     assert.deepEqual(eligibleIndependentItems(contract, recovered.ledger, statuses), []);
 
-    // --- 2.2: exercise a supervisor resume over the now-free lock. attach
-    // reports resumed:true; the resume reconciles first and appends a
-    // "resume" action-evidence marker BEFORE the run continues driving the
-    // SAME item A. (A single controlled cycle is driven directly here, rather
-    // than via driveSupervisor's automatic loop, so the test can flip the
-    // merge-observation fake at the exact safe boundary before continuing —
-    // see the merge-refresh-barrier step below.) ---
-    const attach = await attachSupervisor({ store: deps, observe, dispatchItem }, { runId: "pilot-run-1", engine: "claude", resume: true });
-    assert.equal(attach.resumed, true);
-    const token2 = attach.token;
-
-    await reconcile(deps, observe, { runId: "pilot-run-1", token: token2, engine: "claude" });
-    await appendActionEvidence(deps, "pilot-run-1", token2, {
-      item_id: null,
-      action: "resume",
-      outcome: "resumed",
-      next_action: null,
-      progress: "progress",
-    });
-
-    const resumedCycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "pilot-run-1", token2, "claude");
-    assert.equal(resumedCycle.stop, null);
+    // --- 2.2: exercise a supervisor resume through the REAL entry point
+    // (driveSupervisor with resume: true) — not a manual replication of its
+    // internals. `maxCycles: 1` is a shipped, product-level pause (distinct
+    // from the terminal `maxCyclesSafety` watchdog stop): it lets the run
+    // stop cleanly after one live cycle, lock released, so the test can flip
+    // the merge-observation fake at the exact safe boundary before continuing
+    // — see the merge-refresh-barrier step below — while still driving A's
+    // recovery continuation through driveSupervisor's own resume ->
+    // reconcile -> append-resume-marker -> cycle-loop sequence. ---
+    const resumedDrive = await driveSupervisor(
+      { store: deps, observe, dispatchItem },
+      { runId: "pilot-run-1", engine: "claude", resume: true, maxCycles: 1 },
+    );
+    assert.equal(resumedDrive.resumed, true);
+    assert.equal(resumedDrive.stop, null);
 
     const trailAfterResume = await readActionEvidence(deps, "pilot-run-1");
-    assert.ok(trailAfterResume.some((e) => e.action === "resume"), "a resume marker must be appended to the action-evidence trail");
+    const resumeIndex = trailAfterResume.findIndex((e) => e.action === "resume");
+    const dispatchIndex = trailAfterResume.findIndex((e) => e.action === "dispatch_item" && e.item_id === ITEM_A && e.outcome === "ready_to_deploy");
+    assert.notEqual(resumeIndex, -1, "a resume marker must be appended to the action-evidence trail");
+    assert.notEqual(dispatchIndex, -1, "the resumed cycle's dispatch outcome must be recorded in the trail");
+    assert.ok(resumeIndex < dispatchIndex, "the resume marker (and its preceding reconciliation) must precede the resumed dispatch");
 
     const ledgerAfterResumedCycle = await readLedger(deps, "pilot-run-1");
     const aFreshStarts = ledgerAfterResumedCycle.items[ITEM_A].history.filter((h) => h.to === "in_progress" && h.from === "pending");
@@ -395,8 +410,9 @@ test(
     assert.equal(statuses[ITEM_A], "pending", "A's PR is still observed unmerged");
     assert.deepEqual(eligibleIndependentItems(contract, ledgerAfterResumedCycle, statuses), [], "B must not be eligible while A's PR is unmerged");
 
+    const { token: claimToken } = await acquireLock(deps, "pilot-run-1", "claude");
     await assert.rejects(
-      () => transitionItem(deps, observe, contract, { runId: "pilot-run-1", token: token2, itemId: ITEM_A, engine: "claude", to: "merged" }),
+      () => transitionItem(deps, observe, contract, { runId: "pilot-run-1", token: claimToken, itemId: ITEM_A, engine: "claude", to: "merged" }),
       /not supported by the engine's verified external identity/,
     );
     const ledgerAfterClaim = await readLedger(deps, "pilot-run-1");
@@ -404,7 +420,7 @@ test(
     statuses = await computeExternalDependencyStatuses(observe, contract);
     assert.deepEqual(eligibleIndependentItems(contract, ledgerAfterClaim, statuses), [], "B must still be ineligible after the refused caller claim");
 
-    await releaseLock(deps, "pilot-run-1", token2);
+    await releaseLock(deps, "pilot-run-1", claimToken);
 
     // --- 3.2 + 6.1 terminal: the human merges A's PR (out of band); the
     // pilot only observes it (design.md decision 4). Flipping the fake here —
@@ -427,8 +443,12 @@ test(
     assert.ok(finalLedger.last_reconciliation!.sequence > 0);
 
     // --- 5.1: no duplicate external action — a redundant reconciliation over
-    // the already-merged item appends no new history and dispatches nothing. ---
+    // the already-merged item appends no new history, dispatches nothing, and
+    // — checked at the actual external-mutation boundary (PR creation, label
+    // writes), not merely the dispatch-call count — writes no additional
+    // mutation. ---
     const historyLenBefore = finalLedger.items[ITEM_A].history.length;
+    const mutationsBeforeReplay = mutations.length;
     const { token: replayToken } = await acquireLock(deps, "pilot-run-1", "claude");
     await reconcile(deps, observe, { runId: "pilot-run-1", token: replayToken, engine: "claude" });
     await releaseLock(deps, "pilot-run-1", replayToken);
@@ -436,18 +456,25 @@ test(
     assert.equal(ledgerAfterReplay.items[ITEM_A].history.length, historyLenBefore, "a redundant reconciliation over an already-merged item must append no new history entry");
     assert.equal(calls.filter((c) => c === `dispatch:${ITEM_A}`).length, 2, "no additional dispatch for A after the replay");
     assert.equal(calls.filter((c) => c === `dispatch:${ITEM_B}`).length, 1, "no additional dispatch for B after the replay");
+    assert.equal(mutations.length, mutationsBeforeReplay, "a redundant reconciliation over an already-merged item must record zero additional external mutations (PR creation, label write, issue write, or merge)");
 
     // ...and a crash-and-resume replay (an extra cycle after the run is
-    // already terminal) likewise dispatches nothing further.
+    // already terminal) likewise dispatches nothing further and mutates nothing.
     const { token: extraToken } = await acquireLock(deps, "pilot-run-1", "claude");
     const extraCycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "pilot-run-1", extraToken, "claude");
     assert.equal(extraCycle.allDone, true);
     await releaseLock(deps, "pilot-run-1", extraToken);
     assert.equal(calls.filter((c) => c.startsWith("dispatch:")).length, 3, "no dispatch call beyond the original three (A's blocked attempt, A's recovered attempt, B) is ever recorded");
+    assert.equal(mutations.length, mutationsBeforeReplay, "a crash-and-resume replay over an already-terminal run must record zero additional external mutations");
+    assert.deepEqual(
+      mutations.map((m) => `${m.kind}:${m.item}:${m.pr}`).sort(),
+      ["label_write:100:501", "label_write:200:502", "pr_create:100:501", "pr_create:200:502"],
+      "exactly one pr_create and one label_write per item must ever be recorded — no duplicate across the crash, the recovery continuation, or either replay",
+    );
 
     // --- 4.1/4.2: the evidence bundle is derived from recorded run state and
     // locates every one of the five exercised behaviors. ---
-    const bundle = await buildPilotEvidenceBundle(deps, "pilot-run-1");
+    const bundle = await buildPilotEvidenceBundle(deps, "pilot-run-1", mutations);
     assert.ok(
       bundle.items[ITEM_A].history.some((h) => h.to === "blocked" && h.theme === "transient-rate-limit"),
       "recoverable blocker must be locatable in item A's ledger history",
@@ -465,6 +492,7 @@ test(
     );
     assert.ok(bundle.mergeObservation, "the merge observation that cleared the barrier must be locatable");
     assert.equal((bundle.mergeObservation!.identity as { pr_state: string }).pr_state, "merged");
+    assert.equal(bundle.mutations.length, 4, "the no-duplicate-external-action mutation timeline (one pr_create + one label_write per item) must be locatable in the bundle");
     assert.equal(bundle.terminal.stop, null);
     assert.equal(bundle.terminal.allItemsDone, true, "the terminal condition must be locatable");
   },
