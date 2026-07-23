@@ -15,6 +15,8 @@ import {
   salvageUncommittedWork,
   trySalvageUncommittedWork,
   SALVAGE_NODE_MODULES_EXCLUDE,
+  SALVAGE_MARKER_EXCLUDE,
+  PIPELINE_INTERNAL_MARKER_FILES,
   type SalvageDeps,
 } from "../scripts/salvage-harness-work.ts";
 import { enforceImplCommitRef } from "../scripts/stages/planning.ts";
@@ -22,6 +24,7 @@ import { enforceFixCommitGate, fixSalvageStageLabel } from "../scripts/stages/fi
 import { enforceTestFixCommitFormat, testFixSalvageStageLabel } from "../scripts/testgate.ts";
 import { verifyHarnessCommits, type VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import { validateCommitTrailers } from "../scripts/traceability.ts";
+import { REBASE_MARKER_FILE } from "../scripts/stages/pre_merge.ts";
 
 const RUN_ID = "131/2026-06-12T18:14:44Z";
 
@@ -418,8 +421,8 @@ test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-o
   assert.equal(res.salvaged, true);
   assert.deepEqual(
     capturedArgs,
-    ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE],
-    "unscoped implement salvage args are byte-for-byte unchanged apart from the #521 depth-agnostic exclusion",
+    ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE, ...SALVAGE_MARKER_EXCLUDE],
+    "unscoped implement salvage args are byte-for-byte unchanged apart from the #521/#522 depth-agnostic exclusions",
   );
 });
 
@@ -565,4 +568,106 @@ test("regression #521: salvage stages a nested-node_modules dirty worktree using
   }
   const msg = res.salvaged ? res.message : "";
   assert.doesNotMatch(msg, /node_modules/, "the salvage commit message does not reference node_modules");
+});
+
+// ---------------------------------------------------------------------------
+// Regression #522: pipeline-internal marker files excluded from salvage
+// ---------------------------------------------------------------------------
+
+const MARKER = PIPELINE_INTERNAL_MARKER_FILES[0];
+
+test("regression #522: worktree dirty only with the rebase marker → {salvaged: false}, no gitAddAll/gitCommit; bites without the marker exclusion (4.1)", async () => {
+  const status = `?? ${MARKER}\n`;
+
+  // Fix in place: marker-only status is treated as clean.
+  const clean = fakeGit(status);
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "implement", clean.deps);
+  assert.deepEqual(res, { salvaged: false }, "marker-only worktree is treated as clean");
+  assert.deepEqual(clean.calls.order, [], "neither gitAddAll nor gitCommit is called");
+
+  // Bites: without the marker exclusion, the same status is non-empty →
+  // salvage runs and produces a commit whose only content is the marker.
+  const rawStatusIsDirty = status.trim().length > 0;
+  assert.ok(rawStatusIsDirty, "sanity: the raw porcelain status is non-empty on its own");
+});
+
+test("regression #522: real changed file + marker → salvage stages the real file, gitAddAll args exclude the marker, marker not committed (4.2)", async () => {
+  const status = ` M core/scripts/foo.ts\n?? ${MARKER}\n`;
+  const { deps, calls } = fakeGit(status);
+  let capturedArgs: string[] | null = null;
+  deps.gitAddAll = async (wt, args) => {
+    capturedArgs = [...args];
+    calls.order.push(`add:${wt}`);
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true, "genuine uncommitted work alongside the marker is still salvaged");
+  assert.deepEqual(calls.order, ["add:/wt", "commit:/wt"]);
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  for (const excl of SALVAGE_MARKER_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `gitAddAll args must include the marker exclusion; got ${JSON.stringify(capturedArgs)}`,
+    );
+  }
+});
+
+test("regression #522: scoped (openspec/) salvage also excludes the marker (4.3)", async () => {
+  let capturedArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      if (scope === "openspec/") return "A  openspec/changes/x/proposal.md\n";
+      return `A  openspec/changes/x/proposal.md\n?? ${MARKER}\n`;
+    },
+    gitRestoreStaged: async () => {},
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.equal(res.salvaged, true, "in-scope real change → salvage runs");
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  assert.ok((capturedArgs as string[]).includes("openspec/"), "still restricts staging to scope");
+  for (const excl of SALVAGE_MARKER_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `scoped gitAddAll args must include the marker exclusion; got ${JSON.stringify(capturedArgs)}`,
+    );
+  }
+});
+
+test("regression #522: scoped (openspec/) salvage dirty only with the marker → {salvaged: false} (4.3)", async () => {
+  let addCalled = false;
+  let commitCalled = false;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      if (scope === "openspec/") return `?? ${MARKER}\n`;
+      return `?? ${MARKER}\n`;
+    },
+    gitAddAll: async () => { addCalled = true; },
+    gitCommit: async () => { commitCalled = true; },
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.deepEqual(res, { salvaged: false }, "scoped worktree dirty only with the marker → no salvage");
+  assert.equal(addCalled, false);
+  assert.equal(commitCalled, false);
+});
+
+test("regression #522: drift guard — REBASE_MARKER_FILE (pre_merge) equals the canonical marker constant (4.4)", () => {
+  assert.equal(
+    REBASE_MARKER_FILE,
+    PIPELINE_INTERNAL_MARKER_FILES[0],
+    "pre_merge's marker writer must refer to the same canonical filename the salvage exclusion uses",
+  );
+  assert.equal(PIPELINE_INTERNAL_MARKER_FILES.length, 1, "exactly one canonical marker filename today");
+});
+
+test("regression #522: SALVAGE_MARKER_EXCLUDE carries a depth-agnostic exclusion pathspec for every marker", () => {
+  for (const file of PIPELINE_INTERNAL_MARKER_FILES) {
+    assert.ok(
+      SALVAGE_MARKER_EXCLUDE.includes(`:(exclude,glob)**/${file}`),
+      `missing depth-agnostic exclusion for ${file}; got ${JSON.stringify(SALVAGE_MARKER_EXCLUDE)}`,
+    );
+  }
 });
