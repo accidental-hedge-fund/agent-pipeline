@@ -66,6 +66,9 @@ export interface LoopEvidencePointer {
   pr_number: number | null;
   /** Agent Pipeline's own run id (`.agent-pipeline/runs/<run-id>`) for this item. */
   pipeline_run_id: string;
+  /** The managed worktree root this item's execution ran in, when the engine reports one.
+   *  Optional so existing callers that predate per-item worktree reporting keep validating. */
+  worktree_root?: string | null;
 }
 
 export interface LoopExecutionResponse {

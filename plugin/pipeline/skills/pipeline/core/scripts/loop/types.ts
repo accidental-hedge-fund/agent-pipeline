@@ -729,4 +729,8 @@ export interface LoopActionEvidence {
   outcome: string;
   next_action: LoopNextAction | null;
   progress: "progress" | "no_progress";
+  /** The managed worktree root a `dispatch_item` action ran in, when the dispatch response
+   *  reported one (`pipeline/loop-execution@1`'s `LoopEvidencePointer.worktree_root`). Absent
+   *  for every other action. */
+  worktree_root?: string | null;
 }

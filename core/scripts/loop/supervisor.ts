@@ -334,11 +334,13 @@ export async function runSupervisorCycle(
   const rawOutcomeByItem = new Map<string, unknown>();
   const outcomeByItem = new Map<string, ReturnType<typeof normalizeLoopOutcome>>();
   const dispatchErrorByItem = new Map<string, string>();
+  const worktreeRootByItem = new Map<string, string | null>();
   activeItemIds.forEach((itemId, i) => {
     const result = settled[i];
     if (result.status === "fulfilled") {
       rawOutcomeByItem.set(itemId, result.value.outcome);
       outcomeByItem.set(itemId, normalizeLoopOutcome(result.value.outcome));
+      worktreeRootByItem.set(itemId, result.value.evidence.worktree_root ?? null);
     } else {
       dispatchErrorByItem.set(itemId, result.reason instanceof Error ? result.reason.message : String(result.reason));
       outcomeByItem.set(itemId, "failed");
@@ -421,6 +423,7 @@ export async function runSupervisorCycle(
       outcome,
       next_action: nextAction,
       progress: "progress",
+      worktree_root: worktreeRootByItem.get(itemId) ?? null,
     });
   }
 
@@ -484,6 +487,7 @@ export async function runSupervisorCycle(
       outcome: parkedItemIds.has(itemId) ? "parked_for_replan" : outcome,
       next_action: nextAction,
       progress: "progress",
+      worktree_root: worktreeRootByItem.get(itemId) ?? null,
     });
   }
 
