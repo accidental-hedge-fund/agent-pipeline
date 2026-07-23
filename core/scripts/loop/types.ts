@@ -21,9 +21,75 @@ export type LoopItemState =
   | "ready"
   | "merged"
   | "released"
-  | "deployed";
+  | "deployed"
+  /** Durable, non-failure operator hold — see capability `durable-pause-and-authority`. */
+  | "paused"
+  /** Durable, non-failure hold carrying an outstanding {@link LoopHumanInputRequest} — see
+   *  capability `durable-pause-and-authority`. */
+  | "waiting";
 
-export type LoopAuthorityGate = "push_pr" | "merge" | "release" | "deploy";
+export const LOOP_AUTHORITY_GATES = ["push_pr", "merge", "release", "deploy"] as const;
+
+export type LoopAuthorityGate = (typeof LOOP_AUTHORITY_GATES)[number];
+
+export function isLoopAuthorityGate(value: unknown): value is LoopAuthorityGate {
+  return typeof value === "string" && (LOOP_AUTHORITY_GATES as readonly string[]).includes(value);
+}
+
+// ---------------------------------------------------------------------------
+// Durable paused/waiting holds & audited authority amendments (#510,
+// capability `durable-pause-and-authority`). See loop/pause.ts.
+// ---------------------------------------------------------------------------
+
+export const LOOP_HUMAN_INPUT_REQUEST_KINDS = ["decision", "answer", "authority-grant"] as const;
+
+export type LoopHumanInputRequestKind = (typeof LOOP_HUMAN_INPUT_REQUEST_KINDS)[number];
+
+export function isLoopHumanInputRequestKind(value: unknown): value is LoopHumanInputRequestKind {
+  return typeof value === "string" && (LOOP_HUMAN_INPUT_REQUEST_KINDS as readonly string[]).includes(value);
+}
+
+/** A precise human-input request attached to a `waiting` transition — the durable record a
+ *  resume must satisfy. Persisted on the item so it survives a process restart. */
+export interface LoopHumanInputRequest {
+  request_id: string;
+  item_id: string;
+  kind: LoopHumanInputRequestKind;
+  prompt: string;
+  /** A closed set of permitted response values. When present, a resume's response value MUST
+   *  be a member; when absent, any response value is accepted (subject to the request_id
+   *  matching). Never an empty array — that is refused as validation at request-build time. */
+  permitted_responses?: string[];
+  requested_by_engine: LoopEngineName;
+  requested_at: string;
+}
+
+/** A scoped, audited widening of exactly one authority gate, narrowed to exactly one item — a
+ *  broad/un-scoped grant is refused. Recorded via the decision log (`appendDecision`); never
+ *  widens any other gate or item. */
+export interface LoopAuthorityAmendment {
+  gate: LoopAuthorityGate;
+  scope_item_id: string;
+  actor: string;
+  reason: string;
+  time: string;
+}
+
+/** Evidence that the Pipeline preflight passed — the pipeline-mandate evidence a resume into
+ *  `in_progress` must still satisfy, composed with (never bypassed by) the audited resume. */
+export interface LoopPipelinePreflightEvidence {
+  passed: boolean;
+  checked_at: string;
+}
+
+/** The audited cross-engine handoff decision shape — the `data` payload recorded via
+ *  `appendDecision` when a paused/waiting run is handed from one engine to the other. */
+export interface LoopHandoff {
+  from_engine: LoopEngineName;
+  to_engine: LoopEngineName;
+  reason: string;
+  time: string;
+}
 
 export interface LoopRecoveryBudgets {
   default: number;
@@ -192,6 +258,9 @@ export interface LoopItemLedgerEntry {
   /** Consecutive prior blocks whose fingerprint equals `evidence_fingerprint`
    *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. */
   repeated_evidence_count?: number;
+  /** Present only while `state === "waiting"` — the outstanding human-input request a resume
+   *  must satisfy. Cleared on a successful resume or abandon. */
+  hold_request?: LoopHumanInputRequest;
 }
 
 export interface LoopMergeBarrier {
@@ -249,6 +318,10 @@ export interface LoopLedger {
    *  run — persisted here (not just in the events log) so a resuming engine
    *  can read per-item recovery history directly off the ledger. */
   recovery_attempts: LoopRecoveryAttempt[];
+  /** Every audited scoped authority amendment recorded on this run — durable so a later gated
+   *  transition (on this or a resumed process) can check it. A pre-#510 ledger has no such
+   *  field; see {@link upgradeLedgerForPauseAuthority} in loop/pause.ts. */
+  authority_amendments: LoopAuthorityAmendment[];
 }
 
 export interface LoopLockRecord {
