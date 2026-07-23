@@ -16,9 +16,11 @@ import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
+  type LoopAuthorityAmendment,
   type LoopContract,
   type LoopDecision,
   type LoopEvent,
+  type LoopHumanInputRequest,
   type LoopLedger,
   type LoopLockRecord,
 } from "./types.ts";
@@ -414,6 +416,10 @@ export interface LoopStatus {
   lock: { holder: LoopLockRecord | null; staleness: LockStaleness | null };
   last_reconciliation: LoopLedger["last_reconciliation"];
   event_count: number;
+  /** Outstanding human-input requests, keyed by item id — capability `durable-pause-and-authority`. */
+  outstanding_requests: Record<string, LoopHumanInputRequest>;
+  /** Every audited scoped authority amendment recorded on this run. */
+  authority_amendments: LoopAuthorityAmendment[];
 }
 
 const ACTIVE_STATES = new Set(["in_progress"]);
@@ -427,9 +433,11 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
 
   const items: Record<string, { state: string }> = {};
   const active: string[] = [];
+  const outstanding_requests: Record<string, LoopHumanInputRequest> = {};
   for (const [id, entry] of Object.entries(ledger.items)) {
     items[id] = { state: entry.state };
     if (ACTIVE_STATES.has(entry.state)) active.push(id);
+    if (entry.hold_request) outstanding_requests[id] = entry.hold_request;
   }
 
   return {
@@ -446,6 +454,8 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
     lock: { holder: lock, staleness },
     last_reconciliation: ledger.last_reconciliation,
     event_count: events.length,
+    outstanding_requests,
+    authority_amendments: ledger.authority_amendments ?? [],
   };
 }
 
