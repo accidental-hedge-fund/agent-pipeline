@@ -40,6 +40,7 @@ import {
 } from "./store.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcile.ts";
 import { blockItem, classifyAndBlockItem, eligibleIndependentItems } from "./recovery.ts";
+import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -131,7 +132,7 @@ async function abandonInProgressItem(
   return newLedger;
 }
 
-const DONE_OR_ABANDONED = new Set(["ready", "merged", "released", "deployed", "abandoned"]);
+const DONE_OR_ABANDONED = new Set(["ready", "merged", "released", "deployed", "abandoned", "skipped"]);
 
 // ---------------------------------------------------------------------------
 // One drive cycle.
@@ -214,6 +215,22 @@ export async function runSupervisorCycle(
     return { progress: true, stop: ledger.stop, holdOutstanding: false, allDone: false };
   }
 
+  // Dependency integrity (#513, capability `durable-run-dependency-integrity`): verify every
+  // external dependency against live truth, then propagate a terminal `skipped` to the
+  // transitive dependents of any dependency (in-run or external) that just terminated
+  // non-successfully — before the allDone/eligibility checks below, so a fully-resolved run
+  // completes and a skip is never mistaken for a stalled `pending` item.
+  const externalStatuses = await computeExternalDependencyStatuses(deps.observe, contract);
+  const propagation = propagateSkips(contract, ledger, externalStatuses, () => deps.store.now().toISOString(), engine);
+  if (propagation.skippedItemIds.length > 0) {
+    ledger = propagation.ledger;
+    await writeLedger(deps.store, ledger, token);
+    for (const itemId of propagation.skippedItemIds) {
+      await appendEvent(deps.store, runId, token, "loop_item_skipped", { item_id: itemId });
+    }
+  }
+  const propagated = propagation.skippedItemIds.length > 0;
+
   const allDone = contract.items.every((i) => DONE_OR_ABANDONED.has(ledger.items[i.id]?.state ?? ""));
   if (allDone) {
     await appendActionEvidence(deps.store, runId, token, {
@@ -221,14 +238,14 @@ export async function runSupervisorCycle(
       action: "noop",
       outcome: "all_items_done",
       next_action: null,
-      progress: drifted ? "progress" : "no_progress",
+      progress: drifted || propagated ? "progress" : "no_progress",
     });
-    return { progress: drifted, stop: null, holdOutstanding: false, allDone: true };
+    return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: true };
   }
 
   let activeItemId = Object.values(ledger.items).find((i) => i.state === "in_progress")?.id ?? null;
   if (!activeItemId) {
-    const eligible = eligibleIndependentItems(contract, ledger);
+    const eligible = eligibleIndependentItems(contract, ledger, externalStatuses);
     if (eligible.length > 0) {
       activeItemId = eligible[0];
       ledger = await startItem(deps.store, { runId, token, itemId: activeItemId, engine });
@@ -236,14 +253,31 @@ export async function runSupervisorCycle(
   }
 
   if (!activeItemId) {
+    const deadlockChain = detectDependencyDeadlock(contract, ledger, externalStatuses);
+    if (deadlockChain) {
+      const time = deps.store.now().toISOString();
+      const stop: LoopStopRecord = { reason: "dependency_deadlock", time, deadlock_chain: deadlockChain };
+      const newLedger: LoopLedger = { ...ledger, stop };
+      await writeLedger(deps.store, newLedger, token);
+      await appendEvent(deps.store, runId, token, "loop_run_stopped", { reason: "dependency_deadlock", deadlock_chain: deadlockChain });
+      await appendActionEvidence(deps.store, runId, token, {
+        item_id: null,
+        action: "stop",
+        outcome: "dependency_deadlock",
+        next_action: null,
+        progress: "progress",
+      });
+      return { progress: true, stop, holdOutstanding: false, allDone: false };
+    }
+
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
       action: "noop",
       outcome: "no_eligible_item",
       next_action: null,
-      progress: drifted ? "progress" : "no_progress",
+      progress: drifted || propagated ? "progress" : "no_progress",
     });
-    return { progress: drifted, stop: null, holdOutstanding: false, allDone: false };
+    return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: false };
   }
 
   const request: LoopExecutionRequest = {

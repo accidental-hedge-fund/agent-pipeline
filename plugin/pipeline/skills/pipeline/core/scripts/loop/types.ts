@@ -26,7 +26,12 @@ export type LoopItemState =
   | "paused"
   /** Durable, non-failure hold carrying an outstanding {@link LoopHumanInputRequest} — see
    *  capability `durable-pause-and-authority`. */
-  | "waiting";
+  | "waiting"
+  /** Terminal, dependency-propagated state — see capability
+   *  `durable-run-dependency-integrity`. Reachable only from `pending` or `blocked`, and only
+   *  via propagation (`propagateSkips`, loop/dependencies.ts) — never a caller-requested
+   *  transition. Counts as terminal for run completion, exactly as `abandoned` does. */
+  | "skipped";
 
 export const LOOP_AUTHORITY_GATES = ["push_pr", "merge", "release", "deploy"] as const;
 
@@ -199,7 +204,16 @@ export interface LoopRecoveryAttempt {
 
 export interface LoopContractItem {
   id: string;
+  /** In-snapshot dependency ids only — order-constraining and cycle-checked. An id declared by
+   *  the source input but not present in the snapshot is partitioned into
+   *  {@link LoopContractItem.external_depends_on} instead (capability
+   *  `durable-run-dependency-integrity`), never dropped. */
   depends_on: string[];
+  /** Out-of-snapshot dependency ids — prerequisite work the run cannot itself schedule.
+   *  Preserved but never order-constraining and never part of cycle detection; verified against
+   *  live truth before a dependent item may start (capability `durable-run-dependency-integrity`,
+   *  see loop/dependencies.ts). Empty for a contract compiled with no external dependencies. */
+  external_depends_on: string[];
 }
 
 export interface LoopContract {
@@ -303,7 +317,12 @@ export interface LoopStopRecord {
      *  round 2) was exhausted while every cycle still reported progress — a
      *  durable terminal stop so a run can never fall through the cap silently
      *  nonterminal and unheld; see loop/supervisor.ts. */
-    | "supervisor_cycle_cap";
+    | "supervisor_cycle_cap"
+    /** The run's frontier is structurally unrunnable: no item is `in_progress`, none is
+     *  eligible to start, and at least one non-terminal item remains gated on a pending or
+     *  unsatisfiable dependency — reported instead of spinning into `supervisor_no_progress`
+     *  (capability `durable-run-dependency-integrity`, see loop/dependencies.ts). */
+    | "dependency_deadlock";
   time: string;
   item_id?: string;
   theme?: string;
@@ -311,7 +330,24 @@ export interface LoopStopRecord {
   /** Set when `reason === "repeated_no_progress"` — the evidence fingerprint
    *  that repeated past the class's `repeated_evidence_limit`. */
   fingerprint?: string;
+  /** Set when `reason === "dependency_deadlock"` — for each stuck item, the dependency (in-run
+   *  or external) it waits on and that dependency's observed state. */
+  deadlock_chain?: LoopDeadlockChainEntry[];
 }
+
+/** One stuck item's entry in a {@link LoopStopRecord.deadlock_chain} — capability
+ *  `durable-run-dependency-integrity`. */
+export interface LoopDeadlockChainEntry {
+  item_id: string;
+  waiting_on: string;
+  kind: "in_run" | "external";
+  observed_state: string;
+}
+
+/** The three-valued classification of an external dependency's live-observed satisfaction —
+ *  capability `durable-run-dependency-integrity`. Never resolved from a caller claim; see
+ *  `externalDependencyStatus` (loop/dependencies.ts). */
+export type ExternalDependencyStatus = "satisfied" | "unsatisfiable" | "pending";
 
 export interface LoopNativeGoalCheck {
   engine: LoopEngineName;

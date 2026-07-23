@@ -70,36 +70,36 @@ a caller claim.
 
 ## Acceptance Criteria
 
-- [ ] Contract compilation partitions an item's declared dependencies into in-snapshot `depends_on`
+- [x] Contract compilation partitions an item's declared dependencies into in-snapshot `depends_on`
   (order-constraining) and out-of-snapshot `external_depends_on` (preserved, non-order-constraining);
   a unit test compiling a snapshot with a mix asserts the external ids land in `external_depends_on`,
   are absent from `depends_on`, and do not affect the deterministic ordering — replacing the prior
   "out-of-snapshot dependency is dropped" behavior.
-- [ ] An in-snapshot dependency cycle is still refused as a validation failure and duplicate item ids
+- [x] An in-snapshot dependency cycle is still refused as a validation failure and duplicate item ids
   are still refused; a regression test proves both.
-- [ ] An item with an external dependency whose issue is observed **open** is not eligible to start;
+- [x] An item with an external dependency whose issue is observed **open** is not eligible to start;
   the same item becomes eligible once that issue is observed **closed-as-completed** (or its linked PR
   merged); verification runs through the injected `ReconcileObserveDeps` seam and a unit test asserts
   **zero** real network, git, and subprocess calls.
-- [ ] A new terminal item state `skipped` exists, reachable only from `pending` or `blocked`, with no
+- [x] A new terminal item state `skipped` exists, reachable only from `pending` or `blocked`, with no
   outgoing transitions; the transition-graph enforcement admits exactly those two inbound edges and
   refuses every other edge into or out of `skipped` (guarded by a runtime test, since types are
   stripped).
-- [ ] When an item is `abandoned` (or an external dependency is observed unsatisfiable), its
+- [x] When an item is `abandoned` (or an external dependency is observed unsatisfiable), its
   transitive dependents are propagated to `skipped`, each with a history entry naming the causing
   dependency and an emitted event; a regression test shows the dependent is `skipped` (not left
   `pending`) and that a dependent with an *alternative* satisfiable path is **not** skipped.
-- [ ] A run whose only remaining non-terminal items are gated on pending or unsatisfiable
+- [x] A run whose only remaining non-terminal items are gated on pending or unsatisfiable
   dependencies, with no item in progress and none eligible, stops with a `dependency_deadlock` stop
   record whose `deadlock_chain` payload names each stuck item and the specific dependency (in-run or
   external) and its observed state — distinct from `supervisor_no_progress`; a regression test asserts
   the typed stop and that the pre-fix behavior (silent spin to `supervisor_no_progress`) no longer
   occurs.
-- [ ] A dependency-independent item continues to run to completion while another item is `abandoned`,
+- [x] A dependency-independent item continues to run to completion while another item is `abandoned`,
   `skipped`, or externally gated; the `dependency_deadlock` stop fires only when no
   dependency-independent item can run — proven by a test where an independent item reaches `ready`
   before any deadlock is reported.
-- [ ] `node scripts/build.mjs` regenerates the plugin mirror and `npm run ci` (including
+- [x] `node scripts/build.mjs` regenerates the plugin mirror and `npm run ci` (including
   `openspec validate --all`) is green; every new regression test bites (fails without the change).
 
 ## Capabilities
