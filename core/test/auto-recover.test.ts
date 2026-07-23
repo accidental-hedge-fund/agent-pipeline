@@ -4,7 +4,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { countRecoveryAttempts } from "../scripts/stages/auto_recover.ts";
+import {
+  countRecoveryAttempts,
+  tryAutoRecover,
+  type AutoRecoverDeps,
+} from "../scripts/stages/auto_recover.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 test("countRecoveryAttempts: zero comments → 0", () => {
   assert.equal(countRecoveryAttempts([]), 0);
@@ -59,4 +65,105 @@ test("countRecoveryAttempts: unrelated comments are ignored", () => {
     { body: "## Pipeline: Blocked at pre merge\n\nCI failed." },
   ];
   assert.equal(countRecoveryAttempts(comments), 0);
+});
+
+// ---------------------------------------------------------------------------
+// tryAutoRecover — #499 correction_event emission (source_kind: "retry")
+// ---------------------------------------------------------------------------
+
+const CFG = {
+  repo: "acme/repo",
+  repo_dir: "/tmp/repo",
+  base_branch: "main",
+  auto_recovery_max_retries: 2,
+} as unknown as PipelineConfig;
+
+function memRunStoreDeps(): { deps: RunStoreDeps; lines: () => string[] } {
+  const appends: string[] = [];
+  const deps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async (_p, data) => { appends.push(data); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+  };
+  return { deps, lines: () => appends };
+}
+
+function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
+  return {
+    getOnDiskForIssue: async () => ({ path: "/tmp/repo/.worktrees/x", slug: "x" }) as Awaited<ReturnType<AutoRecoverDeps["getOnDiskForIssue"]>>,
+    hasCommitsAhead: async () => false,
+    getIssueDetail: async () => ({ comments: [] }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
+    removeWorktree: async () => {},
+    postComment: async () => {},
+    removeLabel: async () => {},
+    addLabel: async () => {},
+    ...overrides,
+  };
+}
+
+test("tryAutoRecover: successful recovery (reset to ready) appends one correction_event with source_kind: retry", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps());
+  assert.equal(out.advanced, true);
+  assert.equal(lines().length, 1);
+  const event = JSON.parse(lines()[0]);
+  assert.equal(event.type, "correction_event");
+  assert.equal(event.source_kind, "retry");
+  assert.equal(event.actor_kind, "pipeline");
+  assert.equal(event.failure_class, "harness-crash");
+});
+
+test("tryAutoRecover: no worktree to recover → no-op, no correction_event", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
+    getOnDiskForIssue: async () => null,
+  }));
+  assert.equal(out.status, "no-op");
+  assert.equal(lines().length, 0);
+});
+
+test("tryAutoRecover: worktree already has commits → no-op, no correction_event", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
+    hasCommitsAhead: async () => true,
+  }));
+  assert.equal(out.status, "no-op");
+  assert.equal(lines().length, 0);
+});
+
+test("tryAutoRecover: recovery limit reached → blocked, no correction_event (a bare retry attempt is not a correction)", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const comments = [
+    { body: "## Pipeline: Auto-Recovery (1/2)\n\nRound 1." },
+    { body: "## Pipeline: Auto-Recovery (2/2)\n\nRound 2." },
+  ];
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
+    getIssueDetail: async () => ({ comments }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
+  }));
+  assert.equal(out.status, "blocked");
+  assert.equal(lines().length, 0);
+});
+
+test("tryAutoRecover: no runDir supplied → recovery still succeeds but no correction_event is emitted", async () => {
+  const out = await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps());
+  assert.equal(out.advanced, true);
+});
+
+test("tryAutoRecover: blocked-label clear failure returns a non-success outcome and emits no correction_event — regression for #499 finding c41e8715", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const postCommentCalls: string[] = [];
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
+    removeLabel: async (_cfg, _issue, label) => {
+      if (label === "blocked") throw new Error("gh: label removal failed (network error)");
+    },
+    postComment: async (_cfg, _issue, body) => { postCommentCalls.push(body); },
+  }));
+  assert.equal(out.advanced, false);
+  assert.equal(out.status, "blocked");
+  assert.equal(lines().length, 0, "no correction_event may be recorded when the blocked label was not durably cleared");
+  assert.equal(postCommentCalls.length, 0, "no recovery comment may be posted claiming success when the reset did not happen");
 });

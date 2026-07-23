@@ -30,7 +30,7 @@ const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
   "release", "intake", "sweep", "triage", "merge",
   "refine-spec", "logs", "summary", "path", "config", "run", "improve",
-  "scoreboard", "roadmap", "loop",
+  "scoreboard", "roadmap", "loop", "correction",
 ];
 
 test("command-registry: every recognized dispatch keyword has a registry entry", () => {
@@ -194,7 +194,7 @@ test("command-registry: needsIssueNumber is false for named sub-commands that op
   const issueAgnosticKeys = [
     "init", "doctor", "cleanup", "release", "intake", "sweep",
     "triage", "merge", "refine-spec", "logs", "summary", "path",
-    "config", "improve", "scoreboard", "roadmap",
+    "config", "improve", "scoreboard", "roadmap", "correction",
   ];
   for (const key of issueAgnosticKeys) {
     const entry = COMMAND_REGISTRY[key as keyof typeof COMMAND_REGISTRY] as CommandEntry | undefined;

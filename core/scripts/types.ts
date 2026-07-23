@@ -1405,6 +1405,10 @@ export interface EvidenceBundle {
    *  order. Populated by `finalizeRun` from `events.jsonl`. Additive and
    *  optional: consumers that do not recognize this field SHALL ignore it. */
   interventions?: import("./intervention.ts").HumanInterventionEvent[];
+  /** All `correction_event` records emitted during the run, in chronological
+   *  order. Populated by `finalizeRun` from `events.jsonl` (#499). Additive
+   *  and optional: consumers that do not recognize this field SHALL ignore it. */
+  corrections?: import("./correction.ts").CorrectionEvent[];
   /** Finalized stage accounting copied from `stage_accounting` events by
    *  `finalizeRun`. Additive and optional for older bundles. */
   accounting?: StageAccountingSummary;

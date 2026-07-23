@@ -757,7 +757,7 @@ export async function runAdvance(
       if (isBlocked(detail.labels)) {
         if (stage === "implementing") {
           console.log(`[pipeline] #${issueNumber}: blocked at implementing — attempting auto-recovery`);
-          const out = await autoRecover.tryAutoRecover(cfg, issueNumber, stateDir);
+          const out = await autoRecover.tryAutoRecover(cfg, issueNumber, stateDir, runDir, runStoreDeps);
           printOutcome(issueNumber, stage, out, tlog);
           if (out.advanced) {
             transitions++;

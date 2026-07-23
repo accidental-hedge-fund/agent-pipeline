@@ -23,6 +23,7 @@ import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import { stageDurationMs } from "./evidence-bundle.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
+import { validateCorrectionEvent, type CorrectionEvent } from "./correction.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
 import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
 
@@ -288,6 +289,7 @@ export interface SettledSurfaceUnverifiedEvent extends RunEventBase {
 }
 
 export type { HumanInterventionEvent };
+export type { CorrectionEvent };
 
 export type RunEvent =
   | RunStartEvent
@@ -315,7 +317,8 @@ export type RunEvent =
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent
   | EngineDriftEvent
-  | HumanInterventionEvent;
+  | HumanInterventionEvent
+  | CorrectionEvent;
 
 // ---------------------------------------------------------------------------
 // Deps — injectable I/O seam; unit tests inject in-memory fakes
@@ -493,11 +496,15 @@ export async function resolveRunEngineIdentity(
  *  mode (default) alongside the local write, in "exclusive" mode the local
  *  write is skipped entirely. Sink delivery failure is caught and logged as a
  *  non-fatal warning; it never affects the local write or throws out of here. */
+/** Returns whether the event was durably delivered (local write, or sink
+ *  delivery in exclusive mode) — non-fatal callers may ignore the result;
+ *  a caller that must not report success on a silent failure (e.g. the
+ *  `correction record` CLI) can check it. */
 export async function appendEvent(
   runDir: string,
   event: RunEvent,
   deps: RunStoreDeps = defaultRunStoreDeps,
-): Promise<void> {
+): Promise<boolean> {
   const line = `${JSON.stringify(event)}\n`;
   const hasSink = deps.eventSink !== undefined;
   const skipLocalWrite = hasSink && deps.eventSinkMode === "exclusive";
@@ -506,6 +513,7 @@ export async function appendEvent(
     deps.summaryEvents.push(event);
   }
 
+  let localOk = true;
   if (!skipLocalWrite) {
     try {
       await deps.appendFile(path.join(runDir, "events.jsonl"), line);
@@ -513,7 +521,8 @@ export async function appendEvent(
       console.warn(
         `[pipeline] run-store: appendEvent failed (non-fatal): ${(err as Error).message}`,
       );
-      if (!hasSink) return;
+      localOk = false;
+      if (!hasSink) return false;
     }
   }
 
@@ -521,6 +530,7 @@ export async function appendEvent(
     deps.stdoutWrite(line);
   }
 
+  let sinkOk = true;
   if (hasSink) {
     try {
       await deps.eventSink!(line);
@@ -528,8 +538,11 @@ export async function appendEvent(
       console.warn(
         `[pipeline] run-store: eventSink delivery failed (non-fatal): ${(err as Error).message}`,
       );
+      sinkOk = false;
     }
   }
+
+  return skipLocalWrite ? sinkOk : localOk;
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +742,20 @@ export async function finalizeRun(
   let deltaRoundEvents: DeltaRoundEvent[] = [];
   let deltaCeilingEvents: DeltaRoundCeilingEvent[] = [];
   let deltaChurnEvents: DeltaChurnSuspectedEvent[] = [];
+  let corrections: CorrectionEvent[] = [];
+  // Malformed/unknown-schema_version correction_event records are surfaced
+  // here, not silently dropped: validateCorrectionEvent() partitions the raw
+  // records into valid events (embedded in `corrections`) and visible error
+  // strings (embedded in `correctionErrors`) — neither path throws or aborts
+  // the run.
+  let correctionErrors: string[] = [];
+  const partitionCorrections = (raw: unknown[]): void => {
+    for (const r of raw) {
+      const result = validateCorrectionEvent(r);
+      if (result.ok) corrections.push(result.event);
+      else correctionErrors.push(result.error);
+    }
+  };
   if (deps.summaryEvents) {
     interventions = deps.summaryEvents.filter(
       (e): e is HumanInterventionEvent => e.type === "human_intervention",
@@ -739,6 +766,7 @@ export async function finalizeRun(
     deltaRoundEvents = deps.summaryEvents.filter((e): e is DeltaRoundEvent => e.type === "delta_round");
     deltaCeilingEvents = deps.summaryEvents.filter((e): e is DeltaRoundCeilingEvent => e.type === "delta_round_ceiling");
     deltaChurnEvents = deps.summaryEvents.filter((e): e is DeltaChurnSuspectedEvent => e.type === "delta_churn_suspected");
+    partitionCorrections(deps.summaryEvents.filter((e) => e.type === "correction_event"));
   } else {
     try {
       const eventsForSummary = await readEvents(runDir, deps);
@@ -751,6 +779,7 @@ export async function finalizeRun(
       deltaRoundEvents = eventsForSummary.filter((e): e is DeltaRoundEvent => e.type === "delta_round");
       deltaCeilingEvents = eventsForSummary.filter((e): e is DeltaRoundCeilingEvent => e.type === "delta_round_ceiling");
       deltaChurnEvents = eventsForSummary.filter((e): e is DeltaChurnSuspectedEvent => e.type === "delta_churn_suspected");
+      partitionCorrections(eventsForSummary.filter((e) => e.type === "correction_event"));
     } catch {
       // Non-fatal: missing or unreadable events.jsonl → empty arrays
     }
@@ -788,6 +817,8 @@ export async function finalizeRun(
     schema_version: RUN_SCHEMA_VERSION,
     run_id: fileRunId,
     interventions,
+    corrections,
+    correctionErrors,
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
@@ -874,6 +905,25 @@ export async function listRunIds(
 
   withMtime.sort((a, b) => b.mtime - a.mtime);
   return withMtime.map((e) => e.name);
+}
+
+// ---------------------------------------------------------------------------
+// latestRunDirForIssue — locate the current run directory for a
+// Pipeline-owned correction_event emission point (#499), host-locally.
+// ---------------------------------------------------------------------------
+
+/** Return the absolute path of the most-recent run directory for `issueNumber`
+ *  (by run-id prefix, already sorted by mtime descending by `listRunIds`), or
+ *  `null` when no matching run directory exists. */
+export async function latestRunDirForIssue(
+  repoDir: string,
+  issueNumber: number,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<string | null> {
+  const allIds = await listRunIds(repoDir, deps);
+  const prefix = `${issueNumber}-`;
+  const matchId = allIds.find((rid) => rid.startsWith(prefix));
+  return matchId ? runDirPath(repoDir, matchId) : null;
 }
 
 // ---------------------------------------------------------------------------

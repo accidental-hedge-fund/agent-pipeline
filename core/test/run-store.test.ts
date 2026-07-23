@@ -894,6 +894,112 @@ test("finalizeRun: exclusive sink mode still embeds accounting + interventions v
   assert.equal(summary.interventions[0].kind, "human-risk-override");
 });
 
+// #499 — correction_event survives into summary.json, both via re-read and
+// via the exclusive-sink summaryEvents accumulator.
+test("finalizeRun: correction_event records reach summary.json (events.jsonl re-read path)", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "correction_event",
+      at: STARTED_AT_ISO,
+      correction_id: "abc123",
+      correction_key: "def456",
+      source_kind: "override",
+      failure_class: "review-finding",
+      actor_kind: "human",
+      issue: ISSUE,
+      repo: "acme/repo",
+      run_id: `${ISSUE}-${STARTED_AT}`,
+      stage: "review-2",
+      reviewed_sha: null,
+      head_sha: null,
+      evidence_ref: { kind: "finding", id: "abc12345" },
+      correction: "rejected — false positive",
+      reusable: "unknown",
+    } as unknown as RunEvent,
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.corrections.length, 1);
+  assert.equal(summary.corrections[0].source_kind, "override");
+});
+
+test("finalizeRun: exclusive sink mode still embeds correction_event via summaryEvents", async () => {
+  const { deps, readFile, files } = memRunStore();
+  deps.eventSink = () => {};
+  deps.eventSinkMode = "exclusive";
+  deps.summaryEvents = [];
+  const bundle = makeBundle();
+
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "correction_event",
+      at: STARTED_AT_ISO,
+      correction_id: "abc123",
+      correction_key: "def456",
+      source_kind: "retry",
+      failure_class: "harness-crash",
+      actor_kind: "pipeline",
+      issue: ISSUE,
+      repo: "acme/repo",
+      run_id: `${ISSUE}-${STARTED_AT}`,
+      stage: "implementing",
+      reviewed_sha: null,
+      head_sha: null,
+      evidence_ref: { kind: "blocker", id: "no-commits" },
+      correction: "auto-recovery 1/3",
+      reusable: "unknown",
+    } as unknown as RunEvent,
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  assert.equal(files.has(path.join(RUN_DIR, "events.jsonl")), false, "exclusive mode must not create events.jsonl");
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.corrections.length, 1);
+  assert.equal(summary.corrections[0].source_kind, "retry");
+});
+
+test("finalizeRun: a run with no correction_event records still writes an empty corrections array", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.deepEqual(summary.corrections, []);
+});
+
+// ---------------------------------------------------------------------------
+// latestRunDirForIssue (#499)
+// ---------------------------------------------------------------------------
+
+test("latestRunDirForIssue: returns null when no run directory matches the issue prefix", async () => {
+  const { deps } = memRunStore();
+  const { latestRunDirForIssue } = await import("../scripts/run-store.ts");
+  const result = await latestRunDirForIssue(REPO_DIR, 999, deps);
+  assert.equal(result, null);
+});
+
+test("latestRunDirForIssue: returns the most-recent matching run directory (mtime descending)", async () => {
+  const { deps, files } = memRunStore();
+  const { latestRunDirForIssue } = await import("../scripts/run-store.ts");
+  const olderId = "155-run-b"; // memRunStore's stat() treats "run-b" as older
+  const newerId = "155-run-a"; // and "run-a" as newer
+  files.set(path.join(runsDir(REPO_DIR), olderId, "run.json"), "{}");
+  files.set(path.join(runsDir(REPO_DIR), newerId, "run.json"), "{}");
+  const result = await latestRunDirForIssue(REPO_DIR, 155, deps);
+  assert.equal(result, runDirPath(REPO_DIR, newerId));
+});
+
 // 4.7 — backward-compat regression test
 test("finalizeRun: writes legacy evidence.json with same content as summary.json", async () => {
   const { deps, readFile } = memRunStore();
