@@ -239,8 +239,10 @@ export interface VisualGateDeps {
    *  for tests. */
   copyForPublish?: (srcDir: string, files: string[], destDir: string) => Promise<void>;
   /** Remove the worktree evidence dir, replacing any prior published set
-   *  before the new one is written. Injectable for tests. */
-  removeEvidenceDir?: (destDir: string) => Promise<void>;
+   *  before the new one is written. Resolves `true` when a directory was
+   *  actually present (and removed), `false` when there was nothing there.
+   *  Injectable for tests. */
+  removeEvidenceDir?: (destDir: string) => Promise<boolean>;
   /** `git add -f <relPath>` in the worktree — force-adds only the evidence
    *  path so a gitignored `artifacts_dir` is never swept in. Injectable for tests. */
   gitAddForce?: (cwd: string, relPath: string) => Promise<{ code: number; stderr: string }>;
@@ -479,7 +481,7 @@ export function publishBlobUrl(repo: string, branch: string, rel: string): strin
 
 interface PublishGitDeps {
   copyForPublish: (srcDir: string, files: string[], destDir: string) => Promise<void>;
-  removeEvidenceDir: (destDir: string) => Promise<void>;
+  removeEvidenceDir: (destDir: string) => Promise<boolean>;
   gitAddForce: (cwd: string, relPath: string) => Promise<{ code: number; stderr: string }>;
   gitCommit: (cwd: string, message: string) => Promise<{ code: number; stderr: string }>;
   gitDirty: (cwd: string) => Promise<boolean>;
@@ -517,11 +519,8 @@ async function publishVisualArtifacts(
 
   const { toPublish, overBound } = selectPublishFiles(manifest.files, manifest.fileSizes);
   const overBoundSet = new Set(overBound);
-  if (toPublish.length === 0) {
-    return { attempted: false, ok: false, published: new Set(), overBound: overBoundSet };
-  }
 
-  if (!opts.runDir) {
+  if (toPublish.length > 0 && !opts.runDir) {
     return {
       attempted: true,
       ok: false,
@@ -531,12 +530,20 @@ async function publishVisualArtifacts(
     };
   }
 
-  const srcDir = path.join(opts.runDir, "visual", `attempt-${attempt}`);
   const evidenceAbsDir = path.join(wtPath, PUBLISH_EVIDENCE_DIR);
 
   try {
-    await deps.removeEvidenceDir(evidenceAbsDir);
-    await deps.copyForPublish(srcDir, toPublish, evidenceAbsDir);
+    const priorEvidenceExisted = await deps.removeEvidenceDir(evidenceAbsDir);
+    if (toPublish.length === 0 && !priorEvidenceExisted) {
+      // Nothing captured fits the publish bounds, and there is no stale
+      // evidence set on the branch to replace — a true no-op (#463 review 1).
+      return { attempted: false, ok: false, published: new Set(), overBound: overBoundSet };
+    }
+
+    if (toPublish.length > 0) {
+      const srcDir = path.join(opts.runDir!, "visual", `attempt-${attempt}`);
+      await deps.copyForPublish(srcDir, toPublish, evidenceAbsDir);
+    }
 
     const addRes = await deps.gitAddForce(wtPath, PUBLISH_EVIDENCE_DIR);
     if (addRes.code !== 0) {
@@ -600,8 +607,13 @@ async function defaultCopyForPublish(srcDir: string, files: string[], destDir: s
   }
 }
 
-async function defaultRemoveEvidenceDir(destDir: string): Promise<void> {
+async function defaultRemoveEvidenceDir(destDir: string): Promise<boolean> {
+  const existed = await fsp
+    .access(destDir)
+    .then(() => true)
+    .catch(() => false);
   await fsp.rm(destDir, { recursive: true, force: true });
+  return existed;
 }
 
 async function defaultGitAddForce(cwd: string, relPath: string): Promise<{ code: number; stderr: string }> {

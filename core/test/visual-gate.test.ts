@@ -832,7 +832,7 @@ function publishGitDeps(
 ): Pick<VisualGateDeps, "copyForPublish" | "removeEvidenceDir" | "gitAddForce" | "gitCommit" | "gitDirty" | "gitPush"> {
   return {
     copyForPublish: async () => {},
-    removeEvidenceDir: async () => {},
+    removeEvidenceDir: async () => false,
     gitAddForce: async () => ({ code: 0, stderr: "" }),
     gitCommit: async () => ({ code: 0, stderr: "" }),
     gitDirty: async () => true,
@@ -937,6 +937,35 @@ test("visual-gate: over-bound file is annotated 'not published' and is not commi
   assert.equal(addCalled, 1, "an in-bound file must still trigger a publish commit even when a sibling is over-bound");
   assert.ok(log.comments[0].includes("huge.png (not published: exceeds bound)"));
   assert.ok(log.comments[0].includes("[small.png]("), "the in-bound file must still be published and linked");
+});
+
+test("visual-gate: an all-over-bound deciding run still replaces stale published evidence (#463 review 1)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  // Every captured file this run exceeds the per-file bound, but a prior run
+  // left evidence published on the branch — it must be pruned, not left stale.
+  deps.listArtifacts = async () => [{ rel: "huge.png", size: 3 * 1024 * 1024 }];
+  let addCalled = 0;
+  let committed = false;
+  let pushed = false;
+  Object.assign(
+    deps,
+    publishGitDeps({
+      removeEvidenceDir: async () => true,
+      gitAddForce: async () => { addCalled++; return { code: 0, stderr: "" }; },
+      gitCommit: async (_cwd, message) => { committed = true; return { code: 0, stderr: "" }; },
+      gitPush: async () => { pushed = true; return { code: 0, stderr: "" }; },
+    }),
+  );
+
+  const out = await advanceVisual(cfg, 826, { runDir: "/runs/826" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addCalled, 1, "the evidence-directory deletion must still be staged when everything is over-bound");
+  assert.equal(committed, true, "the deletion of stale evidence must be committed");
+  assert.equal(pushed, true, "the deletion of stale evidence must be pushed");
+  assert.ok(log.comments[0].includes("huge.png (not published: exceeds bound)"));
 });
 
 test("visual-gate: copy-failed files are excluded from publish", async () => {

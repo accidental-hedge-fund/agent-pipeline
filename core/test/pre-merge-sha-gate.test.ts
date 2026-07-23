@@ -71,6 +71,17 @@ test("isPipelineInternalCommit: visual-gate artifact-publish commit is pipeline-
   assert.equal(isPipelineInternalCommit("chore: publish visual-gate evidence for #1"), true);
 });
 
+test("isPipelineInternalCommit: a developer commit merely starting with the publish subject is NOT pipeline-internal (#463 review 1)", () => {
+  // A developer could name a code-changing commit to piggyback on the exemption;
+  // only the exact prescribed subject (prefix + issue number, nothing else) matches.
+  assert.equal(
+    isPipelineInternalCommit("chore: publish visual-gate evidence for #463 and also refactor auth"),
+    false,
+  );
+  assert.equal(isPipelineInternalCommit("chore: publish visual-gate evidence for #463x"), false);
+  assert.equal(isPipelineInternalCommit("chore: publish visual-gate evidence for #"), false);
+});
+
 test("isPipelineInternalCommit: visual-gate artifact-publish commit is NOT read as a visual-fix commit", () => {
   const publishCommit = "chore: publish visual-gate evidence for #16";
   assert.equal(isPipelineInternalCommit(publishCommit), true);

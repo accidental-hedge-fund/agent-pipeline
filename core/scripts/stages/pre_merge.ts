@@ -107,6 +107,18 @@ import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 import { runTestGate } from "../testgate.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
+
+/**
+ * Exact publish-commit subject pattern (#463): the full prescribed subject,
+ * `VISUAL_PUBLISH_COMMIT_PREFIX` followed by an issue number and nothing
+ * else. Matched in full (not as a prefix) so a developer's own code-changing
+ * commit merely starting with the same words — e.g. `chore: publish
+ * visual-gate evidence for #463 and tweak layout` — does NOT match and still
+ * triggers the required re-review.
+ */
+const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
+  `^${VISUAL_PUBLISH_COMMIT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`,
+);
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
@@ -165,7 +177,7 @@ export type AttemptPreMergeAutoFixFn = (
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
   return (
     messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
-    messageHeadline.startsWith(VISUAL_PUBLISH_COMMIT_PREFIX)
+    VISUAL_PUBLISH_COMMIT_PATTERN.test(messageHeadline)
   );
 }
 
